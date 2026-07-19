@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess
+import time
 
 REMOTE_DT = "~/.local/bin/dt"
 SSH_BASE = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3"]
@@ -91,8 +92,12 @@ def rsync(
     link_dest: str | None = None,
     delete: bool = False,
     timeout: float = 300,
+    retries: int = 0,
 ) -> subprocess.CompletedProcess:
-    cmd = ["rsync", "-a", "-e", shlex.join(SSH_BASE)]
+    """--partial keeps interrupted transfers resumable; with retries > 0 a
+    network-ish failure is retried and resumes where it stopped (large
+    checkpoint pulls over flaky links)."""
+    cmd = ["rsync", "-a", "--partial", "-e", shlex.join(SSH_BASE)]
     if delete:
         cmd.append("--delete")
     for ex in excludes or []:
@@ -100,5 +105,13 @@ def rsync(
     if link_dest:
         cmd += [f"--link-dest={link_dest}"]
     cmd += [src, dst]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    return proc
+    attempt = 0
+    while True:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc = subprocess.CompletedProcess(cmd, 255, "", f"rsync timed out after {timeout}s")
+        if proc.returncode == 0 or attempt >= retries:
+            return proc
+        attempt += 1
+        time.sleep(min(5 * attempt, 15))

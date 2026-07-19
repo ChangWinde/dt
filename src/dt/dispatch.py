@@ -22,7 +22,7 @@ from pathlib import Path
 from .config import ConfigError, HeadConfig, Node
 from .jobs import JobEntry, load, new_job_id, running_count, sanitize_name, save
 from .probe import NodeStatus, probe_center
-from .sshio import rsync, run_on
+from .sshio import RemoteError, rsync, run_on
 
 PAYLOAD_DIR = Path(__file__).parent / "payload"
 SNAPSHOT_EXCLUDES = [
@@ -277,7 +277,9 @@ def launch(
         envs["DT_MAX_HOURS"] = str(spec.max_hours)
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in envs.items())
     cmd = f"env {env_str} bash {shlex.quote(job_dir)}/launcher.sh"
-    proc = run_on(node.name, node.local, cmd, timeout=1800)
+    # generous: a first-time uv sync of a torch env can exceed 30 min; on
+    # timeout the caller cancels via the sentinel, so no orphan is possible
+    proc = run_on(node.name, node.local, cmd, timeout=3600)
     if proc.returncode == 0:
         last = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "{}"
         try:
@@ -296,6 +298,21 @@ def _reserve_for(cfg: HeadConfig, spec: RunSpec) -> int:
     return 0 if spec.node else cfg.queue.reserve_free_per_node
 
 
+def _cancel_orphan(node: Node, job_dir: str, session: str) -> None:
+    """The launch ssh timed out or dropped: we cannot know how far the
+    launcher got, and it may still start the tmux session later (it outlives
+    its ssh session). Drop the cancel sentinel (launcher checks it around
+    start) and kill the session in case it already exists."""
+    cmd = (
+        f"touch {shlex.quote(job_dir)}/.dt-cancel 2>/dev/null; "
+        f"tmux kill-session -t {shlex.quote(session)} 2>/dev/null; true"
+    )
+    try:
+        run_on(node.name, node.local, cmd, timeout=10)
+    except Exception:
+        pass  # node unreachable: its sshd will have torn the launcher down too
+
+
 def _try_nodes(
     cfg: HeadConfig,
     candidates: list[Node],
@@ -306,13 +323,30 @@ def _try_nodes(
     sync_to_node,
     log,
 ) -> tuple[JobEntry | None, dict[str, str], bool]:
-    """Shared candidate loop. Returns (entry-or-None, reasons, fatal)."""
+    """Shared candidate loop. Returns (entry-or-None, reasons, fatal).
+
+    A single node failing (unreachable, snapshot error, launch timeout) must
+    never sink the submission: record the reason and try the next candidate.
+    Only env-fail aborts, since the environment is most likely broken
+    center-wide."""
     reasons: dict[str, str] = {}
     for node in candidates:
         log(f"snapshot -> {node.name}")
-        sync_to_node(node)
+        try:
+            sync_to_node(node)
+        except (RemoteError, DispatchError) as e:
+            reasons[node.name] = f"snapshot failed: {e}"
+            log(f"{node.name} snapshot failed, trying next node")
+            continue
         log(f"launching on {node.name}")
-        code, result = launch(cfg, node, job_id, job_dir, session, spec, _reserve_for(cfg, spec))
+        try:
+            code, result = launch(cfg, node, job_id, job_dir, session, spec,
+                                  _reserve_for(cfg, spec))
+        except RemoteError as e:
+            _cancel_orphan(node, job_dir, session)
+            reasons[node.name] = f"launch dropped ({e}); cancelled on node"
+            log(f"{node.name} launch dropped, cancelled, trying next node")
+            continue
         if code == 0 and isinstance(result, dict):
             entry = JobEntry(
                 job_id=job_id,
@@ -394,6 +428,7 @@ def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = Fals
     probe_reasons = {
         s.node: (s.error or f"{len(s.free_gpus)} free < {spec.gpus} wanted")
         for s in statuses
+        if spec.node is None or s.node == spec.node  # pinned: others not tried
     }
     if not candidates:
         if no_queue:

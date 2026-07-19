@@ -27,6 +27,12 @@ esac
 
 mkdir -p "$DT_JOB_DIR/logs"
 
+# A fresh launcher run supersedes any stale cancel sentinel (a previous
+# dispatch attempt whose ssh dropped may have left one behind).
+rm -f "$DT_JOB_DIR/.dt-cancel"
+
+cancelled() { [ -e "$DT_JOB_DIR/.dt-cancel" ]; }
+
 # -- 0. node prerequisites (missing tool = this node is unfit, try another) --
 for tool in tmux flock; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -136,6 +142,12 @@ launch_locked() {
     fi
     local ids
     ids=$(IFS=,; echo "${chosen[*]:-}")
+    # last call: if the dispatcher gave up on us (its ssh dropped), it left
+    # a cancel sentinel - do not start a job nobody tracks
+    if cancelled; then
+        log "cancelled by dispatcher; not starting"
+        return 14
+    fi
     start_session "$ids" || return 14
     echo "$ids" > "$DT_JOB_DIR/gpus"
     return 0

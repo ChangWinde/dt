@@ -36,7 +36,10 @@ change what a queued job will run.
 
 - Always pass `-n <meaningful-name>`; names are how humans find your runs.
 - Write checkpoints/artifacts to `$DT_JOB_DIR/outputs/` so `dt pull` finds them.
-- `dt kill <job> -y` (non-interactive kill requires `-y`).
+- `dt kill <job> -y` (non-interactive kill requires `-y`). Kill verifies death;
+  if the group survives TERM it says so (exit 1) - rerun with `--force`.
+- `dt pull` resumes interrupted transfers (--partial + retries); on failure
+  just rerun it.
 - Long jobs: add `--max-hours N` as a runaway guard.
 - Disable progress bars in training scripts (`TQDM_DISABLE=1`) to keep logs sane.
 - Check capacity first with `dt free --json` when planning multiple submissions.
@@ -54,7 +57,8 @@ dt logs REF [-f] [-n N]
 dt attach REF          enter the job's tmux (C-b d to detach)
 dt wait REF [--poll S]
 dt pull REF [--to DIR] fetch outputs/ back to this head
-dt kill REF [-y]       running job: TERM the group; queued job: dequeue
+dt kill REF [-y] [--force]   running job: TERM (KILL with --force) the group,
+                       confirms death; queued job: dequeue
 dt clean --before YYYY-MM-DD [-y]
 dt doctor              verify ssh/gpu/uv/tmux/net/agent on all nodes
 dt agent status|start|stop|run|install    queue agent lifecycle

@@ -418,10 +418,13 @@ def pull(
         f"{_expand_node_path(outputs_rel)}/" if entry.node_local
         else f"{entry.node}:{outputs_rel}/"
     )
+    # resilient by design: --partial + 2 retries resume where the link broke,
+    # 4h budget for multi-GB checkpoints
     with err.status(f"pulling outputs from {entry.node}..."):
-        proc = rsync(src, f"{dst}/", timeout=3600)
+        proc = rsync(src, f"{dst}/", timeout=4 * 3600, retries=2)
     if proc.returncode != 0:
-        err.print(f"[red]rsync failed: {proc.stderr.strip()}[/red]")
+        err.print(f"[red]rsync failed after retries: {proc.stderr.strip()}[/red]")
+        err.print("[dim]partial data (if any) is kept; rerun dt pull to resume[/dim]")
         raise typer.Exit(1)
     print(dst)
 
@@ -429,13 +432,14 @@ def pull(
 def kill(
     ref: str,
     yes: bool = typer.Option(False, "-y", "--yes"),
+    force: bool = typer.Option(False, "--force", help="SIGKILL (for jobs that swallow TERM)"),
 ) -> None:
-    """Terminate the whole process group of a job."""
+    """Terminate the whole process group of a job (verifies it actually died)."""
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         _, head = _locate(cfg, ref)
-        raise typer.Exit(forward_call(head, ["kill", ref] + (["-y"] if yes else []),
-                                      tty=not yes))
+        argv = ["kill", ref] + (["-y"] if yes else []) + (["--force"] if force else [])
+        raise typer.Exit(forward_call(head, argv, tty=not yes))
 
     entry = _find_or_die(cfg, ref)
     if entry.status == "queued":
@@ -452,7 +456,9 @@ def kill(
         err.print(f"[yellow]dequeued {entry.job_id}[/yellow]")
         return
     entry = jobs_mod.refresh_status(cfg, entry)
-    if entry.status != "running":
+    # "lost" still gets the kill: the group leader may be dead while children
+    # live on (e.g. a child that ignores TERM) - exactly what needs cleanup
+    if entry.status not in ("running", "lost"):
         err.print(f"{entry.job_id} is already {entry.status}")
         return
     if not yes:
@@ -460,13 +466,29 @@ def kill(
             err.print("[red]non-interactive kill needs -y[/red]")
             raise typer.Exit(1)
         typer.confirm(f"kill {entry.job_id} (pgid {entry.pgid} on {entry.node})?", abort=True)
+    sig = "KILL" if force else "TERM"
     # explicit bash: `kill -- -pgid` (negative = whole group) parses
-    # differently in some login shells' kill builtins
-    run_on(entry.node, entry.node_local,
-           f"bash -c 'kill -TERM -- -{entry.pgid}'", timeout=10)
+    # differently in some login shells' kill builtins; then confirm death
+    # (training scripts sometimes swallow TERM)
+    probe = (
+        f"bash -c 'kill -{sig} -- -{entry.pgid}; "
+        f"for i in 1 2 3 4 5 6; do sleep 0.5; "
+        # -0 on the *group*: catches children that outlive a dead leader
+        f"kill -0 -- -{entry.pgid} 2>/dev/null || {{ echo DEAD; exit 0; }}; done; "
+        f"echo ALIVE'"
+    )
+    proc = run_on(entry.node, entry.node_local, probe, timeout=20)
+    verdict = (proc.stdout or "").strip().splitlines()
+    verdict = verdict[-1] if verdict else "UNKNOWN"
+    if verdict == "ALIVE":
+        err.print(
+            f"[red]group {entry.pgid} on {entry.node} survived {sig}[/red] "
+            f"(job stays 'running'; try: dt kill {entry.job_id} -y --force)"
+        )
+        raise typer.Exit(1)
     entry.status = "killed"
     jobs_mod.save(cfg, entry)
-    err.print(f"[yellow]sent TERM to group {entry.pgid} on {entry.node}[/yellow]")
+    err.print(f"[yellow]sent {sig} to group {entry.pgid} on {entry.node}; confirmed dead[/yellow]")
 
 
 def clean(
