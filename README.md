@@ -27,10 +27,11 @@ uv tool install git+ssh://psibot-hm/home/psibot/cw/project/dt
 
 - psibot-hm 上是 editable 安装：改完代码（或 `git pull`）下一次 `dt` 调用
   即是新代码，只有改依赖或入口时才需要 `uv tool install --force -e .`。
-- 其他主节点，在笔记本上跑（笔记本只做中继，跨中心主节点互不可达）：
+- 其他主节点，在笔记本上跑（笔记本只做中继，跨中心主节点互不可达；
+  笔记本无需持有仓库副本，脚本自己会从源拉）：
 
 ```bash
-./deploy.sh                     # 默认 zgca-r0 star-0：拉源 → 推送 → 幂等 bootstrap
+ssh psibot-hm cat cw/project/dt/deploy.sh | bash -s -- zgca-r0 star-0
 ```
 
 - 笔记本自身：`uv tool upgrade dt`（重新解析 git 源的 HEAD）。
