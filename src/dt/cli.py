@@ -1,0 +1,527 @@
+"""dt CLI. One binary, role decided by config shape:
+laptop (has `centers:`) forwards everything to head nodes over ssh;
+head (has `center:`) does the real work for its own center.
+
+stdout is machine-territory (--json payloads, bare job id, paths);
+progress and decoration go to stderr. Fixed exit codes:
+0 ok | 2 no capacity | 3 env failure | 4 not found | 5 unreachable.
+`dt wait` passes the job's own exit code through (its own errors use 64+).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import typer
+
+from . import __version__
+from . import jobs as jobs_mod
+from .config import ConfigError, HeadConfig, LaptopConfig, load
+from .dispatch import DispatchError, NoCapacity, RunSpec, submit
+from .doctor import doctor_center
+from .probe import probe_center, status_as_dict
+from .remote import fan_json, find_center, forward_call, forward_exec
+from .render import doctor_table, err, free_table, out, ps_table
+from .sshio import SSH_BASE, RemoteError, rsync, run_on
+
+EXIT_NO_GPU = 2
+EXIT_ENV = 3
+EXIT_NOT_FOUND = 4
+EXIT_UNREACHABLE = 5
+
+app = typer.Typer(
+    no_args_is_help=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+    rich_markup_mode="rich",
+)
+
+
+def _cfg() -> HeadConfig | LaptopConfig:
+    try:
+        return load()
+    except ConfigError as e:
+        err.print(f"[red]config error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+def _git_sha() -> str | None:
+    for parent in Path(__file__).resolve().parents:
+        if (parent / ".git").exists():
+            proc = subprocess.run(
+                ["git", "-C", str(parent), "rev-parse", "--short", "HEAD"],
+                capture_output=True, text=True,
+            )
+            return proc.stdout.strip() or None
+    return None
+
+
+def _version_cb(value: bool) -> None:
+    if value:
+        sha = _git_sha()
+        print(f"dt {__version__}" + (f" ({sha})" if sha else ""))
+        raise typer.Exit()
+
+
+@app.callback()
+def _root(
+    version: bool = typer.Option(
+        False, "--version", callback=_version_cb, is_eager=True,
+        help="show version (+ git sha when running from a repo)",
+    ),
+) -> None:
+    """DistTrainer: dispatch experiments onto whatever shared GPU is free."""
+
+
+def _need_head(cfg) -> HeadConfig:
+    if not isinstance(cfg, HeadConfig):
+        err.print("[red]this command needs a head-node config (internal use)[/red]")
+        raise typer.Exit(1)
+    return cfg
+
+
+def _find_or_die(cfg: HeadConfig, ref: str) -> jobs_mod.JobEntry:
+    entry = jobs_mod.find(cfg, ref)
+    if entry is None:
+        err.print(f"[red]no job matching {ref!r}[/red]")
+        raise typer.Exit(EXIT_NOT_FOUND)
+    return entry
+
+
+def _expand_node_path(rel: str) -> str:
+    return str(Path.home() / rel)
+
+
+def _laptop_center(cfg: LaptopConfig, center: Optional[str]) -> str:
+    picked = center or cfg.default_center
+    if not picked:
+        err.print("[red]no center: pass -c or set default_center in config[/red]")
+        raise typer.Exit(1)
+    if picked not in cfg.centers:
+        err.print(f"[red]unknown center {picked!r}; configured: {list(cfg.centers)}[/red]")
+        raise typer.Exit(1)
+    return picked
+
+
+def _locate(cfg: LaptopConfig, ref: str) -> tuple[str, str]:
+    hit = find_center(cfg, ref)
+    if hit is None:
+        err.print(f"[red]no center's registry knows job {ref!r}[/red]")
+        raise typer.Exit(EXIT_NOT_FOUND)
+    return hit[0], hit[1]
+
+
+# --------------------------------------------------------------------------
+# free
+# --------------------------------------------------------------------------
+
+def free(
+    watch: bool = typer.Option(False, "--watch", help="live refresh every 2s"),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Show free GPUs across all centers."""
+    cfg = _cfg()
+
+    def gather() -> list[dict]:
+        if isinstance(cfg, HeadConfig):
+            return status_as_dict(cfg.center, probe_center(cfg, use_cache=not watch))
+        rows, errors = fan_json(cfg, ["free"])
+        rows += [{"center": c, "node": cfg.centers[c], "error": e} for c, e in errors.items()]
+        return rows
+
+    if json_:
+        print(json.dumps(gather()))
+        return
+    if watch:
+        from rich.live import Live
+
+        try:
+            with Live(free_table(gather()), console=out, auto_refresh=False) as live:
+                while True:
+                    time.sleep(2)
+                    live.update(free_table(gather()), refresh=True)
+        except KeyboardInterrupt:
+            return
+    else:
+        with err.status("probing nodes..."):
+            rows = gather()
+        out.print(free_table(rows))
+
+
+# --------------------------------------------------------------------------
+# run
+# --------------------------------------------------------------------------
+
+RUN_CTX = {"allow_extra_args": True, "ignore_unknown_options": True}
+
+
+def run(
+    ctx: typer.Context,
+    gpus: int = typer.Option(1, "-g", "--gpus", help="GPUs needed on one node (0 = CPU job)"),
+    name: str = typer.Option("job", "-n", "--name"),
+    center: Optional[str] = typer.Option(None, "-c", "--center"),
+    project: Optional[str] = typer.Option(None, "-p", "--project"),
+    node: Optional[str] = typer.Option(None, "--node", help="pin a specific node"),
+    require_path: Optional[str] = typer.Option(None, "--require-path", help="path that must exist on the node"),
+    max_hours: Optional[float] = typer.Option(None, "--max-hours", help="kill the job group after N hours"),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Submit: dt run -g 2 -n exp42 -- python train.py --lr 3e-4"""
+    cmd = list(ctx.args)
+    while cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        err.print("[red]no command; usage: dt run [opts] -- python train.py ...[/red]")
+        raise typer.Exit(1)
+
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        head = cfg.centers[_laptop_center(cfg, center)]
+        argv = ["run", "-g", str(gpus), "-n", name]
+        if project:
+            argv += ["-p", project]
+        if node:
+            argv += ["--node", node]
+        if require_path:
+            argv += ["--require-path", require_path]
+        if max_hours is not None:
+            argv += ["--max-hours", str(max_hours)]
+        if json_:
+            argv += ["--json"]
+        argv += ["--", *cmd]
+        raise typer.Exit(forward_call(head, argv))
+
+    spec = RunSpec(
+        name=name, gpus=gpus, cmd=cmd, project=project, node=node,
+        require_path=require_path, max_hours=max_hours,
+    )
+
+    def log(msg: str) -> None:
+        err.print(f"[dim]{msg}[/dim]")
+
+    try:
+        entry = submit(cfg, spec, Path.cwd(), log)
+    except NoCapacity as e:
+        for node_name, reason in e.reasons.items():
+            err.print(f"[yellow]{node_name}[/yellow]: {reason}")
+        err.print("[red]no node could take the job[/red]")
+        raise typer.Exit(EXIT_NO_GPU)
+    except (DispatchError, ConfigError) as e:
+        err.print(f"[red]{e}[/red]")
+        raise typer.Exit(EXIT_ENV)
+
+    if json_:
+        print(json.dumps({
+            "job_id": entry.job_id, "node": entry.node, "gpus": entry.gpus,
+            "session": entry.session, "job_dir": entry.job_dir,
+        }))
+    else:
+        gpu_str = ",".join(map(str, entry.gpus)) or "cpu"
+        err.print(
+            f"[green]started[/green] {entry.name} on [bold]{entry.node}[/bold] "
+            f"gpus={gpu_str}  (logs: dt logs {entry.job_id} -f)"
+        )
+        print(entry.job_id)  # bare id, last stdout line: agents rely on this
+
+
+# --------------------------------------------------------------------------
+# ps
+# --------------------------------------------------------------------------
+
+def ps(json_: bool = typer.Option(False, "--json")) -> None:
+    """List jobs (running ones get a live status refresh)."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        rows, errors = fan_json(cfg, ["ps"])
+        for center, e in errors.items():
+            err.print(f"[yellow]{center} unreachable: {e}[/yellow]")
+    else:
+        entries = jobs_mod.list_all(cfg)
+        stale = [e for e in entries if e.status in ("running", "lost")]
+        if stale:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(lambda e: jobs_mod.refresh_status(cfg, e), stale))
+            entries = jobs_mod.list_all(cfg)
+        rows = [{**asdict(e)} for e in entries]
+    if json_:
+        print(json.dumps(rows))
+    else:
+        out.print(ps_table(rows))
+
+
+# --------------------------------------------------------------------------
+# logs / attach / wait
+# --------------------------------------------------------------------------
+
+def logs(
+    ref: str,
+    follow: bool = typer.Option(False, "-f", "--follow"),
+    lines: int = typer.Option(100, "-n", "--lines"),
+) -> None:
+    """Show a job's stdout log."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref)
+        argv = ["logs", ref, "-n", str(lines)] + (["-f"] if follow else [])
+        if follow:
+            forward_exec(head, argv, tty=True)
+        raise typer.Exit(forward_call(head, argv))
+
+    entry = _find_or_die(cfg, ref)
+    log_path = f"{entry.job_dir}/logs/stdout.log"
+    if follow:
+        if entry.node_local:
+            os.execvp("tail", ["tail", "-n", str(lines), "-F", _expand_node_path(log_path)])
+        os.execvp("ssh", [*SSH_BASE, "-t", entry.node,
+                          f"tail -n {lines} -F {shlex.quote(log_path)}"])
+    proc = run_on(entry.node, entry.node_local, f"tail -n {lines} {shlex.quote(log_path)}",
+                  timeout=30)
+    sys.stdout.write(proc.stdout)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise typer.Exit(proc.returncode)
+
+
+def attach(ref: str) -> None:
+    """Attach to the job's tmux session (detach with C-b d; job keeps running)."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref)
+        forward_exec(head, ["attach", ref], tty=True)
+    entry = _find_or_die(cfg, ref)
+    if entry.node_local:
+        os.execvp("tmux", ["tmux", "attach", "-t", entry.session])
+    os.execvp("ssh", [*SSH_BASE, "-t", entry.node,
+                      f"tmux attach -t {shlex.quote(entry.session)}"])
+
+
+def wait(
+    ref: str,
+    poll: float = typer.Option(10, "--poll", help="seconds between status checks"),
+) -> None:
+    """Block until the job ends; exit with the job's own exit code."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref)
+        raise typer.Exit(forward_call(head, ["wait", ref, "--poll", str(poll)]))
+
+    entry = jobs_mod.find(cfg, ref)
+    if entry is None:
+        err.print(f"[red]no job matching {ref!r}[/red]")
+        raise typer.Exit(65)
+    err.print(f"[dim]waiting for {entry.job_id} on {entry.node}[/dim]")
+    lost_streak = 0
+    while True:
+        entry = jobs_mod.refresh_status(cfg, entry)
+        if entry.status == "running":
+            lost_streak = 0
+            time.sleep(poll)
+            continue
+        if entry.status == "lost":
+            # could be a transient ssh hiccup or a race with wrapper startup;
+            # require two consecutive sightings before giving up
+            lost_streak += 1
+            if lost_streak < 2:
+                time.sleep(min(poll, 5))
+                continue
+        break
+    if entry.status == "finished":
+        code = entry.exit_code if entry.exit_code is not None else 0
+        color = "green" if code == 0 else "red"
+        err.print(f"[{color}]{entry.job_id} finished with exit code {code}[/{color}]")
+        raise typer.Exit(min(code, 125))
+    err.print(f"[yellow]{entry.job_id} ended as {entry.status}[/yellow]")
+    raise typer.Exit(66 if entry.status == "killed" else 67)
+
+
+# --------------------------------------------------------------------------
+# pull / kill / clean
+# --------------------------------------------------------------------------
+
+def pull(
+    ref: str,
+    to: Optional[str] = typer.Option(None, "--to", help="destination dir on this head"),
+) -> None:
+    """Fetch the job's outputs/ back to the head node."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref)
+        argv = ["pull", ref] + (["--to", to] if to else [])
+        err.print("[dim]results land on the head node (projects live there)[/dim]")
+        raise typer.Exit(forward_call(head, argv))
+
+    entry = _find_or_die(cfg, ref)
+    outputs_rel = f"{entry.job_dir}/outputs"
+    check = run_on(entry.node, entry.node_local, f"test -d {shlex.quote(outputs_rel)}",
+                   timeout=10)
+    if check.returncode != 0:
+        err.print(f"[red]{entry.job_id} has no outputs/ (script writes to $DT_JOB_DIR/outputs)[/red]")
+        raise typer.Exit(EXIT_NOT_FOUND)
+    dst = Path(to).expanduser() if to else cfg.results_dir() / entry.job_id
+    dst.mkdir(parents=True, exist_ok=True)
+    src = (
+        f"{_expand_node_path(outputs_rel)}/" if entry.node_local
+        else f"{entry.node}:{outputs_rel}/"
+    )
+    with err.status(f"pulling outputs from {entry.node}..."):
+        proc = rsync(src, f"{dst}/", timeout=3600)
+    if proc.returncode != 0:
+        err.print(f"[red]rsync failed: {proc.stderr.strip()}[/red]")
+        raise typer.Exit(1)
+    print(dst)
+
+
+def kill(
+    ref: str,
+    yes: bool = typer.Option(False, "-y", "--yes"),
+) -> None:
+    """Terminate the whole process group of a job."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref)
+        raise typer.Exit(forward_call(head, ["kill", ref] + (["-y"] if yes else []),
+                                      tty=not yes))
+
+    entry = _find_or_die(cfg, ref)
+    entry = jobs_mod.refresh_status(cfg, entry)
+    if entry.status != "running":
+        err.print(f"{entry.job_id} is already {entry.status}")
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            err.print("[red]non-interactive kill needs -y[/red]")
+            raise typer.Exit(1)
+        typer.confirm(f"kill {entry.job_id} (pgid {entry.pgid} on {entry.node})?", abort=True)
+    # explicit bash: `kill -- -pgid` (negative = whole group) parses
+    # differently in some login shells' kill builtins
+    run_on(entry.node, entry.node_local,
+           f"bash -c 'kill -TERM -- -{entry.pgid}'", timeout=10)
+    entry.status = "killed"
+    jobs_mod.save(cfg, entry)
+    err.print(f"[yellow]sent TERM to group {entry.pgid} on {entry.node}[/yellow]")
+
+
+def clean(
+    before: str = typer.Option(..., "--before", help="YYYY-MM-DD; delete finished jobs older than this"),
+    yes: bool = typer.Option(False, "-y", "--yes"),
+) -> None:
+    """Delete old job snapshots + logs on nodes and their registry entries."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        rc = 0
+        for center, head in cfg.centers.items():
+            err.print(f"[dim]cleaning {center}[/dim]")
+            rc |= forward_call(head, ["clean", "--before", before] + (["-y"] if yes else []),
+                               tty=not yes)
+        raise typer.Exit(rc)
+
+    cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
+    victims = [
+        e for e in jobs_mod.list_all(cfg)
+        if e.created_at < cutoff and e.status != "running"
+    ]
+    if not victims:
+        err.print("nothing to clean")
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            err.print("[red]non-interactive clean needs -y[/red]")
+            raise typer.Exit(1)
+        typer.confirm(f"delete {len(victims)} job dirs older than {before}?", abort=True)
+    for e in victims:
+        if not e.job_dir.startswith("dt/jobs/"):  # paranoia before rm -rf
+            err.print(f"[red]skip {e.job_id}: suspicious job_dir {e.job_dir!r}[/red]")
+            continue
+        run_on(e.node, e.node_local, f"rm -rf {shlex.quote(e.job_dir)}", timeout=60)
+        (cfg.registry_dir() / f"{e.job_id}.json").unlink(missing_ok=True)
+    err.print(f"cleaned {len(victims)} jobs")
+
+
+# --------------------------------------------------------------------------
+# doctor / _find
+# --------------------------------------------------------------------------
+
+def doctor(json_: bool = typer.Option(False, "--json")) -> None:
+    """Verify everything the config claims: ssh, nvidia-smi, uv, tmux, net."""
+    cfg = _cfg()
+    if isinstance(cfg, HeadConfig):
+        rows = doctor_center(cfg)
+    else:
+        rows = []
+        for center, head in cfg.centers.items():
+            proc = None
+            try:
+                from .sshio import remote_dt
+                proc = remote_dt(head, ["--version"], timeout=15)
+            except Exception:
+                pass
+            ver = (proc.stdout.strip() if proc and proc.returncode == 0 else "missing")
+            rows.append({"center": center, "node": f"{head} (head)",
+                         "checks": {"ssh": "ok" if ver != "missing" else "fail",
+                                    "dt": ver.replace("dt ", "") or "missing"}})
+        node_rows, errors = fan_json(cfg, ["doctor"], timeout=120)
+        rows += node_rows
+        for center, e in errors.items():
+            rows.append({"center": center, "node": "(doctor failed)", "checks": {"ssh": e[:40]}})
+    if json_:
+        print(json.dumps(rows))
+        return
+    out.print(doctor_table(rows))
+    hard_fail = any(
+        r["checks"].get("ssh") != "ok"
+        or any(r["checks"].get(k) == "missing" for k in ("uv", "tmux", "rsync", "flock"))
+        for r in rows
+    )
+    raise typer.Exit(1 if hard_fail else 0)
+
+
+def _find(ref: str) -> None:
+    """(internal) resolve a job ref in this head's registry, print JSON."""
+    cfg = _need_head(_cfg())
+    entry = jobs_mod.find(cfg, ref)
+    if entry is None:
+        raise typer.Exit(EXIT_NOT_FOUND)
+    print(json.dumps(asdict(entry)))
+
+
+# --------------------------------------------------------------------------
+# registration (incl. single-letter aliases)
+# --------------------------------------------------------------------------
+
+app.command("free")(free)
+app.command("f", hidden=True)(free)
+app.command("run", context_settings=RUN_CTX)(run)
+app.command("r", hidden=True, context_settings=RUN_CTX)(run)
+app.command("ps")(ps)
+app.command("p", hidden=True)(ps)
+app.command("logs")(logs)
+app.command("l", hidden=True)(logs)
+app.command("attach")(attach)
+app.command("wait")(wait)
+app.command("pull")(pull)
+app.command("kill")(kill)
+app.command("k", hidden=True)(kill)
+app.command("clean")(clean)
+app.command("doctor")(doctor)
+app.command("_find", hidden=True)(_find)
+
+
+def main() -> None:
+    try:
+        app()
+    except RemoteError as e:
+        err.print(f"[red]{e}[/red]")
+        sys.exit(EXIT_UNREACHABLE)
+
+
+if __name__ == "__main__":
+    main()
