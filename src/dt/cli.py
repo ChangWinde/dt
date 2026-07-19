@@ -97,6 +97,29 @@ def _find_or_die(cfg: HeadConfig, ref: str) -> jobs_mod.JobEntry:
     return entry
 
 
+def _complete_ref(incomplete: str) -> list[str]:
+    """Tab completion for job refs from the local registry (head mode only:
+    the laptop must not ssh on every <TAB>)."""
+    try:
+        cfg = load()
+    except Exception:
+        return []
+    if not isinstance(cfg, HeadConfig):
+        return []
+    out: list[str] = []
+    entries = sorted(jobs_mod.list_all(cfg), key=lambda e: e.created_at, reverse=True)
+    for e in entries:
+        for cand in (e.name, e.job_id):
+            if cand.startswith(incomplete) and cand not in out:
+                out.append(cand)
+        if len(out) >= 30:
+            break
+    return out
+
+
+REF_ARG = typer.Argument(..., autocompletion=_complete_ref, help="job id, id prefix, or name")
+
+
 def _expand_node_path(rel: str) -> str:
     return str(Path.home() / rel)
 
@@ -259,11 +282,19 @@ def run(
 # ps
 # --------------------------------------------------------------------------
 
-def ps(json_: bool = typer.Option(False, "--json")) -> None:
+PS_TABLE_LIMIT = 30
+
+
+def ps(
+    status: Optional[str] = typer.Option(None, "-s", "--status", help="filter: queued/running/finished/killed/lost/failed"),
+    all_: bool = typer.Option(False, "-a", "--all", help="table shows every job (default: last 30; --json always shows all)"),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
     """List jobs (running ones get a live status refresh)."""
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
-        rows, errors = fan_json(cfg, ["ps"])
+        argv = ["ps"] + (["-s", status] if status else [])
+        rows, errors = fan_json(cfg, argv)
         for center, e in errors.items():
             err.print(f"[yellow]{center} unreachable: {e}[/yellow]")
     else:
@@ -273,11 +304,17 @@ def ps(json_: bool = typer.Option(False, "--json")) -> None:
             with ThreadPoolExecutor(max_workers=8) as pool:
                 list(pool.map(lambda e: jobs_mod.refresh_status(cfg, e), stale))
             entries = jobs_mod.list_all(cfg)
+        if status:
+            entries = [e for e in entries if e.status == status]
         rows = [{**asdict(e)} for e in entries]
     if json_:
-        print(json.dumps(rows))
-    else:
-        out.print(ps_table(rows))
+        print(json.dumps(rows))  # stable contract: json is never truncated
+        return
+    rows.sort(key=lambda r: r.get("created_at", 0))
+    if not all_ and len(rows) > PS_TABLE_LIMIT:
+        err.print(f"[dim]showing last {PS_TABLE_LIMIT} of {len(rows)} jobs (-a for all)[/dim]")
+        rows = rows[-PS_TABLE_LIMIT:]
+    out.print(ps_table(rows))
 
 
 # --------------------------------------------------------------------------
@@ -295,7 +332,7 @@ def _refuse_unplaced(entry: jobs_mod.JobEntry, what: str) -> None:
 
 
 def logs(
-    ref: str,
+    ref: str = REF_ARG,
     follow: bool = typer.Option(False, "-f", "--follow"),
     lines: int = typer.Option(100, "-n", "--lines"),
 ) -> None:
@@ -324,7 +361,7 @@ def logs(
         raise typer.Exit(proc.returncode)
 
 
-def attach(ref: str) -> None:
+def attach(ref: str = REF_ARG) -> None:
     """Attach to the job's tmux session (detach with C-b d; job keeps running)."""
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
@@ -339,14 +376,22 @@ def attach(ref: str) -> None:
 
 
 def wait(
-    ref: str,
+    ref: str = REF_ARG,
     poll: float = typer.Option(10, "--poll", help="seconds between status checks"),
 ) -> None:
     """Block until the job ends; exit with the job's own exit code."""
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         _, head = _locate(cfg, ref)
-        raise typer.Exit(forward_call(head, ["wait", ref, "--poll", str(poll)]))
+        # ssh exit 255 = the link died, not the job (remote dt never returns
+        # 255: job codes are clamped to 125, wait's own errors are 64-68).
+        # The registry is durable, so re-waiting is idempotent - reconnect.
+        while True:
+            rc = forward_call(head, ["wait", ref, "--poll", str(poll)])
+            if rc != 255:
+                raise typer.Exit(rc)
+            err.print("[yellow]link to head dropped; reconnecting in 10s (job unaffected)[/yellow]")
+            time.sleep(10)
 
     entry = jobs_mod.find(cfg, ref)
     if entry is None:
@@ -389,11 +434,71 @@ def wait(
 
 
 # --------------------------------------------------------------------------
+# rerun
+# --------------------------------------------------------------------------
+
+def rerun(
+    ref: str = REF_ARG,
+    name: Optional[str] = typer.Option(None, "-n", "--name", help="new job name (default: same as before)"),
+    no_queue: bool = typer.Option(False, "--no-queue"),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Resubmit a past job: same command/GPUs/pins, today's project code."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref)  # rerun goes to the center that ran it
+        argv = ["rerun", ref]
+        if name:
+            argv += ["-n", name]
+        if no_queue:
+            argv += ["--no-queue"]
+        if json_:
+            argv += ["--json"]
+        raise typer.Exit(forward_call(head, argv))
+
+    from .dispatch import spec_from_entry
+
+    old = _find_or_die(cfg, ref)
+    spec = spec_from_entry(old, name)
+    err.print(f"[dim]rerunning {old.job_id}: {old.cmd}[/dim]")
+
+    def log(msg: str) -> None:
+        err.print(f"[dim]{msg}[/dim]")
+
+    try:
+        entry = submit(cfg, spec, Path.cwd(), log, no_queue=no_queue)
+    except NoCapacity as e:
+        for node_name, reason in e.reasons.items():
+            err.print(f"[yellow]{node_name}[/yellow]: {reason}")
+        err.print("[red]no node could take the job[/red]")
+        raise typer.Exit(EXIT_NO_GPU)
+    except (DispatchError, ConfigError) as e:
+        err.print(f"[red]{e}[/red]")
+        raise typer.Exit(EXIT_ENV)
+
+    if entry.status == "queued":
+        from . import agent as agent_mod
+
+        if agent_mod.alive_pid(cfg) is None:
+            agent_mod.start_detached(cfg)
+    if json_:
+        print(json.dumps({
+            "job_id": entry.job_id, "status": entry.status, "node": entry.node,
+            "gpus": entry.gpus, "rerun_of": old.job_id,
+        }))
+    else:
+        state = ("[cyan]queued[/cyan]" if entry.status == "queued"
+                 else f"[green]started[/green] on [bold]{entry.node}[/bold]")
+        err.print(f"{state} {entry.name} (rerun of {old.job_id})")
+        print(entry.job_id)  # bare id, last stdout line: agents rely on this
+
+
+# --------------------------------------------------------------------------
 # pull / kill / clean
 # --------------------------------------------------------------------------
 
 def pull(
-    ref: str,
+    ref: str = REF_ARG,
     to: Optional[str] = typer.Option(None, "--to", help="destination dir on this head"),
 ) -> None:
     """Fetch the job's outputs/ back to the head node."""
@@ -430,7 +535,7 @@ def pull(
 
 
 def kill(
-    ref: str,
+    ref: str = REF_ARG,
     yes: bool = typer.Option(False, "-y", "--yes"),
     force: bool = typer.Option(False, "--force", help="SIGKILL (for jobs that swallow TERM)"),
 ) -> None:
@@ -493,42 +598,40 @@ def kill(
 
 def clean(
     before: str = typer.Option(..., "--before", help="YYYY-MM-DD; delete finished jobs older than this"),
+    envs: bool = typer.Option(False, "--envs", help="also remove shared venvs unused since that date"),
     yes: bool = typer.Option(False, "-y", "--yes"),
 ) -> None:
     """Delete old job snapshots + logs on nodes and their registry entries."""
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         rc = 0
+        argv_tail = (["--envs"] if envs else []) + (["-y"] if yes else [])
         for center, head in cfg.centers.items():
             err.print(f"[dim]cleaning {center}[/dim]")
-            rc |= forward_call(head, ["clean", "--before", before] + (["-y"] if yes else []),
+            rc |= forward_call(head, ["clean", "--before", before, *argv_tail],
                                tty=not yes)
         raise typer.Exit(rc)
 
     cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
-    victims = [
-        e for e in jobs_mod.list_all(cfg)
+    from .dispatch import clean_jobs
+
+    n_victims = sum(
+        1 for e in jobs_mod.list_all(cfg)
         if e.created_at < cutoff and e.status in ("finished", "killed", "lost", "failed")
-    ]
-    if not victims:
+    )
+    if not n_victims and not envs:
         err.print("nothing to clean")
         return
     if not yes:
         if not sys.stdin.isatty():
             err.print("[red]non-interactive clean needs -y[/red]")
             raise typer.Exit(1)
-        typer.confirm(f"delete {len(victims)} job dirs older than {before}?", abort=True)
-    from .dispatch import remove_staging
-
-    for e in victims:
-        if not e.job_dir.startswith("dt/jobs/"):  # paranoia before rm -rf
-            err.print(f"[red]skip {e.job_id}: suspicious job_dir {e.job_dir!r}[/red]")
-            continue
-        if e.node != "-":  # jobs killed/failed while queued never reached a node
-            run_on(e.node, e.node_local, f"rm -rf {shlex.quote(e.job_dir)}", timeout=60)
-        remove_staging(cfg, e.job_id)
-        (cfg.registry_dir() / f"{e.job_id}.json").unlink(missing_ok=True)
-    err.print(f"cleaned {len(victims)} jobs")
+        what = f"delete {n_victims} job dirs older than {before}"
+        if envs:
+            what += " + stale shared venvs"
+        typer.confirm(f"{what}?", abort=True)
+    n = clean_jobs(cfg, cutoff, envs=envs, log=lambda m: err.print(f"[dim]{m}[/dim]"))
+    err.print(f"cleaned {n} jobs")
 
 
 # --------------------------------------------------------------------------
@@ -700,6 +803,7 @@ app.command("logs")(logs)
 app.command("l", hidden=True)(logs)
 app.command("attach")(attach)
 app.command("wait")(wait)
+app.command("rerun")(rerun)
 app.command("pull")(pull)
 app.command("kill")(kill)
 app.command("k", hidden=True)(kill)

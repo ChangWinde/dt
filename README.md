@@ -59,7 +59,8 @@ queue:                   # 可选：排队与自我约束旋钮
   poll_s: 60             # agent 轮询间隔
   max_my_jobs: 4         # 本人最大并发作业数
   reserve_free_per_node: 0   # 每节点至少留空 N 张卡
-webhook: https://...     # 可选：作业结束 POST 通知
+  auto_clean_days: 14    # agent 每日自动清理 N 天前的作业与闲置环境
+webhook: https://...     # 可选：作业开始/结束/失败 POST 通知
 
 # 笔记本
 default_center: psibot
@@ -78,9 +79,10 @@ dt free                                   # 哪里有空闲卡
 dt run -g 2 -n exp42 -- python train.py   # 提交（stdout 末行是 job id）
 dt ps                                     # 在跑什么（含排队中）
 dt logs exp42 -f                          # 看日志
-dt wait exp42                             # 等结束，透传退出码（覆盖排队阶段）
-dt pull exp42                             # outputs/ 拉回主节点
-dt kill exp42 / dt clean --before ...     # 收尾
+dt wait exp42                             # 等结束，透传退出码（覆盖排队阶段，断线自动重连）
+dt rerun exp42                            # 原样重跑（当前代码 + 相同命令/资源）
+dt pull exp42                             # outputs/ 拉回主节点（断点续传）
+dt kill exp42 / dt clean --before ...     # 收尾（--envs 顺带清闲置环境）
 ```
 
 无空闲卡时 `dt run` 默认进队列（快照在提交时落盘，排队期间改代码不影响

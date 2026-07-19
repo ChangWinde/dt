@@ -1,6 +1,6 @@
 [project]
 name = "dt"
-version = "0.2.1"
+version = "0.3.0"
 description = "DistTrainer: cross-center GPU experiment dispatcher for shared servers"
 requires-python = ">=3.10"
 dependencies = [

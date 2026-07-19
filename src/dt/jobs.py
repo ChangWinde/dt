@@ -60,6 +60,7 @@ class JobEntry:
     require_path: str | None = None
     pin_node: str | None = None
     reason: str | None = None      # failure detail for status == "failed"
+    env_hash: str | None = None    # shared venv (uv.lock sha12) the job uses
 
     def created_str(self) -> str:
         return datetime.fromtimestamp(self.created_at).strftime("%m-%d %H:%M")

@@ -17,10 +17,13 @@ import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .config import ConfigError, HeadConfig, Node
-from .jobs import JobEntry, load, new_job_id, running_count, sanitize_name, save
+from .jobs import (
+    JobEntry, list_all, load, new_job_id, running_count, sanitize_name, save,
+)
 from .probe import NodeStatus, probe_center
 from .sshio import RemoteError, rsync, run_on
 
@@ -46,6 +49,22 @@ class NoCapacity(DispatchError):
         super().__init__(f"no node could take the job ({lines})")
 
 
+# Launcher-reported reasons that are about *this job* rather than about GPU
+# capacity. A queued job stuck on these must not block the jobs behind it
+# (strict FIFO only protects capacity waits from starvation).
+_JOB_SPECIFIC = ("path-missing", "disk-full", "node-unfit")
+
+
+def blocked_not_busy(tried_reasons: dict[str, str]) -> bool:
+    """True when every node we actually tried refused for job-specific
+    reasons (missing dataset path etc.) - waiting for cards will not help."""
+    if not tried_reasons:
+        return False
+    return all(
+        any(r.startswith(p) for p in _JOB_SPECIFIC) for r in tried_reasons.values()
+    )
+
+
 @dataclass
 class RunSpec:
     name: str
@@ -55,6 +74,20 @@ class RunSpec:
     node: str | None = None
     require_path: str | None = None
     max_hours: float | None = None
+
+
+def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
+    """Rebuild a submission spec from a registry entry (dt rerun). The rerun
+    snapshots the project's *current* code; only cmd/resources are replayed."""
+    return RunSpec(
+        name=name or entry.name,
+        gpus=entry.gpus_requested,
+        cmd=shlex.split(entry.cmd),
+        project=entry.project,
+        node=entry.pin_node,
+        require_path=entry.require_path,
+        max_hours=entry.max_hours,
+    )
 
 
 def resolve_project(cfg: HeadConfig, requested: str | None, cwd: Path) -> tuple[str, Path]:
@@ -364,6 +397,7 @@ def _try_nodes(
                 require_path=spec.require_path,
                 pin_node=spec.node,
                 max_hours=spec.max_hours,
+                env_hash=result.get("env") or None,
             )
             return entry, reasons, False
         reason = RETRYABLE.get(code) or FATAL.get(code) or f"exit {code}"
@@ -525,4 +559,81 @@ def dispatch_queued(cfg: HeadConfig, entry: JobEntry, log) -> tuple[str, str | N
         save(cfg, entry)
         remove_staging(cfg, entry.job_id)
         return "failed", bad
+    if blocked_not_busy(reasons):
+        return "blocked", "; ".join(f"{n}: {r}" for n, r in reasons.items())
     return "busy", None
+
+
+# --------------------------------------------------------------------------
+# cleanup (dt clean + agent auto-clean)
+# --------------------------------------------------------------------------
+
+def envs_in_use(cfg: HeadConfig) -> dict[str, set[str]]:
+    """node -> set of env hashes referenced by live (running) jobs."""
+    used: dict[str, set[str]] = {}
+    for e in list_all(cfg):
+        if e.status == "running" and e.env_hash:
+            used.setdefault(e.node, set()).add(e.env_hash)
+    return used
+
+
+def _clean_envs_cmd(envs_dir: str, cutoff: datetime, keep: set[str]) -> str:
+    """Shell that deletes stale shared venvs. Guard rails: only 12-hex-char
+    dir names (our lockhash naming), never ones in `keep`, only dirs not
+    touched since the cutoff (launcher touches the env on every use)."""
+    keep_csv = "," + ",".join(sorted(keep)) + ","
+    stamp = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    return (
+        f"bash -c 'cd {envs_dir} 2>/dev/null || exit 0; "
+        f'for d in */; do d="${{d%/}}"; '
+        f'[[ "$d" =~ ^[0-9a-f]{{12}}$ ]] || continue; '
+        f'case "{keep_csv}" in *",$d,"*) continue;; esac; '
+        f'[ -n "$(find "$d" -maxdepth 0 -newermt "{stamp}" 2>/dev/null)" ] && continue; '
+        f'rm -rf "$d" "$d.lock" && echo "$d"; done\''
+    )
+
+
+def clean_envs(cfg: HeadConfig, cutoff_ts: float, log) -> int:
+    """Remove shared venvs unused since the cutoff on every node."""
+    cutoff = datetime.fromtimestamp(cutoff_ts)
+    used = envs_in_use(cfg)
+    removed = 0
+    for node in cfg.nodes:
+        cmd = _clean_envs_cmd(cfg.envs, cutoff, used.get(node.name, set()))
+        try:
+            proc = run_on(node.name, node.local, cmd, timeout=120)
+        except Exception as e:
+            log(f"{node.name}: env clean skipped ({e})")
+            continue
+        gone = [l for l in (proc.stdout or "").splitlines() if l.strip()]
+        if gone:
+            log(f"{node.name}: removed {len(gone)} stale envs ({', '.join(gone)})")
+            removed += len(gone)
+    return removed
+
+
+def clean_jobs(cfg: HeadConfig, cutoff_ts: float, envs: bool, log) -> int:
+    """Delete node job dirs + registry entries of ended jobs older than the
+    cutoff; optionally also stale shared venvs. Returns jobs removed."""
+    victims = [
+        e for e in list_all(cfg)
+        if e.created_at < cutoff_ts
+        and e.status in ("finished", "killed", "lost", "failed")
+    ]
+    for e in victims:
+        if not e.job_dir.startswith("dt/jobs/"):  # paranoia before rm -rf
+            log(f"skip {e.job_id}: suspicious job_dir {e.job_dir!r}")
+            continue
+        if e.node != "-":  # jobs killed/failed while queued never reached a node
+            try:
+                proc = run_on(e.node, e.node_local,
+                              f"rm -rf {shlex.quote(e.job_dir)}", timeout=60)
+                if proc.returncode != 0:
+                    log(f"{e.job_id}: rm on {e.node} failed (registry entry removed anyway)")
+            except Exception as exc:
+                log(f"{e.job_id}: {e.node} unreachable, job dir orphaned ({exc})")
+        remove_staging(cfg, e.job_id)
+        (cfg.registry_dir() / f"{e.job_id}.json").unlink(missing_ok=True)
+    if envs:
+        clean_envs(cfg, cutoff_ts, log)
+    return len(victims)

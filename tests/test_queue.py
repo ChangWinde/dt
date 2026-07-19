@@ -112,14 +112,14 @@ def test_max_my_jobs_caps_agent(tmp_path):
     save(cfg, _entry("run1", "running", created_at=1.0, node="n1"))
     save(cfg, _entry("q1", "queued", created_at=2.0))
     logs = []
-    assert process_once(cfg, logs.append) == "capped"
+    assert process_once(cfg, logs.append) == [("q1", "capped")]
     # queue untouched
     assert [e.job_id for e in queued_entries(cfg)] == ["q1"]
 
 
 def test_agent_idle_on_empty_queue(tmp_path):
     cfg = _cfg(tmp_path)
-    assert process_once(cfg, lambda m: None) == "idle"
+    assert process_once(cfg, lambda m: None) == []
 
 
 # -- queued dispatch edge cases ------------------------------------------------

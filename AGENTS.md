@@ -25,10 +25,15 @@ snapshot is taken at submit time — editing the project afterwards does not
 change what a queued job will run.
 
 - `dt wait <id>` covers the queued phase too: it blocks through queue →
-  running → finished and still exits with the training exit code.
+  running → finished and still exits with the training exit code. From a
+  laptop it auto-reconnects if the ssh link drops (the job is unaffected).
 - `dt run --no-queue ...` restores fail-fast: exit 2 when nothing is free.
 - `dt kill <id> -y` on a queued job removes it from the queue.
 - `dt ps` shows queued jobs; `dt agent status --json` gives queue depth.
+- A job blocked for job-specific reasons (missing `--require-path`, unfit
+  nodes) does NOT hold up the queue behind it; capacity waits stay FIFO.
+- `dt rerun <id>` resubmits a past job (same cmd/GPUs/pins, current code) -
+  the fix-and-retry primitive after a failure.
 - `dt wait` exit codes: 0-125 job's own, 65 not found, 66 killed, 67 lost,
   68 failed-before-start (env failure at dispatch; reason in `dt ps --json`).
 
@@ -52,14 +57,16 @@ change what a queued job will run.
 dt free [--watch]      free GPUs across nodes
 dt run [-g N] [-n NAME] [-p PROJECT] [--node NODE] [--require-path P]
        [--max-hours H] [--no-queue] -- CMD...
-dt ps                  jobs + live status (includes queued)
+dt ps [-s STATUS] [-a] jobs + live status (table: last 30 unless -a;
+                       --json: always everything)
 dt logs REF [-f] [-n N]
 dt attach REF          enter the job's tmux (C-b d to detach)
 dt wait REF [--poll S]
-dt pull REF [--to DIR] fetch outputs/ back to this head
+dt rerun REF [-n NAME] [--no-queue]   resubmit with current code
+dt pull REF [--to DIR] fetch outputs/ back to this head (resumes/retries)
 dt kill REF [-y] [--force]   running job: TERM (KILL with --force) the group,
                        confirms death; queued job: dequeue
-dt clean --before YYYY-MM-DD [-y]
+dt clean --before YYYY-MM-DD [--envs] [-y]   old jobs (+stale shared venvs)
 dt doctor              verify ssh/gpu/uv/tmux/net/agent on all nodes
 dt agent status|start|stop|run|install    queue agent lifecycle
 ```

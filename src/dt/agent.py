@@ -24,10 +24,11 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import HeadConfig
-from .dispatch import dispatch_queued
+from .dispatch import clean_jobs, dispatch_queued
 from .jobs import queued_entries, running_count
 
 CRON_MARK = "# dt-agent"
+AUTOCLEAN_EVERY_S = 24 * 3600
 
 
 def _lock_path(cfg: HeadConfig) -> Path:
@@ -77,29 +78,68 @@ def notify(cfg: HeadConfig, payload: dict) -> None:
         pass
 
 
-def process_once(cfg: HeadConfig, log) -> str:
-    """One poll tick. Returns what happened: idle | capped | busy | started
-    | failed | killed."""
-    queue = queued_entries(cfg)
-    if not queue:
-        return "idle"
-    cap = cfg.queue.max_my_jobs
-    if cap is not None and running_count(cfg) >= cap:
-        return "capped"
-    head = queue[0]
-    outcome, detail = dispatch_queued(cfg, head, log)
-    if outcome == "started":
-        log(f"{head.job_id} -> {detail}")
-    elif outcome == "failed":
-        log(f"{head.job_id} failed: {detail}")
-        notify(cfg, {
-            "event": "failed", "job_id": head.job_id, "name": head.name,
-            "center": cfg.center, "node": None, "exit_code": None,
-            "reason": detail,
-        })
-    elif outcome == "killed":
-        log(f"{head.job_id} was killed while dispatching; stopped it on {detail}")
-    return outcome
+def process_once(cfg: HeadConfig, log) -> list[tuple[str, str]]:
+    """One poll tick: walk the queue in FIFO order.
+
+    - started / failed / killed: move on to the next queued job
+    - blocked (job-specific: missing dataset path, unfit nodes): skip it so
+      it cannot starve the jobs behind it; retried next tick
+    - busy (GPU capacity): stop - strict FIFO for capacity keeps big jobs
+      from being starved by small ones
+    Returns [(job_id, outcome), ...] for logging/tests."""
+    results: list[tuple[str, str]] = []
+    for entry in queued_entries(cfg):
+        cap = cfg.queue.max_my_jobs
+        if cap is not None and running_count(cfg) >= cap:
+            results.append((entry.job_id, "capped"))
+            break
+        outcome, detail = dispatch_queued(cfg, entry, log)
+        results.append((entry.job_id, outcome))
+        if outcome == "started":
+            log(f"{entry.job_id} -> {detail}")
+            notify(cfg, {
+                "event": "started", "job_id": entry.job_id, "name": entry.name,
+                "center": cfg.center, "node": detail, "exit_code": None,
+            })
+        elif outcome == "failed":
+            log(f"{entry.job_id} failed: {detail}")
+            notify(cfg, {
+                "event": "failed", "job_id": entry.job_id, "name": entry.name,
+                "center": cfg.center, "node": None, "exit_code": None,
+                "reason": detail,
+            })
+        elif outcome == "killed":
+            log(f"{entry.job_id} was killed while dispatching; stopped it on {detail}")
+        elif outcome == "blocked":
+            log(f"{entry.job_id} blocked ({detail}); trying jobs behind it")
+        elif outcome == "busy":
+            break
+    return results
+
+
+def _code_fingerprint() -> int:
+    """Max mtime over the dt package sources. Editable installs (and deploys)
+    change files in place; the agent restarts itself to pick them up."""
+    pkg = Path(__file__).parent
+    files = list(pkg.glob("*.py")) + list((pkg / "payload").glob("*.sh"))
+    try:
+        return max(p.stat().st_mtime_ns for p in files)
+    except ValueError:
+        return 0
+
+
+def _maybe_autoclean(cfg: HeadConfig, log) -> None:
+    """Config-gated daily cleanup (queue.auto_clean_days): ended jobs and
+    stale shared venvs older than N days."""
+    days = cfg.queue.auto_clean_days
+    if not days:
+        return
+    stamp = cfg.root / "last_autoclean"
+    if stamp.exists() and time.time() - stamp.stat().st_mtime < AUTOCLEAN_EVERY_S:
+        return
+    stamp.touch()  # stamp first: a failing clean must not retry every tick
+    n = clean_jobs(cfg, time.time() - days * 86400, envs=True, log=log)
+    log(f"auto-clean: removed {n} ended jobs older than {days:g} days")
 
 
 def run_loop(cfg: HeadConfig) -> int:
@@ -127,6 +167,7 @@ def run_loop(cfg: HeadConfig) -> int:
         print(f"[{stamp}] {msg}", flush=True)
 
     log(f"agent up (pid {os.getpid()}, poll {cfg.queue.poll_s}s)")
+    born_with = _code_fingerprint()
     try:
         while not stop["flag"]:
             try:
@@ -136,13 +177,21 @@ def run_loop(cfg: HeadConfig) -> int:
                 fresh = _load()
                 if isinstance(fresh, _HC):
                     cfg = fresh
-                outcome = process_once(cfg, log)
+                process_once(cfg, log)
+                _maybe_autoclean(cfg, log)
             except Exception as e:  # keep the loop alive, always
                 log(f"poll error: {e}")
-                outcome = "error"
-            # after a successful dispatch, try the next queued job right away
-            sleep_s = 1 if outcome == "started" else cfg.queue.poll_s
-            for _ in range(int(sleep_s * 10)):
+            dt_bin = Path.home() / ".local/bin/dt"
+            if _code_fingerprint() != born_with and dt_bin.exists():
+                # deploy/git pull happened: exec ourselves to run the new
+                # code (the exec drops our lock fd, the fresh image retakes it)
+                log("dt code changed on disk; restarting agent")
+                _pid_path(cfg).unlink(missing_ok=True)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
+                sys.stdout.flush()
+                os.execvp(str(dt_bin), [str(dt_bin), "agent", "run"])
+            for _ in range(int(cfg.queue.poll_s * 10)):
                 if stop["flag"]:
                     break
                 time.sleep(0.1)
@@ -220,6 +269,7 @@ def status(cfg: HeadConfig) -> dict:
         "poll_s": cfg.queue.poll_s,
         "max_my_jobs": cfg.queue.max_my_jobs,
         "reserve_free_per_node": cfg.queue.reserve_free_per_node,
+        "auto_clean_days": cfg.queue.auto_clean_days,
         "webhook": bool(cfg.webhook),
         "log": str(log_path(cfg)),
     }

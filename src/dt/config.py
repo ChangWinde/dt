@@ -34,6 +34,7 @@ class QueueCfg:
     poll_s: int = 60
     max_my_jobs: int | None = None       # cap on my concurrently running jobs
     reserve_free_per_node: int = 0       # always leave N cards free per node
+    auto_clean_days: float | None = None  # agent daily-cleans jobs+envs older than N days
 
 
 @dataclass
@@ -132,10 +133,12 @@ def parse(data: dict) -> HeadConfig | LaptopConfig:
         }
         qraw = data.get("queue") or {}
         max_jobs = qraw.get("max_my_jobs")
+        auto_clean = qraw.get("auto_clean_days")
         queue = QueueCfg(
             poll_s=int(qraw.get("poll_s", 60)),
             max_my_jobs=int(max_jobs) if max_jobs is not None else None,
             reserve_free_per_node=int(qraw.get("reserve_free_per_node", 0)),
+            auto_clean_days=float(auto_clean) if auto_clean is not None else None,
         )
         return HeadConfig(
             center=data["center"],

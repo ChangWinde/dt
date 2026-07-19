@@ -77,6 +77,8 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
         log "uv sync failed, see logs/env.log"
         exit 13
     fi
+    # last-used stamp: `dt clean --envs` reaps envs whose mtime went stale
+    touch "$UV_ENV" 2>/dev/null || true
 else
     log "no uv.lock in snapshot; running with system python"
 fi
@@ -178,5 +180,5 @@ if [ -z "$pgid" ]; then
 fi
 
 ids=$(cat "$DT_JOB_DIR/gpus" 2>/dev/null || echo "")
-printf '{"gpus": [%s], "pgid": %s}\n' "$ids" "$pgid"
+printf '{"gpus": [%s], "pgid": %s, "env": "%s"}\n' "$ids" "$pgid" "${lockhash:-}"
 exit 0
