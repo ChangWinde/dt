@@ -59,6 +59,11 @@ if [ ! -f "$CONF" ]; then
 # paths:
 #   root: ~/dt
 #   envs: ~/dt/envs        # point at a local disk when home is NFS
+# queue:                   # all optional (design doc 7.4)
+#   poll_s: 60             # agent poll cadence
+#   max_my_jobs: 4         # cap my concurrently running jobs
+#   reserve_free_per_node: 0   # always leave N cards free per node
+# webhook: https://...     # POST job-end notifications here
 # --- laptop role ------------------------------------------------------
 # default_center: psibot
 # centers:

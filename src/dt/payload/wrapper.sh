@@ -24,4 +24,13 @@ rc=$?
 
 echo $rc > "$DT_JOB_DIR/exit_code"
 date +%s > "$DT_JOB_DIR/finished_at"
+
+# job-end webhook (best effort, never fails the job). Not reached on
+# `dt kill` (TERM takes this shell down too) - kills are user-initiated.
+if [ -n "${DT_WEBHOOK:-}" ]; then
+    dur=$(( $(date +%s) - $(cat "$DT_JOB_DIR/started_at" 2>/dev/null || date +%s) ))
+    curl -m 10 -s -o /dev/null -X POST -H 'Content-Type: application/json' \
+        -d "{\"event\":\"finished\",\"job_id\":\"${DT_JOB_ID:-}\",\"name\":\"${DT_JOB_NAME:-}\",\"center\":\"${DT_CENTER:-}\",\"node\":\"$(hostname)\",\"exit_code\":$rc,\"duration_s\":$dur}" \
+        "$DT_WEBHOOK" || true
+fi
 exit $rc

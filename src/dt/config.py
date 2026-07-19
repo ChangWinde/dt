@@ -28,6 +28,15 @@ class Node:
 
 
 @dataclass
+class QueueCfg:
+    """Self-restraint knobs (design doc 7.4) + agent cadence."""
+
+    poll_s: int = 60
+    max_my_jobs: int | None = None       # cap on my concurrently running jobs
+    reserve_free_per_node: int = 0       # always leave N cards free per node
+
+
+@dataclass
 class HeadConfig:
     center: str
     nodes: list[Node]
@@ -37,6 +46,8 @@ class HeadConfig:
     envs: str  # node-side path, tilde expanded on the node (homes may differ)
     mem_threshold_mib: int = 500
     disk_min_gib: int = 10
+    queue: QueueCfg = field(default_factory=QueueCfg)
+    webhook: str | None = None           # POST job-end notifications here
     role: str = "head"
 
     @property
@@ -61,6 +72,11 @@ class HeadConfig:
 
     def results_dir(self) -> Path:
         d = self.root / "results"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def queue_dir(self) -> Path:
+        d = self.root / "queue"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -114,6 +130,13 @@ def parse(data: dict) -> HeadConfig | LaptopConfig:
         projects = {
             name: Path(p).expanduser() for name, p in (data.get("projects") or {}).items()
         }
+        qraw = data.get("queue") or {}
+        max_jobs = qraw.get("max_my_jobs")
+        queue = QueueCfg(
+            poll_s=int(qraw.get("poll_s", 60)),
+            max_my_jobs=int(max_jobs) if max_jobs is not None else None,
+            reserve_free_per_node=int(qraw.get("reserve_free_per_node", 0)),
+        )
         return HeadConfig(
             center=data["center"],
             nodes=_parse_nodes(data.get("nodes") or []),
@@ -123,6 +146,8 @@ def parse(data: dict) -> HeadConfig | LaptopConfig:
             envs=envs,
             mem_threshold_mib=int(data.get("mem_threshold_mib", 500)),
             disk_min_gib=int(data.get("disk_min_gib", 10)),
+            queue=queue,
+            webhook=data.get("webhook"),
         )
 
     raise ConfigError("config must contain `centers` (laptop) or `center` (head)")

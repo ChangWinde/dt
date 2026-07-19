@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # DistTrainer launcher: runs on the compute node, delivered with the snapshot.
 # Contract (env in):  DT_JOB_DIR DT_GPUS DT_SESSION DT_ENVS_DIR DT_MEM_MIB
-#                     DT_DISK_GIB [DT_REQUIRE_PATH] [DT_MAX_HOURS]
+#                     DT_DISK_GIB [DT_RESERVE] [DT_REQUIRE_PATH] [DT_MAX_HOURS]
+#                     [DT_WEBHOOK DT_CENTER DT_JOB_ID DT_JOB_NAME]
 # Exit codes:         0 ok | 10 busy | 11 path-missing | 12 disk-full
 #                     13 env-fail | 14 internal | 15 node-unfit
 # On success prints one JSON line: {"gpus": [...], "pgid": N}
@@ -12,6 +13,7 @@ log() { echo "[launcher] $*" >&2; }
 : "${DT_JOB_DIR:?}" "${DT_GPUS:?}" "${DT_SESSION:?}" "${DT_ENVS_DIR:?}"
 DT_MEM_MIB="${DT_MEM_MIB:-500}"
 DT_DISK_GIB="${DT_DISK_GIB:-10}"
+DT_RESERVE="${DT_RESERVE:-0}"
 
 # Values arrive shell-quoted, so `~` never expanded; job_dir may be
 # home-relative. Absolutize everything here, on the node they refer to.
@@ -104,7 +106,7 @@ probe_ok() {
 start_session() {
     local ids=$1
     tmux new-session -d -s "$DT_SESSION" \
-        "cd '$DT_JOB_DIR' && env DT_JOB_DIR='$DT_JOB_DIR' CUDA_VISIBLE_DEVICES='$ids' DT_MAX_HOURS='${DT_MAX_HOURS:-}' DT_UV='$UV_BIN' DT_UV_ENV='$UV_ENV' bash wrapper.sh >> logs/stdout.log 2>&1"
+        "cd '$DT_JOB_DIR' && env DT_JOB_DIR='$DT_JOB_DIR' CUDA_VISIBLE_DEVICES='$ids' DT_MAX_HOURS='${DT_MAX_HOURS:-}' DT_UV='$UV_BIN' DT_UV_ENV='$UV_ENV' DT_WEBHOOK='${DT_WEBHOOK:-}' DT_CENTER='${DT_CENTER:-}' DT_JOB_ID='${DT_JOB_ID:-}' DT_JOB_NAME='${DT_JOB_NAME:-}' bash wrapper.sh >> logs/stdout.log 2>&1"
 }
 
 # -- 3-6. pick GPUs + launch, atomically per node ----------------------------
@@ -113,8 +115,10 @@ launch_locked() {
     if [ "$DT_GPUS" -gt 0 ]; then
         local candidates
         mapfile -t candidates < <(free_gpu_indices)
-        if [ "${#candidates[@]}" -lt "$DT_GPUS" ]; then
-            log "need $DT_GPUS free GPUs, found ${#candidates[@]}"
+        # DT_RESERVE (7.4 knob): after taking DT_GPUS, at least DT_RESERVE
+        # cards must remain free on this node
+        if [ "${#candidates[@]}" -lt $((DT_GPUS + DT_RESERVE)) ]; then
+            log "need $DT_GPUS free GPUs (+$DT_RESERVE reserved), found ${#candidates[@]}"
             return 10
         fi
         for idx in "${candidates[@]}"; do

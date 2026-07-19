@@ -1,18 +1,26 @@
 """Submission flow on a head node: resolve project -> probe -> pick node ->
 snapshot -> launch -> register. Launcher exit codes decide failover:
 busy / path-missing / disk-full try the next node, env-fail aborts.
+
+Queue path (design doc 7.4): when nothing can take the job right now,
+`dt run` stages the snapshot under ~/dt/queue/<job_id>/ and registers the
+job as "queued"; the agent (agent.py) re-plays dispatch_queued() until a
+node frees up. Staging at submit time keeps the 7.2 invariant: editing the
+project while a job waits in line never changes what that job will run.
 """
 
 from __future__ import annotations
 
 import json
 import shlex
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from .config import ConfigError, HeadConfig, Node
-from .jobs import JobEntry, new_job_id, sanitize_name, save
+from .jobs import JobEntry, load, new_job_id, running_count, sanitize_name, save
 from .probe import NodeStatus, probe_center
 from .sshio import rsync, run_on
 
@@ -86,8 +94,10 @@ def git_info(project_dir: Path) -> tuple[str | None, bool, str | None]:
 
 
 def pick_candidates(
-    statuses: list[NodeStatus], nodes: list[Node], spec: RunSpec
+    statuses: list[NodeStatus], nodes: list[Node], spec: RunSpec, reserve: int = 0
 ) -> list[Node]:
+    """Rank eligible nodes. `reserve` = cards to leave free per node (7.4 knob);
+    an explicit --node pin is a user override and bypasses it."""
     by_name = {n.name: n for n in nodes}
     if spec.node:
         if spec.node not in by_name:
@@ -103,9 +113,13 @@ def pick_candidates(
     return [
         by_name[s.node]
         for s in ranked
-        if len(s.free_gpus) >= spec.gpus and s.node in by_name
+        if len(s.free_gpus) - reserve >= spec.gpus and s.node in by_name
     ]
 
+
+# --------------------------------------------------------------------------
+# link-dest bookkeeping (per project@node, stores the previous job id)
+# --------------------------------------------------------------------------
 
 def _linkdest_state(cfg: HeadConfig) -> Path:
     return cfg.state_dir() / "linkdest.json"
@@ -128,56 +142,120 @@ def _save_linkdest(cfg: HeadConfig, state: dict) -> None:
     tmp.replace(path)
 
 
+def _prev_job_id(cfg: HeadConfig, project_name: str, node: Node) -> str | None:
+    val = _load_linkdest(cfg).get(f"{project_name}@{node.name}")
+    if not val:
+        return None
+    # legacy format stored "dt/jobs/<id>/code"; new format stores the bare id
+    return Path(val).parent.name if "/" in val else val
+
+
+def _remember_snapshot(cfg: HeadConfig, project_name: str, node: Node, job_id: str) -> None:
+    state = _load_linkdest(cfg)
+    state[f"{project_name}@{node.name}"] = job_id
+    _save_linkdest(cfg, state)
+
+
+# --------------------------------------------------------------------------
+# snapshot / staging
+# --------------------------------------------------------------------------
+
+def _support_files(cmd: list[str], meta: dict) -> dict[str, str]:
+    """Everything a job dir needs besides code/: launcher, wrapper, cmd, meta."""
+    files = {
+        "launcher.sh": (PAYLOAD_DIR / "launcher.sh").read_text(),
+        "wrapper.sh": (PAYLOAD_DIR / "wrapper.sh").read_text(),
+        "cmd.sh": shlex.join(cmd) + "\n",
+    }
+    meta = dict(meta)
+    diff = meta.pop("_diff", None)
+    if meta.get("git_dirty") and diff:
+        files["code_dirty.patch"] = diff
+    files["meta.json"] = json.dumps(meta, indent=1)
+    return files
+
+
+def _code_dst(node: Node, job_dir: str) -> str:
+    rel = f"{job_dir}/code/"
+    return f"{Path.home()}/{rel}" if node.local else f"{node.name}:{rel}"
+
+
+def _job_dst(node: Node, job_dir: str) -> str:
+    return f"{Path.home()}/{job_dir}/" if node.local else f"{node.name}:{job_dir}/"
+
+
 def snapshot(
     cfg: HeadConfig,
     project_name: str,
     project_dir: Path,
     node: Node,
+    job_id: str,
     job_dir: str,
     spec: RunSpec,
     meta: dict,
 ) -> None:
+    """Direct path: project dir -> node job dir (code + support files)."""
     run_on(node.name, node.local, f"mkdir -p {shlex.quote(job_dir)}/logs", timeout=15, check=True)
 
-    linkdest = _load_linkdest(cfg)
-    prev = linkdest.get(f"{project_name}@{node.name}")
-
-    code_dst = (
-        f"{Path.home()}/{job_dir}/code/" if node.local else f"{node.name}:{job_dir}/code/"
-    )
+    prev = _prev_job_id(cfg, project_name, node)
     proc = rsync(
-        f"{project_dir}/", code_dst,
+        f"{project_dir}/", _code_dst(node, job_dir),
         excludes=SNAPSHOT_EXCLUDES,
-        link_dest=prev,
+        # relative to the dest dir (dt/jobs/<id>/code), so it resolves on the
+        # node regardless of where its home is
+        link_dest=f"../../{prev}/code" if prev else None,
         timeout=600,
     )
     if proc.returncode != 0:
         raise DispatchError(f"code snapshot to {node.name} failed: {proc.stderr.strip()}")
 
-    # support files: launcher, wrapper, cmd.sh, meta.json, optional dirty.patch
-    import tempfile
-
     with tempfile.TemporaryDirectory() as tmp:
         tmpp = Path(tmp)
-        (tmpp / "launcher.sh").write_text((PAYLOAD_DIR / "launcher.sh").read_text())
-        (tmpp / "wrapper.sh").write_text((PAYLOAD_DIR / "wrapper.sh").read_text())
-        (tmpp / "cmd.sh").write_text(shlex.join(spec.cmd) + "\n")
-        (tmpp / "meta.json").write_text(json.dumps(meta, indent=1))
-        if meta.get("git_dirty") and meta.get("_diff"):
-            (tmpp / "code_dirty.patch").write_text(meta["_diff"])
-        meta.pop("_diff", None)
-        support_dst = (
-            f"{Path.home()}/{job_dir}/" if node.local else f"{node.name}:{job_dir}/"
-        )
-        proc = rsync(f"{tmp}/", support_dst, timeout=60)
+        for fname, content in _support_files(spec.cmd, meta).items():
+            (tmpp / fname).write_text(content)
+        proc = rsync(f"{tmp}/", _job_dst(node, job_dir), timeout=60)
         if proc.returncode != 0:
             raise DispatchError(f"support sync to {node.name} failed: {proc.stderr.strip()}")
 
-    linkdest[f"{project_name}@{node.name}"] = f"{job_dir}/code"
-    _save_linkdest(cfg, linkdest)
+    _remember_snapshot(cfg, project_name, node, job_id)
 
 
-def launch(cfg: HeadConfig, node: Node, job_dir: str, session: str, spec: RunSpec) -> tuple[int, dict | str]:
+def stage_dir(cfg: HeadConfig, job_id: str) -> Path:
+    return cfg.queue_dir() / job_id
+
+
+def remove_staging(cfg: HeadConfig, job_id: str) -> None:
+    shutil.rmtree(stage_dir(cfg, job_id), ignore_errors=True)
+
+
+def _stage(cfg: HeadConfig, project_dir: Path, job_id: str, spec: RunSpec, meta: dict) -> Path:
+    """Queue path: snapshot into ~/dt/queue/<job_id>/ shaped exactly like the
+    node-side job dir, so dispatch later is a single rsync."""
+    staging = stage_dir(cfg, job_id)
+    (staging / "code").mkdir(parents=True, exist_ok=True)
+    (staging / "logs").mkdir(exist_ok=True)
+    proc = rsync(f"{project_dir}/", f"{staging}/code/", excludes=SNAPSHOT_EXCLUDES, timeout=600)
+    if proc.returncode != 0:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise DispatchError(f"staging snapshot failed: {proc.stderr.strip()}")
+    for fname, content in _support_files(spec.cmd, meta).items():
+        (staging / fname).write_text(content)
+    return staging
+
+
+# --------------------------------------------------------------------------
+# launch
+# --------------------------------------------------------------------------
+
+def launch(
+    cfg: HeadConfig,
+    node: Node,
+    job_id: str,
+    job_dir: str,
+    session: str,
+    spec: RunSpec,
+    reserve: int = 0,
+) -> tuple[int, dict | str]:
     """Returns (exit_code, parsed-json-or-stderr)."""
     envs = {
         "DT_JOB_DIR": job_dir,
@@ -186,7 +264,13 @@ def launch(cfg: HeadConfig, node: Node, job_dir: str, session: str, spec: RunSpe
         "DT_ENVS_DIR": cfg.envs,
         "DT_MEM_MIB": str(cfg.mem_threshold_mib),
         "DT_DISK_GIB": str(cfg.disk_min_gib),
+        "DT_RESERVE": str(reserve),
+        "DT_JOB_ID": job_id,
+        "DT_JOB_NAME": spec.name,
+        "DT_CENTER": cfg.center,
     }
+    if cfg.webhook:
+        envs["DT_WEBHOOK"] = cfg.webhook
     if spec.require_path:
         envs["DT_REQUIRE_PATH"] = spec.require_path
     if spec.max_hours:
@@ -204,11 +288,65 @@ def launch(cfg: HeadConfig, node: Node, job_dir: str, session: str, spec: RunSpe
     return proc.returncode, (detail[-1] if detail else f"exit {proc.returncode}")
 
 
-def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log) -> JobEntry:
-    """log: callable(str) writing progress to stderr."""
+# --------------------------------------------------------------------------
+# submit (direct or queue) and queued dispatch
+# --------------------------------------------------------------------------
+
+def _reserve_for(cfg: HeadConfig, spec: RunSpec) -> int:
+    return 0 if spec.node else cfg.queue.reserve_free_per_node
+
+
+def _try_nodes(
+    cfg: HeadConfig,
+    candidates: list[Node],
+    spec: RunSpec,
+    job_id: str,
+    job_dir: str,
+    session: str,
+    sync_to_node,
+    log,
+) -> tuple[JobEntry | None, dict[str, str], bool]:
+    """Shared candidate loop. Returns (entry-or-None, reasons, fatal)."""
+    reasons: dict[str, str] = {}
+    for node in candidates:
+        log(f"snapshot -> {node.name}")
+        sync_to_node(node)
+        log(f"launching on {node.name}")
+        code, result = launch(cfg, node, job_id, job_dir, session, spec, _reserve_for(cfg, spec))
+        if code == 0 and isinstance(result, dict):
+            entry = JobEntry(
+                job_id=job_id,
+                name=spec.name,
+                center=cfg.center,
+                project=spec.project or "?",
+                node=node.name,
+                node_local=node.local,
+                job_dir=job_dir,
+                session=session,
+                cmd=shlex.join(spec.cmd),
+                gpus=[int(g) for g in result.get("gpus", []) if str(g) != ""],
+                pgid=int(result["pgid"]),
+                gpus_requested=spec.gpus,
+                require_path=spec.require_path,
+                pin_node=spec.node,
+                max_hours=spec.max_hours,
+            )
+            return entry, reasons, False
+        reason = RETRYABLE.get(code) or FATAL.get(code) or f"exit {code}"
+        reasons[node.name] = f"{reason}: {result}" if isinstance(result, str) else reason
+        if code in FATAL:
+            return None, reasons, True
+        log(f"{node.name} {reason}, trying next node")
+    return None, reasons, False
+
+
+def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = False) -> JobEntry:
+    """log: callable(str) writing progress to stderr.
+    Returns an entry with status "running" (placed now) or "queued"."""
     project_name, project_dir = resolve_project(cfg, spec.project, cwd)
     if not project_dir.is_dir():
         raise ConfigError(f"project dir does not exist: {project_dir}")
+    spec.project = project_name
 
     spec.name = sanitize_name(spec.name)
     job_id = new_job_id(spec.name)
@@ -230,46 +368,126 @@ def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log) -> JobEntry:
         "_diff": diff,
     }
 
+    def enqueue(why: str) -> JobEntry:
+        log(f"{why}; queueing (agent dispatches when a card frees up)")
+        _stage(cfg, project_dir, job_id, spec, meta)
+        entry = JobEntry(
+            job_id=job_id, name=spec.name, center=cfg.center, project=project_name,
+            node="-", node_local=False, job_dir=job_dir, session=session,
+            cmd=shlex.join(spec.cmd), gpus=[], pgid=None, status="queued",
+            git_sha=sha, git_dirty=dirty, max_hours=spec.max_hours,
+            gpus_requested=spec.gpus, require_path=spec.require_path,
+            pin_node=spec.node,
+        )
+        save(cfg, entry)
+        return entry
+
+    cap = cfg.queue.max_my_jobs
+    if cap is not None and running_count(cfg) >= cap:
+        if no_queue:
+            raise NoCapacity({"*": f"max_my_jobs={cap} reached"})
+        return enqueue(f"max_my_jobs={cap} reached")
+
     log(f"probing {cfg.center} nodes")
     statuses = probe_center(cfg, use_cache=False)
-    candidates = pick_candidates(statuses, cfg.nodes, spec)
-    if not candidates:
-        raise NoCapacity({
-            s.node: (s.error or f"{len(s.free_gpus)} free < {spec.gpus}")
-            for s in statuses
-        })
-
-    reasons: dict[str, str] = {
-        s.node: (s.error or "not tried") for s in statuses if s.error
+    candidates = pick_candidates(statuses, cfg.nodes, spec, _reserve_for(cfg, spec))
+    probe_reasons = {
+        s.node: (s.error or f"{len(s.free_gpus)} free < {spec.gpus} wanted")
+        for s in statuses
     }
-    for node in candidates:
-        log(f"snapshot -> {node.name}")
-        snapshot(cfg, project_name, project_dir, node, job_dir, spec, dict(meta))
-        log(f"launching on {node.name}")
-        code, result = launch(cfg, node, job_dir, session, spec)
-        if code == 0 and isinstance(result, dict):
-            entry = JobEntry(
-                job_id=job_id,
-                name=spec.name,
-                center=cfg.center,
-                project=project_name,
-                node=node.name,
-                node_local=node.local,
-                job_dir=job_dir,
-                session=session,
-                cmd=meta["cmd"],
-                gpus=[int(g) for g in result.get("gpus", [])],
-                pgid=int(result["pgid"]),
-                git_sha=sha,
-                git_dirty=dirty,
-                max_hours=spec.max_hours,
-            )
-            save(cfg, entry)
-            return entry
-        reason = RETRYABLE.get(code) or FATAL.get(code) or f"exit {code}"
-        reasons[node.name] = f"{reason}: {result}" if isinstance(result, str) else reason
-        if code in FATAL:
-            raise DispatchError(f"{node.name}: {reasons[node.name]} (aborting, not retryable)")
-        log(f"{node.name} {reason}, trying next node")
+    if not candidates:
+        if no_queue:
+            raise NoCapacity(probe_reasons)
+        return enqueue("no free capacity")
 
-    raise NoCapacity(reasons)
+    def sync_to_node(node: Node) -> None:
+        snapshot(cfg, project_name, project_dir, node, job_id, job_dir, spec, dict(meta))
+
+    entry, reasons, fatal = _try_nodes(
+        cfg, candidates, spec, job_id, job_dir, session, sync_to_node, log,
+    )
+    if entry:
+        entry.git_sha, entry.git_dirty = sha, dirty
+        save(cfg, entry)
+        return entry
+    if fatal:
+        node_name, why = list(reasons.items())[-1]  # fatal is always the last entry
+        raise DispatchError(f"{node_name}: {why} (aborting, not retryable)")
+    if no_queue:
+        raise NoCapacity({**probe_reasons, **reasons})
+    return enqueue("all candidates busy")
+
+
+def dispatch_queued(cfg: HeadConfig, entry: JobEntry, log) -> tuple[str, str | None]:
+    """Try to place a queued job now. Returns (outcome, detail) with outcome in:
+    started | busy | failed | killed. Called by the agent (and tests)."""
+    staging = stage_dir(cfg, entry.job_id)
+    if not (staging / "code").is_dir():
+        entry.status, entry.reason = "failed", "staging snapshot missing"
+        save(cfg, entry)
+        return "failed", entry.reason
+
+    spec = RunSpec(
+        name=entry.name, gpus=entry.gpus_requested, cmd=shlex.split(entry.cmd),
+        project=entry.project, node=entry.pin_node,
+        require_path=entry.require_path, max_hours=entry.max_hours,
+    )
+    statuses = probe_center(cfg, use_cache=False)
+    try:
+        candidates = pick_candidates(statuses, cfg.nodes, spec, _reserve_for(cfg, spec))
+    except ConfigError as e:
+        entry.status, entry.reason = "failed", str(e)
+        save(cfg, entry)
+        remove_staging(cfg, entry.job_id)
+        return "failed", entry.reason
+    if not candidates:
+        return "busy", None
+
+    def sync_to_node(node: Node) -> None:
+        run_on(node.name, node.local, f"mkdir -p {shlex.quote(entry.job_dir)}/logs",
+               timeout=15, check=True)
+        prev = _prev_job_id(cfg, entry.project, node)
+        proc = rsync(
+            f"{staging}/", _job_dst(node, entry.job_dir),
+            # staging mirrors the job dir layout, so link against the whole
+            # previous job dir: <prev>/code/* lines up with code/*
+            link_dest=f"../{prev}" if prev else None,
+            timeout=600,
+        )
+        if proc.returncode != 0:
+            raise DispatchError(f"snapshot to {node.name} failed: {proc.stderr.strip()}")
+        _remember_snapshot(cfg, entry.project, node, entry.job_id)
+
+    try:
+        placed, reasons, fatal = _try_nodes(
+            cfg, candidates, spec, entry.job_id, entry.job_dir, entry.session,
+            sync_to_node, log,
+        )
+    except DispatchError as e:
+        entry.status, entry.reason = "failed", str(e)
+        save(cfg, entry)
+        remove_staging(cfg, entry.job_id)
+        return "failed", entry.reason
+
+    if placed:
+        current = load(cfg, entry.job_id)
+        if current and current.status == "killed":
+            # user killed it mid-dispatch; honor that and take the group down
+            run_on(placed.node, placed.node_local,
+                   f"bash -c 'kill -TERM -- -{placed.pgid}'", timeout=10)
+            remove_staging(cfg, entry.job_id)
+            return "killed", placed.node
+        placed.git_sha, placed.git_dirty = entry.git_sha, entry.git_dirty
+        placed.created_at = entry.created_at  # keep the enqueue time (FIFO truth)
+        save(cfg, placed)
+        # sync the caller's view so the agent logs the right node
+        entry.node, entry.status = placed.node, "running"
+        remove_staging(cfg, entry.job_id)
+        return "started", placed.node
+    if fatal:
+        bad = "; ".join(f"{n}: {r}" for n, r in reasons.items())
+        entry.status, entry.reason = "failed", bad
+        save(cfg, entry)
+        remove_staging(cfg, entry.job_id)
+        return "failed", bad
+    return "busy", None

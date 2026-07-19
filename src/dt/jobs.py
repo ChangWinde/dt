@@ -1,9 +1,11 @@
-"""Job ids, registry (head-side source of truth), and the 4-state model:
+"""Job ids, registry (head-side source of truth), and the state model:
 
+queued   - waiting in the head-side queue, code staged under ~/dt/queue/
 running  - pgid alive on the node
 finished - exit_code file exists
 killed   - marked by `dt kill` (wrapper may not get to write exit_code)
 lost     - neither pgid alive nor exit_code (node reboot etc.)
+failed   - queued dispatch aborted (env-fail); `reason` says why
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ class JobEntry:
     name: str
     center: str
     project: str
-    node: str
+    node: str             # "-" while queued
     node_local: bool
     job_dir: str          # path on the compute node
     session: str          # tmux session name
@@ -53,6 +55,11 @@ class JobEntry:
     max_hours: float | None = None
     created_at: float = field(default_factory=time.time)
     finished_at: float | None = None
+    # queue-era fields (defaults keep pre-queue registry files loadable)
+    gpus_requested: int = 1
+    require_path: str | None = None
+    pin_node: str | None = None
+    reason: str | None = None      # failure detail for status == "failed"
 
     def created_str(self) -> str:
         return datetime.fromtimestamp(self.created_at).strftime("%m-%d %H:%M")
@@ -80,6 +87,18 @@ def list_all(cfg: HeadConfig) -> list[JobEntry]:
         except Exception:
             continue
     return entries
+
+
+def running_count(cfg: HeadConfig) -> int:
+    return sum(1 for e in list_all(cfg) if e.status == "running")
+
+
+def queued_entries(cfg: HeadConfig) -> list[JobEntry]:
+    """FIFO order: oldest enqueue first."""
+    return sorted(
+        (e for e in list_all(cfg) if e.status == "queued"),
+        key=lambda e: e.created_at,
+    )
 
 
 def find(cfg: HeadConfig, ref: str) -> JobEntry | None:

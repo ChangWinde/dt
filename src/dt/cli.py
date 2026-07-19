@@ -173,6 +173,7 @@ def run(
     node: Optional[str] = typer.Option(None, "--node", help="pin a specific node"),
     require_path: Optional[str] = typer.Option(None, "--require-path", help="path that must exist on the node"),
     max_hours: Optional[float] = typer.Option(None, "--max-hours", help="kill the job group after N hours"),
+    no_queue: bool = typer.Option(False, "--no-queue", help="fail fast (exit 2) instead of queueing when no card is free"),
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
     """Submit: dt run -g 2 -n exp42 -- python train.py --lr 3e-4"""
@@ -195,6 +196,8 @@ def run(
             argv += ["--require-path", require_path]
         if max_hours is not None:
             argv += ["--max-hours", str(max_hours)]
+        if no_queue:
+            argv += ["--no-queue"]
         if json_:
             argv += ["--json"]
         argv += ["--", *cmd]
@@ -209,7 +212,7 @@ def run(
         err.print(f"[dim]{msg}[/dim]")
 
     try:
-        entry = submit(cfg, spec, Path.cwd(), log)
+        entry = submit(cfg, spec, Path.cwd(), log, no_queue=no_queue)
     except NoCapacity as e:
         for node_name, reason in e.reasons.items():
             err.print(f"[yellow]{node_name}[/yellow]: {reason}")
@@ -219,11 +222,30 @@ def run(
         err.print(f"[red]{e}[/red]")
         raise typer.Exit(EXIT_ENV)
 
+    agent_started = None
+    if entry.status == "queued":
+        from . import agent as agent_mod
+
+        if agent_mod.alive_pid(cfg) is None:
+            agent_started = agent_mod.start_detached(cfg)
+
     if json_:
         print(json.dumps({
-            "job_id": entry.job_id, "node": entry.node, "gpus": entry.gpus,
-            "session": entry.session, "job_dir": entry.job_dir,
+            "job_id": entry.job_id, "status": entry.status, "node": entry.node,
+            "gpus": entry.gpus, "session": entry.session, "job_dir": entry.job_dir,
         }))
+    elif entry.status == "queued":
+        pos = sum(1 for e in jobs_mod.queued_entries(cfg) if e.created_at <= entry.created_at)
+        note = ""
+        if agent_started:
+            note = " (agent started)"
+        elif agent_started is False:
+            note = " [red](agent failed to start! run: dt agent run)[/red]"
+        err.print(
+            f"[cyan]queued[/cyan] {entry.name} at position {pos}{note}  "
+            f"(dt wait {entry.job_id} blocks until it finishes)"
+        )
+        print(entry.job_id)  # bare id, last stdout line: agents rely on this
     else:
         gpu_str = ",".join(map(str, entry.gpus)) or "cpu"
         err.print(
@@ -262,6 +284,16 @@ def ps(json_: bool = typer.Option(False, "--json")) -> None:
 # logs / attach / wait
 # --------------------------------------------------------------------------
 
+def _refuse_unplaced(entry: jobs_mod.JobEntry, what: str) -> None:
+    if entry.status == "queued":
+        err.print(f"[yellow]{entry.job_id} is still queued; no {what} yet "
+                  f"(dt wait {entry.job_id} blocks until it runs)[/yellow]")
+        raise typer.Exit(1)
+    if entry.status == "failed":
+        err.print(f"[red]{entry.job_id} failed before starting: {entry.reason}[/red]")
+        raise typer.Exit(1)
+
+
 def logs(
     ref: str,
     follow: bool = typer.Option(False, "-f", "--follow"),
@@ -277,6 +309,7 @@ def logs(
         raise typer.Exit(forward_call(head, argv))
 
     entry = _find_or_die(cfg, ref)
+    _refuse_unplaced(entry, "logs")
     log_path = f"{entry.job_dir}/logs/stdout.log"
     if follow:
         if entry.node_local:
@@ -298,6 +331,7 @@ def attach(ref: str) -> None:
         _, head = _locate(cfg, ref)
         forward_exec(head, ["attach", ref], tty=True)
     entry = _find_or_die(cfg, ref)
+    _refuse_unplaced(entry, "tmux session")
     if entry.node_local:
         os.execvp("tmux", ["tmux", "attach", "-t", entry.session])
     os.execvp("ssh", [*SSH_BASE, "-t", entry.node,
@@ -318,7 +352,15 @@ def wait(
     if entry is None:
         err.print(f"[red]no job matching {ref!r}[/red]")
         raise typer.Exit(65)
-    err.print(f"[dim]waiting for {entry.job_id} on {entry.node}[/dim]")
+    if entry.status == "queued":
+        err.print(f"[dim]{entry.job_id} is queued; waiting for dispatch[/dim]")
+        while entry.status == "queued":
+            time.sleep(min(poll, 15))
+            entry = jobs_mod.load(cfg, entry.job_id) or entry
+        if entry.status == "running":
+            err.print(f"[dim]{entry.job_id} started on {entry.node}[/dim]")
+    else:
+        err.print(f"[dim]waiting for {entry.job_id} on {entry.node}[/dim]")
     lost_streak = 0
     while True:
         entry = jobs_mod.refresh_status(cfg, entry)
@@ -339,6 +381,9 @@ def wait(
         color = "green" if code == 0 else "red"
         err.print(f"[{color}]{entry.job_id} finished with exit code {code}[/{color}]")
         raise typer.Exit(min(code, 125))
+    if entry.status == "failed":
+        err.print(f"[red]{entry.job_id} failed before starting: {entry.reason}[/red]")
+        raise typer.Exit(68)
     err.print(f"[yellow]{entry.job_id} ended as {entry.status}[/yellow]")
     raise typer.Exit(66 if entry.status == "killed" else 67)
 
@@ -360,6 +405,7 @@ def pull(
         raise typer.Exit(forward_call(head, argv))
 
     entry = _find_or_die(cfg, ref)
+    _refuse_unplaced(entry, "outputs")
     outputs_rel = f"{entry.job_dir}/outputs"
     check = run_on(entry.node, entry.node_local, f"test -d {shlex.quote(outputs_rel)}",
                    timeout=10)
@@ -392,6 +438,19 @@ def kill(
                                       tty=not yes))
 
     entry = _find_or_die(cfg, ref)
+    if entry.status == "queued":
+        if not yes:
+            if not sys.stdin.isatty():
+                err.print("[red]non-interactive kill needs -y[/red]")
+                raise typer.Exit(1)
+            typer.confirm(f"remove queued job {entry.job_id} from the queue?", abort=True)
+        from .dispatch import remove_staging
+
+        entry.status = "killed"
+        jobs_mod.save(cfg, entry)
+        remove_staging(cfg, entry.job_id)
+        err.print(f"[yellow]dequeued {entry.job_id}[/yellow]")
+        return
     entry = jobs_mod.refresh_status(cfg, entry)
     if entry.status != "running":
         err.print(f"{entry.job_id} is already {entry.status}")
@@ -427,7 +486,7 @@ def clean(
     cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
     victims = [
         e for e in jobs_mod.list_all(cfg)
-        if e.created_at < cutoff and e.status != "running"
+        if e.created_at < cutoff and e.status in ("finished", "killed", "lost", "failed")
     ]
     if not victims:
         err.print("nothing to clean")
@@ -437,13 +496,116 @@ def clean(
             err.print("[red]non-interactive clean needs -y[/red]")
             raise typer.Exit(1)
         typer.confirm(f"delete {len(victims)} job dirs older than {before}?", abort=True)
+    from .dispatch import remove_staging
+
     for e in victims:
         if not e.job_dir.startswith("dt/jobs/"):  # paranoia before rm -rf
             err.print(f"[red]skip {e.job_id}: suspicious job_dir {e.job_dir!r}[/red]")
             continue
-        run_on(e.node, e.node_local, f"rm -rf {shlex.quote(e.job_dir)}", timeout=60)
+        if e.node != "-":  # jobs killed/failed while queued never reached a node
+            run_on(e.node, e.node_local, f"rm -rf {shlex.quote(e.job_dir)}", timeout=60)
+        remove_staging(cfg, e.job_id)
         (cfg.registry_dir() / f"{e.job_id}.json").unlink(missing_ok=True)
     err.print(f"cleaned {len(victims)} jobs")
+
+
+# --------------------------------------------------------------------------
+# agent (queue worker on the head node)
+# --------------------------------------------------------------------------
+
+agent_app = typer.Typer(no_args_is_help=True, help="Queue agent: dispatches queued jobs when cards free up.")
+
+
+def _agent_forward(argv: list[str], center: Optional[str]) -> None:
+    """On a laptop, agent commands run on a center's head."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        head = cfg.centers[_laptop_center(cfg, center)]
+        raise typer.Exit(forward_call(head, ["agent", *argv]))
+
+
+@agent_app.command("run")
+def agent_run(
+    center: Optional[str] = typer.Option(None, "-c", "--center", help="(laptop) which center's head"),
+) -> None:
+    """Run the agent loop in the foreground (what crontab @reboot starts)."""
+    _agent_forward(["run"], center)
+    from . import agent as agent_mod
+
+    raise typer.Exit(agent_mod.run_loop(_need_head(_cfg())))
+
+
+@agent_app.command("start")
+def agent_start(
+    center: Optional[str] = typer.Option(None, "-c", "--center"),
+) -> None:
+    """Start the agent in the background (logs to ~/dt/agent.log)."""
+    _agent_forward(["start"], center)
+    from . import agent as agent_mod
+
+    cfg = _need_head(_cfg())
+    if agent_mod.alive_pid(cfg) is not None:
+        err.print("agent already running")
+        return
+    if agent_mod.start_detached(cfg):
+        err.print(f"[green]agent started[/green] (log: {agent_mod.log_path(cfg)})")
+    else:
+        err.print("[red]agent failed to start; try: dt agent run[/red]")
+        raise typer.Exit(1)
+
+
+@agent_app.command("stop")
+def agent_stop(
+    center: Optional[str] = typer.Option(None, "-c", "--center"),
+) -> None:
+    """Stop the running agent (queued jobs stay queued)."""
+    _agent_forward(["stop"], center)
+    from . import agent as agent_mod
+
+    cfg = _need_head(_cfg())
+    if agent_mod.stop_agent(cfg):
+        err.print("[yellow]agent stopped[/yellow]")
+    else:
+        err.print("no agent running")
+
+
+@agent_app.command("status")
+def agent_status(
+    center: Optional[str] = typer.Option(None, "-c", "--center"),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Agent liveness + queue depth."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        head = cfg.centers[_laptop_center(cfg, center)]
+        raise typer.Exit(forward_call(head, ["agent", "status"] + (["--json"] if json_ else [])))
+    from . import agent as agent_mod
+
+    st = agent_mod.status(_need_head(cfg))
+    if json_:
+        print(json.dumps(st))
+        return
+    state = "[green]running[/green]" if st["alive"] else "[red]stopped[/red]"
+    err.print(
+        f"agent {state} (pid {st['pid']})  queued={st['queued']} running={st['running']}  "
+        f"poll={st['poll_s']}s max_my_jobs={st['max_my_jobs']} "
+        f"reserve={st['reserve_free_per_node']} webhook={'on' if st['webhook'] else 'off'}"
+    )
+    if st["queue_head"]:
+        err.print(f"queue head: {st['queue_head']}")
+
+
+@agent_app.command("install")
+def agent_install(
+    center: Optional[str] = typer.Option(None, "-c", "--center"),
+) -> None:
+    """Install the crontab @reboot line so the agent survives head reboots."""
+    _agent_forward(["install"], center)
+    from . import agent as agent_mod
+
+    _need_head(_cfg())
+    line = agent_mod.install_crontab()
+    err.print(f"crontab installed: [dim]{line}[/dim]")
 
 
 # --------------------------------------------------------------------------
@@ -455,6 +617,15 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
     cfg = _cfg()
     if isinstance(cfg, HeadConfig):
         rows = doctor_center(cfg)
+        from . import agent as agent_mod
+
+        n_queued = len(jobs_mod.queued_entries(cfg))
+        agent_ok = agent_mod.alive_pid(cfg) is not None
+        for r in rows:  # agent runs on the head itself -> its local node row
+            if r["node"] in {n.name for n in cfg.nodes if n.local}:
+                r["checks"]["agent"] = "ok" if agent_ok else (
+                    f"off ({n_queued} queued!)" if n_queued else "off"
+                )
     else:
         rows = []
         for center, head in cfg.centers.items():
@@ -512,6 +683,7 @@ app.command("kill")(kill)
 app.command("k", hidden=True)(kill)
 app.command("clean")(clean)
 app.command("doctor")(doctor)
+app.add_typer(agent_app, name="agent")
 app.command("_find", hidden=True)(_find)
 
 

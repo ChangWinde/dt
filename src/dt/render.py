@@ -14,10 +14,12 @@ out = Console()
 err = Console(stderr=True)
 
 STATUS_STYLE = {
+    "queued": "bold magenta",
     "running": "bold green",
     "finished": "cyan",
     "killed": "yellow",
     "lost": "red",
+    "failed": "bold red",
 }
 
 
@@ -71,12 +73,16 @@ def ps_table(rows: list[dict]) -> Table:
         cmd = r.get("cmd", "")
         if len(cmd) > 48:
             cmd = cmd[:45] + "..."
+        gpus = ",".join(str(g) for g in r.get("gpus", []))
+        if not gpus:
+            # queued: show how many cards the job wants
+            gpus = f"({r.get('gpus_requested', '?')} wanted)" if status == "queued" else "-"
         t.add_row(
             r.get("name", "?"),
             r.get("job_id", "?"),
             r.get("center", "?"),
             r.get("node", "?"),
-            ",".join(str(g) for g in r.get("gpus", [])) or "-",
+            gpus,
             f"[{style}]{status}[/{style}]",
             "" if r.get("exit_code") is None else str(r["exit_code"]),
             created,
@@ -87,11 +93,13 @@ def ps_table(rows: list[dict]) -> Table:
 
 def doctor_table(rows: list[dict]) -> Table:
     t = Table(header_style="bold")
-    cols = ("center", "node", "ssh", "gpu/driver", "uv", "tmux", "rsync", "flock", "net", "dt")
+    cols = ("center", "node", "ssh", "gpu/driver", "uv", "tmux", "rsync", "flock", "net", "agent", "dt")
     for col in cols:
         t.add_column(col)
 
     def paint(v: str) -> str:
+        if v.startswith("off"):
+            return f"[yellow]{v}[/yellow]" if v == "off" else f"[red]{v}[/red]"
         if v in ("ok",) or (v and v not in ("missing", "blocked", "fail", "-")):
             return f"[green]{v}[/green]"
         if v in ("blocked",):
@@ -112,6 +120,7 @@ def doctor_table(rows: list[dict]) -> Table:
             paint(c.get("rsync", "-")),
             paint(c.get("flock", "-")),
             paint(c.get("net", "-")),
+            paint(c.get("agent", "-")),
             paint(c.get("dt", "-")),
         )
     return t

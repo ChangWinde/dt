@@ -55,6 +55,11 @@ default_project: vla
 paths:
   root: ~/dt
   envs: ~/dt/envs        # home 在 NFS 时改指节点本地盘
+queue:                   # 可选：排队与自我约束旋钮
+  poll_s: 60             # agent 轮询间隔
+  max_my_jobs: 4         # 本人最大并发作业数
+  reserve_free_per_node: 0   # 每节点至少留空 N 张卡
+webhook: https://...     # 可选：作业结束 POST 通知
 
 # 笔记本
 default_center: psibot
@@ -71,12 +76,17 @@ centers:
 ```bash
 dt free                                   # 哪里有空闲卡
 dt run -g 2 -n exp42 -- python train.py   # 提交（stdout 末行是 job id）
-dt ps                                     # 在跑什么
+dt ps                                     # 在跑什么（含排队中）
 dt logs exp42 -f                          # 看日志
-dt wait exp42                             # 等结束，透传退出码
+dt wait exp42                             # 等结束，透传退出码（覆盖排队阶段）
 dt pull exp42                             # outputs/ 拉回主节点
 dt kill exp42 / dt clean --before ...     # 收尾
 ```
+
+无空闲卡时 `dt run` 默认进队列（快照在提交时落盘，排队期间改代码不影响
+已提交作业），主节点 agent 每 60s 轮询、FIFO 派发；`--no-queue` 恢复
+"无卡直接退出码 2"。agent 由 `dt run` 入队时自动拉起，`dt agent install`
+写 crontab `@reboot` 保证主节点重启后队列不停摆。
 
 训练脚本约定：从 `$DT_JOB_DIR` 拿作业目录，产物写 `$DT_JOB_DIR/outputs/`。
 
@@ -90,6 +100,6 @@ uv sync            # 含 dev 依赖
 uv run pytest      # 纯逻辑测试（解析、配置、id、渲染）
 ```
 
-代码结构：`config` 配置 → `probe` 探卡 → `dispatch` 提交编排 →
-`payload/launcher.sh` 节点侧原子启动 → `jobs` 注册表与状态机 →
-`remote` 笔记本转发 → `cli` 命令面。
+代码结构：`config` 配置 → `probe` 探卡 → `dispatch` 提交编排（直派 + 排队）→
+`agent` 队列 agent → `payload/launcher.sh` 节点侧原子启动 →
+`jobs` 注册表与状态机 → `remote` 笔记本转发 → `cli` 命令面。
