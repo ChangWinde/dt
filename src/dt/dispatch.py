@@ -323,16 +323,31 @@ def remove_staging(cfg: HeadConfig, job_id: str) -> None:
 def _stage(cfg: HeadConfig, project_dir: Path, job_id: str, spec: RunSpec, meta: dict,
            log=lambda m: None) -> Path:
     """Queue path: snapshot into ~/dt/queue/<job_id>/ shaped exactly like the
-    node-side job dir, so dispatch later is a single rsync."""
+    node-side job dir, so dispatch later is a single rsync.
+
+    Uses a per-project incremental cache: the first submit pays a full copy,
+    every later one pays only the delta, then hardlinks the cache into the
+    job staging (seconds). Snapshot isolation holds: a later project edit
+    writes new inodes into the cache, old stagings keep the old ones."""
     staging = stage_dir(cfg, job_id)
     (staging / "code").mkdir(parents=True, exist_ok=True)
     (staging / "logs").mkdir(exist_ok=True)
-    proc = rsync(f"{project_dir}/", f"{staging}/code/", excludes=_excludes(cfg),
-                 timeout=600, stats=True)
+
+    cache = cfg.cache_dir() / "stage" / (spec.project or "_default")
+    cache.mkdir(parents=True, exist_ok=True)
+    proc = rsync(f"{project_dir}/", f"{cache}/", excludes=_excludes(cfg),
+                 delete=True, timeout=600, stats=True)
+    if proc.returncode != 0:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise DispatchError(f"staging cache sync failed: {proc.stderr.strip()}")
+    _warn_snapshot_size(cfg, proc.stdout, log)
+
+    # hardlink-copy: --link-dest against the source dir itself links every
+    # unchanged file instead of copying bytes
+    proc = rsync(f"{cache}/", f"{staging}/code/", link_dest=str(cache), timeout=600)
     if proc.returncode != 0:
         shutil.rmtree(staging, ignore_errors=True)
         raise DispatchError(f"staging snapshot failed: {proc.stderr.strip()}")
-    _warn_snapshot_size(cfg, proc.stdout, log)
     for fname, content in _support_files(spec.cmd, meta, spec.setup).items():
         (staging / fname).write_text(content)
     return staging

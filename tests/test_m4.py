@@ -90,6 +90,29 @@ def test_spec_from_entry_replays_everything():
     assert spec_from_entry(e, "fresh").name == "fresh"
 
 
+# -- staging cache ---------------------------------------------------------------
+
+def test_stage_hardlinks_and_isolates(tmp_path):
+    from dt.dispatch import RunSpec, _stage
+
+    cfg = _cfg(tmp_path)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / "train.py").write_text("v1")
+    spec = RunSpec(name="j", gpus=1, cmd=["true"], project="p")
+
+    s1 = _stage(cfg, proj, "job1", spec, {"job_id": "job1"})
+    f1 = s1 / "code" / "train.py"
+    assert f1.read_text() == "v1"
+    assert f1.stat().st_nlink >= 2  # hardlinked to the cache, not copied
+
+    # edit the project: an already-staged job must keep its old snapshot
+    (proj / "train.py").write_text("v2-changed")
+    s2 = _stage(cfg, proj, "job2", spec, {"job_id": "job2"})
+    assert (s2 / "code" / "train.py").read_text() == "v2-changed"
+    assert f1.read_text() == "v1"  # isolation held
+
+
 # -- clean ----------------------------------------------------------------------
 
 def test_clean_jobs_selection_and_staging(tmp_path):
