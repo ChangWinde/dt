@@ -107,6 +107,7 @@ class RunSpec:
     require_path: str | None = None
     max_hours: float | None = None
     setup: str | None = None   # project post-sync hook, runs inside the job env
+    extras: list[str] | None = None  # uv sync --extra groups
 
 
 def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
@@ -121,6 +122,7 @@ def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
         require_path=entry.require_path,
         max_hours=entry.max_hours,
         setup=entry.setup,
+        extras=list(entry.extras) if entry.extras else None,
     )
 
 
@@ -366,6 +368,8 @@ def launch(
         envs["DT_WEBHOOK"] = cfg.webhook
     if cfg.proxy:
         envs["DT_PROXY"] = cfg.proxy
+    if spec.extras:
+        envs["DT_EXTRAS"] = " ".join(spec.extras)
     if spec.require_path:
         envs["DT_REQUIRE_PATH"] = spec.require_path
     if spec.max_hours:
@@ -462,6 +466,7 @@ def _try_nodes(
                 env_hash=result.get("env") or None,
                 started_at=time.time(),
                 setup=spec.setup,
+                extras=list(spec.extras or []),
             )
             return entry, reasons, False
         reason = RETRYABLE.get(code) or FATAL.get(code) or f"exit {code}"
@@ -482,6 +487,8 @@ def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = Fals
     spec.project = project_name
     if spec.setup is None:
         spec.setup = project.setup
+    if spec.extras is None:
+        spec.extras = project.extras
 
     spec.name = sanitize_name(spec.name)
     job_id = new_job_id(spec.name)
@@ -512,7 +519,7 @@ def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = Fals
             cmd=shlex.join(spec.cmd), gpus=[], pgid=None, status="queued",
             git_sha=sha, git_dirty=dirty, max_hours=spec.max_hours,
             gpus_requested=spec.gpus, require_path=spec.require_path,
-            pin_node=spec.node, setup=spec.setup,
+            pin_node=spec.node, setup=spec.setup, extras=list(spec.extras or []),
         )
         save(cfg, entry)
         return entry

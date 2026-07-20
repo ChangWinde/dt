@@ -32,6 +32,7 @@ class Project:
     path: Path
     setup: str | None = None  # post-sync hook inside the job env (e.g. install
     #                           local libs that uv.lock cannot describe)
+    extras: list[str] = field(default_factory=list)  # uv sync --extra groups
 
 
 @dataclass
@@ -146,6 +147,7 @@ def parse(data: dict) -> HeadConfig | LaptopConfig:
                 projects[name] = Project(
                     path=Path(p["path"]).expanduser(),
                     setup=(str(p["setup"]).strip() or None) if p.get("setup") else None,
+                    extras=[str(x) for x in (p.get("extras") or [])],
                 )
             else:
                 projects[name] = Project(path=Path(p).expanduser())

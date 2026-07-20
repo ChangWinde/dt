@@ -22,10 +22,12 @@ def test_project_with_setup_hook():
     cfg = parse({
         "center": "c", "nodes": ["n1"],
         "projects": {
-            "omni": {"path": "~/proj/omni", "setup": "uv pip install libs/CleanDiffuser"},
+            "omni": {"path": "~/proj/omni", "setup": "uv pip install libs/CleanDiffuser",
+                     "extras": ["sim", "data"]},
         },
     })
     assert cfg.projects["omni"].setup == "uv pip install libs/CleanDiffuser"
+    assert cfg.projects["omni"].extras == ["sim", "data"]
     with pytest.raises(ConfigError):
         parse({"center": "c", "nodes": ["n1"], "projects": {"bad": {"setup": "x"}}})
 

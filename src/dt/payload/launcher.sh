@@ -86,13 +86,16 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
     if ! flock "$DT_ENVS_DIR/$lockhash.lock" \
         env UV_PROJECT_ENVIRONMENT="$UV_ENV" UV_SYSTEM_CERTS=1 UV_NATIVE_TLS=1 \
             UV_PYTHON_PREFERENCE=only-managed DT_JOB_DIR="$DT_JOB_DIR" UV_BIN="$UV_BIN" \
+            DT_EXTRAS="${DT_EXTRAS:-}" \
         bash -c '
             cd "$DT_JOB_DIR/code" || exit 1
+            eflags=""
+            for e in $DT_EXTRAS; do eflags="$eflags --extra $e"; done
             if [ -f "$DT_JOB_DIR/setup.sh" ]; then
                 # --inexact: exact sync would prune the packages the setup
                 # hook adds on top of the lock (uv sync removes extraneous
                 # packages by default)
-                "$UV_BIN" sync --frozen --inexact || exit 1
+                "$UV_BIN" sync --frozen --inexact $eflags || exit 1
                 smark="$UV_PROJECT_ENVIRONMENT/.dt-setup-$(sha256sum "$DT_JOB_DIR/setup.sh" | cut -c1-8)"
                 if [ ! -f "$smark" ]; then
                     echo "[launcher] running project setup hook"
@@ -100,7 +103,10 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
                     touch "$smark"
                 fi
             else
-                "$UV_BIN" sync --frozen || exit 1
+                # --inexact here too: envs are shared per-lockhash, and an
+                # exact sync from a job with fewer extras would prune the
+                # packages a concurrent job with more extras relies on
+                "$UV_BIN" sync --frozen --inexact $eflags || exit 1
             fi' \
         >>"$DT_JOB_DIR/logs/env.log" 2>&1; then
         log "uv sync / setup failed, see logs/env.log"
