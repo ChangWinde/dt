@@ -51,6 +51,9 @@ nodes:
   - {name: psibot-ys}
 projects:
   vla: ~/cw/project/vla
+  omnistack:                       # 长形式：本地 libs 依赖走 setup 钩子
+    path: ~/cw/project/OmniStack   # （环境锁内执行，按内容哈希幂等）
+    setup: uv pip install --no-deps ./libs/CleanDiffuser
 default_project: vla
 paths:
   root: ~/dt
