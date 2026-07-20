@@ -1,6 +1,7 @@
 """v0.8 operator-visibility round: probe owners, snapshot stats, auto center,
 info parsing helpers."""
 
+from dt.config import Project  # noqa: F401  (used via dispatch in tests)
 from dt.dispatch import transferred_gib
 from dt.probe import SEP, parse_probe_output
 from dt.remote import best_center
@@ -54,6 +55,50 @@ def test_snapshot_excludes_are_root_anchored():
         assert f"{name}/" not in SNAPSHOT_EXCLUDES  # unanchored form is the bug
     for junk in (".venv/", "__pycache__/", ".git/", "*.pyc"):
         assert junk in SNAPSHOT_EXCLUDES
+
+
+def test_ssh_base_has_multiplexing():
+    from dt.sshio import SSH_BASE
+
+    joined = " ".join(SSH_BASE)
+    assert "ControlMaster=auto" in joined
+    assert "ControlPersist=300" in joined
+
+
+def test_pinned_submit_probes_only_the_pin(tmp_path, monkeypatch):
+    """A --node submit must not fan out to the whole center."""
+    import dt.dispatch as dispatch
+    from dt.config import HeadConfig, Node, QueueCfg
+    from dt.probe import NodeStatus
+
+    cfg = HeadConfig(
+        center="t", nodes=[Node(name="n1"), Node(name="n2"), Node(name="n3")],
+        projects={}, default_project=None, root=tmp_path / "dt", envs="~/dt/envs",
+        queue=QueueCfg(),
+    )
+    probed: list[str] = []
+
+    def fake_probe_node(node, mem, timeout=10):
+        probed.append(node.name)
+        return NodeStatus(node=node.name, gpus=[])
+
+    def fake_probe_center(cfg_, use_cache=True):
+        raise AssertionError("pinned submit must not probe the whole center")
+
+    from dt.config import Project
+
+    monkeypatch.setattr(dispatch, "probe_node", fake_probe_node)
+    monkeypatch.setattr(dispatch, "probe_center", fake_probe_center)
+    monkeypatch.setattr(dispatch, "resolve_project",
+                        lambda cfg_, req, cwd: ("p", Project(path=tmp_path)))
+    monkeypatch.setattr(dispatch, "git_info", lambda d: (None, False, None))
+    # no free gpus -> goes to queue; _stage would rsync, stub it out
+    monkeypatch.setattr(dispatch, "_stage", lambda *a, **k: tmp_path)
+
+    spec = dispatch.RunSpec(name="j", gpus=1, cmd=["true"], node="n2")
+    entry = dispatch.submit(cfg, spec, tmp_path, lambda m: None)
+    assert probed == ["n2"]
+    assert entry.status == "queued"
 
 
 def test_rsync_has_stall_guards(monkeypatch):

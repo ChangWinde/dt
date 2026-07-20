@@ -28,7 +28,7 @@ from .config import ConfigError, HeadConfig, Node
 from .jobs import (
     JobEntry, list_all, load, new_job_id, running_count, sanitize_name, save,
 )
-from .probe import NodeStatus, probe_center
+from .probe import NodeStatus, probe_center, probe_node
 from .sshio import RemoteError, rsync, run_on
 
 PAYLOAD_DIR = Path(__file__).parent / "payload"
@@ -530,8 +530,17 @@ def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = Fals
             raise NoCapacity({"*": f"max_my_jobs={cap} reached"})
         return enqueue(f"max_my_jobs={cap} reached")
 
-    log(f"probing {cfg.center} nodes")
-    statuses = probe_center(cfg, use_cache=False)
+    if spec.node:
+        # pinned submit: probing the whole center is wasted latency when
+        # only one node can take the job anyway (burst submissions add up)
+        by_name = {n.name: n for n in cfg.nodes}
+        if spec.node not in by_name:
+            raise ConfigError(f"unknown node {spec.node!r}; configured: {list(by_name)}")
+        log(f"probing {spec.node}")
+        statuses = [probe_node(by_name[spec.node], cfg.mem_threshold_mib)]
+    else:
+        log(f"probing {cfg.center} nodes")
+        statuses = probe_center(cfg, use_cache=False)
     candidates = pick_candidates(statuses, cfg.nodes, spec, _reserve_for(cfg, spec))
     probe_reasons = {
         s.node: (s.error or f"{len(s.free_gpus)} free < {spec.gpus} wanted")

@@ -16,10 +16,15 @@ import time
 
 REMOTE_DT = "~/.local/bin/dt"
 # keepalives bound every hung channel: NAT'd links (kyzs) can stall a live
-# TCP stream silently; 4 missed probes x 15s tears it down in ~60s
+# TCP stream silently; 4 missed probes x 15s tears it down in ~60s.
+# ControlMaster (design doc 8.2): one submit makes 5+ ssh hops to the same
+# node and eval bursts submit dozens of jobs - multiplexing collapses every
+# handshake after the first into ~0. %C hashes host+port+user for the socket.
 SSH_BASE = [
     "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
     "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+    "-o", "ControlMaster=auto", "-o", "ControlPath=~/.ssh/dt-cm-%C",
+    "-o", "ControlPersist=300",
 ]
 
 
