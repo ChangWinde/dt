@@ -32,9 +32,13 @@ from .probe import NodeStatus, probe_center
 from .sshio import RemoteError, rsync, run_on
 
 PAYLOAD_DIR = Path(__file__).parent / "payload"
+# Root-anchored (leading /): project artifact dirs that may legitimately
+# collide with package subpaths deeper in the tree (omnistack/data is a
+# Python module; an unanchored "data/" would silently drop it from the
+# snapshot). Unanchored: junk that is junk at every depth.
 SNAPSHOT_EXCLUDES = [
-    "data/", "checkpoints/", "outputs/", ".venv/", "wandb/", "__pycache__/",
-    ".git/", "*.pyc", ".pytest_cache/",
+    "/data/", "/checkpoints/", "/outputs/", "/wandb/",
+    ".venv/", "__pycache__/", ".git/", "*.pyc", ".pytest_cache/",
 ]
 RETRYABLE = {10: "busy", 11: "path-missing", 12: "disk-full", 15: "node-unfit"}
 FATAL = {13: "env-fail", 14: "internal"}

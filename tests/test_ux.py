@@ -44,6 +44,18 @@ def test_busy_owners_rendering():
 
 # -- snapshot size warning -------------------------------------------------------
 
+def test_snapshot_excludes_are_root_anchored():
+    """Artifact dirs must only be excluded at the project root: a package
+    subdir like omnistack/data/ has to survive the snapshot."""
+    from dt.dispatch import SNAPSHOT_EXCLUDES
+
+    for name in ("data", "checkpoints", "outputs", "wandb"):
+        assert f"/{name}/" in SNAPSHOT_EXCLUDES
+        assert f"{name}/" not in SNAPSHOT_EXCLUDES  # unanchored form is the bug
+    for junk in (".venv/", "__pycache__/", ".git/", "*.pyc"):
+        assert junk in SNAPSHOT_EXCLUDES
+
+
 def test_rsync_has_stall_guards(monkeypatch):
     import subprocess
 
