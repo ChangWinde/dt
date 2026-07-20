@@ -79,14 +79,20 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
         env UV_PROJECT_ENVIRONMENT="$UV_ENV" UV_SYSTEM_CERTS=1 UV_NATIVE_TLS=1 \
             UV_PYTHON_PREFERENCE=only-managed DT_JOB_DIR="$DT_JOB_DIR" UV_BIN="$UV_BIN" \
         bash -c '
-            cd "$DT_JOB_DIR/code" && "$UV_BIN" sync --frozen || exit 1
+            cd "$DT_JOB_DIR/code" || exit 1
             if [ -f "$DT_JOB_DIR/setup.sh" ]; then
+                # --inexact: exact sync would prune the packages the setup
+                # hook adds on top of the lock (uv sync removes extraneous
+                # packages by default)
+                "$UV_BIN" sync --frozen --inexact || exit 1
                 smark="$UV_PROJECT_ENVIRONMENT/.dt-setup-$(sha256sum "$DT_JOB_DIR/setup.sh" | cut -c1-8)"
                 if [ ! -f "$smark" ]; then
                     echo "[launcher] running project setup hook"
                     "$UV_BIN" run --no-sync bash "$DT_JOB_DIR/setup.sh" || exit 1
                     touch "$smark"
                 fi
+            else
+                "$UV_BIN" sync --frozen || exit 1
             fi' \
         >>"$DT_JOB_DIR/logs/env.log" 2>&1; then
         log "uv sync / setup failed, see logs/env.log"
