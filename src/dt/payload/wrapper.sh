@@ -9,11 +9,18 @@ date +%s > "$DT_JOB_DIR/started_at"
 
 cd "$DT_JOB_DIR/code"
 
+# line-buffered logs: stdout goes to a file, and block buffering would hide
+# progress from `dt logs -f` for minutes at a time
+export PYTHONUNBUFFERED=1
+
 runner=(bash "$DT_JOB_DIR/cmd.sh")
 if [ -n "${DT_UV_ENV:-}" ]; then
     export UV_PROJECT_ENVIRONMENT="$DT_UV_ENV"
     export UV_PYTHON_PREFERENCE=only-managed
     runner=("$DT_UV" run --no-sync bash "$DT_JOB_DIR/cmd.sh")
+fi
+if command -v stdbuf >/dev/null 2>&1; then
+    runner=(stdbuf -oL -eL "${runner[@]}")
 fi
 
 if [ -n "${DT_MAX_HOURS:-}" ]; then

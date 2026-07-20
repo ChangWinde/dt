@@ -31,6 +31,12 @@ def test_launcher_setup_hook_contract():
     assert ".dt-setup-" in LAUNCHER
 
 
+def test_wrapper_unbuffers_logs():
+    # block-buffered stdout hides training progress from `dt logs -f`
+    assert "PYTHONUNBUFFERED=1" in WRAPPER
+    assert "stdbuf -oL" in WRAPPER
+
+
 def test_wrapper_reaps_group_escapees():
     # setpgrp callers (omnistack-train) leave the pane group; membership
     # test is cwd-inside-job-dir
