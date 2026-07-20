@@ -44,6 +44,24 @@ def test_busy_owners_rendering():
 
 # -- snapshot size warning -------------------------------------------------------
 
+def test_rsync_has_stall_guards(monkeypatch):
+    import subprocess
+
+    import dt.sshio as sshio
+
+    seen = {}
+
+    def fake_run(cmd, capture_output, text, timeout):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(sshio.subprocess, "run", fake_run)
+    sshio.rsync("a/", "b/")
+    assert "--timeout=60" in seen["cmd"]  # io-stall abort for NAT'd links
+    joined = " ".join(seen["cmd"])
+    assert "ServerAliveInterval=15" in joined  # ssh keepalives in -e
+
+
 def test_transferred_gib_parses_stats():
     stdout = (
         "Number of files: 120\n"

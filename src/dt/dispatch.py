@@ -283,6 +283,7 @@ def snapshot(
         # node regardless of where its home is
         link_dest=f"../../{prev}/code" if prev else None,
         timeout=600,
+        retries=2,  # NAT'd links stall: abort via --timeout, resume via --partial
         stats=True,
     )
     if proc.returncode != 0:
@@ -573,6 +574,7 @@ def dispatch_queued(cfg: HeadConfig, entry: JobEntry, log) -> tuple[str, str | N
             # previous job dir: <prev>/code/* lines up with code/*
             link_dest=f"../{prev}" if prev else None,
             timeout=600,
+            retries=2,
         )
         if proc.returncode != 0:
             raise DispatchError(f"snapshot to {node.name} failed: {proc.stderr.strip()}")

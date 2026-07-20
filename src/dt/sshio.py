@@ -15,7 +15,12 @@ import subprocess
 import time
 
 REMOTE_DT = "~/.local/bin/dt"
-SSH_BASE = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3"]
+# keepalives bound every hung channel: NAT'd links (kyzs) can stall a live
+# TCP stream silently; 4 missed probes x 15s tears it down in ~60s
+SSH_BASE = [
+    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+    "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+]
 
 
 class RemoteError(Exception):
@@ -98,7 +103,10 @@ def rsync(
     """--partial keeps interrupted transfers resumable; with retries > 0 a
     network-ish failure is retried and resumes where it stopped (large
     checkpoint pulls over flaky links)."""
-    cmd = ["rsync", "-a", "--partial", "-e", shlex.join(SSH_BASE)]
+    # --timeout is rsync's own io-stall detector: a NAT link that freezes
+    # mid-stream aborts in 60s instead of hanging the dispatcher forever
+    # (--partial + retries then resumes where it stopped)
+    cmd = ["rsync", "-a", "--partial", "--timeout=60", "-e", shlex.join(SSH_BASE)]
     if stats:
         cmd.append("--stats")
     if delete:
