@@ -55,6 +55,9 @@ if [ ! -f "$CONF" ]; then
 #   - {name: psibot-ys}
 # projects:
 #   myproj: ~/cw/project/myproj
+#   withlibs:                       # long form: post-sync setup hook, runs
+#     path: ~/cw/project/withlibs   # inside the job env (once per env),
+#     setup: uv pip install libs/MyLocalPkg   # e.g. local packages outside uv.lock
 # default_project: myproj
 # paths:
 #   root: ~/dt

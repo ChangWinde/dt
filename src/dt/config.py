@@ -28,6 +28,13 @@ class Node:
 
 
 @dataclass
+class Project:
+    path: Path
+    setup: str | None = None  # post-sync hook inside the job env (e.g. install
+    #                           local libs that uv.lock cannot describe)
+
+
+@dataclass
 class QueueCfg:
     """Self-restraint knobs (design doc 7.4) + agent cadence."""
 
@@ -41,7 +48,7 @@ class QueueCfg:
 class HeadConfig:
     center: str
     nodes: list[Node]
-    projects: dict[str, Path]
+    projects: dict[str, Project]
     default_project: str | None
     root: Path
     envs: str  # node-side path, tilde expanded on the node (homes may differ)
@@ -130,9 +137,17 @@ def parse(data: dict) -> HeadConfig | LaptopConfig:
         paths = data.get("paths", {}) or {}
         root = Path(paths.get("root", "~/dt")).expanduser()
         envs = str(paths.get("envs", "~/dt/envs"))
-        projects = {
-            name: Path(p).expanduser() for name, p in (data.get("projects") or {}).items()
-        }
+        projects: dict[str, Project] = {}
+        for name, p in (data.get("projects") or {}).items():
+            if isinstance(p, dict):
+                if "path" not in p:
+                    raise ConfigError(f"project {name!r} needs a `path`")
+                projects[name] = Project(
+                    path=Path(p["path"]).expanduser(),
+                    setup=(str(p["setup"]).strip() or None) if p.get("setup") else None,
+                )
+            else:
+                projects[name] = Project(path=Path(p).expanduser())
         qraw = data.get("queue") or {}
         max_jobs = qraw.get("max_my_jobs")
         auto_clean = qraw.get("auto_clean_days")

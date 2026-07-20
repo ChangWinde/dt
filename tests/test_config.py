@@ -14,6 +14,20 @@ def test_head_config():
     assert cfg.nodes[0].local and not cfg.nodes[1].local
     assert cfg.envs == "~/dt/envs"
     assert "vla" in cfg.projects
+    assert cfg.projects["vla"].setup is None
+    assert str(cfg.projects["vla"].path).endswith("proj/vla")
+
+
+def test_project_with_setup_hook():
+    cfg = parse({
+        "center": "c", "nodes": ["n1"],
+        "projects": {
+            "omni": {"path": "~/proj/omni", "setup": "uv pip install libs/CleanDiffuser"},
+        },
+    })
+    assert cfg.projects["omni"].setup == "uv pip install libs/CleanDiffuser"
+    with pytest.raises(ConfigError):
+        parse({"center": "c", "nodes": ["n1"], "projects": {"bad": {"setup": "x"}}})
 
 
 def test_laptop_config():

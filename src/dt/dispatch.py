@@ -106,6 +106,7 @@ class RunSpec:
     node: str | None = None
     require_path: str | None = None
     max_hours: float | None = None
+    setup: str | None = None   # project post-sync hook, runs inside the job env
 
 
 def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
@@ -119,10 +120,12 @@ def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
         node=entry.pin_node,
         require_path=entry.require_path,
         max_hours=entry.max_hours,
+        setup=entry.setup,
     )
 
 
-def resolve_project(cfg: HeadConfig, requested: str | None, cwd: Path) -> tuple[str, Path]:
+def resolve_project(cfg: HeadConfig, requested: str | None, cwd: Path):
+    """Returns (name, Project)."""
     if requested:
         if requested not in cfg.projects:
             raise ConfigError(
@@ -130,10 +133,10 @@ def resolve_project(cfg: HeadConfig, requested: str | None, cwd: Path) -> tuple[
             )
         return requested, cfg.projects[requested]
     # inside a configured project dir?
-    for name, path in cfg.projects.items():
+    for name, proj in cfg.projects.items():
         try:
-            cwd.resolve().relative_to(path.resolve())
-            return name, path
+            cwd.resolve().relative_to(proj.path.resolve())
+            return name, proj
         except ValueError:
             continue
     if cfg.default_project:
@@ -241,13 +244,15 @@ def _remember_snapshot(cfg: HeadConfig, project_name: str, node: Node, job_id: s
 # snapshot / staging
 # --------------------------------------------------------------------------
 
-def _support_files(cmd: list[str], meta: dict) -> dict[str, str]:
+def _support_files(cmd: list[str], meta: dict, setup: str | None = None) -> dict[str, str]:
     """Everything a job dir needs besides code/: launcher, wrapper, cmd, meta."""
     files = {
         "launcher.sh": (PAYLOAD_DIR / "launcher.sh").read_text(),
         "wrapper.sh": (PAYLOAD_DIR / "wrapper.sh").read_text(),
         "cmd.sh": shlex.join(cmd) + "\n",
     }
+    if setup:
+        files["setup.sh"] = setup + "\n"
     meta = dict(meta)
     diff = meta.pop("_diff", None)
     if meta.get("git_dirty") and diff:
@@ -296,7 +301,7 @@ def snapshot(
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpp = Path(tmp)
-        for fname, content in _support_files(spec.cmd, meta).items():
+        for fname, content in _support_files(spec.cmd, meta, spec.setup).items():
             (tmpp / fname).write_text(content)
         proc = rsync(f"{tmp}/", _job_dst(node, job_dir), timeout=60)
         if proc.returncode != 0:
@@ -326,7 +331,7 @@ def _stage(cfg: HeadConfig, project_dir: Path, job_id: str, spec: RunSpec, meta:
         shutil.rmtree(staging, ignore_errors=True)
         raise DispatchError(f"staging snapshot failed: {proc.stderr.strip()}")
     _warn_snapshot_size(cfg, proc.stdout, log)
-    for fname, content in _support_files(spec.cmd, meta).items():
+    for fname, content in _support_files(spec.cmd, meta, spec.setup).items():
         (staging / fname).write_text(content)
     return staging
 
@@ -454,6 +459,7 @@ def _try_nodes(
                 max_hours=spec.max_hours,
                 env_hash=result.get("env") or None,
                 started_at=time.time(),
+                setup=spec.setup,
             )
             return entry, reasons, False
         reason = RETRYABLE.get(code) or FATAL.get(code) or f"exit {code}"
@@ -467,10 +473,13 @@ def _try_nodes(
 def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = False) -> JobEntry:
     """log: callable(str) writing progress to stderr.
     Returns an entry with status "running" (placed now) or "queued"."""
-    project_name, project_dir = resolve_project(cfg, spec.project, cwd)
+    project_name, project = resolve_project(cfg, spec.project, cwd)
+    project_dir = project.path
     if not project_dir.is_dir():
         raise ConfigError(f"project dir does not exist: {project_dir}")
     spec.project = project_name
+    if spec.setup is None:
+        spec.setup = project.setup
 
     spec.name = sanitize_name(spec.name)
     job_id = new_job_id(spec.name)
@@ -501,7 +510,7 @@ def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = Fals
             cmd=shlex.join(spec.cmd), gpus=[], pgid=None, status="queued",
             git_sha=sha, git_dirty=dirty, max_hours=spec.max_hours,
             gpus_requested=spec.gpus, require_path=spec.require_path,
-            pin_node=spec.node,
+            pin_node=spec.node, setup=spec.setup,
         )
         save(cfg, entry)
         return entry

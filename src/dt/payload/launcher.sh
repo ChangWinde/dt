@@ -71,13 +71,25 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
     mkdir -p "$DT_ENVS_DIR"
     log "syncing env $lockhash"
     # only-managed: system interpreters lack dev headers (Python.h), which
-    # breaks sdist builds; uv-managed toolchains ship them (design doc 6)
+    # breaks sdist builds; uv-managed toolchains ship them (design doc 6).
+    # setup.sh (optional project hook, e.g. install local libs/ packages that
+    # uv.lock cannot describe) runs under the same env lock, once per env per
+    # setup content (marker), never editable - the job dir is disposable.
     if ! flock "$DT_ENVS_DIR/$lockhash.lock" \
         env UV_PROJECT_ENVIRONMENT="$UV_ENV" UV_SYSTEM_CERTS=1 UV_NATIVE_TLS=1 \
-            UV_PYTHON_PREFERENCE=only-managed \
-        bash -c "cd '$DT_JOB_DIR/code' && '$UV_BIN' sync --frozen" \
+            UV_PYTHON_PREFERENCE=only-managed DT_JOB_DIR="$DT_JOB_DIR" UV_BIN="$UV_BIN" \
+        bash -c '
+            cd "$DT_JOB_DIR/code" && "$UV_BIN" sync --frozen || exit 1
+            if [ -f "$DT_JOB_DIR/setup.sh" ]; then
+                smark="$UV_PROJECT_ENVIRONMENT/.dt-setup-$(sha256sum "$DT_JOB_DIR/setup.sh" | cut -c1-8)"
+                if [ ! -f "$smark" ]; then
+                    echo "[launcher] running project setup hook"
+                    "$UV_BIN" run --no-sync bash "$DT_JOB_DIR/setup.sh" || exit 1
+                    touch "$smark"
+                fi
+            fi' \
         >>"$DT_JOB_DIR/logs/env.log" 2>&1; then
-        log "uv sync failed, see logs/env.log"
+        log "uv sync / setup failed, see logs/env.log"
         exit 13
     fi
     # last-used stamp: `dt clean --envs` reaps envs whose mtime went stale
