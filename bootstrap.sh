@@ -65,6 +65,8 @@ if [ ! -f "$CONF" ]; then
 #   reserve_free_per_node: 0   # always leave N cards free per node
 #   auto_clean_days: 14    # agent daily-cleans ended jobs + stale venvs
 # webhook: https://...     # POST job start/end/fail notifications here
+# snapshot_excludes: [logs/, "*.ckpt"]   # extra rsync excludes on top of defaults
+# snapshot_warn_gib: 2     # warn when a snapshot copies more than this
 # --- laptop role ------------------------------------------------------
 # default_center: psibot
 # centers:

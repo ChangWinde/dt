@@ -93,11 +93,14 @@ def rsync(
     delete: bool = False,
     timeout: float = 300,
     retries: int = 0,
+    stats: bool = False,
 ) -> subprocess.CompletedProcess:
     """--partial keeps interrupted transfers resumable; with retries > 0 a
     network-ish failure is retried and resumes where it stopped (large
     checkpoint pulls over flaky links)."""
     cmd = ["rsync", "-a", "--partial", "-e", shlex.join(SSH_BASE)]
+    if stats:
+        cmd.append("--stats")
     if delete:
         cmd.append("--delete")
     for ex in excludes or []:

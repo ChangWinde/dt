@@ -54,19 +54,23 @@ change what a queued job will run.
 ## All commands
 
 ```
-dt free [--watch]      free GPUs across nodes
-dt run [-g N] [-n NAME] [-p PROJECT] [--node NODE] [--require-path P]
-       [--max-hours H] [--no-queue] -- CMD...
+dt free [--watch] [--who]   free GPUs across nodes (--who: who holds busy cards)
+dt run [-g N] [-n NAME] [-c CENTER|auto] [-p PROJECT] [--node NODE]
+       [--require-path P] [--max-hours H] [--no-queue] -- CMD...
 dt ps [-s STATUS] [-a] jobs + live status (table: last 30 unless -a;
                        --json: always everything)
+dt info REF [--json]   one job's full picture: state, node, gpus, timeline,
+                       duration, exit code, outputs size, git, reason
 dt logs REF [-f] [-n N]
 dt attach REF          enter the job's tmux (C-b d to detach)
 dt wait REF [--poll S]
 dt rerun REF [-n NAME] [--no-queue]   resubmit with current code
 dt pull REF [--to DIR] fetch outputs/ back to this head (resumes/retries)
-dt kill REF [-y] [--force]   running job: TERM (KILL with --force) the group,
-                       confirms death; queued job: dequeue
+dt kill REF... [-y] [--force]   running job: TERM (KILL with --force) the
+                       group, confirms death; queued job: dequeue
 dt clean --before YYYY-MM-DD [--envs] [-y]   old jobs (+stale shared venvs)
 dt doctor              verify ssh/gpu/uv/tmux/net/agent on all nodes
 dt agent status|start|stop|run|install    queue agent lifecycle
 ```
+
+Prefer `dt info <id> --json` over parsing `dt ps` when inspecting one job.

@@ -11,11 +11,15 @@ project while a job waits in line never changes what that job will run.
 
 from __future__ import annotations
 
+import fcntl
 import json
+import re
 import shlex
 import shutil
 import subprocess
 import tempfile
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +38,30 @@ SNAPSHOT_EXCLUDES = [
 ]
 RETRYABLE = {10: "busy", 11: "path-missing", 12: "disk-full", 15: "node-unfit"}
 FATAL = {13: "env-fail", 14: "internal"}
+
+_TRANSFERRED_RE = re.compile(r"Total transferred file size: ([\d,.]+) bytes")
+
+
+def _excludes(cfg: HeadConfig) -> list[str]:
+    return SNAPSHOT_EXCLUDES + cfg.snapshot_excludes
+
+
+def transferred_gib(rsync_stdout: str) -> float | None:
+    """Bytes actually copied, from `rsync --stats` output (None if absent)."""
+    m = _TRANSFERRED_RE.search(rsync_stdout or "")
+    if not m:
+        return None
+    return float(m.group(1).replace(",", "")) / 2**30
+
+
+def _warn_snapshot_size(cfg: HeadConfig, stdout: str, log) -> None:
+    gib = transferred_gib(stdout)
+    if gib is not None and gib > cfg.snapshot_warn_gib:
+        log(
+            f"warning: snapshot transferred {gib:.1f} GiB "
+            f"(> {cfg.snapshot_warn_gib:g} GiB) - if unintended, add the "
+            f"offending dirs to snapshot_excludes in ~/.config/dt/config.yaml"
+        )
 
 
 class DispatchError(Exception):
@@ -158,6 +186,21 @@ def _linkdest_state(cfg: HeadConfig) -> Path:
     return cfg.state_dir() / "linkdest.json"
 
 
+@contextmanager
+def _linkdest_lock(cfg: HeadConfig):
+    """Concurrent submits share this state file; lock the read-modify-write."""
+    lock = cfg.state_dir() / "linkdest.lock"
+    fd = None
+    try:
+        fd = open(lock, "w")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if fd is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            fd.close()
+
+
 def _load_linkdest(cfg: HeadConfig) -> dict:
     path = _linkdest_state(cfg)
     if path.exists():
@@ -184,9 +227,10 @@ def _prev_job_id(cfg: HeadConfig, project_name: str, node: Node) -> str | None:
 
 
 def _remember_snapshot(cfg: HeadConfig, project_name: str, node: Node, job_id: str) -> None:
-    state = _load_linkdest(cfg)
-    state[f"{project_name}@{node.name}"] = job_id
-    _save_linkdest(cfg, state)
+    with _linkdest_lock(cfg):
+        state = _load_linkdest(cfg)
+        state[f"{project_name}@{node.name}"] = job_id
+        _save_linkdest(cfg, state)
 
 
 # --------------------------------------------------------------------------
@@ -226,6 +270,7 @@ def snapshot(
     job_dir: str,
     spec: RunSpec,
     meta: dict,
+    log=lambda m: None,
 ) -> None:
     """Direct path: project dir -> node job dir (code + support files)."""
     run_on(node.name, node.local, f"mkdir -p {shlex.quote(job_dir)}/logs", timeout=15, check=True)
@@ -233,14 +278,16 @@ def snapshot(
     prev = _prev_job_id(cfg, project_name, node)
     proc = rsync(
         f"{project_dir}/", _code_dst(node, job_dir),
-        excludes=SNAPSHOT_EXCLUDES,
+        excludes=_excludes(cfg),
         # relative to the dest dir (dt/jobs/<id>/code), so it resolves on the
         # node regardless of where its home is
         link_dest=f"../../{prev}/code" if prev else None,
         timeout=600,
+        stats=True,
     )
     if proc.returncode != 0:
         raise DispatchError(f"code snapshot to {node.name} failed: {proc.stderr.strip()}")
+    _warn_snapshot_size(cfg, proc.stdout, log)
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpp = Path(tmp)
@@ -261,16 +308,19 @@ def remove_staging(cfg: HeadConfig, job_id: str) -> None:
     shutil.rmtree(stage_dir(cfg, job_id), ignore_errors=True)
 
 
-def _stage(cfg: HeadConfig, project_dir: Path, job_id: str, spec: RunSpec, meta: dict) -> Path:
+def _stage(cfg: HeadConfig, project_dir: Path, job_id: str, spec: RunSpec, meta: dict,
+           log=lambda m: None) -> Path:
     """Queue path: snapshot into ~/dt/queue/<job_id>/ shaped exactly like the
     node-side job dir, so dispatch later is a single rsync."""
     staging = stage_dir(cfg, job_id)
     (staging / "code").mkdir(parents=True, exist_ok=True)
     (staging / "logs").mkdir(exist_ok=True)
-    proc = rsync(f"{project_dir}/", f"{staging}/code/", excludes=SNAPSHOT_EXCLUDES, timeout=600)
+    proc = rsync(f"{project_dir}/", f"{staging}/code/", excludes=_excludes(cfg),
+                 timeout=600, stats=True)
     if proc.returncode != 0:
         shutil.rmtree(staging, ignore_errors=True)
         raise DispatchError(f"staging snapshot failed: {proc.stderr.strip()}")
+    _warn_snapshot_size(cfg, proc.stdout, log)
     for fname, content in _support_files(spec.cmd, meta).items():
         (staging / fname).write_text(content)
     return staging
@@ -398,6 +448,7 @@ def _try_nodes(
                 pin_node=spec.node,
                 max_hours=spec.max_hours,
                 env_hash=result.get("env") or None,
+                started_at=time.time(),
             )
             return entry, reasons, False
         reason = RETRYABLE.get(code) or FATAL.get(code) or f"exit {code}"
@@ -438,7 +489,7 @@ def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = Fals
 
     def enqueue(why: str) -> JobEntry:
         log(f"{why}; queueing (agent dispatches when a card frees up)")
-        _stage(cfg, project_dir, job_id, spec, meta)
+        _stage(cfg, project_dir, job_id, spec, meta, log)
         entry = JobEntry(
             job_id=job_id, name=spec.name, center=cfg.center, project=project_name,
             node="-", node_local=False, job_dir=job_dir, session=session,
@@ -470,7 +521,7 @@ def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = Fals
         return enqueue("no free capacity")
 
     def sync_to_node(node: Node) -> None:
-        snapshot(cfg, project_name, project_dir, node, job_id, job_dir, spec, dict(meta))
+        snapshot(cfg, project_name, project_dir, node, job_id, job_dir, spec, dict(meta), log)
 
     entry, reasons, fatal = _try_nodes(
         cfg, candidates, spec, job_id, job_dir, session, sync_to_node, log,

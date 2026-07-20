@@ -75,14 +75,16 @@ centers:
 ## 快速上手
 
 ```bash
-dt free                                   # 哪里有空闲卡
+dt free --who                             # 哪里有空闲卡 / 忙卡被谁占着
 dt run -g 2 -n exp42 -- python train.py   # 提交（stdout 末行是 job id）
-dt ps                                     # 在跑什么（含排队中）
+dt run -c auto -g 2 -- python train.py    # 笔记本：自动挑空闲最多的中心
+dt ps                                     # 在跑什么（含排队中；-s 过滤 -a 全量）
+dt info exp42                             # 单作业全景（时间线/卡/时长/产物/原因）
 dt logs exp42 -f                          # 看日志
 dt wait exp42                             # 等结束，透传退出码（覆盖排队阶段，断线自动重连）
 dt rerun exp42                            # 原样重跑（当前代码 + 相同命令/资源）
 dt pull exp42                             # outputs/ 拉回主节点（断点续传）
-dt kill exp42 / dt clean --before ...     # 收尾（--envs 顺带清闲置环境）
+dt kill exp1 exp2 / dt clean --before ... # 收尾（--envs 顺带清闲置环境）
 ```
 
 无空闲卡时 `dt run` 默认进队列（快照在提交时落盘，排队期间改代码不影响

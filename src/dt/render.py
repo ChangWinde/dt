@@ -39,9 +39,25 @@ def compress_indices(indices: list[int]) -> str:
     return " ".join(parts)
 
 
-def free_table(rows: list[dict]) -> Table:
+def busy_owners(gpus: list[dict]) -> str:
+    """'alice×3 bob×1' - who occupies the busy cards, by card count."""
+    counts: dict[str, int] = {}
+    for g in gpus:
+        if g.get("free"):
+            continue
+        if not g.get("procs"):
+            continue  # busy by leftover memory only: no owner to blame
+        for u in (g.get("users") or ["?"]):
+            counts[u] = counts.get(u, 0) + 1
+    return " ".join(f"{u}\u00d7{n}" for u, n in
+                    sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+def free_table(rows: list[dict], who: bool = False) -> Table:
     t = Table(title=None, header_style="bold")
-    for col in ("center", "node", "free/total", "free gpus", "note"):
+    cols = ["center", "node", "free/total", "free gpus"]
+    cols.append("in use by" if who else "note")
+    for col in cols:
         t.add_column(col)
     for r in rows:
         if r.get("error"):
@@ -56,7 +72,7 @@ def free_table(rows: list[dict]) -> Table:
             r["node"],
             f"[{style}]{len(free)}/{len(gpus)}[/{style}]",
             f"[{style}]{idx}[/{style}]",
-            "",
+            f"[dim]{busy_owners(gpus)}[/dim]" if who else "",
         )
     return t
 

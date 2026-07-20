@@ -49,6 +49,8 @@ class HeadConfig:
     disk_min_gib: int = 10
     queue: QueueCfg = field(default_factory=QueueCfg)
     webhook: str | None = None           # POST job-end notifications here
+    snapshot_excludes: list[str] = field(default_factory=list)  # extra rsync excludes
+    snapshot_warn_gib: float = 2.0       # warn when a snapshot transfers more
     role: str = "head"
 
     @property
@@ -151,6 +153,8 @@ def parse(data: dict) -> HeadConfig | LaptopConfig:
             disk_min_gib=int(data.get("disk_min_gib", 10)),
             queue=queue,
             webhook=data.get("webhook"),
+            snapshot_excludes=[str(x) for x in (data.get("snapshot_excludes") or [])],
+            snapshot_warn_gib=float(data.get("snapshot_warn_gib", 2.0)),
         )
 
     raise ConfigError("config must contain `centers` (laptop) or `center` (head)")

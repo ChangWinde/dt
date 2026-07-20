@@ -149,6 +149,7 @@ def _locate(cfg: LaptopConfig, ref: str) -> tuple[str, str]:
 
 def free(
     watch: bool = typer.Option(False, "--watch", help="live refresh every 2s"),
+    who: bool = typer.Option(False, "--who", help="show who occupies the busy cards"),
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
     """Show free GPUs across all centers."""
@@ -168,16 +169,16 @@ def free(
         from rich.live import Live
 
         try:
-            with Live(free_table(gather()), console=out, auto_refresh=False) as live:
+            with Live(free_table(gather(), who), console=out, auto_refresh=False) as live:
                 while True:
                     time.sleep(2)
-                    live.update(free_table(gather()), refresh=True)
+                    live.update(free_table(gather(), who), refresh=True)
         except KeyboardInterrupt:
             return
     else:
         with err.status("probing nodes..."):
             rows = gather()
-        out.print(free_table(rows))
+        out.print(free_table(rows, who))
 
 
 # --------------------------------------------------------------------------
@@ -191,7 +192,7 @@ def run(
     ctx: typer.Context,
     gpus: int = typer.Option(1, "-g", "--gpus", help="GPUs needed on one node (0 = CPU job)"),
     name: str = typer.Option("job", "-n", "--name"),
-    center: Optional[str] = typer.Option(None, "-c", "--center"),
+    center: Optional[str] = typer.Option(None, "-c", "--center", help="center name, or 'auto' to pick the freest (laptop)"),
     project: Optional[str] = typer.Option(None, "-p", "--project"),
     node: Optional[str] = typer.Option(None, "--node", help="pin a specific node"),
     require_path: Optional[str] = typer.Option(None, "--require-path", help="path that must exist on the node"),
@@ -209,6 +210,21 @@ def run(
 
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
+        if center == "auto":
+            if require_path:
+                err.print("[red]-c auto cannot honor --require-path: data lives in one "
+                          "center, pick it explicitly[/red]")
+                raise typer.Exit(1)
+            from .remote import best_center
+
+            with err.status("probing all centers..."):
+                rows, _ = fan_json(cfg, ["free"])
+            picked = best_center(rows, gpus)
+            if picked is None:
+                err.print(f"[red]no center has {gpus} free card(s) on one node[/red]")
+                raise typer.Exit(EXIT_NO_GPU)
+            err.print(f"[dim]auto-selected center [bold]{picked}[/bold][/dim]")
+            center = picked
         head = cfg.centers[_laptop_center(cfg, center)]
         argv = ["run", "-g", str(gpus), "-n", name]
         if project:
@@ -434,6 +450,145 @@ def wait(
 
 
 # --------------------------------------------------------------------------
+# info
+# --------------------------------------------------------------------------
+
+INFO_MARK = "@@DT@@"
+
+
+def _parse_marked(text: str, n: int) -> list[str]:
+    """Split probe output on marker lines into exactly n trimmed segments."""
+    segs = [s.strip() for s in text.split(INFO_MARK)]
+    segs += [""] * n
+    return segs[:n]
+
+
+def _fmt_duration(seconds: float) -> str:
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def _fmt_ts(ts: float | None) -> str:
+    if not ts:
+        return "-"
+    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M:%S")
+
+
+def info(
+    ref: str = REF_ARG,
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Everything about one job: state, placement, timeline, artifacts."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref)
+        raise typer.Exit(forward_call(head, ["info", ref] + (["--json"] if json_ else [])))
+
+    entry = _find_or_die(cfg, ref)
+    if entry.status in ("running", "lost"):
+        entry = jobs_mod.refresh_status(cfg, entry)
+
+    live: dict = {}
+    if entry.node != "-":
+        jd = shlex.quote(entry.job_dir)
+        probe = (
+            f"cat {jd}/started_at 2>/dev/null; echo {INFO_MARK}; "
+            f"cat {jd}/finished_at 2>/dev/null; echo {INFO_MARK}; "
+            f"du -sh {jd}/outputs 2>/dev/null | cut -f1; echo {INFO_MARK}; "
+            f"test -f {jd}/code_dirty.patch && echo yes"
+        )
+        try:
+            proc = run_on(entry.node, entry.node_local, probe, timeout=10)
+            started, finished, outputs, patch = _parse_marked(proc.stdout or "", 4)
+            live = {
+                "started_at": float(started) if started.isdigit() else None,
+                "finished_at": float(finished) if finished.isdigit() else None,
+                "outputs_size": outputs or None,
+                "dirty_patch": patch == "yes",
+            }
+        except Exception:
+            live = {"unreachable": True}
+
+    started = live.get("started_at") or entry.started_at
+    finished = live.get("finished_at") or entry.finished_at
+    if started and not finished and entry.status == "running":
+        duration = time.time() - started
+    elif started and finished:
+        duration = finished - started
+    else:
+        duration = None
+
+    data = {
+        "job_id": entry.job_id, "name": entry.name, "status": entry.status,
+        "reason": entry.reason, "center": entry.center, "node": entry.node,
+        "gpus": entry.gpus, "gpus_requested": entry.gpus_requested,
+        "cmd": entry.cmd, "project": entry.project,
+        "git_sha": entry.git_sha, "git_dirty": entry.git_dirty,
+        "queued_at": entry.created_at, "started_at": started,
+        "finished_at": finished, "duration_s": duration,
+        "exit_code": entry.exit_code, "session": entry.session,
+        "job_dir": entry.job_dir, "outputs_size": live.get("outputs_size"),
+        "env_hash": entry.env_hash, "max_hours": entry.max_hours,
+        "require_path": entry.require_path, "pin_node": entry.pin_node,
+        "node_unreachable": live.get("unreachable", False),
+    }
+    if json_:
+        print(json.dumps(data))
+        return
+
+    from rich.table import Table as RTable
+
+    t = RTable(show_header=False, box=None, pad_edge=False)
+    t.add_column(style="bold dim", justify="right")
+    t.add_column()
+    style = {"running": "bold green", "finished": "cyan", "queued": "bold magenta",
+             "killed": "yellow", "lost": "red", "failed": "bold red"}.get(entry.status, "white")
+    status_txt = f"[{style}]{entry.status}[/{style}]"
+    if entry.reason:
+        status_txt += f"  [red]{entry.reason}[/red]"
+    if data["node_unreachable"]:
+        status_txt += "  [yellow](node unreachable, registry view)[/yellow]"
+    if entry.gpus:
+        gpus_txt = ",".join(map(str, entry.gpus))
+    elif entry.gpus_requested == 0:
+        gpus_txt = "cpu"
+    else:
+        gpus_txt = f"({entry.gpus_requested} wanted)"
+    git_txt = (entry.git_sha or "-")[:12] + (" +dirty.patch" if live.get("dirty_patch") else
+                                             " (dirty)" if entry.git_dirty else "")
+    rows = [
+        ("job id", entry.job_id),
+        ("status", status_txt),
+        ("where", f"{entry.center} / {entry.node}" + (f"  pin={entry.pin_node}" if entry.pin_node else "")),
+        ("gpus", gpus_txt),
+        ("cmd", entry.cmd),
+        ("project", f"{entry.project}  git {git_txt}"),
+        ("queued", _fmt_ts(entry.created_at)),
+        ("started", _fmt_ts(started)),
+        ("finished", _fmt_ts(finished)),
+        ("duration", _fmt_duration(duration) if duration is not None else "-"),
+        ("exit code", "-" if entry.exit_code is None else str(entry.exit_code)),
+        ("outputs", data["outputs_size"] or "-"),
+        ("job dir", f"{entry.node}:~/{entry.job_dir}" if entry.node != "-" else "-"),
+        ("session", entry.session),
+        ("env", entry.env_hash or "-"),
+    ]
+    if entry.max_hours:
+        rows.append(("max hours", str(entry.max_hours)))
+    if entry.require_path:
+        rows.append(("require", entry.require_path))
+    for k, v in rows:
+        t.add_row(k, v)
+    out.print(t)
+
+
+# --------------------------------------------------------------------------
 # rerun
 # --------------------------------------------------------------------------
 
@@ -534,19 +689,12 @@ def pull(
     print(dst)
 
 
-def kill(
-    ref: str = REF_ARG,
-    yes: bool = typer.Option(False, "-y", "--yes"),
-    force: bool = typer.Option(False, "--force", help="SIGKILL (for jobs that swallow TERM)"),
-) -> None:
-    """Terminate the whole process group of a job (verifies it actually died)."""
-    cfg = _cfg()
-    if isinstance(cfg, LaptopConfig):
-        _, head = _locate(cfg, ref)
-        argv = ["kill", ref] + (["-y"] if yes else []) + (["--force"] if force else [])
-        raise typer.Exit(forward_call(head, argv, tty=not yes))
-
-    entry = _find_or_die(cfg, ref)
+def _kill_one(cfg: HeadConfig, ref: str, yes: bool, force: bool) -> str:
+    """Returns 'ok' | 'notfound' | 'alive'."""
+    entry = jobs_mod.find(cfg, ref)
+    if entry is None:
+        err.print(f"[red]no job matching {ref!r}[/red]")
+        return "notfound"
     if entry.status == "queued":
         if not yes:
             if not sys.stdin.isatty():
@@ -559,13 +707,13 @@ def kill(
         jobs_mod.save(cfg, entry)
         remove_staging(cfg, entry.job_id)
         err.print(f"[yellow]dequeued {entry.job_id}[/yellow]")
-        return
+        return "ok"
     entry = jobs_mod.refresh_status(cfg, entry)
     # "lost" still gets the kill: the group leader may be dead while children
     # live on (e.g. a child that ignores TERM) - exactly what needs cleanup
     if entry.status not in ("running", "lost"):
         err.print(f"{entry.job_id} is already {entry.status}")
-        return
+        return "ok"
     if not yes:
         if not sys.stdin.isatty():
             err.print("[red]non-interactive kill needs -y[/red]")
@@ -590,10 +738,37 @@ def kill(
             f"[red]group {entry.pgid} on {entry.node} survived {sig}[/red] "
             f"(job stays 'running'; try: dt kill {entry.job_id} -y --force)"
         )
-        raise typer.Exit(1)
+        return "alive"
     entry.status = "killed"
     jobs_mod.save(cfg, entry)
     err.print(f"[yellow]sent {sig} to group {entry.pgid} on {entry.node}; confirmed dead[/yellow]")
+    return "ok"
+
+
+def kill(
+    refs: list[str] = typer.Argument(..., autocompletion=_complete_ref,
+                                     help="one or more job ids / names"),
+    yes: bool = typer.Option(False, "-y", "--yes"),
+    force: bool = typer.Option(False, "--force", help="SIGKILL (for jobs that swallow TERM)"),
+) -> None:
+    """Terminate whole process groups (verifies they actually died)."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        rc = 0
+        argv_tail = (["-y"] if yes else []) + (["--force"] if force else [])
+        for ref in refs:
+            _, head = _locate(cfg, ref)
+            rc |= forward_call(head, ["kill", ref, *argv_tail], tty=not yes)
+        raise typer.Exit(rc)
+
+    cfg = _need_head(cfg)
+    outcomes = [_kill_one(cfg, ref, yes, force) for ref in refs]
+    if all(o == "ok" for o in outcomes):
+        return
+    # single-ref keeps the old exit semantics agents rely on
+    if len(outcomes) == 1 and outcomes[0] == "notfound":
+        raise typer.Exit(EXIT_NOT_FOUND)
+    raise typer.Exit(1)
 
 
 def clean(
@@ -803,6 +978,7 @@ app.command("logs")(logs)
 app.command("l", hidden=True)(logs)
 app.command("attach")(attach)
 app.command("wait")(wait)
+app.command("info")(info)
 app.command("rerun")(rerun)
 app.command("pull")(pull)
 app.command("kill")(kill)

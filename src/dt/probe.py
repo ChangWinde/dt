@@ -15,7 +15,13 @@ from .config import HeadConfig, Node
 from .sshio import run_on
 
 GPU_Q = "nvidia-smi --query-gpu=index,uuid,memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits"
-APP_Q = "nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader"
+# compute apps + owning user (ps resolves each pid; '?' when it just exited)
+APP_Q = (
+    "nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader"
+    " | while IFS=, read -r g p; do p=$(printf %s \"$p\" | tr -d ' ');"
+    " u=$(ps -o user= -p \"$p\" 2>/dev/null | tr -d ' ');"
+    " echo \"$g,$p,${u:-?}\"; done"
+)
 SEP = "---DT---"
 PROBE_CMD = f"{GPU_Q}; echo {SEP}; {APP_Q}"
 CACHE_TTL_S = 3.0
@@ -30,6 +36,7 @@ class Gpu:
     util: int
     procs: int = 0
     free: bool = False
+    users: list[str] = field(default_factory=list)  # owners of compute procs
 
 
 @dataclass
@@ -65,6 +72,9 @@ def parse_probe_output(text: str, mem_threshold_mib: int) -> list[Gpu]:
         uuid = parts[0]
         if uuid in gpus:
             gpus[uuid].procs += 1
+            user = parts[2] if len(parts) > 2 and parts[2] else "?"
+            if user not in gpus[uuid].users:
+                gpus[uuid].users.append(user)
     out = sorted(gpus.values(), key=lambda g: g.index)
     for g in out:
         g.free = g.procs == 0 and g.mem_used < mem_threshold_mib

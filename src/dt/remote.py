@@ -45,6 +45,25 @@ def fan_json(cfg: LaptopConfig, argv: list[str], timeout: float = 60) -> tuple[l
     return rows, errors
 
 
+def best_center(rows: list[dict], gpus: int) -> str | None:
+    """Pick the center for `-c auto`: needs one node with >= gpus free cards;
+    prefer the largest single-node headroom, then total free."""
+    stats: dict[str, tuple[int, int]] = {}  # center -> (best_node_free, total_free)
+    for r in rows:
+        if r.get("error"):
+            continue
+        free = sum(1 for g in r.get("gpus", []) if g.get("free"))
+        c = r.get("center")
+        if not c:
+            continue
+        b, t = stats.get(c, (0, 0))
+        stats[c] = (max(b, free), t + free)
+    fitting = {c: v for c, v in stats.items() if v[0] >= gpus}
+    if not fitting:
+        return None
+    return max(fitting.items(), key=lambda kv: kv[1])[0]
+
+
 def find_center(cfg: LaptopConfig, ref: str) -> tuple[str, str, dict] | None:
     """Locate which center's registry owns a job reference."""
     def one(item: tuple[str, str]):
