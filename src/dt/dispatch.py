@@ -33,8 +33,8 @@ from .sshio import RemoteError, rsync, run_on
 
 PAYLOAD_DIR = Path(__file__).parent / "payload"
 SNAPSHOT_EXCLUDES = [
-    "data/", "checkpoints/", ".venv/", "wandb/", "__pycache__/", ".git/",
-    "*.pyc", ".pytest_cache/",
+    "data/", "checkpoints/", "outputs/", ".venv/", "wandb/", "__pycache__/",
+    ".git/", "*.pyc", ".pytest_cache/",
 ]
 RETRYABLE = {10: "busy", 11: "path-missing", 12: "disk-full", 15: "node-unfit"}
 FATAL = {13: "env-fail", 14: "internal"}
