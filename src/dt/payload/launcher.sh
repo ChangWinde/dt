@@ -70,8 +70,11 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
     UV_ENV="$DT_ENVS_DIR/$lockhash"
     mkdir -p "$DT_ENVS_DIR"
     log "syncing env $lockhash"
+    # only-managed: system interpreters lack dev headers (Python.h), which
+    # breaks sdist builds; uv-managed toolchains ship them (design doc 6)
     if ! flock "$DT_ENVS_DIR/$lockhash.lock" \
         env UV_PROJECT_ENVIRONMENT="$UV_ENV" UV_SYSTEM_CERTS=1 UV_NATIVE_TLS=1 \
+            UV_PYTHON_PREFERENCE=only-managed \
         bash -c "cd '$DT_JOB_DIR/code' && '$UV_BIN' sync --frozen" \
         >>"$DT_JOB_DIR/logs/env.log" 2>&1; then
         log "uv sync failed, see logs/env.log"

@@ -12,6 +12,7 @@ cd "$DT_JOB_DIR/code"
 runner=(bash "$DT_JOB_DIR/cmd.sh")
 if [ -n "${DT_UV_ENV:-}" ]; then
     export UV_PROJECT_ENVIRONMENT="$DT_UV_ENV"
+    export UV_PYTHON_PREFERENCE=only-managed
     runner=("$DT_UV" run --no-sync bash "$DT_JOB_DIR/cmd.sh")
 fi
 
