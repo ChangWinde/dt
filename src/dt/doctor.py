@@ -17,7 +17,21 @@ if [ -x "$HOME/.local/bin/uv" ] || command -v uv >/dev/null 2>&1; then echo DT_U
 if command -v tmux >/dev/null 2>&1; then echo DT_TMUX=ok; else echo DT_TMUX=missing; fi
 if command -v rsync >/dev/null 2>&1; then echo DT_RSYNC=ok; else echo DT_RSYNC=missing; fi
 if command -v flock >/dev/null 2>&1; then echo DT_FLOCK=ok; else echo DT_FLOCK=missing; fi
-if curl -m 3 -sI https://pypi.org >/dev/null 2>&1; then echo DT_NET=ok
+fmt_speed() {
+    awk -v s="${1:-0}" 'BEGIN{
+        if (s >= 1048576) printf "%.0fMB/s", s/1048576;
+        else if (s >= 1024) printf "%.0fKB/s", s/1024;
+        else printf "<1KB/s" }'
+}
+if curl -m 3 -sI https://pypi.org >/dev/null 2>&1; then
+    # reachability is not usability: measure actual download speed
+    spd=$(curl -m 8 -so /dev/null -w "%{speed_download}" https://pypi.org/simple/pip/ 2>/dev/null)
+    label=$(fmt_speed "$spd")
+    if awk -v s="${spd:-0}" 'BEGIN{exit !(s >= 1048576)}'; then
+        echo "DT_NET=ok($label)"
+    else
+        echo "DT_NET=slow($label)"
+    fi
 elif curl -m 3 -sI https://mirrors.aliyun.com/pypi/simple/ >/dev/null 2>&1 \
   || curl -m 3 -sI https://pypi.tuna.tsinghua.edu.cn/simple >/dev/null 2>&1; then echo DT_NET=mirror
 else echo DT_NET=blocked; fi

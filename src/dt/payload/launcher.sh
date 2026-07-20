@@ -27,6 +27,14 @@ esac
 
 mkdir -p "$DT_JOB_DIR/logs"
 
+# Optional egress proxy (config `proxy:`): uv sync + setup hook + the job
+# itself all honor the standard variables. Local traffic stays direct.
+if [ -n "${DT_PROXY:-}" ]; then
+    export HTTP_PROXY="$DT_PROXY" HTTPS_PROXY="$DT_PROXY" \
+           http_proxy="$DT_PROXY" https_proxy="$DT_PROXY" \
+           NO_PROXY="localhost,127.0.0.1" no_proxy="localhost,127.0.0.1"
+fi
+
 # A fresh launcher run supersedes any stale cancel sentinel (a previous
 # dispatch attempt whose ssh dropped may have left one behind).
 rm -f "$DT_JOB_DIR/.dt-cancel"
@@ -139,7 +147,7 @@ start_session() {
     # (Type=forking + kill-server on stop, Linger=no) and every job inside
     # it gets SIGKILLed when the unit stops (seen on psibot-ds).
     tmux -L dt new-session -d -s "$DT_SESSION" \
-        "cd '$DT_JOB_DIR' && env DT_JOB_DIR='$DT_JOB_DIR' CUDA_VISIBLE_DEVICES='$ids' DT_MAX_HOURS='${DT_MAX_HOURS:-}' DT_UV='$UV_BIN' DT_UV_ENV='$UV_ENV' DT_WEBHOOK='${DT_WEBHOOK:-}' DT_CENTER='${DT_CENTER:-}' DT_JOB_ID='${DT_JOB_ID:-}' DT_JOB_NAME='${DT_JOB_NAME:-}' bash wrapper.sh >> logs/stdout.log 2>&1"
+        "cd '$DT_JOB_DIR' && env DT_JOB_DIR='$DT_JOB_DIR' CUDA_VISIBLE_DEVICES='$ids' DT_MAX_HOURS='${DT_MAX_HOURS:-}' DT_UV='$UV_BIN' DT_UV_ENV='$UV_ENV' DT_WEBHOOK='${DT_WEBHOOK:-}' DT_CENTER='${DT_CENTER:-}' DT_JOB_ID='${DT_JOB_ID:-}' DT_JOB_NAME='${DT_JOB_NAME:-}' DT_PROXY='${DT_PROXY:-}' bash wrapper.sh >> logs/stdout.log 2>&1"
 }
 
 # -- 3-6. pick GPUs + launch, atomically per node ----------------------------

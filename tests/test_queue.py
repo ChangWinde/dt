@@ -45,11 +45,13 @@ def test_queue_config_parsed():
         "center": "c", "nodes": ["n1"],
         "queue": {"poll_s": 30, "max_my_jobs": 4, "reserve_free_per_node": 2},
         "webhook": "https://example.com/hook",
+        "proxy": "http://127.0.0.1:7890",
     })
     assert cfg.queue.poll_s == 30
     assert cfg.queue.max_my_jobs == 4
     assert cfg.queue.reserve_free_per_node == 2
     assert cfg.webhook == "https://example.com/hook"
+    assert cfg.proxy == "http://127.0.0.1:7890"
 
 
 def test_queue_config_defaults():

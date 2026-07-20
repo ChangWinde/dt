@@ -921,6 +921,70 @@ def agent_install(
 
 
 # --------------------------------------------------------------------------
+# seed
+# --------------------------------------------------------------------------
+
+def seed(
+    nodes: list[str] = typer.Argument(..., help="compute nodes (from this center's config)"),
+    hf: bool = typer.Option(False, "--hf", help="also seed HF model caches (models--*)"),
+    center: Optional[str] = typer.Option(None, "-c", "--center", help="(laptop) which center"),
+) -> None:
+    """Seed uv wheel cache + managed pythons (+ HF models) from this head to
+    nodes whose own internet is too slow to build heavy envs (dt doctor
+    marks them net=slow). Idempotent: rsync only moves what's missing."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        head = cfg.centers[_laptop_center(cfg, center)]
+        argv = ["seed", *nodes] + (["--hf"] if hf else [])
+        raise typer.Exit(forward_call(head, argv))
+
+    cfg = _need_head(cfg)
+    by_name = {n.name: n for n in cfg.nodes}
+    home = Path.home()
+    pairs = [
+        (home / ".cache/uv", ".cache/uv"),
+        (home / ".local/share/uv/python", ".local/share/uv/python"),
+    ]
+    hf_models = (
+        sorted((home / ".cache/huggingface/hub").glob("models--*")) if hf else []
+    )
+    rc = 0
+    for name in nodes:
+        node = by_name.get(name)
+        if node is None:
+            err.print(f"[red]unknown node {name!r}; configured: {list(by_name)}[/red]")
+            rc = 1
+            continue
+        if node.local:
+            err.print(f"[dim]{name} is this head; skipping[/dim]")
+            continue
+        failed = False
+        for src, rel in pairs:
+            if not src.exists():
+                continue
+            with err.status(f"{name}: seeding {rel} ..."):
+                run_on(name, False, f"mkdir -p {shlex.quote(rel)}", timeout=15)
+                proc = rsync(f"{src}/", f"{name}:{rel}/", timeout=4 * 3600, retries=1)
+            if proc.returncode != 0:
+                err.print(f"[red]{name}: {rel} failed: {(proc.stderr or '').strip()[:120]}[/red]")
+                failed = True
+        if hf_models:
+            run_on(name, False, "mkdir -p .cache/huggingface/hub", timeout=15)
+            for m in hf_models:
+                with err.status(f"{name}: seeding hf {m.name} ..."):
+                    proc = rsync(str(m), f"{name}:.cache/huggingface/hub/",
+                                 timeout=3600, retries=1)
+                if proc.returncode != 0:
+                    err.print(f"[red]{name}: {m.name} failed[/red]")
+                    failed = True
+        if failed:
+            rc = 1
+        else:
+            err.print(f"[green]{name} seeded[/green]")
+    raise typer.Exit(rc)
+
+
+# --------------------------------------------------------------------------
 # doctor / _find
 # --------------------------------------------------------------------------
 
@@ -996,6 +1060,7 @@ app.command("pull")(pull)
 app.command("kill")(kill)
 app.command("k", hidden=True)(kill)
 app.command("clean")(clean)
+app.command("seed")(seed)
 app.command("doctor")(doctor)
 app.add_typer(agent_app, name="agent")
 app.command("_find", hidden=True)(_find)

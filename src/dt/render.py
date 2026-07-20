@@ -116,6 +116,9 @@ def doctor_table(rows: list[dict]) -> Table:
     def paint(v: str) -> str:
         if v.startswith("off"):
             return f"[yellow]{v}[/yellow]" if v == "off" else f"[red]{v}[/red]"
+        if v.startswith("slow"):
+            # reachable but unusably slow (seed caches from the head: dt seed)
+            return f"[yellow]{v}[/yellow]"
         if v in ("ok",) or (v and v not in ("missing", "blocked", "fail", "-")):
             return f"[green]{v}[/green]"
         if v in ("blocked",):

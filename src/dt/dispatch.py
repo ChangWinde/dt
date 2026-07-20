@@ -364,6 +364,8 @@ def launch(
     }
     if cfg.webhook:
         envs["DT_WEBHOOK"] = cfg.webhook
+    if cfg.proxy:
+        envs["DT_PROXY"] = cfg.proxy
     if spec.require_path:
         envs["DT_REQUIRE_PATH"] = spec.require_path
     if spec.max_hours:

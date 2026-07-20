@@ -31,6 +31,14 @@ def test_launcher_setup_hook_contract():
     assert ".dt-setup-" in LAUNCHER
 
 
+def test_proxy_injection_contract():
+    # config `proxy:` must reach both env sync (launcher) and runtime (wrapper)
+    for script in (LAUNCHER, WRAPPER):
+        assert 'HTTPS_PROXY="$DT_PROXY"' in script
+        assert 'NO_PROXY="localhost,127.0.0.1"' in script
+    assert "DT_PROXY='${DT_PROXY:-}'" in LAUNCHER  # forwarded into the tmux session
+
+
 def test_wrapper_unbuffers_logs():
     # block-buffered stdout hides training progress from `dt logs -f`
     assert "PYTHONUNBUFFERED=1" in WRAPPER

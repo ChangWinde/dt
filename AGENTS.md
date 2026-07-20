@@ -69,7 +69,8 @@ dt pull REF [--to DIR] fetch outputs/ back to this head (resumes/retries)
 dt kill REF... [-y] [--force]   running job: TERM (KILL with --force) the
                        group, confirms death; queued job: dequeue
 dt clean --before YYYY-MM-DD [--envs] [-y]   old jobs (+stale shared venvs)
-dt doctor              verify ssh/gpu/uv/tmux/net/agent on all nodes
+dt seed NODE... [--hf] push uv cache/pythons (+HF models) to slow-net nodes
+dt doctor              verify ssh/gpu/uv/tmux/net(+speed)/agent on all nodes
 dt agent status|start|stop|run|install    queue agent lifecycle
 ```
 

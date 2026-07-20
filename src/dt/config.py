@@ -58,6 +58,7 @@ class HeadConfig:
     webhook: str | None = None           # POST job-end notifications here
     snapshot_excludes: list[str] = field(default_factory=list)  # extra rsync excludes
     snapshot_warn_gib: float = 2.0       # warn when a snapshot transfers more
+    proxy: str | None = None             # HTTP(S) proxy injected into jobs (uv sync + runtime)
     role: str = "head"
 
     @property
@@ -170,6 +171,7 @@ def parse(data: dict) -> HeadConfig | LaptopConfig:
             webhook=data.get("webhook"),
             snapshot_excludes=[str(x) for x in (data.get("snapshot_excludes") or [])],
             snapshot_warn_gib=float(data.get("snapshot_warn_gib", 2.0)),
+            proxy=data.get("proxy"),
         )
 
     raise ConfigError("config must contain `centers` (laptop) or `center` (head)")

@@ -70,6 +70,7 @@ if [ ! -f "$CONF" ]; then
 # webhook: https://...     # POST job start/end/fail notifications here
 # snapshot_excludes: [logs/, "*.ckpt"]   # extra rsync excludes on top of defaults
 # snapshot_warn_gib: 2     # warn when a snapshot copies more than this
+# proxy: http://127.0.0.1:7890   # egress proxy injected into jobs (uv sync + runtime)
 # --- laptop role ------------------------------------------------------
 # default_center: psibot
 # centers:

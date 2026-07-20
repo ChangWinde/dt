@@ -13,6 +13,13 @@ cd "$DT_JOB_DIR/code"
 # progress from `dt logs -f` for minutes at a time
 export PYTHONUNBUFFERED=1
 
+# egress proxy for runtime downloads too (HF weights etc.), see launcher.sh
+if [ -n "${DT_PROXY:-}" ]; then
+    export HTTP_PROXY="$DT_PROXY" HTTPS_PROXY="$DT_PROXY" \
+           http_proxy="$DT_PROXY" https_proxy="$DT_PROXY" \
+           NO_PROXY="localhost,127.0.0.1" no_proxy="localhost,127.0.0.1"
+fi
+
 runner=(bash "$DT_JOB_DIR/cmd.sh")
 if [ -n "${DT_UV_ENV:-}" ]; then
     export UV_PROJECT_ENVIRONMENT="$DT_UV_ENV"
