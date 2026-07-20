@@ -64,6 +64,30 @@ if [ "${avail_kb:-0}" -lt $((DT_DISK_GIB * 1024 * 1024)) ]; then
     exit 12
 fi
 
+# -- 1b. cheap busy pre-check, BEFORE the env sync ---------------------------
+# The env flock serializes launchers; on a busy node, agent retries would
+# otherwise hold it almost continuously and a "busy" verdict could take
+# minutes. Advisory only - the authoritative recheck stays inside the
+# launch lock below.
+quick_free_count() {
+    local busy
+    busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
+    nvidia-smi --query-gpu=index,uuid,memory.used --format=csv,noheader,nounits 2>/dev/null \
+    | while IFS=, read -r idx uuid used; do
+        uuid=${uuid// /}; used=${used// /}
+        if [ "$used" -lt "$DT_MEM_MIB" ] && ! grep -qF "$uuid" <<<"$busy"; then
+            echo x
+        fi
+    done | wc -l
+}
+if [ "$DT_GPUS" -gt 0 ]; then
+    nfree=$(quick_free_count)
+    if [ "${nfree:-0}" -lt $((DT_GPUS + DT_RESERVE)) ]; then
+        log "busy (pre-check): need $DT_GPUS free GPUs (+$DT_RESERVE reserved), found ${nfree:-0}"
+        exit 10
+    fi
+fi
+
 # -- 2. environment (shared per uv.lock hash, own lock; slow first sync must
 #       not hold the launch lock) -------------------------------------------
 UV_BIN="$HOME/.local/bin/uv"

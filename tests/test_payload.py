@@ -11,6 +11,14 @@ LAUNCHER = (PAYLOAD / "launcher.sh").read_text()
 WRAPPER = (PAYLOAD / "wrapper.sh").read_text()
 
 
+def test_launcher_prechecks_busy_before_env_sync():
+    # a busy verdict must not wait behind the env flock (agent retries hold
+    # it nearly continuously on a busy node)
+    pre = LAUNCHER.find("busy (pre-check)")
+    sync = LAUNCHER.find("syncing env")
+    assert 0 < pre < sync
+
+
 def test_launcher_uses_dedicated_tmux_server():
     # user tmux servers can be systemd-managed (kill-server on stop):
     # jobs must live on dt's own socket
