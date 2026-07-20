@@ -385,10 +385,11 @@ def attach(ref: str = REF_ARG) -> None:
         forward_exec(head, ["attach", ref], tty=True)
     entry = _find_or_die(cfg, ref)
     _refuse_unplaced(entry, "tmux session")
+    # -L dt: jobs live on dt's dedicated tmux server (see launcher.sh)
     if entry.node_local:
-        os.execvp("tmux", ["tmux", "attach", "-t", entry.session])
+        os.execvp("tmux", ["tmux", "-L", "dt", "attach", "-t", entry.session])
     os.execvp("ssh", [*SSH_BASE, "-t", entry.node,
-                      f"tmux attach -t {shlex.quote(entry.session)}"])
+                      f"tmux -L dt attach -t {shlex.quote(entry.session)}"])
 
 
 def wait(

@@ -116,7 +116,11 @@ probe_ok() {
 
 start_session() {
     local ids=$1
-    tmux new-session -d -s "$DT_SESSION" \
+    # -L dt: dedicated socket = dedicated tmux server. Never join the user's
+    # own server: on some nodes it is managed by a systemd user unit
+    # (Type=forking + kill-server on stop, Linger=no) and every job inside
+    # it gets SIGKILLed when the unit stops (seen on psibot-ds).
+    tmux -L dt new-session -d -s "$DT_SESSION" \
         "cd '$DT_JOB_DIR' && env DT_JOB_DIR='$DT_JOB_DIR' CUDA_VISIBLE_DEVICES='$ids' DT_MAX_HOURS='${DT_MAX_HOURS:-}' DT_UV='$UV_BIN' DT_UV_ENV='$UV_ENV' DT_WEBHOOK='${DT_WEBHOOK:-}' DT_CENTER='${DT_CENTER:-}' DT_JOB_ID='${DT_JOB_ID:-}' DT_JOB_NAME='${DT_JOB_NAME:-}' bash wrapper.sh >> logs/stdout.log 2>&1"
 }
 
@@ -178,7 +182,7 @@ for _ in $(seq 1 20); do
 done
 if [ -z "$pgid" ]; then
     log "wrapper did not start (no pgid file); check logs/stdout.log"
-    tmux kill-session -t "$DT_SESSION" 2>/dev/null
+    tmux -L dt kill-session -t "$DT_SESSION" 2>/dev/null
     exit 14
 fi
 

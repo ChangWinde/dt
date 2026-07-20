@@ -393,7 +393,7 @@ def _cancel_orphan(node: Node, job_dir: str, session: str) -> None:
     start) and kill the session in case it already exists."""
     cmd = (
         f"touch {shlex.quote(job_dir)}/.dt-cancel 2>/dev/null; "
-        f"tmux kill-session -t {shlex.quote(session)} 2>/dev/null; true"
+        f"tmux -L dt kill-session -t {shlex.quote(session)} 2>/dev/null; true"
     )
     try:
         run_on(node.name, node.local, cmd, timeout=10)
