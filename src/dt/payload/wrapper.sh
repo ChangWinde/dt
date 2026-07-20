@@ -23,6 +23,17 @@ else
 fi
 rc=$?
 
+# Reap stragglers that escaped the process group (frameworks calling
+# setpgrp/setsid - seen with omnistack-train): the job is over, so anything
+# still running with cwd inside this job dir is a leak. Never kill ourselves.
+for p in /proc/[0-9]*; do
+    pid="${p#/proc/}"
+    [ "$pid" = "$$" ] && continue
+    case "$(readlink "$p/cwd" 2>/dev/null)" in
+        "$DT_JOB_DIR"|"$DT_JOB_DIR"/*) kill -TERM "$pid" 2>/dev/null;;
+    esac
+done
+
 echo $rc > "$DT_JOB_DIR/exit_code"
 date +%s > "$DT_JOB_DIR/finished_at"
 

@@ -721,16 +721,27 @@ def _kill_one(cfg: HeadConfig, ref: str, yes: bool, force: bool) -> str:
             raise typer.Exit(1)
         typer.confirm(f"kill {entry.job_id} (pgid {entry.pgid} on {entry.node})?", abort=True)
     sig = "KILL" if force else "TERM"
-    # explicit bash: `kill -- -pgid` (negative = whole group) parses
-    # differently in some login shells' kill builtins; then confirm death
-    # (training scripts sometimes swallow TERM)
-    probe = (
-        f"bash -c 'kill -{sig} -- -{entry.pgid}; "
-        f"for i in 1 2 3 4 5 6; do sleep 0.5; "
-        # -0 on the *group*: catches children that outlive a dead leader
-        f"kill -0 -- -{entry.pgid} 2>/dev/null || {{ echo DEAD; exit 0; }}; done; "
-        f"echo ALIVE'"
+    # Two nets, then verify death (training scripts sometimes swallow TERM):
+    # 1. the process group (kill -- -pgid, in bash: login shells parse it
+    #    differently), 2. a job-dir sweep - frameworks that call setpgrp
+    #    (seen: omnistack-train) escape the group, but every process of this
+    #    job runs with cwd inside its job dir.
+    script = (
+        'list() { pgrep -g "$DT_KPG" 2>/dev/null; '
+        'for p in /proc/[0-9]*; do '
+        'case "$(readlink "$p/cwd" 2>/dev/null)" in "$DT_KJD"|"$DT_KJD"/*) echo "${p#/proc/}";; esac; '
+        "done; }; "
+        'kill -"$DT_KSIG" -- -"$DT_KPG" 2>/dev/null; '
+        'for pid in $(list | sort -u); do kill -"$DT_KSIG" "$pid" 2>/dev/null; done; '
+        "for i in 1 2 3 4 5 6; do sleep 0.5; "
+        '[ -z "$(list)" ] && { echo DEAD; exit 0; }; done; '
+        "echo ALIVE"
     )
+    envs = (
+        f"DT_KJD=$HOME/{shlex.quote(entry.job_dir)} "
+        f"DT_KPG={entry.pgid} DT_KSIG={sig}"
+    )
+    probe = f"env {envs} bash -c {shlex.quote(script)}"
     proc = run_on(entry.node, entry.node_local, probe, timeout=20)
     verdict = (proc.stdout or "").strip().splitlines()
     verdict = verdict[-1] if verdict else "UNKNOWN"
