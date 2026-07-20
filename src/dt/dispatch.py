@@ -163,6 +163,18 @@ def git_info(project_dir: Path) -> tuple[str | None, bool, str | None]:
     return sha, dirty, diff
 
 
+def pin_is_busy(statuses: list[NodeStatus], spec: RunSpec) -> bool:
+    """True when a pinned node's probe succeeded and shows too few free GPUs.
+    Callers use this to queue immediately instead of paying a full
+    snapshot+launch round-trip that the launcher will refuse anyway."""
+    if not spec.node or spec.gpus <= 0:
+        return False
+    st = next((s for s in statuses if s.node == spec.node), None)
+    if st is None or st.error is not None:
+        return False  # unknown state: let the launcher decide
+    return len(st.free_gpus) < spec.gpus
+
+
 def pick_candidates(
     statuses: list[NodeStatus], nodes: list[Node], spec: RunSpec, reserve: int = 0
 ) -> list[Node]:
@@ -562,6 +574,8 @@ def submit(cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = Fals
         for s in statuses
         if spec.node is None or s.node == spec.node  # pinned: others not tried
     }
+    if pin_is_busy(statuses, spec):
+        candidates = []  # visibly busy pin: skip the snapshot+launch round-trip
     if not candidates:
         if no_queue:
             raise NoCapacity(probe_reasons)

@@ -101,6 +101,23 @@ def test_pinned_submit_probes_only_the_pin(tmp_path, monkeypatch):
     assert entry.status == "queued"
 
 
+def test_pin_is_busy_classifier():
+    from dt.dispatch import RunSpec, pin_is_busy
+    from dt.probe import Gpu, NodeStatus
+
+    busy = NodeStatus(node="n1", gpus=[Gpu(index=0, uuid="u", mem_used=70000,
+                                           mem_total=81920, util=99, procs=1, free=False)])
+    free = NodeStatus(node="n1", gpus=[Gpu(index=0, uuid="u", mem_used=3,
+                                           mem_total=81920, util=0, procs=0, free=True)])
+    err = NodeStatus(node="n1", error="ssh timeout")
+    spec = RunSpec(name="j", gpus=1, cmd=["true"], node="n1")
+    assert pin_is_busy([busy], spec)
+    assert not pin_is_busy([free], spec)
+    assert not pin_is_busy([err], spec)      # unknown: launcher decides
+    assert not pin_is_busy([busy], RunSpec(name="j", gpus=0, cmd=["true"], node="n1"))
+    assert not pin_is_busy([busy], RunSpec(name="j", gpus=1, cmd=["true"]))  # unpinned
+
+
 def test_rsync_has_stall_guards(monkeypatch):
     import subprocess
 
