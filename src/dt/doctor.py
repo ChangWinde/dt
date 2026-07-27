@@ -7,7 +7,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 from .config import HeadConfig, Node
-from .sshio import run_on
+from .sshio import RemoteError, run_on
 
 CHECK_SNIPPET = r"""
 echo DT_SSH=ok
@@ -17,6 +17,8 @@ if [ -x "$HOME/.local/bin/uv" ] || command -v uv >/dev/null 2>&1; then echo DT_U
 if command -v tmux >/dev/null 2>&1; then echo DT_TMUX=ok; else echo DT_TMUX=missing; fi
 if command -v rsync >/dev/null 2>&1; then echo DT_RSYNC=ok; else echo DT_RSYNC=missing; fi
 if command -v flock >/dev/null 2>&1; then echo DT_FLOCK=ok; else echo DT_FLOCK=missing; fi
+if command -v python3 >/dev/null 2>&1; then echo DT_PYTHON3=ok; else echo DT_PYTHON3=missing; fi
+if command -v timeout >/dev/null 2>&1; then echo DT_TIMEOUT=ok; else echo DT_TIMEOUT=missing; fi
 fmt_speed() {
     awk -v s="${1:-0}" 'BEGIN{
         if (s >= 1048576) printf "%.0fMB/s", s/1048576;
@@ -43,16 +45,24 @@ def check_node(node: Node) -> dict:
     try:
         proc = run_on(node.name, node.local, CHECK_SNIPPET, timeout=20)
     except Exception as e:
-        return {"node": node.name, "checks": {"ssh": f"fail: {e}"}}
+        return {
+            "node": node.name,
+            "checks": {"ssh": f"fail: {e}"},
+            "unreachable": isinstance(e, (RemoteError, OSError)),
+        }
     if proc.returncode != 0 and "DT_SSH=ok" not in proc.stdout:
         msg = (proc.stderr or "").strip().splitlines()
-        return {"node": node.name, "checks": {"ssh": msg[-1][:40] if msg else "fail"}}
+        return {
+            "node": node.name,
+            "checks": {"ssh": msg[-1] if msg else "fail"},
+            "unreachable": proc.returncode == 255,
+        }
     for line in proc.stdout.splitlines():
         if line.startswith("DT_") and "=" in line:
             key, _, val = line.partition("=")
             checks[key[3:].lower()] = val.strip() or "missing"
     checks.setdefault("ssh", "ok")
-    return {"node": node.name, "checks": checks}
+    return {"node": node.name, "checks": checks, "unreachable": False}
 
 
 def doctor_center(cfg: HeadConfig) -> list[dict]:

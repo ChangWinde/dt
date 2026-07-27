@@ -8,7 +8,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
+
+from .jobs import CANCEL_UNVERIFIED_PREFIX
 
 out = Console()
 err = Console(stderr=True)
@@ -41,78 +44,588 @@ def compress_indices(indices: list[int]) -> str:
 
 def busy_owners(gpus: list[dict]) -> str:
     """'alice×3 bob×1' - who occupies the busy cards, by card count."""
+
+    def lease_label(job_id: str) -> str:
+        prefix, separator, rest = job_id.partition("_")
+        if (
+            separator
+            and len(prefix) == 13
+            and prefix[8:9] == "-"
+            and prefix.replace("-", "").isdigit()
+        ):
+            name, suffix_separator, _suffix = rest.rpartition("_")
+            if suffix_separator and name:
+                return f"dt:{name}"
+        return f"dt:{job_id}"
+
     counts: dict[str, int] = {}
     for g in gpus:
         if g.get("free"):
             continue
-        if not g.get("procs"):
+        if not g.get("procs") and not g.get("leased"):
             continue  # busy by leftover memory only: no owner to blame
-        for u in (g.get("users") or ["?"]):
+        lease_owner = g.get("lease_owner")
+        owners = (
+            [lease_label(lease_owner)]
+            if g.get("leased") and isinstance(lease_owner, str) and lease_owner
+            else (g.get("users") or ["?"])
+        )
+        for u in owners:
             counts[u] = counts.get(u, 0) + 1
-    return " ".join(f"{u}\u00d7{n}" for u, n in
-                    sorted(counts.items(), key=lambda kv: -kv[1]))
+    return " ".join(
+        f"{u}\u00d7{n}" for u, n in sorted(counts.items(), key=lambda kv: -kv[1])
+    )
+
+
+def _gib(mib: float) -> str:
+    gib = mib / 1024
+    return f"{gib:.0f}" if gib >= 10 else f"{gib:.1f}"
+
+
+def _disk_gib(gib: float) -> str:
+    return f"{gib / 1024:.1f}T" if gib >= 1024 else f"{gib:.0f}G"
+
+
+DISK_LOW_FREE_GIB = 20.0
+DISK_LOW_FREE_FRACTION = 0.05
+GPU_PULSE_MEMORY_MIB = 512
+
+
+def _reserved_zero_util_label(gpus: list[dict]) -> str | None:
+    """Distinguish untouched leases from CPU/GPU pulse workloads.
+
+    A lease without a currently visible CUDA process can mean either the
+    wrapper is still initializing or a simulator/data workload releases its
+    short-lived GPU process between bursts.  Retained VRAM is the inexpensive
+    signal available in the existing probe that the latter has touched CUDA.
+    """
+    reserved = [
+        gpu
+        for gpu in gpus
+        if gpu.get("leased") and not gpu.get("procs") and gpu.get("util") == 0
+    ]
+    if not reserved:
+        return None
+    touched_cuda = any(
+        isinstance(gpu.get("mem_used"), (int, float))
+        and not isinstance(gpu.get("mem_used"), bool)
+        and float(gpu["mem_used"]) >= GPU_PULSE_MEMORY_MIB
+        for gpu in reserved
+    )
+    return "pulse" if touched_cuda else "init"
+
+
+def _disk_low_headroom(system: dict) -> tuple[bool, float | None]:
+    free = system.get("disk_free_gib")
+    total = system.get("disk_total_gib")
+    if (
+        not isinstance(free, (int, float))
+        or isinstance(free, bool)
+        or not isinstance(total, (int, float))
+        or isinstance(total, bool)
+        or total <= 0
+    ):
+        return False, None
+    fraction = max(0.0, float(free)) / float(total)
+    return (
+        float(free) < DISK_LOW_FREE_GIB or fraction < DISK_LOW_FREE_FRACTION,
+        fraction,
+    )
+
+
+def _compact_remote_error(value: object) -> str:
+    """Short human label; machine output retains the original error."""
+    text = str(value)
+    lowered = text.lower()
+    if "no route to host" in lowered:
+        return "offline: no route"
+    if "timed out" in lowered or "timeout" in lowered:
+        return "offline: timeout"
+    if "connection refused" in lowered:
+        return "offline: refused"
+    if (
+        "could not resolve hostname" in lowered
+        or "name or service not known" in lowered
+    ):
+        return "offline: DNS"
+    if (
+        "wrapper pid " in lowered
+        and " is not running" in lowered
+        and "exit_code is missing" in lowered
+    ):
+        return "exit marker missing"
+    return text
 
 
 def free_table(rows: list[dict], who: bool = False) -> Table:
-    t = Table(title=None, header_style="bold")
-    cols = ["center", "node", "free/total", "free gpus"]
-    cols.append("in use by" if who else "note")
-    for col in cols:
-        t.add_column(col)
+    t = Table(
+        title=None,
+        header_style="bold",
+        box=None,
+        padding=(0, 1),
+        collapse_padding=True,
+        pad_edge=False,
+    )
+    one_center = len({r.get("center") for r in rows}) <= 1
+    t.add_column(
+        "node" if one_center else "target",
+        no_wrap=True,
+        overflow="ellipsis",
+        min_width=9,
+        max_width=18,
+    )
+    t.add_column(
+        "GPU free",
+        no_wrap=True,
+        overflow="ellipsis",
+        min_width=8,
+        max_width=11,
+    )
+    t.add_column("load", no_wrap=True, overflow="ellipsis", min_width=5, max_width=9)
+    t.add_column(
+        "VRAM free",
+        no_wrap=True,
+        overflow="ellipsis",
+        min_width=9,
+        max_width=11,
+    )
+    t.add_column("CPU", no_wrap=True, overflow="ellipsis", min_width=6, max_width=8)
+    t.add_column("RAM", no_wrap=True, overflow="ellipsis", min_width=3, max_width=11)
+    t.add_column("disk", no_wrap=True, overflow="ellipsis", min_width=4, max_width=7)
+    t.add_column(
+        "IO / issue",
+        no_wrap=True,
+        overflow="ellipsis",
+        min_width=4,
+        max_width=17,
+    )
+    if who:
+        t.add_column(
+            "in use",
+            no_wrap=True,
+            overflow="ellipsis",
+            min_width=5,
+            max_width=12,
+        )
     for r in rows:
+        target = r["node"] if one_center else f"{r['center']}/{r['node']}"
         if r.get("error"):
-            t.add_row(r["center"], r["node"], "-", "-", f"[red]{r['error']}[/red]")
+            issue_text = _compact_remote_error(r["error"])
+            if issue_text.startswith("offline: "):
+                issue_text = issue_text.removeprefix("offline: ")
+            issue = escape(issue_text)
+            values = [
+                target,
+                "[red]offline[/red]",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                f"[red]{issue}[/red]",
+            ]
+            if who:
+                values.append("")
+            t.add_row(*values)
             continue
         gpus = r.get("gpus", [])
         free = [g for g in gpus if g.get("free")]
         idx = compress_indices([g["index"] for g in free])
-        style = "green" if free else "dim"
-        t.add_row(
-            r["center"],
-            r["node"],
-            f"[{style}]{len(free)}/{len(gpus)}[/{style}]",
-            f"[{style}]{idx}[/{style}]",
-            f"[dim]{busy_owners(gpus)}[/dim]" if who else "",
+        utils = [
+            float(g["util"])
+            for g in gpus
+            if isinstance(g.get("util"), (int, float))
+            and not isinstance(g.get("util"), bool)
+        ]
+        temperatures = [
+            int(g["temperature"])
+            for g in gpus
+            if isinstance(g.get("temperature"), int)
+            and not isinstance(g.get("temperature"), bool)
+        ]
+        reserved_label = _reserved_zero_util_label(gpus)
+        util_text = (
+            reserved_label
+            if reserved_label is not None and (not utils or max(utils) == 0)
+            else (f"{max(utils):.0f}%" if utils else "-")
         )
+        temperature_text = f"{max(temperatures)}°" if temperatures else "-"
+        load = f"{util_text}/{temperature_text}" if utils or temperatures else "-"
+        mem_total = sum(g.get("mem_total", 0) for g in gpus)
+        mem_free = sum(
+            max(0, g.get("mem_total", 0) - g.get("mem_used", 0)) for g in gpus
+        )
+        vram = f"{_gib(mem_free)}/{_gib(mem_total)}G" if mem_total else "-"
+        system = r.get("system") or {}
+        cpu = (
+            f"{system['cpu_load1']:.1f}/{system['cpu_cores']}"
+            if system.get("cpu_cores")
+            else "-"
+        )
+        mem_total_mib = system.get("mem_total_mib", 0)
+        ram = (
+            f"{_gib(system.get('mem_used_mib', 0))}/{_gib(mem_total_mib)}G"
+            if mem_total_mib
+            else "-"
+        )
+        disk_low, disk_free_fraction = _disk_low_headroom(system)
+        disk = "-"
+        if system.get("disk_total_gib"):
+            disk = _disk_gib(system["disk_free_gib"])
+            if disk_low:
+                disk = f"[yellow]{disk}![/yellow]"
+        io_pressure = system.get("io_pressure")
+        io = f"{io_pressure:.1f}%" if io_pressure is not None else "-"
+        if r.get("gpu_inventory_error"):
+            io = "[yellow]GPU inventory![/yellow]"
+        elif disk_low and disk_free_fraction is not None:
+            io = f"[yellow]disk {disk_free_fraction * 100:.1f}%[/yellow]"
+        style = "green" if free else "dim"
+        availability = f"{len(free)}/{len(gpus)}"
+        if free:
+            availability += f" [{idx}]"
+        values = [
+            target,
+            f"[{style}]{availability}[/{style}]",
+            load,
+            vram,
+            cpu,
+            ram,
+            disk,
+            io,
+        ]
+        if who:
+            values.append(f"[dim]{busy_owners(gpus)}[/dim]")
+        t.add_row(*values)
     return t
 
 
-def ps_table(rows: list[dict]) -> Table:
-    t = Table(header_style="bold")
-    for col in ("name", "job id", "center", "node", "gpus", "status", "exit", "created", "cmd"):
-        t.add_column(col)
+def _job_display_status(row: dict) -> tuple[str, str]:
+    status = row.get("status", "?")
+    display_status = status
+    display_style = STATUS_STYLE.get(status, "white")
+    reason = row.get("reason")
+    if status == "queued" and isinstance(reason, str):
+        if reason.startswith("waiting:") and "unreachable:" in reason:
+            display_status = "queued offline"
+            display_style = "yellow"
+        elif reason.startswith("blocked:"):
+            display_status = "queued blocked"
+            display_style = "yellow"
+    queue_position = row.get("queue_position")
+    queue_depth = row.get("queue_depth")
+    if (
+        status == "queued"
+        and isinstance(queue_position, int)
+        and isinstance(queue_depth, int)
+    ):
+        display_status += f" #{queue_position}/{queue_depth}"
+    if status == "running" and row.get("node_unreachable"):
+        display_status = "running? offline"
+        display_style = "yellow"
+    if (
+        status == "running"
+        and isinstance(reason, str)
+        and reason.startswith(CANCEL_UNVERIFIED_PREFIX)
+    ):
+        display_status += " cancel!"
+        display_style = "red"
+    if status == "running" and row.get("max_hours_exceeded"):
+        display_status += " >max"
+        display_style = "yellow"
+    return display_status, display_style
+
+
+def ps_table(
+    rows: list[dict],
+    wide: bool = False,
+    caption: str | None = None,
+    show_progress: bool = False,
+    show_issue: bool = False,
+) -> Table:
+    """Render jobs densely by default; full identity/command only on request."""
+    one_center = len({r.get("center") for r in rows}) <= 1
+    detailed = show_progress or show_issue
+    compact_status_width = 7 if show_progress else 11
+    for row in rows:
+        status_text, _ = _job_display_status(row)
+        exit_code = row.get("exit_code")
+        if exit_code is not None:
+            status_text += f"/{exit_code}"
+        compact_status_width = min(
+            22,
+            max(compact_status_width, len(status_text)),
+        )
+    t = Table(
+        header_style="bold",
+        box=None,
+        padding=(0, 1),
+        pad_edge=False,
+        caption=caption,
+        caption_justify="left",
+    )
+    if wide:
+        for col in (
+            "name",
+            "job id",
+            "center",
+            "node",
+            "live" if show_progress else "gpus",
+            "status",
+            "exit",
+            "created",
+            *(
+                ("progress / issue",)
+                if show_progress
+                else ("issue",)
+                if show_issue
+                else ()
+            ),
+            "cmd",
+        ):
+            t.add_column(col, no_wrap=True, overflow="ellipsis")
+    else:
+        t.add_column(
+            "name",
+            no_wrap=True,
+            overflow="ellipsis",
+            min_width=8 if detailed else 12,
+            max_width=(
+                (17 if one_center else 15) if detailed else (34 if one_center else 26)
+            ),
+        )
+        t.add_column(
+            "node" if one_center else "target",
+            no_wrap=True,
+            overflow="ellipsis",
+            min_width=9 if one_center else 12,
+            max_width=10 if one_center else 18,
+        )
+        t.add_column(
+            "live" if show_progress else "GPU",
+            no_wrap=True,
+            overflow="ellipsis",
+            min_width=17 if show_progress else 3,
+            max_width=17 if show_progress else 6,
+        )
+        t.add_column(
+            "status/exit",
+            no_wrap=True,
+            overflow="ellipsis",
+            min_width=compact_status_width,
+            max_width=22,
+        )
+        if show_progress:
+            t.add_column(
+                "progress",
+                no_wrap=True,
+                overflow="ellipsis",
+                min_width=13,
+                max_width=25,
+            )
+        elif show_issue:
+            t.add_column(
+                "issue",
+                no_wrap=True,
+                overflow="ellipsis",
+                min_width=13,
+                max_width=32,
+            )
+        else:
+            t.add_column(
+                "when",
+                no_wrap=True,
+                overflow="ellipsis",
+                min_width=5,
+                max_width=5,
+            )
+    if not rows:
+        t.add_row("[dim]no matching jobs[/dim]", *([""] * (len(t.columns) - 1)))
+        return t
     for r in sorted(rows, key=lambda x: x.get("created_at", 0)):
         status = r.get("status", "?")
-        style = STATUS_STYLE.get(status, "white")
-        created = datetime.fromtimestamp(r["created_at"]).strftime("%m-%d %H:%M") \
-            if r.get("created_at") else "-"
+        created_at = (
+            datetime.fromtimestamp(r["created_at"]) if r.get("created_at") else None
+        )
+        created = created_at.strftime("%m-%d %H:%M") if created_at else "-"
+        when = (
+            created_at.strftime("%H:%M")
+            if created_at and created_at.date() == datetime.now().date()
+            else (created_at.strftime("%m-%d") if created_at else "-")
+        )
         cmd = r.get("cmd", "")
         if len(cmd) > 48:
             cmd = cmd[:45] + "..."
         gpus = ",".join(str(g) for g in r.get("gpus", []))
         if not gpus:
             # queued: show how many cards the job wants
-            gpus = f"({r.get('gpus_requested', '?')} wanted)" if status == "queued" else "-"
-        t.add_row(
-            r.get("name", "?"),
-            r.get("job_id", "?"),
-            r.get("center", "?"),
-            r.get("node", "?"),
-            gpus,
-            f"[{style}]{status}[/{style}]",
-            "" if r.get("exit_code") is None else str(r["exit_code"]),
-            created,
-            cmd,
+            gpus = f"want:{r.get('gpus_requested', '?')}" if status == "queued" else "-"
+        if show_progress:
+            assigned = r.get("gpus") or []
+            resources = r.get("resources")
+            if status == "running" and isinstance(resources, dict):
+                if resources.get("error"):
+                    gpus = "[yellow]!probe[/yellow]"
+                elif not assigned:
+                    system = resources.get("system")
+                    if isinstance(system, dict):
+                        load = system.get("cpu_load1")
+                        used = system.get("mem_used_mib")
+                        io = system.get("io_pressure")
+                        load_text = (
+                            f"{float(load):.1f}"
+                            if isinstance(load, (int, float))
+                            and not isinstance(load, bool)
+                            else "-"
+                        )
+                        ram_text = (
+                            f"{_gib(float(used))}G"
+                            if isinstance(used, (int, float))
+                            and not isinstance(used, bool)
+                            else "-"
+                        )
+                        io_text = (
+                            f"{float(io):.1f}%"
+                            if isinstance(io, (int, float)) and not isinstance(io, bool)
+                            else "-"
+                        )
+                        gpus = f"C{load_text}/R{ram_text}/I{io_text}"
+                    else:
+                        gpus = "cpu:…"
+                else:
+                    live_gpus = [
+                        gpu
+                        for gpu in (resources.get("gpus") or [])
+                        if isinstance(gpu, dict)
+                    ]
+                    if live_gpus:
+                        indices = ",".join(
+                            str(gpu.get("index", "?")) for gpu in live_gpus
+                        )
+                        utils = [
+                            float(gpu["util"])
+                            for gpu in live_gpus
+                            if isinstance(gpu.get("util"), (int, float))
+                        ]
+                        used_mib = sum(
+                            float(gpu.get("mem_used", 0)) for gpu in live_gpus
+                        )
+                        temperatures = [
+                            int(gpu["temperature"])
+                            for gpu in live_gpus
+                            if isinstance(gpu.get("temperature"), int)
+                        ]
+                        reserved_label = _reserved_zero_util_label(live_gpus)
+                        util_text = (
+                            reserved_label
+                            if reserved_label is not None
+                            and (not utils or max(utils) == 0)
+                            else (f"{sum(utils) / len(utils):.0f}%" if utils else "-")
+                        )
+                        gpus = f"{indices}:{util_text}/{_gib(used_mib)}G"
+                        if temperatures:
+                            gpus += f"/{max(temperatures)}°"
+                    else:
+                        gpus = f"{gpus}:…"
+            elif not assigned and status == "running":
+                gpus = "cpu:…"
+        exit_code = r.get("exit_code")
+        display_status, display_style = _job_display_status(r)
+        progress = r.get("progress")
+        progress_parts: list[str] = []
+        if isinstance(progress, dict):
+            step = progress.get("step")
+            total = progress.get("total_steps")
+            if isinstance(step, int):
+                step_text = f"{step:,}"
+                if isinstance(total, int):
+                    step_text += f"/{total:,}"
+                progress_parts.append(f"step {step_text}" if wide else step_text)
+            elif (
+                status == "running"
+                and isinstance(total, int)
+                and not isinstance(total, bool)
+            ):
+                progress_parts.append(
+                    f"pre-step · target {total:,}" if wide else f"pre-step /{total:,}"
+                )
+            percent = progress.get("percent")
+            if isinstance(percent, (int, float)) and not isinstance(percent, bool):
+                progress_parts.append(
+                    (f"{float(percent):g}%" if wide else f"{float(percent):.0f}%")
+                )
+            eta = progress.get("eta")
+            if isinstance(eta, str) and eta:
+                progress_parts.append(f"ETA {escape(eta)}")
+            samples = progress.get("samples_per_sec")
+            if isinstance(samples, (int, float)) and not isinstance(samples, bool):
+                progress_parts.append(f"{float(samples):g}/s")
+        reason_issue = (
+            r.get("reason") if status in ("queued", "failed", "lost") else None
         )
+        issue = r.get("progress_error") or reason_issue or r.get("status_probe_error")
+        if not issue and status == "lost":
+            # Old registries may predate persisted lost diagnostics. Keep the
+            # table actionable without inventing detail in machine output.
+            issue = "exit marker missing"
+        if (
+            not issue
+            and status == "finished"
+            and isinstance(exit_code, int)
+            and exit_code != 0
+        ):
+            # Keep --issues local and fast: tell the operator how to inspect
+            # the failure without adding one remote log fetch per table row.
+            issue = "dt logs REF"
+        if not issue and r.get("max_hours_exceeded"):
+            issue = "max-hours exceeded"
+        progress_text = (" · " if wide else " ").join(progress_parts)
+        if not progress_text and issue:
+            compact_issue = _compact_remote_error(issue)
+            if "offline" in display_status and compact_issue.startswith("offline: "):
+                compact_issue = compact_issue.removeprefix("offline: ")
+            progress_text = f"[yellow]{escape(compact_issue)}[/yellow]"
+        if not progress_text:
+            progress_text = "-"
+        if wide:
+            display_node = r.get("node", "?")
+            if display_node in (None, "-", "?"):
+                display_node = r.get("pin_node") or display_node
+            values = [
+                r.get("name", "?"),
+                r.get("job_id", "?"),
+                r.get("center", "?"),
+                display_node,
+                gpus,
+                f"[{display_style}]{display_status}[/{display_style}]",
+                "" if exit_code is None else str(exit_code),
+                created,
+            ]
+            if detailed:
+                values.append(progress_text)
+            values.append(cmd)
+            t.add_row(*values)
+        else:
+            display_node = r.get("node", "?")
+            if display_node in (None, "-", "?"):
+                display_node = r.get("pin_node") or display_node
+            target = (
+                display_node if one_center else f"{r.get('center', '?')}/{display_node}"
+            )
+            result = (
+                display_status if exit_code is None else f"{display_status}/{exit_code}"
+            )
+            t.add_row(
+                r.get("name", "?"),
+                target,
+                gpus,
+                f"[{display_style}]{result}[/{display_style}]",
+                progress_text if detailed else when,
+            )
     return t
 
 
 def doctor_table(rows: list[dict]) -> Table:
-    t = Table(header_style="bold")
-    cols = ("center", "node", "ssh", "gpu/driver", "uv", "tmux", "rsync", "flock", "net", "agent", "dt")
-    for col in cols:
-        t.add_column(col)
-
     def paint(v: str) -> str:
         if v.startswith("off"):
             return f"[yellow]{v}[/yellow]" if v == "off" else f"[red]{v}[/red]"
@@ -127,19 +640,75 @@ def doctor_table(rows: list[dict]) -> Table:
             return v
         return f"[red]{v}[/red]"
 
+    def ssh_status(value: object) -> str:
+        """Keep common transport failures actionable in a narrow terminal."""
+        return paint(_compact_remote_error(value))
+
+    def tools(checks: dict) -> str:
+        labels = {"python3": "py", "timeout": "to"}
+        values = [
+            (name, str(checks.get(name, "-")))
+            for name in ("uv", "tmux", "rsync", "flock", "python3", "timeout")
+            if checks.get(name, "-") != "-"
+        ]
+        if not values:
+            return "-"
+        failures = [(name, value) for name, value in values if value != "ok"]
+        if not failures:
+            return paint("all ok")
+        return " ".join(
+            f"{labels.get(name, name)}:{paint(value)}" for name, value in failures
+        )
+
+    def control(checks: dict) -> str:
+        values = []
+        for name in ("agent", "dt"):
+            value = str(checks.get(name, "-"))
+            if value != "-":
+                values.append(f"{name}:{paint(value)}")
+        return " ".join(values) or "-"
+
+    one_center = len({r.get("center") for r in rows}) <= 1
+    t = Table(
+        header_style="bold",
+        box=None,
+        padding=(0, 1),
+        pad_edge=False,
+    )
+    t.add_column(
+        "node" if one_center else "target",
+        no_wrap=True,
+        overflow="ellipsis",
+        min_width=10,
+        max_width=22,
+    )
+    t.add_column(
+        "ssh",
+        no_wrap=True,
+        overflow="ellipsis",
+        min_width=8,
+        max_width=20,
+    )
+    t.add_column("driver", no_wrap=True, overflow="ellipsis", max_width=12)
+    t.add_column("tools", no_wrap=True, overflow="ellipsis", min_width=5, max_width=10)
+    t.add_column("net", no_wrap=True, overflow="ellipsis", max_width=14)
+    t.add_column(
+        "control",
+        no_wrap=True,
+        overflow="ellipsis",
+        min_width=7,
+        max_width=14,
+    )
+
     for r in rows:
         c = r.get("checks", {})
+        target = r["node"] if one_center else f"{r.get('center', '?')}/{r['node']}"
         t.add_row(
-            r.get("center", "?"),
-            r["node"],
-            paint(c.get("ssh", "fail")),
+            target,
+            ssh_status(c.get("ssh", "fail")),
             paint(c.get("gpu", "-")),
-            paint(c.get("uv", "-")),
-            paint(c.get("tmux", "-")),
-            paint(c.get("rsync", "-")),
-            paint(c.get("flock", "-")),
+            tools(c),
             paint(c.get("net", "-")),
-            paint(c.get("agent", "-")),
-            paint(c.get("dt", "-")),
+            control(c),
         )
     return t

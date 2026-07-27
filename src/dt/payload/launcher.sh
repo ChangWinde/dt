@@ -2,30 +2,103 @@
 # DistTrainer launcher: runs on the compute node, delivered with the snapshot.
 # Contract (env in):  DT_JOB_DIR DT_GPUS DT_SESSION DT_ENVS_DIR DT_MEM_MIB
 #                     DT_DISK_GIB [DT_RESERVE] [DT_REQUIRE_PATH] [DT_MAX_HOURS]
-#                     [DT_WEBHOOK DT_CENTER DT_JOB_ID DT_JOB_NAME]
+#                     [DT_MAX_VRAM_MIB] [DT_MAX_JOB_MEMORY_MIB]
+#                     [DT_WEBHOOK DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME]
+#                     [DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST]
+#                     [DT_PAYLOAD_ATTEST_MS]
+#                     [DT_PREDECESSOR_JOB_ID DT_PREDECESSOR_JOB_DIR]
+#                     [DT_CACHE_SOURCE_JOB_ID DT_CACHE_SOURCE_JOB_DIR
+#                      DT_CACHE_SOURCE_RELPATH DT_CACHE_ENV
+#                      DT_CACHE_SOURCE_ENV DT_CACHE_SOURCE_SNAPSHOT
+#                      DT_CACHE_MODE]
 # Exit codes:         0 ok | 10 busy | 11 path-missing | 12 disk-full
 #                     13 env-fail | 14 internal | 15 node-unfit
-# On success prints one JSON line: {"gpus": [...], "pgid": N}
+#                     16 cache-missing | 17 payload-integrity
+# On success prints one JSON line with placement, environment cache state,
+# setup execution, and node boot identity.
 set -u
 
+# A local-node launch inherits the dt client's shell. Never let its active
+# project environment influence this job's managed uv sync/setup.
+unset VIRTUAL_ENV UV_PROJECT_ENVIRONMENT
+
 log() { echo "[launcher] $*" >&2; }
+now_ms() { date +%s%3N; }
+LAUNCHER_STARTED_MS=$(now_ms)
+PAYLOAD_ATTEST_DURATION_MS="${DT_PAYLOAD_ATTEST_MS:-0}"
+case "$PAYLOAD_ATTEST_DURATION_MS" in
+    *[!0-9]*|"") PAYLOAD_ATTEST_DURATION_MS=0 ;;
+esac
 
 : "${DT_JOB_DIR:?}" "${DT_GPUS:?}" "${DT_SESSION:?}" "${DT_ENVS_DIR:?}"
 DT_MEM_MIB="${DT_MEM_MIB:-500}"
 DT_DISK_GIB="${DT_DISK_GIB:-10}"
 DT_RESERVE="${DT_RESERVE:-0}"
+DT_GPU_LEASE_ROOT="$HOME/dt/gpu-leases"
+mkdir -p "$DT_GPU_LEASE_ROOT"
+
+lease_available() {
+    local idx=$1 lock="$DT_GPU_LEASE_ROOT/gpu-$1.lock"
+    [ ! -e "$lock" ] || flock -n "$lock" -c true
+}
 
 # Values arrive shell-quoted, so `~` never expanded; job_dir may be
 # home-relative. Absolutize everything here, on the node they refer to.
 DT_ENVS_DIR="${DT_ENVS_DIR/#\~/$HOME}"
 DT_REQUIRE_PATH="${DT_REQUIRE_PATH:-}"
 DT_REQUIRE_PATH="${DT_REQUIRE_PATH/#\~/$HOME}"
+DT_ARTIFACT_ROOT="${DT_ARTIFACT_ROOT:-}"
+DT_ARTIFACT_MANIFEST="${DT_ARTIFACT_MANIFEST:-}"
+DT_PREDECESSOR_JOB_ID="${DT_PREDECESSOR_JOB_ID:-}"
+DT_PREDECESSOR_JOB_DIR="${DT_PREDECESSOR_JOB_DIR:-}"
+DT_PREDECESSOR_OUTPUTS=""
+DT_PREDECESSOR_META_PATH=""
+DT_CACHE_SOURCE_JOB_ID="${DT_CACHE_SOURCE_JOB_ID:-}"
+DT_CACHE_SOURCE_JOB_DIR="${DT_CACHE_SOURCE_JOB_DIR:-}"
+DT_CACHE_SOURCE_RELPATH="${DT_CACHE_SOURCE_RELPATH:-}"
+DT_CACHE_ENV="${DT_CACHE_ENV:-}"
+DT_CACHE_SOURCE_ENV="${DT_CACHE_SOURCE_ENV:-}"
+DT_CACHE_SOURCE_SNAPSHOT="${DT_CACHE_SOURCE_SNAPSHOT:-}"
+DT_CACHE_MODE="${DT_CACHE_MODE:-shared}"
+DT_REUSE_CACHE_PATH=""
+DT_CACHE_SOURCE_PATH=""
+DT_CACHE_RUNTIME_RELPATH=""
+DT_CACHE_SOURCE_MANIFEST_SHA256=""
+DT_CACHE_CLONE_FILES=0
+DT_CACHE_CLONE_BYTES=0
+DT_CACHE_CLONE_DURATION_MS=0
+ARTIFACT_VERIFY_DURATION_MS=0
+case "$DT_ARTIFACT_ROOT" in
+    "") : ;;
+    /*) : ;;
+    *) DT_ARTIFACT_ROOT="$HOME/$DT_ARTIFACT_ROOT" ;;
+esac
 case "$DT_JOB_DIR" in
     /*) : ;;
     *) DT_JOB_DIR="$HOME/$DT_JOB_DIR" ;;
 esac
+case "$DT_PREDECESSOR_JOB_DIR" in
+    "") : ;;
+    /*) : ;;
+    *) DT_PREDECESSOR_JOB_DIR="$HOME/$DT_PREDECESSOR_JOB_DIR" ;;
+esac
+case "$DT_CACHE_SOURCE_JOB_DIR" in
+    "") : ;;
+    /*) : ;;
+    *) DT_CACHE_SOURCE_JOB_DIR="$HOME/$DT_CACHE_SOURCE_JOB_DIR" ;;
+esac
 
 mkdir -p "$DT_JOB_DIR/logs"
+
+if [ -n "$DT_PREDECESSOR_JOB_ID" ]; then
+    if [ -d "$DT_PREDECESSOR_JOB_DIR" ] \
+       && [ "$(cat "$DT_PREDECESSOR_JOB_DIR/exit_code" 2>/dev/null)" = 0 ]; then
+        DT_PREDECESSOR_OUTPUTS="$DT_PREDECESSOR_JOB_DIR/outputs"
+        DT_PREDECESSOR_META_PATH="$DT_PREDECESSOR_JOB_DIR/meta.json"
+    else
+        log "predecessor handoff unavailable for $DT_PREDECESSOR_JOB_ID"
+    fi
+fi
 
 # Optional egress proxy (config `proxy:`): uv sync + setup hook + the job
 # itself all honor the standard variables. Local traffic stays direct.
@@ -41,6 +114,36 @@ rm -f "$DT_JOB_DIR/.dt-cancel"
 
 cancelled() { [ -e "$DT_JOB_DIR/.dt-cancel" ]; }
 
+cache_metadata_manifest() {
+    python3 - "$1" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+files = sorted(
+    (path for path in root.rglob("*") if path.is_file()),
+    key=lambda path: str(path.relative_to(root)),
+)
+digest = hashlib.sha256()
+size = 0
+for path in files:
+    metadata = path.stat()
+    size += metadata.st_size
+    digest.update(
+        (
+            str(path.relative_to(root))
+            + "\0"
+            + str(metadata.st_size)
+            + "\0"
+            + str(metadata.st_mtime_ns)
+            + "\n"
+        ).encode()
+    )
+print(f"{len(files)}\t{size}\t{digest.hexdigest()}")
+PY
+}
+
 # -- 0. node prerequisites (missing tool = this node is unfit, try another) --
 for tool in tmux flock; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -52,16 +155,176 @@ if [ "$DT_GPUS" -gt 0 ] && ! command -v nvidia-smi >/dev/null 2>&1; then
     log "node-unfit: nvidia-smi not found but $DT_GPUS GPUs requested"
     exit 15
 fi
+# Contracts the user explicitly asked for are not best-effort extras. A node
+# that cannot honour one is unfit, and saying so here costs nothing. Finding
+# out later -- inside the job, after a card is taken -- wastes the placement
+# and reports an exit code that looks like the training command's own failure.
+if [ -n "${DT_MAX_VRAM_MIB:-}" ] || [ -n "${DT_MAX_JOB_MEMORY_MIB:-}" ]; then
+    # The guard lives in telemetry.py under the node's python3 while the job
+    # runs under uv's managed interpreter: a node can run the job perfectly
+    # well and still be unable to arm the guard.
+    if ! command -v python3 >/dev/null 2>&1; then
+        log "node-unfit: python3 required for resource guards"
+        exit 15
+    fi
+fi
+if [ -n "${DT_MAX_HOURS:-}" ] && ! command -v timeout >/dev/null 2>&1; then
+    log "node-unfit: timeout required for --max-hours"
+    exit 15
+fi
 
 # -- 1. preconditions: dataset path, free disk ------------------------------
 if [ -n "${DT_REQUIRE_PATH:-}" ] && [ ! -e "$DT_REQUIRE_PATH" ]; then
     log "require-path missing: $DT_REQUIRE_PATH"
     exit 11
 fi
+if [ -n "$DT_CACHE_SOURCE_JOB_ID" ]; then
+    case "$DT_CACHE_MODE" in
+        shared|clone) : ;;
+        *)
+            log "invalid cache mode: $DT_CACHE_MODE"
+            exit 13
+            ;;
+    esac
+    case "$DT_CACHE_ENV" in
+        [A-Za-z_]*)
+            if [[ "$DT_CACHE_ENV" == *[!A-Za-z0-9_]* ]]; then
+                log "invalid cache environment variable"
+                exit 13
+            fi
+            ;;
+        *)
+            log "invalid cache environment variable"
+            exit 13
+            ;;
+    esac
+    if ! command -v realpath >/dev/null 2>&1 \
+       || ! command -v python3 >/dev/null 2>&1; then
+        log "node-unfit: realpath and python3 are required for cache reuse"
+        exit 15
+    fi
+    if [ ! -d "$DT_CACHE_SOURCE_JOB_DIR" ] \
+       || [ "$(cat "$DT_CACHE_SOURCE_JOB_DIR/exit_code" 2>/dev/null)" != "0" ]; then
+        log "cache source job is missing or did not finish successfully"
+        exit 16
+    fi
+    cache_source_root=$(realpath -e -- "$DT_CACHE_SOURCE_JOB_DIR" 2>/dev/null || true)
+    cache_candidate="$DT_CACHE_SOURCE_JOB_DIR/$DT_CACHE_SOURCE_RELPATH"
+    DT_REUSE_CACHE_PATH=$(realpath -e -- "$cache_candidate" 2>/dev/null || true)
+    if [ -z "$cache_source_root" ] || [ ! -d "$DT_REUSE_CACHE_PATH" ]; then
+        log "cache source directory missing: $DT_CACHE_SOURCE_RELPATH"
+        exit 16
+    fi
+    DT_CACHE_SOURCE_PATH="$DT_REUSE_CACHE_PATH"
+    case "$DT_REUSE_CACHE_PATH" in
+        "$cache_source_root"/outputs/*) : ;;
+        *)
+            log "cache source resolves outside the source job outputs"
+            exit 13
+            ;;
+    esac
+    if ! python3 -c \
+        'import json,sys; d=json.load(open(sys.argv[1])); raise SystemExit(0 if d.get("snapshot_sha256")==sys.argv[2] else 1)' \
+        "$cache_source_root/meta.json" "$DT_CACHE_SOURCE_SNAPSHOT" \
+        >/dev/null 2>&1; then
+        log "cache source snapshot identity mismatch"
+        exit 16
+    fi
+    cache_source_env=$(tr -d '[:space:]' \
+        <"$cache_source_root/env-key" 2>/dev/null || true)
+    if [ "$cache_source_env" != "$DT_CACHE_SOURCE_ENV" ]; then
+        log "cache source environment identity mismatch"
+        exit 16
+    fi
+fi
 avail_kb=$(df -Pk "$DT_JOB_DIR" | awk 'NR==2 {print $4}')
 if [ "${avail_kb:-0}" -lt $((DT_DISK_GIB * 1024 * 1024)) ]; then
     log "disk below ${DT_DISK_GIB}G on job filesystem"
     exit 12
+fi
+
+if [ -n "$DT_CACHE_SOURCE_JOB_ID" ] && [ "$DT_CACHE_MODE" = clone ]; then
+    if ! command -v unshare >/dev/null 2>&1; then
+        log "node-unfit: unshare required for isolated cache clones"
+        exit 15
+    fi
+    cache_clone_started_ms=$(now_ms)
+    cache_source_before=$(cache_metadata_manifest "$DT_REUSE_CACHE_PATH") || {
+        log "could not inventory cache source before clone"
+        exit 16
+    }
+    cache_clone_parent="$DT_JOB_DIR/outputs/.cache"
+    cache_clone_path="$cache_clone_parent/dt-clone"
+    mkdir -p "$cache_clone_parent"
+    cache_clone_tmp=$(mktemp -d "$cache_clone_parent/.dt-clone.XXXXXX") || {
+        log "could not create private cache clone directory"
+        exit 16
+    }
+    if cp --help 2>&1 | grep -q -- "--reflink"; then
+        cp -a --reflink=auto "$DT_REUSE_CACHE_PATH/." "$cache_clone_tmp/"
+    else
+        cp -a "$DT_REUSE_CACHE_PATH/." "$cache_clone_tmp/"
+    fi
+    cache_clone_rc=$?
+    if [ "$cache_clone_rc" -ne 0 ]; then
+        rm -rf -- "$cache_clone_tmp"
+        log "private cache clone failed"
+        exit 16
+    fi
+    cache_source_after=$(cache_metadata_manifest "$DT_REUSE_CACHE_PATH") || {
+        rm -rf -- "$cache_clone_tmp"
+        log "could not inventory cache source after clone"
+        exit 16
+    }
+    cache_clone_manifest=$(cache_metadata_manifest "$cache_clone_tmp") || {
+        rm -rf -- "$cache_clone_tmp"
+        log "could not verify private cache clone"
+        exit 16
+    }
+    if [ "$cache_source_before" != "$cache_source_after" ] \
+       || [ "$cache_source_before" != "$cache_clone_manifest" ]; then
+        rm -rf -- "$cache_clone_tmp"
+        log "cache source changed during clone or clone metadata mismatched"
+        exit 16
+    fi
+    rm -rf -- "$cache_clone_path"
+    mv "$cache_clone_tmp" "$cache_clone_path" || {
+        rm -rf -- "$cache_clone_tmp"
+        log "could not publish private cache clone"
+        exit 16
+    }
+    IFS=$'\t' read -r DT_CACHE_CLONE_FILES DT_CACHE_CLONE_BYTES \
+        DT_CACHE_SOURCE_MANIFEST_SHA256 <<<"$cache_source_before"
+    DT_REUSE_CACHE_PATH="$cache_clone_path"
+    DT_CACHE_RUNTIME_RELPATH="outputs/.cache/dt-clone"
+    DT_CACHE_CLONE_DURATION_MS=$(($(now_ms) - cache_clone_started_ms))
+elif [ -n "$DT_CACHE_SOURCE_JOB_ID" ]; then
+    DT_CACHE_RUNTIME_RELPATH="$DT_CACHE_SOURCE_RELPATH"
+fi
+
+if [ -n "$DT_ARTIFACT_MANIFEST" ]; then
+    if [ -z "$DT_ARTIFACT_ROOT" ] \
+       || [ "${#DT_ARTIFACT_MANIFEST}" -ne 64 ] \
+       || [[ "$DT_ARTIFACT_MANIFEST" == *[!0-9a-f]* ]]; then
+        log "invalid artifact manifest binding"
+        exit 13
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        log "node-unfit: python3 required for artifact verification"
+        exit 15
+    fi
+    artifact_manifest_path="$DT_ARTIFACT_ROOT/.dt/manifests/$DT_ARTIFACT_MANIFEST.json"
+    log "verifying artifact manifest ${DT_ARTIFACT_MANIFEST:0:12}"
+    artifact_verify_started_ms=$(now_ms)
+    if ! python3 "$DT_JOB_DIR/artifact_verify.py" \
+        --root "$DT_ARTIFACT_ROOT" \
+        --manifest "$artifact_manifest_path" \
+        --expected-sha256 "$DT_ARTIFACT_MANIFEST" \
+        >>"$DT_JOB_DIR/logs/env.log" 2>&1; then
+        log "artifact integrity failed; see logs/env.log"
+        exit 13
+    fi
+    ARTIFACT_VERIFY_DURATION_MS=$(($(now_ms) - artifact_verify_started_ms))
 fi
 
 # -- 1b. cheap busy pre-check, BEFORE the env sync ---------------------------
@@ -70,36 +333,77 @@ fi
 # minutes. Advisory only - the authoritative recheck stays inside the
 # launch lock below.
 quick_free_count() {
-    local busy
-    busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
-    nvidia-smi --query-gpu=index,uuid,memory.used --format=csv,noheader,nounits 2>/dev/null \
-    | while IFS=, read -r idx uuid used; do
-        uuid=${uuid// /}; used=${used// /}
-        if [ "$used" -lt "$DT_MEM_MIB" ] && ! grep -qF "$uuid" <<<"$busy"; then
+    local busy rows detail
+    busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>&1)
+    if [ $? -ne 0 ]; then
+        detail=${busy##*$'\n'}
+        log "node-unfit: GPU process query failed: ${detail:-unknown nvidia-smi error}"
+        return 15
+    fi
+    rows=$(nvidia-smi --query-gpu=index,uuid,memory.used \
+        --format=csv,noheader,nounits 2>&1)
+    if [ $? -ne 0 ]; then
+        detail=${rows##*$'\n'}
+        log "node-unfit: GPU query failed: ${detail:-unknown nvidia-smi error}"
+        return 15
+    fi
+    busy=${busy// /}
+    printf '%s\n' "$rows" | while IFS=, read -r idx uuid used; do
+        idx=${idx// /}; uuid=${uuid// /}; used=${used// /}
+        if [ "$used" -lt "$DT_MEM_MIB" ] && ! grep -qF "$uuid" <<<"$busy" \
+           && lease_available "$idx"; then
             echo x
         fi
     done | wc -l
 }
 if [ "$DT_GPUS" -gt 0 ]; then
     nfree=$(quick_free_count)
+    query_rc=$?
+    if [ "$query_rc" -ne 0 ]; then
+        exit "$query_rc"
+    fi
     if [ "${nfree:-0}" -lt $((DT_GPUS + DT_RESERVE)) ]; then
         log "busy (pre-check): need $DT_GPUS free GPUs (+$DT_RESERVE reserved), found ${nfree:-0}"
         exit 10
     fi
 fi
 
-# -- 2. environment (shared per uv.lock hash, own lock; slow first sync must
-#       not hold the launch lock) -------------------------------------------
+# -- 2. environment (shared per reproducible dependency identity, own lock;
+#       slow first sync must not hold the launch lock) ----------------------
+ENV_STARTED_MS=$(now_ms)
+PREFLIGHT_DURATION_MS=$((ENV_STARTED_MS - LAUNCHER_STARTED_MS))
 UV_BIN="$HOME/.local/bin/uv"
 command -v "$UV_BIN" >/dev/null 2>&1 || UV_BIN="$(command -v uv || true)"
 UV_ENV=""
+ENV_PREEXISTING=false
+SETUP_RAN=false
+SETUP_RAN_MARK="$DT_JOB_DIR/logs/.setup-ran"
+rm -f "$SETUP_RAN_MARK"
 if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
     if [ -z "$UV_BIN" ]; then
         log "project has uv.lock but uv is not installed on this node"
         exit 13
     fi
-    lockhash=$(sha256sum "$DT_JOB_DIR/code/uv.lock" | cut -c1-12)
+    if [ -f "$DT_JOB_DIR/env-key" ]; then
+        lockhash=$(tr -d '[:space:]' < "$DT_JOB_DIR/env-key")
+        case "$lockhash" in
+            *[!0-9a-f]*|"")
+                log "invalid environment identity in $DT_JOB_DIR/env-key"
+                exit 13
+                ;;
+        esac
+        if [ "${#lockhash}" -ne 12 ]; then
+            log "invalid environment identity length in $DT_JOB_DIR/env-key"
+            exit 13
+        fi
+    else
+        # Compatibility for job bundles produced by older head nodes.
+        lockhash=$(sha256sum "$DT_JOB_DIR/code/uv.lock" | cut -c1-12)
+    fi
     UV_ENV="$DT_ENVS_DIR/$lockhash"
+    if [ -d "$UV_ENV" ]; then
+        ENV_PREEXISTING=true
+    fi
     mkdir -p "$DT_ENVS_DIR"
     log "syncing env $lockhash"
     # only-managed: system interpreters lack dev headers (Python.h), which
@@ -108,66 +412,217 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
     # uv.lock cannot describe) runs under the same env lock, once per env per
     # setup content (marker), never editable - the job dir is disposable.
     if ! flock "$DT_ENVS_DIR/$lockhash.lock" \
-        env UV_PROJECT_ENVIRONMENT="$UV_ENV" UV_SYSTEM_CERTS=1 UV_NATIVE_TLS=1 \
+        env UV_PROJECT_ENVIRONMENT="$UV_ENV" UV_SYSTEM_CERTS=1 \
             UV_PYTHON_PREFERENCE=only-managed DT_JOB_DIR="$DT_JOB_DIR" UV_BIN="$UV_BIN" \
             DT_EXTRAS="${DT_EXTRAS:-}" \
         bash -c '
             cd "$DT_JOB_DIR/code" || exit 1
             eflags=""
             for e in $DT_EXTRAS; do eflags="$eflags --extra $e"; done
+            sync_once() {
+                "$UV_BIN" sync --frozen --inexact $eflags
+            }
+            is_pypi_network_failure() {
+                grep -Fq "https://pypi.org/" "$1" \
+                    && grep -Eqi \
+                        "Request failed|Failed to fetch|tls handshake|connection (timed out|reset|refused)|dns error" \
+                        "$1"
+            }
+            pypi_hint_path="$HOME/dt/network/pypi-index"
+            pypi_mirror_allowed() {
+                case "$1" in
+                    "https://mirrors.aliyun.com/pypi/simple/"|\
+                    "https://pypi.tuna.tsinghua.edu.cn/simple/") return 0 ;;
+                    *) return 1 ;;
+                esac
+            }
+            load_pypi_mirror_hint() {
+                [ -z "${UV_DEFAULT_INDEX:-}" ] || return 0
+                [ -f "$pypi_hint_path" ] || return 1
+                hinted_mirror=$(head -n 1 "$pypi_hint_path" 2>/dev/null)
+                pypi_mirror_allowed "$hinted_mirror" || return 1
+                hint_mtime=$(stat -c %Y "$pypi_hint_path" 2>/dev/null) || return 1
+                hint_now=$(date +%s)
+                [ $((hint_now - hint_mtime)) -le 21600 ] || return 1
+                command -v curl >/dev/null 2>&1 || return 1
+                curl -m 5 -fsSIL "$hinted_mirror" >/dev/null 2>&1 || return 1
+                mirror="$hinted_mirror"
+                export UV_DEFAULT_INDEX="$mirror"
+                echo "[launcher] using cached PyPI mirror hint $mirror"
+            }
+            select_pypi_mirror() {
+                mirror=""
+                for candidate in \
+                    "https://mirrors.aliyun.com/pypi/simple/" \
+                    "https://pypi.tuna.tsinghua.edu.cn/simple/"; do
+                    if command -v curl >/dev/null 2>&1 \
+                       && curl -m 5 -fsSIL "$candidate" >/dev/null 2>&1; then
+                        mirror="$candidate"
+                        break
+                    fi
+                done
+                [ -n "$mirror" ] || return 1
+                export UV_DEFAULT_INDEX="$mirror"
+                mkdir -p "$(dirname "$pypi_hint_path")"
+                hint_tmp="$pypi_hint_path.tmp.$$"
+                printf "%s\n" "$mirror" >"$hint_tmp" \
+                    && mv "$hint_tmp" "$pypi_hint_path"
+            }
+            retry_with_pypi_mirror() {
+                select_pypi_mirror || return 1
+                echo "[launcher] PyPI unavailable; retrying via $mirror"
+                # Keep the proven fallback for the setup hook too: project
+                # setup commonly runs `uv pip install`, and falling back only
+                # for `uv sync` makes the same outage fail one command later.
+                sync_once
+            }
+            sync_with_cache_repair() {
+                attempt_log="$DT_JOB_DIR/logs/.uv-sync-attempt-$$.log"
+                if sync_once >"$attempt_log" 2>&1; then
+                    cat "$attempt_log"
+                    rm -f "$attempt_log"
+                    return 0
+                fi
+                cat "$attempt_log"
+                package=""
+                if grep -Eq "The wheel is invalid|Invalid Wheel-Version" \
+                        "$attempt_log"; then
+                    package=$(
+                        sed -nE \
+                            "s/.*\\(([A-Za-z0-9._-]+)==[^)]*\\).*/\\1/p" \
+                            "$attempt_log" | head -n 1
+                    )
+                fi
+                if [ -n "$package" ]; then
+                    echo "[launcher] invalid cached wheel for $package; cleaning package cache and retrying once"
+                    if "$UV_BIN" cache clean "$package"; then
+                        rm -f "$attempt_log"
+                        sync_once
+                        return $?
+                    fi
+                fi
+                if is_pypi_network_failure "$attempt_log" \
+                   && retry_with_pypi_mirror; then
+                    rm -f "$attempt_log"
+                    return 0
+                fi
+                rm -f "$attempt_log"
+                return 1
+            }
+            load_pypi_mirror_hint || true
             if [ -f "$DT_JOB_DIR/setup.sh" ]; then
                 # --inexact: exact sync would prune the packages the setup
                 # hook adds on top of the lock (uv sync removes extraneous
                 # packages by default)
-                "$UV_BIN" sync --frozen --inexact $eflags || exit 1
+                sync_with_cache_repair || exit 1
+                # A warm sync can make no network request, so it cannot reveal
+                # that direct PyPI is down. Probe once before the one-time
+                # setup hook rather than fail after another uv retry cycle.
+                if [ -z "${UV_DEFAULT_INDEX:-}" ] \
+                   && command -v curl >/dev/null 2>&1 \
+                   && ! curl -m 5 -fsSIL "https://pypi.org/simple/" \
+                        >/dev/null 2>&1 \
+                   && select_pypi_mirror; then
+                    echo "[launcher] PyPI unavailable before setup; using $mirror"
+                fi
                 smark="$UV_PROJECT_ENVIRONMENT/.dt-setup-$(sha256sum "$DT_JOB_DIR/setup.sh" | cut -c1-8)"
                 if [ ! -f "$smark" ]; then
                     echo "[launcher] running project setup hook"
-                    "$UV_BIN" run --no-sync bash "$DT_JOB_DIR/setup.sh" || exit 1
+                    "$UV_BIN" run --no-sync bash -e "$DT_JOB_DIR/setup.sh" || exit 1
                     touch "$smark"
+                    touch "$DT_JOB_DIR/logs/.setup-ran"
                 fi
             else
                 # --inexact here too: envs are shared per-lockhash, and an
                 # exact sync from a job with fewer extras would prune the
                 # packages a concurrent job with more extras relies on
-                "$UV_BIN" sync --frozen --inexact $eflags || exit 1
+                sync_with_cache_repair || exit 1
             fi' \
         >>"$DT_JOB_DIR/logs/env.log" 2>&1; then
         log "uv sync / setup failed, see logs/env.log"
         exit 13
     fi
+    if [ -f "$SETUP_RAN_MARK" ]; then
+        SETUP_RAN=true
+        rm -f "$SETUP_RAN_MARK"
+    fi
     # last-used stamp: `dt clean --envs` reaps envs whose mtime went stale
     touch "$UV_ENV" 2>/dev/null || true
 else
     log "no uv.lock in snapshot; running with system python"
+    # Minimal/non-uv projects commonly invoke `python`, while Debian/Ubuntu
+    # nodes expose only `python3` to non-interactive shells. Keep the alias
+    # job-local instead of mutating the node or guessing inside cmd.sh.
+    if ! command -v python >/dev/null 2>&1; then
+        python3_bin=$(command -v python3 || true)
+        if [ -n "$python3_bin" ]; then
+            mkdir -p "$DT_JOB_DIR/.dt-bin"
+            ln -sf "$python3_bin" "$DT_JOB_DIR/.dt-bin/python"
+        fi
+    fi
 fi
+if [ -n "$DT_CACHE_SOURCE_JOB_ID" ] \
+   && [ "${lockhash:-}" != "$DT_CACHE_SOURCE_ENV" ]; then
+    log "target environment identity does not match cache source"
+    exit 13
+fi
+ENV_DURATION_MS=$(($(now_ms) - ENV_STARTED_MS))
 
 # -- helpers ----------------------------------------------------------------
 free_gpu_indices() {
-    local busy
-    busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>/dev/null | tr -d ' ')
-    nvidia-smi --query-gpu=index,uuid,memory.used --format=csv,noheader,nounits 2>/dev/null \
-    | while IFS=, read -r idx uuid used; do
+    local busy rows detail
+    busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>&1)
+    if [ $? -ne 0 ]; then
+        detail=${busy##*$'\n'}
+        log "node-unfit: GPU process query failed: ${detail:-unknown nvidia-smi error}"
+        return 15
+    fi
+    rows=$(nvidia-smi --query-gpu=index,uuid,memory.used \
+        --format=csv,noheader,nounits 2>&1)
+    if [ $? -ne 0 ]; then
+        detail=${rows##*$'\n'}
+        log "node-unfit: GPU query failed: ${detail:-unknown nvidia-smi error}"
+        return 15
+    fi
+    busy=${busy// /}
+    printf '%s\n' "$rows" | while IFS=, read -r idx uuid used; do
         idx=${idx// /}; uuid=${uuid// /}; used=${used// /}
-        if [ "$used" -lt "$DT_MEM_MIB" ] && ! grep -qF "$uuid" <<<"$busy"; then
+        if [ "$used" -lt "$DT_MEM_MIB" ] && ! grep -qF "$uuid" <<<"$busy" \
+           && lease_available "$idx"; then
             echo "$idx"
         fi
     done
 }
 
+GPU_PROBE_ERROR=""
 probe_ok() {
     # Try a 256 MiB allocation on one GPU; catches races with other users.
-    local idx=$1
-    if [ -z "$UV_ENV" ]; then return 0; fi
-    if ! env UV_PROJECT_ENVIRONMENT="$UV_ENV" "$UV_BIN" run --no-sync \
-        --project "$DT_JOB_DIR/code" python -c "import torch" >/dev/null 2>&1; then
-        return 0  # no torch in env: skip the probe, recheck already done
+    local idx=$1 rc detail
+    GPU_PROBE_ERROR=""
+    if ! command -v python3 >/dev/null 2>&1 \
+       || [ ! -f "$DT_JOB_DIR/cuda_probe.py" ]; then
+        return 0
     fi
-    CUDA_VISIBLE_DEVICES=$idx timeout 120 \
-        env UV_PROJECT_ENVIRONMENT="$UV_ENV" "$UV_BIN" run --no-sync \
-        --project "$DT_JOB_DIR/code" python -c \
-        "import torch; a = torch.empty(64 * 1024 * 1024, dtype=torch.float32, device='cuda'); del a" \
-        >/dev/null 2>&1
+    # Use the CUDA Driver API directly. Importing the full project PyTorch
+    # stack just to test one allocation dominated warm FIFO handoffs.
+    detail=$(CUDA_VISIBLE_DEVICES=$idx timeout 120 \
+        python3 "$DT_JOB_DIR/cuda_probe.py" --bytes 268435456 \
+        2>&1)
+    rc=$?
+    # Old/non-CUDA nodes can still run CPU jobs; the two nvidia-smi checks stay
+    # authoritative when the driver API is unavailable.
+    [ "$rc" -eq 42 ] && return 0
+    if [ "$rc" -ne 0 ]; then
+        if [ "$rc" -eq 124 ]; then
+            GPU_PROBE_ERROR="CUDA allocation probe failed: timed out after 120s"
+        else
+            detail=${detail//$'\r'/}
+            detail=${detail##*$'\n'}
+            detail=${detail:-"exit $rc without diagnostic"}
+            GPU_PROBE_ERROR="CUDA allocation probe failed: ${detail:0:240}"
+        fi
+    fi
+    return "$rc"
 }
 
 start_session() {
@@ -175,17 +630,41 @@ start_session() {
     # -L dt: dedicated socket = dedicated tmux server. Never join the user's
     # own server: on some nodes it is managed by a systemd user unit
     # (Type=forking + kill-server on stop, Linger=no) and every job inside
-    # it gets SIGKILLed when the unit stops (seen on psibot-ds).
+    # it gets SIGKILLed when the unit stops (observed on a production node).
+    # fd 9 owns the node launch lock in this launcher. A newly-created tmux
+    # server otherwise inherits it and keeps every later launcher blocked for
+    # the lifetime of the job. Close only tmux's copy; this shell keeps the
+    # lock until wrapper.sh publishes pgid after acquiring the GPU leases.
+    # Keep dt's tiny dedicated server alive after the session ends. Creating a
+    # fresh tmux server for every FIFO item costs most of a second and leaves
+    # the GPU idle between otherwise back-to-back experiments. Runtime env is
+    # still passed explicitly below, and fd 9 is closed before the server can
+    # inherit the node launch lock.
     tmux -L dt new-session -d -s "$DT_SESSION" \
-        "cd '$DT_JOB_DIR' && env DT_JOB_DIR='$DT_JOB_DIR' CUDA_VISIBLE_DEVICES='$ids' DT_MAX_HOURS='${DT_MAX_HOURS:-}' DT_UV='$UV_BIN' DT_UV_ENV='$UV_ENV' DT_WEBHOOK='${DT_WEBHOOK:-}' DT_CENTER='${DT_CENTER:-}' DT_JOB_ID='${DT_JOB_ID:-}' DT_JOB_NAME='${DT_JOB_NAME:-}' DT_PROXY='${DT_PROXY:-}' bash wrapper.sh >> logs/stdout.log 2>&1"
+        "cd '$DT_JOB_DIR' && env DT_JOB_DIR='$DT_JOB_DIR' DT_ARTIFACT_ROOT='${DT_ARTIFACT_ROOT:-}' DT_ARTIFACT_MANIFEST='${DT_ARTIFACT_MANIFEST:-}' DT_PREDECESSOR_JOB_ID='$DT_PREDECESSOR_JOB_ID' DT_PREDECESSOR_JOB_DIR='$DT_PREDECESSOR_JOB_DIR' DT_PREDECESSOR_OUTPUTS='$DT_PREDECESSOR_OUTPUTS' DT_PREDECESSOR_META_PATH='$DT_PREDECESSOR_META_PATH' DT_REUSE_CACHE_PATH='$DT_REUSE_CACHE_PATH' DT_REUSE_CACHE_ENV='$DT_CACHE_ENV' DT_CACHE_SOURCE_PATH='$DT_CACHE_SOURCE_PATH' DT_CACHE_SOURCE_JOB_ID='$DT_CACHE_SOURCE_JOB_ID' DT_CACHE_SOURCE_RELPATH='$DT_CACHE_SOURCE_RELPATH' DT_CACHE_SOURCE_ENV='$DT_CACHE_SOURCE_ENV' DT_CACHE_SOURCE_SNAPSHOT='$DT_CACHE_SOURCE_SNAPSHOT' DT_CACHE_MODE='$DT_CACHE_MODE' DT_CACHE_RUNTIME_RELPATH='$DT_CACHE_RUNTIME_RELPATH' DT_CACHE_SOURCE_MANIFEST_SHA256='$DT_CACHE_SOURCE_MANIFEST_SHA256' DT_CACHE_CLONE_FILES='$DT_CACHE_CLONE_FILES' DT_CACHE_CLONE_BYTES='$DT_CACHE_CLONE_BYTES' DT_CACHE_CLONE_DURATION_MS='$DT_CACHE_CLONE_DURATION_MS' CUDA_VISIBLE_DEVICES='$ids' DT_GPU_IDS='$ids' DT_MAX_HOURS='${DT_MAX_HOURS:-}' DT_MAX_VRAM_MIB='${DT_MAX_VRAM_MIB:-}' DT_MAX_JOB_MEMORY_MIB='${DT_MAX_JOB_MEMORY_MIB:-}' DT_UV='$UV_BIN' DT_UV_ENV='$UV_ENV' DT_WEBHOOK='${DT_WEBHOOK:-}' DT_CENTER='${DT_CENTER:-}' DT_NODE='${DT_NODE:-}' DT_JOB_ID='${DT_JOB_ID:-}' DT_JOB_NAME='${DT_JOB_NAME:-}' DT_PROXY='${DT_PROXY:-}' bash wrapper.sh >> logs/stdout.log 2>&1" \
+        \; set-option -g exit-empty off \
+        9>&-
 }
 
 # -- 3-6. pick GPUs + launch, atomically per node ----------------------------
+pgid=""
+GPU_PROBE_DURATION_MS=0
+SESSION_START_DURATION_MS=0
 launch_locked() {
     local chosen=()
+    local gpu_probe_started_ms session_start_started_ms attempt
+    gpu_probe_started_ms=$(now_ms)
     if [ "$DT_GPUS" -gt 0 ]; then
-        local candidates
-        mapfile -t candidates < <(free_gpu_indices)
+        local candidates candidate_rows query_rc
+        candidate_rows=$(free_gpu_indices)
+        query_rc=$?
+        if [ "$query_rc" -ne 0 ]; then
+            return "$query_rc"
+        fi
+        candidates=()
+        if [ -n "$candidate_rows" ]; then
+            mapfile -t candidates <<<"$candidate_rows"
+        fi
         # DT_RESERVE (7.4 knob): after taking DT_GPUS, at least DT_RESERVE
         # cards must remain free on this node
         if [ "${#candidates[@]}" -lt $((DT_GPUS + DT_RESERVE)) ]; then
@@ -197,7 +676,7 @@ launch_locked() {
             if probe_ok "$idx"; then
                 chosen+=("$idx")
             else
-                log "gpu $idx failed memory probe (grabbed by someone else?)"
+                log "gpu $idx ${GPU_PROBE_ERROR:-CUDA allocation probe failed}"
             fi
         done
         if [ "${#chosen[@]}" -lt "$DT_GPUS" ]; then
@@ -205,6 +684,7 @@ launch_locked() {
             return 10
         fi
     fi
+    GPU_PROBE_DURATION_MS=$(($(now_ms) - gpu_probe_started_ms))
     local ids
     ids=$(IFS=,; echo "${chosen[*]:-}")
     # last call: if the dispatcher gave up on us (its ssh dropped), it left
@@ -213,35 +693,64 @@ launch_locked() {
         log "cancelled by dispatcher; not starting"
         return 14
     fi
+    # A dropped launcher attempt can leave marker files after its session was
+    # cancelled. Never accept an old pgid as proof that this new wrapper owns
+    # the leases. If the old session still exists, refuse this attempt instead
+    # of overlapping two wrappers with the same job identity.
+    if tmux -L dt has-session -t "$DT_SESSION" 2>/dev/null; then
+        log "session $DT_SESSION already exists from a prior launch attempt"
+        return 14
+    fi
+    rm -f "$DT_JOB_DIR/pgid" "$DT_JOB_DIR/gpus" \
+          "$DT_JOB_DIR/started_at" "$DT_JOB_DIR/finished_at" \
+          "$DT_JOB_DIR/exit_code" "$DT_JOB_DIR"/exit_code.tmp.*
+    session_start_started_ms=$(now_ms)
     start_session "$ids" || return 14
+    # Close the check→start race: cancellation may land after the pre-start
+    # check but before tmux becomes visible to the dispatcher's kill command.
+    if cancelled; then
+        log "cancelled by dispatcher during session start"
+        tmux -L dt kill-session -t "$DT_SESSION" 2>/dev/null
+        return 14
+    fi
     echo "$ids" > "$DT_JOB_DIR/gpus"
+    # Keep the node launch lock until wrapper.sh owns every selected GPU
+    # lease and records its pgid. Otherwise a second launcher can observe an
+    # idle card during CPU-only dataset initialization and double-assign it.
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        [ -f "$DT_JOB_DIR/pgid" ] && pgid=$(cat "$DT_JOB_DIR/pgid") && break
+        sleep 0.1
+    done
+    if [ -z "$pgid" ]; then
+        log "wrapper did not acquire GPU lease/start (no pgid file); check logs/stdout.log"
+        tmux -L dt kill-session -t "$DT_SESSION" 2>/dev/null
+        return 14
+    fi
+    SESSION_START_DURATION_MS=$(($(now_ms) - session_start_started_ms))
     return 0
 }
 
 lockfile="$HOME/dt/launch-$(hostname).lock"
 mkdir -p "$HOME/dt"
 exec 9>"$lockfile"
+LOCK_WAIT_STARTED_MS=$(now_ms)
 if ! flock -w 300 9; then
     log "could not take node launch lock within 300s"
     exit 10
 fi
+LOCK_WAIT_DURATION_MS=$(($(now_ms) - LOCK_WAIT_STARTED_MS))
 launch_locked
 rc=$?
 exec 9>&-
 [ $rc -ne 0 ] && exit $rc
 
-# -- 7. wait for the wrapper to record its process group ---------------------
-pgid=""
-for _ in $(seq 1 20); do
-    [ -f "$DT_JOB_DIR/pgid" ] && pgid=$(cat "$DT_JOB_DIR/pgid") && break
-    sleep 0.5
-done
-if [ -z "$pgid" ]; then
-    log "wrapper did not start (no pgid file); check logs/stdout.log"
-    tmux -L dt kill-session -t "$DT_SESSION" 2>/dev/null
-    exit 14
-fi
-
 ids=$(cat "$DT_JOB_DIR/gpus" 2>/dev/null || echo "")
-printf '{"gpus": [%s], "pgid": %s, "env": "%s"}\n' "$ids" "$pgid" "${lockhash:-}"
+boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "")
+REMOTE_TOTAL_DURATION_MS=$(($(now_ms) - LAUNCHER_STARTED_MS))
+printf '{"gpus": [%s], "pgid": %s, "env": "%s", "env_preexisting": %s, "setup_ran": %s, "boot_id": "%s", "launch_phases_ms": {"payload_attestation": %s, "preflight": %s, "artifact_verification": %s, "environment": %s, "launch_lock_wait": %s, "gpu_probe": %s, "session_start": %s, "remote_total": %s}}\n' \
+    "$ids" "$pgid" "${lockhash:-}" "$ENV_PREEXISTING" "$SETUP_RAN" "$boot_id" \
+    "$PAYLOAD_ATTEST_DURATION_MS" "$PREFLIGHT_DURATION_MS" \
+    "$ARTIFACT_VERIFY_DURATION_MS" \
+    "$ENV_DURATION_MS" "$LOCK_WAIT_DURATION_MS" \
+    "$GPU_PROBE_DURATION_MS" "$SESSION_START_DURATION_MS" "$REMOTE_TOTAL_DURATION_MS"
 exit 0

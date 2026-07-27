@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
+        with:
+          version: "0.11.32"
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install "${{ matrix.python-version }}"
+
+      - name: Sync locked environment
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+        run: uv sync --locked --all-groups
+
+      - name: Test
+        run: uv run --no-sync pytest -q -p no:cacheprovider
+
+      - name: Static checks
+        if: matrix.python-version == '3.11'
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+          uv run --no-sync mypy --strict --no-incremental \
+            --cache-dir=/tmp/dt-mypy \
+            --follow-imports=skip \
+            src/dt/submission.py src/dt/monitoring.py \
+            src/dt/forwarding.py src/dt/transfers.py src/dt/storage.py
+          bash -n src/dt/payload/*.sh bootstrap.sh deploy.sh \
+            scripts/release-check.sh
+          git diff --check
+
+      - name: Build and install release artifacts
+        if: matrix.python-version == '3.11'
+        env:
+          DT_RELEASE_PYTHON: "3.11"
+          DT_RELEASE_SKIP_SYNC: "1"
+        run: scripts/release-check.sh dist
