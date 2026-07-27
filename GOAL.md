@@ -123,7 +123,7 @@ Tasks:
 - [x] T5.3: resolve or explicitly document every remaining contradiction or
   missing proof.
 
-### M6: Reproducible release — IN PROGRESS
+### M6: Reproducible release — COMPLETE
 
 Acceptance: a clean, immutable source commit produces byte-reproducible wheel
 and sdist artifacts; the release bundle contains a dependency inventory,
@@ -141,7 +141,7 @@ Tasks:
   artifact audit, runtime constraints, SBOM, and checksum manifest.
 - [x] T6.4: replace live-tree deployment with explicit versioned artifacts,
   digest verification, exact dependency constraints, and retained rollback.
-- [ ] T6.5: complete the final clean-tree release check, independent review,
+- [x] T6.5: complete the final clean-tree release check, independent review,
   release commit, tag, and immutable artifact record.
 
 ## Decisions Log
@@ -234,11 +234,16 @@ Tasks:
   but the sdist uses an allowlist and a separate public README. Public release
   artifacts must contain zero internal host/path markers and zero recognized
   secret markers.
+- [2026-07-28] Release review closed every blocking finding, full regression
+  passed on Python 3.10 and 3.11, and the supported range was narrowed to
+  those verified versions. The immutable 0.6.0 bundle is bound to its exact
+  clean commit by `release-manifest.json`; public upload remains a separate
+  authorized promotion action.
 
 ## Current Focus
 
-Milestone: M6 reproducible release
-Task: T6.5 final clean-tree verification, review, release commit, and tag
-Next action: reconcile release documentation, run the terminal gate from the
-intended commit, and bind the retained artifacts to that exact source identity.
-Do not occupy a GPU with release-only filler work.
+Milestone: M6 reproducible release complete
+Task: retain and promote the verified 0.6.0 artifact bundle
+Next action: configure an approved remote/package index when publication is
+authorized, observe the pinned CI workflow, and promote the retained artifacts
+without rebuilding them. Do not occupy a GPU with release-only filler work.
