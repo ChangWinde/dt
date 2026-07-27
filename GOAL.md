@@ -144,7 +144,7 @@ Tasks:
 - [x] T6.5: complete the final clean-tree release check, independent review,
   release commit, tag, and immutable artifact record.
 
-### M7: Operator UX simplification — IN PROGRESS
+### M7: Operator UX simplification — COMPLETE
 
 Acceptance: the primary command surface is clearly grouped, redundant
 compatibility entry points do not compete with the normal workflow, `dt ps`
@@ -162,7 +162,7 @@ Tasks:
   workflows; hide the redundant `task` facade while preserving compatibility.
 - [x] T7.4: preserve exact cross-center history and issue selection with
   mixed-version head fallback.
-- [ ] T7.5: complete full regression, terminal UX review, clean release gate,
+- [x] T7.5: complete full regression, terminal UX review, clean release gate,
   0.6.1 artifact retention, and tag.
 
 ## Decisions Log
@@ -264,11 +264,15 @@ Tasks:
   its default is queued/running, `--recent` admits ten terminal records,
   `--issues` is an actionable failure inbox, and `-a` is the explicit complete
   history path. Default JSON remains full for compatibility.
+- [2026-07-28] The 0.6.1 terminal review passed at 60, 80, and 120 columns;
+  Python 3.10 and 3.11 each passed 822 tests. Redundant `task` remains hidden
+  compatibility, while distinct advanced commands are grouped instead of
+  being deleted.
 
 ## Current Focus
 
-Milestone: M7 operator UX simplification
-Task: T7.5 final regression, release verification, 0.6.1 artifacts, and tag
-Next action: run the full supported-version and release gates, inspect the
-real 80-column CLI states, then bind the retained bundle to the exact clean
-commit. Do not occupy a GPU with release-only filler work.
+Milestone: M7 operator UX simplification complete
+Task: retain and promote the verified 0.6.1 artifact bundle
+Next action: configure an approved remote/package index when publication is
+authorized, observe hosted CI, and promote the retained artifacts without
+rebuilding them. Do not occupy a GPU with release-only filler work.
