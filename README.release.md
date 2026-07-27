@@ -11,7 +11,7 @@ import package are both named `dt`.
 ## Requirements
 
 - Linux head and compute nodes reachable through non-interactive SSH;
-- Python 3.10–3.12 on the client/head;
+- Python 3.10–3.11 on the client/head;
 - `uv`, OpenSSH, rsync, tmux, flock, and timeout;
 - NVIDIA drivers and `nvidia-smi` on nodes used for GPU jobs.
 

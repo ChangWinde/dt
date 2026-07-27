@@ -8,7 +8,7 @@ records.
 
 - Distribution: `disttrainer`
 - Executable and import package: `dt`
-- Supported Python: 3.10–3.12
+- Supported Python: 3.10–3.11
 - Supported runtime: trusted-account Linux/SSH GPU centers described in
   `SUPPORT.md` and `SECURITY.md`
 - License: `LicenseRef-Proprietary`; publishing or distributing outside the
@@ -23,7 +23,7 @@ public Python index.
    version metadata, and the intended source diff.
 2. Confirm the Git worktree is clean and the current commit is the reviewed
    release source.
-3. Run the CI matrix on Python 3.10, 3.11, and 3.12.
+3. Run the CI matrix on Python 3.10 and 3.11.
 4. Run the local terminal gate:
 
    ```bash

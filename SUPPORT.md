@@ -5,7 +5,7 @@
 DistTrainer 0.6 supports:
 
 - Linux head and compute nodes;
-- Python 3.10, 3.11, or 3.12 on the client/head;
+- Python 3.10 or 3.11 on the client/head;
 - OpenSSH client/server, rsync, tmux, flock, timeout, and uv;
 - NVIDIA compute nodes with `nvidia-smi` and a usable CUDA driver for GPU
   jobs;

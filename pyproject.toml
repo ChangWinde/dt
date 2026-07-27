@@ -3,7 +3,7 @@ name = "disttrainer"
 version = "0.6.0"
 description = "DistTrainer: cross-center GPU experiment dispatcher for shared servers"
 readme = "README.release.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10,<3.12"
 license = "LicenseRef-Proprietary"
 license-files = ["LICENSE"]
 keywords = ["gpu", "experiments", "scheduler", "ssh", "research"]
@@ -15,7 +15,6 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering",
     "Topic :: System :: Distributed Computing",
 ]
