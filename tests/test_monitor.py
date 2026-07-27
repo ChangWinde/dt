@@ -4869,11 +4869,13 @@ def test_ps_watch_uses_poll_driven_redraws_and_stops_cleanly(tmp_path, monkeypat
             raise KeyboardInterrupt
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(
-        cli,
-        "_gather_ps_rows",
-        lambda cfg_, status, include_progress=False: (next(frames), {}),
-    )
+    gather_calls = []
+
+    def fake_gather(cfg_, status, include_progress=False, **kwargs):
+        gather_calls.append(kwargs)
+        return next(frames), {}
+
+    monkeypatch.setattr(cli, "_gather_ps_rows", fake_gather)
 
     def fake_view(*args, **kwargs):
         seen.setdefault("view_kwargs", []).append(kwargs)
@@ -4886,6 +4888,7 @@ def test_ps_watch_uses_poll_driven_redraws_and_stops_cleanly(tmp_path, monkeypat
     result = CliRunner().invoke(cli.app, ["ps", "--watch", "--poll", "0.1"])
 
     assert result.exit_code == 0, result.output
+    assert all(call["active_only"] is True for call in gather_calls)
     assert seen["initial"] == "running"
     assert seen["updates"] == [("finished", True)]
     assert seen["auto_refresh"] is False
@@ -4939,25 +4942,39 @@ def test_ps_failure_issue_view_is_actionable_without_live_enrichment(
         root=tmp_path / "dt",
         envs="~/dt/envs",
     )
-    row = {
-        "job_id": "env-failed",
-        "name": "env-failed",
-        "center": "c",
-        "node": "n1",
-        "gpus": [],
-        "status": "failed",
-        "exit_code": None,
-        "created_at": 100.0,
-        "cmd": "true",
-        "reason": "n1: env-fail: invalid uv.lock, see logs/env.log",
-    }
+    rows = [
+        {
+            "job_id": "env-failed",
+            "name": "env-failed",
+            "center": "c",
+            "node": "n1",
+            "gpus": [],
+            "status": "failed",
+            "exit_code": None,
+            "created_at": 100.0,
+            "cmd": "true",
+            "reason": "n1: env-fail: invalid uv.lock, see logs/env.log",
+        },
+        {
+            "job_id": "success",
+            "name": "success",
+            "center": "c",
+            "node": "n1",
+            "gpus": [],
+            "status": "finished",
+            "exit_code": 0,
+            "created_at": 101.0,
+            "cmd": "true",
+            "reason": None,
+        },
+    ]
     gather_calls = []
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
         cli,
         "_gather_ps_rows",
-        lambda cfg_, status, include_progress=False: (
-            gather_calls.append((status, include_progress)) or [row],
+        lambda cfg_, status, include_progress=False, **kwargs: (
+            gather_calls.append((status, include_progress)) or rows,
             {},
         ),
     )
@@ -4967,9 +4984,11 @@ def test_ps_failure_issue_view_is_actionable_without_live_enrichment(
 
     assert filtered.exit_code == 0, filtered.output
     assert explicit.exit_code == 0, explicit.output
-    for result in (filtered, explicit):
-        assert "issue" in result.output
-        assert "invalid uv.lock" in result.output
+    assert "issue" in filtered.output
+    assert "invalid uv.lock" in filtered.output
+    assert "Recent issues" in explicit.output
+    assert "invalid uv.lock" in explicit.output
+    assert "success" not in explicit.output
     assert gather_calls == [("failed", False), (None, False)]
 
 
@@ -5428,6 +5447,43 @@ def test_laptop_ps_active_filter_is_applied_by_each_head(monkeypatch):
     assert seen == [["ps", "--active", "--with-progress"]]
 
 
+def test_laptop_ps_issue_filter_is_applied_before_each_head_window(monkeypatch):
+    import dt.remote as remote_mod
+
+    cfg = LaptopConfig(centers={"a": "head-a", "b": "head-b"})
+    seen = []
+
+    def fan(cfg_, argv):
+        seen.append(argv)
+        return {
+            "a": {
+                "schema_version": cli.PS_WINDOW_SCHEMA,
+                "center": "a",
+                "total": 1,
+                "rows": [{"job_id": "a-failed", "status": "failed"}],
+            },
+            "b": {
+                "schema_version": cli.PS_WINDOW_SCHEMA,
+                "center": "b",
+                "total": 0,
+                "rows": [],
+            },
+        }, remote_mod.FanErrors()
+
+    monkeypatch.setattr(cli, "fan_json_by_center", fan)
+
+    rows, errors = cli._gather_ps_rows(
+        cfg,
+        status=None,
+        issues_only=True,
+        remote_window=True,
+    )
+
+    assert errors == {}
+    assert rows == [{"job_id": "a-failed", "status": "failed"}]
+    assert seen == [["ps", "--issues", "--window"]]
+
+
 def test_laptop_ps_limit_is_applied_by_each_head_and_globally(monkeypatch):
     cfg = LaptopConfig(centers={"a": "head-a", "b": "head-b"})
     seen = []
@@ -5513,7 +5569,7 @@ def test_ps_window_json_keeps_active_and_reports_full_count(tmp_path, monkeypatc
     assert payload["schema_version"] == cli.PS_WINDOW_SCHEMA
     assert payload["center"] == "c"
     assert payload["total"] == 41
-    assert len(payload["rows"]) == 30
+    assert len(payload["rows"]) == 11
     assert payload["rows"][0]["job_id"] == "old-running"
     assert payload["rows"][-1]["job_id"] == "finished-39"
 
@@ -5593,9 +5649,9 @@ def test_laptop_ps_window_falls_back_to_old_head(monkeypatch):
     )
 
     assert errors == {}
-    assert len(rows) == 30
+    assert len(rows) == 10
     assert cli._ps_rows_total(rows) == 40
-    assert rows[0]["job_id"] == "job-10"
+    assert rows[0]["job_id"] == "job-30"
     assert calls == [["ps", "--window"], ["ps"]]
 
 
@@ -5755,6 +5811,91 @@ def test_ps_active_json_returns_only_queued_and_running(tmp_path, monkeypatch):
     assert {row["job_id"] for row in rows} == {"job-queued", "job-running"}
 
 
+def test_ps_human_defaults_to_active_and_history_is_explicit(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    for index, status in enumerate(("finished", "lost", "queued", "running")):
+        cli.jobs_mod.save(
+            cfg,
+            JobEntry(
+                job_id=f"job-{status}",
+                name=f"exp-{status}",
+                center="c",
+                project="p",
+                node="n1",
+                node_local=False,
+                job_dir=f"dt/jobs/job-{status}",
+                session=f"dt_job_{status}",
+                cmd="true",
+                status=status,
+                exit_code=0 if status == "finished" else None,
+                created_at=float(index + 1),
+            ),
+        )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli.jobs_mod,
+        "refresh_status",
+        lambda cfg_, entry, observation=None: entry,
+    )
+
+    current = CliRunner().invoke(cli.app, ["ps"])
+    recent = CliRunner().invoke(cli.app, ["ps", "--recent"])
+    all_jobs = CliRunner().invoke(cli.app, ["ps", "--all"])
+    machine = CliRunner().invoke(cli.app, ["ps", "--json"])
+
+    assert current.exit_code == 0, current.output
+    assert "Active jobs" in current.output
+    assert "exp-queued" in current.output
+    assert "exp-running" in current.output
+    assert "exp-finished" not in current.output
+    assert "exp-lost" not in current.output
+    assert "dt ps --recent" in current.output
+
+    assert recent.exit_code == 0, recent.output
+    assert "Active + recent" in recent.output
+    assert "exp-finished" in recent.output
+    assert "exp-lost" in recent.output
+
+    assert all_jobs.exit_code == 0, all_jobs.output
+    assert "exp-finished" in all_jobs.output
+    assert "exp-lost" in all_jobs.output
+
+    assert machine.exit_code == 0, machine.output
+    assert {row["status"] for row in json.loads(machine.stdout)} == {
+        "finished",
+        "lost",
+        "queued",
+        "running",
+    }
+
+
+def test_ps_human_empty_state_points_to_submit_and_history(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, ["ps"])
+
+    assert result.exit_code == 0, result.output
+    assert "No active jobs." in result.output
+    assert "dt run -n NAME -f -- COMMAND" in result.output
+    assert "dt ps --recent" in result.output
+    assert "state" not in result.output
+
+
 def test_ps_limit_bounds_json_without_changing_default_contract(tmp_path, monkeypatch):
     cfg = HeadConfig(
         center="c",
@@ -5850,6 +5991,32 @@ def test_ps_active_rejects_status_filter(tmp_path, monkeypatch):
         "reasons": {},
         "exit_code": 1,
     }
+
+
+def test_ps_recent_rejects_ambiguous_filters(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    for extra in (
+        ["--active"],
+        ["--all"],
+        ["--status", "finished"],
+        ["--issues"],
+        ["--limit", "3"],
+    ):
+        result = CliRunner().invoke(cli.app, ["ps", "--recent", *extra, "--json"])
+
+        assert result.exit_code == 1, result.output
+        payload = json.loads(result.stdout)
+        assert payload["error"] == "invalid_argument"
+        assert payload["message"].startswith("--recent cannot be combined")
 
 
 def test_laptop_ps_all_heads_unreachable_has_machine_error(monkeypatch):

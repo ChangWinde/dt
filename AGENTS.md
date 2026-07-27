@@ -34,7 +34,7 @@ For a continuous single-node experiment queue, submit every task without
 dt task psibot-ds "python train.py --cfg a" -n dp-a
 dt task psibot-ds "python train.py --cfg b" -n dp-b
 dt task psibot-ds "python train.py --cfg c" -n dp-c
-dt ps --watch --active
+dt ps --watch
 ```
 
 The first fitting task starts and the rest queue automatically. The resident
@@ -215,11 +215,14 @@ change what a queued job will run.
   running kill. If death cannot be verified, the launched node/PGID is restored
   as `running`, the agent emits `cancel_failed`, and `dt ps` shows
   `running cancel!` until the task is killed or ends.
-- `dt ps` shows queued jobs; `--active` returns only queued/running jobs (including
-  compact JSON instead of the full registry); `-s failed` / `-s lost` automatically replace
-  timestamps with registry issues, and `--issues` does the same for a mixed
-  list without extra log/GPU probes. Finished jobs with a nonzero process exit
-  point to `dt logs REF`; legacy lost rows without a reason show `exit marker
+- Human `dt ps` defaults to queued/running only; `--recent` adds the ten newest
+  terminal jobs and `-a` requests complete history. Default `--json` remains
+  the full registry; the hidden compatibility filter `--active` returns only
+  queued/running JSON. `-s failed` / `-s lost` replace timestamps with registry
+  issues, while `--issues` filters to actionable failures, losses, nonzero
+  exits, blocked queue entries, and anomalous running jobs without extra
+  log/GPU probes. Finished jobs with a nonzero process exit point to
+  `dt logs SHORT_REF`; legacy lost rows without a reason show `exit marker
   missing`. A fresh reachable LOST probe backfills the precise wrapper/marker
   diagnostic into the registry. Laptop one-shot `ps --json` returns 5 when
   every center query is unreachable (protocol failure 1) instead of a false
@@ -227,7 +230,7 @@ change what a queued job will run.
   watch mode stays alive through outages. `dt agent status --json` gives queue
   depth.
 - Human laptop `dt ps`/`--watch` requests `dt_ps_window_v1` from each head:
-  every actionable row plus enough recent rows for the exact global 30-row
+  every active row plus enough recent rows for the exact global ten-record
   table, together with the pre-window total. Public `--json` and `-a` remain
   full-history. Heads without `--window` support automatically fall back to the
   legacy full-array response.
@@ -541,10 +544,10 @@ dt run [-g N] [-n NAME] [-c CENTER|auto] [-p PROJECT] [--node NODE]
                        options before it fail locally instead of being sent
                        as the remote executable; explicit artifacts require
                        --node or a predecessor with a selected node
-dt ps [--active | -s STATUS] [-a] [--limit N] [-w] [--issues]
+dt ps [--recent | -a | -s STATUS] [--limit N] [-w] [--issues]
       [--watch] [--poll S]
-                       compact multi-job monitor;
-                       active jobs survive the 30-row cap; watch adds progress/
+                       compact multi-job monitor; default is queued/running;
+                       --recent adds ten terminal records; watch adds progress/
                        issue; `live` shows GPU util/VRAM/temp or compact
                        CPU load/RAM/IO (one probe per node);
                        status/resource/log reads share one bounded parallel wave;

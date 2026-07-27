@@ -103,13 +103,11 @@ ROOT_EPILOG = """
 
 [dim]2[/dim]  dt run -n exp -f -- python train.py
 
-[dim]3[/dim]  dt ps --watch
+[dim]3[/dim]  dt ps
 
 [dim]4[/dim]  dt logs exp -f
 
 [dim]5[/dim]  dt pull exp --lite
-
-[dim]6[/dim]  dt sync NODE -p PROJECT --plan
 """
 
 app = typer.Typer(
@@ -3327,7 +3325,7 @@ def chain(
 # ps
 # --------------------------------------------------------------------------
 
-PS_TABLE_LIMIT = 30
+PS_RECENT_LIMIT = 10
 PS_WINDOW_SCHEMA = "dt_ps_window_v1"
 
 
@@ -3454,6 +3452,7 @@ def _gather_ps_rows(
     status: str | None,
     include_progress: bool = False,
     active_only: bool = False,
+    issues_only: bool = False,
     remote_window: bool = False,
     limit: int | None = None,
 ) -> tuple[list[dict], dict[str, str]]:
@@ -3462,6 +3461,8 @@ def _gather_ps_rows(
         argv = ["ps"] + (["-s", status] if status else [])
         if active_only:
             argv.append("--active")
+        if issues_only:
+            argv.append("--issues")
         if include_progress:
             argv.append("--with-progress")
         if limit is not None:
@@ -3473,7 +3474,12 @@ def _gather_ps_rows(
         return _limit_ps_rows(rows, limit), errors
 
     entries = jobs_mod.list_all(cfg)
-    stale = [entry for entry in entries if entry.status in ("running", "lost")]
+    refresh_statuses = {"running", "lost"}
+    if active_only:
+        refresh_statuses = {"running"}
+    elif status is not None:
+        refresh_statuses &= {status}
+    stale = [entry for entry in entries if entry.status in refresh_statuses]
     observations: dict[str, dict[str, object]] = {}
     configured_nodes = {node.name: node for node in cfg.nodes}
     node_statuses: dict[str, NodeStatus] = {}
@@ -3626,18 +3632,26 @@ def _gather_ps_rows(
     return _limit_ps_rows(rows, limit), {}
 
 
-def _select_ps_rows(rows: list[dict], all_: bool) -> list[dict]:
-    """Apply the table limit without ever hiding actionable old jobs."""
+def _select_ps_rows(
+    rows: list[dict],
+    all_: bool,
+    recent: bool = True,
+) -> list[dict]:
+    """Select active work by default, with bounded history only on request."""
     ordered = sorted(rows, key=lambda row: row.get("created_at", 0))
-    if all_ or len(ordered) <= PS_TABLE_LIMIT:
+    if all_:
         return ordered
 
-    active_statuses = {"queued", "running", "lost"}
+    active_statuses = {"queued", "running"}
     active = [row for row in ordered if row.get("status") in active_statuses]
+    if not recent:
+        return active
+
     inactive = [row for row in ordered if row.get("status") not in active_statuses]
-    recent_slots = max(0, PS_TABLE_LIMIT - len(active))
-    recent = inactive[-recent_slots:] if recent_slots else []
-    return sorted([*active, *recent], key=lambda row: row.get("created_at", 0))
+    return sorted(
+        [*active, *inactive[-PS_RECENT_LIMIT:]],
+        key=lambda row: row.get("created_at", 0),
+    )
 
 
 def _visible_ps_rows(
@@ -3645,10 +3659,43 @@ def _visible_ps_rows(
     *,
     all_: bool,
     limit: int | None,
+    recent: bool = True,
 ) -> list[dict]:
     if limit is not None:
         return sorted(rows, key=lambda row: row.get("created_at", 0))
-    return _select_ps_rows(rows, all_)
+    return _select_ps_rows(rows, all_, recent=recent)
+
+
+def _ps_issue_rows(rows: list[dict]) -> list[dict]:
+    """Return only jobs that need operator attention."""
+
+    def actionable(row: dict) -> bool:
+        status = row.get("status")
+        reason = row.get("reason")
+        if status in {"failed", "lost"}:
+            return True
+        if status == "finished":
+            exit_code = row.get("exit_code")
+            return (
+                isinstance(exit_code, int)
+                and not isinstance(exit_code, bool)
+                and exit_code != 0
+            )
+        if status == "queued" and isinstance(reason, str):
+            return reason.startswith("blocked:") or "unreachable:" in reason
+        if status == "running":
+            return bool(
+                row.get("node_unreachable")
+                or row.get("max_hours_exceeded")
+                or (
+                    isinstance(reason, str)
+                    and reason.startswith(jobs_mod.CANCEL_UNVERIFIED_PREFIX)
+                )
+            )
+        return False
+
+    selected = [row for row in rows if actionable(row)]
+    return _PsRows(selected, total=len(selected))
 
 
 def _ps_queue_runway_note(
@@ -3710,16 +3757,28 @@ def _ps_view(
     errors: dict[str, str],
     *,
     all_: bool,
+    recent: bool = False,
     limit: int | None = None,
     wide: bool,
     poll: float,
     show_queue_runway: bool = False,
     laptop: bool = False,
+    title: str = "Active jobs",
+    empty_text: str = "no active jobs",
 ):
-    visible = _visible_ps_rows(rows, all_=all_, limit=limit)
+    visible = _visible_ps_rows(
+        rows,
+        all_=all_,
+        limit=limit,
+        recent=recent,
+    )
     total = _ps_rows_total(rows)
     shown = f"{len(visible)}/{total} jobs" if len(visible) != total else f"{total} jobs"
     caption = shown
+    if not all_ and not recent:
+        caption += " · history: dt ps --recent"
+    elif recent and len(visible) != total:
+        caption += " · all history: dt ps -a"
     runway = _ps_queue_runway_note(rows, laptop=laptop) if show_queue_runway else None
     if runway:
         caption += f" · {runway}"
@@ -3732,6 +3791,8 @@ def _ps_view(
         wide=wide,
         caption=caption,
         show_progress=True,
+        title=title,
+        empty_text=empty_text,
     )
 
 
@@ -3746,12 +3807,18 @@ def ps(
         False,
         "--active",
         help="show only queued and running jobs",
+        hidden=True,
+    ),
+    recent: bool = typer.Option(
+        False,
+        "--recent",
+        help=f"include the {PS_RECENT_LIMIT} most recent terminal jobs",
     ),
     all_: bool = typer.Option(
         False,
         "-a",
         "--all",
-        help="table shows every job (default: active + recent, up to 30)",
+        help="include the complete job history",
     ),
     limit: Optional[int] = typer.Option(
         None,
@@ -3782,20 +3849,30 @@ def ps(
     issues: bool = typer.Option(
         False,
         "--issues",
-        help="show failure/loss reasons instead of timestamps (no live probes)",
+        help="show only actionable failures, losses, blocks, and anomalies",
     ),
     json_: bool = typer.Option(
         False,
         "--json",
-        help="full array unless --limit; with --watch, stream one array per refresh",
+        help="full array by default; explicit filters narrow it",
     ),
     window: bool = typer.Option(False, "--window", hidden=True),
 ) -> None:
-    """List or continuously monitor jobs with live status refresh."""
+    """Show active jobs; opt into recent or complete history."""
     if active and status is not None:
         _fail_submission(
             kind="invalid_argument",
             message="--active cannot be combined with --status",
+            exit_code=1,
+            json_=json_,
+        )
+    if recent and (active or all_ or status is not None or issues or limit is not None):
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "--recent cannot be combined with --active, --all, --status, "
+                "--issues, or --limit"
+            ),
             exit_code=1,
             json_=json_,
         )
@@ -3814,28 +3891,63 @@ def ps(
             json_=json_,
         )
     cfg = _cfg()
+    default_active_view = (
+        not json_
+        and status is None
+        and not active
+        and not recent
+        and not all_
+        and not issues
+        and limit is None
+    )
+    active_only = active or default_active_view
+    recent_view = recent or issues or status is not None
+    if issues:
+        view_title = "All issues" if all_ else "Recent issues"
+        empty_text = "no jobs need attention"
+    elif all_:
+        view_title = "All jobs"
+        empty_text = "no jobs"
+    elif recent:
+        view_title = "Active + recent"
+        empty_text = "no jobs"
+    elif status is not None:
+        view_title = f"{status.title()} jobs"
+        empty_text = f"no {status} jobs"
+    elif limit is not None:
+        view_title = "Newest jobs"
+        empty_text = "no jobs"
+    else:
+        view_title = "Active jobs"
+        empty_text = "no active jobs"
     remote_window = isinstance(cfg, LaptopConfig) and (
         window or (not json_ and (not all_ or limit is not None))
     )
 
     def gather(include_progress: bool):
         window_kwargs = {"remote_window": True} if remote_window else {}
-        if limit is not None:
+        if limit is not None and not issues:
             window_kwargs["limit"] = limit
-        if active:
-            return _gather_ps_rows(
+        if issues:
+            window_kwargs["issues_only"] = True
+        if active_only:
+            rows, errors = _gather_ps_rows(
                 cfg,
                 status,
                 include_progress=include_progress,
                 active_only=True,
                 **window_kwargs,
             )
-        return _gather_ps_rows(
-            cfg,
-            status,
-            include_progress=include_progress,
-            **window_kwargs,
-        )
+        else:
+            rows, errors = _gather_ps_rows(
+                cfg,
+                status,
+                include_progress=include_progress,
+                **window_kwargs,
+            )
+        if issues:
+            rows = _limit_ps_rows(_ps_issue_rows(rows), limit)
+        return rows, errors
 
     if watch_:
         try:
@@ -3855,11 +3967,14 @@ def ps(
                         rows,
                         errors,
                         all_=all_,
+                        recent=recent_view,
                         limit=limit,
                         wide=wide,
                         poll=poll,
-                        show_queue_runway=status is None,
+                        show_queue_runway=status is None and not issues,
                         laptop=isinstance(cfg, LaptopConfig),
+                        title=view_title,
+                        empty_text=empty_text,
                     ),
                     console=out,
                     auto_refresh=False,
@@ -3872,11 +3987,14 @@ def ps(
                                 rows,
                                 errors,
                                 all_=all_,
+                                recent=recent_view,
                                 limit=limit,
                                 wide=wide,
                                 poll=poll,
-                                show_queue_runway=status is None,
+                                show_queue_runway=status is None and not issues,
                                 laptop=isinstance(cfg, LaptopConfig),
+                                title=view_title,
+                                empty_text=empty_text,
                             ),
                             refresh=True,
                         )
@@ -3917,23 +4035,70 @@ def ps(
                 )
             )
             return
-        print(json.dumps(rows))  # stable contract: json is never truncated
+        if recent:
+            rows = _visible_ps_rows(
+                rows,
+                all_=False,
+                limit=None,
+                recent=True,
+            )
+        print(json.dumps(rows))  # stable default contract: json is never truncated
         return
-    visible = _visible_ps_rows(rows, all_=all_, limit=limit)
+    visible = _visible_ps_rows(
+        rows,
+        all_=all_,
+        limit=limit,
+        recent=recent_view,
+    )
     total = _ps_rows_total(rows)
-    if len(visible) != total:
-        hint = (
-            f"--limit {limit}: newest matching jobs"
-            if limit is not None
-            else "-a for all; active jobs are always included"
-        )
+    if limit is not None and len(visible) != total:
+        hint = f"--limit {limit}: newest matching jobs"
         err.print(f"[dim]showing {len(visible)} of {total} jobs ({hint})[/dim]")
+    if issues:
+        issue_count = f"{len(visible)}/{total}" if len(visible) != total else str(total)
+        caption = f"{issue_count} need attention" + (
+            "" if all_ else " · all issues: dt ps --issues -a"
+        )
+    elif default_active_view:
+        caption = "history: dt ps --recent · details: dt info REF"
+    elif recent:
+        caption = (
+            f"{len(visible)} shown of {total} · {PS_RECENT_LIMIT} recent max · "
+            "all history: dt ps -a"
+        )
+    elif all_:
+        caption = f"{len(visible)} jobs · narrow with: dt ps -s STATUS"
+    elif status is not None:
+        status_count = (
+            f"{len(visible)}/{total}" if len(visible) != total else str(total)
+        )
+        caption = (
+            f"{status_count} {status} · all: dt ps -s {status} -a · newest: --limit N"
+        )
+    elif limit is not None:
+        caption = f"{len(visible)} newest jobs"
+    else:
+        caption = None
+    if not visible and default_active_view:
+        if errors:
+            out.print("[yellow]No active jobs reported by reachable centers.[/yellow]")
+        else:
+            out.print("[bold green]No active jobs.[/bold green]")
+        out.print(
+            "[dim]submit: dt run -n NAME -f -- COMMAND · history: dt ps --recent[/dim]"
+        )
+        if all_centers_failed:
+            raise typer.Exit(_fan_failure_exit_code(errors))
+        return
     out.print(
         ps_table(
             visible,
             wide=wide,
+            caption=caption,
             show_progress=with_progress,
             show_issue=(not with_progress and (issues or status in ("failed", "lost"))),
+            title=view_title,
+            empty_text=empty_text,
         )
     )
     if all_centers_failed:
@@ -11944,36 +12109,40 @@ def _find(ref: str) -> None:
 # registration (incl. single-letter aliases)
 # --------------------------------------------------------------------------
 
-app.command("free")(free)
+app.command("free", rich_help_panel="Everyday")(free)
 app.command("f", hidden=True)(free)
-app.command("task")(task)
+app.command("task", hidden=True)(task)
 app.command("t", hidden=True)(task)
-app.command("batch")(batch)
-app.command("chain")(chain)
-app.command("run", context_settings=RUN_CTX)(run)
+app.command("batch", rich_help_panel="Experiments")(batch)
+app.command("chain", rich_help_panel="Experiments")(chain)
+app.command("run", context_settings=RUN_CTX, rich_help_panel="Everyday")(run)
 app.command("r", hidden=True, context_settings=RUN_CTX)(run)
-app.command("ps")(ps)
+app.command("ps", rich_help_panel="Everyday")(ps)
 app.command("p", hidden=True)(ps)
-app.command("logs")(logs)
+app.command("logs", rich_help_panel="Everyday")(logs)
 app.command("l", hidden=True)(logs)
-app.command("attach")(attach)
-app.command("wait")(wait)
-app.command("info")(info)
-app.command("compare")(compare)
-app.command("watch")(watch)
-app.command("metrics")(metrics)
-app.command("rerun")(rerun)
-app.command("fork", context_settings=RUN_CTX)(fork)
-app.command("pull")(pull)
-app.command("kill")(kill)
+app.command("attach", rich_help_panel="Operations")(attach)
+app.command("wait", rich_help_panel="Everyday")(wait)
+app.command("info", rich_help_panel="Everyday")(info)
+app.command("compare", rich_help_panel="Experiments")(compare)
+app.command(
+    "watch",
+    short_help="Follow selected jobs with live logs until they finish.",
+    rich_help_panel="Experiments",
+)(watch)
+app.command("metrics", rich_help_panel="Experiments")(metrics)
+app.command("rerun", rich_help_panel="Experiments")(rerun)
+app.command("fork", context_settings=RUN_CTX, rich_help_panel="Experiments")(fork)
+app.command("pull", rich_help_panel="Everyday")(pull)
+app.command("kill", rich_help_panel="Operations")(kill)
 app.command("k", hidden=True)(kill)
-app.command("clean")(clean)
-app.command("storage")(storage)
-app.command("compact")(compact)
-app.command("sync")(sync)
-app.command("seed")(seed)
-app.command("doctor")(doctor)
-app.add_typer(agent_app, name="agent")
+app.command("clean", rich_help_panel="Operations")(clean)
+app.command("storage", rich_help_panel="Operations")(storage)
+app.command("compact", rich_help_panel="Operations")(compact)
+app.command("sync", rich_help_panel="Operations")(sync)
+app.command("seed", rich_help_panel="Operations")(seed)
+app.command("doctor", rich_help_panel="Operations")(doctor)
+app.add_typer(agent_app, name="agent", rich_help_panel="Operations")
 app.command("_find", hidden=True)(_find)
 
 

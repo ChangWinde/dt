@@ -23,7 +23,7 @@ DistTrainer assumes one trusted Unix identity across trusted hosts. Read
 Install a reviewed wheel by exact path:
 
 ```bash
-uv tool install ./disttrainer-0.6.0-py3-none-any.whl
+uv tool install ./disttrainer-0.6.1-py3-none-any.whl
 dt --version
 ```
 
@@ -75,7 +75,8 @@ dt doctor
 ```bash
 dt free --who
 dt run -n baseline -f -- python train.py
-dt ps --watch
+dt ps
+dt ps --recent
 dt info baseline
 dt logs baseline -f
 dt pull baseline --collection baseline

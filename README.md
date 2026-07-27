@@ -20,7 +20,7 @@ scripts/release-check.sh dist
 
 ```bash
 bash bootstrap.sh \
-  dist/disttrainer-0.6.0-py3-none-any.whl \
+  dist/disttrainer-0.6.1-py3-none-any.whl \
   dist/runtime-constraints.txt
 ```
 
@@ -42,8 +42,8 @@ symlink、缺失摘要和内容漂移。计算节点仍无需安装 dt：launche
 保留的旧制品：
 
 ```bash
-./deploy.sh --plan --rollback 0.6.0 HEAD_A
-./deploy.sh --rollback 0.6.0 HEAD_A
+./deploy.sh --plan --rollback 0.6.1 HEAD_A
+./deploy.sh --rollback 0.6.1 HEAD_A
 ```
 
 开发仍使用 `uv sync --locked --all-groups` 与 `uv run dt`，但 editable 工作树
@@ -157,11 +157,13 @@ dt task psibot-ds "python next.py" -p vla -n next \
                                             # 用当前代码追加到已有运行任务之后
 dt run -g 2 -n exp42 -- python train.py   # 非跟随提交（stdout 末行是 job id）
 dt run -c auto -g 2 -- python train.py    # 笔记本：自动挑空闲最多的中心
-dt ps                                     # 紧凑任务表（含排队中；-s 过滤 -a 全量）
+dt ps                                     # 默认只看 queued/running，不混入历史
+dt ps --recent                            # active + 最近 10 条结束记录
+dt ps -a                                  # 明确请求完整历史
 dt ps --active --json                     # 只取 queued/running，适合轮询与自动化
 dt ps --json --limit 30                   # 只取最新 30 条，避免大历史库反复传全量
 dt ps -s failed                           # 失败任务自动显示根因，不额外探测日志/GPU
-dt ps --issues                            # 混合列表用 issue 替代时间，快速定位异常
+dt ps --issues                            # 只显示失败、lost、非零退出和阻塞任务
 dt ps --watch -s running                  # 多任务实时状态、进度、GPU 与异常
 dt ps -w                                  # 展开 job id 与命令
 dt info exp42                             # 单作业全景 + 最近 3600 条资源样本摘要
@@ -212,7 +214,7 @@ SHA-256，并拒绝路径、符号链接、身份或归档不一致的候选。�
 dt task psibot-ds "python train.py --cfg a" -p omnistack -n dp-a
 dt task psibot-ds "python train.py --cfg b" -p omnistack -n dp-b
 dt task psibot-ds "python train.py --cfg c" -p omnistack -n dp-c
-dt ps --watch --active                    # 一屏看 running + queued
+dt ps --watch                             # 一屏看 running + queued
 ```
 
 第一条会占用空闲卡，其余任务默认进入 FIFO 容量队列；前一条进入终态后，常驻
@@ -547,20 +549,21 @@ queued dequeue 与 agent 派发使用原子状态提交：耗时的 rsync/uv set
 `dt/job.json`，不再只存在于提交时 stderr。这样自动化脚本不必按入口维护不同
 解析器。
 
-`dt ps` 默认针对窄终端优化，一项任务只占一行，集中显示名称、节点、GPU、
-状态/退出码和时间；80 列下优先保留完整节点、GPU 和异常状态，名称再按剩余
-宽度省略。紧凑 `when` 对今天显示 `HH:MM`、历史显示 `MM-DD`，宽表继续显示
-完整时间。最多显示 30 项时，运行中、排队中和 lost 任务始终保留，
-不会被较新的历史任务挤掉。`dt ps -w` 增加 job id 与命令，`dt ps --json`
-始终返回全部任务和完整机器可读字段，不受表格上限影响。
+`dt ps` 默认只显示 queued/running，一项任务只占一行，集中显示名称、四位
+短 ref、节点、GPU、状态/退出码和时间；短 ref 可直接传给 `info/logs/wait/pull`。
+80 列下优先保留 ref、完整节点、GPU 和异常状态，名称再按剩余宽度省略。
+`dt ps --recent` 追加最近 10 条 terminal 记录，`dt ps -a` 才读取完整历史。
+`dt ps -w` 增加完整 job id 与命令；默认 `dt ps --json` 仍返回全部任务和完整
+机器可读字段，自动化契约不受人类默认视图变化影响。
 laptop 的人类表格不会再为此拉取每个 center 的全部历史：head 返回带原始总数
-的 `dt_ps_window_v1`，包含全部 actionable 任务和足以合并出全局最近 30 项的
-窗口，因此仍能精确显示 `showing 30 of N`。`-a` 和公开 `--json` 继续走全量
+的 `dt_ps_window_v1`，包含全部 active 任务和足以合并出全局最近 10 项的
+窗口。`-a` 和公开 `--json` 继续走全量
 契约；旧 head 不支持窗口时自动回退兼容的全量数组。
 过滤 `failed` 或 `lost` 时，最后一列自动从时间切换为 `issue`，直接显示
-registry 原因；混合列表可显式加 `--issues`。该模式只使用已有状态字段，不会
-为了展示失败原因额外访问日志或 GPU。已结束但退出码非零的训练会直接提示
-`dt logs REF`，避免 issue 列看起来正常；旧 registry 中没有 reason 的 lost
+registry 原因；`--issues` 进一步过滤为真正需要处理的任务，成功和正常 killed
+记录不会混入。该模式只使用已有状态字段，不会为了展示失败原因额外访问日志
+或 GPU。已结束但退出码非零的训练会直接提示带短 ref 的 `dt logs abcd`；
+旧 registry 中没有 reason 的 lost
 任务显示 `exit marker missing`。节点可达并再次确认 wrapper 已消失后，
 dt 会把包含 wrapper PID 和 exit marker 路径的精确原因回填到 registry/JSON。
 运行任务的状态探针连不上节点时，紧凑表直接显示 `running? offline`；若注册表

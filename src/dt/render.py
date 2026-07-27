@@ -342,10 +342,13 @@ def ps_table(
     caption: str | None = None,
     show_progress: bool = False,
     show_issue: bool = False,
+    title: str | None = None,
+    empty_text: str = "no matching jobs",
 ) -> Table:
     """Render jobs densely by default; full identity/command only on request."""
     one_center = len({r.get("center") for r in rows}) <= 1
     detailed = show_progress or show_issue
+    show_ref = not show_progress
     compact_status_width = 7 if show_progress else 11
     for row in rows:
         status_text, _ = _job_display_status(row)
@@ -357,6 +360,8 @@ def ps_table(
             max(compact_status_width, len(status_text)),
         )
     t = Table(
+        title=title,
+        title_justify="left",
         header_style="bold",
         box=None,
         padding=(0, 1),
@@ -394,6 +399,15 @@ def ps_table(
                 (17 if one_center else 15) if detailed else (34 if one_center else 26)
             ),
         )
+        if show_ref:
+            t.add_column(
+                "ref",
+                no_wrap=True,
+                overflow="ellipsis",
+                min_width=4,
+                max_width=4,
+                style="dim",
+            )
         t.add_column(
             "node" if one_center else "target",
             no_wrap=True,
@@ -409,7 +423,7 @@ def ps_table(
             max_width=17 if show_progress else 6,
         )
         t.add_column(
-            "status/exit",
+            "state",
             no_wrap=True,
             overflow="ellipsis",
             min_width=compact_status_width,
@@ -440,9 +454,10 @@ def ps_table(
                 max_width=5,
             )
     if not rows:
-        t.add_row("[dim]no matching jobs[/dim]", *([""] * (len(t.columns) - 1)))
+        t.add_row(f"[dim]{empty_text}[/dim]", *([""] * (len(t.columns) - 1)))
         return t
     for r in sorted(rows, key=lambda x: x.get("created_at", 0)):
+        short_ref = str(r.get("job_id", "?")).rsplit("_", 1)[-1][-4:]
         status = r.get("status", "?")
         created_at = (
             datetime.fromtimestamp(r["created_at"]) if r.get("created_at") else None
@@ -576,7 +591,7 @@ def ps_table(
         ):
             # Keep --issues local and fast: tell the operator how to inspect
             # the failure without adding one remote log fetch per table row.
-            issue = "dt logs REF"
+            issue = f"dt logs {short_ref}"
         if not issue and r.get("max_hours_exceeded"):
             issue = "max-hours exceeded"
         progress_text = (" · " if wide else " ").join(progress_parts)
@@ -615,13 +630,18 @@ def ps_table(
             result = (
                 display_status if exit_code is None else f"{display_status}/{exit_code}"
             )
-            t.add_row(
-                r.get("name", "?"),
-                target,
-                gpus,
-                f"[{display_style}]{result}[/{display_style}]",
-                progress_text if detailed else when,
+            values = [r.get("name", "?")]
+            if show_ref:
+                values.append(short_ref)
+            values.extend(
+                [
+                    target,
+                    gpus,
+                    f"[{display_style}]{result}[/{display_style}]",
+                    progress_text if detailed else when,
+                ]
             )
+            t.add_row(*values)
     return t
 
 

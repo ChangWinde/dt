@@ -34,13 +34,16 @@ def test_root_help_has_a_compact_end_to_end_quick_start():
     for command in (
         "dt free",
         "dt run -n exp -f -- python train.py",
-        "dt ps --watch",
+        "dt ps",
         "dt logs exp -f",
         "dt pull exp --lite",
-        "dt sync NODE -p PROJECT --plan",
     ):
         assert command in normalized
     assert "seed Seed caches for slow-network nodes." in normalized
+    assert "Everyday" in normalized
+    assert "Experiments" in normalized
+    assert "Operations" in normalized
+    assert not re.search(r"\btask\s+Safe fast path", normalized)
     assert "nodes whose own internet is too slow" not in normalized
     assert max(map(len, result.output.splitlines())) <= 80
     command_lines = [
@@ -48,7 +51,7 @@ def test_root_help_has_a_compact_end_to_end_quick_start():
         for line in result.output.splitlines()
         if re.match(r"\d+\s+dt ", line.strip())
     ]
-    assert len(command_lines) == 6
+    assert len(command_lines) == 5
 
     seed_help = CliRunner().invoke(
         cli.app,
@@ -58,6 +61,9 @@ def test_root_help_has_a_compact_end_to_end_quick_start():
     assert seed_help.exit_code == 0, seed_help.output
     assert "Idempotent" in seed_help.output
     assert "managed Python runtimes" in seed_help.output
+
+    compatibility_help = CliRunner().invoke(cli.app, ["task", "--help"])
+    assert compatibility_help.exit_code == 0, compatibility_help.output
 
 
 # -- probe owners --------------------------------------------------------------
@@ -2174,7 +2180,10 @@ def test_ps_table_defaults_to_one_compact_row_per_job_at_80_columns(monkeypatch)
     assert "short-canary" in rendered
     assert "psibot-ds" in rendered
     assert "GPU" in rendered
-    assert "status/exit" in rendered
+    assert "state" in rendered
+    assert "ref" in rendered
+    assert "baea" in rendered
+    assert "f787" in rendered
     assert "when" in rendered
     assert "05:10" in rendered
     assert "VERY_LONG_COMMAND" not in rendered
@@ -2420,7 +2429,7 @@ def test_ps_table_marks_queued_reason_and_uses_pinned_target():
     assert "queued blocked" in rendered
 
 
-def test_ps_default_limit_never_hides_old_active_jobs():
+def test_ps_selection_defaults_to_active_and_recent_is_bounded():
     from dt.cli import _select_ps_rows
 
     rows = [
@@ -2436,12 +2445,15 @@ def test_ps_default_limit_never_hides_old_active_jobs():
         "status": "running",
         "created_at": 1.0,
     }
-    selected = _select_ps_rows([old_running, *rows], all_=False)
+    active = _select_ps_rows([old_running, *rows], all_=False, recent=False)
+    recent = _select_ps_rows([old_running, *rows], all_=False, recent=True)
 
-    assert len(selected) == 30
-    assert old_running in selected
-    assert rows[-1] in selected
-    assert rows[0] not in selected
+    assert active == [old_running]
+    assert len(recent) == 11
+    assert old_running in recent
+    assert rows[-1] in recent
+    assert rows[-10] in recent
+    assert rows[-11] not in recent
 
 
 def test_ps_table_has_explicit_empty_state():

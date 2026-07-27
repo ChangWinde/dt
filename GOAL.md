@@ -144,6 +144,27 @@ Tasks:
 - [x] T6.5: complete the final clean-tree release check, independent review,
   release commit, tag, and immutable artifact record.
 
+### M7: Operator UX simplification — IN PROGRESS
+
+Acceptance: the primary command surface is clearly grouped, redundant
+compatibility entry points do not compete with the normal workflow, `dt ps`
+defaults to current actionable work, historical and issue views are explicit,
+and the complete 0.6.1 release gate passes without changing machine-readable
+defaults.
+
+Tasks:
+
+- [x] T7.1: make human `dt ps` show queued/running only by default and keep
+  full default JSON compatibility.
+- [x] T7.2: add bounded `--recent`, actionable `--issues`, short references,
+  and a useful empty state.
+- [x] T7.3: group root help into everyday, experiment, and operations
+  workflows; hide the redundant `task` facade while preserving compatibility.
+- [x] T7.4: preserve exact cross-center history and issue selection with
+  mixed-version head fallback.
+- [ ] T7.5: complete full regression, terminal UX review, clean release gate,
+  0.6.1 artifact retention, and tag.
+
 ## Decisions Log
 
 - [2026-07-27] Real DP/LIBERO-10 work remains the primary product canary;
@@ -239,11 +260,15 @@ Tasks:
   those verified versions. The immutable 0.6.0 bundle is bound to its exact
   clean commit by `release-manifest.json`; public upload remains a separate
   authorized promotion action.
+- [2026-07-28] Human `dt ps` is an operational dashboard, not a registry dump:
+  its default is queued/running, `--recent` admits ten terminal records,
+  `--issues` is an actionable failure inbox, and `-a` is the explicit complete
+  history path. Default JSON remains full for compatibility.
 
 ## Current Focus
 
-Milestone: M6 reproducible release complete
-Task: retain and promote the verified 0.6.0 artifact bundle
-Next action: configure an approved remote/package index when publication is
-authorized, observe the pinned CI workflow, and promote the retained artifacts
-without rebuilding them. Do not occupy a GPU with release-only filler work.
+Milestone: M7 operator UX simplification
+Task: T7.5 final regression, release verification, 0.6.1 artifacts, and tag
+Next action: run the full supported-version and release gates, inspect the
+real 80-column CLI states, then bind the retained bundle to the exact clean
+commit. Do not occupy a GPU with release-only filler work.
