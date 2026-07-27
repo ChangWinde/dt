@@ -30,6 +30,13 @@ public Python index.
    scripts/release-check.sh dist
    ```
 
+On a restricted machine whose uv cache was populated from the same lock file,
+run the identical gate without network access:
+
+```bash
+DT_RELEASE_OFFLINE=1 scripts/release-check.sh dist
+```
+
 The gate refuses a dirty worktree. It runs the full tests and static checks,
 builds wheel and sdist twice, compares their SHA-256 identities, audits package
 paths and disclosure markers, installs the wheel in a clean Python
