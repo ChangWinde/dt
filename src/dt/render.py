@@ -6,6 +6,7 @@ promise and agents can pipe --json safely.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any, TypeAlias
 
 from rich.console import Console
 from rich.markup import escape
@@ -24,6 +25,7 @@ STATUS_STYLE = {
     "lost": "red",
     "failed": "bold red",
 }
+JsonRow: TypeAlias = dict[str, Any]
 
 
 def compress_indices(indices: list[int]) -> str:
@@ -42,7 +44,7 @@ def compress_indices(indices: list[int]) -> str:
     return " ".join(parts)
 
 
-def busy_owners(gpus: list[dict]) -> str:
+def busy_owners(gpus: list[JsonRow]) -> str:
     """'alice×3 bob×1' - who occupies the busy cards, by card count."""
 
     def lease_label(job_id: str) -> str:
@@ -91,7 +93,7 @@ DISK_LOW_FREE_FRACTION = 0.05
 GPU_PULSE_MEMORY_MIB = 512
 
 
-def _reserved_zero_util_label(gpus: list[dict]) -> str | None:
+def _reserved_zero_util_label(gpus: list[JsonRow]) -> str | None:
     """Distinguish untouched leases from CPU/GPU pulse workloads.
 
     A lease without a currently visible CUDA process can mean either the
@@ -115,7 +117,7 @@ def _reserved_zero_util_label(gpus: list[dict]) -> str | None:
     return "pulse" if touched_cuda else "init"
 
 
-def _disk_low_headroom(system: dict) -> tuple[bool, float | None]:
+def _disk_low_headroom(system: JsonRow) -> tuple[bool, float | None]:
     free = system.get("disk_free_gib")
     total = system.get("disk_total_gib")
     if (
@@ -157,7 +159,7 @@ def _compact_remote_error(value: object) -> str:
     return text
 
 
-def free_table(rows: list[dict], who: bool = False) -> Table:
+def free_table(rows: list[JsonRow], who: bool = False) -> Table:
     t = Table(
         title=None,
         header_style="bold",
@@ -300,7 +302,7 @@ def free_table(rows: list[dict], who: bool = False) -> Table:
     return t
 
 
-def _job_display_status(row: dict) -> tuple[str, str]:
+def _job_display_status(row: JsonRow) -> tuple[str, str]:
     status = row.get("status", "?")
     display_status = status
     display_style = STATUS_STYLE.get(status, "white")
@@ -337,7 +339,7 @@ def _job_display_status(row: dict) -> tuple[str, str]:
 
 
 def ps_table(
-    rows: list[dict],
+    rows: list[JsonRow],
     wide: bool = False,
     caption: str | None = None,
     show_progress: bool = False,
@@ -347,7 +349,7 @@ def ps_table(
 ) -> Table:
     """Render jobs densely by default; full identity/command only on request."""
 
-    def row_ref(row: dict) -> str:
+    def row_ref(row: JsonRow) -> str:
         explicit = row.get("display_ref")
         if isinstance(explicit, str) and explicit:
             return explicit
@@ -355,7 +357,7 @@ def ps_table(
 
     one_center = len({r.get("center") for r in rows}) <= 1
 
-    def row_target(row: dict) -> str:
+    def row_target(row: JsonRow) -> str:
         node = row.get("node", "?")
         if node in (None, "-", "?"):
             node = row.get("pin_node") or node
@@ -668,7 +670,7 @@ def ps_table(
     return t
 
 
-def doctor_table(rows: list[dict]) -> Table:
+def doctor_table(rows: list[JsonRow]) -> Table:
     def paint(v: str) -> str:
         if v.startswith("off"):
             return f"[yellow]{v}[/yellow]" if v == "off" else f"[red]{v}[/red]"
@@ -687,7 +689,7 @@ def doctor_table(rows: list[dict]) -> Table:
         """Keep common transport failures actionable in a narrow terminal."""
         return paint(_compact_remote_error(value))
 
-    def tools(checks: dict) -> str:
+    def tools(checks: JsonRow) -> str:
         labels = {"python3": "py", "timeout": "to"}
         values = [
             (name, str(checks.get(name, "-")))
@@ -703,7 +705,7 @@ def doctor_table(rows: list[dict]) -> Table:
             f"{labels.get(name, name)}:{paint(value)}" for name, value in failures
         )
 
-    def control(checks: dict) -> str:
+    def control(checks: JsonRow) -> str:
         values = []
         for name in ("agent", "dt"):
             value = str(checks.get(name, "-"))

@@ -24,7 +24,7 @@ def completion_watch_command(entry: JobEntry) -> str:
     )
 
 
-def spawn_completion_watcher(entry: JobEntry) -> subprocess.Popen:
+def spawn_completion_watcher(entry: JobEntry) -> subprocess.Popen[bytes]:
     """Open one quiet persistent channel for a running job."""
     command = completion_watch_command(entry)
     argv = ["bash", "-c", command] if entry.node_local else ssh_cmd(entry.node, command)
@@ -37,7 +37,7 @@ def spawn_completion_watcher(entry: JobEntry) -> subprocess.Popen:
     )
 
 
-def stop_completion_watcher(process: subprocess.Popen) -> None:
+def stop_completion_watcher(process: subprocess.Popen[bytes]) -> None:
     if process.poll() is not None:
         return
     try:
@@ -62,7 +62,7 @@ class CompletionSignals:
         self,
         on_error: Callable[[str, str], None] | None = None,
     ) -> None:
-        self._processes: dict[str, subprocess.Popen] = {}
+        self._processes: dict[str, subprocess.Popen[bytes]] = {}
         self._disabled: set[str] = set()
         self._on_error = on_error or (lambda _job_id, _detail: None)
 

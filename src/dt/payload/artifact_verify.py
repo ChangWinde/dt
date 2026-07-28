@@ -10,7 +10,10 @@ import stat
 import sys
 from pathlib import Path
 
-from snapshot_hash import tree_sha256
+try:
+    from ..snapshot_hash import tree_sha256
+except ImportError:  # standalone copy beside snapshot_hash.py on compute nodes
+    from snapshot_hash import tree_sha256  # type: ignore[import-not-found,no-redef]
 
 
 def _sha256(path: Path) -> str:

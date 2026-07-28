@@ -25,7 +25,7 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   duplicate nodes, multiple local-node aliases, non-finite retention values,
   and invalid YAML with actionable configuration errors.
 - Cleanup and snapshot-store persistence now have isolated, strict-typed domain
-  modules. The release type gate covers nine modules instead of five.
+  modules. The release type gate now covers the complete `src/dt` package.
 
 ### Fixed
 

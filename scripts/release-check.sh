@@ -87,9 +87,7 @@ uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync mypy --strict --no-incremental \
     --cache-dir="$WORK_DIR/mypy" --follow-imports=skip \
-    src/dt/submission.py src/dt/monitoring.py src/dt/forwarding.py \
-    src/dt/transfers.py src/dt/storage.py src/dt/config.py \
-    src/dt/onboarding.py src/dt/maintenance.py src/dt/snapshot_store.py
+    src/dt
 bash -n src/dt/payload/*.sh bootstrap.sh deploy.sh scripts/release-check.sh
 git diff --check
 

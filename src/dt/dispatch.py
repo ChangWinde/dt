@@ -25,13 +25,14 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from threading import Event
-from typing import Callable, Mapping
+from typing import Callable, Mapping, cast
 
-from .config import ConfigError, HeadConfig, Node
+from .config import ConfigError, HeadConfig, Node, Project
 from .lifecycle import termination_probe, termination_verdict
 from .maintenance import (
     BeforeRegistryRemove,
@@ -141,7 +142,7 @@ _DELETED_FILES_RE = re.compile(r"Number of deleted files: ([\d,]+)")
 _TRANSFERRED_FILES_RE = re.compile(r"Number of regular files transferred: ([\d,]+)")
 
 
-def _launch_phases_s(result: dict) -> dict[str, float]:
+def _launch_phases_s(result: dict[str, object]) -> dict[str, float]:
     raw = result.get("launch_phases_ms")
     if not isinstance(raw, dict):
         return {}
@@ -192,7 +193,11 @@ def transferred_files(rsync_stdout: str) -> int | None:
     return sum(int(match.group(1).replace(",", "")) for match in matches)
 
 
-def _warn_snapshot_size(cfg: HeadConfig, stdout: str, log) -> None:
+def _warn_snapshot_size(
+    cfg: HeadConfig,
+    stdout: str,
+    log: Callable[[str], None],
+) -> None:
     gib = transferred_gib(stdout)
     if gib is not None and gib > cfg.snapshot_warn_gib:
         log(
@@ -202,7 +207,11 @@ def _warn_snapshot_size(cfg: HeadConfig, stdout: str, log) -> None:
         )
 
 
-def _retry_logger(log, subject: str, phase: str):
+def _retry_logger(
+    log: Callable[[str], None],
+    subject: str,
+    phase: str,
+) -> Callable[[RsyncRetryEvent], None]:
     def observe(event: RsyncRetryEvent) -> None:
         detail = event.message
         if len(detail) > 140:
@@ -438,7 +447,7 @@ def _artifact_remote_check(
 
 
 @contextmanager
-def _seed_cache_lock(cfg: HeadConfig, node: Node):
+def _seed_cache_lock(cfg: HeadConfig, node: Node) -> Iterator[None]:
     """Serialize writers to one node's shared uv/HF cache trees."""
     identity = hashlib.sha256(node.name.encode()).hexdigest()[:20]
     path = cfg.state_dir() / f"seed-cache-{identity}.lock"
@@ -458,7 +467,7 @@ def _sync_cache_lock(
     *,
     exclusive: bool,
     blocking: bool = True,
-):
+) -> Iterator[bool]:
     """Coordinate one mutable node/project cache across dt processes.
 
     Writers (sync) serialize. Snapshot readers use a non-blocking shared lock:
@@ -486,7 +495,7 @@ def sync_project(
     project_name: str,
     project_dir: Path,
     node: Node,
-    log,
+    log: Callable[[str], None],
     *,
     plan: bool = False,
     retries: int = 2,
@@ -522,7 +531,7 @@ def _sync_project_locked(
     project_name: str,
     project_dir: Path,
     node: Node,
-    log,
+    log: Callable[[str], None],
     *,
     plan: bool,
     retries: int,
@@ -643,7 +652,7 @@ def sync_artifacts(
     project_dir: Path,
     node: Node,
     artifacts: list[str],
-    log,
+    log: Callable[[str], None],
     *,
     plan: bool = False,
     retries: int = 2,
@@ -1316,7 +1325,11 @@ def inherited_cache_fork_spec_from_entry(
     return spec
 
 
-def resolve_project(cfg: HeadConfig, requested: str | None, cwd: Path):
+def resolve_project(
+    cfg: HeadConfig,
+    requested: str | None,
+    cwd: Path,
+) -> tuple[str, Project]:
     """Returns (name, Project)."""
     if requested:
         if requested not in cfg.projects:
@@ -1341,7 +1354,7 @@ def resolve_project(cfg: HeadConfig, requested: str | None, cwd: Path):
 def git_info(project_dir: Path) -> tuple[str | None, bool, str | None]:
     """(sha, dirty, diff) - all None/False when not a git repo."""
 
-    def _git(*args: str) -> subprocess.CompletedProcess:
+    def _git(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", "-C", str(project_dir), *args],
             capture_output=True,
@@ -1500,7 +1513,7 @@ def _repair_queued_snapshot(
     cfg: HeadConfig,
     entry: JobEntry,
     staging: Path,
-    log,
+    log: Callable[[str], None],
 ) -> None:
     """Restore a mutated queued worktree from its exact content-addressed copy.
 
@@ -1593,7 +1606,7 @@ def capture_snapshot(
     cfg: HeadConfig,
     project_name: str,
     project_dir: Path,
-    log=lambda message: None,
+    log: Callable[[str], None] = lambda message: None,
 ) -> StoredSnapshot:
     """Freeze the current project tree into an immutable content store.
 
@@ -1650,7 +1663,7 @@ def _code_src(node: Node, job_dir: str) -> str:
 def resolve_snapshot(
     cfg: HeadConfig,
     entry: JobEntry,
-    log=lambda message: None,
+    log: Callable[[str], None] = lambda message: None,
 ) -> StoredSnapshot:
     """Resolve an exact archived snapshot, backfilling legacy jobs if safe.
 
@@ -1718,7 +1731,7 @@ def _linkdest_state(cfg: HeadConfig) -> Path:
 
 
 @contextmanager
-def _linkdest_lock(cfg: HeadConfig):
+def _linkdest_lock(cfg: HeadConfig) -> Iterator[None]:
     """Concurrent submits share this state file; lock the read-modify-write."""
     lock = cfg.state_dir() / "linkdest.lock"
     fd = None
@@ -1732,17 +1745,23 @@ def _linkdest_lock(cfg: HeadConfig):
             fd.close()
 
 
-def _load_linkdest(cfg: HeadConfig) -> dict:
+def _load_linkdest(cfg: HeadConfig) -> dict[str, str]:
     path = _linkdest_state(cfg)
     if path.exists():
         try:
-            return json.loads(path.read_text())
-        except Exception:
+            raw: object = json.loads(path.read_text())
+            if isinstance(raw, dict):
+                return {
+                    str(key): value
+                    for key, value in raw.items()
+                    if isinstance(value, str)
+                }
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return {}
     return {}
 
 
-def _save_linkdest(cfg: HeadConfig, state: dict) -> None:
+def _save_linkdest(cfg: HeadConfig, state: dict[str, str]) -> None:
     path = _linkdest_state(cfg)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=1))
@@ -1813,7 +1832,7 @@ def _stable_snapshot_copy_dest(
     copy_dest: str | None,
     *,
     whole_job: bool,
-):
+) -> Iterator[str | None]:
     """Hold a shared cache lock only when copy-dest points at that cache."""
     if copy_dest != _sync_cache_copy_dest(project_name, whole_job):
         yield copy_dest
@@ -1861,7 +1880,7 @@ def payload_sha256(files: Mapping[str, str] | None = None) -> str:
 
 def _support_files(
     cmd: list[str],
-    meta: dict,
+    meta: dict[str, object],
     setup: str | None = None,
     env_key: str | None = None,
     *,
@@ -1876,7 +1895,7 @@ def _support_files(
         files["env-key"] = env_key + "\n"
     meta = dict(meta)
     diff = meta.pop("_diff", None)
-    if meta.get("git_dirty") and diff:
+    if meta.get("git_dirty") and isinstance(diff, str) and diff:
         files["code_dirty.patch"] = diff
     files["meta.json"] = json.dumps(meta, indent=1)
     return files
@@ -2015,8 +2034,8 @@ def snapshot(
     job_id: str,
     job_dir: str,
     spec: RunSpec,
-    meta: dict,
-    log=lambda m: None,
+    meta: dict[str, object],
+    log: Callable[[str], None] = lambda m: None,
     *,
     expected_sha256: str | None = None,
     pre_filtered: bool = False,
@@ -2122,8 +2141,8 @@ def _stage(
     project_dir: Path,
     job_id: str,
     spec: RunSpec,
-    meta: dict,
-    log=lambda m: None,
+    meta: dict[str, object],
+    log: Callable[[str], None] = lambda m: None,
     stored: StoredSnapshot | None = None,
     *,
     runtime_files: Mapping[str, str] | None = None,
@@ -2172,12 +2191,13 @@ def _stage(
     if proc.returncode != 0:
         shutil.rmtree(staging, ignore_errors=True)
         raise DispatchError(f"staging snapshot failed: {proc.stderr.strip()}")
-    meta["snapshot_sha256"] = tree_sha256(staging / "code")
+    snapshot_sha256 = tree_sha256(staging / "code")
+    meta["snapshot_sha256"] = snapshot_sha256
     meta["rerun_snapshot_changed"] = _rerun_snapshot_changed(
         spec,
-        meta["snapshot_sha256"],
+        snapshot_sha256,
     )
-    if stored and meta["snapshot_sha256"] != stored.sha256:
+    if stored and snapshot_sha256 != stored.sha256:
         shutil.rmtree(staging, ignore_errors=True)
         raise DispatchError(
             f"staging snapshot changed during copy: expected {stored.sha256}, "
@@ -2187,7 +2207,7 @@ def _stage(
         staging / "code",
         spec.extras,
         spec.setup,
-        meta["snapshot_sha256"],
+        snapshot_sha256,
         spec.setup_inputs,
     )
     for fname, content in _support_files(
@@ -2214,7 +2234,7 @@ def launch(
     session: str,
     spec: RunSpec,
     reserve: int = 0,
-) -> tuple[int, dict | str]:
+) -> tuple[int, dict[str, object] | str]:
     """Returns (exit_code, parsed-json-or-stderr)."""
     envs = {
         "DT_JOB_DIR": job_dir,
@@ -2301,9 +2321,12 @@ def launch(
     if proc.returncode == 0:
         last = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "{}"
         try:
-            return 0, json.loads(last)
+            parsed: object = json.loads(last)
         except json.JSONDecodeError:
             return 14, f"unparseable launcher output: {last!r}"
+        if isinstance(parsed, dict):
+            return 0, cast(dict[str, object], parsed)
+        return 14, f"unparseable launcher output: {last!r}"
     detail = (proc.stderr or "").strip().splitlines()
     return proc.returncode, (detail[-1] if detail else f"exit {proc.returncode}")
 
@@ -2428,8 +2451,8 @@ def _try_nodes(
     job_id: str,
     job_dir: str,
     session: str,
-    sync_to_node,
-    log,
+    sync_to_node: Callable[[Node], str],
+    log: Callable[[str], None],
     *,
     created_at: float | None = None,
     payload_sha256: str | None = None,
@@ -2487,6 +2510,15 @@ def _try_nodes(
         if code == 0 and isinstance(result, dict):
             env_preexisting = result.get("env_preexisting")
             setup_ran = result.get("setup_ran")
+            raw_gpus = result.get("gpus")
+            gpu_values = raw_gpus if isinstance(raw_gpus, list) else []
+            pgid_value = result.get("pgid")
+            if not isinstance(pgid_value, (str, int)) or isinstance(pgid_value, bool):
+                failure_kinds.add("fatal")
+                reasons[node.name] = "internal: launcher returned no valid pgid"
+                return None, reasons, True, failure_kinds
+            env_value = result.get("env")
+            boot_id_value = result.get("boot_id")
             entry = JobEntry(
                 job_id=job_id,
                 name=spec.name,
@@ -2497,8 +2529,8 @@ def _try_nodes(
                 job_dir=job_dir,
                 session=session,
                 cmd=shlex.join(spec.cmd),
-                gpus=[int(g) for g in result.get("gpus", []) if str(g) != ""],
-                pgid=int(result["pgid"]),
+                gpus=[int(g) for g in gpu_values if isinstance(g, (str, int))],
+                pgid=int(pgid_value),
                 gpus_requested=spec.gpus,
                 require_path=spec.require_path,
                 require_disk_gib=spec.require_disk_gib,
@@ -2506,7 +2538,7 @@ def _try_nodes(
                 max_hours=spec.max_hours,
                 max_vram_mib=spec.max_vram_mib,
                 max_job_memory_mib=spec.max_job_memory_mib,
-                env_hash=result.get("env") or None,
+                env_hash=env_value if isinstance(env_value, str) else None,
                 snapshot_duration_s=snapshot_duration_s,
                 launch_duration_s=launch_duration_s,
                 launch_phases_s=_launch_phases_s(result),
@@ -2514,7 +2546,7 @@ def _try_nodes(
                     env_preexisting if isinstance(env_preexisting, bool) else None
                 ),
                 setup_ran=(setup_ran if isinstance(setup_ran, bool) else None),
-                boot_id=result.get("boot_id") or None,
+                boot_id=boot_id_value if isinstance(boot_id_value, str) else None,
                 snapshot_sha256=snapshot_sha256,
                 payload_sha256=payload_sha256,
                 artifact_manifest=spec.artifact_manifest,
@@ -2555,7 +2587,11 @@ def _try_nodes(
 
 
 def submit(
-    cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = False
+    cfg: HeadConfig,
+    spec: RunSpec,
+    cwd: Path,
+    log: Callable[[str], None],
+    no_queue: bool = False,
 ) -> JobEntry:
     """log: callable(str) writing progress to stderr.
     Returns an entry with status "running" (placed now) or "queued"."""
@@ -2590,7 +2626,7 @@ def submit_fork(
     cfg: HeadConfig,
     source: JobEntry,
     spec: RunSpec,
-    log,
+    log: Callable[[str], None],
     no_queue: bool = False,
     force_queue: bool = False,
     force_queue_label: str = "batch",
@@ -2640,11 +2676,11 @@ def _submit_prepared(
     cfg: HeadConfig,
     spec: RunSpec,
     *,
-    source_factory,
+    source_factory: Callable[[], StoredSnapshot],
     git_sha: str | None,
     git_dirty: bool,
     git_diff: str | None,
-    log,
+    log: Callable[[str], None],
     no_queue: bool,
     force_queue: bool = False,
     force_queue_label: str = "batch",
@@ -2791,6 +2827,7 @@ def _submit_prepared(
             and predecessor.node == spec.node
         )
         if dependency_ready_on_pin:
+            assert predecessor is not None
             log(
                 f"dependency {spec.after_success} already succeeded on "
                 f"{predecessor.node}; placing immediately"
@@ -3019,7 +3056,11 @@ def _submit_prepared(
     )
 
 
-def dispatch_queued(cfg: HeadConfig, entry: JobEntry, log) -> tuple[str, str | None]:
+def dispatch_queued(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    log: Callable[[str], None],
+) -> tuple[str, str | None]:
     """Try to place a queued job now. Returns (outcome, detail) with outcome in:
     started | busy | blocked | failed | killed | cancel-failed.
     Called by the agent (and tests)."""
@@ -3114,7 +3155,7 @@ def _commit_queued_transition(
 def _dispatch_queued_active(
     cfg: HeadConfig,
     entry: JobEntry,
-    log,
+    log: Callable[[str], None],
 ) -> tuple[str, str | None]:
     """Dispatch one queued entry with atomic, cancellation-aware transitions."""
 
@@ -3282,7 +3323,7 @@ def _dispatch_queued_active(
             return interrupted
         return "busy", None
 
-    def sync_to_node(node: Node) -> str | None:
+    def sync_to_node(node: Node) -> str:
         run_on(
             node.name,
             node.local,
@@ -3472,7 +3513,7 @@ def clean_jobs(
     cfg: HeadConfig,
     cutoff_ts: float,
     envs: bool,
-    log,
+    log: Callable[[str], None],
     *,
     projects: set[str] | None = None,
     before_registry_remove: BeforeRegistryRemove | None = None,
