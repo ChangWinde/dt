@@ -18,6 +18,7 @@ import re
 import secrets
 import tempfile
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
@@ -204,7 +205,7 @@ def save(cfg: HeadConfig, entry: JobEntry) -> None:
 
 
 @contextmanager
-def job_lock(cfg: HeadConfig, job_id: str):
+def job_lock(cfg: HeadConfig, job_id: str) -> Iterator[None]:
     """Serialize status probes and destructive lifecycle transitions."""
     path = cfg.registry_dir() / f".{job_id}.lock"
     with path.open("w") as lock:
@@ -216,7 +217,7 @@ def job_lock(cfg: HeadConfig, job_id: str):
 
 
 @contextmanager
-def pull_destination_lock(cfg: HeadConfig, destination: Path):
+def pull_destination_lock(cfg: HeadConfig, destination: Path) -> Iterator[None]:
     """Serialize all writers targeting the same canonical result directory."""
     canonical = destination.expanduser().resolve(strict=False)
     digest = hashlib.sha256(os.fsencode(canonical)).hexdigest()[:24]

@@ -85,9 +85,10 @@ uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync mypy --strict --no-incremental \
   --cache-dir=/tmp/dt-mypy --follow-imports=skip \
-  src/dt/submission.py src/dt/monitoring.py src/dt/forwarding.py \
-  src/dt/transfers.py src/dt/storage.py
-bash -n src/dt/payload/*.sh bootstrap.sh deploy.sh scripts/release-check.sh
+  src/dt
+python scripts/repo_hygiene.py
+bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
+  scripts/release-check.sh
 git diff --check
 ```
 
@@ -128,9 +129,9 @@ Do not commit:
 - generated release artifacts;
 - unrelated formatting or cleanup.
 
-The package README is `PACKAGE_README.md`. It is intentionally sanitized for
-the sdist and must not contain internal hosts, paths, datasets, or experiment
-identifiers.
+The package README is `docs/package-readme.md`. It is intentionally sanitized
+for the sdist and must not contain internal hosts, paths, datasets, or
+experiment identifiers.
 
 ## Pull requests
 
@@ -152,4 +153,5 @@ security changes. The versions in `pyproject.toml` and `src/dt/__init__.py`
 must match.
 
 Run `scripts/release-check.sh` only from the intended clean release commit. See
-the [release procedure](docs/releasing.md) for artifact promotion and rollback.
+the [release procedure](../docs/releasing.md) for artifact promotion and
+rollback.

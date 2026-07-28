@@ -89,7 +89,7 @@ def _node_row(
             "else b=0; n=0; fi; "
             f'printf \'{kind}\\t%s\\t%s\\n\' "${{b:--1}}" "$n"'
         )
-    base = {
+    base: dict[str, object] = {
         "node": node.name,
         "error": None,
         **{

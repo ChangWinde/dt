@@ -27,6 +27,12 @@ DistTrainer provides collision-safe GPU leases, bounded remote operations,
 content identities, path validation, previewable destructive maintenance, and
 process-tree cleanup within that trust model.
 
+Destructive cleanup validates a registry job directory against the exact
+`dt/jobs/JOB_ID` slot before invoking `rm`. A failed remote or related local
+deletion retains the registry record so the operation remains visible and
+retryable. Laptop cleanup is single-center by default; cross-center cleanup
+requires `--all-centers`.
+
 ## Reporting a vulnerability
 
 Report vulnerabilities privately to the maintainer or operations channel that

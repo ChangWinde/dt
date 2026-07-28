@@ -19,9 +19,9 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from pathlib import Path
-from typing import TypedDict
+from typing import TextIO, TypedDict
 
 _active_gpu_probe: subprocess.Popen[str] | None = None
 _active_gpu_probe_lock = threading.RLock()
@@ -563,7 +563,7 @@ def _trip_resource_guard(
 
 
 @contextlib.contextmanager
-def _sample_stream(path: Path):
+def _sample_stream(path: Path) -> Iterator[TextIO | None]:
     """Yield the history stream, or None if it cannot be used.
 
     Recording history is best-effort; the resource guards are a contract. Every
@@ -649,6 +649,7 @@ def main() -> int:
                 break
             sampled_at = time.time()
             job, job_state = _job_usage(args.root_pid, job_state, sampled_at)
+            phase = _phase(args.phase_file)
             row = {
                 "schema_version": "dt_resource_v1",
                 "timestamp": sampled_at,
@@ -659,7 +660,7 @@ def main() -> int:
                 "node": os.environ.get("DT_NODE") or socket.gethostname(),
                 "gpus": gpus,
                 "job": job,
-                "phase": _phase(args.phase_file),
+                "phase": phase,
                 "host": _host(args.output),
                 "gpu_error": gpu_error,
             }
@@ -680,7 +681,7 @@ def main() -> int:
                 kind="max_vram_mib",
                 violation=violation,
                 sampled_at=sampled_at,
-                phase=row["phase"],
+                phase=phase,
             ):
                 break
             violation = _job_memory_violation(job, args.max_job_memory_mib)
@@ -690,7 +691,7 @@ def main() -> int:
                 kind="max_job_memory_mib",
                 violation=violation,
                 sampled_at=sampled_at,
-                phase=row["phase"],
+                phase=phase,
             ):
                 break
             if args.samples and count >= args.samples:

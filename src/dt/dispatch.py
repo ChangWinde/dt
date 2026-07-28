@@ -25,21 +25,26 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path, PurePosixPath
 from threading import Event
-from typing import Callable, Mapping
+from typing import Callable, Mapping, cast
 
-from .config import ConfigError, HeadConfig, Node
+from .config import ConfigError, HeadConfig, Node, Project
 from .lifecycle import termination_probe, termination_verdict
+from .maintenance import (
+    BeforeRegistryRemove,
+    CleanReport,
+    clean_job_victims as _clean_job_victims,
+    clean_jobs as _clean_jobs,
+)
 from .jobs import (
     CANCEL_UNVERIFIED_PREFIX,
     UNCERTAIN_LAUNCH_PREFIX,
     JobEntry,
     job_lock,
-    list_all,
     load,
     new_job_id,
     request_agent_wake,
@@ -57,6 +62,12 @@ from .payload_hash import (
 )
 from .probe import NodeStatus, probe_center, probe_node
 from .snapshot_hash import tree_sha256
+from .snapshot_store import (
+    code_path as _snapshot_path,
+    load_state as _load_snapshot_store_state,
+    lock as _snapshot_store_lock,
+    save_state as _save_snapshot_store_state,
+)
 from .sshio import (
     RSYNC_UNREACHABLE_EXIT_CODES,
     RemoteError,
@@ -131,7 +142,7 @@ _DELETED_FILES_RE = re.compile(r"Number of deleted files: ([\d,]+)")
 _TRANSFERRED_FILES_RE = re.compile(r"Number of regular files transferred: ([\d,]+)")
 
 
-def _launch_phases_s(result: dict) -> dict[str, float]:
+def _launch_phases_s(result: dict[str, object]) -> dict[str, float]:
     raw = result.get("launch_phases_ms")
     if not isinstance(raw, dict):
         return {}
@@ -182,7 +193,11 @@ def transferred_files(rsync_stdout: str) -> int | None:
     return sum(int(match.group(1).replace(",", "")) for match in matches)
 
 
-def _warn_snapshot_size(cfg: HeadConfig, stdout: str, log) -> None:
+def _warn_snapshot_size(
+    cfg: HeadConfig,
+    stdout: str,
+    log: Callable[[str], None],
+) -> None:
     gib = transferred_gib(stdout)
     if gib is not None and gib > cfg.snapshot_warn_gib:
         log(
@@ -192,7 +207,11 @@ def _warn_snapshot_size(cfg: HeadConfig, stdout: str, log) -> None:
         )
 
 
-def _retry_logger(log, subject: str, phase: str):
+def _retry_logger(
+    log: Callable[[str], None],
+    subject: str,
+    phase: str,
+) -> Callable[[RsyncRetryEvent], None]:
     def observe(event: RsyncRetryEvent) -> None:
         detail = event.message
         if len(detail) > 140:
@@ -428,7 +447,7 @@ def _artifact_remote_check(
 
 
 @contextmanager
-def _seed_cache_lock(cfg: HeadConfig, node: Node):
+def _seed_cache_lock(cfg: HeadConfig, node: Node) -> Iterator[None]:
     """Serialize writers to one node's shared uv/HF cache trees."""
     identity = hashlib.sha256(node.name.encode()).hexdigest()[:20]
     path = cfg.state_dir() / f"seed-cache-{identity}.lock"
@@ -448,7 +467,7 @@ def _sync_cache_lock(
     *,
     exclusive: bool,
     blocking: bool = True,
-):
+) -> Iterator[bool]:
     """Coordinate one mutable node/project cache across dt processes.
 
     Writers (sync) serialize. Snapshot readers use a non-blocking shared lock:
@@ -476,7 +495,7 @@ def sync_project(
     project_name: str,
     project_dir: Path,
     node: Node,
-    log,
+    log: Callable[[str], None],
     *,
     plan: bool = False,
     retries: int = 2,
@@ -512,7 +531,7 @@ def _sync_project_locked(
     project_name: str,
     project_dir: Path,
     node: Node,
-    log,
+    log: Callable[[str], None],
     *,
     plan: bool,
     retries: int,
@@ -633,7 +652,7 @@ def sync_artifacts(
     project_dir: Path,
     node: Node,
     artifacts: list[str],
-    log,
+    log: Callable[[str], None],
     *,
     plan: bool = False,
     retries: int = 2,
@@ -1306,7 +1325,11 @@ def inherited_cache_fork_spec_from_entry(
     return spec
 
 
-def resolve_project(cfg: HeadConfig, requested: str | None, cwd: Path):
+def resolve_project(
+    cfg: HeadConfig,
+    requested: str | None,
+    cwd: Path,
+) -> tuple[str, Project]:
     """Returns (name, Project)."""
     if requested:
         if requested not in cfg.projects:
@@ -1331,7 +1354,7 @@ def resolve_project(cfg: HeadConfig, requested: str | None, cwd: Path):
 def git_info(project_dir: Path) -> tuple[str | None, bool, str | None]:
     """(sha, dirty, diff) - all None/False when not a git repo."""
 
-    def _git(*args: str) -> subprocess.CompletedProcess:
+    def _git(*args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", "-C", str(project_dir), *args],
             capture_output=True,
@@ -1471,48 +1494,6 @@ def pick_candidates(
 # --------------------------------------------------------------------------
 
 
-def _snapshot_store_state(cfg: HeadConfig) -> Path:
-    return cfg.state_dir() / "snapshot-store.json"
-
-
-@contextmanager
-def _snapshot_store_lock(cfg: HeadConfig):
-    """Serialize capture so the per-project hard-link baseline stays valid."""
-    lock = cfg.state_dir() / "snapshot-store.lock"
-    with open(lock, "w") as fd:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-
-
-def _load_snapshot_store_state(cfg: HeadConfig) -> dict[str, str]:
-    path = _snapshot_store_state(cfg)
-    if not path.exists():
-        return {}
-    try:
-        raw = json.loads(path.read_text())
-        return {
-            str(project): str(digest)
-            for project, digest in raw.items()
-            if re.fullmatch(r"[0-9a-f]{64}", str(digest))
-        }
-    except Exception:
-        return {}
-
-
-def _save_snapshot_store_state(cfg: HeadConfig, state: dict[str, str]) -> None:
-    path = _snapshot_store_state(cfg)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=1))
-    tmp.replace(path)
-
-
-def _snapshot_path(cfg: HeadConfig, digest: str) -> Path:
-    return cfg.snapshots_dir() / digest / "code"
-
-
 def _validate_stored_snapshot(cfg: HeadConfig, digest: str) -> StoredSnapshot:
     code = _snapshot_path(cfg, digest)
     if not code.is_dir():
@@ -1532,7 +1513,7 @@ def _repair_queued_snapshot(
     cfg: HeadConfig,
     entry: JobEntry,
     staging: Path,
-    log,
+    log: Callable[[str], None],
 ) -> None:
     """Restore a mutated queued worktree from its exact content-addressed copy.
 
@@ -1625,7 +1606,7 @@ def capture_snapshot(
     cfg: HeadConfig,
     project_name: str,
     project_dir: Path,
-    log=lambda message: None,
+    log: Callable[[str], None] = lambda message: None,
 ) -> StoredSnapshot:
     """Freeze the current project tree into an immutable content store.
 
@@ -1682,7 +1663,7 @@ def _code_src(node: Node, job_dir: str) -> str:
 def resolve_snapshot(
     cfg: HeadConfig,
     entry: JobEntry,
-    log=lambda message: None,
+    log: Callable[[str], None] = lambda message: None,
 ) -> StoredSnapshot:
     """Resolve an exact archived snapshot, backfilling legacy jobs if safe.
 
@@ -1750,7 +1731,7 @@ def _linkdest_state(cfg: HeadConfig) -> Path:
 
 
 @contextmanager
-def _linkdest_lock(cfg: HeadConfig):
+def _linkdest_lock(cfg: HeadConfig) -> Iterator[None]:
     """Concurrent submits share this state file; lock the read-modify-write."""
     lock = cfg.state_dir() / "linkdest.lock"
     fd = None
@@ -1764,17 +1745,23 @@ def _linkdest_lock(cfg: HeadConfig):
             fd.close()
 
 
-def _load_linkdest(cfg: HeadConfig) -> dict:
+def _load_linkdest(cfg: HeadConfig) -> dict[str, str]:
     path = _linkdest_state(cfg)
     if path.exists():
         try:
-            return json.loads(path.read_text())
-        except Exception:
+            raw: object = json.loads(path.read_text())
+            if isinstance(raw, dict):
+                return {
+                    str(key): value
+                    for key, value in raw.items()
+                    if isinstance(value, str)
+                }
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return {}
     return {}
 
 
-def _save_linkdest(cfg: HeadConfig, state: dict) -> None:
+def _save_linkdest(cfg: HeadConfig, state: dict[str, str]) -> None:
     path = _linkdest_state(cfg)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, indent=1))
@@ -1845,7 +1832,7 @@ def _stable_snapshot_copy_dest(
     copy_dest: str | None,
     *,
     whole_job: bool,
-):
+) -> Iterator[str | None]:
     """Hold a shared cache lock only when copy-dest points at that cache."""
     if copy_dest != _sync_cache_copy_dest(project_name, whole_job):
         yield copy_dest
@@ -1893,7 +1880,7 @@ def payload_sha256(files: Mapping[str, str] | None = None) -> str:
 
 def _support_files(
     cmd: list[str],
-    meta: dict,
+    meta: dict[str, object],
     setup: str | None = None,
     env_key: str | None = None,
     *,
@@ -1908,7 +1895,7 @@ def _support_files(
         files["env-key"] = env_key + "\n"
     meta = dict(meta)
     diff = meta.pop("_diff", None)
-    if meta.get("git_dirty") and diff:
+    if meta.get("git_dirty") and isinstance(diff, str) and diff:
         files["code_dirty.patch"] = diff
     files["meta.json"] = json.dumps(meta, indent=1)
     return files
@@ -2047,8 +2034,8 @@ def snapshot(
     job_id: str,
     job_dir: str,
     spec: RunSpec,
-    meta: dict,
-    log=lambda m: None,
+    meta: dict[str, object],
+    log: Callable[[str], None] = lambda m: None,
     *,
     expected_sha256: str | None = None,
     pre_filtered: bool = False,
@@ -2154,8 +2141,8 @@ def _stage(
     project_dir: Path,
     job_id: str,
     spec: RunSpec,
-    meta: dict,
-    log=lambda m: None,
+    meta: dict[str, object],
+    log: Callable[[str], None] = lambda m: None,
     stored: StoredSnapshot | None = None,
     *,
     runtime_files: Mapping[str, str] | None = None,
@@ -2204,12 +2191,13 @@ def _stage(
     if proc.returncode != 0:
         shutil.rmtree(staging, ignore_errors=True)
         raise DispatchError(f"staging snapshot failed: {proc.stderr.strip()}")
-    meta["snapshot_sha256"] = tree_sha256(staging / "code")
+    snapshot_sha256 = tree_sha256(staging / "code")
+    meta["snapshot_sha256"] = snapshot_sha256
     meta["rerun_snapshot_changed"] = _rerun_snapshot_changed(
         spec,
-        meta["snapshot_sha256"],
+        snapshot_sha256,
     )
-    if stored and meta["snapshot_sha256"] != stored.sha256:
+    if stored and snapshot_sha256 != stored.sha256:
         shutil.rmtree(staging, ignore_errors=True)
         raise DispatchError(
             f"staging snapshot changed during copy: expected {stored.sha256}, "
@@ -2219,7 +2207,7 @@ def _stage(
         staging / "code",
         spec.extras,
         spec.setup,
-        meta["snapshot_sha256"],
+        snapshot_sha256,
         spec.setup_inputs,
     )
     for fname, content in _support_files(
@@ -2246,7 +2234,7 @@ def launch(
     session: str,
     spec: RunSpec,
     reserve: int = 0,
-) -> tuple[int, dict | str]:
+) -> tuple[int, dict[str, object] | str]:
     """Returns (exit_code, parsed-json-or-stderr)."""
     envs = {
         "DT_JOB_DIR": job_dir,
@@ -2333,9 +2321,12 @@ def launch(
     if proc.returncode == 0:
         last = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "{}"
         try:
-            return 0, json.loads(last)
+            parsed: object = json.loads(last)
         except json.JSONDecodeError:
             return 14, f"unparseable launcher output: {last!r}"
+        if isinstance(parsed, dict):
+            return 0, cast(dict[str, object], parsed)
+        return 14, f"unparseable launcher output: {last!r}"
     detail = (proc.stderr or "").strip().splitlines()
     return proc.returncode, (detail[-1] if detail else f"exit {proc.returncode}")
 
@@ -2460,8 +2451,8 @@ def _try_nodes(
     job_id: str,
     job_dir: str,
     session: str,
-    sync_to_node,
-    log,
+    sync_to_node: Callable[[Node], str],
+    log: Callable[[str], None],
     *,
     created_at: float | None = None,
     payload_sha256: str | None = None,
@@ -2519,6 +2510,15 @@ def _try_nodes(
         if code == 0 and isinstance(result, dict):
             env_preexisting = result.get("env_preexisting")
             setup_ran = result.get("setup_ran")
+            raw_gpus = result.get("gpus")
+            gpu_values = raw_gpus if isinstance(raw_gpus, list) else []
+            pgid_value = result.get("pgid")
+            if not isinstance(pgid_value, (str, int)) or isinstance(pgid_value, bool):
+                failure_kinds.add("fatal")
+                reasons[node.name] = "internal: launcher returned no valid pgid"
+                return None, reasons, True, failure_kinds
+            env_value = result.get("env")
+            boot_id_value = result.get("boot_id")
             entry = JobEntry(
                 job_id=job_id,
                 name=spec.name,
@@ -2529,8 +2529,8 @@ def _try_nodes(
                 job_dir=job_dir,
                 session=session,
                 cmd=shlex.join(spec.cmd),
-                gpus=[int(g) for g in result.get("gpus", []) if str(g) != ""],
-                pgid=int(result["pgid"]),
+                gpus=[int(g) for g in gpu_values if isinstance(g, (str, int))],
+                pgid=int(pgid_value),
                 gpus_requested=spec.gpus,
                 require_path=spec.require_path,
                 require_disk_gib=spec.require_disk_gib,
@@ -2538,7 +2538,7 @@ def _try_nodes(
                 max_hours=spec.max_hours,
                 max_vram_mib=spec.max_vram_mib,
                 max_job_memory_mib=spec.max_job_memory_mib,
-                env_hash=result.get("env") or None,
+                env_hash=env_value if isinstance(env_value, str) else None,
                 snapshot_duration_s=snapshot_duration_s,
                 launch_duration_s=launch_duration_s,
                 launch_phases_s=_launch_phases_s(result),
@@ -2546,7 +2546,7 @@ def _try_nodes(
                     env_preexisting if isinstance(env_preexisting, bool) else None
                 ),
                 setup_ran=(setup_ran if isinstance(setup_ran, bool) else None),
-                boot_id=result.get("boot_id") or None,
+                boot_id=boot_id_value if isinstance(boot_id_value, str) else None,
                 snapshot_sha256=snapshot_sha256,
                 payload_sha256=payload_sha256,
                 artifact_manifest=spec.artifact_manifest,
@@ -2587,7 +2587,11 @@ def _try_nodes(
 
 
 def submit(
-    cfg: HeadConfig, spec: RunSpec, cwd: Path, log, no_queue: bool = False
+    cfg: HeadConfig,
+    spec: RunSpec,
+    cwd: Path,
+    log: Callable[[str], None],
+    no_queue: bool = False,
 ) -> JobEntry:
     """log: callable(str) writing progress to stderr.
     Returns an entry with status "running" (placed now) or "queued"."""
@@ -2622,7 +2626,7 @@ def submit_fork(
     cfg: HeadConfig,
     source: JobEntry,
     spec: RunSpec,
-    log,
+    log: Callable[[str], None],
     no_queue: bool = False,
     force_queue: bool = False,
     force_queue_label: str = "batch",
@@ -2672,11 +2676,11 @@ def _submit_prepared(
     cfg: HeadConfig,
     spec: RunSpec,
     *,
-    source_factory,
+    source_factory: Callable[[], StoredSnapshot],
     git_sha: str | None,
     git_dirty: bool,
     git_diff: str | None,
-    log,
+    log: Callable[[str], None],
     no_queue: bool,
     force_queue: bool = False,
     force_queue_label: str = "batch",
@@ -2823,6 +2827,7 @@ def _submit_prepared(
             and predecessor.node == spec.node
         )
         if dependency_ready_on_pin:
+            assert predecessor is not None
             log(
                 f"dependency {spec.after_success} already succeeded on "
                 f"{predecessor.node}; placing immediately"
@@ -3051,7 +3056,11 @@ def _submit_prepared(
     )
 
 
-def dispatch_queued(cfg: HeadConfig, entry: JobEntry, log) -> tuple[str, str | None]:
+def dispatch_queued(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    log: Callable[[str], None],
+) -> tuple[str, str | None]:
     """Try to place a queued job now. Returns (outcome, detail) with outcome in:
     started | busy | blocked | failed | killed | cancel-failed.
     Called by the agent (and tests)."""
@@ -3146,7 +3155,7 @@ def _commit_queued_transition(
 def _dispatch_queued_active(
     cfg: HeadConfig,
     entry: JobEntry,
-    log,
+    log: Callable[[str], None],
 ) -> tuple[str, str | None]:
     """Dispatch one queued entry with atomic, cancellation-aware transitions."""
 
@@ -3314,7 +3323,7 @@ def _dispatch_queued_active(
             return interrupted
         return "busy", None
 
-    def sync_to_node(node: Node) -> str | None:
+    def sync_to_node(node: Node) -> str:
         run_on(
             node.name,
             node.local,
@@ -3490,133 +3499,32 @@ def _dispatch_queued_active(
 # --------------------------------------------------------------------------
 
 
-def envs_in_use(cfg: HeadConfig) -> dict[str, set[str]]:
-    """node -> set of env hashes referenced by live (running) jobs."""
-    used: dict[str, set[str]] = {}
-    for e in list_all(cfg):
-        if e.status == "running" and e.env_hash:
-            used.setdefault(e.node, set()).add(e.env_hash)
-    return used
-
-
-def _clean_envs_cmd(envs_dir: str, cutoff: datetime, keep: set[str]) -> str:
-    """Shell that deletes stale shared venvs. Guard rails: only 12-hex-char
-    dir names (our lockhash naming), never ones in `keep`, only dirs not
-    touched since the cutoff (launcher touches the env on every use)."""
-    keep_csv = "," + ",".join(sorted(keep)) + ","
-    stamp = cutoff.strftime("%Y-%m-%d %H:%M:%S")
-    return (
-        f"bash -c 'cd {envs_dir} 2>/dev/null || exit 0; "
-        f'for d in */; do d="${{d%/}}"; '
-        f'[[ "$d" =~ ^[0-9a-f]{{12}}$ ]] || continue; '
-        f'case "{keep_csv}" in *",$d,"*) continue;; esac; '
-        f'[ -n "$(find "$d" -maxdepth 0 -newermt "{stamp}" 2>/dev/null)" ] && continue; '
-        f'rm -rf "$d" "$d.lock" && echo "$d"; done\''
-    )
-
-
-def clean_envs(cfg: HeadConfig, cutoff_ts: float, log) -> int:
-    """Remove shared venvs unused since the cutoff on every node."""
-    cutoff = datetime.fromtimestamp(cutoff_ts)
-    used = envs_in_use(cfg)
-    removed = 0
-    for node in cfg.nodes:
-        cmd = _clean_envs_cmd(cfg.envs, cutoff, used.get(node.name, set()))
-        try:
-            proc = run_on(node.name, node.local, cmd, timeout=120)
-        except Exception as e:
-            log(f"{node.name}: env clean skipped ({e})")
-            continue
-        gone = [line for line in (proc.stdout or "").splitlines() if line.strip()]
-        if gone:
-            log(f"{node.name}: removed {len(gone)} stale envs ({', '.join(gone)})")
-            removed += len(gone)
-    return removed
-
-
 def clean_job_victims(
     cfg: HeadConfig,
     cutoff_ts: float,
     *,
     projects: set[str] | None = None,
 ) -> list[JobEntry]:
-    """Return ended jobs eligible for cleanup without mutating any state."""
-    entries = list_all(cfg)
-    active_source_jobs = {
-        source_job
-        for entry in entries
-        if entry.status in ("queued", "running")
-        for source_job in (entry.cache_source_job, entry.after_success)
-        if source_job
-    }
-    return [
-        e
-        for e in entries
-        if e.created_at < cutoff_ts
-        and e.status in ("finished", "killed", "lost", "failed")
-        and (projects is None or e.project in projects)
-        and e.job_id not in active_source_jobs
-    ]
+    """Compatibility wrapper for the isolated maintenance domain."""
+    return _clean_job_victims(cfg, cutoff_ts, projects=projects)
 
 
 def clean_jobs(
     cfg: HeadConfig,
     cutoff_ts: float,
     envs: bool,
-    log,
+    log: Callable[[str], None],
     *,
     projects: set[str] | None = None,
-) -> int:
-    """Delete node job dirs + registry entries of ended jobs older than the
-    cutoff; optionally also stale shared venvs. Returns jobs removed."""
-    victims = clean_job_victims(cfg, cutoff_ts, projects=projects)
-    for e in victims:
-        if not e.job_dir.startswith("dt/jobs/"):  # paranoia before rm -rf
-            log(f"skip {e.job_id}: suspicious job_dir {e.job_dir!r}")
-            continue
-        if e.node != "-":  # jobs killed/failed while queued never reached a node
-            try:
-                proc = run_on(
-                    e.node, e.node_local, f"rm -rf {shlex.quote(e.job_dir)}", timeout=60
-                )
-                if proc.returncode != 0:
-                    log(
-                        f"{e.job_id}: rm on {e.node} failed (registry entry removed anyway)"
-                    )
-            except Exception as exc:
-                log(f"{e.job_id}: {e.node} unreachable, job dir orphaned ({exc})")
-        remove_staging(cfg, e.job_id)
-        (cfg.registry_dir() / f"{e.job_id}.json").unlink(missing_ok=True)
-
-    victim_digests = {
-        e.snapshot_sha256
-        for e in victims
-        if e.snapshot_sha256 and re.fullmatch(r"[0-9a-f]{64}", e.snapshot_sha256)
-    }
-    removed_digests: set[str] = set()
-    if victim_digests:
-        with _snapshot_store_lock(cfg):
-            referenced = {
-                e.snapshot_sha256
-                for e in list_all(cfg)
-                if e.snapshot_sha256
-                and re.fullmatch(r"[0-9a-f]{64}", e.snapshot_sha256)
-            }
-            for digest in victim_digests - referenced:
-                path = cfg.snapshots_dir() / digest
-                try:
-                    old_enough = path.stat().st_mtime < cutoff_ts
-                except FileNotFoundError:
-                    continue
-                if path.is_dir() and old_enough:
-                    shutil.rmtree(path)
-                    removed_digests.add(digest)
-            state = {
-                project: digest
-                for project, digest in _load_snapshot_store_state(cfg).items()
-                if digest not in removed_digests
-            }
-            _save_snapshot_store_state(cfg, state)
-    if envs:
-        clean_envs(cfg, cutoff_ts, log)
-    return len(victims)
+    before_registry_remove: BeforeRegistryRemove | None = None,
+) -> CleanReport:
+    """Compatibility wrapper preserving dispatch's injectable SSH seam."""
+    return _clean_jobs(
+        cfg,
+        cutoff_ts,
+        envs,
+        log,
+        projects=projects,
+        runner=run_on,
+        before_registry_remove=before_registry_remove,
+    )

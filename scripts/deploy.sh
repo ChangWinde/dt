@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Deploy or roll back an immutable DistTrainer release on explicit head nodes.
 # Usage:
-#   ./deploy.sh [--plan] RELEASE_DIR HOST...
-#   ./deploy.sh [--plan] --rollback VERSION HOST...
+#   scripts/deploy.sh [--plan] RELEASE_DIR HOST...
+#   scripts/deploy.sh [--plan] --rollback VERSION HOST...
 set -euo pipefail
 
 PLAN=0
@@ -14,7 +14,7 @@ if [[ "${1:-}" == "--plan" ]]; then
 fi
 if [[ "${1:-}" == "--rollback" ]]; then
     [[ $# -ge 3 ]] || {
-        echo "usage: ./deploy.sh [--plan] --rollback VERSION HOST..." >&2
+        echo "usage: scripts/deploy.sh [--plan] --rollback VERSION HOST..." >&2
         exit 2
     }
     ROLLBACK_VERSION="$2"
@@ -75,7 +75,7 @@ if [[ -n "$ROLLBACK_VERSION" ]]; then
 fi
 
 [[ $# -ge 2 ]] || {
-    echo "usage: ./deploy.sh [--plan] RELEASE_DIR HOST..." >&2
+    echo "usage: scripts/deploy.sh [--plan] RELEASE_DIR HOST..." >&2
     exit 2
 }
 RELEASE_INPUT="$1"

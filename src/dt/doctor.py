@@ -5,6 +5,7 @@ every declared node plus the tool prerequisites on it. Covers the M0 list.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from .config import HeadConfig, Node
 from .sshio import RemoteError, run_on
@@ -40,7 +41,7 @@ else echo DT_NET=blocked; fi
 """
 
 
-def check_node(node: Node) -> dict:
+def check_node(node: Node) -> dict[str, Any]:
     checks: dict[str, str] = {}
     try:
         proc = run_on(node.name, node.local, CHECK_SNIPPET, timeout=20)
@@ -65,7 +66,7 @@ def check_node(node: Node) -> dict:
     return {"node": node.name, "checks": checks, "unreachable": False}
 
 
-def doctor_center(cfg: HeadConfig) -> list[dict]:
+def doctor_center(cfg: HeadConfig) -> list[dict[str, Any]]:
     with ThreadPoolExecutor(max_workers=max(len(cfg.nodes), 1)) as pool:
         rows = list(pool.map(check_node, cfg.nodes))
     for r in rows:

@@ -4,7 +4,7 @@ Run reproducible experiments on shared GPU servers without hand-managed SSH
 sessions, GPU selection, environment setup, or result copies.
 
 [![CI](https://github.com/ChangWinde/dt/actions/workflows/ci.yml/badge.svg)](https://github.com/ChangWinde/dt/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB.svg)](SUPPORT.md)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB.svg)](.github/SUPPORT.md)
 [![Release](https://img.shields.io/badge/release-0.6.2-0A7BBB.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey.svg)](LICENSE)
 
@@ -61,7 +61,26 @@ nodes also require NVIDIA drivers and `nvidia-smi`.
 
 ### 2. Configure a head
 
-Create `~/.config/dt/config.yaml`:
+Create a validated config in one command:
+
+```bash
+dt init --role head --center research \
+  --node gpu-head --local-node gpu-head \
+  --node gpu-node-1 \
+  --project policy=~/projects/policy
+```
+
+For a single machine and the current project, the short form is enough:
+
+```bash
+dt init --role head --center research
+```
+
+It uses the current hostname as a local node and the current directory as the
+default project. Preview the generated YAML with `--dry-run`; an existing
+config is never replaced unless `--force` is explicit.
+
+The resulting `~/.config/dt/config.yaml` is equivalent to:
 
 ```yaml
 center: research
@@ -90,6 +109,12 @@ dt agent status
 
 Read the [configuration guide](docs/configuration.md) before adding setup hooks,
 multiple centers, storage policy, or queue limits.
+
+From a laptop, create a forwarding config with:
+
+```bash
+dt init --role laptop --center research --head gpu-head
+```
 
 ### 3. Run and recover an experiment
 
@@ -173,7 +198,11 @@ dt clean --before 2026-07-01 --plan
 ```
 
 Maintenance commands are previewable and fail closed on identity, path, or
-snapshot inconsistencies. Run mutation only after reviewing its plan.
+snapshot inconsistencies. Cleanup retention is measured from terminal
+completion, and failed node/result deletion retains the registry record for a
+safe retry. From a laptop, cleanup defaults to one selected center; use
+`--all-centers` only when that wider scope is intentional. Run mutation only
+after reviewing its plan.
 
 ## How it works
 
@@ -225,9 +254,9 @@ Start with the [documentation index](docs/README.md).
 | New operator | [Getting started](docs/getting-started.md) |
 | Center administrator | [Configuration](docs/configuration.md) and [Operations](docs/operations.md) |
 | Researcher | [Experiment workflows](docs/workflows.md) |
-| Contributor | [Architecture](docs/architecture.md) and [Contributing](CONTRIBUTING.md) |
+| Contributor | [Architecture](docs/architecture.md) and [Contributing](.github/CONTRIBUTING.md) |
 | Release maintainer | [Release procedure](docs/releasing.md) |
-| Security reviewer | [Security policy](SECURITY.md) and [Support contract](SUPPORT.md) |
+| Security reviewer | [Security policy](.github/SECURITY.md) and [Support contract](.github/SUPPORT.md) |
 
 Design decisions, validation audits, experiment records, and performance
 reports remain in `docs/adr/`, `docs/audits/`, `docs/experiments/`, and
@@ -246,13 +275,14 @@ uv run --no-sync python scripts/docs.py
 
 Changes to queueing, process cleanup, transfer, identity, or destructive
 maintenance require both success-path and denied/failure-path regression tests.
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change.
+Read the [contribution guide](.github/CONTRIBUTING.md) before submitting a
+change.
 
 ## Security and license
 
 DistTrainer assumes one trusted Unix identity across trusted SSH hosts. It is
 not a tenant-isolation boundary or a sandbox for untrusted project code. Read
-[SECURITY.md](SECURITY.md) before deployment.
+[security policy](.github/SECURITY.md) before deployment.
 
 This repository is currently distributed under the
 [DistTrainer Proprietary License](LICENSE). No open-source usage rights are

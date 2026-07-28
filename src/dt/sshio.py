@@ -79,7 +79,7 @@ def run_remote(
     remote: str,
     timeout: float = 15,
     check: bool = False,
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess[str]:
     """Run a shell string on host, capturing output."""
     try:
         proc = subprocess.run(
@@ -99,7 +99,7 @@ def run_remote(
 
 def run_local(
     command: str, timeout: float = 15, check: bool = False
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess[str]:
     # cwd=home so relative paths behave exactly like an ssh login would.
     proc = subprocess.run(
         ["bash", "-c", command],
@@ -121,7 +121,7 @@ def run_on(
     command: str,
     timeout: float = 15,
     check: bool = False,
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess[str]:
     if is_local:
         return run_local(command, timeout=timeout, check=check)
     return run_remote(node_name, command, timeout=timeout, check=check)
@@ -138,7 +138,7 @@ def remote_dt_cmd(argv: list[str]) -> str:
 
 def remote_dt(
     host: str, argv: list[str], timeout: float = 30
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess[str]:
     """Invoke dt on a head node (absolute path; PATH is not set over ssh)."""
     return run_remote(host, remote_dt_cmd(argv), timeout=timeout)
 
@@ -158,7 +158,7 @@ def rsync(
     dry_run: bool = False,
     cancel_event: Event | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess[str]:
     """--partial keeps interrupted transfers resumable; with retries > 0 a
     network-ish failure is retried and resumes where it stopped (large
     checkpoint pulls over flaky links)."""

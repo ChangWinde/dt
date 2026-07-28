@@ -1444,6 +1444,8 @@ def test_clean_removes_only_unreferenced_snapshot_store(tmp_path, monkeypatch):
     old = _entry(
         job_id="old",
         created_at=1.0,
+        finished_at=1.0,
+        job_dir="dt/jobs/old",
         snapshot_sha256=gone,
         node="-",
         status="finished",
@@ -1460,7 +1462,7 @@ def test_clean_removes_only_unreferenced_snapshot_store(tmp_path, monkeypatch):
     save(cfg, old)
     save(cfg, live)
 
-    assert dispatch.clean_jobs(cfg, 1.5, envs=False, log=lambda _: None) == 1
+    assert dispatch.clean_jobs(cfg, 1.5, envs=False, log=lambda _: None).removed == 1
     assert (cfg.snapshots_dir() / keep).is_dir()
     assert not (cfg.snapshots_dir() / gone).exists()
 
@@ -1471,6 +1473,7 @@ def test_clean_preserves_cache_source_for_active_consumer(tmp_path):
         job_id="source",
         node="-",
         created_at=1.0,
+        finished_at=1.0,
         job_dir="dt/jobs/source",
     )
     consumer = _entry(
@@ -1491,7 +1494,7 @@ def test_clean_preserves_cache_source_for_active_consumer(tmp_path):
     save(cfg, source)
     save(cfg, consumer)
 
-    assert dispatch.clean_jobs(cfg, 5.0, envs=False, log=lambda _: None) == 0
+    assert dispatch.clean_jobs(cfg, 5.0, envs=False, log=lambda _: None).removed == 0
     assert (cfg.registry_dir() / "source.json").is_file()
 
 
@@ -1501,6 +1504,7 @@ def test_clean_preserves_predecessor_for_active_chain_stage(tmp_path):
         job_id="guard",
         node="-",
         created_at=1.0,
+        finished_at=1.0,
         job_dir="dt/jobs/guard",
     )
     consumer = _entry(
@@ -1517,5 +1521,5 @@ def test_clean_preserves_predecessor_for_active_chain_stage(tmp_path):
     save(cfg, source)
     save(cfg, consumer)
 
-    assert dispatch.clean_jobs(cfg, 5.0, envs=False, log=lambda _: None) == 0
+    assert dispatch.clean_jobs(cfg, 5.0, envs=False, log=lambda _: None).removed == 0
     assert (cfg.registry_dir() / "guard.json").is_file()

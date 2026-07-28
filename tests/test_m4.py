@@ -1,9 +1,13 @@
 """Queue anti-starvation, rerun spec replay, cleanup selection, completion."""
 
 import json
+import os
+import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import dt.agent as agent
+import pytest
 from typer.testing import CliRunner
 
 from dt import cli
@@ -38,6 +42,8 @@ def _entry(job_id: str, status: str, created_at: float, **kw) -> JobEntry:
         status=status,
         created_at=created_at,
     )
+    if status in {"finished", "killed", "lost", "failed"}:
+        defaults["finished_at"] = created_at
     defaults.update(kw)
     return JobEntry(job_id=job_id, **defaults)
 
@@ -605,8 +611,9 @@ def test_clean_jobs_selection_and_staging(tmp_path):
     save(cfg, _entry("new-done", "finished", created_at=9e9))  # too new
     staging = cfg.queue_dir() / "old-done"
     staging.mkdir(parents=True)
-    n = clean_jobs(cfg, cutoff_ts=100.0, envs=False, log=lambda m: None)
-    assert n == 1
+    report = clean_jobs(cfg, cutoff_ts=100.0, envs=False, log=lambda m: None)
+    assert report.removed == 1
+    assert report.failures == []
     assert load(cfg, "old-done") is None
     assert not staging.exists()
     assert {e.job_id for e in list_all(cfg)} == {"old-queued", "new-done"}
@@ -617,7 +624,7 @@ def test_clean_jobs_project_filter(tmp_path):
     save(cfg, _entry("smoke-done", "finished", created_at=1.0, project="smoke"))
     save(cfg, _entry("science-done", "finished", created_at=1.0, project="science"))
 
-    n = clean_jobs(
+    report = clean_jobs(
         cfg,
         cutoff_ts=100.0,
         envs=False,
@@ -625,9 +632,135 @@ def test_clean_jobs_project_filter(tmp_path):
         projects={"smoke"},
     )
 
-    assert n == 1
+    assert report.removed == 1
+    assert report.failures == []
     assert load(cfg, "smoke-done") is None
     assert load(cfg, "science-done") is not None
+
+
+def test_clean_uses_terminal_time_instead_of_submission_time(tmp_path):
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry(
+            "long-running",
+            "finished",
+            created_at=1.0,
+            finished_at=200.0,
+        ),
+    )
+
+    report = clean_jobs(cfg, cutoff_ts=100.0, envs=False, log=lambda _: None)
+
+    assert report.eligible == 0
+    assert report.removed == 0
+    assert load(cfg, "long-running") is not None
+
+
+def test_clean_rejects_job_dir_outside_exact_managed_slot(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = _entry(
+        "corrupt",
+        "finished",
+        created_at=1.0,
+        job_dir="dt/jobs/../../valuable",
+        node="n1",
+    )
+    save(cfg, entry)
+    monkeypatch.setattr(
+        "dt.dispatch.run_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe remote delete must not run")
+        ),
+    )
+
+    report = clean_jobs(cfg, cutoff_ts=100.0, envs=False, log=lambda _: None)
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["unsafe_job_dir"]
+    assert load(cfg, entry.job_id) is not None
+
+
+def test_clean_retains_registry_when_remote_delete_fails(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = _entry(
+        "remote-failure",
+        "finished",
+        created_at=1.0,
+        node="n1",
+    )
+    save(cfg, entry)
+    monkeypatch.setattr(
+        "dt.dispatch.run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="permission denied"
+        ),
+    )
+
+    report = clean_jobs(cfg, cutoff_ts=100.0, envs=False, log=lambda _: None)
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["remote_delete_failed"]
+    assert load(cfg, entry.job_id) is not None
+
+
+def test_clean_retains_registry_when_related_local_cleanup_fails(tmp_path):
+    cfg = _cfg(tmp_path)
+    entry = _entry("local-failure", "finished", created_at=1.0)
+    save(cfg, entry)
+
+    def fail(_entry):
+        raise OSError("result is read-only")
+
+    report = clean_jobs(
+        cfg,
+        cutoff_ts=100.0,
+        envs=False,
+        log=lambda _: None,
+        before_registry_remove=fail,
+    )
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["local_cleanup_failed"]
+    assert load(cfg, entry.job_id) is not None
+
+
+def test_environment_cleanup_quotes_operator_configured_path(tmp_path):
+    from dt.maintenance import clean_envs_command
+
+    envs = tmp_path / "envs; touch PWNED"
+    stale = envs / "a1b2c3d4e5f6"
+    stale.mkdir(parents=True)
+    os.utime(stale, (1.0, 1.0))
+    command = clean_envs_command(
+        str(envs),
+        datetime.now() + timedelta(days=1),
+        keep=set(),
+    )
+
+    result = subprocess.run(
+        command,
+        shell=True,
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not stale.exists()
+    assert not (tmp_path / "PWNED").exists()
+
+
+def test_environment_cleanup_rejects_corrupt_live_identity(tmp_path):
+    from dt.maintenance import clean_envs_command
+
+    with pytest.raises(ValueError, match="cleanup refused"):
+        clean_envs_command(
+            str(tmp_path),
+            datetime.now(),
+            keep={'"; touch PWNED; #'},
+        )
 
 
 def test_clean_cli_project_filter_plan(tmp_path, monkeypatch):
@@ -692,6 +825,45 @@ def test_clean_results_plan_then_removes_only_identity_verified_managed_pull(
     assert not owned.exists()
     assert unowned.is_dir()
     assert load(cfg, old.job_id) is None
+
+
+def test_clean_results_failure_retains_retryable_registry_record(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    old = _entry("old-done", "finished", created_at=1.0)
+    save(cfg, old)
+    owned = cfg.results_dir() / old.job_id
+    (owned / "dt").mkdir(parents=True)
+    (owned / "dt" / "job.json").write_text(json.dumps({"job_id": old.job_id}))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli.shutil,
+        "rmtree",
+        lambda path: (_ for _ in ()).throw(OSError("read-only result")),
+    )
+
+    cleaned = CliRunner().invoke(
+        cli.app,
+        ["clean", "--before", "1970-01-02", "--results", "-y"],
+    )
+
+    assert cleaned.exit_code == 1
+    assert "local_cleanup_failed" in cleaned.output
+    assert owned.is_dir()
+    assert load(cfg, old.job_id) is not None
+
+
+def test_clean_rejects_invalid_date_without_traceback(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_cfg", lambda: _cfg(tmp_path))
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["clean", "--before", "tomorrow", "--plan"],
+    )
+
+    assert result.exit_code == 1
+    assert "YYYY-MM-DD" in result.output
+    assert result.exception is not None
+    assert not isinstance(result.exception, ValueError)
 
 
 def test_storage_json_inventory_is_scoped_to_managed_paths(tmp_path, monkeypatch):

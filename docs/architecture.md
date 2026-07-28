@@ -113,42 +113,53 @@ stdout/stderr separation, JSON schemas, and stable exit codes.
 
 | Area | Modules |
 |---|---|
-| Configuration and state | `config.py`, `jobs.py`, `submission.py` |
+| Configuration and state | `config.py`, `onboarding.py`, `jobs.py`, `submission.py` |
 | Placement and queueing | `dispatch.py`, `agent.py`, `probe.py`, `completion.py` |
 | Remote boundaries | `remote.py`, `forwarding.py`, `sshio.py`, `lifecycle.py` |
 | Observation | `monitoring.py`, `doctor.py`, `render.py` |
-| Data recovery | `transfers.py`, `storage.py`, `compact.py` |
-| Identity | `snapshot_hash.py`, `payload_hash.py` |
+| Data recovery and retention | `transfers.py`, `storage.py`, `compact.py`, `maintenance.py` |
+| Identity | `snapshot_hash.py`, `snapshot_store.py`, `payload_hash.py` |
 | Node runtime | `payload/` |
 
 Domain modules expose typed or pure boundaries where practical. Subprocess,
 SSH, filesystem, registry, and terminal rendering remain explicit seams so
 failure paths can be tested independently.
 
+Destructive retention policy lives outside the dispatcher. It accepts explicit
+remote and local seams, validates each job directory against its exact registry
+identity, and removes the registry record only after node and related local
+cleanup succeed. Snapshot-store locking and persistence are likewise isolated
+from submission orchestration.
+
 ## Repository layout
 
 ```text
 dt/
-├── .github/            CI and dependency-update policy
+├── .github/            Community policy, CI, and dependency automation
+│   ├── CONTRIBUTING.md Contribution and verification contract
+│   ├── SECURITY.md     Trust boundary and vulnerability reporting
+│   └── SUPPORT.md      Supported platform and compatibility contract
 ├── docs/               User guides, architecture, decisions, and evidence
 │   ├── adr/            Architecture decision records
 │   ├── audits/         Validation and release evidence
 │   ├── experiments/    Reproducible experiment records
+│   ├── package-readme.md  Sanitized Python package description
 │   ├── performance/    Performance measurements
 │   ├── plans/          Historical implementation plans
 │   └── project/        Completed project history
-├── scripts/            Documentation and release verification tools
+├── scripts/            Repository, release, and deployment tools
+│   ├── deploy.sh       Explicit release deployment and rollback
+│   └── repo_hygiene.py Enforced tracked-root allowlist
 ├── src/dt/             Installable Python package and node payload
 ├── tests/              Unit, integration, CLI, payload, and reliability tests
 ├── bootstrap.sh        Verified release installer
-├── deploy.sh           Explicit release deployment and rollback
-├── PACKAGE_README.md   Sanitized Python package metadata README
 └── README.md           Repository product entry point
 ```
 
 Generated experiment outputs, result collections, caches, virtual
 environments, and release artifacts are ignored. They do not belong in source
-snapshots or Git history.
+snapshots or Git history. The tracked root allowlist and its rationale are
+recorded in [ADR 0005](adr/0005-convention-first-repository-layout.md).
 
 ## Compatibility boundary
 

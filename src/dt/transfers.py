@@ -66,13 +66,14 @@ def pull_job_record(entry: JobEntry) -> dict[str, object]:
     record: dict[str, object] = asdict(entry)
     started = entry.started_at
     finished = entry.finished_at
-    numeric_timestamps = (
-        isinstance(started, (int, float))
+    duration = (
+        float(finished) - float(started)
+        if isinstance(started, (int, float))
         and not isinstance(started, bool)
         and isinstance(finished, (int, float))
         and not isinstance(finished, bool)
+        else None
     )
-    duration = float(finished) - float(started) if numeric_timestamps else None
     record["duration_s"] = (
         max(0.0, duration) if duration is not None and math.isfinite(duration) else None
     )

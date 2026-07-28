@@ -17,6 +17,7 @@ import re
 import signal
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -25,14 +26,24 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from threading import Event
-from typing import Callable, NoReturn, Optional
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    NoReturn,
+    Optional,
+    TypeAlias,
+    TypedDict,
+    TypeVar,
+    cast,
+)
 
 import typer
 
 from . import __version__
 from . import jobs as jobs_mod
 from .completion import CompletionSignals
-from .config import ConfigError, HeadConfig, LaptopConfig, load
+from .config import ConfigError, HeadConfig, LaptopConfig, config_path, load
 from .dispatch import (
     DispatchError,
     FailedBeforeStart,
@@ -48,6 +59,7 @@ from .monitoring import ResourceTelemetryQuery
 from .monitoring import parse_resource_jsonl as _parse_resource_jsonl  # noqa: F401
 from .monitoring import safe_phase_name as _safe_phase_name
 from .monitoring import summarize_resources as _summarize_resources  # noqa: F401
+from .onboarding import InitError, build_config, render_config, write_config
 from .probe import NodeStatus, probe_center, probe_node, status_as_dict
 from .remote import (
     fan_json,
@@ -96,6 +108,13 @@ EXIT_ENV = 3
 EXIT_NOT_FOUND = 4
 EXIT_UNREACHABLE = 5
 
+JsonDict: TypeAlias = dict[str, Any]
+
+
+class _RsyncCancelKwargs(TypedDict, total=False):
+    cancel_event: Event
+
+
 ROOT_EPILOG = """
 [bold]Quick start[/bold]
 
@@ -116,6 +135,13 @@ app = typer.Typer(
     rich_markup_mode="rich",
     epilog=ROOT_EPILOG,
 )
+
+CliFunction = TypeVar("CliFunction", bound=Callable[..., Any])
+
+
+def _typed_cli_decorator(value: object) -> Callable[[CliFunction], CliFunction]:
+    """Preserve function signatures across Typer versions without typed stubs."""
+    return cast(Callable[[CliFunction], CliFunction], value)
 
 
 def _cfg() -> HeadConfig | LaptopConfig:
@@ -145,7 +171,7 @@ def _version_cb(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.callback()
+@_typed_cli_decorator(app.callback())
 def _root(
     version: bool = typer.Option(
         False,
@@ -158,7 +184,94 @@ def _root(
     """DistTrainer: dispatch experiments onto whatever shared GPU is free."""
 
 
-def _need_head(cfg) -> HeadConfig:
+def init_config(
+    role: str = typer.Option(..., "--role", help="this machine's role: head or laptop"),
+    center: str = typer.Option(
+        ..., "--center", help="stable name for this research center"
+    ),
+    head: Optional[str] = typer.Option(
+        None, "--head", help="(laptop) SSH alias of the center's head"
+    ),
+    node: Optional[list[str]] = typer.Option(
+        None,
+        "--node",
+        help="(head) compute-node SSH alias; repeat for multiple nodes",
+    ),
+    local_node: Optional[str] = typer.Option(
+        None,
+        "--local-node",
+        help="(head) one configured node that runs locally instead of SSH",
+    ),
+    project: Optional[list[str]] = typer.Option(
+        None,
+        "--project",
+        help="(head) NAME=PATH; repeat for multiple projects (default: cwd)",
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        help="destination (default: DT_CONFIG or ~/.config/dt/config.yaml)",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="replace an existing config atomically"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="print validated YAML without writing"
+    ),
+    json_: bool = typer.Option(False, "--json", help="emit a machine-readable result"),
+) -> None:
+    """Create a minimal validated configuration.
+
+    Head quick start: dt init --role head --center research
+
+    Laptop quick start: dt init --role laptop --center research --head gpu-head
+    """
+    if dry_run and json_:
+        err.print("[red]use either --dry-run or --json, not both[/red]")
+        raise typer.Exit(1)
+    target = (config or config_path()).expanduser()
+    try:
+        payload = build_config(
+            role=role,
+            center=center,
+            head=head,
+            nodes=list(node or []),
+            local_node=local_node,
+            projects=list(project or []),
+            cwd=Path.cwd(),
+            hostname=socket.gethostname(),
+        )
+        if dry_run:
+            print(render_config(payload), end="")
+            return
+        write_config(target, payload, force=force)
+    except InitError as exc:
+        err.print(f"[red]init error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    normalized_role = role.strip().lower()
+    next_steps = (
+        ["dt doctor", "dt agent install", "dt free"]
+        if normalized_role == "head"
+        else ["dt doctor", "dt free"]
+    )
+    if json_:
+        print(
+            json.dumps(
+                {
+                    "config": str(target),
+                    "next": next_steps,
+                    "role": normalized_role,
+                    "written": True,
+                }
+            )
+        )
+        return
+    err.print(f"[green]created {target}[/green] · role {normalized_role}")
+    err.print("[dim]next: " + "  →  ".join(next_steps) + "[/dim]")
+
+
+def _need_head(cfg: HeadConfig | LaptopConfig) -> HeadConfig:
     if not isinstance(cfg, HeadConfig):
         err.print("[red]this command needs a head-node config (internal use)[/red]")
         raise typer.Exit(1)
@@ -473,11 +586,11 @@ def _preflight_retryable_head_operation(
 
 def _fan_failure_exit_code(errors: dict[str, str]) -> int:
     """Classify a failed center fan-out without parsing error text."""
-    unreachable = getattr(errors, "unreachable", set())
+    unreachable: set[str] = getattr(errors, "unreachable", set())
     return EXIT_UNREACHABLE if errors and set(errors) == set(unreachable) else 1
 
 
-def _free_scheduler_context(cfg: HeadConfig) -> dict[str, object]:
+def _free_scheduler_context(cfg: HeadConfig) -> JsonDict:
     """One local registry read that explains dt-owned idle or queued capacity."""
     from . import agent as agent_mod
 
@@ -527,16 +640,16 @@ def _free_scheduler_context(cfg: HeadConfig) -> dict[str, object]:
 
 def _with_free_scheduler_context(
     cfg: HeadConfig,
-    rows: list[dict],
-) -> list[dict]:
+    rows: list[JsonDict],
+) -> list[JsonDict]:
     context = _free_scheduler_context(cfg)
     return [{**row, "_scheduler": context} for row in rows]
 
 
-def _best_free_submit_node(rows: list[dict]) -> object:
+def _best_free_submit_node(rows: list[JsonDict]) -> object:
     """Prefer GPU capacity first, then avoid a known low-disk tie."""
 
-    def rank(row: dict) -> tuple[int, int, float]:
+    def rank(row: JsonDict) -> tuple[int, int, float]:
         free_gpus = sum(bool(gpu.get("free")) for gpu in row.get("gpus") or [])
         system = row.get("system")
         system = system if isinstance(system, dict) else {}
@@ -554,6 +667,8 @@ def _best_free_submit_node(rows: list[dict]) -> object:
             and float(disk_total) > 0
         )
         if free_known and total_known:
+            assert isinstance(disk_free, int | float)
+            assert isinstance(disk_total, int | float)
             low_disk = (
                 float(disk_free) < DISK_LOW_FREE_GIB
                 or float(disk_free) / float(disk_total) < DISK_LOW_FREE_FRACTION
@@ -564,13 +679,18 @@ def _best_free_submit_node(rows: list[dict]) -> object:
         return (
             free_gpus,
             disk_health,
-            float(disk_free) if free_known else -1.0,
+            (
+                float(disk_free)
+                if isinstance(disk_free, int | float)
+                and not isinstance(disk_free, bool)
+                else -1.0
+            ),
         )
 
     return max(rows, key=rank).get("node")
 
 
-def _public_free_rows(rows: list[dict]) -> list[dict]:
+def _public_free_rows(rows: list[JsonDict]) -> list[JsonDict]:
     """Remove the internal scheduler envelope from public resource rows."""
     return [
         {key: value for key, value in row.items() if key != "_scheduler"}
@@ -583,7 +703,7 @@ def _free_submit_action(
     node: str,
     *,
     center: str | None = None,
-) -> dict[str, object]:
+) -> JsonDict:
     argv = ["dt", "task", node, "COMMAND", "-n", "NAME"]
     if center is not None:
         argv.extend(["-c", center])
@@ -596,10 +716,10 @@ def _free_submit_action(
 
 def _free_center_explanation(
     center: str,
-    rows: list[dict],
+    rows: list[JsonDict],
     *,
     pin_center: bool = False,
-) -> dict[str, object]:
+) -> JsonDict:
     """Build a stable machine explanation for one center's capacity state."""
     reachable = [row for row in rows if not row.get("error")]
     unavailable = [row for row in rows if row.get("error")]
@@ -628,7 +748,7 @@ def _free_center_explanation(
         (row["_scheduler"] for row in rows if isinstance(row.get("_scheduler"), dict)),
         None,
     )
-    capacity: dict[str, object] = {
+    capacity: JsonDict = {
         "reachable_nodes": len(reachable),
         "unavailable_nodes": len(unavailable),
         "gpus_total": total,
@@ -638,7 +758,7 @@ def _free_center_explanation(
     }
     if gpu_inventory_errors:
         capacity["gpu_inventory_errors"] = gpu_inventory_errors
-    result: dict[str, object] = {
+    result: JsonDict = {
         "center": center,
         "capacity": capacity,
         "scheduler": context,
@@ -654,7 +774,7 @@ def _free_center_explanation(
         result["message"] = str(context.get("error") or "scheduler state unavailable")
         return result
 
-    actions: list[dict[str, object]] = []
+    actions: list[JsonDict] = []
     if running == 0 and queued == 0:
         if lease_owners:
             result["state"] = "idle_with_dt_leases"
@@ -796,12 +916,12 @@ def _free_center_explanation(
 
 
 def _free_explain_payload(
-    rows: list[dict],
+    rows: list[JsonDict],
     *,
     pin_centers: bool = False,
-) -> dict[str, object]:
+) -> JsonDict:
     """Combine resource and scheduler truth without changing legacy JSON."""
-    by_center: dict[str, list[dict]] = {}
+    by_center: dict[str, list[JsonDict]] = {}
     for row in rows:
         by_center.setdefault(str(row.get("center") or ""), []).append(row)
     centers = [
@@ -852,12 +972,12 @@ def _free_explain_payload(
     }
 
 
-def _free_scheduler_table(rows: list[dict], *, pin_centers: bool = False):
+def _free_scheduler_table(rows: list[JsonDict], *, pin_centers: bool = False) -> Any:
     """Compact explanation under the resource table; absent for older heads."""
     from rich.markup import escape
     from rich.table import Table
 
-    contexts: dict[str, dict[str, object]] = {}
+    contexts: dict[str, JsonDict] = {}
     for row in rows:
         context = row.get("_scheduler")
         center = row.get("center")
@@ -1039,11 +1159,11 @@ def _free_scheduler_table(rows: list[dict], *, pin_centers: bool = False):
 
 
 def _free_view(
-    rows: list[dict],
+    rows: list[JsonDict],
     who: bool,
     *,
     pin_centers: bool = False,
-):
+) -> Any:
     from rich.console import Group
 
     resources = free_table(rows, who)
@@ -1084,7 +1204,7 @@ def free(
     include_scheduler = scheduler_context or explain or not json_
     pin_centers = isinstance(cfg, LaptopConfig)
 
-    def gather() -> tuple[list[dict], dict[str, str]]:
+    def gather() -> tuple[list[JsonDict], dict[str, str]]:
         if isinstance(cfg, HeadConfig):
             rows = status_as_dict(
                 cfg.center,
@@ -1095,14 +1215,16 @@ def free(
             return rows, {}
         base_argv = ["free"] + (["--fresh"] if watch or fresh else [])
         argv = base_argv + (["--scheduler-context"] if include_scheduler else [])
-        rows, errors = fan_json(cfg, argv)
+        raw_rows, errors = fan_json(cfg, argv)
+        rows = cast(list[JsonDict], raw_rows)
         if include_scheduler and any(
             "--scheduler-context" in message and "no such option" in message.lower()
             for message in errors.values()
         ):
             # Version-skew fallback: preserve resource visibility from old heads.
-            rows, errors = fan_json(cfg, base_argv)
-        unreachable = getattr(errors, "unreachable", set())
+            raw_rows, errors = fan_json(cfg, base_argv)
+            rows = cast(list[JsonDict], raw_rows)
+        unreachable: set[str] = getattr(errors, "unreachable", set())
         rows += [
             {
                 "center": center,
@@ -1117,7 +1239,7 @@ def free(
         return rows, errors
 
     def result_code(
-        rows: list[dict],
+        rows: list[JsonDict],
         errors: dict[str, str],
     ) -> int:
         if isinstance(cfg, LaptopConfig):
@@ -1225,7 +1347,7 @@ def _captured_submission_identity(
     stdout: str,
     *,
     json_: bool,
-) -> tuple[str | None, dict[str, object] | None]:
+) -> tuple[str | None, JsonDict | None]:
     """Extract only a complete public submission response."""
     if json_:
         try:
@@ -1392,11 +1514,11 @@ def _validate_submission_workflow(
 def _read_failed_start_log(
     entry: jobs_mod.JobEntry,
     lines: int = 20,
-) -> dict[str, object]:
+) -> JsonDict:
     """Read the launcher environment log for a placed pre-start failure."""
     relative = "logs/env.log"
     path = f"{entry.job_dir}/{relative}"
-    result: dict[str, object] = {
+    result: JsonDict = {
         "path": relative,
         "tail": "",
         "error": None,
@@ -1436,7 +1558,7 @@ def _failed_start_kind(entry: jobs_mod.JobEntry) -> str:
 def _maybe_read_failed_start_log(
     entry: jobs_mod.JobEntry,
     lines: int = 20,
-) -> dict[str, object] | None:
+) -> JsonDict | None:
     if not _failed_start_has_env_log(entry):
         return None
     return _read_failed_start_log(entry, lines)
@@ -1444,7 +1566,7 @@ def _maybe_read_failed_start_log(
 
 def _emit_failed_start(
     entry: jobs_mod.JobEntry,
-    failure_log: dict[str, object] | None,
+    failure_log: JsonDict | None,
     *,
     json_: bool,
     exit_code: int,
@@ -1452,7 +1574,7 @@ def _emit_failed_start(
     """Emit the stable human/JSON contract for a placed pre-start failure."""
     message = f"{entry.job_id} failed before start on {entry.node}: {entry.reason}"
     if json_:
-        payload: dict[str, object] = {
+        payload: JsonDict = {
             "error": _failed_start_kind(entry),
             "message": message,
             "reasons": {},
@@ -1593,8 +1715,8 @@ def _resolve_submission_dependency(
 def _submission_payload(
     entry: jobs_mod.JobEntry,
     **extra: object,
-) -> dict[str, object]:
-    payload: dict[str, object] = {
+) -> JsonDict:
+    payload: JsonDict = {
         "job_id": entry.job_id,
         "status": entry.status,
         "project": entry.project,
@@ -1665,7 +1787,7 @@ def _emit_submission(
     *,
     json_: bool,
     agent_started: bool | None,
-    payload_extra: dict[str, object] | None = None,
+    payload_extra: JsonDict | None = None,
 ) -> None:
     if json_:
         print(json.dumps(_submission_payload(entry, **(payload_extra or {}))))
@@ -1846,7 +1968,8 @@ def run(
             from .remote import best_center
 
             with err.status("probing all centers..."):
-                rows, errors = fan_json(cfg, ["free"])
+                raw_rows, errors = fan_json(cfg, ["free"])
+                rows = cast(list[JsonDict], raw_rows)
             picked = best_center(
                 rows,
                 gpus,
@@ -2020,7 +2143,7 @@ def _sync_task_artifacts_raw(
     server: str,
     project: str | None,
     artifacts: list[str],
-) -> tuple[str, str, dict[str, object]]:
+) -> tuple[str, str, JsonDict]:
     """Sync explicit inputs to one task node and return its immutable binding."""
     from rich.markup import escape
 
@@ -2039,7 +2162,7 @@ def _sync_task_artifacts_raw(
             1,
         )
 
-    retry_events: list[dict[str, object]] = []
+    retry_events: list[JsonDict] = []
     started = time.perf_counter()
 
     def progress(message: str) -> None:
@@ -2092,7 +2215,7 @@ def _sync_task_artifacts_raw(
 def _emit_task_artifact_sync_success(
     server: str,
     manifest: str,
-    row: dict[str, object],
+    row: JsonDict,
 ) -> None:
     from rich.markup import escape
 
@@ -2115,7 +2238,7 @@ def _sync_task_artifacts(
     project: str | None,
     artifacts: list[str],
     json_: bool,
-) -> tuple[str, str, dict[str, object]]:
+) -> tuple[str, str, JsonDict]:
     try:
         result = _sync_task_artifacts_raw(
             cfg,
@@ -2143,7 +2266,7 @@ def _submit_request(
     artifacts: list[str],
     no_queue: bool,
     json_: bool,
-) -> tuple[jobs_mod.JobEntry, bool | None, dict[str, object] | None]:
+) -> tuple[jobs_mod.JobEntry, bool | None, JsonDict | None]:
     """Resolve one normalized request and cross the dispatcher boundary once."""
     node = request.node
     after_success_id = None
@@ -2157,7 +2280,7 @@ def _submit_request(
 
     project = request.project
     artifact_manifest = request.artifact_manifest
-    artifact_sync: dict[str, object] | None = None
+    artifact_sync: JsonDict | None = None
     if artifacts:
         if node is None:
             _fail_submission(
@@ -2200,9 +2323,12 @@ def _follow_submitted_job(
     json_: bool,
 ) -> None:
     """Use the shared interactive view and stable terminal exit contract."""
-    completed = watch(job_id, poll, lines, json_, True)
+    # ``_job_refs`` preserves direct-string compatibility even though Typer's
+    # public annotation models repeated positional arguments as a list.
+    direct_ref = cast(list[str], job_id)
+    completed = watch(direct_ref, poll, lines, json_, True)
     if completed:
-        wait(job_id, poll, lines, json_, True, True)
+        wait(direct_ref, poll, lines, json_, True, True)
     else:
         _print_monitor_stopped(job_id)
 
@@ -2560,12 +2686,12 @@ def _batch_error(
     exc: Exception,
     *,
     item_label: str = "batch item",
-) -> tuple[dict[str, object], int, jobs_mod.JobEntry | None]:
+) -> tuple[JsonDict, int, jobs_mod.JobEntry | None]:
     if isinstance(exc, FailedBeforeStart):
         entry = exc.entry
         failure_log = _maybe_read_failed_start_log(entry)
         code = EXIT_ENV
-        payload: dict[str, object] = {
+        payload: JsonDict = {
             "kind": _failed_start_kind(entry),
             "message": (
                 f"{entry.job_id} failed before start on {entry.node}: {entry.reason}"
@@ -2633,13 +2759,13 @@ def _batch_receipt(
     commands: list[str],
     entries: list[jobs_mod.JobEntry],
     artifact_manifest: str | None,
-    artifact_sync: dict[str, object] | None,
+    artifact_sync: JsonDict | None,
     agent_started: bool | None,
-    error: dict[str, object] | None,
+    error: JsonDict | None,
     exit_code: int,
     policy: _InventoryPolicy = _BATCH_POLICY,
     stage_gpus: list[int] | None = None,
-) -> dict[str, object]:
+) -> JsonDict:
     shared_snapshot = entries[0].snapshot_sha256 if entries else None
     interrupted = (
         isinstance(error, dict)
@@ -2661,7 +2787,7 @@ def _batch_receipt(
         for row, entry in zip(jobs, entries, strict=True):
             row["after_success"] = entry.after_success
             row["gpus_requested"] = entry.gpus_requested
-    receipt: dict[str, object] = {
+    receipt: JsonDict = {
         "schema_version": policy.schema_version,
         "status": (
             "submitted"
@@ -2721,7 +2847,7 @@ def _batch_receipt(
 
 
 def _emit_batch_human(
-    receipt: dict[str, object],
+    receipt: JsonDict,
     *,
     emit_job_ids: bool = True,
 ) -> None:
@@ -2759,7 +2885,7 @@ def _emit_batch_human(
     _emit_batch_next_commands(receipt)
 
 
-def _emit_batch_next_commands(receipt: dict[str, object]) -> None:
+def _emit_batch_next_commands(receipt: JsonDict) -> None:
     jobs = receipt.get("jobs")
     if not isinstance(jobs, list) or not jobs:
         return
@@ -3005,8 +3131,8 @@ def _inventory_command(
             )
         )
 
-    artifact_sync: dict[str, object] | None = None
-    failure: dict[str, object] | None = None
+    artifact_sync: JsonDict | None = None
+    failure: JsonDict | None = None
     failure_code = 0
     if artifacts:
         try:
@@ -3095,7 +3221,7 @@ def _inventory_command(
                     if policy.dependency_policy == "previous_success":
                         assert predecessor is not None
                         spec.after_success = predecessor.job_id
-                    fork_kwargs: dict[str, object] = {"force_queue": True}
+                    fork_kwargs: JsonDict = {"force_queue": True}
                     if policy.command != "batch":
                         fork_kwargs["force_queue_label"] = policy.command
                     entry = dispatch_mod.submit_fork(
@@ -3345,31 +3471,31 @@ PS_WINDOW_SCHEMA = "dt_ps_window_v2"
 PS_LEGACY_WINDOW_SCHEMA = "dt_ps_window_v1"
 
 
-class _PsRows(list):
+class _PsRows(list[JsonDict]):
     """Rows plus explicit metadata retained across local window operations."""
 
     def __init__(
         self,
-        rows=(),
+        rows: Iterable[JsonDict] = (),
         *,
         total: int | None = None,
         applied_filters: frozenset[str] | set[str] = frozenset(),
-    ):
+    ) -> None:
         super().__init__(rows)
         self.total = len(self) if total is None else total
         self.applied_filters = frozenset(applied_filters)
 
 
-def _ps_rows_total(rows: list[dict]) -> int:
+def _ps_rows_total(rows: list[JsonDict]) -> int:
     return int(getattr(rows, "total", len(rows)))
 
 
-def _ps_rows_filters(rows: list[dict]) -> frozenset[str]:
-    value = getattr(rows, "applied_filters", frozenset())
+def _ps_rows_filters(rows: list[JsonDict]) -> frozenset[str]:
+    value: frozenset[str] | set[str] = getattr(rows, "applied_filters", frozenset())
     return value if isinstance(value, frozenset) else frozenset(value)
 
 
-def _limit_ps_rows(rows: list[dict], limit: int | None) -> list[dict]:
+def _limit_ps_rows(rows: list[JsonDict], limit: int | None) -> list[JsonDict]:
     """Return the newest matching rows while retaining the pre-limit total."""
     if limit is None:
         return rows
@@ -3388,7 +3514,7 @@ def _ps_window_contract(
     issues_only: bool,
     limit: int | None,
     with_progress: bool,
-) -> dict[str, object]:
+) -> JsonDict:
     """Describe the exact filtering and selection represented by a v2 window."""
     return {
         "status": status,
@@ -3400,7 +3526,7 @@ def _ps_window_contract(
     }
 
 
-def _ps_window_contract_from_argv(argv: list[str]) -> dict[str, object]:
+def _ps_window_contract_from_argv(argv: list[str]) -> JsonDict:
     status = None
     for option in ("-s", "--status"):
         if option in argv:
@@ -3420,8 +3546,8 @@ def _ps_window_contract_from_argv(argv: list[str]) -> dict[str, object]:
     )
 
 
-def _scope_laptop_ps_refs(cfg: LaptopConfig, rows: list[dict]) -> None:
-    by_center: dict[str, list[dict]] = {}
+def _scope_laptop_ps_refs(cfg: LaptopConfig, rows: list[JsonDict]) -> None:
+    by_center: dict[str, list[JsonDict]] = {}
     scope_capable = {
         id(row)
         for row in rows
@@ -3451,9 +3577,9 @@ def _scope_laptop_ps_refs(cfg: LaptopConfig, rows: list[dict]) -> None:
 
 
 def _ps_window_size_is_exact(
-    rows: list[dict],
+    rows: list[JsonDict],
     total: int,
-    query: dict[str, object],
+    query: JsonDict,
 ) -> bool:
     requested_limit = query.get("limit")
     if isinstance(requested_limit, int):
@@ -3475,7 +3601,7 @@ def _ps_window_unsupported(message: str) -> bool:
 def _gather_laptop_ps_window(
     cfg: LaptopConfig,
     argv: list[str],
-) -> tuple[list[dict], dict[str, str]]:
+) -> tuple[list[JsonDict], dict[str, str]]:
     """Fetch exact per-center table windows, with old-head fallback."""
     requested_query = _ps_window_contract_from_argv(argv)
     data_by_center, errors = fan_json_by_center(
@@ -3521,7 +3647,7 @@ def _gather_laptop_ps_window(
                 for row in payload:
                     if isinstance(row, dict):
                         row.setdefault("center", center)
-                selected: list[dict] = _PsRows(payload, total=len(payload))
+                selected: list[JsonDict] = _PsRows(payload, total=len(payload))
                 requested_status = requested_query["status"]
                 if isinstance(requested_status, str):
                     matched = [
@@ -3561,7 +3687,7 @@ def _gather_laptop_ps_window(
             else:
                 errors[center] = "invalid legacy ps response from head"
 
-    merged: list[dict] = []
+    merged: list[JsonDict] = []
     total = 0
     for center in cfg.centers:
         payload = data_by_center.get(center)
@@ -3630,7 +3756,7 @@ def _gather_ps_rows(
     issues_only: bool = False,
     remote_window: bool = False,
     limit: int | None = None,
-) -> tuple[list[dict], dict[str, str]]:
+) -> tuple[list[JsonDict], dict[str, str]]:
     """Collect and refresh job rows without coupling them to one output mode."""
     if isinstance(cfg, LaptopConfig):
         argv = ["ps"] + (["-s", status] if status else [])
@@ -3645,7 +3771,8 @@ def _gather_ps_rows(
         if remote_window:
             rows, errors = _gather_laptop_ps_window(cfg, argv)
         else:
-            rows, errors = fan_json(cfg, argv)
+            raw_rows, errors = fan_json(cfg, argv)
+            rows = cast(list[JsonDict], raw_rows)
             _scope_laptop_ps_refs(cfg, rows)
         return _limit_ps_rows(rows, limit), errors
 
@@ -3657,13 +3784,15 @@ def _gather_ps_rows(
     elif status is not None:
         refresh_statuses &= {status}
     stale = [entry for entry in entries if entry.status in refresh_statuses]
-    observations: dict[str, dict[str, object]] = {}
+    observations: dict[str, JsonDict] = {}
     configured_nodes = {node.name: node for node in cfg.nodes}
     node_statuses: dict[str, NodeStatus] = {}
-    progress_by_id: dict[str, dict[str, object]] = {}
+    progress_by_id: dict[str, JsonDict] = {}
 
-    def refresh(entry: jobs_mod.JobEntry):
-        observation: dict[str, object] = {}
+    def refresh(
+        entry: jobs_mod.JobEntry,
+    ) -> tuple[str, jobs_mod.JobEntry, JsonDict]:
+        observation: JsonDict = {}
         refreshed = jobs_mod.refresh_status(
             cfg,
             entry,
@@ -3671,7 +3800,7 @@ def _gather_ps_rows(
         )
         return entry.job_id, refreshed, observation
 
-    def collect_progress(entry: jobs_mod.JobEntry) -> dict[str, object]:
+    def collect_progress(entry: jobs_mod.JobEntry) -> JsonDict:
         try:
             proc, _path, source, tail = _read_job_log_tail(entry, 80)
             if proc.returncode != 0 and LOG_SOURCE_MARK not in (proc.stdout or ""):
@@ -3813,10 +3942,10 @@ def _gather_ps_rows(
 
 
 def _select_ps_rows(
-    rows: list[dict],
+    rows: list[JsonDict],
     all_: bool,
     recent: bool = True,
-) -> list[dict]:
+) -> list[JsonDict]:
     """Select active work by default, with bounded history only on request."""
     ordered = sorted(rows, key=lambda row: row.get("created_at", 0))
     if all_:
@@ -3834,7 +3963,7 @@ def _select_ps_rows(
     )
 
 
-def _select_v1_compatible_ps_rows(rows: list[dict]) -> list[dict]:
+def _select_v1_compatible_ps_rows(rows: list[JsonDict]) -> list[JsonDict]:
     """Return a superset that both 0.6.0 and 0.6.1 clients trim exactly."""
     ordered = sorted(rows, key=lambda row: row.get("created_at", 0))
     legacy_active = [
@@ -3850,21 +3979,21 @@ def _select_v1_compatible_ps_rows(rows: list[dict]) -> list[dict]:
 
 
 def _visible_ps_rows(
-    rows: list[dict],
+    rows: list[JsonDict],
     *,
     all_: bool,
     limit: int | None,
     recent: bool = True,
-) -> list[dict]:
+) -> list[JsonDict]:
     if limit is not None:
         return sorted(rows, key=lambda row: row.get("created_at", 0))
     return _select_ps_rows(rows, all_, recent=recent)
 
 
-def _ps_issue_rows(rows: list[dict]) -> list[dict]:
+def _ps_issue_rows(rows: list[JsonDict]) -> list[JsonDict]:
     """Return only jobs that need operator attention."""
 
-    def actionable(row: dict) -> bool:
+    def actionable(row: JsonDict) -> bool:
         status = row.get("status")
         reason = row.get("reason")
         if status in {"failed", "lost"}:
@@ -3899,14 +4028,14 @@ def _ps_issue_rows(rows: list[dict]) -> list[dict]:
 
 
 def _ps_queue_runway_note(
-    rows: list[dict],
+    rows: list[JsonDict],
     *,
     laptop: bool,
 ) -> str | None:
     """Human-only warning derived from the already-fetched active rows."""
     from rich.markup import escape
 
-    centers: dict[str, dict[str, object]] = {}
+    centers: dict[str, JsonDict] = {}
     for row in rows:
         status = row.get("status")
         if status not in {"queued", "running"}:
@@ -3953,7 +4082,7 @@ def _ps_queue_runway_note(
 
 
 def _ps_view(
-    rows: list[dict],
+    rows: list[JsonDict],
     errors: dict[str, str],
     *,
     all_: bool,
@@ -3965,7 +4094,7 @@ def _ps_view(
     laptop: bool = False,
     title: str = "Active jobs",
     empty_text: str = "no active jobs",
-):
+) -> Any:
     visible = _visible_ps_rows(
         rows,
         all_=all_,
@@ -4139,8 +4268,8 @@ def ps(
         window or (not json_ and (not all_ or limit is not None))
     )
 
-    def gather(include_progress: bool):
-        window_kwargs = {"remote_window": True} if remote_window else {}
+    def gather(include_progress: bool) -> tuple[list[JsonDict], dict[str, str]]:
+        window_kwargs: JsonDict = {"remote_window": True} if remote_window else {}
         if limit is not None and not legacy_issue_window:
             window_kwargs["limit"] = limit
         if issues:
@@ -4472,7 +4601,7 @@ def _sanitize_log_text(text: str) -> str:
     return _LOG_NUL_RUN_RE.sub(replacement, text)
 
 
-def _safe_job_resource_sample(value: object) -> dict[str, object] | None:
+def _safe_job_resource_sample(value: object) -> JsonDict | None:
     """Validate the training-writable live telemetry before rendering it."""
     if not isinstance(value, dict) or value.get("schema_version") != "dt_resource_v1":
         return None
@@ -4521,7 +4650,7 @@ def _safe_job_resource_sample(value: object) -> dict[str, object] | None:
             return None
         safe_job[key] = candidate
 
-    safe: dict[str, object] = {
+    safe: JsonDict = {
         "schema_version": "dt_resource_v1",
         "job": safe_job,
     }
@@ -4535,7 +4664,7 @@ def _safe_job_resource_sample(value: object) -> dict[str, object] | None:
 
 def _parse_job_log_tail_response(
     entry: jobs_mod.JobEntry, text: str
-) -> tuple[str, str, str, float | None, dict[str, object] | None]:
+) -> tuple[str, str, str, float | None, JsonDict | None]:
     """Parse a smart-tail response including optional selected-log metadata."""
     default_display = (
         "logs/env.log"
@@ -4592,10 +4721,10 @@ def _parse_job_log_tail(entry: jobs_mod.JobEntry, text: str) -> tuple[str, str, 
     return path, display, tail
 
 
-def _parse_log_progress(text: str) -> dict[str, object] | None:
+def _parse_log_progress(text: str) -> JsonDict | None:
     """Extract only explicit, broadly recognizable progress facts from logs."""
     clean = _ANSI_ESCAPE_RE.sub("", text or "")
-    progress: dict[str, object] = {}
+    progress: JsonDict = {}
     step_matches = list(_LOG_STEP_RE.finditer(clean))
     steps = [int(match.group(1)) for match in step_matches]
 
@@ -4674,12 +4803,12 @@ def _parse_log_progress(text: str) -> dict[str, object] | None:
             continue
         timestamped_steps.append((int(match.group("step")), timestamp))
     recent_step_times: list[float] = []
-    for (previous_step, previous_time), (current_step, current_time) in zip(
+    for (previous_step, previous_time), (next_step, current_time) in zip(
         timestamped_steps, timestamped_steps[1:]
     ):
-        if current_step > previous_step and current_time > previous_time:
+        if next_step > previous_step and current_time > previous_time:
             recent_step_times.append(
-                (current_time - previous_time) / (current_step - previous_step)
+                (current_time - previous_time) / (next_step - previous_step)
             )
     current_step = progress.get("step")
     remaining_steps: float | None = None
@@ -4748,7 +4877,7 @@ def _format_eta_duration(seconds: int) -> str:
     return " ".join(parts)
 
 
-def _format_log_progress(progress: dict[str, object]) -> str:
+def _format_log_progress(progress: JsonDict) -> str:
     parts: list[str] = []
     step = progress.get("step")
     total = progress.get("total_steps")
@@ -4779,7 +4908,7 @@ def _format_log_progress(progress: dict[str, object]) -> str:
 
 def _read_job_log_tail(
     entry: jobs_mod.JobEntry, lines: int, *, timeout: float = 10
-) -> tuple[subprocess.CompletedProcess, str, str, str]:
+) -> tuple[subprocess.CompletedProcess[str], str, str, str]:
     proc = run_on(
         entry.node,
         entry.node_local,
@@ -5216,6 +5345,7 @@ def attach(ref: str = REF_ARG) -> None:
     if isinstance(cfg, LaptopConfig):
         _, head = _locate(cfg, ref)
         forward_exec(head, ["attach", ref], tty=True)
+        return
     entry = _find_or_die(cfg, ref)
     _refuse_unplaced(entry, "tmux session")
     # -L dt: jobs live on dt's dedicated tmux server (see launcher.sh)
@@ -5350,7 +5480,7 @@ def _wait_until_terminal(
         while True:
             if stop_event is not None and stop_event.is_set():
                 raise _WaitStopped
-            observation: dict[str, object] = {}
+            observation: JsonDict = {}
             entry = jobs_mod.refresh_status(
                 cfg,
                 entry,
@@ -5385,6 +5515,7 @@ def _wait_until_terminal(
             if overdue is not None and not guard_overdue_reported:
                 from rich.markup import escape
 
+                assert entry.max_hours is not None
                 guard = f"{float(entry.max_hours):g}h"
                 if unreachable_now:
                     detail = (
@@ -5425,11 +5556,11 @@ def _read_finished_failure_log(
     emit: Callable[[str], None],
     write_tail: Callable[[str], object],
     primary_log_shown: bool = False,
-) -> dict[str, object]:
+) -> JsonDict:
     """Read primary and referenced failure evidence without changing job outcome."""
     from rich.markup import escape
 
-    failure_log: dict[str, object] = {
+    failure_log: JsonDict = {
         "path": "logs/stdout.log",
         "tail": "",
         "error": None,
@@ -5458,7 +5589,7 @@ def _read_finished_failure_log(
                 write_tail(primary_tail)
             referenced = _referenced_output_log(primary_tail)
             if referenced:
-                referenced_log: dict[str, object] = {
+                referenced_log: JsonDict = {
                     "path": referenced,
                     "tail": "",
                     "error": None,
@@ -5501,7 +5632,7 @@ _SIGKILL_FAILURE_RE = re.compile(
 )
 
 
-def _failure_log_text(failure_log: dict[str, object]) -> str:
+def _failure_log_text(failure_log: JsonDict) -> str:
     parts = [str(failure_log.get("tail") or "")]
     referenced = failure_log.get("referenced")
     if isinstance(referenced, dict):
@@ -5510,9 +5641,9 @@ def _failure_log_text(failure_log: dict[str, object]) -> str:
 
 
 def _probable_host_oom_hint(
-    failure_log: dict[str, object],
-    resource_summary: dict[str, object] | None,
-) -> dict[str, object] | None:
+    failure_log: JsonDict,
+    resource_summary: JsonDict | None,
+) -> JsonDict | None:
     """Infer a bounded host-OOM hint from SIGKILL plus persisted telemetry."""
     if not _SIGKILL_FAILURE_RE.search(_failure_log_text(failure_log)):
         return None
@@ -5523,7 +5654,7 @@ def _probable_host_oom_hint(
     if not isinstance(job, dict) or not isinstance(host, dict):
         return None
 
-    def number(row: dict[str, object], key: str) -> float | None:
+    def number(row: JsonDict, key: str) -> float | None:
         value = row.get(key)
         if (
             not isinstance(value, (int, float))
@@ -5576,7 +5707,7 @@ def _wait_terminal_result(
     emit: Callable[[str], None],
     write_tail: Callable[[str], object],
     primary_log_shown: bool = False,
-) -> tuple[dict[str, object], int]:
+) -> tuple[JsonDict, int]:
     """Build one terminal wait result and its stable process exit code."""
     if entry.status == "finished":
         from rich.markup import escape
@@ -5589,19 +5720,19 @@ def _wait_terminal_result(
             emit(f"[{color}]{summary}[/{color}]  [dim]{job_id}[/dim]")
         else:
             emit(f"[{color}]{summary}[/{color}]\n[dim]job {job_id}[/dim]")
-        extra: dict[str, object] = {"exit_code": code}
+        extra: JsonDict = {"exit_code": code}
         if code != 0 and error_lines:
-            failure_log = _read_finished_failure_log(
+            finished_failure_log = _read_finished_failure_log(
                 entry,
                 error_lines,
                 emit=emit,
                 write_tail=write_tail,
                 primary_log_shown=primary_log_shown,
             )
-            extra["failure_log"] = failure_log
-            if _SIGKILL_FAILURE_RE.search(_failure_log_text(failure_log)):
+            extra["failure_log"] = finished_failure_log
+            if _SIGKILL_FAILURE_RE.search(_failure_log_text(finished_failure_log)):
                 failure_hint = _probable_host_oom_hint(
-                    failure_log,
+                    finished_failure_log,
                     _job_resource_summary(entry),
                 )
                 if failure_hint is not None:
@@ -5610,7 +5741,7 @@ def _wait_terminal_result(
         return _submission_payload(entry, **extra), min(code, 125)
 
     if entry.status == "failed":
-        failure_log: dict[str, object] | None = None
+        failure_log: JsonDict | None = None
         if _is_uncertain_launch(entry):
             from rich.markup import escape
 
@@ -5664,10 +5795,10 @@ def _wait_duration(entry: jobs_mod.JobEntry) -> float | None:
 
 
 def _wait_group_payload(
-    results: list[tuple[jobs_mod.JobEntry, dict[str, object], int]],
-) -> dict[str, object]:
+    results: list[tuple[jobs_mod.JobEntry, JsonDict, int]],
+) -> JsonDict:
     """Build the stable terminal contract for multi-job wait."""
-    jobs: list[dict[str, object]] = []
+    jobs: list[JsonDict] = []
     aggregate_exit_code = 0
     succeeded = 0
     for entry, payload, process_exit_code in results:
@@ -5697,7 +5828,7 @@ def _write_group_failure_tail(text: str) -> None:
         sys.stderr.write("\n")
 
 
-def _render_wait_group(payload: dict[str, object]) -> None:
+def _render_wait_group(payload: JsonDict) -> None:
     from rich.markup import escape
     from rich.table import Table
 
@@ -5972,7 +6103,7 @@ def wait(
     def wait_one(
         index: int,
         entry: jobs_mod.JobEntry,
-    ) -> tuple[jobs_mod.JobEntry, dict[str, object], int]:
+    ) -> tuple[jobs_mod.JobEntry, JsonDict, int]:
         def emit(message: str) -> None:
             err.print(f"[dim]{index}/{len(entries)}[/dim] · {message}")
 
@@ -6050,7 +6181,7 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _fmt_memory_mib(value: object, *, compact: bool = False) -> str:
-    if value is None:
+    if not isinstance(value, int | float) or isinstance(value, bool):
         return "-"
     mib = float(value)
     if mib < 1024:
@@ -6064,9 +6195,7 @@ def _fmt_ts(ts: float | None) -> str:
     return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M:%S")
 
 
-def _job_resources(
-    cfg: HeadConfig, entry: jobs_mod.JobEntry
-) -> dict[str, object] | None:
+def _job_resources(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> JsonDict | None:
     """Live resource snapshot for a running job, scoped to its assigned GPUs."""
     if entry.status != "running" or entry.node == "-":
         return None
@@ -6083,7 +6212,7 @@ def _job_resources(
     }
 
 
-def _resource_rows(resources: dict[str, object] | None) -> list[tuple[str, str]]:
+def _resource_rows(resources: JsonDict | None) -> list[tuple[str, str]]:
     if not resources:
         return []
     if resources.get("error"):
@@ -6105,7 +6234,7 @@ def _resource_rows(resources: dict[str, object] | None) -> list[tuple[str, str]]
         pss_anon = job.get("pss_anon_mib")
         pss = job.get("pss_mib")
         if isinstance(pss_anon, (int, float)):
-            memory = pss_anon
+            memory: object = pss_anon
             memory_label = "RAM(anon PSS)"
         elif isinstance(pss, (int, float)):
             memory = pss
@@ -6146,7 +6275,7 @@ def _resource_rows(resources: dict[str, object] | None) -> list[tuple[str, str]]
     return rows
 
 
-def _compact_watch_snapshot(snapshot: dict[str, object]) -> dict[str, object]:
+def _compact_watch_snapshot(snapshot: JsonDict) -> JsonDict:
     """Project a full watch frame onto the stable automation essentials."""
     keys = (
         "job_id",
@@ -6189,8 +6318,8 @@ def _watch_snapshot(
     lines: int,
     *,
     compact: bool = False,
-    queue_context: dict[str, object] | None = None,
-) -> tuple[jobs_mod.JobEntry, dict[str, object]]:
+    queue_context: JsonDict | None = None,
+) -> tuple[jobs_mod.JobEntry, JsonDict]:
     """Collect one watch frame. Kept separate so the terminal loop is testable."""
     if entry.status == "queued":
         entry = jobs_mod.load(cfg, entry.job_id) or entry
@@ -6203,7 +6332,7 @@ def _watch_snapshot(
     terminal_statuses = {"finished", "killed", "lost", "failed"}
     should_refresh = initial_status in ("running", "lost")
     should_read_log = entry.node != "-" and initial_status != "queued"
-    status_observation: dict[str, object] = {}
+    status_observation: JsonDict = {}
     with ThreadPoolExecutor(max_workers=4) as pool:
         status_future = (
             pool.submit(
@@ -6293,7 +6422,7 @@ def _watch_snapshot(
             progress = _parse_log_progress(log_tail)
         except Exception as e:
             log_tail = f"[log unavailable: {e}]"
-    queue_fields: dict[str, object] = {
+    queue_fields: JsonDict = {
         "queue_position": None,
         "queue_depth": None,
         "queue_ahead_count": None,
@@ -6355,11 +6484,13 @@ def _watch_group_snapshot(
     lines: int,
     *,
     compact: bool = False,
-) -> tuple[list[jobs_mod.JobEntry], list[dict[str, object]]]:
+) -> tuple[list[jobs_mod.JobEntry], list[JsonDict]]:
     """Collect independent job frames concurrently while preserving ref order."""
     queue_contexts = jobs_mod.queue_contexts(jobs_mod.list_all(cfg))
 
-    def collect(entry: jobs_mod.JobEntry):
+    def collect(
+        entry: jobs_mod.JobEntry,
+    ) -> tuple[jobs_mod.JobEntry, JsonDict]:
         if compact:
             return _watch_snapshot(
                 cfg,
@@ -6384,10 +6515,10 @@ def _watch_group_snapshot(
 
 
 def _watch_group_payload(
-    snapshots: list[dict[str, object]],
+    snapshots: list[JsonDict],
     *,
     compact: bool = False,
-) -> dict[str, object]:
+) -> JsonDict:
     """Build one stable machine-readable multi-job watch frame."""
     statuses = ("queued", "running", "finished", "killed", "lost", "failed")
     counts = {
@@ -6420,7 +6551,7 @@ def _watch_group_payload(
     }
 
 
-def _watch_view(snapshot: dict[str, object]):
+def _watch_view(snapshot: JsonDict) -> Any:
     from rich.console import Group
     from rich.markup import escape
     from rich.panel import Panel
@@ -6512,7 +6643,7 @@ def _watch_view(snapshot: dict[str, object]):
     return Group(t, Panel(Text(log), title=title, border_style="dim"))
 
 
-def _watch_group_view(payload: dict[str, object]):
+def _watch_group_view(payload: JsonDict) -> Any:
     """Render a dense fleet view plus logs only for active or failed jobs."""
     from rich.console import Group
     from rich.markup import escape
@@ -6613,7 +6744,7 @@ def _watch_group_view(payload: dict[str, object]):
             pss_anon = job.get("pss_anon_mib")
             pss = job.get("pss_mib")
             if isinstance(pss_anon, (int, float)):
-                memory = pss_anon
+                memory: object = pss_anon
                 label = "RAM(anon PSS)"
             elif isinstance(pss, (int, float)):
                 memory = pss
@@ -6676,7 +6807,7 @@ def _watch_group_view(payload: dict[str, object]):
     return Group(table, *panels)
 
 
-def _gpu_sampling_note(summary: dict[str, object]) -> str | None:
+def _gpu_sampling_note(summary: JsonDict) -> str | None:
     """Explain a zero sampled peak without claiming that the GPU was idle."""
     zero_peak = []
     for index, gpu in (summary.get("gpus") or {}).items():
@@ -6705,7 +6836,7 @@ def _gpu_sampling_note(summary: dict[str, object]) -> str | None:
 
 def _job_resource_summary(
     entry: jobs_mod.JobEntry,
-) -> dict[str, object] | None:
+) -> JsonDict | None:
     """Read a bounded persisted summary without making watch depend on it."""
     if entry.node == "-":
         return None
@@ -6724,9 +6855,9 @@ def _job_resource_summary(
 
 
 def _phase_spans_for_human(
-    summary: dict[str, object], *, max_spans: int
-) -> tuple[list[dict[str, object] | None], int]:
-    spans = [
+    summary: JsonDict, *, max_spans: int
+) -> tuple[list[JsonDict | None], int]:
+    spans: list[JsonDict | None] = [
         span
         for span in summary.get("phases") or []
         if isinstance(span, dict) and _safe_phase_name(span.get("phase"))
@@ -6742,7 +6873,7 @@ def _phase_spans_for_human(
 
 
 def _resource_summary_rows(
-    summary: dict[str, object] | None,
+    summary: JsonDict | None,
 ) -> list[tuple[str, str]]:
     """Compact persisted-telemetry rows for ``dt info``."""
     if not summary:
@@ -6894,7 +7025,7 @@ def _resource_summary_rows(
     return rows
 
 
-def _metrics_table(entry: jobs_mod.JobEntry, summary: dict[str, object]):
+def _metrics_table(entry: jobs_mod.JobEntry, summary: JsonDict) -> Any:
     from rich.table import Table
     from rich.text import Text
 
@@ -6943,7 +7074,9 @@ def _metrics_table(entry: jobs_mod.JobEntry, summary: dict[str, object]):
     t.add_column("mean", justify="right")
     t.add_column("peak", justify="right")
 
-    def fmt(value, suffix="", scale=1.0):
+    def fmt(value: object, suffix: str = "", scale: float = 1.0) -> str:
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            return "-"
         return "-" if value is None else f"{float(value) / scale:.1f}{suffix}"
 
     gpu_error_samples = int(summary.get("gpu_error_samples") or 0)
@@ -7076,9 +7209,9 @@ def _remote_timestamp(value: str) -> float | None:
     return timestamp if math.isfinite(timestamp) and timestamp > 0 else None
 
 
-def _parse_phase_jsonl(text: str) -> tuple[list[dict[str, object]], int]:
+def _parse_phase_jsonl(text: str) -> tuple[list[JsonDict], int]:
     """Parse application phase markers, tolerating interrupted final writes."""
-    markers: list[dict[str, object]] = []
+    markers: list[JsonDict] = []
     invalid = 0
     for line in text.splitlines():
         try:
@@ -7109,11 +7242,11 @@ def _phase_summary_from_text(
     *,
     finished_at: float | None,
     tail_limit: int,
-) -> dict[str, object] | None:
+) -> JsonDict | None:
     markers, invalid = _parse_phase_jsonl(text)
     if not markers:
         return None
-    timed: list[dict[str, object]] = []
+    timed: list[JsonDict] = []
     for index, marker in enumerate(markers):
         next_timestamp = (
             float(markers[index + 1]["timestamp"])
@@ -7144,11 +7277,11 @@ def _phase_summary_from_text(
 
 
 def _phase_summary_rows(
-    summary: dict[str, object] | None,
+    summary: JsonDict | None,
 ) -> list[tuple[str, str]]:
     if not summary:
         return []
-    markers = [
+    markers: list[JsonDict | None] = [
         marker
         for marker in summary.get("markers") or []
         if isinstance(marker, dict) and _safe_phase_name(marker.get("phase"))
@@ -7175,7 +7308,7 @@ def _phase_summary_rows(
 def _info_live(
     entry: jobs_mod.JobEntry,
     resource_tail: int = INFO_RESOURCE_TAIL,
-) -> dict[str, object]:
+) -> JsonDict:
     """Read remote timing, output size, dirty marker, and telemetry tail."""
     if entry.node == "-":
         return {}
@@ -7233,7 +7366,7 @@ def _info_live(
 INFO_COMMAND_PREVIEW_CHARS = 160
 
 
-def _info_command_text(command: str, *, full: bool):
+def _info_command_text(command: str, *, full: bool) -> Any:
     """Keep the human summary scannable without weakening the JSON contract."""
     from rich.text import Text
 
@@ -7387,7 +7520,7 @@ def info(
         finished_at=finished,
         tail_limit=INFO_PHASE_TAIL,
     )
-    queue_context = {
+    queue_context: JsonDict = {
         "queue_position": None,
         "queue_depth": None,
         "queue_ahead_count": None,
@@ -7726,8 +7859,8 @@ COMPARE_JOB_METRIC_SOURCE = "@job"
 COMPARE_JOB_METRICS = {"duration_s"}
 
 
-def _compare_payload(entries: list[jobs_mod.JobEntry]) -> dict[str, object]:
-    checks: dict[str, dict[str, object]] = {}
+def _compare_payload(entries: list[jobs_mod.JobEntry]) -> JsonDict:
+    checks: dict[str, JsonDict] = {}
     for field, label in COMPARE_CONTROLS:
         values = {entry.job_id: getattr(entry, field) for entry in entries}
         encoded = {json.dumps(value, sort_keys=True) for value in values.values()}
@@ -7888,7 +8021,7 @@ def _read_compare_metric(
     entry: jobs_mod.JobEntry,
     output_glob: str,
     field: str,
-) -> dict[str, object]:
+) -> JsonDict:
     if output_glob == COMPARE_JOB_METRIC_SOURCE:
         if field == "duration_s":
             started_at = entry.started_at
@@ -7986,7 +8119,7 @@ def _compare_metric_payload(
     labels: list[str],
     lower_is_better: bool,
     unit: str | None,
-) -> dict[str, object]:
+) -> JsonDict:
     with ThreadPoolExecutor(max_workers=min(8, len(entries))) as pool:
         readings = list(
             pool.map(
@@ -8007,7 +8140,7 @@ def _compare_metric_payload(
         for entry, reading, label in zip(entries, readings, labels, strict=True)
     }
     ordered_labels = list(dict.fromkeys(labels))
-    groups: list[dict[str, object]] = []
+    groups: list[JsonDict] = []
     for label in ordered_labels:
         rows = [
             (entry.job_id, _compare_numeric_field(reading, "value"))
@@ -8065,19 +8198,19 @@ def _compare_metric_payload(
     }
 
 
-def _compare_numeric_field(row: dict[str, object], field: str) -> float:
+def _compare_numeric_field(row: JsonDict, field: str) -> float:
     value = row[field]
     assert not isinstance(value, bool) and isinstance(value, (int, float))
     return float(value)
 
 
 def _compare_metric_gate(
-    metric: dict[str, object],
+    metric: JsonDict,
     *,
     min_improvement: float | None,
     max_regression: float | None,
     max_spread: float | None,
-) -> dict[str, object]:
+) -> JsonDict:
     groups = metric["groups"]
     assert isinstance(groups, list) and len(groups) == 2
     baseline, candidate = groups
@@ -8162,7 +8295,7 @@ def _metric_number(value: float) -> str:
     return f"{value:.6g}"
 
 
-def _render_compare_metric(metric: dict[str, object]) -> None:
+def _render_compare_metric(metric: JsonDict) -> None:
     from rich.markup import escape
     from rich.table import Table as RTable
 
@@ -8252,7 +8385,7 @@ def _render_compare_metric(metric: dict[str, object]) -> None:
                 err.print(f"[red]gate:[/red] {escape(str(failure))}")
 
 
-def _render_compare(data: dict[str, object]) -> None:
+def _render_compare(data: JsonDict) -> None:
     from rich.markup import escape
     from rich.table import Table as RTable
 
@@ -8510,7 +8643,7 @@ def compare(
                 "spec": metric,
             }
         elif not data["results_ready"]:
-            skipped_metric: dict[str, object] = {
+            skipped_metric: JsonDict = {
                 "status": "skipped",
                 "reason": "results_not_ready",
                 "spec": metric,
@@ -9007,9 +9140,9 @@ def _fork_repeat_receipt(
     cache_mode: str,
     cold_cache_env: str | None,
     agent_started: bool | None,
-    error: dict[str, object] | None,
+    error: JsonDict | None,
     exit_code: int,
-) -> dict[str, object]:
+) -> JsonDict:
     interrupted = (
         isinstance(error, dict)
         and error.get("kind") == "fork_repeat_submission_interrupted"
@@ -9028,7 +9161,7 @@ def _fork_repeat_receipt(
         )
         for index, entry in enumerate(entries, start=1)
     ]
-    receipt: dict[str, object] = {
+    receipt: JsonDict = {
         "schema_version": FORK_REPEAT_SCHEMA,
         "status": (
             "submitted"
@@ -9099,7 +9232,7 @@ def _fork_repeat_receipt(
 
 
 def _emit_fork_repeat_human(
-    receipt: dict[str, object],
+    receipt: JsonDict,
     *,
     emit_job_ids: bool = True,
 ) -> None:
@@ -9404,7 +9537,7 @@ def fork(
         else None
     )
 
-    def build_spec(item_name: str | None):
+    def build_spec(item_name: str | None) -> RunSpec:
         if inherit_cache:
             item_spec = dispatch_mod.inherited_cache_fork_spec_from_entry(
                 old,
@@ -9473,7 +9606,7 @@ def fork(
 
     if repeat > 1:
         entries: list[jobs_mod.JobEntry] = []
-        failure: dict[str, object] | None = None
+        failure: JsonDict | None = None
         failure_code = 0
         agent_started: bool | None = None
         agent_checked = False
@@ -9646,8 +9779,9 @@ def fork(
         from rich.markup import escape
 
         reason_note = f" · [yellow]{escape(entry.reason)}[/yellow]"
+    exact_snapshot = (entry.snapshot_sha256 or "unknown")[:12]
     err.print(
-        f"{state} {entry.name}  exact={entry.snapshot_sha256[:12]} "
+        f"{state} {entry.name}  exact={exact_snapshot} "
         f"(fork of {entry.forked_from or source.job_id}){reason_note}"
     )
     print(entry.job_id)
@@ -9676,7 +9810,7 @@ PULL_LOG_RESERVED_EXCLUDES = ["job.json", "resources.jsonl"]
 def _rsync_retry_observer(
     subject: str,
     phase: str,
-    events: list[dict[str, object]],
+    events: list[JsonDict],
 ) -> Callable[[RsyncRetryEvent], None]:
     def observe(event: RsyncRetryEvent) -> None:
         from rich.markup import escape
@@ -9770,7 +9904,7 @@ def _pull_unlocked(
         help="link retries after the first attempt (0 = fail fast)",
     ),
     _cfg_override: HeadConfig | LaptopConfig | None = None,
-    _result: dict[str, object] | None = None,
+    _result: JsonDict | None = None,
     _cancel_event: Event | None = None,
     _collection: str | None = None,
 ) -> None:
@@ -9818,7 +9952,7 @@ def _pull_unlocked(
     output_excludes = list(dict.fromkeys([*PULL_RESERVED_EXCLUDES, *excludes]))
     entry: jobs_mod.JobEntry | None = None
     remote_outputs_bytes: int | None = None
-    retry_events: list[dict[str, object]] = []
+    retry_events: list[JsonDict] = []
 
     def fail(
         kind: str,
@@ -10023,7 +10157,9 @@ def _pull_unlocked(
     finally:
         record_tmp.unlink(missing_ok=True)
     records = ["dt/job.json"]
-    cancel_kwargs = {"cancel_event": _cancel_event} if _cancel_event is not None else {}
+    cancel_kwargs: _RsyncCancelKwargs = (
+        {"cancel_event": _cancel_event} if _cancel_event is not None else {}
+    )
 
     def confirmed_records(*, logs_recovered: bool = False) -> list[str]:
         """Inventory reserved top-level run records already present locally."""
@@ -10229,8 +10365,8 @@ def _pull_unlocked(
 
 def _pull_group_payload(
     root: Path,
-    results: list[dict[str, object]],
-) -> dict[str, object]:
+    results: list[JsonDict],
+) -> JsonDict:
     aggregate_exit_code = 0
     pulled = 0
     for result in results:
@@ -10252,7 +10388,7 @@ def _pull_group_payload(
     }
 
 
-def _render_pull_group(payload: dict[str, object]) -> None:
+def _render_pull_group(payload: JsonDict) -> None:
     from rich.markup import escape
     from rich.table import Table
 
@@ -10307,8 +10443,8 @@ def _pull_group_one(
     force: bool,
     retries: int,
     cancel_event: Event,
-) -> dict[str, object]:
-    result: dict[str, object] = {}
+) -> JsonDict:
+    result: JsonDict = {}
     try:
         with jobs_mod.pull_destination_lock(cfg, destination):
             _pull_unlocked(
@@ -10564,7 +10700,7 @@ def pull(
             json_=json_,
         )
     cancel_event = Event()
-    ordered_results: list[dict[str, object] | None] = [None] * len(entries)
+    ordered_results: list[JsonDict | None] = [None] * len(entries)
     work_items: list[tuple[int, str, jobs_mod.JobEntry, Path]] = []
     for index, (ref, entry) in enumerate(zip(refs, entries, strict=True)):
         if entry is None:
@@ -10663,7 +10799,7 @@ def _kill_one(
     ref: str,
     yes: bool,
     force: bool,
-    result: dict[str, object] | None = None,
+    result: JsonDict | None = None,
 ) -> str:
     """Returns 'ok' | 'notfound' | 'alive' | 'unverified'."""
 
@@ -10849,7 +10985,7 @@ def kill(
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         if json_:
-            rows: list[dict[str, object]] = []
+            rows: list[JsonDict] = []
             outcomes: list[str] = []
             argv_tail = ["-y"] + (["--force"] if force else []) + ["--json"]
             for ref in refs:
@@ -11013,6 +11149,14 @@ def clean(
     before: str = typer.Option(
         ..., "--before", help="YYYY-MM-DD; delete finished jobs older than this"
     ),
+    center: Optional[str] = typer.Option(
+        None, "-c", "--center", help="(laptop) clean one center"
+    ),
+    all_centers: bool = typer.Option(
+        False,
+        "--all-centers",
+        help="(laptop) explicitly clean every configured center",
+    ),
     project: Optional[list[str]] = typer.Option(
         None,
         "-p",
@@ -11037,6 +11181,9 @@ def clean(
     """Delete old job snapshots + logs on nodes and their registry entries."""
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
+        if center is not None and all_centers:
+            err.print("[red]use either --center or --all-centers, not both[/red]")
+            raise typer.Exit(1)
         rc = 0
         argv_tail = (
             [
@@ -11049,14 +11196,33 @@ def clean(
             + (["--plan"] if plan else [])
             + (["-y"] if yes else [])
         )
-        for center, head in cfg.centers.items():
-            err.print(f"[dim]cleaning {center}[/dim]")
+        targets = (
+            list(cfg.centers.items())
+            if all_centers
+            else [
+                (
+                    selected := _laptop_center(cfg, center),
+                    cfg.centers[selected],
+                )
+            ]
+        )
+        for target_center, head in targets:
+            err.print(f"[dim]cleaning {target_center}[/dim]")
             rc |= forward_call(
                 head, ["clean", "--before", before, *argv_tail], tty=not yes
             )
         raise typer.Exit(rc)
 
-    cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
+    if center is not None or all_centers:
+        err.print("[red]--center and --all-centers are laptop-only options[/red]")
+        raise typer.Exit(1)
+    try:
+        cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
+    except ValueError:
+        err.print(
+            f"[red]invalid --before {before!r}; expected a real YYYY-MM-DD date[/red]"
+        )
+        raise typer.Exit(1)
     from .dispatch import clean_job_victims, clean_jobs
 
     projects = set(project) if project else None
@@ -11104,22 +11270,36 @@ def clean(
             what += " + stale shared venvs"
         typer.confirm(f"{what}?", abort=True)
     removed_results = 0
+    managed_results_by_job: dict[str, list[Path]] = {}
     for job_id, path in managed_results:
-        try:
+        managed_results_by_job.setdefault(job_id, []).append(path)
+
+    def remove_managed_results(entry: jobs_mod.JobEntry) -> None:
+        nonlocal removed_results
+        for path in managed_results_by_job.get(entry.job_id, []):
             shutil.rmtree(path)
-        except OSError as exc:
-            err.print(f"[yellow]{job_id}: result cleanup skipped ({exc})[/yellow]")
-        else:
             removed_results += 1
-    n = clean_jobs(
+
+    report = clean_jobs(
         cfg,
         cutoff,
         envs=envs,
         log=lambda m: err.print(f"[dim]{m}[/dim]"),
         projects=projects,
+        before_registry_remove=remove_managed_results if results else None,
     )
     suffix = f" + {removed_results} managed results" if results else ""
-    err.print(f"cleaned {n} jobs{suffix}")
+    err.print(f"cleaned {report.removed}/{report.eligible} jobs{suffix}")
+    if report.failures:
+        err.print(
+            f"[red]{len(report.failures)} job(s) retained after cleanup "
+            "failures; rerun after fixing the reported cause[/red]"
+        )
+        for failure in report.failures:
+            err.print(
+                f"[red]{failure.job_id} · {failure.kind} · {failure.message}[/red]"
+            )
+        raise typer.Exit(1)
 
 
 def _local_tree_disk_bytes(path: Path) -> int:
@@ -11302,12 +11482,14 @@ def compact(
         if len(rows) > 20:
             err.print(f"[dim]... {len(rows) - 20} more jobs[/dim]")
         verb = "would compact" if plan else "compacted"
+        planned_code_bytes = payload["planned_code_bytes"]
+        assert isinstance(planned_code_bytes, int)
         err.print(
             f"{verb} {payload['planned_jobs'] if plan else payload['compacted_jobs']} "
             f"jobs · already compact {payload['already_compact_jobs']} · "
             f"missing dirs {payload['missing_job_dirs']} · "
             f"failed {payload['failed_jobs']} · "
-            f"{_format_transfer_bytes(int(payload['planned_code_bytes']))}"
+            f"{_format_transfer_bytes(planned_code_bytes)}"
         )
         skipped = payload["skipped"]
         if isinstance(skipped, dict) and skipped:
@@ -11339,7 +11521,7 @@ def _agent_forward(argv: list[str], center: Optional[str]) -> None:
         raise typer.Exit(forward_call(head, ["agent", *argv]))
 
 
-@agent_app.command("run")
+@_typed_cli_decorator(agent_app.command("run"))
 def agent_run(
     center: Optional[str] = typer.Option(
         None, "-c", "--center", help="(laptop) which center's head"
@@ -11352,7 +11534,7 @@ def agent_run(
     raise typer.Exit(agent_mod.run_loop(_need_head(_cfg())))
 
 
-@agent_app.command("start")
+@_typed_cli_decorator(agent_app.command("start"))
 def agent_start(
     center: Optional[str] = typer.Option(None, "-c", "--center"),
 ) -> None:
@@ -11371,7 +11553,7 @@ def agent_start(
         raise typer.Exit(1)
 
 
-@agent_app.command("stop")
+@_typed_cli_decorator(agent_app.command("stop"))
 def agent_stop(
     center: Optional[str] = typer.Option(None, "-c", "--center"),
 ) -> None:
@@ -11386,7 +11568,7 @@ def agent_stop(
         err.print("no agent running")
 
 
-@agent_app.command("status")
+@_typed_cli_decorator(agent_app.command("status"))
 def agent_status(
     center: Optional[str] = typer.Option(None, "-c", "--center"),
     json_: bool = typer.Option(False, "--json"),
@@ -11407,7 +11589,7 @@ def agent_status(
     err.print(_agent_status_table(st))
 
 
-def _agent_status_table(st: dict):
+def _agent_status_table(st: JsonDict) -> Any:
     """Compact status card whose rows stay readable in an 80-column shell."""
     from rich.table import Table
 
@@ -11455,7 +11637,7 @@ def _agent_status_table(st: dict):
     return table
 
 
-@agent_app.command("install")
+@_typed_cli_decorator(agent_app.command("install"))
 def agent_install(
     center: Optional[str] = typer.Option(None, "-c", "--center"),
 ) -> None:
@@ -11661,10 +11843,10 @@ def sync(
 
     def sync_one(
         name: str,
-    ) -> tuple[dict[str, object], int | None, list[str]]:
+    ) -> tuple[JsonDict, int | None, list[str]]:
         node = by_name[name]
         messages: list[str] = []
-        retry_events: list[dict[str, object]] = []
+        retry_events: list[JsonDict] = []
         started = time.perf_counter()
         try:
             if artifacts:
@@ -11752,7 +11934,7 @@ def sync(
                 messages,
             )
 
-    def run_all() -> list[tuple[dict[str, object], int | None, list[str]]]:
+    def run_all() -> list[tuple[JsonDict, int | None, list[str]]]:
         if len(names) == 1:
             return [sync_one(names[0])]
         pool = ThreadPoolExecutor(max_workers=min(8, len(names)))
@@ -11789,7 +11971,7 @@ def sync(
             json_=json_,
         )
 
-    rows: list[dict[str, object]] = []
+    rows: list[JsonDict] = []
     failure_codes: list[int] = []
     for name, (row, failure_code, messages) in zip(names, results):
         rows.append(row)
@@ -11952,7 +12134,7 @@ def seed(
     from .dispatch import _seed_cache_lock, transferred_bytes
 
     home = Path.home()
-    components: list[dict[str, object]] = []
+    components: list[JsonDict] = []
     for component_name, src, rel in (
         ("uv-cache", home / ".cache/uv", ".cache/uv"),
         (
@@ -11991,10 +12173,10 @@ def seed(
         *,
         message: str,
         code: int,
-        completed: list[dict[str, object]] | None = None,
+        completed: list[JsonDict] | None = None,
         transferred: int = 0,
-        retry_events: list[dict[str, object]] | None = None,
-    ) -> dict[str, object]:
+        retry_events: list[JsonDict] | None = None,
+    ) -> JsonDict:
         component_rows = completed or []
         has_seeded = any(
             component.get("status") == "seeded" for component in component_rows
@@ -12015,9 +12197,9 @@ def seed(
             **({"retry_events": retry_events} if retry_events else {}),
         }
 
-    def seed_one_unlocked(name: str) -> dict[str, object]:
+    def seed_one_unlocked(name: str) -> JsonDict:
         node = by_name[name]
-        retry_events: list[dict[str, object]] = []
+        retry_events: list[JsonDict] = []
         if node.local:
             return {
                 "node": name,
@@ -12078,7 +12260,7 @@ def seed(
                 code=code,
             )
 
-        completed: list[dict[str, object]] = []
+        completed: list[JsonDict] = []
         total = 0
         failure_codes: list[int] = []
         failure_messages: list[str] = []
@@ -12102,6 +12284,7 @@ def seed(
                 code = EXIT_UNREACHABLE
                 proc = None
             else:
+                assert proc is not None
                 detail = (
                     proc.stderr or proc.stdout or f"rsync exited {proc.returncode}"
                 ).strip()
@@ -12151,7 +12334,7 @@ def seed(
                 transferred=total,
                 retry_events=retry_events,
             )
-        row: dict[str, object] = {
+        row: JsonDict = {
             "node": name,
             "status": "seeded",
             "hf": hf,
@@ -12163,14 +12346,14 @@ def seed(
             row["retry_events"] = retry_events
         return row
 
-    def seed_one(name: str) -> dict[str, object]:
+    def seed_one(name: str) -> JsonDict:
         node = by_name[name]
         if node.local or not components or plan:
             return seed_one_unlocked(name)
         with _seed_cache_lock(cfg, node):
             return seed_one_unlocked(name)
 
-    def run_all() -> list[dict[str, object]]:
+    def run_all() -> list[JsonDict]:
         if len(names) == 1:
             return [seed_one(names[0])]
         with ThreadPoolExecutor(max_workers=min(8, len(names))) as pool:
@@ -12286,7 +12469,7 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
             accept_nonzero_json=True,
             unreachable_errors=unreachable_errors,
         )
-        rows += node_rows
+        rows += cast(list[JsonDict], node_rows)
         for center, e in errors.items():
             rows.append(
                 {
@@ -12359,6 +12542,7 @@ def _find(ref: str) -> None:
 # registration (incl. single-letter aliases)
 # --------------------------------------------------------------------------
 
+app.command("init", rich_help_panel="Setup")(init_config)
 app.command("free", rich_help_panel="Everyday")(free)
 app.command("f", hidden=True)(free)
 app.command("task", hidden=True)(task)

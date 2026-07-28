@@ -16,8 +16,10 @@ while developing and validating DistTrainer.
 | Build and promote a release | [Release procedure](releasing.md) |
 
 The root [README](../README.md) is the product overview. The
-[support contract](../SUPPORT.md), [security policy](../SECURITY.md), and
-[contribution guide](../CONTRIBUTING.md) define the supported boundary.
+[support contract](../.github/SUPPORT.md),
+[security policy](../.github/SECURITY.md), and
+[contribution guide](../.github/CONTRIBUTING.md) define the supported
+boundary.
 
 ## Evidence library
 

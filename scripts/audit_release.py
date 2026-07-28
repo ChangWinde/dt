@@ -37,6 +37,9 @@ REQUIRED_PAYLOADS = {
     "dt/payload/telemetry.py",
     "dt/payload/wrapper.sh",
 }
+ALLOWED_SDIST_PATHS = {
+    ("docs", "package-readme.md"),
+}
 
 
 def _safe_parts(name: str) -> tuple[str, ...]:
@@ -64,7 +67,10 @@ def audit_sdist(path: str, distribution: str, version: str) -> dict[str, object]
             if member.issym() or member.islnk() or member.isdev():
                 raise ValueError(f"unsupported sdist member type: {member.name}")
             relative = parts[1:]
-            if any(part in FORBIDDEN_PATH_PARTS for part in relative):
+            if (
+                any(part in FORBIDDEN_PATH_PARTS for part in relative)
+                and relative not in ALLOWED_SDIST_PATHS
+            ):
                 raise ValueError(f"forbidden release path: {member.name}")
             if not member.isfile():
                 continue

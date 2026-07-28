@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import shutil
 import signal
@@ -28,6 +29,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from types import FrameType
 from typing import Callable
 
 from . import completion as completion_mod
@@ -112,7 +114,7 @@ def alive_pid(cfg: HeadConfig) -> int | None:
     return None
 
 
-def notify(cfg: HeadConfig, payload: dict) -> None:
+def notify(cfg: HeadConfig, payload: dict[str, object]) -> None:
     """POST a job event to the configured webhook. Never raises."""
     if not cfg.webhook:
         return
@@ -129,7 +131,7 @@ def notify(cfg: HeadConfig, payload: dict) -> None:
 
 def _reconcile_jobs(
     cfg: HeadConfig,
-    log,
+    log: Callable[[str], None],
     entries: list[JobEntry] | None = None,
 ) -> list[JobEntry]:
     """Refresh active jobs before queue accounting.
@@ -156,7 +158,7 @@ def _reconcile_jobs(
     if not candidates:
         return entries
 
-    def reconcile(entry):
+    def reconcile(entry: JobEntry) -> tuple[str, JobEntry, Exception | None]:
         before = entry.status
         try:
             refreshed = refresh_status(cfg, entry)
@@ -200,7 +202,7 @@ def _reconcile_jobs(
 
 def _process_once_with_snapshot(
     cfg: HeadConfig,
-    log,
+    log: Callable[[str], None],
     *,
     blocked_log_state: dict[str, str] | None = None,
 ) -> tuple[list[tuple[str, str]], list[JobEntry]]:
@@ -311,7 +313,10 @@ def _process_once_with_snapshot(
     return results, entries
 
 
-def process_once(cfg: HeadConfig, log) -> list[tuple[str, str]]:
+def process_once(
+    cfg: HeadConfig,
+    log: Callable[[str], None],
+) -> list[tuple[str, str]]:
     """Public/test-friendly one-tick API returning dispatch outcomes only."""
     return _process_once_with_snapshot(cfg, log)[0]
 
@@ -371,18 +376,29 @@ def _restart_preflight(
     return False, detail[-240:]
 
 
-def _maybe_autoclean(cfg: HeadConfig, log) -> None:
+def _maybe_autoclean(cfg: HeadConfig, log: Callable[[str], None]) -> None:
     """Config-gated daily cleanup (queue.auto_clean_days): ended jobs and
     stale shared venvs older than N days."""
     days = cfg.queue.auto_clean_days
-    if not days:
+    if days is None:
+        return
+    if not math.isfinite(days) or days <= 0:
+        log(f"auto-clean disabled: invalid retention {days!r} days")
         return
     stamp = cfg.root / "last_autoclean"
     if stamp.exists() and time.time() - stamp.stat().st_mtime < AUTOCLEAN_EVERY_S:
         return
     stamp.touch()  # stamp first: a failing clean must not retry every tick
-    n = clean_jobs(cfg, time.time() - days * 86400, envs=True, log=log)
-    log(f"auto-clean: removed {n} ended jobs older than {days:g} days")
+    report = clean_jobs(cfg, time.time() - days * 86400, envs=True, log=log)
+    log(
+        f"auto-clean: removed {report.removed}/{report.eligible} ended jobs "
+        f"older than {days:g} days"
+    )
+    if report.failures:
+        log(
+            f"auto-clean: retained {len(report.failures)} job records after "
+            "cleanup failures"
+        )
 
 
 def _consume_agent_wake(cfg: HeadConfig) -> bool:
@@ -396,7 +412,7 @@ def _consume_agent_wake(cfg: HeadConfig) -> bool:
 
 
 def _stop_completion_watchers(
-    watchers: dict[str, subprocess.Popen],
+    watchers: dict[str, subprocess.Popen[bytes]],
 ) -> None:
     for process in watchers.values():
         _stop_completion_watcher(process)
@@ -405,7 +421,7 @@ def _stop_completion_watchers(
 
 def _sync_completion_watchers(
     cfg: HeadConfig,
-    watchers: dict[str, subprocess.Popen],
+    watchers: dict[str, subprocess.Popen[bytes]],
     log: Callable[[str], None],
     entries: list[JobEntry] | None = None,
 ) -> None:
@@ -439,7 +455,7 @@ def _sync_completion_watchers(
 
 
 def _consume_completion_events(
-    watchers: dict[str, subprocess.Popen],
+    watchers: dict[str, subprocess.Popen[bytes]],
     log: Callable[[str], None],
 ) -> list[str]:
     completed: list[str] = []
@@ -475,7 +491,7 @@ def _next_poll_delay(
 def _sleep_until_next_poll(
     cfg: HeadConfig,
     stop: dict[str, bool],
-    completion_watchers: dict[str, subprocess.Popen] | None = None,
+    completion_watchers: dict[str, subprocess.Popen[bytes]] | None = None,
     log: Callable[[str], None] | None = None,
     *,
     queue_active: bool | None = None,
@@ -513,7 +529,7 @@ def run_loop(cfg: HeadConfig) -> int:
 
     stop = {"flag": False}
 
-    def _term(signum, frame):  # noqa: ARG001
+    def _term(signum: int, frame: FrameType | None) -> None:  # noqa: ARG001
         stop["flag"] = True
 
     signal.signal(signal.SIGTERM, _term)
@@ -542,7 +558,7 @@ def run_loop(cfg: HeadConfig) -> int:
     )
     born_with = _code_fingerprint()
     rejected_restart_fingerprint: int | None = None
-    completion_watchers: dict[str, subprocess.Popen] = {}
+    completion_watchers: dict[str, subprocess.Popen[bytes]] = {}
     blocked_log_state: dict[str, str] = {}
     try:
         while not stop["flag"]:
@@ -692,7 +708,7 @@ def _adaptive_handoff_state(
     return "ready", "queue is empty and ready for the next submission"
 
 
-def status(cfg: HeadConfig) -> dict:
+def status(cfg: HeadConfig) -> dict[str, object]:
     pid = alive_pid(cfg)
     damage: list[RegistryDamage] = []
     entries = list_all(cfg, damage=damage)

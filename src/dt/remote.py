@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from typing import Any, TypeAlias, cast
 
 from .config import LaptopConfig
 from .sshio import RemoteError, SSH_BASE, remote_dt, remote_dt_cmd
@@ -17,6 +18,9 @@ from .sshio import RemoteError, SSH_BASE, remote_dt, remote_dt_cmd
 PREFERRED_LOOKUP_GRACE_S = 0.15
 # Four hex characters cover historical ids; current ids use a longer suffix.
 FULL_JOB_ID_RE = re.compile(r"^\d{8}-\d{4}_[A-Za-z0-9_-]+_[0-9a-f]{4,}$")
+JsonDict: TypeAlias = dict[str, Any]
+LookupHit: TypeAlias = tuple[str, str, JsonDict]
+LookupResult: TypeAlias = tuple[str, LookupHit | None, str | None, bool]
 
 
 class FanErrors(dict[str, str]):
@@ -34,7 +38,7 @@ def fan_json(
     *,
     accept_nonzero_json: bool = False,
     unreachable_errors: set[str] | None = None,
-) -> tuple[list, FanErrors]:
+) -> tuple[list[object], FanErrors]:
     """Run `dt <argv> --json` on every head in parallel.
 
     Returns (merged rows, {center: error}) - unreachable heads become errors,
@@ -49,7 +53,7 @@ def fan_json(
         accept_nonzero_json=accept_nonzero_json,
         unreachable_errors=unreachable_errors,
     )
-    rows: list = []
+    rows: list[object] = []
     for center in cfg.centers:
         if center not in data_by_center:
             continue
@@ -71,7 +75,7 @@ def fan_json_by_center(
 ) -> tuple[dict[str, object], FanErrors]:
     """Fan out JSON while retaining each response's owning center."""
 
-    def one(item: tuple[str, str]):
+    def one(item: tuple[str, str]) -> tuple[str, object | None, str | None, bool]:
         center, head = item
         try:
             proc = remote_dt(head, [*argv, "--json"], timeout=timeout)
@@ -120,7 +124,7 @@ def fan_json_by_center(
 
 
 def best_center(
-    rows: list[dict],
+    rows: list[JsonDict],
     gpus: int,
     *,
     require_disk_gib: int = 0,
@@ -159,7 +163,7 @@ def find_center(
     *,
     errors: dict[str, str] | None = None,
     unreachable: set[str] | None = None,
-) -> tuple[str, str, dict] | None:
+) -> LookupHit | None:
     """Locate the registry that owns a job without erasing lookup failures.
 
     ``None`` alone remains backward-compatible. Callers that must distinguish a
@@ -168,7 +172,7 @@ def find_center(
     not-found exit code (4) is a confirmed miss and is not an error.
     """
 
-    def one(item: tuple[str, str]):
+    def one(item: tuple[str, str]) -> LookupResult:
         center, head = item
         try:
             proc = remote_dt(head, ["_find", ref], timeout=20)
@@ -198,7 +202,7 @@ def find_center(
             return center, None, "bad json from head (dt installed there?)", False
         if not isinstance(payload, dict):
             return center, None, "invalid job lookup object from head", False
-        return center, (center, head, payload), None, False
+        return center, (center, head, cast(JsonDict, payload)), None, False
 
     items = list(cfg.centers.items())
     preferred = cfg.default_center
