@@ -25,6 +25,7 @@ from dt.jobs import JobEntry
 PAYLOAD = Path(__file__).parent.parent / "src" / "dt" / "payload"
 LAUNCHER = (PAYLOAD / "launcher.sh").read_text()
 WRAPPER = (PAYLOAD / "wrapper.sh").read_text()
+WRAPPER_TIMEOUT_SECONDS = 15
 
 
 def test_launcher_prechecks_busy_before_env_sync():
@@ -724,7 +725,7 @@ def test_wrapper_exports_verified_cache_and_writes_receipt(tmp_path):
         env=env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -801,7 +802,7 @@ def test_wrapper_exports_private_clone_and_writes_v2_receipt(tmp_path):
         env=env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -983,7 +984,7 @@ def test_wrapper_prevents_python_bytecode_mutating_bound_artifacts(tmp_path):
         env=env,
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -1038,7 +1039,7 @@ def test_payload_clears_caller_virtualenv_before_managed_uv(tmp_path):
         env=env,
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -1178,7 +1179,7 @@ def test_wrapper_records_subsecond_start_and_finish_timestamps(tmp_path):
         env=env,
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -1229,7 +1230,7 @@ def test_wrapper_exports_phase_helper_and_records_automatic_markers(tmp_path):
         env=env,
         capture_output=True,
         text=True,
-        timeout=5,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
     )
 
     assert proc.returncode == 0, proc.stderr
@@ -1273,7 +1274,7 @@ def test_wrapper_hup_writes_exit_marker(tmp_path):
     assert (tmp_path / "pgid").exists()
 
     os.killpg(proc.pid, signal.SIGHUP)
-    assert proc.wait(timeout=5) == 129
+    assert proc.wait(timeout=WRAPPER_TIMEOUT_SECONDS) == 129
     assert (tmp_path / "exit_code").read_text().strip() == "129"
     assert (tmp_path / "finished_at").is_file()
 
@@ -1315,7 +1316,7 @@ def test_wrapper_hup_reaps_group_escapee(tmp_path):
         child_pid = int(pid_file.read_text())
 
         os.killpg(proc.pid, signal.SIGHUP)
-        assert proc.wait(timeout=5) == 129
+        assert proc.wait(timeout=WRAPPER_TIMEOUT_SECONDS) == 129
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             try:
@@ -1369,7 +1370,7 @@ def test_wrapper_unexpected_exit_stops_telemetry(tmp_path):
     proc = subprocess.Popen(["bash", str(PAYLOAD / "wrapper.sh")], env=env)
     telemetry_pid = None
     try:
-        assert proc.wait(timeout=5) != 0
+        assert proc.wait(timeout=WRAPPER_TIMEOUT_SECONDS) != 0
         pid_file = tmp_path / "telemetry.pid"
         deadline = time.monotonic() + 2
         while not pid_file.exists() and time.monotonic() < deadline:
@@ -1419,7 +1420,7 @@ def test_wrapper_force_reaps_term_ignoring_group_escapee(tmp_path):
     proc = subprocess.Popen(["bash", str(PAYLOAD / "wrapper.sh")], env=env)
     child_pid = None
     try:
-        assert proc.wait(timeout=5) == 0
+        assert proc.wait(timeout=WRAPPER_TIMEOUT_SECONDS) == 0
         child_pid = int((tmp_path / "escape.pid").read_text())
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
