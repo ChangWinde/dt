@@ -29,6 +29,11 @@ jobs:
       - name: Install Python
         run: uv python install "${{ matrix.python-version }}"
 
+      - name: Install shell compatibility test dependency
+        run: |
+          sudo apt-get update --quiet
+          sudo apt-get install --yes --no-install-recommends zsh
+
       - name: Sync locked environment
         env:
           UV_PYTHON: ${{ matrix.python-version }}
