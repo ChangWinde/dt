@@ -2158,7 +2158,7 @@ def test_ps_table_defaults_to_one_compact_row_per_job_at_80_columns(monkeypatch)
             "gpus": [0],
             "status": "finished",
             "exit_code": 0,
-            "created_at": 1784841026.0,
+            "created_at": FrozenDatetime(2026, 7, 24, 5, 10).timestamp(),
             "cmd": "python -c 'VERY_LONG_COMMAND_SHOULD_NOT_BE_IN_COMPACT_VIEW'",
         },
         {
@@ -2169,7 +2169,7 @@ def test_ps_table_defaults_to_one_compact_row_per_job_at_80_columns(monkeypatch)
             "gpus": [],
             "status": "running",
             "exit_code": None,
-            "created_at": 1784843182.0,
+            "created_at": FrozenDatetime(2026, 7, 24, 5, 46).timestamp(),
             "cmd": "sleep 30",
         },
     ]
