@@ -4,6 +4,27 @@ All notable user-visible changes are recorded here. DistTrainer follows
 semantic versioning for the Python distribution and preserves the documented
 CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
+## Unreleased
+
+### Changed
+
+- Repository documentation now has a concise product README, task-oriented
+  operator guides, an explicit architecture and directory map, generated
+  evidence indexes, and deterministic relative-link validation.
+- Contribution guidance now defines branch names, atomic commit structure,
+  compatibility surfaces, required checks, and documentation ownership.
+- The sanitized Python package description is now named
+  `PACKAGE_README.md`, which makes its release-only role explicit.
+
+### Fixed
+
+- Hosted CI now binds each test job to its matrix interpreter, normalizes
+  timezone and styled terminal output, installs the intentional zsh
+  compatibility dependency, and allows realistic wrapper cleanup latency on
+  loaded runners.
+- Failed hosted tests now emit bounded, actionable annotations instead of only
+  an opaque process exit code.
+
 ## 0.6.2 — 2026-07-28
 
 ### Fixed

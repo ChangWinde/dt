@@ -2,7 +2,8 @@
 
 ## Outcome
 
-All eight criteria in `GOAL.md` have current source, automated-test, and live
+All eight criteria in `docs/project/development-history.md` have current source,
+automated-test, and live
 center evidence. This closes the bounded DT product audit and the tested
 action-modifying sidecar families. It does **not** claim that OmniStack's
 separate universal-policy quality target above 90% has been met.
