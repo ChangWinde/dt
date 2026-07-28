@@ -19,7 +19,7 @@ public Python index.
 
 ## Prepare
 
-1. Reconcile `CHANGELOG.md`, `README.release.md`, `SECURITY.md`, `SUPPORT.md`,
+1. Reconcile `CHANGELOG.md`, `PACKAGE_README.md`, `SECURITY.md`, `SUPPORT.md`,
    version metadata, and the intended source diff.
 2. Confirm the Git worktree is clean and the current commit is the reviewed
    release source.
