@@ -35,7 +35,9 @@ jobs:
         run: uv sync --locked --all-groups
 
       - name: Test
-        run: uv run --no-sync pytest -q -p no:cacheprovider
+        env:
+          TZ: UTC
+        run: env -u FORCE_COLOR uv run --no-sync pytest -q -p no:cacheprovider
 
       - name: Static checks
         if: matrix.python-version == '3.11'
@@ -56,4 +58,5 @@ jobs:
         env:
           DT_RELEASE_PYTHON: "3.11"
           DT_RELEASE_SKIP_SYNC: "1"
-        run: scripts/release-check.sh dist
+          TZ: UTC
+        run: env -u FORCE_COLOR scripts/release-check.sh dist
