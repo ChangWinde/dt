@@ -3,12 +3,24 @@
 DistTrainer loads `~/.config/dt/config.yaml` by default. Set `DT_CONFIG` to an
 alternate path for isolated testing or multiple operator profiles.
 
+Create a minimal validated file instead of starting from a blank document:
+
+```bash
+dt init --role head --center research
+dt init --role laptop --center research --head gpu-head
+```
+
+`dt init --dry-run` prints YAML without writing. Normal writes are atomic,
+private (`0600`), and refuse replacement unless `--force` is explicit.
+
 The file has one of two exclusive roles:
 
 - a head declares `center`, `nodes`, and `projects`;
 - a laptop declares `centers` and forwards commands to one or more heads.
 
-A file containing both roles is rejected.
+A file containing both roles is rejected. Unknown keys and wrong nested types
+are rejected as likely spelling or structure mistakes rather than silently
+ignored.
 
 ## Head configuration
 
@@ -108,8 +120,10 @@ pulled reports from polluting code snapshots.
 | `reserve_free_per_node` | 0 | GPUs to leave unused on each node |
 | `auto_clean_days` | disabled | Age threshold for daily job and unused-environment cleanup |
 
-Both polling values must be positive. Automatic cleanup should be enabled only
-after managed results and retention expectations are documented.
+Polling values and `auto_clean_days` must be finite and positive. Cleanup age
+is measured from a terminal job's `finished_at`; legacy or damaged records
+without a completion timestamp are retained. Automatic cleanup should be
+enabled only after managed results and retention expectations are documented.
 
 ### Resource and transport policy
 

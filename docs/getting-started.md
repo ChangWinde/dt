@@ -45,7 +45,29 @@ not on `PATH`.
 
 ## Configure the head
 
-Create `~/.config/dt/config.yaml`:
+Create a validated configuration:
+
+```bash
+dt init --role head --center research \
+  --node gpu-head --local-node gpu-head \
+  --node gpu-node-1 \
+  --project policy=~/projects/policy
+```
+
+This writes `~/.config/dt/config.yaml` with private file permissions and refuses
+to replace an existing file unless `--force` is explicit. Use `--dry-run` to
+inspect the exact YAML first.
+
+For a one-machine setup using the current project, use:
+
+```bash
+dt init --role head --center research
+```
+
+That short form records the current hostname as a local node and the current
+directory as the default project.
+
+The explicit example above generates:
 
 ```yaml
 center: research
@@ -66,6 +88,12 @@ queue:
 
 `gpu-node-1` must be a working SSH alias. A node marked `local: true` executes
 through the local host rather than SSH.
+
+For a laptop that forwards to this head:
+
+```bash
+dt init --role laptop --center research --head gpu-head
+```
 
 Validate the configuration:
 

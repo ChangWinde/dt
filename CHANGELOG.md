@@ -6,6 +6,12 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `dt init` now creates minimal, validated head or laptop configurations,
+  supports a no-write preview, writes atomically with private permissions, and
+  refuses accidental replacement.
+
 ### Changed
 
 - Repository documentation now has a concise product README, task-oriented
@@ -15,6 +21,11 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   compatibility surfaces, required checks, and documentation ownership.
 - The sanitized Python package description is now named
   `PACKAGE_README.md`, which makes its release-only role explicit.
+- Configuration parsing now rejects unknown keys, malformed nested values,
+  duplicate nodes, multiple local-node aliases, non-finite retention values,
+  and invalid YAML with actionable configuration errors.
+- Cleanup and snapshot-store persistence now have isolated, strict-typed domain
+  modules. The release type gate covers nine modules instead of five.
 
 ### Fixed
 
@@ -24,6 +35,12 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   loaded runners.
 - Failed hosted tests now emit bounded, actionable annotations instead of only
   an opaque process exit code.
+- Cleanup retention now uses terminal completion time. Exact managed job paths
+  are validated before deletion, remote or related-result failures retain the
+  registry record for retry, and laptop cleanup affects only the selected
+  center unless `--all-centers` is explicit.
+- Environment cleanup safely quotes operator-configured paths and reports
+  nonzero remote cleanup commands instead of counting them as successful.
 
 ## 0.6.2 — 2026-07-28
 

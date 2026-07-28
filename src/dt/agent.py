@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import shutil
 import signal
@@ -375,14 +376,25 @@ def _maybe_autoclean(cfg: HeadConfig, log) -> None:
     """Config-gated daily cleanup (queue.auto_clean_days): ended jobs and
     stale shared venvs older than N days."""
     days = cfg.queue.auto_clean_days
-    if not days:
+    if days is None:
+        return
+    if not math.isfinite(days) or days <= 0:
+        log(f"auto-clean disabled: invalid retention {days!r} days")
         return
     stamp = cfg.root / "last_autoclean"
     if stamp.exists() and time.time() - stamp.stat().st_mtime < AUTOCLEAN_EVERY_S:
         return
     stamp.touch()  # stamp first: a failing clean must not retry every tick
-    n = clean_jobs(cfg, time.time() - days * 86400, envs=True, log=log)
-    log(f"auto-clean: removed {n} ended jobs older than {days:g} days")
+    report = clean_jobs(cfg, time.time() - days * 86400, envs=True, log=log)
+    log(
+        f"auto-clean: removed {report.removed}/{report.eligible} ended jobs "
+        f"older than {days:g} days"
+    )
+    if report.failures:
+        log(
+            f"auto-clean: retained {len(report.failures)} job records after "
+            "cleanup failures"
+        )
 
 
 def _consume_agent_wake(cfg: HeadConfig) -> bool:

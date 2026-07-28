@@ -113,17 +113,23 @@ stdout/stderr separation, JSON schemas, and stable exit codes.
 
 | Area | Modules |
 |---|---|
-| Configuration and state | `config.py`, `jobs.py`, `submission.py` |
+| Configuration and state | `config.py`, `onboarding.py`, `jobs.py`, `submission.py` |
 | Placement and queueing | `dispatch.py`, `agent.py`, `probe.py`, `completion.py` |
 | Remote boundaries | `remote.py`, `forwarding.py`, `sshio.py`, `lifecycle.py` |
 | Observation | `monitoring.py`, `doctor.py`, `render.py` |
-| Data recovery | `transfers.py`, `storage.py`, `compact.py` |
-| Identity | `snapshot_hash.py`, `payload_hash.py` |
+| Data recovery and retention | `transfers.py`, `storage.py`, `compact.py`, `maintenance.py` |
+| Identity | `snapshot_hash.py`, `snapshot_store.py`, `payload_hash.py` |
 | Node runtime | `payload/` |
 
 Domain modules expose typed or pure boundaries where practical. Subprocess,
 SSH, filesystem, registry, and terminal rendering remain explicit seams so
 failure paths can be tested independently.
+
+Destructive retention policy lives outside the dispatcher. It accepts explicit
+remote and local seams, validates each job directory against its exact registry
+identity, and removes the registry record only after node and related local
+cleanup succeed. Snapshot-store locking and persistence are likewise isolated
+from submission orchestration.
 
 ## Repository layout
 

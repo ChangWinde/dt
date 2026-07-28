@@ -1,6 +1,6 @@
 import pytest
 
-from dt.config import ConfigError, HeadConfig, LaptopConfig, parse
+from dt.config import ConfigError, HeadConfig, LaptopConfig, load, parse
 
 
 def test_head_config():
@@ -96,3 +96,94 @@ def test_both_roles_rejected():
 def test_empty_rejected():
     with pytest.raises(ConfigError):
         parse({})
+
+
+@pytest.mark.parametrize(
+    "days",
+    [0, -1, float("inf"), float("-inf"), float("nan")],
+)
+def test_auto_clean_days_must_be_a_finite_positive_number(days):
+    with pytest.raises(ConfigError, match="auto_clean_days"):
+        parse(
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "queue": {"auto_clean_days": days},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"center": "c", "nodes": [{"local": True}]},
+        {"centers": ["head"]},
+        {"center": "c", "nodes": ["n1"], "projects": ["project"]},
+    ],
+)
+def test_malformed_config_shapes_raise_config_error(payload):
+    with pytest.raises(ConfigError):
+        parse(payload)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        {"paths": []},
+        {"paths": {"root": {}}},
+        {"paths": {"envs": ""}},
+        {"paths": {"results": []}},
+        {"projects": []},
+        {"projects": {"p": {"path": ".", "setup": 7}}},
+        {"projects": {"p": {"path": ".", "extras": "gpu"}}},
+        {"queue": []},
+        {"webhook": []},
+        {"proxy": {}},
+        {"snapshot_excludes": [""]},
+    ],
+)
+def test_head_config_rejects_wrong_nested_types(field):
+    with pytest.raises(ConfigError):
+        parse({"center": "c", "nodes": ["n1"], **field})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"center": "c", "nodes": ["n1"], "poll_seconds": 1},
+        {"center": "c", "nodes": [{"name": "n1", "locla": True}]},
+        {"center": "c", "nodes": ["n1"], "paths": {"job_root": "/tmp"}},
+        {"center": "c", "nodes": ["n1"], "queue": {"poll_seconds": 1}},
+        {
+            "center": "c",
+            "nodes": ["n1"],
+            "projects": {"p": {"path": ".", "extra": ["gpu"]}},
+        },
+        {"centers": {"c": {"head": "h", "host": "other"}}},
+    ],
+)
+def test_unknown_config_keys_are_rejected_as_likely_typos(payload):
+    with pytest.raises(ConfigError, match="unknown"):
+        parse(payload)
+
+
+def test_only_one_node_can_be_marked_local():
+    with pytest.raises(ConfigError, match="one node"):
+        parse(
+            {
+                "center": "c",
+                "nodes": [
+                    {"name": "n1", "local": True},
+                    {"name": "n2", "local": True},
+                ],
+            }
+        )
+
+
+def test_load_wraps_invalid_yaml_as_config_error(tmp_path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    path.write_text("center: [unterminated\n")
+    monkeypatch.setenv("DT_CONFIG", str(path))
+
+    with pytest.raises(ConfigError, match="cannot parse"):
+        load()

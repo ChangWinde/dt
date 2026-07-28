@@ -3555,6 +3555,92 @@ def test_run_auto_partial_outage_without_capacity_is_unknown(
     }
 
 
+def test_laptop_clean_defaults_to_only_the_configured_center(monkeypatch):
+    from typer.testing import CliRunner
+
+    from dt import cli
+    from dt.config import LaptopConfig
+
+    cfg = LaptopConfig(
+        centers={"east": "east-head", "west": "west-head"},
+        default_center="east",
+    )
+    forwarded = []
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "forward_call",
+        lambda head, argv, tty: forwarded.append((head, argv, tty)) or 0,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["clean", "--before", "2026-01-01", "-y"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [head for head, _argv, _tty in forwarded] == ["east-head"]
+    assert "cleaning east" in result.output
+
+
+def test_laptop_clean_requires_explicit_all_centers_escalation(monkeypatch):
+    from typer.testing import CliRunner
+
+    from dt import cli
+    from dt.config import LaptopConfig
+
+    cfg = LaptopConfig(
+        centers={"east": "east-head", "west": "west-head"},
+        default_center="east",
+    )
+    forwarded = []
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "forward_call",
+        lambda head, argv, tty: forwarded.append((head, argv, tty)) or 0,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["clean", "--before", "2026-01-01", "--all-centers", "-y"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [head for head, _argv, _tty in forwarded] == [
+        "east-head",
+        "west-head",
+    ]
+    assert all("-y" in argv for _head, argv, _tty in forwarded)
+
+
+def test_laptop_clean_can_target_one_nondefault_center(monkeypatch):
+    from typer.testing import CliRunner
+
+    from dt import cli
+    from dt.config import LaptopConfig
+
+    cfg = LaptopConfig(
+        centers={"east": "east-head", "west": "west-head"},
+        default_center="east",
+    )
+    forwarded = []
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "forward_call",
+        lambda head, argv, tty: forwarded.append((head, argv, tty)) or 0,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["clean", "--before", "2026-01-01", "-c", "west", "-y"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [head for head, _argv, _tty in forwarded] == ["west-head"]
+
+
 # -- info helpers -----------------------------------------------------------------
 
 

@@ -17,6 +17,7 @@ import re
 import signal
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -32,7 +33,7 @@ import typer
 from . import __version__
 from . import jobs as jobs_mod
 from .completion import CompletionSignals
-from .config import ConfigError, HeadConfig, LaptopConfig, load
+from .config import ConfigError, HeadConfig, LaptopConfig, config_path, load
 from .dispatch import (
     DispatchError,
     FailedBeforeStart,
@@ -48,6 +49,7 @@ from .monitoring import ResourceTelemetryQuery
 from .monitoring import parse_resource_jsonl as _parse_resource_jsonl  # noqa: F401
 from .monitoring import safe_phase_name as _safe_phase_name
 from .monitoring import summarize_resources as _summarize_resources  # noqa: F401
+from .onboarding import InitError, build_config, render_config, write_config
 from .probe import NodeStatus, probe_center, probe_node, status_as_dict
 from .remote import (
     fan_json,
@@ -156,6 +158,93 @@ def _root(
     ),
 ) -> None:
     """DistTrainer: dispatch experiments onto whatever shared GPU is free."""
+
+
+def init_config(
+    role: str = typer.Option(..., "--role", help="this machine's role: head or laptop"),
+    center: str = typer.Option(
+        ..., "--center", help="stable name for this research center"
+    ),
+    head: Optional[str] = typer.Option(
+        None, "--head", help="(laptop) SSH alias of the center's head"
+    ),
+    node: Optional[list[str]] = typer.Option(
+        None,
+        "--node",
+        help="(head) compute-node SSH alias; repeat for multiple nodes",
+    ),
+    local_node: Optional[str] = typer.Option(
+        None,
+        "--local-node",
+        help="(head) one configured node that runs locally instead of SSH",
+    ),
+    project: Optional[list[str]] = typer.Option(
+        None,
+        "--project",
+        help="(head) NAME=PATH; repeat for multiple projects (default: cwd)",
+    ),
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        help="destination (default: DT_CONFIG or ~/.config/dt/config.yaml)",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="replace an existing config atomically"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="print validated YAML without writing"
+    ),
+    json_: bool = typer.Option(False, "--json", help="emit a machine-readable result"),
+) -> None:
+    """Create a minimal validated configuration.
+
+    Head quick start: dt init --role head --center research
+
+    Laptop quick start: dt init --role laptop --center research --head gpu-head
+    """
+    if dry_run and json_:
+        err.print("[red]use either --dry-run or --json, not both[/red]")
+        raise typer.Exit(1)
+    target = (config or config_path()).expanduser()
+    try:
+        payload = build_config(
+            role=role,
+            center=center,
+            head=head,
+            nodes=list(node or []),
+            local_node=local_node,
+            projects=list(project or []),
+            cwd=Path.cwd(),
+            hostname=socket.gethostname(),
+        )
+        if dry_run:
+            print(render_config(payload), end="")
+            return
+        write_config(target, payload, force=force)
+    except InitError as exc:
+        err.print(f"[red]init error:[/red] {exc}")
+        raise typer.Exit(1)
+
+    normalized_role = role.strip().lower()
+    next_steps = (
+        ["dt doctor", "dt agent install", "dt free"]
+        if normalized_role == "head"
+        else ["dt doctor", "dt free"]
+    )
+    if json_:
+        print(
+            json.dumps(
+                {
+                    "config": str(target),
+                    "next": next_steps,
+                    "role": normalized_role,
+                    "written": True,
+                }
+            )
+        )
+        return
+    err.print(f"[green]created {target}[/green] · role {normalized_role}")
+    err.print("[dim]next: " + "  →  ".join(next_steps) + "[/dim]")
 
 
 def _need_head(cfg) -> HeadConfig:
@@ -11013,6 +11102,14 @@ def clean(
     before: str = typer.Option(
         ..., "--before", help="YYYY-MM-DD; delete finished jobs older than this"
     ),
+    center: Optional[str] = typer.Option(
+        None, "-c", "--center", help="(laptop) clean one center"
+    ),
+    all_centers: bool = typer.Option(
+        False,
+        "--all-centers",
+        help="(laptop) explicitly clean every configured center",
+    ),
     project: Optional[list[str]] = typer.Option(
         None,
         "-p",
@@ -11037,6 +11134,9 @@ def clean(
     """Delete old job snapshots + logs on nodes and their registry entries."""
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
+        if center is not None and all_centers:
+            err.print("[red]use either --center or --all-centers, not both[/red]")
+            raise typer.Exit(1)
         rc = 0
         argv_tail = (
             [
@@ -11049,14 +11149,33 @@ def clean(
             + (["--plan"] if plan else [])
             + (["-y"] if yes else [])
         )
-        for center, head in cfg.centers.items():
-            err.print(f"[dim]cleaning {center}[/dim]")
+        targets = (
+            list(cfg.centers.items())
+            if all_centers
+            else [
+                (
+                    selected := _laptop_center(cfg, center),
+                    cfg.centers[selected],
+                )
+            ]
+        )
+        for target_center, head in targets:
+            err.print(f"[dim]cleaning {target_center}[/dim]")
             rc |= forward_call(
                 head, ["clean", "--before", before, *argv_tail], tty=not yes
             )
         raise typer.Exit(rc)
 
-    cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
+    if center is not None or all_centers:
+        err.print("[red]--center and --all-centers are laptop-only options[/red]")
+        raise typer.Exit(1)
+    try:
+        cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
+    except ValueError:
+        err.print(
+            f"[red]invalid --before {before!r}; expected a real YYYY-MM-DD date[/red]"
+        )
+        raise typer.Exit(1)
     from .dispatch import clean_job_victims, clean_jobs
 
     projects = set(project) if project else None
@@ -11104,22 +11223,36 @@ def clean(
             what += " + stale shared venvs"
         typer.confirm(f"{what}?", abort=True)
     removed_results = 0
+    managed_results_by_job: dict[str, list[Path]] = {}
     for job_id, path in managed_results:
-        try:
+        managed_results_by_job.setdefault(job_id, []).append(path)
+
+    def remove_managed_results(entry: jobs_mod.JobEntry) -> None:
+        nonlocal removed_results
+        for path in managed_results_by_job.get(entry.job_id, []):
             shutil.rmtree(path)
-        except OSError as exc:
-            err.print(f"[yellow]{job_id}: result cleanup skipped ({exc})[/yellow]")
-        else:
             removed_results += 1
-    n = clean_jobs(
+
+    report = clean_jobs(
         cfg,
         cutoff,
         envs=envs,
         log=lambda m: err.print(f"[dim]{m}[/dim]"),
         projects=projects,
+        before_registry_remove=remove_managed_results if results else None,
     )
     suffix = f" + {removed_results} managed results" if results else ""
-    err.print(f"cleaned {n} jobs{suffix}")
+    err.print(f"cleaned {report.removed}/{report.eligible} jobs{suffix}")
+    if report.failures:
+        err.print(
+            f"[red]{len(report.failures)} job(s) retained after cleanup "
+            "failures; rerun after fixing the reported cause[/red]"
+        )
+        for failure in report.failures:
+            err.print(
+                f"[red]{failure.job_id} · {failure.kind} · {failure.message}[/red]"
+            )
+        raise typer.Exit(1)
 
 
 def _local_tree_disk_bytes(path: Path) -> int:
@@ -12359,6 +12492,7 @@ def _find(ref: str) -> None:
 # registration (incl. single-letter aliases)
 # --------------------------------------------------------------------------
 
+app.command("init", rich_help_panel="Setup")(init_config)
 app.command("free", rich_help_panel="Everyday")(free)
 app.command("f", hidden=True)(free)
 app.command("task", hidden=True)(task)

@@ -36,7 +36,16 @@ uv run dt --help
 
 ## Configure
 
-Create `~/.config/dt/config.yaml` on a head:
+Create a validated `~/.config/dt/config.yaml` on a head:
+
+```bash
+dt init --role head --center research \
+  --node gpu-head --local-node gpu-head \
+  --node gpu-node-1 \
+  --project policy=~/projects/policy
+```
+
+The generated file is equivalent to:
 
 ```yaml
 center: research
@@ -56,7 +65,13 @@ queue:
   active_poll_s: 2
 ```
 
-A laptop that forwards to one or more heads uses:
+A laptop that forwards to one or more heads can initialize with:
+
+```bash
+dt init --role laptop --center research --head gpu-head
+```
+
+The generated laptop file is:
 
 ```yaml
 default_center: research
@@ -126,8 +141,10 @@ dt clean --before 2026-07-01 --plan
 ```
 
 Preview destructive maintenance first. Non-interactive mutation requires
-explicit confirmation, and compaction fails closed unless its recovery
-snapshot and job identity are verified.
+explicit confirmation. Cleanup uses terminal completion time and retains
+registry state when a managed path or deletion fails, so the operation is
+visible and retryable. Compaction fails closed unless its recovery snapshot and
+job identity are verified.
 
 See `SUPPORT.md` for the supported platform contract and `CHANGELOG.md` for
 release changes.
