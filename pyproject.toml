@@ -56,3 +56,8 @@ only-include = [
 
 [tool.ruff]
 extend-exclude = [".logs", "results"]
+
+[tool.ruff.lint]
+# Keep the lint contract stable across Ruff releases. New rule families are
+# adopted deliberately instead of changing implicitly on dependency updates.
+select = ["E4", "E7", "E9", "F"]

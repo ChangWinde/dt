@@ -1026,8 +1026,10 @@ def test_pull_multiple_json_recovers_jobs_concurrently_into_isolated_dirs(
     monkeypatch.setattr(
         cli.jobs_mod,
         "find",
-        lambda cfg_, ref: entries.get(ref)
-        or next((entry for entry in entries.values() if entry.job_id == ref), None),
+        lambda cfg_, ref: (
+            entries.get(ref)
+            or next((entry for entry in entries.values() if entry.job_id == ref), None)
+        ),
     )
     monkeypatch.setattr(
         cli,
@@ -1137,8 +1139,10 @@ def test_pull_multiple_isolates_failures_and_uses_first_nonzero_in_ref_order(
     monkeypatch.setattr(
         cli.jobs_mod,
         "find",
-        lambda cfg_, ref: entries.get(ref)
-        or next((entry for entry in entries.values() if entry.job_id == ref), None),
+        lambda cfg_, ref: (
+            entries.get(ref)
+            or next((entry for entry in entries.values() if entry.job_id == ref), None)
+        ),
     )
     monkeypatch.setattr(
         cli,
@@ -1204,8 +1208,10 @@ def test_pull_multiple_isolates_missing_refs_and_recovers_valid_jobs(
     monkeypatch.setattr(
         cli.jobs_mod,
         "find",
-        lambda cfg_, ref: entries.get(ref)
-        or next((entry for entry in entries.values() if entry.job_id == ref), None),
+        lambda cfg_, ref: (
+            entries.get(ref)
+            or next((entry for entry in entries.values() if entry.job_id == ref), None)
+        ),
     )
     monkeypatch.setattr(
         cli,
@@ -1279,8 +1285,10 @@ def test_pull_multiple_ctrl_c_cancels_workers_and_prints_exact_resume(
     monkeypatch.setattr(
         cli.jobs_mod,
         "find",
-        lambda cfg_, ref: entries.get(ref)
-        or next((entry for entry in entries.values() if entry.job_id == ref), None),
+        lambda cfg_, ref: (
+            entries.get(ref)
+            or next((entry for entry in entries.values() if entry.job_id == ref), None)
+        ),
     )
 
     def pull_one(
@@ -1463,8 +1471,9 @@ def test_laptop_pull_multiple_forwards_once_when_refs_share_center(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_forward_retryable_with_reconnect",
-        lambda head, argv, ref, **kwargs: forwarded.append((head, argv, ref, kwargs))
-        or 5,
+        lambda head, argv, ref, **kwargs: (
+            forwarded.append((head, argv, ref, kwargs)) or 5
+        ),
     )
 
     result = CliRunner().invoke(
