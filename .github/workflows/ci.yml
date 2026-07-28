@@ -37,7 +37,24 @@ jobs:
       - name: Test
         env:
           TZ: UTC
-        run: env -u FORCE_COLOR uv run --no-sync pytest -q -p no:cacheprovider
+        run: |
+          set +e
+          env -u FORCE_COLOR uv run --no-sync pytest -q -p no:cacheprovider \
+            2>&1 | tee "$RUNNER_TEMP/dt-pytest.log"
+          test_status=${PIPESTATUS[0]}
+          set -e
+          if (( test_status != 0 )); then
+            failure_tail="$(
+              tail -n 160 "$RUNNER_TEMP/dt-pytest.log" |
+                awk '{
+                  gsub(/%/, "%25")
+                  gsub(/\r/, "%0D")
+                  printf "%s%s", (NR > 1 ? "%0A" : ""), $0
+                } END { print "" }'
+            )"
+            echo "::error title=pytest failure::$failure_tail"
+          fi
+          exit "$test_status"
 
       - name: Static checks
         if: matrix.python-version == '3.11'
