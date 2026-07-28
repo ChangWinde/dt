@@ -39,13 +39,14 @@ jobs:
           TZ: UTC
         run: |
           set +e
-          env -u FORCE_COLOR uv run --no-sync pytest -q -p no:cacheprovider \
+          env -u FORCE_COLOR uv run --no-sync pytest -q --tb=short \
+            -p no:cacheprovider \
             2>&1 | tee "$RUNNER_TEMP/dt-pytest.log"
           test_status=${PIPESTATUS[0]}
           set -e
           if (( test_status != 0 )); then
             failure_tail="$(
-              tail -n 160 "$RUNNER_TEMP/dt-pytest.log" |
+              tail -c 2800 "$RUNNER_TEMP/dt-pytest.log" |
                 awk '{
                   gsub(/%/, "%25")
                   gsub(/\r/, "%0D")
