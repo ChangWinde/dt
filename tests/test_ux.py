@@ -2152,6 +2152,7 @@ def test_ps_table_defaults_to_one_compact_row_per_job_at_80_columns(monkeypatch)
         {
             "name": "dt-dp-microbatch64-stability10k",
             "job_id": "20260724-0510_dt-dp-microbatch64-stability10k_baea",
+            "display_ref": "lity_baea",
             "center": "psibot",
             "node": "psibot-ds",
             "gpus": [0],
@@ -2182,7 +2183,7 @@ def test_ps_table_defaults_to_one_compact_row_per_job_at_80_columns(monkeypatch)
     assert "GPU" in rendered
     assert "state" in rendered
     assert "ref" in rendered
-    assert "baea" in rendered
+    assert "lity_baea" in rendered
     assert "f787" in rendered
     assert "when" in rendered
     assert "05:10" in rendered
@@ -2214,6 +2215,34 @@ def test_ps_table_wide_retains_full_identity_and_command():
 
     assert row["job_id"] in rendered
     assert row["cmd"] in rendered
+
+
+def test_ps_table_keeps_center_scoped_ref_usable_at_80_columns():
+    from rich.console import Console
+
+    from dt.render import ps_table
+
+    row = {
+        "name": "long-experiment-name-that-may-ellipsize",
+        "job_id": "20260728-1200_long-experiment_abcd",
+        "display_ref": "research-west:abcd",
+        "center": "research-west",
+        "node": "gpu-node-12",
+        "gpus": [3],
+        "status": "failed",
+        "exit_code": None,
+        "created_at": 100.0,
+        "cmd": "python train.py",
+        "reason": "failed-before-start",
+    }
+    console = Console(width=80, record=True, color_system=None)
+    console.print(ps_table([row], show_issue=True))
+    rendered = console.export_text()
+
+    assert "research-west:abcd" in rendered
+    assert "gpu-node-12" in rendered
+    assert "failed" in rendered
+    assert max(map(len, rendered.splitlines())) <= 80
 
 
 def test_ps_compact_prioritizes_node_gpu_and_issue_at_80_columns():

@@ -14,9 +14,8 @@ import fcntl
 import hashlib
 import json
 import os
-import random
 import re
-import string
+import secrets
 import tempfile
 import time
 from contextlib import contextmanager
@@ -53,7 +52,10 @@ def sanitize_name(name: str) -> str:
 
 def new_job_id(name: str) -> str:
     stamp = datetime.now().strftime("%Y%m%d-%H%M")
-    suffix = "".join(random.choices(string.hexdigits.lower(), k=4))
+    # Keep the readable minute/name prefix, but give concurrent submissions
+    # enough entropy that one registry filename cannot realistically collide
+    # with and overwrite another.
+    suffix = secrets.token_hex(8)
     return f"{stamp}_{sanitize_name(name)}_{suffix}"
 
 
@@ -122,6 +124,49 @@ class JobEntry:
 
 
 _JOB_ENTRY_FIELDS = frozenset(item.name for item in fields(JobEntry))
+
+
+def compact_refs(records: list[tuple[str, str]], minimum: int = 4) -> dict[str, str]:
+    """Return the shortest resolver-safe suffix for every job id.
+
+    Four characters remain the normal display size.  Older registries can
+    contain suffix collisions, so only the colliding references expand.
+    """
+    if minimum < 1:
+        raise ValueError("minimum compact ref length must be positive")
+    job_ids = [job_id for job_id, _name in records]
+    names = {name for _job_id, name in records}
+    unresolved = set(job_ids)
+    refs: dict[str, str] = {}
+    max_length = max((len(job_id) for job_id in job_ids), default=0)
+    for width in range(minimum, max_length + 1):
+        for job_id in tuple(unresolved):
+            candidate = job_id[-width:]
+            if candidate in names:
+                continue
+            matches = sum(
+                other.startswith(candidate) or other.endswith(candidate)
+                for other in job_ids
+            )
+            if matches == 1:
+                refs[job_id] = candidate
+                unresolved.remove(job_id)
+        if not unresolved:
+            break
+    for job_id in unresolved:
+        # Exact ids are resolved before names and partial matches.
+        refs[job_id] = job_id
+    return refs
+
+
+def compact_job_refs(
+    entries: list[JobEntry],
+    minimum: int = 4,
+) -> dict[str, str]:
+    return compact_refs(
+        [(entry.job_id, entry.name) for entry in entries],
+        minimum=minimum,
+    )
 
 
 def _decode_entry(raw: object) -> JobEntry:
@@ -256,23 +301,40 @@ def queue_contexts(entries: list[JobEntry]) -> dict[str, dict[str, object]]:
     }
 
 
-def find(cfg: HeadConfig, ref: str) -> JobEntry | None:
-    """Resolve a job reference: exact id, else unique name/id-prefix match
-    (most recent first)."""
+def resolve_ref(
+    cfg: HeadConfig,
+    ref: str,
+) -> tuple[JobEntry | None, list[JobEntry]]:
+    """Return one resolved job or the ambiguous partial-id candidates."""
     ref = ref.strip()
     if not ref:
-        return None  # startswith("") matches everything: never guess here
+        return None, []
+    scoped_prefix = f"{cfg.center}:"
+    if ref.startswith(scoped_prefix):
+        ref = ref[len(scoped_prefix) :]
+        if not ref:
+            return None, []
+    elif ":" in ref:
+        return None, []
     exact = load(cfg, ref)
     if exact:
-        return exact
-    matches = [
-        e
-        for e in list_all(cfg)
-        if e.name == ref or e.job_id.startswith(ref) or ref in e.job_id
-    ]
-    if not matches:
-        return None
-    return sorted(matches, key=lambda e: e.created_at)[-1]
+        return exact, []
+    entries = list_all(cfg)
+    exact_names = [entry for entry in entries if entry.name == ref]
+    if exact_names:
+        # Reusing a meaningful experiment name intentionally addresses its
+        # newest run; compact refs never overlap an exact name.
+        return max(exact_names, key=lambda entry: entry.created_at), []
+    matches = [e for e in entries if e.job_id.startswith(ref) or e.job_id.endswith(ref)]
+    if len(matches) != 1:
+        return None, sorted(matches, key=lambda entry: entry.created_at, reverse=True)
+    return matches[0], []
+
+
+def find(cfg: HeadConfig, ref: str) -> JobEntry | None:
+    """Resolve an exact id/name or one unique id prefix/compact suffix."""
+    entry, _ambiguous = resolve_ref(cfg, ref)
+    return entry
 
 
 def refresh_status(

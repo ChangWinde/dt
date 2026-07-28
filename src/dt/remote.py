@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
@@ -14,6 +15,8 @@ from .config import LaptopConfig
 from .sshio import RemoteError, SSH_BASE, remote_dt, remote_dt_cmd
 
 PREFERRED_LOOKUP_GRACE_S = 0.15
+# Four hex characters cover historical ids; current ids use a longer suffix.
+FULL_JOB_ID_RE = re.compile(r"^\d{8}-\d{4}_[A-Za-z0-9_-]+_[0-9a-f]{4,}$")
 
 
 class FanErrors(dict[str, str]):
@@ -224,13 +227,26 @@ def find_center(
                 ]
                 results = [future.result() for future in futures]
             else:
-                if preferred_result[1] is not None:
+                if (
+                    preferred_result[1] is not None
+                    and FULL_JOB_ID_RE.fullmatch(ref) is None
+                ):
                     # The common case: avoid unrelated SSH handshakes entirely.
                     return preferred_result[1]
                 results = [preferred_result, *pool.map(one, remaining)]
-    for _center, hit, _message, _is_unreachable in results:
-        if hit is not None:
-            return hit
+    hits = [
+        hit for _center, hit, _message, _is_unreachable in results if hit is not None
+    ]
+    if len(hits) > 1:
+        if errors is not None:
+            centers = ", ".join(hit[0] for hit in hits)
+            for center, _head, _payload in hits:
+                errors[center] = (
+                    f"job reference {ref!r} is present in multiple centers: {centers}"
+                )
+        return None
+    if hits:
+        return hits[0]
     for center, _hit, message, is_unreachable in results:
         if message is None:
             continue

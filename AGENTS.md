@@ -229,11 +229,13 @@ change what a queued job will run.
   empty-array success; partial center results remain usable with exit 0, while
   watch mode stays alive through outages. `dt agent status --json` gives queue
   depth.
-- Human laptop `dt ps`/`--watch` requests `dt_ps_window_v1` from each head:
-  every active row plus enough recent rows for the exact global ten-record
-  table, together with the pre-window total. Public `--json` and `-a` remain
-  full-history. Heads without `--window` support automatically fall back to the
-  legacy full-array response.
+- Human laptop `dt ps`/`--watch` requests query-bound `dt_ps_window_v2` from
+  each head: every active row plus enough recent rows for the exact global
+  ten-record table, together with the pre-window total. Public `--json` and
+  `-a` remain full-history. A `v1` response or a head without `--window`
+  support automatically falls back to the legacy full-array response and local
+  filtering. Rows from those old heads use full job ids until the head is
+  upgraded because old resolvers cannot safely consume `CENTER:REF`.
 - Before each queue pass, the resident agent refreshes running jobs in parallel.
   Finished/lost jobs therefore release `max_my_jobs` capacity without requiring
   a manual `ps/info/wait`. An unreachable node preserves the last known state

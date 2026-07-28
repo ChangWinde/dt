@@ -346,10 +346,38 @@ def ps_table(
     empty_text: str = "no matching jobs",
 ) -> Table:
     """Render jobs densely by default; full identity/command only on request."""
+
+    def row_ref(row: dict) -> str:
+        explicit = row.get("display_ref")
+        if isinstance(explicit, str) and explicit:
+            return explicit
+        return str(row.get("job_id") or "?").rsplit("_", 1)[-1][-4:]
+
     one_center = len({r.get("center") for r in rows}) <= 1
+
+    def row_target(row: dict) -> str:
+        node = row.get("node", "?")
+        if node in (None, "-", "?"):
+            node = row.get("pin_node") or node
+        return str(node) if one_center else f"{row.get('center', '?')}/{node}"
+
     detailed = show_progress or show_issue
     show_ref = not show_progress
+    ref_width = max(
+        4,
+        max(
+            (len(row_ref(row)) for row in rows),
+            default=4,
+        ),
+    )
     compact_status_width = 7 if show_progress else 11
+    target_width = max(
+        9 if one_center else 12,
+        min(
+            18,
+            max((len(row_target(row)) for row in rows), default=0),
+        ),
+    )
     for row in rows:
         status_text, _ = _job_display_status(row)
         exit_code = row.get("exit_code")
@@ -403,17 +431,17 @@ def ps_table(
             t.add_column(
                 "ref",
                 no_wrap=True,
-                overflow="ellipsis",
-                min_width=4,
-                max_width=4,
+                overflow="ignore",
+                min_width=ref_width,
+                max_width=ref_width,
                 style="dim",
             )
         t.add_column(
             "node" if one_center else "target",
             no_wrap=True,
             overflow="ellipsis",
-            min_width=9 if one_center else 12,
-            max_width=10 if one_center else 18,
+            min_width=target_width,
+            max_width=target_width,
         )
         t.add_column(
             "live" if show_progress else "GPU",
@@ -457,7 +485,7 @@ def ps_table(
         t.add_row(f"[dim]{empty_text}[/dim]", *([""] * (len(t.columns) - 1)))
         return t
     for r in sorted(rows, key=lambda x: x.get("created_at", 0)):
-        short_ref = str(r.get("job_id", "?")).rsplit("_", 1)[-1][-4:]
+        display_ref = row_ref(r)
         status = r.get("status", "?")
         created_at = (
             datetime.fromtimestamp(r["created_at"]) if r.get("created_at") else None
@@ -591,7 +619,7 @@ def ps_table(
         ):
             # Keep --issues local and fast: tell the operator how to inspect
             # the failure without adding one remote log fetch per table row.
-            issue = f"dt logs {short_ref}"
+            issue = f"dt logs {display_ref}"
         if not issue and r.get("max_hours_exceeded"):
             issue = "max-hours exceeded"
         progress_text = (" · " if wide else " ").join(progress_parts)
@@ -621,18 +649,13 @@ def ps_table(
             values.append(cmd)
             t.add_row(*values)
         else:
-            display_node = r.get("node", "?")
-            if display_node in (None, "-", "?"):
-                display_node = r.get("pin_node") or display_node
-            target = (
-                display_node if one_center else f"{r.get('center', '?')}/{display_node}"
-            )
+            target = row_target(r)
             result = (
                 display_status if exit_code is None else f"{display_status}/{exit_code}"
             )
             values = [r.get("name", "?")]
             if show_ref:
-                values.append(short_ref)
+                values.append(display_ref)
             values.extend(
                 [
                     target,

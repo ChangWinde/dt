@@ -545,6 +545,45 @@ def test_laptop_lookup_default_hit_skips_unrelated_centers(monkeypatch):
     assert calls == ["head-a"]
 
 
+def test_laptop_full_job_id_lookup_fails_closed_across_centers(monkeypatch):
+    import dt.remote as remote_mod
+
+    cfg = LaptopConfig(
+        centers={"primary": "head-a", "backup": "head-b"},
+        default_center="primary",
+    )
+    job_id = "20260728-1200_same-job_abcd"
+    calls = []
+
+    def lookup(head, argv, timeout):
+        calls.append(head)
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            json.dumps({"job_id": job_id, "status": "finished"}),
+            "",
+        )
+
+    monkeypatch.setattr(remote_mod, "remote_dt", lookup)
+    errors = {}
+
+    hit = remote_mod.find_center(cfg, job_id, errors=errors)
+
+    assert hit is None
+    assert sorted(calls) == ["head-a", "head-b"]
+    assert set(errors) == {"primary", "backup"}
+    assert all("present in multiple centers" in message for message in errors.values())
+
+
+def test_full_job_id_detection_accepts_legacy_and_current_suffixes():
+    import dt.remote as remote_mod
+
+    assert remote_mod.FULL_JOB_ID_RE.fullmatch("20260728-1200_same-job_abcd")
+    assert remote_mod.FULL_JOB_ID_RE.fullmatch(
+        "20260728-1200_same-job_a1b2c3d4e5f60718"
+    )
+
+
 def test_laptop_lookup_hedges_when_default_center_is_slow(monkeypatch):
     import dt.remote as remote_mod
 
@@ -5459,12 +5498,21 @@ def test_laptop_ps_issue_filter_is_applied_before_each_head_window(monkeypatch):
             "a": {
                 "schema_version": cli.PS_WINDOW_SCHEMA,
                 "center": "a",
+                "query": cli._ps_window_contract_from_argv(["ps", "--issues"]),
                 "total": 1,
-                "rows": [{"job_id": "a-failed", "status": "failed"}],
+                "rows": [
+                    {
+                        "job_id": "a-failed",
+                        "display_ref": "fail",
+                        "center": "a",
+                        "status": "failed",
+                    }
+                ],
             },
             "b": {
                 "schema_version": cli.PS_WINDOW_SCHEMA,
                 "center": "b",
+                "query": cli._ps_window_contract_from_argv(["ps", "--issues"]),
                 "total": 0,
                 "rows": [],
             },
@@ -5480,8 +5528,266 @@ def test_laptop_ps_issue_filter_is_applied_before_each_head_window(monkeypatch):
     )
 
     assert errors == {}
-    assert rows == [{"job_id": "a-failed", "status": "failed"}]
-    assert seen == [["ps", "--issues", "--window"]]
+    assert rows == [
+        {
+            "job_id": "a-failed",
+            "display_ref": "a:fail",
+            "center": "a",
+            "status": "failed",
+        }
+    ]
+    assert seen == [
+        [
+            "ps",
+            "--issues",
+            "--window",
+            "--window-schema",
+            cli.PS_WINDOW_SCHEMA,
+        ]
+    ]
+
+
+def test_laptop_ps_issue_window_falls_back_from_v1_semantics(monkeypatch):
+    import dt.remote as remote_mod
+
+    cfg = LaptopConfig(
+        centers={"old": "head-old"},
+        default_center="old",
+    )
+    old_failure = {
+        "name": "old-failure",
+        "job_id": "20260720-0000_old-failure_dead",
+        "center": "old",
+        "status": "failed",
+        "created_at": 1.0,
+    }
+    successful = [
+        {
+            "name": f"success-{index}",
+            "job_id": f"20260728-0000_success-{index}_{index:04x}",
+            "center": "old",
+            "status": "finished",
+            "exit_code": 0,
+            "created_at": float(index + 2),
+        }
+        for index in range(40)
+    ]
+    legacy_window = {
+        "schema_version": "dt_ps_window_v1",
+        "center": "old",
+        "total": 41,
+        "rows": successful[-30:],
+    }
+    calls = []
+
+    def fan(cfg_, argv):
+        calls.append(argv)
+        if "--window" in argv:
+            return {"old": legacy_window}, remote_mod.FanErrors()
+        return {"old": [old_failure, *successful]}, remote_mod.FanErrors()
+
+    monkeypatch.setattr(cli, "fan_json_by_center", fan)
+
+    rows, errors = cli._gather_ps_rows(
+        cfg,
+        status=None,
+        issues_only=True,
+        remote_window=True,
+    )
+    rows = cli._ps_issue_rows(rows)
+
+    assert errors == {}
+    assert [row["job_id"] for row in rows] == [old_failure["job_id"]]
+    assert cli._ps_rows_total(rows) == 1
+    assert calls == [
+        [
+            "ps",
+            "--issues",
+            "--window",
+            "--window-schema",
+            cli.PS_WINDOW_SCHEMA,
+        ],
+        ["ps"],
+    ]
+
+
+def test_legacy_active_fallback_computes_ref_against_full_history(monkeypatch):
+    import dt.remote as remote_mod
+
+    cfg = LaptopConfig(
+        centers={"old": "head-old"},
+        default_center="old",
+    )
+    active_id = "20260728-0000_active-job_24a3"
+    historical_id = "20260720-0000_historical-job_24a3"
+    full_rows = [
+        {
+            "name": "historical-job",
+            "job_id": historical_id,
+            "center": "old",
+            "status": "finished",
+            "exit_code": 0,
+            "created_at": 1.0,
+        },
+        {
+            "name": "active-job",
+            "job_id": active_id,
+            "center": "old",
+            "status": "running",
+            "created_at": 2.0,
+        },
+    ]
+    calls = []
+
+    def fan(cfg_, argv):
+        calls.append(argv)
+        if "--window" in argv:
+            return {
+                "old": {
+                    "schema_version": cli.PS_LEGACY_WINDOW_SCHEMA,
+                    "center": "old",
+                    "total": 1,
+                    "rows": [full_rows[1]],
+                }
+            }, remote_mod.FanErrors()
+        return {"old": full_rows}, remote_mod.FanErrors()
+
+    monkeypatch.setattr(cli, "fan_json_by_center", fan)
+
+    rows, errors = cli._gather_ps_rows(
+        cfg,
+        status=None,
+        active_only=True,
+        remote_window=True,
+    )
+
+    assert errors == {}
+    assert len(rows) == 1
+    assert rows[0]["job_id"] == active_id
+    assert rows[0]["display_ref"] == active_id
+    assert calls[-1] == ["ps"]
+
+
+def test_multi_center_legacy_window_uses_full_unscoped_ref(monkeypatch):
+    import dt.remote as remote_mod
+
+    cfg = LaptopConfig(
+        centers={"old": "head-old", "new": "head-new"},
+        default_center="new",
+    )
+    old_job_id = "20260720-0000_old-job_dead"
+    query = cli._ps_window_contract_from_argv(["ps", "--active"])
+
+    def fan(cfg_, argv):
+        if set(cfg_.centers) == {"old"}:
+            return {
+                "old": [
+                    {
+                        "name": "old-job",
+                        "job_id": old_job_id,
+                        "center": "old",
+                        "status": "running",
+                        "created_at": 1.0,
+                    }
+                ]
+            }, remote_mod.FanErrors()
+        return {
+            "old": {
+                "schema_version": cli.PS_LEGACY_WINDOW_SCHEMA,
+                "center": "old",
+                "total": 1,
+                "rows": [],
+            },
+            "new": {
+                "schema_version": cli.PS_WINDOW_SCHEMA,
+                "center": "new",
+                "query": query,
+                "total": 1,
+                "rows": [
+                    {
+                        "name": "new-job",
+                        "job_id": "20260728-0000_new-job_beef",
+                        "display_ref": "beef",
+                        "center": "new",
+                        "status": "running",
+                        "created_at": 2.0,
+                    }
+                ],
+            },
+        }, remote_mod.FanErrors()
+
+    monkeypatch.setattr(cli, "fan_json_by_center", fan)
+
+    rows, errors = cli._gather_ps_rows(
+        cfg,
+        status=None,
+        active_only=True,
+        remote_window=True,
+    )
+
+    assert errors == {}
+    assert {row["display_ref"] for row in rows} == {
+        old_job_id,
+        "new:beef",
+    }
+
+
+def test_laptop_ps_issue_window_preserves_total_and_requested_limit(monkeypatch):
+    import dt.remote as remote_mod
+
+    cfg = LaptopConfig(
+        centers={"new": "head-new"},
+        default_center="new",
+    )
+    seen = []
+    rows = [
+        {
+            "name": f"failure-{index}",
+            "job_id": f"20260728-0000_failure-{index}_{index:04x}",
+            "center": "new",
+            "status": "failed",
+            "created_at": float(index),
+        }
+        for index in range(50)
+    ]
+
+    def fan(cfg_, argv):
+        seen.append(argv)
+        return {
+            "new": {
+                "schema_version": cli.PS_WINDOW_SCHEMA,
+                "center": "new",
+                "query": cli._ps_window_contract_from_argv(argv[:-1]),
+                "total": 100,
+                "rows": rows,
+            }
+        }, remote_mod.FanErrors()
+
+    monkeypatch.setattr(cli, "fan_json_by_center", fan)
+
+    observed, errors = cli._gather_ps_rows(
+        cfg,
+        status=None,
+        issues_only=True,
+        remote_window=True,
+        limit=50,
+    )
+    observed = cli._ps_issue_rows(observed)
+
+    assert errors == {}
+    assert len(observed) == 50
+    assert cli._ps_rows_total(observed) == 100
+    assert seen == [
+        [
+            "ps",
+            "--issues",
+            "--limit",
+            "50",
+            "--window",
+            "--window-schema",
+            cli.PS_WINDOW_SCHEMA,
+        ]
+    ]
 
 
 def test_laptop_ps_limit_is_applied_by_each_head_and_globally(monkeypatch):
@@ -5562,16 +5868,162 @@ def test_ps_window_json_keeps_active_and_reports_full_count(tmp_path, monkeypatc
         lambda cfg_, entry, observation=None: entry,
     )
 
-    result = CliRunner().invoke(cli.app, ["ps", "--window", "--json"])
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ps",
+            "--window",
+            "--window-schema",
+            cli.PS_WINDOW_SCHEMA,
+            "--json",
+        ],
+    )
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["schema_version"] == cli.PS_WINDOW_SCHEMA
+    assert payload["query"] == cli._ps_window_contract(
+        status=None,
+        active_only=False,
+        issues_only=False,
+        limit=None,
+        with_progress=False,
+    )
     assert payload["center"] == "c"
     assert payload["total"] == 41
     assert len(payload["rows"]) == 11
     assert payload["rows"][0]["job_id"] == "old-running"
     assert payload["rows"][-1]["job_id"] == "finished-39"
+
+
+def test_ps_window_without_negotiation_stays_v1_for_old_laptops(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    for index in range(40):
+        cli.jobs_mod.save(
+            cfg,
+            JobEntry(
+                job_id=f"finished-{index}",
+                name=f"finished-{index}",
+                center="c",
+                project="p",
+                node="n1",
+                node_local=False,
+                job_dir=f"jobs/finished-{index}",
+                session=f"finished-{index}",
+                cmd="true",
+                status="finished",
+                exit_code=0,
+                created_at=float(index),
+            ),
+        )
+    for index in range(35):
+        cli.jobs_mod.save(
+            cfg,
+            JobEntry(
+                job_id=f"running-{index}",
+                name=f"running-{index}",
+                center="c",
+                project="p",
+                node="n1",
+                node_local=False,
+                job_dir=f"jobs/running-{index}",
+                session=f"running-{index}",
+                cmd="true",
+                status="running",
+                created_at=float(index + 100),
+            ),
+        )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli.jobs_mod,
+        "refresh_status",
+        lambda cfg_, entry, observation=None: entry,
+    )
+
+    result = CliRunner().invoke(cli.app, ["ps", "--window", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == cli.PS_LEGACY_WINDOW_SCHEMA
+    assert "query" not in payload
+    assert payload["total"] == 75
+    assert len(payload["rows"]) == 65
+    assert sum(row["status"] == "running" for row in payload["rows"]) == 35
+    assert [row["job_id"] for row in payload["rows"][:2]] == [
+        "finished-10",
+        "finished-11",
+    ]
+
+
+def test_v1_issue_window_returns_full_superset_for_old_clients(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entries = [
+        JobEntry(
+            job_id="old-failure",
+            name="old-failure",
+            center="c",
+            project="p",
+            node="n1",
+            node_local=False,
+            job_dir="jobs/old-failure",
+            session="old-failure",
+            cmd="false",
+            status="failed",
+            created_at=1.0,
+        ),
+        *[
+            JobEntry(
+                job_id=f"success-{index}",
+                name=f"success-{index}",
+                center="c",
+                project="p",
+                node="n1",
+                node_local=False,
+                job_dir=f"jobs/success-{index}",
+                session=f"success-{index}",
+                cmd="true",
+                status="finished",
+                exit_code=0,
+                created_at=float(index + 2),
+            )
+            for index in range(40)
+        ],
+    ]
+    for entry in entries:
+        cli.jobs_mod.save(cfg, entry)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["ps", "--issues", "--window", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == cli.PS_LEGACY_WINDOW_SCHEMA
+    assert payload["total"] == 41
+    assert len(payload["rows"]) == 41
+    assert payload["rows"][0]["job_id"] == "old-failure"
 
 
 def test_laptop_ps_window_preserves_remote_total(monkeypatch):
@@ -5586,14 +6038,32 @@ def test_laptop_ps_window_preserves_remote_total(monkeypatch):
         "a": {
             "schema_version": cli.PS_WINDOW_SCHEMA,
             "center": "a",
+            "query": cli._ps_window_contract_from_argv(["ps"]),
             "total": 500,
-            "rows": [{"job_id": "a-new", "created_at": 10.0}],
+            "rows": [
+                {
+                    "job_id": f"a-running-{index}",
+                    "center": "a",
+                    "status": "running",
+                    "created_at": float(index),
+                }
+                for index in range(500)
+            ],
         },
         "b": {
             "schema_version": cli.PS_WINDOW_SCHEMA,
             "center": "b",
+            "query": cli._ps_window_contract_from_argv(["ps"]),
             "total": 63,
-            "rows": [{"job_id": "b-new", "created_at": 20.0}],
+            "rows": [
+                {
+                    "job_id": f"b-finished-{index}",
+                    "center": "b",
+                    "status": "finished",
+                    "created_at": float(index + 500),
+                }
+                for index in range(53, 63)
+            ],
         },
     }
 
@@ -5610,9 +6080,18 @@ def test_laptop_ps_window_preserves_remote_total(monkeypatch):
     )
 
     assert errors == {}
-    assert [row["job_id"] for row in rows] == ["a-new", "b-new"]
+    assert len(rows) == 510
+    assert rows[0]["job_id"] == "a-running-0"
+    assert rows[-1]["job_id"] == "b-finished-62"
     assert cli._ps_rows_total(rows) == 563
-    assert seen == [["ps", "--window"]]
+    assert seen == [
+        [
+            "ps",
+            "--window",
+            "--window-schema",
+            cli.PS_WINDOW_SCHEMA,
+        ]
+    ]
 
 
 def test_laptop_ps_window_falls_back_to_old_head(monkeypatch):
@@ -5652,7 +6131,15 @@ def test_laptop_ps_window_falls_back_to_old_head(monkeypatch):
     assert len(rows) == 10
     assert cli._ps_rows_total(rows) == 40
     assert rows[0]["job_id"] == "job-30"
-    assert calls == [["ps", "--window"], ["ps"]]
+    assert calls == [
+        [
+            "ps",
+            "--window",
+            "--window-schema",
+            cli.PS_WINDOW_SCHEMA,
+        ],
+        ["ps"],
+    ]
 
 
 def test_laptop_ps_limit_fallback_does_not_send_new_option_to_old_head(
@@ -5699,7 +6186,14 @@ def test_laptop_ps_limit_fallback_does_not_send_new_option_to_old_head(
     assert [row["job_id"] for row in rows] == ["job-3", "job-4"]
     assert cli._ps_rows_total(rows) == 5
     assert calls == [
-        ["ps", "--limit", "2", "--window"],
+        [
+            "ps",
+            "--limit",
+            "2",
+            "--window",
+            "--window-schema",
+            cli.PS_WINDOW_SCHEMA,
+        ],
         ["ps"],
     ]
 

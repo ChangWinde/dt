@@ -168,6 +168,20 @@ def _need_head(cfg) -> HeadConfig:
 def _find_or_die(cfg: HeadConfig, ref: str) -> jobs_mod.JobEntry:
     entry = jobs_mod.find(cfg, ref)
     if entry is None:
+        _entry, ambiguous = jobs_mod.resolve_ref(cfg, ref)
+        if ambiguous:
+            display_refs = jobs_mod.compact_job_refs(jobs_mod.list_all(cfg))
+            choices = ", ".join(
+                f"{candidate.name}={display_refs[candidate.job_id]}"
+                for candidate in ambiguous[:5]
+            )
+            remainder = len(ambiguous) - min(len(ambiguous), 5)
+            if remainder:
+                choices += f", +{remainder} more"
+            err.print(
+                f"[red]ambiguous job reference {ref!r}[/red]; use one of: {choices}"
+            )
+            raise typer.Exit(EXIT_NOT_FOUND)
         err.print(f"[red]no job matching {ref!r}[/red]")
         raise typer.Exit(EXIT_NOT_FOUND)
     return entry
@@ -194,7 +208,7 @@ def _complete_ref(incomplete: str) -> list[str]:
 
 
 REF_ARG = typer.Argument(
-    ..., autocompletion=_complete_ref, help="job id, id prefix, or name"
+    ..., autocompletion=_complete_ref, help="job id, compact ref, id prefix, or name"
 )
 REFS_OPTIONAL_ARG = typer.Argument(
     None,
@@ -3326,19 +3340,33 @@ def chain(
 # --------------------------------------------------------------------------
 
 PS_RECENT_LIMIT = 10
-PS_WINDOW_SCHEMA = "dt_ps_window_v1"
+PS_V1_RECENT_LIMIT = 30
+PS_WINDOW_SCHEMA = "dt_ps_window_v2"
+PS_LEGACY_WINDOW_SCHEMA = "dt_ps_window_v1"
 
 
 class _PsRows(list):
-    """Rows plus the pre-window count used by the human laptop view."""
+    """Rows plus explicit metadata retained across local window operations."""
 
-    def __init__(self, rows=(), *, total: int | None = None):
+    def __init__(
+        self,
+        rows=(),
+        *,
+        total: int | None = None,
+        applied_filters: frozenset[str] | set[str] = frozenset(),
+    ):
         super().__init__(rows)
         self.total = len(self) if total is None else total
+        self.applied_filters = frozenset(applied_filters)
 
 
 def _ps_rows_total(rows: list[dict]) -> int:
     return int(getattr(rows, "total", len(rows)))
+
+
+def _ps_rows_filters(rows: list[dict]) -> frozenset[str]:
+    value = getattr(rows, "applied_filters", frozenset())
+    return value if isinstance(value, frozenset) else frozenset(value)
 
 
 def _limit_ps_rows(rows: list[dict], limit: int | None) -> list[dict]:
@@ -3346,7 +3374,95 @@ def _limit_ps_rows(rows: list[dict], limit: int | None) -> list[dict]:
     if limit is None:
         return rows
     ordered = sorted(rows, key=lambda row: row.get("created_at", 0))
-    return _PsRows(ordered[-limit:], total=_ps_rows_total(rows))
+    return _PsRows(
+        ordered[-limit:],
+        total=_ps_rows_total(rows),
+        applied_filters=_ps_rows_filters(rows),
+    )
+
+
+def _ps_window_contract(
+    *,
+    status: str | None,
+    active_only: bool,
+    issues_only: bool,
+    limit: int | None,
+    with_progress: bool,
+) -> dict[str, object]:
+    """Describe the exact filtering and selection represented by a v2 window."""
+    return {
+        "status": status,
+        "active_only": active_only,
+        "issues_only": issues_only,
+        "limit": limit,
+        "with_progress": with_progress,
+        "recent_terminal_limit": None if limit is not None else PS_RECENT_LIMIT,
+    }
+
+
+def _ps_window_contract_from_argv(argv: list[str]) -> dict[str, object]:
+    status = None
+    for option in ("-s", "--status"):
+        if option in argv:
+            index = argv.index(option)
+            status = argv[index + 1]
+            break
+    limit = None
+    if "--limit" in argv:
+        index = argv.index("--limit")
+        limit = int(argv[index + 1])
+    return _ps_window_contract(
+        status=status,
+        active_only="--active" in argv,
+        issues_only="--issues" in argv,
+        limit=limit,
+        with_progress="--with-progress" in argv,
+    )
+
+
+def _scope_laptop_ps_refs(cfg: LaptopConfig, rows: list[dict]) -> None:
+    by_center: dict[str, list[dict]] = {}
+    scope_capable = {
+        id(row)
+        for row in rows
+        if isinstance(row.get("display_ref"), str) and row["display_ref"]
+    }
+    for row in rows:
+        center = row.get("center")
+        if isinstance(center, str) and center:
+            by_center.setdefault(center, []).append(row)
+    for center_rows in by_center.values():
+        for row in center_rows:
+            display_ref = row.get("display_ref")
+            if not isinstance(display_ref, str) or not display_ref:
+                row["display_ref"] = str(row.get("job_id") or "?")
+    if len(cfg.centers) <= 1:
+        return
+    for center, center_rows in by_center.items():
+        for row in center_rows:
+            local_ref = row.get("display_ref")
+            if id(row) in scope_capable and isinstance(local_ref, str) and local_ref:
+                row["display_ref"] = f"{center}:{local_ref}"
+            else:
+                # Pre-v2 heads do not understand CENTER:REF.  A full id remains
+                # directly usable there and is globally disambiguated by the
+                # laptop lookup path.
+                row["display_ref"] = str(row.get("job_id") or local_ref or "?")
+
+
+def _ps_window_size_is_exact(
+    rows: list[dict],
+    total: int,
+    query: dict[str, object],
+) -> bool:
+    requested_limit = query.get("limit")
+    if isinstance(requested_limit, int):
+        return len(rows) == min(total, requested_limit)
+    active_count = sum(row.get("status") in {"queued", "running"} for row in rows)
+    return len(rows) == active_count + min(
+        total - active_count,
+        PS_RECENT_LIMIT,
+    )
 
 
 def _ps_window_unsupported(message: str) -> bool:
@@ -3361,40 +3477,81 @@ def _gather_laptop_ps_window(
     argv: list[str],
 ) -> tuple[list[dict], dict[str, str]]:
     """Fetch exact per-center table windows, with old-head fallback."""
-    data_by_center, errors = fan_json_by_center(cfg, [*argv, "--window"])
+    requested_query = _ps_window_contract_from_argv(argv)
+    data_by_center, errors = fan_json_by_center(
+        cfg,
+        [
+            *argv,
+            "--window",
+            "--window-schema",
+            PS_WINDOW_SCHEMA,
+        ],
+    )
 
-    unsupported = [
+    fallback_centers = [
         center for center, message in errors.items() if _ps_window_unsupported(message)
     ]
-    if unsupported:
+    fallback_centers.extend(
+        center
+        for center, payload in data_by_center.items()
+        if isinstance(payload, dict)
+        and payload.get("schema_version") == PS_LEGACY_WINDOW_SCHEMA
+        and center not in fallback_centers
+    )
+    if fallback_centers:
         fallback_cfg = LaptopConfig(
-            centers={center: cfg.centers[center] for center in unsupported},
+            centers={center: cfg.centers[center] for center in fallback_centers},
             default_center=(
-                cfg.default_center if cfg.default_center in unsupported else None
+                cfg.default_center if cfg.default_center in fallback_centers else None
             ),
         )
-        legacy_argv = list(argv)
-        if "--limit" in legacy_argv:
-            limit_index = legacy_argv.index("--limit")
-            del legacy_argv[limit_index : limit_index + 2]
+        legacy_argv = ["ps"]
+        if bool(requested_query["with_progress"]):
+            legacy_argv.append("--with-progress")
         fallback_data, fallback_errors = fan_json_by_center(
             fallback_cfg,
             legacy_argv,
         )
-        for center in unsupported:
+        for center in fallback_centers:
+            data_by_center.pop(center, None)
             errors.pop(center, None)
             errors.unreachable.discard(center)
             payload = fallback_data.get(center)
             if isinstance(payload, list):
+                for row in payload:
+                    if isinstance(row, dict):
+                        row.setdefault("center", center)
+                selected: list[dict] = _PsRows(payload, total=len(payload))
+                requested_status = requested_query["status"]
+                if isinstance(requested_status, str):
+                    matched = [
+                        row for row in selected if row.get("status") == requested_status
+                    ]
+                    selected = _PsRows(matched, total=len(matched))
+                elif bool(requested_query["active_only"]):
+                    matched = [
+                        row
+                        for row in selected
+                        if row.get("status") in {"queued", "running"}
+                    ]
+                    selected = _PsRows(matched, total=len(matched))
+                if bool(requested_query["issues_only"]):
+                    selected = _ps_issue_rows(selected)
+                requested_limit = requested_query["limit"]
+                if isinstance(requested_limit, int):
+                    selected = _limit_ps_rows(selected, requested_limit)
+                else:
+                    selected = _PsRows(
+                        _select_ps_rows(selected, all_=False),
+                        total=_ps_rows_total(selected),
+                        applied_filters=_ps_rows_filters(selected),
+                    )
                 data_by_center[center] = {
                     "schema_version": PS_WINDOW_SCHEMA,
                     "center": center,
-                    "total": len(payload),
-                    "rows": (
-                        payload
-                        if "--limit" in argv
-                        else _select_ps_rows(payload, all_=False)
-                    ),
+                    "query": requested_query,
+                    "total": _ps_rows_total(selected),
+                    "rows": list(selected),
                 }
                 continue
             if center in fallback_errors:
@@ -3417,17 +3574,35 @@ def _gather_laptop_ps_window(
         window_total = payload.get("total")
         if (
             payload.get("schema_version") != PS_WINDOW_SCHEMA
+            or payload.get("center") != center
+            or payload.get("query") != requested_query
             or not isinstance(window_rows, list)
             or not all(isinstance(row, dict) for row in window_rows)
+            or not all(row.get("center") == center for row in window_rows)
             or not isinstance(window_total, int)
             or isinstance(window_total, bool)
             or window_total < len(window_rows)
+            or not _ps_window_size_is_exact(
+                window_rows,
+                window_total,
+                requested_query,
+            )
+            or (
+                bool(requested_query["issues_only"])
+                and len(_ps_issue_rows(window_rows)) != len(window_rows)
+            )
         ):
             errors[center] = "invalid ps window object from head"
             continue
         merged.extend(window_rows)
         total += window_total
-    return _PsRows(merged, total=total), errors
+    _scope_laptop_ps_refs(cfg, merged)
+    applied_filters = {"issues"} if bool(requested_query["issues_only"]) else set()
+    return _PsRows(
+        merged,
+        total=total,
+        applied_filters=applied_filters,
+    ), errors
 
 
 def _max_hours_overdue(
@@ -3471,9 +3646,11 @@ def _gather_ps_rows(
             rows, errors = _gather_laptop_ps_window(cfg, argv)
         else:
             rows, errors = fan_json(cfg, argv)
+            _scope_laptop_ps_refs(cfg, rows)
         return _limit_ps_rows(rows, limit), errors
 
     entries = jobs_mod.list_all(cfg)
+    display_refs = jobs_mod.compact_job_refs(entries)
     refresh_statuses = {"running", "lost"}
     if active_only:
         refresh_statuses = {"running"}
@@ -3562,7 +3739,10 @@ def _gather_ps_rows(
     now = time.time()
     rows = []
     for entry in entries:
-        row = {**asdict(entry)}
+        row = {
+            **asdict(entry),
+            "display_ref": display_refs[entry.job_id],
+        }
         row.update(
             {
                 "queue_position": None,
@@ -3654,6 +3834,21 @@ def _select_ps_rows(
     )
 
 
+def _select_v1_compatible_ps_rows(rows: list[dict]) -> list[dict]:
+    """Return a superset that both 0.6.0 and 0.6.1 clients trim exactly."""
+    ordered = sorted(rows, key=lambda row: row.get("created_at", 0))
+    legacy_active = [
+        row for row in ordered if row.get("status") in {"queued", "running", "lost"}
+    ]
+    inactive = [
+        row for row in ordered if row.get("status") not in {"queued", "running", "lost"}
+    ]
+    return sorted(
+        [*legacy_active, *inactive[-PS_V1_RECENT_LIMIT:]],
+        key=lambda row: row.get("created_at", 0),
+    )
+
+
 def _visible_ps_rows(
     rows: list[dict],
     *,
@@ -3695,7 +3890,12 @@ def _ps_issue_rows(rows: list[dict]) -> list[dict]:
         return False
 
     selected = [row for row in rows if actionable(row)]
-    return _PsRows(selected, total=len(selected))
+    already_filtered = "issues" in _ps_rows_filters(rows)
+    return _PsRows(
+        selected,
+        total=_ps_rows_total(rows) if already_filtered else len(selected),
+        applied_filters={*_ps_rows_filters(rows), "issues"},
+    )
 
 
 def _ps_queue_runway_note(
@@ -3857,6 +4057,11 @@ def ps(
         help="full array by default; explicit filters narrow it",
     ),
     window: bool = typer.Option(False, "--window", hidden=True),
+    window_schema: Optional[str] = typer.Option(
+        None,
+        "--window-schema",
+        hidden=True,
+    ),
 ) -> None:
     """Show active jobs; opt into recent or complete history."""
     if active and status is not None:
@@ -3890,6 +4095,15 @@ def ps(
             exit_code=1,
             json_=json_,
         )
+    if window_schema is not None and (not window or window_schema != PS_WINDOW_SCHEMA):
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"--window-schema requires --window and must be {PS_WINDOW_SCHEMA!r}"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
     cfg = _cfg()
     default_active_view = (
         not json_
@@ -3902,6 +4116,7 @@ def ps(
     )
     active_only = active or default_active_view
     recent_view = recent or issues or status is not None
+    legacy_issue_window = window and window_schema is None and issues
     if issues:
         view_title = "All issues" if all_ else "Recent issues"
         empty_text = "no jobs need attention"
@@ -3926,7 +4141,7 @@ def ps(
 
     def gather(include_progress: bool):
         window_kwargs = {"remote_window": True} if remote_window else {}
-        if limit is not None and not issues:
+        if limit is not None and not legacy_issue_window:
             window_kwargs["limit"] = limit
         if issues:
             window_kwargs["issues_only"] = True
@@ -3945,7 +4160,7 @@ def ps(
                 include_progress=include_progress,
                 **window_kwargs,
             )
-        if issues:
+        if issues and not legacy_issue_window:
             rows = _limit_ps_rows(_ps_issue_rows(rows), limit)
         return rows, errors
 
@@ -4020,17 +4235,46 @@ def ps(
         )
     if json_:
         if window:
+            schema_version = window_schema or PS_LEGACY_WINDOW_SCHEMA
+            if schema_version == PS_LEGACY_WINDOW_SCHEMA:
+                if legacy_issue_window:
+                    window_rows = sorted(
+                        rows,
+                        key=lambda row: row.get("created_at", 0),
+                    )
+                elif limit is not None:
+                    window_rows = sorted(
+                        rows,
+                        key=lambda row: row.get("created_at", 0),
+                    )
+                else:
+                    window_rows = _select_v1_compatible_ps_rows(rows)
+            else:
+                window_rows = _visible_ps_rows(
+                    rows,
+                    all_=False,
+                    limit=limit,
+                )
             print(
                 json.dumps(
                     {
-                        "schema_version": PS_WINDOW_SCHEMA,
+                        "schema_version": schema_version,
                         "center": cfg.center if isinstance(cfg, HeadConfig) else "all",
-                        "total": _ps_rows_total(rows),
-                        "rows": _visible_ps_rows(
-                            rows,
-                            all_=False,
-                            limit=limit,
+                        **(
+                            {
+                                "query": _ps_window_contract(
+                                    status=status,
+                                    active_only=active_only,
+                                    issues_only=issues,
+                                    limit=limit,
+                                    with_progress=with_progress,
+                                )
+                            }
+                            if schema_version == PS_WINDOW_SCHEMA
+                            else {}
                         ),
+                        "total": _ps_rows_total(rows),
+                        "rows": window_rows,
                     }
                 )
             )
@@ -12099,8 +12343,14 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
 def _find(ref: str) -> None:
     """(internal) resolve a job ref in this head's registry, print JSON."""
     cfg = _need_head(_cfg())
-    entry = jobs_mod.find(cfg, ref)
+    entry, ambiguous = jobs_mod.resolve_ref(cfg, ref)
     if entry is None:
+        if ambiguous:
+            print(
+                f"ambiguous job reference {ref!r} ({len(ambiguous)} matches)",
+                file=sys.stderr,
+            )
+            raise typer.Exit(1)
         raise typer.Exit(EXIT_NOT_FOUND)
     print(json.dumps(asdict(entry)))
 

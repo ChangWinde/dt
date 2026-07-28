@@ -1,5 +1,9 @@
 # DistTrainer 0.6.1 operator-UX release audit
 
+> Superseded by the 0.6.2 corrective audit: post-tag review found ambiguous
+> four-character references and a mixed-version `--issues` window regression.
+> The retained 0.6.1 artifact is historical and must not be promoted.
+
 ## Verdict
 
 **PASS** for the 0.6.1 current-first CLI and release candidate.

@@ -165,6 +165,23 @@ Tasks:
 - [x] T7.5: complete full regression, terminal UX review, clean release gate,
   0.6.1 artifact retention, and tag.
 
+### M8: Operator UX corrective release — COMPLETE
+
+Acceptance: compact references resolve exactly or fail closed, mixed-version
+issue windows cannot omit matching jobs, filtered totals and limits are exact,
+and the complete 0.6.2 release and review gates pass.
+
+Tasks:
+
+- [x] T8.1: reproduce compact-reference collisions against the real registry
+  and replace fixed four-character handles with resolver-safe compact refs.
+- [x] T8.2: add query-bound `dt_ps_window_v2` and exact `v1` full-array
+  fallback.
+- [x] T8.3: preserve issue totals and per-center/global `--limit` semantics.
+- [x] T8.4: add collision, mixed-version, protocol-size, terminal-width, and
+  negative-path regression coverage.
+- [x] T8.5: pass supported-version release gates and independent final review.
+
 ## Decisions Log
 
 - [2026-07-27] Real DP/LIBERO-10 work remains the primary product canary;

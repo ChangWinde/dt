@@ -57,7 +57,7 @@ environment, and produces:
 (cd dist && sha256sum -c SHA256SUMS)
 python3 -m json.tool dist/release-audit.json
 python3 -m json.tool dist/release-manifest.json
-git tag -a v0.6.1 -m "DistTrainer 0.6.1"
+git tag -a v0.6.2 -m "DistTrainer 0.6.2"
 ```
 
 The manifest must report `git_dirty: false` and the intended release commit.
@@ -71,8 +71,8 @@ from the verified bundle. For PyPI, first confirm the `disttrainer` name,
 copyright-holder authorization, and trusted-publisher configuration, then use:
 
 ```bash
-uv publish dist/disttrainer-0.6.1-py3-none-any.whl \
-  dist/disttrainer-0.6.1.tar.gz
+uv publish dist/disttrainer-0.6.2-py3-none-any.whl \
+  dist/disttrainer-0.6.2.tar.gz
 ```
 
 Never pass a token on the command line or store it in this repository.
@@ -90,8 +90,8 @@ Each host retains the complete verified bundle below
 `~/.local/share/disttrainer/releases/VERSION/`. To restore a retained version:
 
 ```bash
-./deploy.sh --plan --rollback 0.6.1 HEAD_A
-./deploy.sh --rollback 0.6.1 HEAD_A
+./deploy.sh --plan --rollback 0.6.2 HEAD_A
+./deploy.sh --rollback 0.6.2 HEAD_A
 ```
 
 After deployment, run `dt --version`, `dt doctor --json`, inspect agent status,

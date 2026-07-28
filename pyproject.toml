@@ -1,6 +1,6 @@
 [project]
 name = "disttrainer"
-version = "0.6.1"
+version = "0.6.2"
 description = "DistTrainer: cross-center GPU experiment dispatcher for shared servers"
 readme = "README.release.md"
 requires-python = ">=3.10,<3.12"

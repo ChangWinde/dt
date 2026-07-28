@@ -4,6 +4,23 @@ All notable user-visible changes are recorded here. DistTrainer follows
 semantic versioning for the Python distribution and preserves the documented
 CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
+## 0.6.2 — 2026-07-28
+
+### Fixed
+
+- Compact job references now expand only when necessary to remain unique.
+  Ambiguous partial references fail closed instead of silently selecting a newer
+  experiment; multi-center tables emit directly routable `CENTER:REF` values.
+- New job ids use a cryptographically strong 64-bit suffix, preventing
+  same-minute, same-name submissions from realistically colliding with and
+  overwriting an existing registry record; historical four-character ids
+  remain fully supported.
+- Cross-center human `ps` windows now use the query-bound
+  `dt_ps_window_v2` protocol. A 0.6.0/0.6.1 `v1` head triggers an exact
+  full-array fallback, so older failures cannot disappear from `--issues`.
+- `dt ps --issues --limit N` now requests enough candidates from every head and
+  preserves the complete filtered count through global selection.
+
 ## 0.6.1 — 2026-07-28
 
 ### Changed
