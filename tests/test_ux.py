@@ -29,7 +29,8 @@ def test_root_help_has_a_compact_end_to_end_quick_start():
     result = CliRunner().invoke(cli.app, ["--help"], terminal_width=80)
 
     assert result.exit_code == 0, result.output
-    normalized = " ".join(result.output.split())
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.output)
+    normalized = " ".join(output.split())
     assert "Quick start" in normalized
     for command in (
         "dt free",
@@ -45,10 +46,10 @@ def test_root_help_has_a_compact_end_to_end_quick_start():
     assert "Operations" in normalized
     assert not re.search(r"\btask\s+Safe fast path", normalized)
     assert "nodes whose own internet is too slow" not in normalized
-    assert max(map(len, result.output.splitlines())) <= 80
+    assert max(map(len, output.splitlines())) <= 80
     command_lines = [
         line.strip()
-        for line in result.output.splitlines()
+        for line in output.splitlines()
         if re.match(r"\d+\s+dt ", line.strip())
     ]
     assert len(command_lines) == 5

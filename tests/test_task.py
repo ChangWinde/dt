@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -1781,7 +1782,8 @@ def test_run_rejects_unknown_dt_option_instead_of_running_it_remotely(monkeypatc
     )
 
     assert result.exit_code == 2
-    assert "No such option: --artifcat" in result.output
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.output)
+    assert "No such option: --artifcat" in output
 
 
 def test_task_rejects_invalid_resources_before_loading_config(monkeypatch):
