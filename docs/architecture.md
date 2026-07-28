@@ -1,56 +1,161 @@
-# dt architecture
+# DistTrainer architecture
+
+DistTrainer separates operator intent, authoritative lifecycle state, remote
+execution, and recoverable experiment data. The head is the control-plane
+authority. Compute nodes execute only dispatched snapshots and runtime payloads.
+
+## System view
+
+```mermaid
+flowchart LR
+    LAPTOP["Laptop CLI"] -->|SSH forwarding| HEAD
+    HEAD["Head CLI and registry"] --> QUEUE["Resident queue agent"]
+    HEAD --> SNAPSHOTS["Content-addressed snapshots"]
+    QUEUE -->|probe and dispatch| NODE1["Compute node"]
+    QUEUE -->|probe and dispatch| NODE2["Compute node"]
+    SNAPSHOTS --> NODE1
+    SNAPSHOTS --> NODE2
+    NODE1 --> RECORDS["Logs, telemetry, metadata, outputs"]
+    NODE2 --> RECORDS
+    RECORDS --> HEAD
+    HEAD --> LAPTOP
+```
+
+A laptop never contacts compute nodes directly. It forwards immutable command
+arguments to a configured head. The head validates the project and submission,
+records the job, stages the exact source, and either dispatches immediately or
+queues the job.
 
 ## Control plane
 
-The head-side registry is the source of truth for job lifecycle and immutable
-submission contracts. CLI mutations register work; the resident agent
-reconciles running jobs and dispatches queued work. Compute nodes execute only
-the staged snapshot and runtime payload selected by the head.
+The head registry is the lifecycle source of truth. A registered job contains:
 
-## Queue policies
+- stable job and center identity;
+- source snapshot and runtime payload hashes;
+- normalized command, project, resource request, pins, and guards;
+- queue dependency and lineage;
+- node, GPU, process-group, and lifecycle timestamps;
+- terminal result or explicit failed/lost reason;
+- artifact, environment, and recovery metadata.
 
-The scheduler owns placement and FIFO capacity fairness. Submission helpers
-declare policy without becoming secondary schedulers:
+The resident agent reconciles queued and running entries. It resolves
+dependencies before probing GPU capacity. A pending dependency is a
+job-specific blocker, so unrelated runnable work can pass it. A failed
+dependency becomes failed before start and never consumes a GPU lease.
 
-- `run` / `task`: one independent job;
-- `batch`: independent same-snapshot items; runtime failures continue;
-- `chain`: a linear same-snapshot graph; each item starts only after its
-  predecessor succeeds; stages may declare heterogeneous GPU counts while
-  retaining one immutable snapshot;
-- `fork`: one or more exact-snapshot derivatives.
-
-Dependency resolution happens on the head before GPU capacity probing. A
-pending dependency is a job-specific blocker, so unrelated work behind it may
-run. A failed dependency is terminal failed-before-start and never consumes a
-GPU lease.
+Capacity waits retain FIFO fairness among fitting jobs. Missing required paths
+or incompatible pins do not block unrelated candidates.
 
 ## Data plane
 
-Code snapshots are immutable and content-addressed. Explicit reusable inputs
-live in the project artifact root and may be bound by a content manifest. Each
-job retains its own logs, telemetry, outputs, exit status, and recovery
-actions, including jobs submitted as part of a batch or chain.
+Source snapshots are immutable and content-addressed. Editing a project after
+submission cannot change queued work. Every dispatched job receives a private
+code tree derived from the attested snapshot.
 
-## CLI composition
+Large generated or reusable inputs are excluded from normal snapshots. The
+operator can stage them explicitly and bind a content manifest. The compute
+payload verifies that manifest before setup or application execution.
 
-`cli.py` is the Typer composition root: it declares public commands, preserves
-stdout/stderr and exit-code compatibility, and connects services. Domain logic
-is split by change boundary:
+Each job owns:
 
-- `submission.py` owns normalized submission requests, pre-config validation,
-  task-name derivation, and the `RunSpec` boundary. `run` is the primary
-  workflow; `task` is a pinned-node shell-command compatibility facade.
-- `monitoring.py` owns persisted resource queries, JSONL parsing, phase-aware
-  aggregation, and summary identity. `info --metrics-tail` and `metrics --tail`
-  consume this same contract.
-- `forwarding.py` owns immutable laptop-to-head argv construction. Streaming
-  commands keep their reconnect policies in the composition layer.
-- `transfers.py` owns portable collection paths, pull probes, and recovered job
-  records; `sshio.py` owns SSH/rsync mechanics.
-- `storage.py` owns read-only managed-storage inventory; `compact.py` owns the
-  separately recoverable code-compaction transaction.
+```text
+code/                 immutable dispatched source copy
+cmd.sh                normalized application command
+meta.json             dispatch contract
+logs/                 setup and application logs
+outputs/              recoverable application and DistTrainer evidence
+exit_code              atomic terminal marker
+finished_at            node-local completion timestamp
+```
 
-Compatibility commands remain registered in `cli.py`; extraction does not
-change public names, JSON schemas, stdout rules, or stable exit codes. The
-decision and rejected alternatives are recorded in
-`docs/adr/0004-compatible-cli-convergence.md`.
+Managed pulls copy `outputs/` and the recovery record to the head results root.
+Compaction can remove an old private `code/` copy only after validating its
+content-addressed recovery snapshot.
+
+## Remote execution
+
+The head sends a small attested payload with every job:
+
+| Payload | Responsibility |
+|---|---|
+| `launcher.sh` | Preflight, environment sync, artifact verification, GPU probe, and managed-session start |
+| `wrapper.sh` | GPU leases, application process tree, signals, guards, telemetry, and terminal markers |
+| `telemetry.py` | Fixed-cadence GPU, CPU, memory, I/O, thermal, and process-tree samples |
+| `cuda_probe.py` | Driver-level allocation check before application start |
+| `artifact_verify.py` | Bound-input size, identity, and path verification |
+| `phase.sh` | Application-visible phase markers |
+
+The wrapper owns advisory GPU lease file descriptors for its lifetime. A GPU
+can therefore be reserved during CPU-only initialization even when
+`nvidia-smi` shows no CUDA process.
+
+Signal handling records a terminal code and reaps processes whose groups or
+sessions escaped the main application group. Unverifiable process death remains
+an explicit operational failure rather than a false terminal success.
+
+## Public workflow policies
+
+| Workflow | Policy |
+|---|---|
+| `run` | One independent current-snapshot job |
+| `batch` | Independent same-node, same-snapshot items; runtime failures continue |
+| `chain` | Same-snapshot linear dependency graph; predecessor failure stops successors |
+| `rerun` | Historical command and resources with current project code |
+| `fork` | Historical exact snapshot with explicit overrides |
+
+The CLI composes these policies from shared submission contracts. Workflow
+helpers do not implement secondary schedulers.
+
+## Source modules
+
+`src/dt/cli.py` is the Typer composition root. It preserves command names,
+stdout/stderr separation, JSON schemas, and stable exit codes.
+
+| Area | Modules |
+|---|---|
+| Configuration and state | `config.py`, `jobs.py`, `submission.py` |
+| Placement and queueing | `dispatch.py`, `agent.py`, `probe.py`, `completion.py` |
+| Remote boundaries | `remote.py`, `forwarding.py`, `sshio.py`, `lifecycle.py` |
+| Observation | `monitoring.py`, `doctor.py`, `render.py` |
+| Data recovery | `transfers.py`, `storage.py`, `compact.py` |
+| Identity | `snapshot_hash.py`, `payload_hash.py` |
+| Node runtime | `payload/` |
+
+Domain modules expose typed or pure boundaries where practical. Subprocess,
+SSH, filesystem, registry, and terminal rendering remain explicit seams so
+failure paths can be tested independently.
+
+## Repository layout
+
+```text
+dt/
+├── .github/            CI and dependency-update policy
+├── docs/               User guides, architecture, decisions, and evidence
+│   ├── adr/            Architecture decision records
+│   ├── audits/         Validation and release evidence
+│   ├── experiments/    Reproducible experiment records
+│   ├── performance/    Performance measurements
+│   ├── plans/          Historical implementation plans
+│   └── project/        Completed project history
+├── scripts/            Documentation and release verification tools
+├── src/dt/             Installable Python package and node payload
+├── tests/              Unit, integration, CLI, payload, and reliability tests
+├── bootstrap.sh        Verified release installer
+├── deploy.sh           Explicit release deployment and rollback
+├── PACKAGE_README.md   Sanitized Python package metadata README
+└── README.md           Repository product entry point
+```
+
+Generated experiment outputs, result collections, caches, virtual
+environments, and release artifacts are ignored. They do not belong in source
+snapshots or Git history.
+
+## Compatibility boundary
+
+Public command names, JSON schemas, stable exit codes, job state semantics, and
+the non-follow job-ID stdout contract are compatibility surfaces.
+
+Internal module layout is not a public Python API. Compatibility commands may
+remain registered but hidden from primary help when a simpler workflow
+supersedes them. The rationale is recorded in
+[ADR 0004](adr/0004-compatible-cli-convergence.md).

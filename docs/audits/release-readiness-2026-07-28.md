@@ -13,7 +13,8 @@ repository's proprietary license.
 
 - Product and release changes from `8e99bc0` through candidate `ed011be`.
 - The final release commit adds only this closeout record and the matching
-  `GOAL.md` state. The complete clean-tree gate must pass again on that exact
+  `docs/project/development-history.md` state. The complete clean-tree gate
+  must pass again on that exact
   commit before creating `v0.6.0`.
 - Runtime trust boundary: one trusted Unix identity across trusted Linux/SSH
   hosts, as documented in `SECURITY.md`.

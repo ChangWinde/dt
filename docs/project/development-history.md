@@ -1,4 +1,8 @@
-# GOAL
+# DistTrainer development history
+
+> Archived completion record for the 0.6 development campaign. This document
+> preserves historical goals and evidence; it is not the current user guide or
+> release roadmap.
 
 ## Vision
 

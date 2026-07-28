@@ -1,4 +1,4 @@
-# DistTrainer
+# DistTrainer (`disttrainer`)
 
 DistTrainer (`dt`) is a command-line control plane for reproducible experiments
 on shared Linux GPU servers. It discovers capacity, captures immutable project

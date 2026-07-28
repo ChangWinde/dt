@@ -2,7 +2,7 @@
 name = "disttrainer"
 version = "0.6.2"
 description = "DistTrainer: cross-center GPU experiment dispatcher for shared servers"
-readme = "README.release.md"
+readme = "PACKAGE_README.md"
 requires-python = ">=3.10,<3.12"
 license = "LicenseRef-Proprietary"
 license-files = ["LICENSE"]
@@ -45,7 +45,7 @@ packages = ["src/dt"]
 [tool.hatch.build.targets.sdist]
 only-include = [
     "src",
-    "README.release.md",
+    "PACKAGE_README.md",
     "LICENSE",
     "CHANGELOG.md",
     "SECURITY.md",
@@ -56,3 +56,8 @@ only-include = [
 
 [tool.ruff]
 extend-exclude = [".logs", "results"]
+
+[tool.ruff.lint]
+# Keep the lint contract stable across Ruff releases. New rule families are
+# adopted deliberately instead of changing implicitly on dependency updates.
+select = ["E4", "E7", "E9", "F"]

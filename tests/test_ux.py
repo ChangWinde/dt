@@ -1105,7 +1105,7 @@ def test_laptop_free_human_requests_scheduler_context(monkeypatch):
     monkeypatch.setattr(
         cli,
         "fan_json",
-        lambda cfg_, argv: (calls.append(argv) or ([row], {})),
+        lambda cfg_, argv: calls.append(argv) or ([row], {}),
     )
 
     result = CliRunner().invoke(cli.app, ["free"])
@@ -1150,7 +1150,7 @@ def test_laptop_free_explain_pins_actions_to_their_centers(monkeypatch):
     monkeypatch.setattr(
         cli,
         "fan_json",
-        lambda cfg_, argv: (calls.append(argv) or ([east, west], {})),
+        lambda cfg_, argv: calls.append(argv) or ([east, west], {}),
     )
 
     result = CliRunner().invoke(

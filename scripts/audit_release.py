@@ -14,7 +14,6 @@ FORBIDDEN_PATH_PARTS = {
     ".git",
     ".github",
     "AGENTS.md",
-    "GOAL.md",
     "bootstrap.sh",
     "deploy.sh",
     "docs",

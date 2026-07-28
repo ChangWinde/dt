@@ -2,7 +2,8 @@
 
 ## Outcome
 
-The bounded DT product goal is complete: SC-1 through SC-8 in `GOAL.md` have
+The bounded DT product goal is complete: SC-1 through SC-8 in
+`docs/project/development-history.md` have
 source, automated-test, and live-center evidence. Cleanup preserved the
 reproducible experiment record while removing caches, duplicate payloads,
 standalone smoke infrastructure, temporary fault-injection data, and
