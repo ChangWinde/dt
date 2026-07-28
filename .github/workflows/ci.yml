@@ -66,6 +66,7 @@ jobs:
       - name: Static checks
         if: matrix.python-version == '3.11'
         run: |
+          uv run --no-sync python scripts/docs.py
           uv run --no-sync ruff check .
           uv run --no-sync ruff format --check .
           uv run --no-sync mypy --strict --no-incremental \

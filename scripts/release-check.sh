@@ -82,6 +82,7 @@ if [[ "${DT_RELEASE_SKIP_SYNC:-0}" != "1" ]]; then
 fi
 
 uv run --no-sync pytest -q -p no:cacheprovider
+uv run --no-sync python scripts/docs.py
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync mypy --strict --no-incremental \
