@@ -4,7 +4,7 @@ Run reproducible experiments on shared GPU servers without hand-managed SSH
 sessions, GPU selection, environment setup, or result copies.
 
 [![CI](https://github.com/ChangWinde/dt/actions/workflows/ci.yml/badge.svg)](https://github.com/ChangWinde/dt/actions/workflows/ci.yml)
-[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB.svg)](SUPPORT.md)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB.svg)](.github/SUPPORT.md)
 [![Release](https://img.shields.io/badge/release-0.6.2-0A7BBB.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey.svg)](LICENSE)
 
@@ -254,9 +254,9 @@ Start with the [documentation index](docs/README.md).
 | New operator | [Getting started](docs/getting-started.md) |
 | Center administrator | [Configuration](docs/configuration.md) and [Operations](docs/operations.md) |
 | Researcher | [Experiment workflows](docs/workflows.md) |
-| Contributor | [Architecture](docs/architecture.md) and [Contributing](CONTRIBUTING.md) |
+| Contributor | [Architecture](docs/architecture.md) and [Contributing](.github/CONTRIBUTING.md) |
 | Release maintainer | [Release procedure](docs/releasing.md) |
-| Security reviewer | [Security policy](SECURITY.md) and [Support contract](SUPPORT.md) |
+| Security reviewer | [Security policy](.github/SECURITY.md) and [Support contract](.github/SUPPORT.md) |
 
 Design decisions, validation audits, experiment records, and performance
 reports remain in `docs/adr/`, `docs/audits/`, `docs/experiments/`, and
@@ -275,13 +275,14 @@ uv run --no-sync python scripts/docs.py
 
 Changes to queueing, process cleanup, transfer, identity, or destructive
 maintenance require both success-path and denied/failure-path regression tests.
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change.
+Read the [contribution guide](.github/CONTRIBUTING.md) before submitting a
+change.
 
 ## Security and license
 
 DistTrainer assumes one trusted Unix identity across trusted SSH hosts. It is
 not a tenant-isolation boundary or a sandbox for untrusted project code. Read
-[SECURITY.md](SECURITY.md) before deployment.
+[security policy](.github/SECURITY.md) before deployment.
 
 This repository is currently distributed under the
 [DistTrainer Proprietary License](LICENSE). No open-source usage rights are

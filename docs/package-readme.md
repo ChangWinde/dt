@@ -15,8 +15,9 @@ import package are both named `dt`.
 - `uv`, OpenSSH, rsync, tmux, flock, and timeout;
 - NVIDIA drivers and `nvidia-smi` on nodes used for GPU jobs.
 
-DistTrainer assumes one trusted Unix identity across trusted hosts. Read
-`SECURITY.md` before deployment.
+DistTrainer assumes one trusted Unix identity across trusted hosts. Read the
+[security policy](https://github.com/ChangWinde/dt/blob/main/.github/SECURITY.md)
+before deployment.
 
 ## Install
 
@@ -146,5 +147,8 @@ registry state when a managed path or deletion fails, so the operation is
 visible and retryable. Compaction fails closed unless its recovery snapshot and
 job identity are verified.
 
-See `SUPPORT.md` for the supported platform contract and `CHANGELOG.md` for
+See the
+[support contract](https://github.com/ChangWinde/dt/blob/main/.github/SUPPORT.md)
+for the supported platform contract and the
+[changelog](https://github.com/ChangWinde/dt/blob/main/CHANGELOG.md) for
 release changes.

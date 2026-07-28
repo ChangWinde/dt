@@ -83,12 +83,14 @@ fi
 
 uv run --no-sync pytest -q -p no:cacheprovider
 uv run --no-sync python scripts/docs.py
+uv run --no-sync python scripts/repo_hygiene.py
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync mypy --strict --no-incremental \
     --cache-dir="$WORK_DIR/mypy" --follow-imports=skip \
     src/dt
-bash -n src/dt/payload/*.sh bootstrap.sh deploy.sh scripts/release-check.sh
+bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
+    scripts/release-check.sh
 git diff --check
 
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"

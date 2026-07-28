@@ -67,13 +67,14 @@ jobs:
         if: matrix.python-version == '3.11'
         run: |
           uv run --no-sync python scripts/docs.py
+          uv run --no-sync python scripts/repo_hygiene.py
           uv run --no-sync ruff check .
           uv run --no-sync ruff format --check .
           uv run --no-sync mypy --strict --no-incremental \
             --cache-dir=/tmp/dt-mypy \
             --follow-imports=skip \
             src/dt
-          bash -n src/dt/payload/*.sh bootstrap.sh deploy.sh \
+          bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
             scripts/release-check.sh
           git diff --check
 

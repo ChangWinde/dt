@@ -19,8 +19,11 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   evidence indexes, and deterministic relative-link validation.
 - Contribution guidance now defines branch names, atomic commit structure,
   compatibility surfaces, required checks, and documentation ownership.
-- The sanitized Python package description is now named
-  `PACKAGE_README.md`, which makes its release-only role explicit.
+- The sanitized Python package description lives at
+  `docs/package-readme.md`, separate from the repository product overview.
+- Community policy, deployment tooling, and package metadata now live in
+  convention-owned directories; a repository-hygiene gate protects the
+  minimal tracked root layout.
 - Configuration parsing now rejects unknown keys, malformed nested values,
   duplicate nodes, multiple local-node aliases, non-finite retention values,
   and invalid YAML with actionable configuration errors.

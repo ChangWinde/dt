@@ -143,5 +143,5 @@ uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 ```
 
-Read `CONTRIBUTING.md` for the complete gate and `docs/README.md` for the
-documentation map.
+Read `.github/CONTRIBUTING.md` for the complete gate and `docs/README.md` for
+the documentation map.

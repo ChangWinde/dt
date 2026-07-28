@@ -14,8 +14,8 @@ The client or head uses Python 3.10 or 3.11. Head and compute hosts require:
 - NVIDIA drivers and `nvidia-smi` on GPU nodes.
 
 DistTrainer assumes the same trusted Unix identity across the configured hosts.
-Read the [security policy](../SECURITY.md) before operating across a shared
-account or untrusted project tree.
+Read the [security policy](../.github/SECURITY.md) before operating across a
+shared account or untrusted project tree.
 
 ## Install a release
 

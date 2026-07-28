@@ -10,7 +10,7 @@ records.
 - Executable and import package: `dt`
 - Supported Python: 3.10–3.11
 - Supported runtime: trusted-account Linux/SSH GPU centers described in
-  `SUPPORT.md` and `SECURITY.md`
+  `.github/SUPPORT.md` and `.github/SECURITY.md`
 - License: `LicenseRef-Proprietary`; publishing or distributing outside the
   authorized organization requires copyright-holder approval
 
@@ -19,8 +19,9 @@ public Python index.
 
 ## Prepare
 
-1. Reconcile `CHANGELOG.md`, `PACKAGE_README.md`, `SECURITY.md`, `SUPPORT.md`,
-   version metadata, and the intended source diff.
+1. Reconcile `CHANGELOG.md`, `docs/package-readme.md`,
+   `.github/SECURITY.md`, `.github/SUPPORT.md`, version metadata, and the
+   intended source diff.
 2. Confirm the Git worktree is clean and the current commit is the reviewed
    release source.
 3. Run the CI matrix on Python 3.10 and 3.11.
@@ -82,16 +83,16 @@ Never pass a token on the command line or store it in this repository.
 Preview and deploy only to explicit heads:
 
 ```bash
-./deploy.sh --plan dist HEAD_A HEAD_B
-./deploy.sh dist HEAD_A HEAD_B
+scripts/deploy.sh --plan dist HEAD_A HEAD_B
+scripts/deploy.sh dist HEAD_A HEAD_B
 ```
 
 Each host retains the complete verified bundle below
 `~/.local/share/disttrainer/releases/VERSION/`. To restore a retained version:
 
 ```bash
-./deploy.sh --plan --rollback 0.6.2 HEAD_A
-./deploy.sh --rollback 0.6.2 HEAD_A
+scripts/deploy.sh --plan --rollback 0.6.2 HEAD_A
+scripts/deploy.sh --rollback 0.6.2 HEAD_A
 ```
 
 After deployment, run `dt --version`, `dt doctor --json`, inspect agent status,

@@ -17,7 +17,7 @@ repository's proprietary license.
   must pass again on that exact
   commit before creating `v0.6.0`.
 - Runtime trust boundary: one trusted Unix identity across trusted Linux/SSH
-  hosts, as documented in `SECURITY.md`.
+  hosts, as documented in `.github/SECURITY.md`.
 
 ## Release-blocking findings closed
 

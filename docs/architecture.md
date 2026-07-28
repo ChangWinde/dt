@@ -135,26 +135,31 @@ from submission orchestration.
 
 ```text
 dt/
-├── .github/            CI and dependency-update policy
+├── .github/            Community policy, CI, and dependency automation
+│   ├── CONTRIBUTING.md Contribution and verification contract
+│   ├── SECURITY.md     Trust boundary and vulnerability reporting
+│   └── SUPPORT.md      Supported platform and compatibility contract
 ├── docs/               User guides, architecture, decisions, and evidence
 │   ├── adr/            Architecture decision records
 │   ├── audits/         Validation and release evidence
 │   ├── experiments/    Reproducible experiment records
+│   ├── package-readme.md  Sanitized Python package description
 │   ├── performance/    Performance measurements
 │   ├── plans/          Historical implementation plans
 │   └── project/        Completed project history
-├── scripts/            Documentation and release verification tools
+├── scripts/            Repository, release, and deployment tools
+│   ├── deploy.sh       Explicit release deployment and rollback
+│   └── repo_hygiene.py Enforced tracked-root allowlist
 ├── src/dt/             Installable Python package and node payload
 ├── tests/              Unit, integration, CLI, payload, and reliability tests
 ├── bootstrap.sh        Verified release installer
-├── deploy.sh           Explicit release deployment and rollback
-├── PACKAGE_README.md   Sanitized Python package metadata README
 └── README.md           Repository product entry point
 ```
 
 Generated experiment outputs, result collections, caches, virtual
 environments, and release artifacts are ignored. They do not belong in source
-snapshots or Git history.
+snapshots or Git history. The tracked root allowlist and its rationale are
+recorded in [ADR 0005](adr/0005-convention-first-repository-layout.md).
 
 ## Compatibility boundary
 
