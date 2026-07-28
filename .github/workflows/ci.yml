@@ -42,6 +42,7 @@ jobs:
       - name: Test
         env:
           TZ: UTC
+          UV_PYTHON: ${{ matrix.python-version }}
         run: |
           set +e
           env -u FORCE_COLOR uv run --no-sync pytest -q --tb=short \
