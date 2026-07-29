@@ -211,8 +211,9 @@ def _process_once_with_snapshot(
     - started / failed / killed / cancel-failed: move on to the next queued job
     - blocked (job-specific: missing dataset path, unfit nodes): skip it so
       it cannot starve the jobs behind it; retried next tick
-    - busy (GPU capacity): stop - strict FIFO for capacity keeps big jobs
-      from being starved by small ones
+    - busy (GPU capacity): preserve FIFO for every job that could use the same
+      capacity; a pinned wait may be skipped only for later work pinned to a
+      different node
     Returns both outcomes and the updated registry snapshot so the rest of the
     loop can make watcher/sleep decisions without another historical scan.
     """
@@ -231,11 +232,25 @@ def _process_once_with_snapshot(
     # still hold GPUs, so it consumes the max_my_jobs budget.
     running = sum(entry.status == "running" for entry in entries) + len(damage)
     results: list[tuple[str, str]] = []
+    busy_pins: set[str] = set()
     for entry in queue:
         cap = cfg.queue.max_my_jobs
         if cap is not None and running >= cap:
             results.append((entry.job_id, "capped"))
             break
+        if busy_pins and entry.gpus_requested > 0:
+            if entry.pin_node is None:
+                # An unpinned GPU job could consume capacity on every busy
+                # pin, so it overlaps the earlier waiter and restores the
+                # normal FIFO stop.
+                results.append((entry.job_id, "busy"))
+                break
+            if entry.pin_node in busy_pins:
+                # This job competes for the same capacity as an earlier pinned
+                # waiter. Keep its FIFO position while still reaching jobs
+                # whose pins are disjoint.
+                results.append((entry.job_id, "busy"))
+                continue
         outcome, detail = dispatch_queued(cfg, entry, log)
         results.append((entry.job_id, outcome))
         if blocked_log_state is not None and outcome != "blocked":
@@ -304,7 +319,9 @@ def _process_once_with_snapshot(
             if blocked_log_state is not None:
                 blocked_log_state[entry.job_id] = blocked_detail
         elif outcome == "busy":
-            break
+            if entry.pin_node is None:
+                break
+            busy_pins.add(entry.pin_node)
     if blocked_log_state is not None:
         queued_ids = {entry.job_id for entry in queue}
         for job_id in list(blocked_log_state):

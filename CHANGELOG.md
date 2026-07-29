@@ -32,6 +32,9 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- Pinned capacity waits now preserve FIFO per node instead of globally
+  blocking later jobs pinned to other nodes, preventing avoidable cross-node
+  GPU idle time without allowing same-node jobs to overtake one another.
 - Hosted CI now binds each test job to its matrix interpreter, normalizes
   timezone and styled terminal output, installs the intentional zsh
   compatibility dependency, and allows realistic wrapper cleanup latency on

@@ -129,7 +129,9 @@ dt pull baseline --collection baseline
 
 `-f` follows the submitted job and returns its process exit code. Without `-f`,
 `dt run` prints the job ID and returns after registration. When no fitting GPU
-is free, the job enters the resident FIFO queue by default.
+is free, the job enters the resident FIFO queue by default. FIFO is preserved
+among jobs that can use the same capacity; a job pinned to one busy node does
+not hold later work pinned to a different node.
 
 Write checkpoints, reports, and evaluation artifacts under
 `$DT_JOB_DIR/outputs/`. This is the recovery boundary used by `dt pull`.

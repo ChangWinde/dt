@@ -102,6 +102,10 @@ When no GPU is free, submission queues by default. `dt wait` covers both queued
 and running phases and returns the experiment process's exit code. Use
 `--no-queue` only when fail-fast behavior is required.
 
+FIFO fairness is maintained per overlapping capacity: jobs pinned to one busy
+node do not prevent later jobs pinned to another node from using that other
+node.
+
 Write checkpoints and reports below `$DT_JOB_DIR/outputs/` so recovery commands
 can find them.
 

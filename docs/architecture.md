@@ -43,8 +43,12 @@ dependencies before probing GPU capacity. A pending dependency is a
 job-specific blocker, so unrelated runnable work can pass it. A failed
 dependency becomes failed before start and never consumes a GPU lease.
 
-Capacity waits retain FIFO fairness among fitting jobs. Missing required paths
-or incompatible pins do not block unrelated candidates.
+Capacity waits retain FIFO fairness among jobs that can use the same capacity.
+A busy pinned node preserves FIFO for later jobs on that node but does not
+hold jobs pinned to different nodes behind it. Unpinned capacity waits still
+stop the walk because they may compete for every eligible node. Missing
+required paths or incompatible pins likewise do not block unrelated
+candidates.
 
 ## Data plane
 

@@ -89,6 +89,142 @@ def test_busy_head_stops_the_walk(tmp_path, monkeypatch):
     assert outcomes == [("big", "busy")]  # strict FIFO for capacity
 
 
+def test_busy_pinned_head_does_not_block_a_disjoint_pin(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry("local", "queued", created_at=1.0, pin_node="n1"),
+    )
+    save(
+        cfg,
+        _entry("remote", "queued", created_at=2.0, pin_node="n2"),
+    )
+
+    def fake_dispatch(cfg_, entry, log):
+        if entry.job_id == "local":
+            return "busy", None
+        return "started", "n2"
+
+    monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
+    outcomes = process_once(cfg, lambda m: None)
+    assert outcomes == [("local", "busy"), ("remote", "started")]
+
+
+def test_busy_pin_keeps_fifo_within_node_while_other_pin_advances(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry("local-1", "queued", created_at=1.0, pin_node="n1"),
+    )
+    save(
+        cfg,
+        _entry("local-2", "queued", created_at=2.0, pin_node="n1"),
+    )
+    save(
+        cfg,
+        _entry("remote", "queued", created_at=3.0, pin_node="n2"),
+    )
+    dispatched = []
+
+    def fake_dispatch(cfg_, entry, log):
+        dispatched.append(entry.job_id)
+        if entry.job_id == "local-1":
+            return "busy", None
+        return "started", "n2"
+
+    monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
+    outcomes = process_once(cfg, lambda m: None)
+    assert outcomes == [
+        ("local-1", "busy"),
+        ("local-2", "busy"),
+        ("remote", "started"),
+    ]
+    assert dispatched == ["local-1", "remote"]
+
+
+def test_busy_pin_stops_at_later_unpinned_gpu_work(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry(
+            "local",
+            "queued",
+            created_at=1.0,
+            pin_node="n1",
+            gpus_requested=2,
+        ),
+    )
+    save(
+        cfg,
+        _entry(
+            "anywhere",
+            "queued",
+            created_at=2.0,
+            pin_node=None,
+            gpus_requested=1,
+        ),
+    )
+    save(
+        cfg,
+        _entry(
+            "remote",
+            "queued",
+            created_at=3.0,
+            pin_node="n2",
+            gpus_requested=1,
+        ),
+    )
+    dispatched = []
+
+    def fake_dispatch(cfg_, entry, log):
+        dispatched.append(entry.job_id)
+        return "busy", None
+
+    monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
+    outcomes = process_once(cfg, lambda m: None)
+    assert outcomes == [("local", "busy"), ("anywhere", "busy")]
+    assert dispatched == ["local"]
+
+
+def test_busy_pin_does_not_hold_cpu_only_work_on_the_same_node(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry(
+            "gpu",
+            "queued",
+            created_at=1.0,
+            pin_node="n1",
+            gpus_requested=1,
+        ),
+    )
+    save(
+        cfg,
+        _entry(
+            "cpu",
+            "queued",
+            created_at=2.0,
+            pin_node="n1",
+            gpus_requested=0,
+        ),
+    )
+
+    def fake_dispatch(cfg_, entry, log):
+        if entry.job_id == "gpu":
+            return "busy", None
+        return "started", "n1"
+
+    monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
+    outcomes = process_once(cfg, lambda m: None)
+    assert outcomes == [("gpu", "busy"), ("cpu", "started")]
+
+
 def test_started_notifies_webhook(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     cfg.webhook = "http://example/hook"

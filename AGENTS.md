@@ -42,6 +42,8 @@ dt agent status --json
 
 `dt run --no-queue` restores fail-fast behavior and returns exit 2 when no
 capacity fits. A job-specific blocker does not hold up runnable work behind it.
+FIFO is preserved among jobs competing for the same capacity; a busy pinned
+node does not block later work pinned to a different node.
 
 To preload independent work on one node:
 
