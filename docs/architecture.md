@@ -23,8 +23,8 @@ flowchart LR
 
 A laptop never contacts compute nodes directly. It forwards immutable command
 arguments to a configured head. The head validates the project and submission,
-records the job, stages the exact source, and either dispatches immediately or
-queues the job.
+records the job, archives exact source and payload objects, and either
+dispatches immediately or queues a small job-specific control bundle.
 
 ## Control plane
 
@@ -63,13 +63,13 @@ payload verifies that manifest before setup or application execution.
 Each job owns:
 
 ```text
-code/                 immutable dispatched source copy
-cmd.sh                normalized application command
-meta.json             dispatch contract
-logs/                 setup and application logs
-outputs/              recoverable application and DistTrainer evidence
-exit_code              atomic terminal marker
-finished_at            node-local completion timestamp
+code/                   immutable dispatched source copy
+logs/                   setup and application logs
+outputs/                recoverable application and DistTrainer evidence
+.dt/meta.json           dispatch contract
+.dt/command.sh          normalized application command
+.dt/payload/            attested node runtime
+.dt/state/              process, GPU, timestamp, and terminal markers
 ```
 
 Managed pulls copy `outputs/` and the recovery record to the head results root.
@@ -117,11 +117,11 @@ stdout/stderr separation, JSON schemas, and stable exit codes.
 
 | Area | Modules |
 |---|---|
-| Configuration and state | `config.py`, `onboarding.py`, `jobs.py`, `submission.py` |
+| Configuration and state | `config.py`, `layout.py`, `onboarding.py`, `jobs.py`, `submission.py` |
 | Placement and queueing | `dispatch.py`, `agent.py`, `probe.py`, `completion.py` |
 | Remote boundaries | `remote.py`, `forwarding.py`, `sshio.py`, `lifecycle.py` |
 | Observation | `monitoring.py`, `doctor.py`, `render.py` |
-| Data recovery and retention | `transfers.py`, `storage.py`, `compact.py`, `maintenance.py` |
+| Data recovery and retention | `transfers.py`, `storage.py`, `migration.py`, `compact.py`, `maintenance.py` |
 | Identity | `snapshot_hash.py`, `snapshot_store.py`, `payload_hash.py` |
 | Node runtime | `payload/` |
 

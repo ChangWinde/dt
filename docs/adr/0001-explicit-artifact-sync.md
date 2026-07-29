@@ -21,8 +21,12 @@ When at least one artifact is provided, `sync` transfers only those explicit
 project-relative files or directories into:
 
 ```text
-~/dt/artifacts/<sanitized-project>/<relative-path>
+$DT_ROOT/worker/artifacts/<sanitized-project>/<relative-path>
 ```
+
+ADR 0006 later introduced the `worker/` role namespace. Legacy
+`~/dt/artifacts/` data remains compatible but is not the destination for new
+submissions.
 
 Jobs receive the absolute project artifact root in `DT_ARTIFACT_ROOT`.
 
@@ -41,7 +45,7 @@ Every artifact sync computes a deterministic manifest from project-relative
 selection paths, file/directory type, mode, byte size, and content hash. It
 rehashes the source after transfer to reject source mutation, then publishes
 the manifest at
-`~/dt/artifacts/<project>/.dt/manifests/<sha256>.json`. Manifests are
+`$DT_ROOT/worker/artifacts/<project>/.dt/manifests/<sha256>.json`. Manifests are
 content-addressed; publishing a later selection does not invalidate an earlier
 job binding.
 

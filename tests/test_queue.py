@@ -1,3 +1,4 @@
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -1295,6 +1296,9 @@ def test_queued_snapshot_repairs_local_staging_from_exact_store(
     digest = dispatch.tree_sha256(frozen)
     stored = cfg.snapshots_dir() / digest / "code"
     shutil.copytree(frozen, stored)
+    (stored.parent / "meta.json").write_text(
+        json.dumps({"snapshot_sha256": digest, "project": "p"})
+    )
 
     entry = _entry(
         "q-repair-staging",

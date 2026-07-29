@@ -35,7 +35,9 @@ Expected state:
 ## Implemented behavior
 
 1. `paths.results` optionally places recovered outputs on a dedicated head-side
-   data disk. The compatible default remains `paths.root/results`.
+   data disk. At the time of this audit the compatible default was
+   `paths.root/results`; ADR 0006 later changed new configurations to
+   `paths.root/head/results` while retaining legacy discovery.
 2. `dt pull REF... --collection NAME` always writes
    `<results>/collections/NAME/<job-id>/`. Absolute names, `..`, backslashes,
    empty names, and `--to` combinations fail before remote access.

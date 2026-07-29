@@ -36,6 +36,7 @@ This page helps operators choose a command and handle its result. Run
 | `dt attach` | Enter the job's managed tmux session |
 | `dt kill` | Terminate and verify a complete job process group |
 | `dt storage` | Inventory DistTrainer-managed storage |
+| `dt migrate layout` | Plan or apply identity-verified legacy runtime moves |
 | `dt compact` | Remove recoverable old code copies while retaining job evidence |
 | `dt clean` | Delete explicitly scoped old jobs, results, or environments |
 | `dt sync` | Incrementally stage project code or explicit large inputs |

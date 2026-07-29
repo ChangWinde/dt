@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 
 from .config import HeadConfig, Node
+from .layout import ROLE_LAYOUT, node_path_expression
 from .sshio import RemoteError, run_on
 
 GPU_ERROR = "---DT-GPU-ERROR---"
@@ -29,7 +30,8 @@ GPU_Q = (
     f"echo {GPU_ERROR}; printf '%s\\n' \"$dt_gpu_raw\"; "
     "else printf '%s\\n' \"$dt_gpu_raw\" "
     "| while IFS=, read -r idx uuid used total util temp; do "
-    'idx=$(printf %s "$idx" | tr -d " "); lease="$HOME/dt/gpu-leases/gpu-$idx.lock"; '
+    'idx=$(printf %s "$idx" | tr -d " "); '
+    'lease="${DT_GPU_LEASE_ROOT:-$HOME/dt/gpu-leases}/gpu-$idx.lock"; '
     "leased=0; lease_owner=; "
     'if [ -e "$lease" ] && command -v flock >/dev/null 2>&1 '
     '&& ! flock -n -s "$lease" -c true; then '
@@ -73,6 +75,16 @@ printf '%s,%s,%s,%s,%s,%s,%s\n' \
 """
 PROBE_CMD = f"{GPU_Q}; echo {SEP}; {APP_Q}; echo {SYS_SEP}; {SYSTEM_Q}"
 CACHE_TTL_S = 3.0
+
+
+def probe_command(lease_root: str | None = None) -> str:
+    """Build a probe bound to the same lease namespace used by launchers."""
+    if lease_root is None:
+        return PROBE_CMD
+    return (
+        f"DT_GPU_LEASE_ROOT={node_path_expression(lease_root)}; "
+        f"export DT_GPU_LEASE_ROOT; {PROBE_CMD}"
+    )
 
 
 @dataclass
@@ -255,9 +267,20 @@ def parse_probe_error(text: str) -> str | None:
     return None
 
 
-def probe_node(node: Node, mem_threshold_mib: int, timeout: float = 10) -> NodeStatus:
+def probe_node(
+    node: Node,
+    mem_threshold_mib: int,
+    timeout: float = 10,
+    *,
+    lease_root: str | None = None,
+) -> NodeStatus:
     try:
-        proc = run_on(node.name, node.local, PROBE_CMD, timeout=timeout)
+        proc = run_on(
+            node.name,
+            node.local,
+            probe_command(lease_root),
+            timeout=timeout,
+        )
     except Exception as e:  # RemoteError / TimeoutExpired
         return NodeStatus(
             node=node.name,
@@ -289,6 +312,16 @@ def probe_node(node: Node, mem_threshold_mib: int, timeout: float = 10) -> NodeS
     )
 
 
+def _probe_configured_node(cfg: HeadConfig, node: Node) -> NodeStatus:
+    if cfg.layout == ROLE_LAYOUT:
+        return probe_node(
+            node,
+            cfg.mem_threshold_mib,
+            lease_root=cfg.lease_root_for(node),
+        )
+    return probe_node(node, cfg.mem_threshold_mib)
+
+
 def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
     cache_file = cfg.cache_dir() / "probe.json"
     if use_cache and cache_file.exists():
@@ -311,9 +344,7 @@ def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
                 pass  # broken cache -> reprobe
 
     with ThreadPoolExecutor(max_workers=max(len(cfg.nodes), 1)) as pool:
-        statuses = list(
-            pool.map(lambda n: probe_node(n, cfg.mem_threshold_mib), cfg.nodes)
-        )
+        statuses = list(pool.map(lambda n: _probe_configured_node(cfg, n), cfg.nodes))
 
     tmp_name: str | None = None
     try:

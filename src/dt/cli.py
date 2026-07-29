@@ -55,6 +55,15 @@ from .dispatch import (
 from .doctor import doctor_center
 from .forwarding import HeadCommand
 from .lifecycle import termination_probe, termination_verdict
+from .layout import (
+    ROLE_LAYOUT,
+    display_node_path,
+    job_control_dir,
+    job_state_dir,
+    local_node_path,
+    node_path_expression,
+    rsync_destination,
+)
 from .monitoring import ResourceTelemetryQuery
 from .monitoring import parse_resource_jsonl as _parse_resource_jsonl  # noqa: F401
 from .monitoring import safe_phase_name as _safe_phase_name
@@ -386,7 +395,7 @@ def _job_refs(
 
 
 def _expand_node_path(rel: str) -> str:
-    return str(Path.home() / rel)
+    return os.fspath(local_node_path(rel))
 
 
 def _laptop_center(cfg: LaptopConfig, center: Optional[str]) -> str:
@@ -1527,7 +1536,7 @@ def _read_failed_start_log(
         proc = run_on(
             entry.node,
             entry.node_local,
-            f"tail -n {lines} -- {shlex.quote(path)}",
+            f"tail -n {lines} -- {node_path_expression(path)}",
             timeout=30,
         )
     except Exception as exc:
@@ -4539,12 +4548,12 @@ def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
     outputs_path = f"{entry.job_dir}/outputs"
     resources_path = f"{outputs_path}/dt/resources.jsonl"
     return (
-        f"dt_stdout={shlex.quote(stdout_path)}; "
+        f"dt_stdout={node_path_expression(stdout_path)}; "
         'dt_log_source="$dt_stdout"; '
         'dt_stdout_size=$(stat -c %s -- "$dt_stdout" 2>/dev/null || echo 0); '
         'dt_stdout_mtime=$(stat -c %Y -- "$dt_stdout" 2>/dev/null || echo 0); '
         'dt_log_mtime="$dt_stdout_mtime"; '
-        f"dt_nested=$(find {shlex.quote(outputs_path)} "
+        f"dt_nested=$(find {node_path_expression(outputs_path)} "
         "\\( -type d \\( -name .cache -o -name checkpoints \\) -prune \\) -o "
         "\\( -type f -name '*.log' -printf '%T@\\t%p\\n' \\) 2>/dev/null | "
         "sort -rn -k1,1 | head -n 1 | cut -f 2-); "
@@ -4555,8 +4564,10 @@ def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
         'dt_log_source="$dt_nested"; '
         'dt_log_mtime="$dt_nested_mtime"; '
         "fi; fi; "
-        f"dt_resource_sample=$(tail -n 1 -- {shlex.quote(resources_path)} "
+        f"dt_resource_sample=$(tail -n 1 -- {node_path_expression(resources_path)} "
         "2>/dev/null || true); "
+        'case "$dt_log_source" in "$HOME"/*) '
+        'dt_log_source="~/${dt_log_source#"$HOME"/}";; esac; '
         f"printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' "
         f'{shlex.quote(LOG_SOURCE_MARK)} "$dt_log_source" '
         f'{shlex.quote(LOG_MTIME_MARK)} "$dt_log_mtime" '
@@ -5149,7 +5160,7 @@ def _follow_job_log(
             and entry.pgid > 0
             else None
         )
-        tail_argv = [
+        tail_options = [
             *(
                 [f"--pid={wrapper_pgid}", "-s", "0.2"]
                 if wrapper_pgid is not None
@@ -5158,10 +5169,17 @@ def _follow_job_log(
             "-n",
             str(lines),
             "-F",
-            (_expand_node_path(log_path) if entry.node_local else log_path),
         ]
         try:
-            pipeline = f"{shlex.join(['tail', *tail_argv])} | LC_ALL=C tr -d '\\000'"
+            target = (
+                shlex.quote(_expand_node_path(log_path))
+                if entry.node_local
+                else node_path_expression(log_path)
+            )
+            pipeline = (
+                f"{shlex.join(['tail', *tail_options])} -- {target} "
+                "| LC_ALL=C tr -d '\\000'"
+            )
             safe_tail = ["bash", "-o", "pipefail", "-c", pipeline]
             follow_cmd = (
                 safe_tail
@@ -5571,7 +5589,7 @@ def _read_finished_failure_log(
         proc = run_on(
             entry.node,
             entry.node_local,
-            f"tail -n {error_lines} {shlex.quote(log_path)}",
+            f"tail -n {error_lines} {node_path_expression(log_path)}",
             timeout=30,
         )
         primary_tail = _sanitize_log_text(proc.stdout or "")
@@ -5599,7 +5617,7 @@ def _read_finished_failure_log(
                 referenced_proc = run_on(
                     entry.node,
                     entry.node_local,
-                    f"tail -n {error_lines} {shlex.quote(referenced_path)}",
+                    f"tail -n {error_lines} {node_path_expression(referenced_path)}",
                     timeout=30,
                 )
                 referenced_tail = _sanitize_log_text(referenced_proc.stdout or "")
@@ -6202,7 +6220,15 @@ def _job_resources(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> JsonDict | None
     node = next((node for node in cfg.nodes if node.name == entry.node), None)
     if node is None:
         return {"error": f"node {entry.node!r} is no longer configured"}
-    status = probe_node(node, cfg.mem_threshold_mib)
+    status = (
+        probe_node(
+            node,
+            cfg.mem_threshold_mib,
+            lease_root=cfg.lease_root_for(node),
+        )
+        if cfg.layout == ROLE_LAYOUT
+        else probe_node(node, cfg.mem_threshold_mib)
+    )
     if status.error:
         return {"error": status.error}
     assigned = set(entry.gpus)
@@ -7272,7 +7298,7 @@ def _phase_summary_from_text(
         "markers": timed,
         "invalid_lines": invalid,
         "tail_limit": tail_limit,
-        "path": f"~/{entry.job_dir}/outputs/dt/phases.jsonl",
+        "path": display_node_path(f"{entry.job_dir}/outputs/dt/phases.jsonl"),
     }
 
 
@@ -7312,19 +7338,21 @@ def _info_live(
     """Read remote timing, output size, dirty marker, and telemetry tail."""
     if entry.node == "-":
         return {}
-    jd = shlex.quote(entry.job_dir)
+    job = node_path_expression(entry.job_dir)
+    state = node_path_expression(job_state_dir(entry.job_dir, entry.storage_layout))
+    control = node_path_expression(job_control_dir(entry.job_dir, entry.storage_layout))
     resource_reader = ResourceTelemetryQuery(entry, resource_tail).command(
         require_file=False
     )
     probe = (
-        f"cat {jd}/started_at 2>/dev/null; echo {INFO_MARK}; "
-        f"cat {jd}/finished_at 2>/dev/null; echo {INFO_MARK}; "
-        f"du -sh {jd}/outputs 2>/dev/null | cut -f1; echo {INFO_MARK}; "
-        f"test -f {jd}/code_dirty.patch && echo yes; echo {INFO_MARK}; "
+        f"cat {state}/started_at 2>/dev/null; echo {INFO_MARK}; "
+        f"cat {state}/finished_at 2>/dev/null; echo {INFO_MARK}; "
+        f"du -sh {job}/outputs 2>/dev/null | cut -f1; echo {INFO_MARK}; "
+        f"test -f {control}/code_dirty.patch && echo yes; echo {INFO_MARK}; "
         f"{resource_reader}; "
         f"echo {INFO_MARK}; tail -n {INFO_PHASE_TAIL} "
-        f"{jd}/outputs/dt/phases.jsonl 2>/dev/null || true; echo {INFO_MARK}; "
-        f"cat {jd}/outputs/dt/resource-guard.json 2>/dev/null || true"
+        f"{job}/outputs/dt/phases.jsonl 2>/dev/null || true; echo {INFO_MARK}; "
+        f"cat {job}/outputs/dt/resource-guard.json 2>/dev/null || true"
     )
     try:
         proc = run_on(entry.node, entry.node_local, probe, timeout=10)
@@ -7670,7 +7698,14 @@ def info(
         ("duration", _fmt_duration(duration) if duration is not None else "-"),
         ("exit code", "-" if entry.exit_code is None else str(entry.exit_code)),
         ("outputs", data["outputs_size"] or "-"),
-        ("job dir", f"{entry.node}:~/{entry.job_dir}" if entry.node != "-" else "-"),
+        (
+            "job dir",
+            (
+                f"{entry.node}:{display_node_path(entry.job_dir)}"
+                if entry.node != "-"
+                else "-"
+            ),
+        ),
         ("session", entry.session),
         ("env", entry.env_hash or "-"),
     ]
@@ -7977,7 +8012,7 @@ import math
 import os
 import sys
 
-root = {root!r}
+root = os.path.expanduser({root!r})
 matches = sorted(glob.glob(os.path.join(root, {output_glob!r}), recursive=True))
 if len(matches) != 1:
     print(json.dumps({{
@@ -10034,7 +10069,7 @@ def _pull_unlocked(
         else (
             _collection_root(cfg, _collection) / entry.job_id
             if _collection
-            else cfg.results_dir() / entry.job_id
+            else cfg.job_results_dir(entry.job_id)
         )
     )
     existing_record = dst / "dt" / "job.json"
@@ -10177,10 +10212,11 @@ def _pull_unlocked(
         return paths
 
     if outputs_present:
-        src = (
-            f"{_expand_node_path(outputs_rel)}/"
-            if entry.node_local
-            else f"{entry.node}:{outputs_rel}/"
+        src = rsync_destination(
+            entry.node,
+            entry.node_local,
+            outputs_rel,
+            directory=True,
         )
         # resilient by design: --partial + 2 retries resume where the link
         # broke, with a 4h budget for multi-GB checkpoints.
@@ -10276,10 +10312,11 @@ def _pull_unlocked(
     records = confirmed_records()
 
     logs_rel = f"{entry.job_dir}/logs"
-    logs_src = (
-        f"{_expand_node_path(logs_rel)}/"
-        if entry.node_local
-        else f"{entry.node}:{logs_rel}/"
+    logs_src = rsync_destination(
+        entry.node,
+        entry.node_local,
+        logs_rel,
+        directory=True,
     )
     logs_dst = f"{records_dir}/"
     if json_:
@@ -10648,7 +10685,7 @@ def pull(
             else (
                 _collection_root(cfg, collection) / entry.job_id
                 if collection
-                else cfg.results_dir() / entry.job_id
+                else cfg.job_results_dir(entry.job_id)
             )
         ).absolute()
         try:
@@ -10690,7 +10727,15 @@ def pull(
     root = (
         Path(to).expanduser()
         if to
-        else (_collection_root(cfg, collection) if collection else cfg.results_dir())
+        else (
+            _collection_root(cfg, collection)
+            if collection
+            else (
+                cfg.results_dir() / "jobs"
+                if cfg.layout == ROLE_LAYOUT
+                else cfg.results_dir()
+            )
+        )
     ).absolute()
     if root.exists() and not root.is_dir():
         _fail_submission(
@@ -10899,6 +10944,7 @@ def _kill_one(
             sig,
             session=entry.session if uncertain_launch else None,
             cancel_sentinel=uncertain_launch,
+            layout=entry.storage_layout,
         )
         target = (
             f"uncertain launch {entry.job_id}"
@@ -11313,7 +11359,7 @@ def storage(
     ),
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Inventory DT-managed head, result, job, and environment storage."""
+    """Inventory every DT-managed head and worker storage class."""
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         route = _head_command(cfg, center, "storage").flag("--json", json_)
@@ -11357,8 +11403,9 @@ def storage(
             "",
         )
     for row in node_rows:
-        for kind in ("jobs", "envs"):
-            section = row[kind]
+        for kind, section in row.items():
+            if kind in {"node", "error", "managed_root"}:
+                continue
             assert isinstance(section, dict)
             bytes_value = section.get("bytes")
             table.add_row(
@@ -11505,6 +11552,122 @@ def compact(
 
 
 # --------------------------------------------------------------------------
+# layout migration
+# --------------------------------------------------------------------------
+
+migrate_app = typer.Typer(
+    no_args_is_help=True,
+    help="Plan and apply compatible runtime-data migrations.",
+)
+
+
+@_typed_cli_decorator(migrate_app.command("layout"))
+def migrate_layout(
+    plan: bool = typer.Option(
+        False,
+        "--plan",
+        help="inventory legacy data without changing it (the default)",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "-y",
+        "--yes",
+        help="apply only identity-verified, non-active moves",
+    ),
+    center: Optional[str] = typer.Option(
+        None,
+        "-c",
+        "--center",
+        help="(laptop) which center's head",
+    ),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Move safe legacy records and terminal jobs into role namespaces."""
+    if plan and yes:
+        _fail_submission(
+            kind="invalid_argument",
+            message="use either --plan or -y, not both",
+            exit_code=1,
+            json_=json_,
+        )
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        head = cfg.centers[_laptop_center(cfg, center)]
+        argv = ["migrate", "layout", "-y" if yes else "--plan"]
+        if json_:
+            argv.append("--json")
+        raise typer.Exit(forward_call(head, argv, tty=False))
+    if center is not None:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--center is a laptop-only option",
+            exit_code=1,
+            json_=json_,
+        )
+    if cfg.layout != ROLE_LAYOUT:
+        _fail_submission(
+            kind="configuration",
+            message="layout migration requires a role-scoped head configuration",
+            exit_code=1,
+            json_=json_,
+        )
+
+    from .migration import apply_layout, plan_layout
+
+    payload = (
+        apply_layout(
+            cfg,
+            runner=run_on,
+            log=lambda message: err.print(f"[yellow]{message}[/yellow]"),
+        )
+        if yes
+        else plan_layout(cfg, runner=run_on)
+    )
+    if json_:
+        print(json.dumps(payload))
+    else:
+        from rich.markup import escape
+
+        rows = payload["rows"]
+        assert isinstance(rows, list)
+        for raw in rows[:30]:
+            assert isinstance(raw, dict)
+            size = raw.get("bytes")
+            size_text = _format_transfer_bytes(size) if isinstance(size, int) else "-"
+            detail = f" · {escape(str(raw['blocker']))}" if raw.get("blocker") else ""
+            err.print(
+                f"[dim]{escape(str(raw['scope']))} · "
+                f"{escape(str(raw['kind']))} · "
+                f"{escape(str(raw.get('identity') or '-'))} · "
+                f"{escape(str(raw['status']))} · {size_text}{detail}[/dim]"
+            )
+        if len(rows) > 30:
+            err.print(f"[dim]... {len(rows) - 30} more paths[/dim]")
+        if yes:
+            applied = payload["applied_summary"]
+            assert isinstance(applied, dict)
+            err.print(
+                f"migrated {applied['migrated']} items · failed {applied['failed']}"
+            )
+        else:
+            summary = payload["summary"]
+            assert isinstance(summary, dict)
+            err.print(
+                f"plan: {summary.get('movable', 0)} movable · "
+                f"{summary.get('copy_verified', 0)} resumable copies · "
+                f"{summary.get('duplicate_verified', 0)} verified duplicates · "
+                f"{summary.get('blocked', 0)} blocked · "
+                f"{summary.get('review_required', 0)} review required"
+            )
+            err.print("[dim]apply verified moves with: dt migrate layout -y[/dim]")
+    if yes:
+        applied_summary = payload["applied_summary"]
+        assert isinstance(applied_summary, dict)
+        if int(applied_summary["failed"]):
+            raise typer.Exit(1)
+
+
+# --------------------------------------------------------------------------
 # agent (queue worker on the head node)
 # --------------------------------------------------------------------------
 
@@ -11538,7 +11701,7 @@ def agent_run(
 def agent_start(
     center: Optional[str] = typer.Option(None, "-c", "--center"),
 ) -> None:
-    """Start the agent in the background (logs to ~/dt/agent.log)."""
+    """Start the agent in the background (log path is shown on success)."""
     _agent_forward(["start"], center)
     from . import agent as agent_mod
 
@@ -11645,8 +11808,8 @@ def agent_install(
     _agent_forward(["install"], center)
     from . import agent as agent_mod
 
-    _need_head(_cfg())
-    line = agent_mod.install_crontab()
+    cfg = _need_head(_cfg())
+    line = agent_mod.install_crontab(cfg)
     err.print(f"crontab installed: [dim]{line}[/dim]")
 
 
@@ -12577,6 +12740,7 @@ app.command("sync", rich_help_panel="Operations")(sync)
 app.command("seed", rich_help_panel="Operations")(seed)
 app.command("doctor", rich_help_panel="Operations")(doctor)
 app.add_typer(agent_app, name="agent", rich_help_panel="Operations")
+app.add_typer(migrate_app, name="migrate", rich_help_panel="Operations")
 app.command("_find", hidden=True)(_find)
 
 

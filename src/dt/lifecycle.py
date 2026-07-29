@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import shlex
 
+from .layout import job_cancel_path, job_state_dir, node_path_expression
+
 
 def termination_probe(
     job_dir: str,
@@ -12,6 +14,7 @@ def termination_probe(
     *,
     session: str | None = None,
     cancel_sentinel: bool = False,
+    layout: str | None = None,
 ) -> str:
     """Build a remote command that signals every process belonging to a job.
 
@@ -20,7 +23,7 @@ def termination_probe(
     cancellation additionally leaves the launcher sentinel and closes tmux.
     """
     prefix = (
-        'touch "$DT_KJD/.dt-cancel" 2>/dev/null || '
+        'touch "$DT_KCANCEL" 2>/dev/null || '
         '{ echo "cancel sentinel write failed" >&2; exit 69; }; '
         if cancel_sentinel
         else ""
@@ -49,12 +52,17 @@ def termination_probe(
         "echo ALIVE"
     )
     envs = [
-        f"DT_KJD=$HOME/{shlex.quote(job_dir)}",
+        f"DT_KJD={node_path_expression(job_dir)}",
+        f"DT_KSTATE={node_path_expression(job_state_dir(job_dir, layout))}",
         f"DT_KPG={int(pgid) if pgid is not None else 0}",
         f"DT_KSIG={shlex.quote(sig)}",
     ]
     if session is not None:
         envs.append(f"DT_KSESSION={shlex.quote(session)}")
+    if cancel_sentinel:
+        envs.append(
+            f"DT_KCANCEL={node_path_expression(job_cancel_path(job_dir, layout))}"
+        )
     return f"env {' '.join(envs)} bash -c {shlex.quote(script)}"
 
 

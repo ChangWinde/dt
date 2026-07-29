@@ -46,7 +46,7 @@ default_project: policy
 
 paths:
   root: ~/dt
-  envs: /local/dt/envs
+  worker_root: /local/dt
   results: /data/dt/results
 
 mem_threshold_mib: 500
@@ -73,6 +73,7 @@ proxy: http://proxy.example.invalid:8080
 | `center` | Stable center name recorded with jobs and used by laptop routing |
 | `nodes[].name` | SSH alias or local hostname known to the operator |
 | `nodes[].local` | Run node commands locally; use for at most the intended head-local node |
+| `nodes[].root` | Optional worker base override for that node; DT derives `worker/` below it |
 
 Node order does not grant a permanent placement preference. DistTrainer probes
 eligible nodes and selects fitting capacity while respecting explicit pins and
@@ -102,13 +103,18 @@ Absolute paths and `..` are rejected in `setup_inputs`.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `paths.root` | `~/dt` | Head registry, queue, cache, snapshots, state, and default results |
-| `paths.envs` | `~/dt/envs` | Compute-node shared `uv` environments |
-| `paths.results` | `<root>/results` | Head-side destination for managed pulls |
+| `paths.root` | `~/dt` | Head runtime base; DT owns `<root>/head/` |
+| `paths.worker_root` | `~/dt` | Default worker runtime base; DT owns `<worker_root>/worker/` |
+| `paths.envs` | `<worker_root>/worker/envs` | Optional compute-node environment override |
+| `paths.results` | `<root>/head/results` | Optional head-side managed-pull root override |
 
-Place `paths.envs` on node-local storage when home directories use slow NFS.
+Set `nodes[].root` when workers use different data disks. Use `paths.envs` only
+when environments must live outside the worker namespace.
 Place `paths.results` outside source worktrees. This prevents checkpoints and
 pulled reports from polluting code snapshots.
+
+All managed roots must be absolute or begin with `~/`; `/`, `~`, relative
+paths, and `..` components are rejected.
 
 ### Queue policy
 

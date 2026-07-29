@@ -79,8 +79,7 @@ projects:
 default_project: policy
 paths:
   root: ~/dt
-  envs: ~/dt/envs
-  results: ~/dt/results
+  worker_root: ~/dt
 queue:
   poll_s: 60
   active_poll_s: 2

@@ -8,6 +8,24 @@ set -u
 # them. The launcher supplies the one authoritative managed env below.
 unset VIRTUAL_ENV UV_PROJECT_ENVIRONMENT
 
+: "${DT_JOB_DIR:?}"
+DT_CONTROL_DIR="${DT_CONTROL_DIR:-$DT_JOB_DIR}"
+DT_PAYLOAD_DIR="${DT_PAYLOAD_DIR:-$DT_JOB_DIR}"
+DT_STATE_DIR="${DT_STATE_DIR:-$DT_JOB_DIR}"
+DT_OUTPUT_DIR="${DT_OUTPUT_DIR:-$DT_JOB_DIR/outputs}"
+DT_META_PATH="${DT_META_PATH:-$DT_JOB_DIR/meta.json}"
+DT_COMMAND_PATH="${DT_COMMAND_PATH:-$DT_JOB_DIR/cmd.sh}"
+DT_BIN_DIR="${DT_BIN_DIR:-$DT_JOB_DIR/.dt-bin}"
+DT_CACHE_ROOT="${DT_CACHE_ROOT:-$HOME/dt}"
+DT_GPU_LEASE_ROOT="${DT_GPU_LEASE_ROOT:-$HOME/dt/gpu-leases}"
+mkdir -p "$DT_STATE_DIR" "$DT_OUTPUT_DIR" "$DT_GPU_LEASE_ROOT" \
+         "$DT_CONTROL_DIR/tmp" "$DT_CACHE_ROOT/tools/xdg" \
+         "$DT_CACHE_ROOT/tools/uv" "$DT_CACHE_ROOT/tools/torch"
+export TMPDIR="${TMPDIR:-$DT_CONTROL_DIR/tmp}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$DT_CACHE_ROOT/tools/xdg}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$DT_CACHE_ROOT/tools/uv}"
+export TORCH_HOME="${TORCH_HOME:-$DT_CACHE_ROOT/tools/torch}"
+
 dt_timestamp() {
     local value
     value=$(date +%s.%N 2>/dev/null) || value=""
@@ -116,10 +134,10 @@ dt_reap_escapees() {
 # a no-op there.
 dt_record_completion() {
     local dt_rc=$1
-    [ -f "$DT_JOB_DIR/exit_code" ] && return
-    dt_timestamp > "$DT_JOB_DIR/finished_at"
-    printf '%s\n' "$dt_rc" > "$DT_JOB_DIR/exit_code.tmp.$$"
-    mv "$DT_JOB_DIR/exit_code.tmp.$$" "$DT_JOB_DIR/exit_code"
+    [ -f "$DT_STATE_DIR/exit_code" ] && return
+    dt_timestamp > "$DT_STATE_DIR/finished_at"
+    printf '%s\n' "$dt_rc" > "$DT_STATE_DIR/exit_code.tmp.$$"
+    mv "$DT_STATE_DIR/exit_code.tmp.$$" "$DT_STATE_DIR/exit_code"
 }
 dt_signal_exit() {
     local dt_signal=$1 dt_rc=$2
@@ -148,10 +166,10 @@ trap 'dt_signal_exit TERM 143' TERM
 # advisory locks for the lifetime of this shell (and escaped children).
 dt_gpu_lease_fds=()
 if [ -n "${DT_GPU_IDS:-}" ]; then
-    mkdir -p "$HOME/dt/gpu-leases"
+    mkdir -p "$DT_GPU_LEASE_ROOT"
     IFS=',' read -ra dt_gpu_indices <<<"$DT_GPU_IDS"
     for dt_gpu_index in "${dt_gpu_indices[@]}"; do
-        dt_gpu_lock="$HOME/dt/gpu-leases/gpu-$dt_gpu_index.lock"
+        dt_gpu_lock="$DT_GPU_LEASE_ROOT/gpu-$dt_gpu_index.lock"
         exec {dt_gpu_lease_fd}>"$dt_gpu_lock"
         if ! flock -n "$dt_gpu_lease_fd"; then
             echo "[wrapper] GPU $dt_gpu_index lease is already held" >&2
@@ -162,14 +180,14 @@ if [ -n "${DT_GPU_IDS:-}" ]; then
     done
 fi
 
-echo $$ > "$DT_JOB_DIR/pgid"
-dt_timestamp > "$DT_JOB_DIR/started_at"
+echo $$ > "$DT_STATE_DIR/pgid"
+dt_timestamp > "$DT_STATE_DIR/started_at"
 
 cd "$DT_JOB_DIR/code"
 
 # Immutable code snapshots intentionally omit .git. Give applications a
 # stable path to the dispatch metadata instead of making them infer it.
-export DT_META_PATH="$DT_JOB_DIR/meta.json"
+export DT_META_PATH
 
 # Shared uv environments contain an editable install from whichever snapshot
 # synced most recently. Put this job's own root/src-layout source first so
@@ -178,10 +196,10 @@ export PYTHONPATH="$DT_JOB_DIR/code:$DT_JOB_DIR/code/src${PYTHONPATH:+:$PYTHONPA
 
 # Resource history belongs to the job, not the client connection. Store it
 # under outputs/ so `dt pull` recovers it even when the application is silent.
-mkdir -p "$DT_JOB_DIR/outputs/dt"
-if [ -f "$DT_JOB_DIR/phase.sh" ]; then
-    chmod 700 "$DT_JOB_DIR/phase.sh" 2>/dev/null || true
-    export DT_PHASE="$DT_JOB_DIR/phase.sh"
+mkdir -p "$DT_OUTPUT_DIR/dt"
+if [ -f "$DT_PAYLOAD_DIR/phase.sh" ]; then
+    chmod 700 "$DT_PAYLOAD_DIR/phase.sh" 2>/dev/null || true
+    export DT_PHASE="$DT_PAYLOAD_DIR/phase.sh"
     export DT_PHASE_FILE="$DT_JOB_DIR/outputs/dt/phases.jsonl"
     export DT_PHASE_CURRENT="$DT_JOB_DIR/outputs/dt/phase-current"
     : >"$DT_PHASE_FILE"
@@ -254,7 +272,7 @@ if [ -n "${DT_MAX_VRAM_MIB:-}" ] || [ -n "${DT_MAX_JOB_MEMORY_MIB:-}" ]; then
         echo "[wrapper] cannot arm resource guard: python3 is unavailable" >&2
         exit 76
     fi
-    if [ ! -f "$DT_JOB_DIR/telemetry.py" ]; then
+    if [ ! -f "$DT_PAYLOAD_DIR/telemetry.py" ]; then
         echo "[wrapper] cannot arm resource guard: telemetry payload is missing" >&2
         exit 76
     fi
@@ -271,7 +289,7 @@ if [ -n "${DT_MAX_HOURS:-}" ] && ! command -v timeout >/dev/null 2>&1; then
     echo "[wrapper] cannot enforce --max-hours: timeout is unavailable" >&2
     exit 76
 fi
-if command -v python3 >/dev/null 2>&1 && [ -f "$DT_JOB_DIR/telemetry.py" ]; then
+if command -v python3 >/dev/null 2>&1 && [ -f "$DT_PAYLOAD_DIR/telemetry.py" ]; then
     dt_telemetry_args=(
         --output "$DT_JOB_DIR/outputs/dt/resources.jsonl" \
         --gpus "${DT_GPU_IDS:-}" --root-pid "$$" --interval 1 \
@@ -292,7 +310,7 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$DT_JOB_DIR/telemetry.py" ]; then
             --max-job-memory-mib "$DT_MAX_JOB_MEMORY_MIB"
         )
     fi
-    python3 "$DT_JOB_DIR/telemetry.py" "${dt_telemetry_args[@]}" \
+    python3 "$DT_PAYLOAD_DIR/telemetry.py" "${dt_telemetry_args[@]}" \
         >>"$DT_JOB_DIR/logs/telemetry.log" 2>&1 &
     dt_telemetry_pid=$!
 fi
@@ -301,6 +319,8 @@ fi
 # for projects without uv.lock. Never alter the node-wide interpreter.
 if [ -d "$DT_JOB_DIR/.dt-bin" ]; then
     export PATH="$DT_JOB_DIR/.dt-bin:$PATH"
+elif [ -d "$DT_BIN_DIR" ]; then
+    export PATH="$DT_BIN_DIR:$PATH"
 fi
 
 # line-buffered logs: stdout goes to a file, and block buffering would hide
@@ -322,11 +342,11 @@ if [ -n "${DT_PROXY:-}" ]; then
            NO_PROXY="localhost,127.0.0.1" no_proxy="localhost,127.0.0.1"
 fi
 
-runner=(bash "$DT_JOB_DIR/cmd.sh")
+runner=(bash "$DT_COMMAND_PATH")
 if [ -n "${DT_UV_ENV:-}" ]; then
     export UV_PROJECT_ENVIRONMENT="$DT_UV_ENV"
     export UV_PYTHON_PREFERENCE=only-managed
-    runner=("$DT_UV" run --no-sync bash "$DT_JOB_DIR/cmd.sh")
+    runner=("$DT_UV" run --no-sync bash "$DT_COMMAND_PATH")
 fi
 if command -v stdbuf >/dev/null 2>&1; then
     runner=(stdbuf -oL -eL "${runner[@]}")
@@ -380,7 +400,7 @@ dt_record_lifecycle_event "completion_recorded"
 if [ -n "${DT_WEBHOOK:-}" ]; then
     dt_webhook_finished=$(dt_timestamp)
     dt_webhook_started=$(
-        cat "$DT_JOB_DIR/started_at" 2>/dev/null || printf '%s\n' "$dt_webhook_finished"
+        cat "$DT_STATE_DIR/started_at" 2>/dev/null || printf '%s\n' "$dt_webhook_finished"
     )
     dur=$(awk -v start="$dt_webhook_started" -v finish="$dt_webhook_finished" \
         'BEGIN { value=finish-start; if (value < 0) value=0; printf "%.3f", value }')
