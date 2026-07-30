@@ -92,8 +92,7 @@ projects:
 default_project: policy
 paths:
   root: ~/dt
-  envs: ~/dt/envs
-  results: ~/dt/results
+  worker_root: ~/dt
 queue:
   poll_s: 60
   active_poll_s: 2
@@ -129,7 +128,9 @@ dt pull baseline --collection baseline
 
 `-f` follows the submitted job and returns its process exit code. Without `-f`,
 `dt run` prints the job ID and returns after registration. When no fitting GPU
-is free, the job enters the resident FIFO queue by default.
+is free, the job enters the resident FIFO queue by default. FIFO is preserved
+among jobs that can use the same capacity; a job pinned to one busy node does
+not hold later work pinned to a different node.
 
 Write checkpoints, reports, and evaluation artifacts under
 `$DT_JOB_DIR/outputs/`. This is the recovery boundary used by `dt pull`.
@@ -193,6 +194,7 @@ code, which makes fix-and-retry lineage explicit.
 ```bash
 dt pull baseline --lite
 dt storage
+dt migrate layout --plan
 dt compact --before 2026-07-01 --plan
 dt clean --before 2026-07-01 --plan
 ```
@@ -226,6 +228,19 @@ runtime payload. Compute nodes hold GPU leases and execute the job in a managed
 session. Every terminal path records an exit marker or an explicit lost-state
 reason.
 
+Runtime data is role-scoped below the configured base:
+
+```text
+~/dt/
+├── head/       registry, queue, immutable objects, managed pulls, cache
+└── worker/     job capsules, environments, artifacts, cache, leases
+```
+
+Each worker job is one capsule containing `code/`, `outputs/`, `logs/`, and a
+private `.dt/` control directory. Project worktrees and DT configuration stay
+outside this runtime root. Existing flat-layout jobs remain readable; use
+`dt migrate layout --plan` before moving any verified terminal data.
+
 See [Architecture](docs/architecture.md) for module boundaries, data flow, and
 the repository layout.
 
@@ -238,7 +253,7 @@ the repository layout.
 | Observe work | `dt ps`, `dt watch`, `dt info`, `dt logs`, `dt metrics` |
 | Wait or recover | `dt wait`, `dt pull`, `dt attach` |
 | Iterate | `dt rerun`, `dt fork`, `dt compare` |
-| Operate the service | `dt agent`, `dt storage`, `dt compact`, `dt clean`, `dt kill` |
+| Operate the service | `dt agent`, `dt storage`, `dt migrate`, `dt compact`, `dt clean`, `dt kill` |
 | Prepare remote data | `dt sync`, `dt seed` |
 
 The [command reference](docs/command-reference.md) explains command selection,

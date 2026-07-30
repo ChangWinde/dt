@@ -14,6 +14,8 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
+from .layout import LEGACY_LAYOUT, ROLE_LAYOUT, node_path, normalize_node_root
+
 
 class ConfigError(Exception):
     pass
@@ -27,6 +29,7 @@ def config_path() -> Path:
 class Node:
     name: str
     local: bool = False
+    root: str | None = None
 
 
 @dataclass
@@ -60,8 +63,10 @@ class HeadConfig:
     default_project: str | None
     root: Path
     envs: str  # node-side path, tilde expanded on the node (homes may differ)
+    worker_root: str = "~/dt"
+    envs_explicit: bool = True
     results_root: Path | None = (
-        None  # head-side recovered outputs; defaults to root/results
+        None  # head-side recovered outputs; defaults to head/results
     )
     mem_threshold_mib: int = 500
     disk_min_gib: int = 10
@@ -71,24 +76,89 @@ class HeadConfig:
     snapshot_warn_gib: float = 2.0  # warn when a snapshot transfers more
     proxy: str | None = None  # HTTP(S) proxy injected into jobs (uv sync + runtime)
     role: str = "head"
+    layout: str = LEGACY_LAYOUT
+
+    @property
+    def head_root(self) -> Path:
+        return self.root / "head" if self.layout == ROLE_LAYOUT else self.root
+
+    def worker_root_for(self, node: Node) -> str:
+        return node.root or self.worker_root
+
+    def worker_path(self, node: Node, *parts: str) -> str:
+        if self.layout == ROLE_LAYOUT:
+            return node_path(self.worker_root_for(node), "worker", *parts)
+        return node_path(self.worker_root_for(node), *parts)
+
+    def worker_job_dir(self, node: Node, job_id: str) -> str:
+        return self.worker_path(node, "jobs", job_id)
+
+    def envs_for(self, node: Node) -> str:
+        if self.envs_explicit:
+            return self.envs
+        return self.worker_path(node, "envs")
+
+    def cache_root_for(self, node: Node) -> str:
+        if self.layout == ROLE_LAYOUT:
+            return self.worker_path(node, "cache")
+        return self.worker_root_for(node)
+
+    def runtime_root_for(self, node: Node) -> str:
+        if self.layout == ROLE_LAYOUT:
+            return self.worker_path(node, "runtime")
+        return self.worker_root_for(node)
+
+    def lease_root_for(self, node: Node) -> str:
+        if self.layout == ROLE_LAYOUT:
+            return self.worker_path(node, "runtime", "leases")
+        return node_path(self.worker_root_for(node), "gpu-leases")
 
     @property
     def jobs_dir(self) -> str:
-        # Path on *compute nodes*, relative to the node's home.
+        # Compatibility helper for call sites that have not selected a node.
+        if self.layout == ROLE_LAYOUT:
+            return node_path(self.worker_root, "worker", "jobs")
         return "dt/jobs"
 
     def registry_dir(self) -> Path:
-        d = self.root / "registry"
+        d = (
+            self.head_root / "state" / "registry"
+            if self.layout == ROLE_LAYOUT
+            else self.root / "registry"
+        )
         d.mkdir(parents=True, exist_ok=True)
         return d
 
     def cache_dir(self) -> Path:
-        d = self.root / "cache"
+        d = self.head_root / "cache"
         d.mkdir(parents=True, exist_ok=True)
         return d
 
     def state_dir(self) -> Path:
-        d = self.root / "state"
+        d = (
+            self.head_root / "state" / "locks"
+            if self.layout == ROLE_LAYOUT
+            else self.root / "state"
+        )
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def control_state_dir(self) -> Path:
+        """Head metadata root; coordination lock files stay in ``state_dir``."""
+        d = (
+            self.head_root / "state"
+            if self.layout == ROLE_LAYOUT
+            else self.root / "state"
+        )
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def agent_dir(self) -> Path:
+        d = (
+            self.head_root / "state" / "agent"
+            if self.layout == ROLE_LAYOUT
+            else self.root
+        )
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -96,13 +166,24 @@ class HeadConfig:
         d = (
             self.results_root
             if self.results_root is not None
-            else self.root / "results"
+            else self.head_root / "results"
         )
         d.mkdir(parents=True, exist_ok=True)
         return d
 
+    def job_results_dir(self, job_id: str) -> Path:
+        """Return the default recovered-output directory for one job."""
+        root = self.results_dir()
+        if self.layout == ROLE_LAYOUT:
+            root /= "jobs"
+        return root / job_id
+
     def queue_dir(self) -> Path:
-        d = self.root / "queue"
+        d = (
+            self.head_root / "state" / "queue"
+            if self.layout == ROLE_LAYOUT
+            else self.root / "queue"
+        )
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -114,9 +195,45 @@ class HeadConfig:
         files to one another, while every dispatched job receives its own
         inode copy.
         """
-        d = self.root / "snapshots"
+        d = (
+            self.head_root / "snapshots" / "source"
+            if self.layout == ROLE_LAYOUT
+            else self.root / "snapshots"
+        )
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def payloads_dir(self) -> Path:
+        d = self.head_root / "snapshots" / "payload"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def quarantine_dir(self) -> Path:
+        d = (
+            self.head_root / "quarantine"
+            if self.layout == ROLE_LAYOUT
+            else self.root / "recovery"
+        )
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def legacy_registry_dir(self) -> Path:
+        return self.root / "registry"
+
+    def legacy_queue_dir(self) -> Path:
+        return self.root / "queue"
+
+    def legacy_snapshots_dir(self) -> Path:
+        return self.root / "snapshots"
+
+    def legacy_results_dir(self) -> Path:
+        return self.results_root or self.root / "results"
+
+    def legacy_cache_dir(self) -> Path:
+        return self.root / "cache"
+
+    def legacy_recovery_dir(self) -> Path:
+        return self.root / "recovery"
 
 
 @dataclass
@@ -198,12 +315,20 @@ def _parse_nodes(raw: object) -> list[Node]:
             name = _nonempty_string(item, "nodes[].name")
             nodes.append(Node(name=name))
         elif isinstance(item, dict):
-            _reject_unknown(item, {"name", "local"}, "node entry")
+            _reject_unknown(item, {"name", "local", "root"}, "node entry")
             name = _nonempty_string(item.get("name"), "nodes[].name")
             local = item.get("local", False)
             if not isinstance(local, bool):
                 raise ConfigError("`nodes[].local` must be true or false")
-            nodes.append(Node(name=name, local=local))
+            raw_root = item.get("root")
+            root: str | None = None
+            if raw_root is not None:
+                root_text = _nonempty_string(raw_root, "nodes[].root")
+                try:
+                    root = normalize_node_root(root_text)
+                except ValueError as exc:
+                    raise ConfigError(f"`nodes[].root` {exc}") from None
+            nodes.append(Node(name=name, local=local, root=root))
         else:
             raise ConfigError(f"bad node entry: {item!r}")
     if not nodes:
@@ -291,17 +416,50 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         )
         center = _nonempty_string(data["center"], "center")
         paths = _optional_mapping(data, "paths")
-        _reject_unknown(paths, {"root", "envs", "results"}, "paths")
-        root = Path(
-            _nonempty_string(paths.get("root", "~/dt"), "paths.root")
-        ).expanduser()
-        envs = _nonempty_string(paths.get("envs", "~/dt/envs"), "paths.envs")
-        results_value = paths.get("results")
-        results_root = (
-            Path(_nonempty_string(results_value, "paths.results")).expanduser()
-            if results_value is not None
-            else None
+        _reject_unknown(
+            paths,
+            {"root", "worker_root", "envs", "results"},
+            "paths",
         )
+        raw_head_root = _nonempty_string(
+            paths.get("root", "~/dt"),
+            "paths.root",
+        )
+        try:
+            head_root_text = normalize_node_root(raw_head_root)
+        except ValueError as exc:
+            raise ConfigError(f"`paths.root` {exc}") from None
+        root = Path(head_root_text).expanduser()
+        raw_worker_root = _nonempty_string(
+            paths.get("worker_root", "~/dt"),
+            "paths.worker_root",
+        )
+        try:
+            worker_root = normalize_node_root(raw_worker_root)
+        except ValueError as exc:
+            raise ConfigError(f"`paths.worker_root` {exc}") from None
+        envs_explicit = "envs" in paths
+        raw_envs = _nonempty_string(
+            paths.get(
+                "envs",
+                node_path(worker_root, "worker", "envs"),
+            ),
+            "paths.envs",
+        )
+        try:
+            envs = normalize_node_root(raw_envs)
+        except ValueError as exc:
+            raise ConfigError(f"`paths.envs` {exc}") from None
+        results_value = paths.get("results")
+        if results_value is not None:
+            raw_results = _nonempty_string(results_value, "paths.results")
+            try:
+                results_path = normalize_node_root(raw_results)
+            except ValueError as exc:
+                raise ConfigError(f"`paths.results` {exc}") from None
+            results_root = Path(results_path).expanduser()
+        else:
+            results_root = None
         raw_projects = _optional_mapping(data, "projects")
         projects: dict[str, Project] = {}
         for raw_name, p in raw_projects.items():
@@ -441,6 +599,8 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             default_project=default_project,
             root=root,
             envs=envs,
+            worker_root=worker_root,
+            envs_explicit=envs_explicit,
             results_root=results_root,
             mem_threshold_mib=mem_threshold_mib,
             disk_min_gib=disk_min_gib,
@@ -449,6 +609,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             snapshot_excludes=excludes,
             snapshot_warn_gib=snapshot_warn_gib,
             proxy=proxy,
+            layout=ROLE_LAYOUT,
         )
 
     raise ConfigError("config must contain `centers` (laptop) or `center` (head)")

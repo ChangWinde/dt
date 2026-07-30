@@ -1,6 +1,6 @@
 """Job ids, registry (head-side source of truth), and the state model:
 
-queued   - waiting in the head-side queue, code staged under ~/dt/queue/
+queued   - waiting in the head-side queue; exact source/payload objects retained
 running  - pgid alive on the node
 finished - exit_code file exists
 killed   - marked by `dt kill` (wrapper may not get to write exit_code)
@@ -25,6 +25,12 @@ from datetime import datetime
 from pathlib import Path
 
 from .config import HeadConfig
+from .layout import (
+    LEGACY_LAYOUT,
+    ROLE_LAYOUT,
+    job_state_dir,
+    node_path_expression,
+)
 from .sshio import run_on
 
 NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
@@ -34,13 +40,13 @@ UNCERTAIN_LAUNCH_PREFIX = "launch outcome uncertain: "
 
 
 def agent_wake_path(cfg: HeadConfig) -> Path:
-    return cfg.root / "agent.wake"
+    return cfg.agent_dir() / "agent.wake"
 
 
 def request_agent_wake(cfg: HeadConfig) -> None:
     """Best-effort nudge for the resident queue agent."""
     try:
-        cfg.root.mkdir(parents=True, exist_ok=True)
+        cfg.agent_dir().mkdir(parents=True, exist_ok=True)
         agent_wake_path(cfg).touch()
     except OSError:
         pass
@@ -119,6 +125,12 @@ class JobEntry:
     # first copies it into this job's outputs so runtime writes are isolated.
     # None on old registry rows is interpreted as the legacy shared mode.
     cache_mode: str | None = None
+    # Filesystem provenance. Missing values identify pre-role-layout records.
+    storage_layout: str | None = None
+    worker_root: str | None = None
+    worker_roots: dict[str, str] = field(default_factory=dict)
+    job_relpath: str | None = None
+    recovered_at: float | None = None
 
     def created_str(self) -> str:
         return datetime.fromtimestamp(self.created_at).strftime("%m-%d %H:%M")
@@ -170,12 +182,15 @@ def compact_job_refs(
     )
 
 
-def _decode_entry(raw: object) -> JobEntry:
+def _decode_entry(raw: object, *, layout: str | None = None) -> JobEntry:
     if not isinstance(raw, dict):
         raise TypeError("job registry entry must be a JSON object")
-    return JobEntry(
+    entry = JobEntry(
         **{key: value for key, value in raw.items() if key in _JOB_ENTRY_FIELDS}
     )
+    if entry.storage_layout is None and layout is not None:
+        entry.storage_layout = layout
+    return entry
 
 
 @dataclass(frozen=True)
@@ -187,7 +202,17 @@ class RegistryDamage:
 
 
 def save(cfg: HeadConfig, entry: JobEntry) -> None:
-    path = cfg.registry_dir() / f"{entry.job_id}.json"
+    if entry.storage_layout is None and cfg.layout == ROLE_LAYOUT:
+        entry.storage_layout = ROLE_LAYOUT
+    legacy_path = cfg.legacy_registry_dir() / f"{entry.job_id}.json"
+    if (
+        cfg.layout == ROLE_LAYOUT
+        and entry.storage_layout == LEGACY_LAYOUT
+        and legacy_path.exists()
+    ):
+        path = legacy_path
+    else:
+        path = cfg.registry_dir() / f"{entry.job_id}.json"
     fd, tmp = tempfile.mkstemp(
         prefix=f".{entry.job_id}.",
         suffix=".tmp",
@@ -204,16 +229,38 @@ def save(cfg: HeadConfig, entry: JobEntry) -> None:
             pass
 
 
+def remove_record(cfg: HeadConfig, job_id: str) -> None:
+    """Remove every compatible registry copy so an old row cannot reappear."""
+    paths = {
+        cfg.registry_dir() / f"{job_id}.json",
+        cfg.legacy_registry_dir() / f"{job_id}.json",
+    }
+    for path in paths:
+        path.unlink(missing_ok=True)
+
+
 @contextmanager
 def job_lock(cfg: HeadConfig, job_id: str) -> Iterator[None]:
     """Serialize status probes and destructive lifecycle transitions."""
-    path = cfg.registry_dir() / f".{job_id}.lock"
-    with path.open("w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    paths: list[Path] = []
+    if cfg.layout == ROLE_LAYOUT and cfg.legacy_registry_dir().is_dir():
+        paths.append(cfg.legacy_registry_dir() / f".{job_id}.lock")
+    paths.append(cfg.state_dir() / f"job-{job_id}.lock")
+    locks = []
+    try:
+        for path in paths:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = path.open("w")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            locks.append(descriptor)
         try:
             yield
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            for descriptor in reversed(locks):
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        for descriptor in reversed(locks):
+            descriptor.close()
 
 
 @contextmanager
@@ -231,10 +278,14 @@ def pull_destination_lock(cfg: HeadConfig, destination: Path) -> Iterator[None]:
 
 
 def load(cfg: HeadConfig, job_id: str) -> JobEntry | None:
-    path = cfg.registry_dir() / f"{job_id}.json"
-    if not path.exists():
-        return None
-    return _decode_entry(json.loads(path.read_text()))
+    candidates = [(cfg.registry_dir() / f"{job_id}.json", cfg.layout)]
+    legacy = cfg.legacy_registry_dir() / f"{job_id}.json"
+    if legacy != candidates[0][0]:
+        candidates.append((legacy, LEGACY_LAYOUT))
+    for path, layout in candidates:
+        if path.exists():
+            return _decode_entry(json.loads(path.read_text()), layout=layout)
+    return None
 
 
 def list_all(
@@ -248,16 +299,24 @@ def list_all(
     but it is never silently dropped: callers that make capacity decisions or
     show state to a human receive it through ``damage``.
     """
-    entries = []
-    for f in sorted(cfg.registry_dir().glob("*.json")):
-        try:
-            entries.append(_decode_entry(json.loads(f.read_text())))
-        except Exception as exc:
-            if damage is not None:
-                detail = " ".join(str(exc).split()) or type(exc).__name__
-                damage.append(RegistryDamage(path=f.name, detail=detail))
+    entries: dict[str, JobEntry] = {}
+    directories = [(cfg.legacy_registry_dir(), LEGACY_LAYOUT)]
+    current = cfg.registry_dir()
+    if current != cfg.legacy_registry_dir():
+        directories.append((current, cfg.layout))
+    for directory, layout in directories:
+        if not directory.is_dir():
             continue
-    return entries
+        for f in sorted(directory.glob("*.json")):
+            try:
+                entry = _decode_entry(json.loads(f.read_text()), layout=layout)
+                entries[entry.job_id] = entry
+            except Exception as exc:
+                if damage is not None:
+                    detail = " ".join(str(exc).split()) or type(exc).__name__
+                    damage.append(RegistryDamage(path=f.name, detail=detail))
+                continue
+    return [entries[job_id] for job_id in sorted(entries)]
 
 
 def running_count(cfg: HeadConfig) -> int:
@@ -381,17 +440,19 @@ def _refresh_status_locked(
         )
     if entry.status not in ("running", "lost"):
         return entry
+    state_dir = job_state_dir(entry.job_dir, entry.storage_layout)
+    state = node_path_expression(state_dir)
     probe = (
         "cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo UNKNOWN; "
         f"echo {STATUS_MARK}; "
-        f"if dt_rc=$(cat {entry.job_dir}/exit_code 2>/dev/null); then "
+        f"if dt_rc=$(cat {state}/exit_code 2>/dev/null); then "
         'printf "%s\\n" "$dt_rc"; '
-        f"cat {entry.job_dir}/started_at 2>/dev/null || echo UNKNOWN; "
-        f"cat {entry.job_dir}/finished_at 2>/dev/null || echo UNKNOWN; "
+        f"cat {state}/started_at 2>/dev/null || echo UNKNOWN; "
+        f"cat {state}/finished_at 2>/dev/null || echo UNKNOWN; "
         f"elif kill -0 {entry.pgid} 2>/dev/null; then "
-        f"echo RUNNING; cat {entry.job_dir}/started_at 2>/dev/null "
+        f"echo RUNNING; cat {state}/started_at 2>/dev/null "
         "|| echo UNKNOWN; echo UNKNOWN; "
-        f"else echo LOST; cat {entry.job_dir}/started_at 2>/dev/null "
+        f"else echo LOST; cat {state}/started_at 2>/dev/null "
         "|| echo UNKNOWN; echo UNKNOWN; fi"
     )
     try:
@@ -501,7 +562,7 @@ def _refresh_status_locked(
             if not entry.reason:
                 entry.reason = (
                     f"wrapper pid {entry.pgid} is not running and "
-                    f"{entry.job_dir}/exit_code is missing"
+                    f"{state_dir}/exit_code is missing"
                 )
                 entry.finished_at = entry.finished_at or time.time()
                 save(cfg, entry)
@@ -509,7 +570,7 @@ def _refresh_status_locked(
         entry.status = "lost"
         entry.reason = (
             f"wrapper pid {entry.pgid} is not running and "
-            f"{entry.job_dir}/exit_code is missing"
+            f"{state_dir}/exit_code is missing"
         )
         entry.finished_at = time.time()
     save(cfg, entry)

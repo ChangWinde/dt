@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -10,6 +9,7 @@ from threading import Event
 from typing import Callable, Iterable
 
 from .jobs import JobEntry
+from .layout import job_state_dir, node_path_expression
 from .sshio import ssh_cmd
 
 
@@ -17,9 +17,11 @@ def completion_watch_command(entry: JobEntry) -> str:
     """Wait remotely for one wrapper to publish completion or disappear."""
     if entry.pgid is None:
         raise ValueError(f"{entry.job_id} has no wrapper pid")
-    job_dir = shlex.quote(entry.job_dir.rstrip("/"))
+    state_dir = node_path_expression(
+        job_state_dir(entry.job_dir.rstrip("/"), entry.storage_layout)
+    )
     return (
-        f"while [ ! -f {job_dir}/exit_code ] && "
+        f"while [ ! -f {state_dir}/exit_code ] && "
         f"kill -0 {int(entry.pgid)} 2>/dev/null; do sleep 0.1; done"
     )
 

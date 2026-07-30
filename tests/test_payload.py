@@ -55,7 +55,7 @@ def test_launcher_does_not_leak_node_launch_lock_into_tmux():
 
 def test_launcher_clears_stale_attempt_markers_before_new_session():
     session_check = LAUNCHER.index('tmux -L dt has-session -t "$DT_SESSION"')
-    marker_clear = LAUNCHER.index('rm -f "$DT_JOB_DIR/pgid"')
+    marker_clear = LAUNCHER.index('rm -f "$DT_STATE_DIR/pgid"')
     session_start = LAUNCHER.index('start_session "$ids"')
 
     assert session_check < marker_clear < session_start
@@ -68,7 +68,7 @@ def test_launcher_rechecks_cancel_sentinel_after_session_start():
         session_start,
     )
     gpu_marker = LAUNCHER.index(
-        'echo "$ids" > "$DT_JOB_DIR/gpus"',
+        'echo "$ids" > "$DT_STATE_DIR/gpus"',
         session_start,
     )
 
@@ -101,7 +101,7 @@ def test_launcher_setup_hook_contract():
     assert "setup.sh" in LAUNCHER
     assert "--inexact" in LAUNCHER
     assert ".dt-setup-" in LAUNCHER
-    assert '"$DT_JOB_DIR/env-key"' in LAUNCHER
+    assert '"$DT_CONTROL_DIR/env-key"' in LAUNCHER
 
 
 def _run_launcher_with_fake_uv(
@@ -998,7 +998,8 @@ def test_wrapper_prefers_the_job_snapshot_over_shared_editable_sources():
 
 
 def test_wrapper_exposes_stable_dispatch_metadata_path():
-    assert 'export DT_META_PATH="$DT_JOB_DIR/meta.json"' in WRAPPER
+    assert 'DT_META_PATH="${DT_META_PATH:-$DT_JOB_DIR/meta.json}"' in WRAPPER
+    assert "export DT_META_PATH" in WRAPPER
 
 
 def test_payload_clears_caller_virtualenv_before_managed_uv(tmp_path):
@@ -1064,7 +1065,7 @@ def test_gpu_lease_closes_pre_cuda_startup_race():
     )
     assert "attempt < 100" in LAUNCHER
     assert "sleep 0.1" in LAUNCHER
-    assert WRAPPER.find("flock -n") < WRAPPER.find('echo $$ > "$DT_JOB_DIR/pgid"')
+    assert WRAPPER.find("flock -n") < WRAPPER.find('echo $$ > "$DT_STATE_DIR/pgid"')
     assert "gpu-$dt_gpu_index.lock" in WRAPPER
 
 
@@ -1157,7 +1158,7 @@ def test_wrapper_records_catchable_session_teardown():
     assert "trap 'dt_on_exit $?' EXIT" in WRAPPER
     assert "trap 'dt_signal_exit HUP 129' HUP" in WRAPPER
     assert "trap 'dt_signal_exit TERM 143' TERM" in WRAPPER
-    assert 'mv "$DT_JOB_DIR/exit_code.tmp.$$" "$DT_JOB_DIR/exit_code"' in WRAPPER
+    assert 'mv "$DT_STATE_DIR/exit_code.tmp.$$" "$DT_STATE_DIR/exit_code"' in WRAPPER
 
 
 def test_wrapper_records_subsecond_start_and_finish_timestamps(tmp_path):

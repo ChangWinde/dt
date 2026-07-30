@@ -19,6 +19,14 @@ from pathlib import Path
 
 from .config import HeadConfig, Node
 from .jobs import JobEntry, RegistryDamage, list_all
+from .layout import (
+    LEGACY_LAYOUT,
+    ROLE_LAYOUT,
+    job_control_dir,
+    node_path,
+    node_path_expression,
+    normalize_node_root,
+)
 from .snapshot_hash import tree_sha256
 from .sshio import RemoteError, run_on
 
@@ -62,7 +70,22 @@ def _snapshot_candidate(
     if _SNAPSHOT_DIGEST.fullmatch(digest) is None:
         return None, "snapshot_identity_missing"
 
-    snapshot_root = cfg.snapshots_dir() / digest
+    roots = [cfg.snapshots_dir() / digest]
+    legacy = cfg.legacy_snapshots_dir() / digest
+    if legacy != roots[0]:
+        roots.append(legacy)
+    snapshot_root = next(
+        (
+            root
+            for root in roots
+            if not root.is_symlink()
+            and not (root / "code").is_symlink()
+            and not (root / "meta.json").is_symlink()
+            and (root / "code").is_dir()
+            and (root / "meta.json").is_file()
+        ),
+        roots[0],
+    )
     archive_code = snapshot_root / "code"
     meta_path = snapshot_root / "meta.json"
     if (
@@ -111,16 +134,35 @@ def preflight(cfg: HeadConfig, cutoff_ts: float) -> CompactPreflight:
             continue
         seen_job_ids.add(entry.job_id)
 
-        registry_path = cfg.registry_dir() / f"{entry.job_id}.json"
-        if registry_path.is_symlink() or not registry_path.is_file():
+        registry_paths = {
+            cfg.registry_dir() / f"{entry.job_id}.json",
+            cfg.legacy_registry_dir() / f"{entry.job_id}.json",
+        }
+        if not any(path.is_file() and not path.is_symlink() for path in registry_paths):
             skipped["registry_identity_mismatch"] += 1
-            continue
-        if entry.job_dir != f"{cfg.jobs_dir}/{entry.job_id}":
-            skipped["job_dir_mismatch"] += 1
             continue
         node = configured_nodes.get(entry.node)
         if node is None:
             skipped["node_not_configured"] += 1
+            continue
+        try:
+            expected_job_dir = (
+                node_path(
+                    normalize_node_root(entry.worker_root or ""),
+                    "worker",
+                    "jobs",
+                    entry.job_id,
+                )
+                if entry.storage_layout == ROLE_LAYOUT
+                else f"dt/jobs/{entry.job_id}"
+            )
+        except ValueError:
+            expected_job_dir = ""
+        if (
+            entry.storage_layout not in {None, LEGACY_LAYOUT, ROLE_LAYOUT}
+            or entry.job_dir != expected_job_dir
+        ):
+            skipped["job_dir_mismatch"] += 1
             continue
         if node.local != entry.node_local:
             skipped["node_identity_mismatch"] += 1
@@ -187,12 +229,17 @@ def _remote_command(
         ),
     ]
     for candidate in candidates:
-        root = shlex.quote(candidate.entry.job_dir)
+        root = node_path_expression(candidate.entry.job_dir)
         job_id = shlex.quote(candidate.entry.job_id)
         receipt = shlex.quote(_receipt(candidate, now))
+        control = job_control_dir(
+            candidate.entry.job_dir,
+            candidate.entry.storage_layout,
+        )
         lines.extend(
             [
                 f"root={root}",
+                f"control={node_path_expression(control)}",
                 f"job_id={job_id}",
                 'code="$root/code"',
                 'if [ ! -e "$root" ] && [ ! -L "$root" ]; then',
@@ -221,11 +268,11 @@ def _remote_command(
                         '>/dev/null 2>&1 && [ ! -e "$code" ] '
                         '&& [ ! -L "$code" ]; then'
                     ),
-                    '    receipt_tmp="$root/.code-pruned.$$.tmp"',
+                    '    receipt_tmp="$control/.code-pruned.$$.tmp"',
                     (
                         f"    if (umask 077; printf '%s' {receipt} "
                         '>"$receipt_tmp") && '
-                        'mv -f -- "$receipt_tmp" "$root/code-pruned.json"; then'
+                        'mv -f -- "$receipt_tmp" "$control/code-pruned.json"; then'
                     ),
                     '      emit compacted "$job_id" "$bytes" code_removed',
                     "    else",

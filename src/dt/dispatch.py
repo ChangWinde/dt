@@ -4,10 +4,9 @@ busy / path-missing / disk-full try the next node; env-fail and an
 unverifiable orphan cancellation abort.
 
 Queue path (design doc 7.4): when nothing can take the job right now,
-`dt run` stages the snapshot under ~/dt/queue/<job_id>/ and registers the
-job as "queued"; the agent (agent.py) re-plays dispatch_queued() until a
-node frees up. Staging at submit time keeps the 7.2 invariant: editing the
-project while a job waits in line never changes what that job will run.
+`dt run` stores immutable source and payload objects by digest, keeps only
+job-specific control files in the queue, and registers the job as "queued";
+the agent (agent.py) re-plays dispatch_queued() until a node frees up.
 """
 
 from __future__ import annotations
@@ -17,6 +16,7 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -34,6 +34,19 @@ from typing import Callable, Mapping, cast
 
 from .config import ConfigError, HeadConfig, Node, Project
 from .lifecycle import termination_probe, termination_verdict
+from .layout import (
+    ROLE_LAYOUT,
+    display_node_path,
+    job_cancel_path,
+    job_command_path,
+    job_control_dir,
+    job_meta_path,
+    job_payload_dir,
+    job_state_dir,
+    node_path,
+    node_path_expression,
+    rsync_destination,
+)
 from .maintenance import (
     BeforeRegistryRemove,
     CleanReport,
@@ -227,13 +240,25 @@ def _retry_logger(
     return observe
 
 
-def sync_cache_rel(project_name: str) -> str:
+def sync_cache_rel(
+    project_name: str,
+    cfg: HeadConfig | None = None,
+    node: Node | None = None,
+) -> str:
     """Dedicated, disposable node-side mirror used to accelerate snapshots."""
+    if cfg is not None and node is not None and cfg.layout == ROLE_LAYOUT:
+        return cfg.worker_path(node, "cache", "sync", sanitize_name(project_name))
     return f"dt/sync/{sanitize_name(project_name)}"
 
 
-def artifact_root_rel(project_name: str) -> str:
+def artifact_root_rel(
+    project_name: str,
+    cfg: HeadConfig | None = None,
+    node: Node | None = None,
+) -> str:
     """Persistent root for explicit, reusable project inputs on a node."""
+    if cfg is not None and node is not None and cfg.layout == ROLE_LAYOUT:
+        return cfg.worker_path(node, "artifacts", sanitize_name(project_name))
     return f"dt/artifacts/{sanitize_name(project_name)}"
 
 
@@ -426,20 +451,18 @@ def _artifact_remote_check(
     components = [Path(target.parts[0])]
     for component in target.parts[1:]:
         components.append(components[-1] / component)
-    checks = " ".join(shlex.quote(path.as_posix()) for path in components)
+    checks = " ".join(node_path_expression(path.as_posix()) for path in components)
     expected = "-d" if is_dir else "-f"
-    operation = (
-        f"mkdir -p {shlex.quote(parent.as_posix())}"
-        if prepare
-        else f"test -d {shlex.quote(parent.as_posix())}"
-    )
+    parent_expr = node_path_expression(parent.as_posix())
+    target_expr = node_path_expression(target.as_posix())
+    operation = f"mkdir -p {parent_expr}" if prepare else f"test -d {parent_expr}"
     return (
         f"for dt_artifact_component in {checks}; do "
         '[ ! -L "$dt_artifact_component" ] || { '
         'echo "artifact destination contains symlink: '
         '$dt_artifact_component" >&2; exit 73; }; done; '
-        f"if [ -e {shlex.quote(target.as_posix())} ] && "
-        f"[ ! {expected} {shlex.quote(target.as_posix())} ]; then "
+        f"if [ -e {target_expr} ] && "
+        f"[ ! {expected} {target_expr} ]; then "
         f'echo "artifact destination has wrong type: {target.as_posix()}" >&2; '
         "exit 73; fi; "
         f"{operation}"
@@ -538,15 +561,15 @@ def _sync_project_locked(
     on_retry: Callable[[RsyncRetryEvent], None] | None,
     cancel_event: Event | None,
 ) -> dict[str, object]:
-    rel = f"{sync_cache_rel(project_name)}/code"
-    dst = f"{Path.home()}/{rel}/" if node.local else f"{node.name}:{rel}/"
+    rel = f"{sync_cache_rel(project_name, cfg, node)}/code"
+    dst = rsync_destination(node.name, node.local, rel, directory=True)
     cache_present: bool | None = None
     rsync_dst = dst
     if plan:
         probed = run_on(
             node.name,
             node.local,
-            f"test -d {shlex.quote(rel)}",
+            f"test -d {node_path_expression(rel)}",
             timeout=15,
         )
         if probed.returncode not in (0, 1):
@@ -572,16 +595,17 @@ def _sync_project_locked(
             preview_rel = (
                 f".dt-sync-plan-{sanitize_name(project_name)}-{uuid.uuid4().hex}"
             )
-            rsync_dst = (
-                f"{Path.home()}/{preview_rel}/"
-                if node.local
-                else f"{node.name}:{preview_rel}/"
+            rsync_dst = rsync_destination(
+                node.name,
+                node.local,
+                preview_rel,
+                directory=True,
             )
     else:
         prepared = run_on(
             node.name,
             node.local,
-            f"mkdir -p {shlex.quote(rel)}",
+            f"mkdir -p {node_path_expression(rel)}",
             timeout=15,
         )
         if prepared.returncode != 0:
@@ -626,7 +650,7 @@ def _sync_project_locked(
     result: dict[str, object] = {
         "node": node.name,
         "project": project_name,
-        "path": f"~/{rel}",
+        "path": display_node_path(rel),
         "transferred_bytes": transferred_bytes(proc.stdout),
         "transferred_gib": transferred_gib(proc.stdout),
         "deleted_files": (
@@ -675,7 +699,7 @@ def sync_artifacts(
             "transient files or select individual inputs if unintended"
         )
     manifest_bytes, manifest_sha256 = _artifact_manifest(project_name, sources)
-    root_rel = artifact_root_rel(project_name)
+    root_rel = artifact_root_rel(project_name, cfg, node)
     rows: list[dict[str, object]] = []
     total_bytes = 0
     total_bytes_known = True
@@ -737,18 +761,19 @@ def sync_artifacts(
                     f".dt-artifact-plan-{sanitize_name(project_name)}-"
                     f"{uuid.uuid4().hex}"
                 )
-                destination = (
-                    f"{Path.home()}/{preview_rel}/"
-                    if node.local
-                    else f"{node.name}:{preview_rel}/"
+                destination = rsync_destination(
+                    node.name,
+                    node.local,
+                    preview_rel,
+                    directory=True,
                 )
             else:
                 destination_rel = target_rel if is_dir else parent_rel
-                destination_path = f"{destination_rel}/"
-                destination = (
-                    f"{Path.home()}/{destination_path}"
-                    if node.local
-                    else f"{node.name}:{shlex.quote(destination_path)}"
+                destination = rsync_destination(
+                    node.name,
+                    node.local,
+                    destination_rel,
+                    directory=True,
                 )
             source_arg = f"{source}/" if is_dir else str(source)
             proc = rsync(
@@ -791,7 +816,7 @@ def sync_artifacts(
                 total_files += files
             row: dict[str, object] = {
                 "source": relative,
-                "path": f"~/{target_rel}",
+                "path": display_node_path(target_rel),
                 "kind": "directory" if is_dir else "file",
                 "mode": mode,
                 "source_bytes": source_bytes,
@@ -861,10 +886,11 @@ def sync_artifacts(
             with tempfile.TemporaryDirectory() as temporary:
                 local_manifest = Path(temporary) / f"{manifest_sha256}.json"
                 local_manifest.write_bytes(manifest_bytes)
-                manifest_destination = (
-                    f"{Path.home()}/{manifest_rel}/"
-                    if node.local
-                    else f"{node.name}:{manifest_rel}/"
+                manifest_destination = rsync_destination(
+                    node.name,
+                    node.local,
+                    manifest_rel,
+                    directory=True,
                 )
                 published = rsync(
                     str(local_manifest),
@@ -893,13 +919,13 @@ def sync_artifacts(
         "node": node.name,
         "project": project_name,
         "mode": "artifacts",
-        "path": f"~/{root_rel}",
+        "path": display_node_path(root_rel),
         "transferred_bytes": total_bytes if total_bytes_known else None,
         "transferred_gib": (total_bytes / 2**30 if total_bytes_known else None),
         "deleted_files": total_deleted,
         "artifacts": rows,
         "artifact_manifest_sha256": manifest_sha256,
-        "artifact_manifest_path": f"~/{manifest_path}",
+        "artifact_manifest_path": display_node_path(manifest_path),
     }
     if total_files_known:
         result["transferred_files"] = total_files
@@ -1496,8 +1522,24 @@ def pick_candidates(
 
 def _validate_stored_snapshot(cfg: HeadConfig, digest: str) -> StoredSnapshot:
     code = _snapshot_path(cfg, digest)
-    if not code.is_dir():
+    root = code.parent
+    meta = root / "meta.json"
+    if (
+        root.is_symlink()
+        or code.is_symlink()
+        or meta.is_symlink()
+        or not code.is_dir()
+        or not meta.is_file()
+    ):
         raise DispatchError(f"exact snapshot {digest} is not archived on this head")
+    try:
+        identity = json.loads(meta.read_text("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise DispatchError(
+            f"exact snapshot {digest} metadata cannot be read: {exc}"
+        ) from exc
+    if not isinstance(identity, dict) or identity.get("snapshot_sha256") != digest:
+        raise DispatchError(f"exact snapshot {digest} metadata identity mismatched")
     try:
         observed = tree_sha256(code)
     except (OSError, ValueError) as exc:
@@ -1524,6 +1566,25 @@ def _repair_queued_snapshot(
     """
     expected = entry.snapshot_sha256 or ""
     if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        return
+    if entry.storage_layout == ROLE_LAYOUT:
+        _validate_stored_snapshot(cfg, expected)
+        source_ref = staging / ".dt" / "source.json"
+        if source_ref.is_symlink() or not source_ref.is_file():
+            raise DispatchError("queued source reference is unsafe or missing")
+        try:
+            reference = json.loads(source_ref.read_text("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise DispatchError(
+                f"queued source reference cannot be read: {exc}"
+            ) from exc
+        if (
+            not isinstance(reference, dict)
+            or reference.get("schema_version") != "dt_queue_source_v1"
+            or reference.get("snapshot_sha256") != expected
+            or reference.get("payload_sha256") != entry.payload_sha256
+        ):
+            raise DispatchError("queued source reference identity mismatch")
         return
     staged_code = staging / "code"
     try:
@@ -1656,8 +1717,12 @@ def capture_snapshot(
 
 
 def _code_src(node: Node, job_dir: str) -> str:
-    rel = f"{job_dir}/code/"
-    return f"{Path.home()}/{rel}" if node.local else f"{node.name}:{rel}"
+    return rsync_destination(
+        node.name,
+        node.local,
+        f"{job_dir}/code",
+        directory=True,
+    )
 
 
 def resolve_snapshot(
@@ -1727,7 +1792,7 @@ def resolve_snapshot(
 
 
 def _linkdest_state(cfg: HeadConfig) -> Path:
-    return cfg.state_dir() / "linkdest.json"
+    return cfg.control_state_dir() / "linkdest.json"
 
 
 @contextmanager
@@ -1746,19 +1811,24 @@ def _linkdest_lock(cfg: HeadConfig) -> Iterator[None]:
 
 
 def _load_linkdest(cfg: HeadConfig) -> dict[str, str]:
-    path = _linkdest_state(cfg)
-    if path.exists():
+    state: dict[str, str] = {}
+    paths = [cfg.root / "state" / "linkdest.json", _linkdest_state(cfg)]
+    for path in dict.fromkeys(paths):
+        if not path.exists():
+            continue
         try:
             raw: object = json.loads(path.read_text())
             if isinstance(raw, dict):
-                return {
-                    str(key): value
-                    for key, value in raw.items()
-                    if isinstance(value, str)
-                }
+                state.update(
+                    {
+                        str(key): value
+                        for key, value in raw.items()
+                        if isinstance(value, str)
+                    }
+                )
         except (OSError, UnicodeError, json.JSONDecodeError):
-            return {}
-    return {}
+            continue
+    return state
 
 
 def _save_linkdest(cfg: HeadConfig, state: dict[str, str]) -> None:
@@ -1781,6 +1851,7 @@ def _snapshot_baselines(
     project_name: str,
     node: Node,
     whole_job: bool = False,
+    job_dir: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Return ``(hard_link_dest, copy_dest)`` for a new job workdir.
 
@@ -1790,33 +1861,65 @@ def _snapshot_baselines(
     """
     prev = _prev_job_id(cfg, project_name, node)
     if prev:
-        previous_path = (
-            f"{cfg.jobs_dir}/{prev}" if whole_job else f"{cfg.jobs_dir}/{prev}/code"
+        previous = load(cfg, prev)
+        previous_job_dir = (
+            previous.job_dir
+            if previous is not None and previous.node == node.name
+            else cfg.worker_job_dir(node, prev)
         )
+        previous_path = previous_job_dir if whole_job else f"{previous_job_dir}/code"
         ready = run_on(
             node.name,
             node.local,
-            f"test -d {shlex.quote(previous_path)}",
+            f"test -d {node_path_expression(previous_path)}",
             timeout=10,
         )
         if ready.returncode == 0:
+            destination = (
+                job_dir
+                if whole_job
+                else (f"{job_dir}/code" if job_dir is not None else None)
+            )
+            relative = (
+                posixpath.relpath(previous_path, start=destination)
+                if destination is not None
+                else (f"../{prev}" if whole_job else f"../../{prev}/code")
+            )
             return (
                 None,
-                f"../{prev}" if whole_job else f"../../{prev}/code",
+                relative,
             )
-    cache_root = sync_cache_rel(project_name)
+    cache_root = sync_cache_rel(project_name, cfg, node)
     ready = run_on(
         node.name,
         node.local,
-        f"test -d {shlex.quote(f'{cache_root}/code')}",
+        f"test -d {node_path_expression(f'{cache_root}/code')}",
         timeout=10,
     )
     if ready.returncode != 0:
         return None, None
-    return None, _sync_cache_copy_dest(project_name, whole_job)
+    return None, _sync_cache_copy_dest(
+        project_name,
+        whole_job,
+        cfg=cfg,
+        node=node,
+        job_dir=job_dir,
+    )
 
 
-def _sync_cache_copy_dest(project_name: str, whole_job: bool) -> str:
+def _sync_cache_copy_dest(
+    project_name: str,
+    whole_job: bool,
+    *,
+    cfg: HeadConfig | None = None,
+    node: Node | None = None,
+    job_dir: str | None = None,
+) -> str:
+    if cfg is not None and node is not None and job_dir is not None:
+        cache_root = sync_cache_rel(project_name, cfg, node)
+        destination = job_dir if whole_job else f"{job_dir}/code"
+        target = cache_root if whole_job else f"{cache_root}/code"
+        return posixpath.relpath(target, start=destination)
     return (
         f"../../sync/{sanitize_name(project_name)}"
         if whole_job
@@ -1832,9 +1935,16 @@ def _stable_snapshot_copy_dest(
     copy_dest: str | None,
     *,
     whole_job: bool,
+    job_dir: str | None = None,
 ) -> Iterator[str | None]:
     """Hold a shared cache lock only when copy-dest points at that cache."""
-    if copy_dest != _sync_cache_copy_dest(project_name, whole_job):
+    if copy_dest != _sync_cache_copy_dest(
+        project_name,
+        whole_job,
+        cfg=cfg,
+        node=node,
+        job_dir=job_dir,
+    ):
         yield copy_dest
         return
     with _sync_cache_lock(
@@ -1878,6 +1988,61 @@ def payload_sha256(files: Mapping[str, str] | None = None) -> str:
     return _payload_sha256(runtime)
 
 
+def _stored_payload_dir(
+    cfg: HeadConfig,
+    digest: str,
+    runtime_files: Mapping[str, str] | None = None,
+) -> Path:
+    """Return one attested payload object, creating it when bytes are supplied."""
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise DispatchError("invalid runtime payload identity")
+    root = cfg.payloads_dir() / digest
+
+    def validate() -> Path:
+        runtime_paths = [root / name for name in RUNTIME_PAYLOAD_NAMES]
+        if (
+            root.is_symlink()
+            or not root.is_dir()
+            or any(path.is_symlink() or not path.is_file() for path in runtime_paths)
+        ):
+            raise DispatchError(f"runtime payload store {digest} is unsafe or missing")
+        try:
+            observed = payload_sha256(_payload_files_from_dir(root))
+        except OSError as exc:
+            raise DispatchError(
+                f"runtime payload store {digest} cannot be read: {exc}"
+            ) from exc
+        if observed != digest:
+            raise DispatchError(
+                f"runtime payload store is corrupt: expected {digest}, "
+                f"observed {observed}"
+            )
+        return root
+
+    lock_path = cfg.state_dir() / "payload-store.lock"
+    with lock_path.open("w", encoding="utf-8") as descriptor:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        if root.exists():
+            return validate()
+        if runtime_files is None:
+            raise DispatchError(
+                f"runtime payload {digest} is not archived on this head"
+            )
+        observed = payload_sha256(runtime_files)
+        if observed != digest:
+            raise DispatchError(
+                f"runtime payload changed before archival: expected {digest}, "
+                f"observed {observed}"
+            )
+        temp = Path(tempfile.mkdtemp(prefix=".payload-", dir=cfg.payloads_dir()))
+        try:
+            _write_support_files(temp, runtime_files)
+            os.replace(temp, root)
+        finally:
+            shutil.rmtree(temp, ignore_errors=True)
+        return validate()
+
+
 def _support_files(
     cmd: list[str],
     meta: dict[str, object],
@@ -1885,20 +2050,34 @@ def _support_files(
     env_key: str | None = None,
     *,
     runtime_files: Mapping[str, str] | None = None,
+    layout: str | None = None,
 ) -> dict[str, str]:
     """Everything a job dir needs besides code/: launcher, wrapper, cmd, meta."""
-    files = dict(_runtime_payload_files() if runtime_files is None else runtime_files)
-    files["cmd.sh"] = shlex.join(cmd) + "\n"
+    runtime = dict(_runtime_payload_files() if runtime_files is None else runtime_files)
+    files = {
+        (f".dt/payload/{name}" if layout == ROLE_LAYOUT else name): content
+        for name, content in runtime.items()
+    }
+    control_prefix = ".dt/" if layout == ROLE_LAYOUT else ""
+    command_name = "command.sh" if layout == ROLE_LAYOUT else "cmd.sh"
+    files[f"{control_prefix}{command_name}"] = shlex.join(cmd) + "\n"
     if setup:
-        files["setup.sh"] = setup + "\n"
+        files[f"{control_prefix}setup.sh"] = setup + "\n"
     if env_key:
-        files["env-key"] = env_key + "\n"
+        files[f"{control_prefix}env-key"] = env_key + "\n"
     meta = dict(meta)
     diff = meta.pop("_diff", None)
     if meta.get("git_dirty") and isinstance(diff, str) and diff:
-        files["code_dirty.patch"] = diff
-    files["meta.json"] = json.dumps(meta, indent=1)
+        files[f"{control_prefix}code_dirty.patch"] = diff
+    files[f"{control_prefix}meta.json"] = json.dumps(meta, indent=1)
     return files
+
+
+def _write_support_files(base: Path, files: Mapping[str, str]) -> None:
+    for name, content in files.items():
+        path = base / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
 
 
 def environment_key(
@@ -2006,17 +2185,26 @@ def _setup_input_identities(
 
 
 def _code_dst(node: Node, job_dir: str) -> str:
-    rel = f"{job_dir}/code/"
-    return f"{Path.home()}/{rel}" if node.local else f"{node.name}:{rel}"
+    return rsync_destination(
+        node.name,
+        node.local,
+        f"{job_dir}/code",
+        directory=True,
+    )
 
 
 def _job_dst(node: Node, job_dir: str) -> str:
-    return f"{Path.home()}/{job_dir}/" if node.local else f"{node.name}:{job_dir}/"
+    return rsync_destination(
+        node.name,
+        node.local,
+        job_dir,
+        directory=True,
+    )
 
 
 def _remote_tree_sha256(node: Node, code_dir: str) -> str:
     hash_script = Path(snapshot_hash_mod.__file__).read_text()
-    hash_cmd = f"python3 -c {shlex.quote(hash_script)} {shlex.quote(code_dir)}"
+    hash_cmd = f"python3 -c {shlex.quote(hash_script)} {node_path_expression(code_dir)}"
     hash_proc = run_on(node.name, node.local, hash_cmd, timeout=120)
     lines = (hash_proc.stdout or "").strip().splitlines()
     digest = lines[-1] if lines else ""
@@ -2045,18 +2233,24 @@ def snapshot(
     run_on(
         node.name,
         node.local,
-        f"mkdir -p {shlex.quote(job_dir)}/logs",
+        f"mkdir -p {node_path_expression(f'{job_dir}/logs')}",
         timeout=15,
         check=True,
     )
 
-    link_dest, copy_dest = _snapshot_baselines(cfg, project_name, node)
+    link_dest, copy_dest = _snapshot_baselines(
+        cfg,
+        project_name,
+        node,
+        job_dir=job_dir,
+    )
     with _stable_snapshot_copy_dest(
         cfg,
         project_name,
         node,
         copy_dest,
         whole_job=False,
+        job_dir=job_dir,
     ) as stable_copy_dest:
         if copy_dest is not None and stable_copy_dest is None:
             log(
@@ -2104,14 +2298,17 @@ def snapshot(
 
     with tempfile.TemporaryDirectory() as tmp:
         tmpp = Path(tmp)
-        for fname, content in _support_files(
-            spec.cmd,
-            meta,
-            spec.setup,
-            env_key,
-            runtime_files=runtime_files,
-        ).items():
-            (tmpp / fname).write_text(content)
+        _write_support_files(
+            tmpp,
+            _support_files(
+                spec.cmd,
+                meta,
+                spec.setup,
+                env_key,
+                runtime_files=runtime_files,
+                layout=cfg.layout,
+            ),
+        )
         proc = rsync(
             f"{tmp}/",
             _job_dst(node, job_dir),
@@ -2129,11 +2326,20 @@ def snapshot(
 
 
 def stage_dir(cfg: HeadConfig, job_id: str) -> Path:
-    return cfg.queue_dir() / job_id
+    current = cfg.queue_dir() / job_id
+    legacy = cfg.legacy_queue_dir() / job_id
+    if current.exists() or not legacy.exists():
+        return current
+    return legacy
 
 
 def remove_staging(cfg: HeadConfig, job_id: str) -> None:
-    shutil.rmtree(stage_dir(cfg, job_id), ignore_errors=True)
+    roots = {
+        cfg.queue_dir() / job_id,
+        cfg.legacy_queue_dir() / job_id,
+    }
+    for root in roots:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def _stage(
@@ -2147,18 +2353,23 @@ def _stage(
     *,
     runtime_files: Mapping[str, str] | None = None,
 ) -> Path:
-    """Queue path: snapshot into ~/dt/queue/<job_id>/ shaped exactly like the
-    node-side job dir, so dispatch later is a single rsync.
+    """Create a durable job-specific queue control bundle.
 
-    Uses a per-project incremental cache: the first submit pays a full copy,
-    every later one pays only the delta. The mutable cache is a copy baseline,
-    never a hard-link baseline: metadata-only rsync updates must not mutate an
-    already-queued snapshot through a shared inode."""
+    Role-scoped queues reference immutable source/payload stores and do not
+    duplicate source. Legacy programmatic configurations retain the historical
+    self-contained staged worktree for compatibility.
+    """
     staging = stage_dir(cfg, job_id)
-    (staging / "code").mkdir(parents=True, exist_ok=True)
+    staging.mkdir(parents=True, exist_ok=True)
     (staging / "logs").mkdir(exist_ok=True)
 
-    if stored is None:
+    if cfg.layout == ROLE_LAYOUT:
+        if stored is None:
+            raise DispatchError("role-scoped queue requires an archived snapshot")
+        source = _validate_stored_snapshot(cfg, stored.sha256).code_dir
+        snapshot_sha256 = stored.sha256
+    elif stored is None:
+        (staging / "code").mkdir(parents=True, exist_ok=True)
         cache = cfg.cache_dir() / "stage" / (spec.project or "_default")
         cache.mkdir(parents=True, exist_ok=True)
         proc = rsync(
@@ -2177,21 +2388,23 @@ def _stage(
         _warn_snapshot_size(cfg, proc.stdout, log)
         source = cache
     else:
+        (staging / "code").mkdir(parents=True, exist_ok=True)
         source = stored.code_dir
 
-    # A queued workdir remains independent from both the mutable compatibility
-    # cache and the immutable content store.  It may later be edited on a node.
-    proc = rsync(
-        f"{source}/",
-        f"{staging}/code/",
-        copy_dest=str(source),
-        timeout=600,
-        checksum=True,
-    )
-    if proc.returncode != 0:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise DispatchError(f"staging snapshot failed: {proc.stderr.strip()}")
-    snapshot_sha256 = tree_sha256(staging / "code")
+    if cfg.layout != ROLE_LAYOUT:
+        # Legacy staged worktrees remain private from the mutable cache and
+        # immutable content store.
+        proc = rsync(
+            f"{source}/",
+            f"{staging}/code/",
+            copy_dest=str(source),
+            timeout=600,
+            checksum=True,
+        )
+        if proc.returncode != 0:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise DispatchError(f"staging snapshot failed: {proc.stderr.strip()}")
+        snapshot_sha256 = tree_sha256(staging / "code")
     meta["snapshot_sha256"] = snapshot_sha256
     meta["rerun_snapshot_changed"] = _rerun_snapshot_changed(
         spec,
@@ -2204,20 +2417,33 @@ def _stage(
             f"observed {meta['snapshot_sha256']}"
         )
     env_key = environment_key(
-        staging / "code",
+        source if cfg.layout == ROLE_LAYOUT else staging / "code",
         spec.extras,
         spec.setup,
         snapshot_sha256,
         spec.setup_inputs,
     )
-    for fname, content in _support_files(
+    support = _support_files(
         spec.cmd,
         meta,
         spec.setup,
         env_key,
-        runtime_files=runtime_files,
-    ).items():
-        (staging / fname).write_text(content)
+        runtime_files=({} if cfg.layout == ROLE_LAYOUT else runtime_files),
+        layout=cfg.layout,
+    )
+    if cfg.layout == ROLE_LAYOUT:
+        support[".dt/source.json"] = json.dumps(
+            {
+                "schema_version": "dt_queue_source_v1",
+                "snapshot_sha256": snapshot_sha256,
+                "payload_sha256": spec.payload_sha256,
+            },
+            indent=1,
+        )
+    _write_support_files(
+        staging,
+        support,
+    )
     return staging
 
 
@@ -2236,11 +2462,26 @@ def launch(
     reserve: int = 0,
 ) -> tuple[int, dict[str, object] | str]:
     """Returns (exit_code, parsed-json-or-stderr)."""
+    control_dir = job_control_dir(job_dir, cfg.layout)
+    payload_dir = job_payload_dir(job_dir, cfg.layout)
+    state_dir = job_state_dir(job_dir, cfg.layout)
     envs = {
+        "DT_ROOT": cfg.worker_root_for(node),
+        "DT_WORKER_ROOT": cfg.worker_path(node),
         "DT_JOB_DIR": job_dir,
+        "DT_OUTPUT_DIR": f"{job_dir}/outputs",
+        "DT_CONTROL_DIR": control_dir,
+        "DT_PAYLOAD_DIR": payload_dir,
+        "DT_STATE_DIR": state_dir,
+        "DT_META_PATH": job_meta_path(job_dir, cfg.layout),
+        "DT_COMMAND_PATH": job_command_path(job_dir, cfg.layout),
+        "DT_CANCEL_PATH": job_cancel_path(job_dir, cfg.layout),
+        "DT_CACHE_ROOT": cfg.cache_root_for(node),
+        "DT_RUNTIME_ROOT": cfg.runtime_root_for(node),
+        "DT_GPU_LEASE_ROOT": cfg.lease_root_for(node),
         "DT_GPUS": str(spec.gpus),
         "DT_SESSION": session,
-        "DT_ENVS_DIR": cfg.envs,
+        "DT_ENVS_DIR": cfg.envs_for(node),
         "DT_MEM_MIB": str(cfg.mem_threshold_mib),
         "DT_DISK_GIB": str(max(cfg.disk_min_gib, spec.require_disk_gib or 0)),
         "DT_RESERVE": str(reserve),
@@ -2250,7 +2491,7 @@ def launch(
         "DT_NODE": node.name,
     }
     if spec.project:
-        envs["DT_ARTIFACT_ROOT"] = artifact_root_rel(spec.project)
+        envs["DT_ARTIFACT_ROOT"] = artifact_root_rel(spec.project, cfg, node)
     if spec.artifact_manifest:
         envs["DT_ARTIFACT_MANIFEST"] = spec.artifact_manifest
     if cfg.webhook:
@@ -2299,7 +2540,8 @@ def launch(
         verifier = Path(payload_hash_mod.__file__).read_text(encoding="utf-8")
         verify_cmd = (
             f"python3 -c {shlex.quote(verifier)} "
-            f"{shlex.quote(job_dir)} {shlex.quote(spec.payload_sha256)}"
+            f"{node_path_expression(payload_dir)} "
+            f"{shlex.quote(spec.payload_sha256)}"
         )
         attestation = (
             "if ! command -v python3 >/dev/null 2>&1; then "
@@ -2314,7 +2556,10 @@ def launch(
             'if [ "$DT_PAYLOAD_ATTEST_RC" -ne 0 ]; then '
             'exit "$DT_PAYLOAD_ATTEST_RC"; fi; '
         )
-    cmd = f"{attestation}exec env {env_str} bash {shlex.quote(job_dir)}/launcher.sh"
+    cmd = (
+        f"{attestation}exec env {env_str} bash "
+        f"{node_path_expression(f'{payload_dir}/launcher.sh')}"
+    )
     # generous: a first-time uv sync of a torch env can exceed 30 min; on
     # timeout the caller cancels via the sentinel, so no orphan is possible
     proc = run_on(node.name, node.local, cmd, timeout=3600)
@@ -2340,7 +2585,13 @@ def _reserve_for(cfg: HeadConfig, spec: RunSpec) -> int:
     return 0 if spec.node else cfg.queue.reserve_free_per_node
 
 
-def _cancel_orphan(node: Node, job_dir: str, session: str) -> str | None:
+def _cancel_orphan(
+    node: Node,
+    job_dir: str,
+    session: str,
+    *,
+    layout: str | None = None,
+) -> str | None:
     """The launch ssh timed out or dropped: we cannot know how far the
     launcher got, and it may still start the tmux session later (it outlives
     its ssh session). Return ``None`` only after the cancel sentinel is
@@ -2351,6 +2602,7 @@ def _cancel_orphan(node: Node, job_dir: str, session: str) -> str | None:
         "TERM",
         session=session,
         cancel_sentinel=True,
+        layout=layout,
     )
     try:
         proc = run_on(node.name, node.local, probe, timeout=20)
@@ -2380,6 +2632,7 @@ def _cancel_placed_launch(entry: JobEntry) -> str | None:
         "TERM",
         session=entry.session,
         cancel_sentinel=True,
+        layout=entry.storage_layout,
     )
     try:
         proc = run_on(entry.node, entry.node_local, probe, timeout=20)
@@ -2438,6 +2691,10 @@ def _record_cancelled_inflight_launch(
         current.started_at = placed.started_at
         current.snapshot_sha256 = placed.snapshot_sha256 or current.snapshot_sha256
         current.payload_sha256 = placed.payload_sha256 or current.payload_sha256
+        current.storage_layout = placed.storage_layout
+        current.worker_root = placed.worker_root
+        current.job_relpath = placed.job_relpath
+        current.job_dir = placed.job_dir
         current.finished_at = time.time()
         current.reason = "dequeued by user; in-flight launch cancelled (TERM)"
         save(cfg, current)
@@ -2449,7 +2706,7 @@ def _try_nodes(
     candidates: list[Node],
     spec: RunSpec,
     job_id: str,
-    job_dir: str,
+    job_dir: str | Callable[[Node], str],
     session: str,
     sync_to_node: Callable[[Node], str],
     log: Callable[[str], None],
@@ -2469,6 +2726,7 @@ def _try_nodes(
     reasons: dict[str, str] = {}
     failure_kinds: set[str] = set()
     for node in candidates:
+        node_job_dir = job_dir(node) if callable(job_dir) else job_dir
         log(f"snapshot -> {node.name}")
         snapshot_started = time.perf_counter()
         try:
@@ -2488,11 +2746,26 @@ def _try_nodes(
         launch_started = time.perf_counter()
         try:
             code, result = launch(
-                cfg, node, job_id, job_dir, session, spec, _reserve_for(cfg, spec)
+                cfg,
+                node,
+                job_id,
+                node_job_dir,
+                session,
+                spec,
+                _reserve_for(cfg, spec),
             )
         except RemoteError as e:
             failure_kinds.add("unreachable")
-            cancel_error = _cancel_orphan(node, job_dir, session)
+            cancel_error = (
+                _cancel_orphan(
+                    node,
+                    node_job_dir,
+                    session,
+                    layout=cfg.layout,
+                )
+                if cfg.layout == ROLE_LAYOUT
+                else _cancel_orphan(node, node_job_dir, session)
+            )
             if cancel_error is not None:
                 failure_kinds.add("cancel-unverified")
                 reasons[node.name] = (
@@ -2526,7 +2799,7 @@ def _try_nodes(
                 project=spec.project or "?",
                 node=node.name,
                 node_local=node.local,
-                job_dir=job_dir,
+                job_dir=node_job_dir,
                 session=session,
                 cmd=shlex.join(spec.cmd),
                 gpus=[int(g) for g in gpu_values if isinstance(g, (str, int))],
@@ -2572,6 +2845,9 @@ def _try_nodes(
                 cache_env=spec.cache_env,
                 cache_source_env_hash=spec.cache_source_env_hash,
                 cache_mode=spec.cache_mode,
+                storage_layout=cfg.layout,
+                worker_root=cfg.worker_root_for(node),
+                job_relpath=f"jobs/{job_id}",
             )
             return entry, reasons, False, failure_kinds
         reason = RETRYABLE.get(code) or FATAL.get(code) or f"exit {code}"
@@ -2694,14 +2970,31 @@ def _submit_prepared(
     spec.name = sanitize_name(spec.name)
     job_id = new_job_id(spec.name)
     session = f"dt_{job_id}"
-    # Home-relative on purpose: it is resolved on the *node*, whose home may
-    # differ from the head's. Launcher absolutizes it on arrival.
-    job_dir = f"{cfg.jobs_dir}/{job_id}"
+    # Persist the logical path; home expansion occurs only on the selected
+    # worker. Unpinned queued jobs use the default root until placement stores
+    # the selected node's effective root.
+    job_relpath = f"jobs/{job_id}"
+    submit_worker_roots = {node.name: cfg.worker_root_for(node) for node in cfg.nodes}
+    submit_worker_root = (
+        submit_worker_roots.get(spec.node, cfg.worker_root)
+        if spec.node
+        else cfg.worker_root
+    )
+    job_dir = (
+        node_path(submit_worker_root, "worker", "jobs", job_id)
+        if cfg.layout == ROLE_LAYOUT
+        else cfg.worker_job_dir(Node(name="-"), job_id)
+    )
+
+    def job_dir_for_node(node: Node) -> str:
+        return cfg.worker_job_dir(node, job_id)
 
     project_name = spec.project or "?"
     runtime_files = _runtime_payload_files()
     runtime_sha256 = payload_sha256(runtime_files)
     spec.payload_sha256 = runtime_sha256
+    if cfg.layout == ROLE_LAYOUT:
+        _stored_payload_dir(cfg, runtime_sha256, runtime_files)
     meta = {
         "job_id": job_id,
         "name": spec.name,
@@ -2805,6 +3098,10 @@ def _submit_prepared(
             cache_env=spec.cache_env,
             cache_source_env_hash=spec.cache_source_env_hash,
             cache_mode=spec.cache_mode,
+            storage_layout=cfg.layout,
+            worker_root=submit_worker_root,
+            worker_roots=dict(submit_worker_roots),
+            job_relpath=job_relpath,
         )
         save(cfg, entry)
         request_agent_wake(cfg)
@@ -2856,7 +3153,18 @@ def _submit_prepared(
                 f"unknown node {spec.node!r}; configured: {list(by_name)}"
             )
         log(f"probing {spec.node}")
-        statuses = [probe_node(by_name[spec.node], cfg.mem_threshold_mib)]
+        pinned = by_name[spec.node]
+        statuses = [
+            (
+                probe_node(
+                    pinned,
+                    cfg.mem_threshold_mib,
+                    lease_root=cfg.lease_root_for(pinned),
+                )
+                if cfg.layout == ROLE_LAYOUT
+                else probe_node(pinned, cfg.mem_threshold_mib)
+            )
+        ]
     else:
         log(f"probing {cfg.center} nodes")
         statuses = probe_center(cfg, use_cache=False)
@@ -2895,13 +3203,14 @@ def _submit_prepared(
 
     def sync_to_node(node: Node) -> str:
         source = exact_source()
+        node_job_dir = job_dir_for_node(node)
         return snapshot(
             cfg,
             project_name,
             source.code_dir,
             node,
             job_id,
-            job_dir,
+            node_job_dir,
             spec,
             dict(meta),
             log,
@@ -2915,7 +3224,7 @@ def _submit_prepared(
         candidates,
         spec,
         job_id,
-        job_dir,
+        job_dir_for_node,
         session,
         sync_to_node,
         log,
@@ -2935,6 +3244,7 @@ def _submit_prepared(
             )
             uncertain_reason = f"{UNCERTAIN_LAUNCH_PREFIX}{why}"
             failed_at = time.time()
+            failed_job_dir = job_dir_for_node(node)
             uncertain = JobEntry(
                 job_id=job_id,
                 name=spec.name,
@@ -2942,7 +3252,7 @@ def _submit_prepared(
                 project=project_name,
                 node=node_name,
                 node_local=node.local,
-                job_dir=job_dir,
+                job_dir=failed_job_dir,
                 session=session,
                 cmd=shlex.join(spec.cmd),
                 gpus=[],
@@ -2982,6 +3292,9 @@ def _submit_prepared(
                 cache_env=spec.cache_env,
                 cache_source_env_hash=spec.cache_source_env_hash,
                 cache_mode=spec.cache_mode,
+                storage_layout=cfg.layout,
+                worker_root=cfg.worker_root_for(node),
+                job_relpath=job_relpath,
             )
             save(cfg, uncertain)
             raise NoReachableNode({node_name: (f"job {job_id}: {uncertain_reason}")})
@@ -2990,6 +3303,7 @@ def _submit_prepared(
             Node(name=node_name),
         )
         failed_at = time.time()
+        failed_job_dir = job_dir_for_node(node)
         failed = JobEntry(
             job_id=job_id,
             name=spec.name,
@@ -2997,7 +3311,7 @@ def _submit_prepared(
             project=project_name,
             node=node_name,
             node_local=node.local,
-            job_dir=job_dir,
+            job_dir=failed_job_dir,
             session=session,
             cmd=shlex.join(spec.cmd),
             gpus=[],
@@ -3037,6 +3351,9 @@ def _submit_prepared(
             cache_env=spec.cache_env,
             cache_source_env_hash=spec.cache_source_env_hash,
             cache_mode=spec.cache_mode,
+            storage_layout=cfg.layout,
+            worker_root=cfg.worker_root_for(node),
+            job_relpath=job_relpath,
         )
         save(cfg, failed)
         raise FailedBeforeStart(failed)
@@ -3152,6 +3469,18 @@ def _commit_queued_transition(
     return None
 
 
+def _queued_node(cfg: HeadConfig, entry: JobEntry, node: Node) -> Node:
+    """Rebind a queued placement to its submit-time worker-root policy."""
+    if entry.storage_layout != ROLE_LAYOUT:
+        return node
+    persisted = entry.worker_roots.get(node.name) or entry.worker_root
+    return Node(
+        name=node.name,
+        local=node.local,
+        root=persisted or cfg.worker_root_for(node),
+    )
+
+
 def _dispatch_queued_active(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -3167,12 +3496,20 @@ def _dispatch_queued_active(
         return _existing_dispatch_outcome(current)
 
     staging = stage_dir(cfg, entry.job_id)
-    staged_code = staging / "code"
+    staged_code = (
+        _snapshot_path(cfg, entry.snapshot_sha256 or "")
+        if entry.storage_layout == ROLE_LAYOUT
+        else staging / "code"
+    )
     if staged_code.is_symlink() or not staged_code.is_dir():
         detail = (
             "staging snapshot is an unsafe symlink"
             if staged_code.is_symlink()
-            else "staging snapshot missing"
+            else (
+                "archived queue snapshot missing"
+                if entry.storage_layout == ROLE_LAYOUT
+                else "staging snapshot missing"
+            )
         )
         entry.status, entry.reason = "failed", detail
         interrupted = commit()
@@ -3188,12 +3525,27 @@ def _dispatch_queued_active(
         if interrupted is not None:
             return interrupted
         return "failed", entry.reason
+    try:
+        staged_payload_dir = (
+            _stored_payload_dir(cfg, entry.payload_sha256 or "")
+            if entry.storage_layout == ROLE_LAYOUT and entry.payload_sha256
+            else staging
+        )
+    except DispatchError as exc:
+        entry.status, entry.reason = "failed", str(exc)
+        interrupted = commit()
+        remove_staging(cfg, entry.job_id)
+        if interrupted is not None:
+            return interrupted
+        return "failed", entry.reason
     staged_payload_complete = all(
-        (staging / name).is_file() for name in RUNTIME_PAYLOAD_NAMES
+        (staged_payload_dir / name).is_file() for name in RUNTIME_PAYLOAD_NAMES
     )
     if entry.payload_sha256 or staged_payload_complete:
         try:
-            observed_payload = payload_sha256(_payload_files_from_dir(staging))
+            observed_payload = payload_sha256(
+                _payload_files_from_dir(staged_payload_dir)
+            )
         except OSError as exc:
             entry.status = "failed"
             entry.reason = f"staged dt payload cannot be read: {exc}"
@@ -3275,7 +3627,17 @@ def _dispatch_queued_active(
             if interrupted is not None:
                 return interrupted
             return "failed", entry.reason
-        statuses = [probe_node(pinned, cfg.mem_threshold_mib)]
+        statuses = [
+            (
+                probe_node(
+                    pinned,
+                    cfg.mem_threshold_mib,
+                    lease_root=cfg.lease_root_for(pinned),
+                )
+                if cfg.layout == ROLE_LAYOUT
+                else probe_node(pinned, cfg.mem_threshold_mib)
+            )
+        ]
     else:
         statuses = probe_center(cfg, use_cache=False)
     probe_reasons = {
@@ -3323,23 +3685,37 @@ def _dispatch_queued_active(
             return interrupted
         return "busy", None
 
+    candidates = [_queued_node(cfg, entry, node) for node in candidates]
+
+    def job_dir_for_node(node: Node) -> str:
+        if entry.storage_layout == ROLE_LAYOUT:
+            return cfg.worker_job_dir(node, entry.job_id)
+        return entry.job_dir
+
     def sync_to_node(node: Node) -> str:
+        node_job_dir = job_dir_for_node(node)
         run_on(
             node.name,
             node.local,
-            f"mkdir -p {shlex.quote(entry.job_dir)}/logs",
+            f"mkdir -p {node_path_expression(f'{node_job_dir}/logs')}",
             timeout=15,
             check=True,
         )
+        role_layout = entry.storage_layout == ROLE_LAYOUT
         link_dest, copy_dest = _snapshot_baselines(
-            cfg, entry.project, node, whole_job=True
+            cfg,
+            entry.project,
+            node,
+            whole_job=not role_layout,
+            job_dir=node_job_dir,
         )
         with _stable_snapshot_copy_dest(
             cfg,
             entry.project,
             node,
             copy_dest,
-            whole_job=True,
+            whole_job=not role_layout,
+            job_dir=node_job_dir,
         ) as stable_copy_dest:
             if copy_dest is not None and stable_copy_dest is None:
                 log(
@@ -3347,39 +3723,62 @@ def _dispatch_queued_active(
                     "continuing without cache baseline"
                 )
             proc = rsync(
-                f"{staging}/",
-                _job_dst(node, entry.job_dir),
-                # staging mirrors the job dir layout, so link against the
-                # whole previous job dir: <prev>/code/* lines up with code/*
+                (f"{staged_code}/" if role_layout else f"{staging}/"),
+                (
+                    _code_dst(node, node_job_dir)
+                    if role_layout
+                    else _job_dst(node, node_job_dir)
+                ),
                 link_dest=link_dest,
                 copy_dest=stable_copy_dest,
                 timeout=600,
                 retries=2,
                 on_retry=_retry_logger(log, node.name, "queued snapshot"),
                 checksum=True,
+                delete=role_layout,
             )
         if proc.returncode != 0:
             raise DispatchError(
                 f"snapshot to {node.name} failed: {proc.stderr.strip()}"
             )
-        # A previous transfer attempt (or accidental inspection of the remote
-        # worktree) may have left generated files under code/.  The whole-job
-        # sync above intentionally preserves runtime logs and outputs, so
-        # converge only code/ before attesting its exact tree identity.
-        proc = rsync(
-            f"{staging}/code/",
-            _code_dst(node, entry.job_dir),
-            delete=True,
-            timeout=600,
-            retries=2,
-            on_retry=_retry_logger(log, node.name, "queued code convergence"),
-            checksum=True,
-        )
+        if role_layout:
+            proc = rsync(
+                f"{staging}/",
+                _job_dst(node, node_job_dir),
+                timeout=60,
+                retries=2,
+                on_retry=_retry_logger(log, node.name, "queued support"),
+            )
+            if proc.returncode == 0:
+                proc = rsync(
+                    f"{staged_payload_dir}/",
+                    rsync_destination(
+                        node.name,
+                        node.local,
+                        job_payload_dir(node_job_dir, ROLE_LAYOUT),
+                        directory=True,
+                    ),
+                    timeout=60,
+                    retries=2,
+                    on_retry=_retry_logger(log, node.name, "queued payload"),
+                )
+        else:
+            # A previous transfer attempt (or accidental inspection of the
+            # remote worktree) may have left generated files under code/.
+            proc = rsync(
+                f"{staging}/code/",
+                _code_dst(node, node_job_dir),
+                delete=True,
+                timeout=600,
+                retries=2,
+                on_retry=_retry_logger(log, node.name, "queued code convergence"),
+                checksum=True,
+            )
         if proc.returncode != 0:
             raise DispatchError(
                 f"code convergence on {node.name} failed: {proc.stderr.strip()}"
             )
-        observed = _remote_tree_sha256(node, f"{entry.job_dir}/code")
+        observed = _remote_tree_sha256(node, f"{node_job_dir}/code")
         if entry.snapshot_sha256 and observed != entry.snapshot_sha256:
             raise DispatchError(
                 f"queued snapshot changed in transit to {node.name}: "
@@ -3394,7 +3793,7 @@ def _dispatch_queued_active(
             candidates,
             spec,
             entry.job_id,
-            entry.job_dir,
+            job_dir_for_node,
             entry.session,
             sync_to_node,
             log,
@@ -3450,11 +3849,14 @@ def _dispatch_queued_active(
         entry.status = "failed"
         node_name = list(reasons)[-1]
         node = next(
-            (candidate for candidate in cfg.nodes if candidate.name == node_name),
+            (candidate for candidate in candidates if candidate.name == node_name),
             Node(name=node_name),
         )
         entry.node = node_name
         entry.node_local = node.local
+        if entry.storage_layout == ROLE_LAYOUT:
+            entry.worker_root = cfg.worker_root_for(node)
+            entry.job_dir = cfg.worker_job_dir(node, entry.job_id)
         entry.finished_at = time.time()
         if "cancel-unverified" in failure_kinds:
             entry.reason = f"{UNCERTAIN_LAUNCH_PREFIX}{bad}"

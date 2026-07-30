@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shlex
 import subprocess
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -10,6 +9,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import HeadConfig, Node
+from .layout import ROLE_LAYOUT, node_path_expression
 
 
 class StorageRunner(Protocol):
@@ -63,23 +63,28 @@ def _head_row(
     }
 
 
-def _remote_path(path: str) -> str:
-    if path == "~":
-        return '"$HOME"'
-    if path.startswith("~/"):
-        return '"$HOME"/' + shlex.quote(path[2:])
-    return shlex.quote(path)
-
-
 def _node_row(
     cfg: HeadConfig,
     node: Node,
     runner: StorageRunner,
 ) -> dict[str, object]:
-    paths = {"jobs": cfg.jobs_dir, "envs": cfg.envs}
+    paths = {
+        "jobs": (
+            cfg.worker_path(node, "jobs") if cfg.layout == ROLE_LAYOUT else cfg.jobs_dir
+        ),
+        "envs": cfg.envs_for(node),
+    }
+    if cfg.layout == ROLE_LAYOUT:
+        paths.update(
+            {
+                "artifacts": cfg.worker_path(node, "artifacts"),
+                "cache": cfg.cache_root_for(node),
+                "runtime": cfg.runtime_root_for(node),
+            }
+        )
     commands: list[str] = []
     for kind, raw_path in paths.items():
-        path = _remote_path(raw_path)
+        path = node_path_expression(raw_path)
         commands.append(
             f"if [ -d {path} ]; then "
             f"b=$(timeout 45s du -s -B1 -- {path} 2>/dev/null | "
@@ -97,6 +102,8 @@ def _node_row(
             for kind, raw_path in paths.items()
         },
     }
+    if cfg.layout == ROLE_LAYOUT:
+        base["managed_root"] = cfg.worker_path(node)
     try:
         proc = runner(
             node.name,
@@ -142,15 +149,48 @@ def inventory(
     disk_bytes: Callable[[Path], int],
 ) -> dict[str, object]:
     """Collect one stable inventory payload for all DT-managed paths."""
-    results_root = cfg.results_root or cfg.root / "results"
-    head_paths = {
-        "results": results_root,
-        "snapshots": cfg.root / "snapshots",
-        "cache": cfg.root / "cache",
-        "recovery": cfg.root / "recovery",
-        "registry": cfg.root / "registry",
-        "queue": cfg.root / "queue",
-    }
+    results_root = cfg.results_dir()
+    if cfg.layout == ROLE_LAYOUT:
+        head_paths = {
+            "state": cfg.head_root / "state",
+            "snapshots": cfg.head_root / "snapshots",
+            "results": results_root,
+            "quarantine": cfg.quarantine_dir(),
+            "cache": cfg.cache_dir(),
+        }
+        legacy_paths = {
+            "legacy_registry": cfg.legacy_registry_dir(),
+            "legacy_queue": cfg.legacy_queue_dir(),
+            "legacy_snapshots": cfg.legacy_snapshots_dir(),
+            "legacy_results": cfg.legacy_results_dir(),
+            "legacy_cache": cfg.legacy_cache_dir(),
+            "legacy_recovery": cfg.legacy_recovery_dir(),
+            "legacy_state": cfg.root / "state",
+        }
+        legacy_paths.update(
+            {
+                f"legacy_agent_{name.replace('.', '_')}": cfg.root / name
+                for name in (
+                    "agent.lock",
+                    "agent.log",
+                    "agent.pid",
+                    "agent.wake",
+                    "autoclean.last",
+                )
+            }
+        )
+        head_paths.update(
+            {kind: path for kind, path in legacy_paths.items() if path.exists()}
+        )
+    else:
+        head_paths = {
+            "results": results_root,
+            "snapshots": cfg.root / "snapshots",
+            "cache": cfg.root / "cache",
+            "recovery": cfg.root / "recovery",
+            "registry": cfg.root / "registry",
+            "queue": cfg.root / "queue",
+        }
     head_rows = [_head_row(kind, path, disk_bytes) for kind, path in head_paths.items()]
     with ThreadPoolExecutor(max_workers=min(4, len(cfg.nodes))) as pool:
         futures = [pool.submit(_node_row, cfg, node, runner) for node in cfg.nodes]
@@ -163,8 +203,9 @@ def inventory(
     total_bytes = head_bytes + sum(
         int(section["bytes"])
         for row in node_rows
-        for kind in ("jobs", "envs")
-        if isinstance((section := row[kind]), dict)
+        for kind, section in row.items()
+        if kind not in {"node", "error", "managed_root"}
+        and isinstance(section, dict)
         and isinstance(section.get("bytes"), int)
     )
     return {

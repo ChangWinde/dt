@@ -14,7 +14,7 @@ def test_head_config():
     )
     assert isinstance(cfg, HeadConfig)
     assert cfg.nodes[0].local and not cfg.nodes[1].local
-    assert cfg.envs == "~/dt/envs"
+    assert cfg.envs == "~/dt/worker/envs"
     assert "vla" in cfg.projects
     assert cfg.projects["vla"].setup is None
     assert str(cfg.projects["vla"].path).endswith("proj/vla")

@@ -11,6 +11,10 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 - `dt init` now creates minimal, validated head or laptop configurations,
   supports a no-write preview, writes atomically with private permissions, and
   refuses accidental replacement.
+- Role-scoped runtime storage separates head authority from worker execution
+  capsules. New queues reference immutable source and payload objects instead
+  of duplicating source, and `dt migrate layout` provides plan-first,
+  identity-verified compatibility migration.
 
 ### Changed
 
@@ -27,11 +31,17 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 - Configuration parsing now rejects unknown keys, malformed nested values,
   duplicate nodes, multiple local-node aliases, non-finite retention values,
   and invalid YAML with actionable configuration errors.
+- Managed roots now support one default worker base and per-node overrides;
+  broad, relative, or traversal-bearing roots are rejected. Storage inventory,
+  lifecycle, pulls, compaction, and cleanup honor persisted layout provenance.
 - Cleanup and snapshot-store persistence now have isolated, strict-typed domain
   modules. The release type gate now covers the complete `src/dt` package.
 
 ### Fixed
 
+- Pinned capacity waits now preserve FIFO per node instead of globally
+  blocking later jobs pinned to other nodes, preventing avoidable cross-node
+  GPU idle time without allowing same-node jobs to overtake one another.
 - Hosted CI now binds each test job to its matrix interpreter, normalizes
   timezone and styled terminal output, installs the intentional zsh
   compatibility dependency, and allows realistic wrapper cleanup latency on

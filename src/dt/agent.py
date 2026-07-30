@@ -1,10 +1,11 @@
 """Queue agent (design doc 7.4): a resident loop on the head node that
 replays the head of the FIFO queue whenever cards free up.
 
-Singleton via flock on ~/dt/agent.lock -- the lock doubles as the liveness
-probe (if we can take it, no agent is running). Capacity waits stay FIFO so
-large jobs do not starve; job-specific blockers (for example a missing
-required path or an incompatible pin) do not hold runnable jobs behind them.
+Singleton via a flock below the head agent-state directory; the lock doubles
+as the liveness probe (if we can take it, no agent is running). Capacity waits
+stay FIFO so large jobs do not starve; job-specific blockers (for example a
+missing required path or an incompatible pin) do not hold runnable jobs behind
+them.
 
 Survival: `dt agent install` writes a crontab @reboot line; `dt run` also
 starts the agent on demand when it queues a job and none is alive.
@@ -20,6 +21,7 @@ import fcntl
 import json
 import math
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -55,15 +57,15 @@ AGENT_LOG_BACKUPS = 2
 
 
 def _lock_path(cfg: HeadConfig) -> Path:
-    return cfg.root / "agent.lock"
+    return cfg.agent_dir() / "agent.lock"
 
 
 def _pid_path(cfg: HeadConfig) -> Path:
-    return cfg.root / "agent.pid"
+    return cfg.agent_dir() / "agent.pid"
 
 
 def log_path(cfg: HeadConfig) -> Path:
-    return cfg.root / "agent.log"
+    return cfg.agent_dir() / "agent.log"
 
 
 def _rotate_agent_log(cfg: HeadConfig) -> bool:
@@ -96,7 +98,7 @@ def _rotate_agent_log(cfg: HeadConfig) -> bool:
 
 def alive_pid(cfg: HeadConfig) -> int | None:
     """The running agent's pid, or None. Truth is the flock, not the pid file."""
-    cfg.root.mkdir(parents=True, exist_ok=True)
+    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
     try:
         fd = os.open(_lock_path(cfg), os.O_RDWR | os.O_CREAT, 0o644)
     except OSError:
@@ -211,8 +213,9 @@ def _process_once_with_snapshot(
     - started / failed / killed / cancel-failed: move on to the next queued job
     - blocked (job-specific: missing dataset path, unfit nodes): skip it so
       it cannot starve the jobs behind it; retried next tick
-    - busy (GPU capacity): stop - strict FIFO for capacity keeps big jobs
-      from being starved by small ones
+    - busy (GPU capacity): preserve FIFO for every job that could use the same
+      capacity; a pinned wait may be skipped only for later work pinned to a
+      different node
     Returns both outcomes and the updated registry snapshot so the rest of the
     loop can make watcher/sleep decisions without another historical scan.
     """
@@ -231,11 +234,25 @@ def _process_once_with_snapshot(
     # still hold GPUs, so it consumes the max_my_jobs budget.
     running = sum(entry.status == "running" for entry in entries) + len(damage)
     results: list[tuple[str, str]] = []
+    busy_pins: set[str] = set()
     for entry in queue:
         cap = cfg.queue.max_my_jobs
         if cap is not None and running >= cap:
             results.append((entry.job_id, "capped"))
             break
+        if busy_pins and entry.gpus_requested > 0:
+            if entry.pin_node is None:
+                # An unpinned GPU job could consume capacity on every busy
+                # pin, so it overlaps the earlier waiter and restores the
+                # normal FIFO stop.
+                results.append((entry.job_id, "busy"))
+                break
+            if entry.pin_node in busy_pins:
+                # This job competes for the same capacity as an earlier pinned
+                # waiter. Keep its FIFO position while still reaching jobs
+                # whose pins are disjoint.
+                results.append((entry.job_id, "busy"))
+                continue
         outcome, detail = dispatch_queued(cfg, entry, log)
         results.append((entry.job_id, outcome))
         if blocked_log_state is not None and outcome != "blocked":
@@ -304,7 +321,9 @@ def _process_once_with_snapshot(
             if blocked_log_state is not None:
                 blocked_log_state[entry.job_id] = blocked_detail
         elif outcome == "busy":
-            break
+            if entry.pin_node is None:
+                break
+            busy_pins.add(entry.pin_node)
     if blocked_log_state is not None:
         queued_ids = {entry.job_id for entry in queue}
         for job_id in list(blocked_log_state):
@@ -385,7 +404,7 @@ def _maybe_autoclean(cfg: HeadConfig, log: Callable[[str], None]) -> None:
     if not math.isfinite(days) or days <= 0:
         log(f"auto-clean disabled: invalid retention {days!r} days")
         return
-    stamp = cfg.root / "last_autoclean"
+    stamp = cfg.agent_dir() / "last_autoclean"
     if stamp.exists() and time.time() - stamp.stat().st_mtime < AUTOCLEAN_EVERY_S:
         return
     stamp.touch()  # stamp first: a failing clean must not retry every tick
@@ -518,7 +537,7 @@ def _sleep_until_next_poll(
 def run_loop(cfg: HeadConfig) -> int:
     """Foreground loop (what crontab/nohup runs). Exit 1 if another agent
     already holds the lock."""
-    cfg.root.mkdir(parents=True, exist_ok=True)
+    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
     fd = os.open(_lock_path(cfg), os.O_RDWR | os.O_CREAT, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -628,7 +647,7 @@ def run_loop(cfg: HeadConfig) -> int:
 
 
 def start_detached(cfg: HeadConfig) -> bool:
-    """Spawn `dt agent run` in the background, logging to ~/dt/agent.log.
+    """Spawn `dt agent run` in the background, logging below head agent state.
     Returns False if one is already alive."""
     if alive_pid(cfg) is not None:
         return False
@@ -668,12 +687,15 @@ def stop_agent(cfg: HeadConfig) -> bool:
     return alive_pid(cfg) is None
 
 
-def install_crontab() -> str:
+def install_crontab(cfg: HeadConfig | None = None) -> str:
     """Idempotently add the @reboot line. Returns the line installed."""
     dt_bin = str(Path.home() / ".local/bin/dt")
+    agent_dir = cfg.agent_dir() if cfg is not None else Path.home() / "dt"
+    agent_log = log_path(cfg) if cfg is not None else agent_dir / "agent.log"
     line = (
-        f"@reboot sleep 30 && mkdir -p $HOME/dt && "
-        f"{dt_bin} agent run >> $HOME/dt/agent.log 2>&1 {CRON_MARK}"
+        f"@reboot sleep 30 && mkdir -p {shlex.quote(str(agent_dir))} && "
+        f"{shlex.quote(dt_bin)} agent run >> {shlex.quote(str(agent_log))} "
+        f"2>&1 {CRON_MARK}"
     )
     proc = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
     existing = proc.stdout if proc.returncode == 0 else ""

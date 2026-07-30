@@ -128,9 +128,26 @@ dt storage
 dt storage --json
 ```
 
-The inventory separates head registry/state, managed results, remote job
-directories, snapshots, and shared environments. Use it before changing
-retention policy.
+The inventory covers every managed head class and each worker's jobs,
+environments, artifacts, cache, and runtime coordination directories. Legacy
+flat-layout residue is reported separately. Use it before changing retention
+policy.
+
+## Runtime layout migration
+
+New submissions use role-scoped paths. Existing jobs remain readable in place.
+Inventory legacy data first:
+
+```bash
+dt migrate layout --plan
+dt migrate layout --plan --json
+```
+
+The plan reports source, destination, identity, allocated size, and blockers.
+Running, queued, lost, or otherwise uncertain jobs never move. Apply only
+freshly verified rows with `dt migrate layout -y`; interrupted worker copies
+are resumable after destination identity verification. Managed results,
+quarantine evidence, and rebuildable legacy cache remain review-only.
 
 ## Safe compaction
 

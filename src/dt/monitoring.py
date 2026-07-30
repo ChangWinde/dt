@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
-import shlex
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
 from .jobs import JobEntry
+from .layout import display_node_path, node_path_expression
 
 JsonDict = dict[str, Any]
 
@@ -52,14 +52,14 @@ class ResourceTelemetryQuery:
 
     @property
     def display_path(self) -> str:
-        return f"~/{self.path}"
+        return display_node_path(self.path)
 
     @property
     def tail_limit(self) -> int | None:
         return self.tail or None
 
     def command(self, *, require_file: bool) -> str:
-        path = shlex.quote(self.path)
+        path = node_path_expression(self.path)
         reader = f"tail -n {self.tail} -- {path}" if self.tail else f"cat -- {path}"
         if require_file:
             return f"test -f {path} && {reader}"

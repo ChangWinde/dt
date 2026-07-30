@@ -34,17 +34,38 @@ esac
 DT_MEM_MIB="${DT_MEM_MIB:-500}"
 DT_DISK_GIB="${DT_DISK_GIB:-10}"
 DT_RESERVE="${DT_RESERVE:-0}"
-DT_GPU_LEASE_ROOT="$HOME/dt/gpu-leases"
-mkdir -p "$DT_GPU_LEASE_ROOT"
-
-lease_available() {
-    local idx=$1 lock="$DT_GPU_LEASE_ROOT/gpu-$1.lock"
-    [ ! -e "$lock" ] || flock -n "$lock" -c true
-}
 
 # Values arrive shell-quoted, so `~` never expanded; job_dir may be
 # home-relative. Absolutize everything here, on the node they refer to.
-DT_ENVS_DIR="${DT_ENVS_DIR/#\~/$HOME}"
+dt_absolutize() {
+    case "$1" in
+        "~") printf '%s\n' "$HOME" ;;
+        "~/"*) printf '%s/%s\n' "$HOME" "${1#\~/}" ;;
+        /*) printf '%s\n' "$1" ;;
+        *) printf '%s/%s\n' "$HOME" "$1" ;;
+    esac
+}
+
+DT_JOB_DIR=$(dt_absolutize "$DT_JOB_DIR")
+DT_ROOT=$(dt_absolutize "${DT_ROOT:-$HOME/dt}")
+DT_WORKER_ROOT=$(dt_absolutize "${DT_WORKER_ROOT:-$DT_ROOT}")
+DT_CONTROL_DIR=$(dt_absolutize "${DT_CONTROL_DIR:-$DT_JOB_DIR}")
+DT_PAYLOAD_DIR=$(dt_absolutize "${DT_PAYLOAD_DIR:-$DT_JOB_DIR}")
+DT_STATE_DIR=$(dt_absolutize "${DT_STATE_DIR:-$DT_JOB_DIR}")
+DT_OUTPUT_DIR=$(dt_absolutize "${DT_OUTPUT_DIR:-$DT_JOB_DIR/outputs}")
+DT_META_PATH=$(dt_absolutize "${DT_META_PATH:-$DT_JOB_DIR/meta.json}")
+DT_COMMAND_PATH=$(dt_absolutize "${DT_COMMAND_PATH:-$DT_JOB_DIR/cmd.sh}")
+DT_CANCEL_PATH=$(dt_absolutize "${DT_CANCEL_PATH:-$DT_JOB_DIR/.dt-cancel}")
+if [ "$DT_CONTROL_DIR" = "$DT_JOB_DIR" ]; then
+    DT_BIN_DIR="$DT_JOB_DIR/.dt-bin"
+else
+    DT_BIN_DIR="$DT_CONTROL_DIR/bin"
+fi
+DT_ENVS_DIR=$(dt_absolutize "$DT_ENVS_DIR")
+DT_CACHE_ROOT=$(dt_absolutize "${DT_CACHE_ROOT:-$HOME/dt}")
+DT_RUNTIME_ROOT=$(dt_absolutize "${DT_RUNTIME_ROOT:-$HOME/dt}")
+DT_GPU_LEASE_ROOT=$(dt_absolutize \
+    "${DT_GPU_LEASE_ROOT:-$HOME/dt/gpu-leases}")
 DT_REQUIRE_PATH="${DT_REQUIRE_PATH:-}"
 DT_REQUIRE_PATH="${DT_REQUIRE_PATH/#\~/$HOME}"
 DT_ARTIFACT_ROOT="${DT_ARTIFACT_ROOT:-}"
@@ -70,31 +91,47 @@ DT_CACHE_CLONE_DURATION_MS=0
 ARTIFACT_VERIFY_DURATION_MS=0
 case "$DT_ARTIFACT_ROOT" in
     "") : ;;
+    "~/"*) DT_ARTIFACT_ROOT="$HOME/${DT_ARTIFACT_ROOT#\~/}" ;;
     /*) : ;;
     *) DT_ARTIFACT_ROOT="$HOME/$DT_ARTIFACT_ROOT" ;;
 esac
-case "$DT_JOB_DIR" in
-    /*) : ;;
-    *) DT_JOB_DIR="$HOME/$DT_JOB_DIR" ;;
-esac
 case "$DT_PREDECESSOR_JOB_DIR" in
     "") : ;;
-    /*) : ;;
-    *) DT_PREDECESSOR_JOB_DIR="$HOME/$DT_PREDECESSOR_JOB_DIR" ;;
+    *) DT_PREDECESSOR_JOB_DIR=$(dt_absolutize "$DT_PREDECESSOR_JOB_DIR") ;;
 esac
 case "$DT_CACHE_SOURCE_JOB_DIR" in
     "") : ;;
-    /*) : ;;
-    *) DT_CACHE_SOURCE_JOB_DIR="$HOME/$DT_CACHE_SOURCE_JOB_DIR" ;;
+    *) DT_CACHE_SOURCE_JOB_DIR=$(dt_absolutize "$DT_CACHE_SOURCE_JOB_DIR") ;;
 esac
 
-mkdir -p "$DT_JOB_DIR/logs"
+mkdir -p "$DT_JOB_DIR/logs" "$DT_OUTPUT_DIR" "$DT_CONTROL_DIR" \
+         "$DT_STATE_DIR" "$DT_GPU_LEASE_ROOT" "$DT_RUNTIME_ROOT/locks" \
+         "$DT_CACHE_ROOT/tools/xdg" "$DT_CACHE_ROOT/tools/uv" \
+         "$DT_CACHE_ROOT/tools/torch" "$DT_CONTROL_DIR/tmp"
+export DT_ROOT DT_WORKER_ROOT DT_JOB_DIR DT_CONTROL_DIR DT_PAYLOAD_DIR \
+       DT_STATE_DIR DT_OUTPUT_DIR \
+       DT_META_PATH DT_COMMAND_PATH DT_CANCEL_PATH DT_BIN_DIR DT_ENVS_DIR DT_CACHE_ROOT DT_RUNTIME_ROOT \
+       DT_GPU_LEASE_ROOT
+export TMPDIR="$DT_CONTROL_DIR/tmp"
+export XDG_CACHE_HOME="$DT_CACHE_ROOT/tools/xdg"
+export UV_CACHE_DIR="$DT_CACHE_ROOT/tools/uv"
+export TORCH_HOME="$DT_CACHE_ROOT/tools/torch"
+
+lease_available() {
+    local idx=$1 lock="$DT_GPU_LEASE_ROOT/gpu-$1.lock"
+    [ ! -e "$lock" ] || flock -n "$lock" -c true
+}
 
 if [ -n "$DT_PREDECESSOR_JOB_ID" ]; then
+    predecessor_state="$DT_PREDECESSOR_JOB_DIR/.dt/state"
+    predecessor_meta="$DT_PREDECESSOR_JOB_DIR/.dt/meta.json"
+    [ -d "$predecessor_state" ] || predecessor_state="$DT_PREDECESSOR_JOB_DIR"
+    [ -f "$predecessor_meta" ] \
+        || predecessor_meta="$DT_PREDECESSOR_JOB_DIR/meta.json"
     if [ -d "$DT_PREDECESSOR_JOB_DIR" ] \
-       && [ "$(cat "$DT_PREDECESSOR_JOB_DIR/exit_code" 2>/dev/null)" = 0 ]; then
+       && [ "$(cat "$predecessor_state/exit_code" 2>/dev/null)" = 0 ]; then
         DT_PREDECESSOR_OUTPUTS="$DT_PREDECESSOR_JOB_DIR/outputs"
-        DT_PREDECESSOR_META_PATH="$DT_PREDECESSOR_JOB_DIR/meta.json"
+        DT_PREDECESSOR_META_PATH="$predecessor_meta"
     else
         log "predecessor handoff unavailable for $DT_PREDECESSOR_JOB_ID"
     fi
@@ -110,9 +147,9 @@ fi
 
 # A fresh launcher run supersedes any stale cancel sentinel (a previous
 # dispatch attempt whose ssh dropped may have left one behind).
-rm -f "$DT_JOB_DIR/.dt-cancel"
+rm -f "$DT_CANCEL_PATH"
 
-cancelled() { [ -e "$DT_JOB_DIR/.dt-cancel" ]; }
+cancelled() { [ -e "$DT_CANCEL_PATH" ]; }
 
 cache_metadata_manifest() {
     python3 - "$1" <<'PY'
@@ -203,8 +240,14 @@ if [ -n "$DT_CACHE_SOURCE_JOB_ID" ]; then
         log "node-unfit: realpath and python3 are required for cache reuse"
         exit 15
     fi
+    cache_source_state="$DT_CACHE_SOURCE_JOB_DIR/.dt/state"
+    cache_source_control="$DT_CACHE_SOURCE_JOB_DIR/.dt"
+    [ -d "$cache_source_state" ] \
+        || cache_source_state="$DT_CACHE_SOURCE_JOB_DIR"
+    [ -d "$cache_source_control" ] \
+        || cache_source_control="$DT_CACHE_SOURCE_JOB_DIR"
     if [ ! -d "$DT_CACHE_SOURCE_JOB_DIR" ] \
-       || [ "$(cat "$DT_CACHE_SOURCE_JOB_DIR/exit_code" 2>/dev/null)" != "0" ]; then
+       || [ "$(cat "$cache_source_state/exit_code" 2>/dev/null)" != "0" ]; then
         log "cache source job is missing or did not finish successfully"
         exit 16
     fi
@@ -225,13 +268,13 @@ if [ -n "$DT_CACHE_SOURCE_JOB_ID" ]; then
     esac
     if ! python3 -c \
         'import json,sys; d=json.load(open(sys.argv[1])); raise SystemExit(0 if d.get("snapshot_sha256")==sys.argv[2] else 1)' \
-        "$cache_source_root/meta.json" "$DT_CACHE_SOURCE_SNAPSHOT" \
+        "$cache_source_control/meta.json" "$DT_CACHE_SOURCE_SNAPSHOT" \
         >/dev/null 2>&1; then
         log "cache source snapshot identity mismatch"
         exit 16
     fi
     cache_source_env=$(tr -d '[:space:]' \
-        <"$cache_source_root/env-key" 2>/dev/null || true)
+        <"$cache_source_control/env-key" 2>/dev/null || true)
     if [ "$cache_source_env" != "$DT_CACHE_SOURCE_ENV" ]; then
         log "cache source environment identity mismatch"
         exit 16
@@ -316,7 +359,7 @@ if [ -n "$DT_ARTIFACT_MANIFEST" ]; then
     artifact_manifest_path="$DT_ARTIFACT_ROOT/.dt/manifests/$DT_ARTIFACT_MANIFEST.json"
     log "verifying artifact manifest ${DT_ARTIFACT_MANIFEST:0:12}"
     artifact_verify_started_ms=$(now_ms)
-    if ! python3 "$DT_JOB_DIR/artifact_verify.py" \
+    if ! python3 "$DT_PAYLOAD_DIR/artifact_verify.py" \
         --root "$DT_ARTIFACT_ROOT" \
         --manifest "$artifact_manifest_path" \
         --expected-sha256 "$DT_ARTIFACT_MANIFEST" \
@@ -384,16 +427,16 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
         log "project has uv.lock but uv is not installed on this node"
         exit 13
     fi
-    if [ -f "$DT_JOB_DIR/env-key" ]; then
-        lockhash=$(tr -d '[:space:]' < "$DT_JOB_DIR/env-key")
+    if [ -f "$DT_CONTROL_DIR/env-key" ]; then
+        lockhash=$(tr -d '[:space:]' < "$DT_CONTROL_DIR/env-key")
         case "$lockhash" in
             *[!0-9a-f]*|"")
-                log "invalid environment identity in $DT_JOB_DIR/env-key"
+                log "invalid environment identity in $DT_CONTROL_DIR/env-key"
                 exit 13
                 ;;
         esac
         if [ "${#lockhash}" -ne 12 ]; then
-            log "invalid environment identity length in $DT_JOB_DIR/env-key"
+            log "invalid environment identity length in $DT_CONTROL_DIR/env-key"
             exit 13
         fi
     else
@@ -428,7 +471,7 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
                         "Request failed|Failed to fetch|tls handshake|connection (timed out|reset|refused)|dns error" \
                         "$1"
             }
-            pypi_hint_path="$HOME/dt/network/pypi-index"
+            pypi_hint_path="$DT_CACHE_ROOT/network/pypi-index"
             pypi_mirror_allowed() {
                 case "$1" in
                     "https://mirrors.aliyun.com/pypi/simple/"|\
@@ -510,7 +553,7 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
                 return 1
             }
             load_pypi_mirror_hint || true
-            if [ -f "$DT_JOB_DIR/setup.sh" ]; then
+            if [ -f "$DT_CONTROL_DIR/setup.sh" ]; then
                 # --inexact: exact sync would prune the packages the setup
                 # hook adds on top of the lock (uv sync removes extraneous
                 # packages by default)
@@ -525,10 +568,10 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
                    && select_pypi_mirror; then
                     echo "[launcher] PyPI unavailable before setup; using $mirror"
                 fi
-                smark="$UV_PROJECT_ENVIRONMENT/.dt-setup-$(sha256sum "$DT_JOB_DIR/setup.sh" | cut -c1-8)"
+                smark="$UV_PROJECT_ENVIRONMENT/.dt-setup-$(sha256sum "$DT_CONTROL_DIR/setup.sh" | cut -c1-8)"
                 if [ ! -f "$smark" ]; then
                     echo "[launcher] running project setup hook"
-                    "$UV_BIN" run --no-sync bash -e "$DT_JOB_DIR/setup.sh" || exit 1
+                    "$UV_BIN" run --no-sync bash -e "$DT_CONTROL_DIR/setup.sh" || exit 1
                     touch "$smark"
                     touch "$DT_JOB_DIR/logs/.setup-ran"
                 fi
@@ -556,8 +599,13 @@ else
     if ! command -v python >/dev/null 2>&1; then
         python3_bin=$(command -v python3 || true)
         if [ -n "$python3_bin" ]; then
-            mkdir -p "$DT_JOB_DIR/.dt-bin"
-            ln -sf "$python3_bin" "$DT_JOB_DIR/.dt-bin/python"
+            if [ "$DT_CONTROL_DIR" = "$DT_JOB_DIR" ]; then
+                mkdir -p "$DT_JOB_DIR/.dt-bin"
+                ln -sf "$python3_bin" "$DT_JOB_DIR/.dt-bin/python"
+            else
+                mkdir -p "$DT_BIN_DIR"
+                ln -sf "$python3_bin" "$DT_BIN_DIR/python"
+            fi
         fi
     fi
 fi
@@ -597,16 +645,17 @@ free_gpu_indices() {
 GPU_PROBE_ERROR=""
 probe_ok() {
     # Try a 256 MiB allocation on one GPU; catches races with other users.
-    local idx=$1 rc detail
+    local idx=$1 rc detail payload_dir
+    payload_dir="${DT_PAYLOAD_DIR:-$DT_JOB_DIR}"
     GPU_PROBE_ERROR=""
     if ! command -v python3 >/dev/null 2>&1 \
-       || [ ! -f "$DT_JOB_DIR/cuda_probe.py" ]; then
+       || [ ! -f "$payload_dir/cuda_probe.py" ]; then
         return 0
     fi
     # Use the CUDA Driver API directly. Importing the full project PyTorch
     # stack just to test one allocation dominated warm FIFO handoffs.
     detail=$(CUDA_VISIBLE_DEVICES=$idx timeout 120 \
-        python3 "$DT_JOB_DIR/cuda_probe.py" --bytes 268435456 \
+        python3 "$payload_dir/cuda_probe.py" --bytes 268435456 \
         2>&1)
     rc=$?
     # Old/non-CUDA nodes can still run CPU jobs; the two nvidia-smi checks stay
@@ -641,7 +690,7 @@ start_session() {
     # still passed explicitly below, and fd 9 is closed before the server can
     # inherit the node launch lock.
     tmux -L dt new-session -d -s "$DT_SESSION" \
-        "cd '$DT_JOB_DIR' && env DT_JOB_DIR='$DT_JOB_DIR' DT_ARTIFACT_ROOT='${DT_ARTIFACT_ROOT:-}' DT_ARTIFACT_MANIFEST='${DT_ARTIFACT_MANIFEST:-}' DT_PREDECESSOR_JOB_ID='$DT_PREDECESSOR_JOB_ID' DT_PREDECESSOR_JOB_DIR='$DT_PREDECESSOR_JOB_DIR' DT_PREDECESSOR_OUTPUTS='$DT_PREDECESSOR_OUTPUTS' DT_PREDECESSOR_META_PATH='$DT_PREDECESSOR_META_PATH' DT_REUSE_CACHE_PATH='$DT_REUSE_CACHE_PATH' DT_REUSE_CACHE_ENV='$DT_CACHE_ENV' DT_CACHE_SOURCE_PATH='$DT_CACHE_SOURCE_PATH' DT_CACHE_SOURCE_JOB_ID='$DT_CACHE_SOURCE_JOB_ID' DT_CACHE_SOURCE_RELPATH='$DT_CACHE_SOURCE_RELPATH' DT_CACHE_SOURCE_ENV='$DT_CACHE_SOURCE_ENV' DT_CACHE_SOURCE_SNAPSHOT='$DT_CACHE_SOURCE_SNAPSHOT' DT_CACHE_MODE='$DT_CACHE_MODE' DT_CACHE_RUNTIME_RELPATH='$DT_CACHE_RUNTIME_RELPATH' DT_CACHE_SOURCE_MANIFEST_SHA256='$DT_CACHE_SOURCE_MANIFEST_SHA256' DT_CACHE_CLONE_FILES='$DT_CACHE_CLONE_FILES' DT_CACHE_CLONE_BYTES='$DT_CACHE_CLONE_BYTES' DT_CACHE_CLONE_DURATION_MS='$DT_CACHE_CLONE_DURATION_MS' CUDA_VISIBLE_DEVICES='$ids' DT_GPU_IDS='$ids' DT_MAX_HOURS='${DT_MAX_HOURS:-}' DT_MAX_VRAM_MIB='${DT_MAX_VRAM_MIB:-}' DT_MAX_JOB_MEMORY_MIB='${DT_MAX_JOB_MEMORY_MIB:-}' DT_UV='$UV_BIN' DT_UV_ENV='$UV_ENV' DT_WEBHOOK='${DT_WEBHOOK:-}' DT_CENTER='${DT_CENTER:-}' DT_NODE='${DT_NODE:-}' DT_JOB_ID='${DT_JOB_ID:-}' DT_JOB_NAME='${DT_JOB_NAME:-}' DT_PROXY='${DT_PROXY:-}' bash wrapper.sh >> logs/stdout.log 2>&1" \
+        "cd '$DT_JOB_DIR' && env DT_ROOT='${DT_ROOT:-}' DT_WORKER_ROOT='${DT_WORKER_ROOT:-}' DT_JOB_DIR='$DT_JOB_DIR' DT_OUTPUT_DIR='$DT_OUTPUT_DIR' DT_CONTROL_DIR='$DT_CONTROL_DIR' DT_PAYLOAD_DIR='$DT_PAYLOAD_DIR' DT_STATE_DIR='$DT_STATE_DIR' DT_META_PATH='$DT_META_PATH' DT_COMMAND_PATH='$DT_COMMAND_PATH' DT_CANCEL_PATH='$DT_CANCEL_PATH' DT_BIN_DIR='$DT_BIN_DIR' DT_CACHE_ROOT='$DT_CACHE_ROOT' DT_RUNTIME_ROOT='$DT_RUNTIME_ROOT' DT_GPU_LEASE_ROOT='$DT_GPU_LEASE_ROOT' DT_ARTIFACT_ROOT='${DT_ARTIFACT_ROOT:-}' DT_ARTIFACT_MANIFEST='${DT_ARTIFACT_MANIFEST:-}' DT_PREDECESSOR_JOB_ID='$DT_PREDECESSOR_JOB_ID' DT_PREDECESSOR_JOB_DIR='$DT_PREDECESSOR_JOB_DIR' DT_PREDECESSOR_OUTPUTS='$DT_PREDECESSOR_OUTPUTS' DT_PREDECESSOR_META_PATH='$DT_PREDECESSOR_META_PATH' DT_REUSE_CACHE_PATH='$DT_REUSE_CACHE_PATH' DT_REUSE_CACHE_ENV='$DT_CACHE_ENV' DT_CACHE_SOURCE_PATH='$DT_CACHE_SOURCE_PATH' DT_CACHE_SOURCE_JOB_ID='$DT_CACHE_SOURCE_JOB_ID' DT_CACHE_SOURCE_RELPATH='$DT_CACHE_SOURCE_RELPATH' DT_CACHE_SOURCE_ENV='$DT_CACHE_SOURCE_ENV' DT_CACHE_SOURCE_SNAPSHOT='$DT_CACHE_SOURCE_SNAPSHOT' DT_CACHE_MODE='$DT_CACHE_MODE' DT_CACHE_RUNTIME_RELPATH='$DT_CACHE_RUNTIME_RELPATH' DT_CACHE_SOURCE_MANIFEST_SHA256='$DT_CACHE_SOURCE_MANIFEST_SHA256' DT_CACHE_CLONE_FILES='$DT_CACHE_CLONE_FILES' DT_CACHE_CLONE_BYTES='$DT_CACHE_CLONE_BYTES' DT_CACHE_CLONE_DURATION_MS='$DT_CACHE_CLONE_DURATION_MS' CUDA_VISIBLE_DEVICES='$ids' DT_GPU_IDS='$ids' DT_MAX_HOURS='${DT_MAX_HOURS:-}' DT_MAX_VRAM_MIB='${DT_MAX_VRAM_MIB:-}' DT_MAX_JOB_MEMORY_MIB='${DT_MAX_JOB_MEMORY_MIB:-}' DT_UV='$UV_BIN' DT_UV_ENV='$UV_ENV' DT_WEBHOOK='${DT_WEBHOOK:-}' DT_CENTER='${DT_CENTER:-}' DT_NODE='${DT_NODE:-}' DT_JOB_ID='${DT_JOB_ID:-}' DT_JOB_NAME='${DT_JOB_NAME:-}' DT_PROXY='${DT_PROXY:-}' bash '$DT_PAYLOAD_DIR/wrapper.sh' >> logs/stdout.log 2>&1" \
         \; set-option -g exit-empty off \
         9>&-
 }
@@ -701,9 +750,9 @@ launch_locked() {
         log "session $DT_SESSION already exists from a prior launch attempt"
         return 14
     fi
-    rm -f "$DT_JOB_DIR/pgid" "$DT_JOB_DIR/gpus" \
-          "$DT_JOB_DIR/started_at" "$DT_JOB_DIR/finished_at" \
-          "$DT_JOB_DIR/exit_code" "$DT_JOB_DIR"/exit_code.tmp.*
+    rm -f "$DT_STATE_DIR/pgid" "$DT_STATE_DIR/gpus" \
+          "$DT_STATE_DIR/started_at" "$DT_STATE_DIR/finished_at" \
+          "$DT_STATE_DIR/exit_code" "$DT_STATE_DIR"/exit_code.tmp.*
     session_start_started_ms=$(now_ms)
     start_session "$ids" || return 14
     # Close the check→start race: cancellation may land after the pre-start
@@ -713,12 +762,12 @@ launch_locked() {
         tmux -L dt kill-session -t "$DT_SESSION" 2>/dev/null
         return 14
     fi
-    echo "$ids" > "$DT_JOB_DIR/gpus"
+    echo "$ids" > "$DT_STATE_DIR/gpus"
     # Keep the node launch lock until wrapper.sh owns every selected GPU
     # lease and records its pgid. Otherwise a second launcher can observe an
     # idle card during CPU-only dataset initialization and double-assign it.
     for ((attempt = 0; attempt < 100; attempt++)); do
-        [ -f "$DT_JOB_DIR/pgid" ] && pgid=$(cat "$DT_JOB_DIR/pgid") && break
+        [ -f "$DT_STATE_DIR/pgid" ] && pgid=$(cat "$DT_STATE_DIR/pgid") && break
         sleep 0.1
     done
     if [ -z "$pgid" ]; then
@@ -730,8 +779,8 @@ launch_locked() {
     return 0
 }
 
-lockfile="$HOME/dt/launch-$(hostname).lock"
-mkdir -p "$HOME/dt"
+lockfile="$DT_RUNTIME_ROOT/locks/launch-$(hostname).lock"
+mkdir -p "$DT_RUNTIME_ROOT/locks"
 exec 9>"$lockfile"
 LOCK_WAIT_STARTED_MS=$(now_ms)
 if ! flock -w 300 9; then
@@ -744,7 +793,7 @@ rc=$?
 exec 9>&-
 [ $rc -ne 0 ] && exit $rc
 
-ids=$(cat "$DT_JOB_DIR/gpus" 2>/dev/null || echo "")
+ids=$(cat "$DT_STATE_DIR/gpus" 2>/dev/null || echo "")
 boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "")
 REMOTE_TOTAL_DURATION_MS=$(($(now_ms) - LAUNCHER_STARTED_MS))
 printf '{"gpus": [%s], "pgid": %s, "env": "%s", "env_preexisting": %s, "setup_ran": %s, "boot_id": "%s", "launch_phases_ms": {"payload_attestation": %s, "preflight": %s, "artifact_verification": %s, "environment": %s, "launch_lock_wait": %s, "gpu_probe": %s, "session_start": %s, "remote_total": %s}}\n' \

@@ -12,7 +12,14 @@ from datetime import datetime
 from pathlib import PurePosixPath
 
 from .config import HeadConfig
-from .jobs import JobEntry, list_all
+from .jobs import JobEntry, list_all, remove_record
+from .layout import (
+    LEGACY_LAYOUT,
+    ROLE_LAYOUT,
+    node_path,
+    node_path_expression,
+    normalize_node_root,
+)
 from .snapshot_store import load_state, lock, save_state
 
 Log = Callable[[str], None]
@@ -47,16 +54,6 @@ def envs_in_use(cfg: HeadConfig) -> dict[str, set[str]]:
     return used
 
 
-def _node_path_expression(path: str) -> str:
-    """Quote a node path while preserving the documented ``~/`` expansion."""
-    if path == "~":
-        return '"$HOME"'
-    if path.startswith("~/"):
-        remainder = path[2:]
-        return '"$HOME"/' + shlex.quote(remainder)
-    return shlex.quote(path)
-
-
 def clean_envs_command(
     envs_dir: str,
     cutoff: datetime,
@@ -68,7 +65,7 @@ def clean_envs_command(
     keep_csv = "," + ",".join(sorted(keep)) + ","
     stamp = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     script = (
-        f"cd {_node_path_expression(envs_dir)} 2>/dev/null || exit 0; "
+        f"cd {node_path_expression(envs_dir)} 2>/dev/null || exit 0; "
         'for d in */; do d="${d%/}"; '
         '[[ "$d" =~ ^[0-9a-f]{12}$ ]] || continue; '
         f'case "{keep_csv}" in *",$d,"*) continue;; esac; '
@@ -93,7 +90,7 @@ def clean_envs(
     for node in cfg.nodes:
         try:
             command = clean_envs_command(
-                cfg.envs,
+                cfg.envs_for(node),
                 cutoff,
                 used.get(node.name, set()),
             )
@@ -142,13 +139,33 @@ def clean_job_victims(
     ]
 
 
-def _managed_job_dir(entry: JobEntry) -> str | None:
+def _managed_job_dir(cfg: HeadConfig, entry: JobEntry) -> str | None:
     """Validate that a registry path names exactly this job's managed slot."""
-    path = PurePosixPath(entry.job_dir)
-    expected = ("dt", "jobs", entry.job_id)
-    if path.is_absolute() or path.parts != expected:
-        return None
-    return path.as_posix()
+    if entry.storage_layout == ROLE_LAYOUT:
+        node = next((item for item in cfg.nodes if item.name == entry.node), None)
+        if node is None:
+            if entry.node != "-":
+                return None
+            from .config import Node
+
+            node = Node(name="-")
+        if entry.worker_root is None:
+            return None
+        try:
+            persisted_root = normalize_node_root(entry.worker_root)
+            expected = node_path(
+                persisted_root,
+                "worker",
+                "jobs",
+                entry.job_id,
+            )
+        except ValueError:
+            return None
+    else:
+        expected = PurePosixPath("dt", "jobs", entry.job_id).as_posix()
+        if entry.storage_layout not in {None, LEGACY_LAYOUT}:
+            return None
+    return entry.job_dir if entry.job_dir == expected else None
 
 
 def _remove_unreferenced_snapshots(
@@ -173,13 +190,18 @@ def _remove_unreferenced_snapshots(
             and re.fullmatch(r"[0-9a-f]{64}", entry.snapshot_sha256)
         }
         for digest in victim_digests - referenced:
-            path = cfg.snapshots_dir() / digest
-            try:
-                old_enough = path.stat().st_mtime < cutoff_ts
-            except FileNotFoundError:
-                continue
-            if path.is_dir() and old_enough:
-                shutil.rmtree(path)
+            roots = {cfg.snapshots_dir(), cfg.legacy_snapshots_dir()}
+            removed_any = False
+            for root in roots:
+                path = root / digest
+                try:
+                    old_enough = path.stat().st_mtime < cutoff_ts
+                except FileNotFoundError:
+                    continue
+                if path.is_dir() and not path.is_symlink() and old_enough:
+                    shutil.rmtree(path)
+                    removed_any = True
+            if removed_any:
                 removed_digests.add(digest)
         state = {
             project: digest
@@ -204,7 +226,7 @@ def clean_jobs(
     removed_entries: list[JobEntry] = []
     failures: list[CleanFailure] = []
     for entry in victims:
-        managed_dir = _managed_job_dir(entry)
+        managed_dir = _managed_job_dir(cfg, entry)
         if managed_dir is None:
             message = f"refusing unmanaged job_dir {entry.job_dir!r}"
             log(f"{entry.job_id}: {message}")
@@ -222,7 +244,7 @@ def clean_jobs(
                 proc = runner(
                     entry.node,
                     entry.node_local,
-                    f"rm -rf -- {shlex.quote(managed_dir)}",
+                    f"rm -rf -- {node_path_expression(managed_dir)}",
                     60,
                     False,
                 )
@@ -256,8 +278,9 @@ def clean_jobs(
         try:
             if before_registry_remove is not None:
                 before_registry_remove(entry)
-            shutil.rmtree(cfg.queue_dir() / entry.job_id, ignore_errors=True)
-            (cfg.registry_dir() / f"{entry.job_id}.json").unlink(missing_ok=True)
+            for queue in {cfg.queue_dir(), cfg.legacy_queue_dir()}:
+                shutil.rmtree(queue / entry.job_id, ignore_errors=True)
+            remove_record(cfg, entry.job_id)
         except Exception as exc:
             message = f"local cleanup failed: {exc}"
             log(f"{entry.job_id}: {message}; registry retained")

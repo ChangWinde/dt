@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import math
-import shlex
 from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 
 from .config import HeadConfig
 from .jobs import JobEntry
+from .layout import node_path_expression
 
 
 def collection_parts(collection: str) -> tuple[str, ...]:
@@ -40,7 +40,7 @@ def collection_root(cfg: HeadConfig, collection: str) -> Path:
 
 def pull_outputs_probe_command(outputs_rel: str) -> str:
     """Return one best-effort existence + apparent-size remote probe."""
-    quoted = shlex.quote(outputs_rel)
+    quoted = node_path_expression(outputs_rel)
     return (
         f"if test -d {quoted}; then "
         f"{{ timeout 5s du -s -b --count-links -- {quoted} 2>/dev/null "
