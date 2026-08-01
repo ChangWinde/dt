@@ -2318,45 +2318,38 @@ def test_doctor_overlaps_network_and_runtime_checks(tmp_path):
 
     from dt import doctor
 
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
     gpu_started = tmp_path / "gpu-started"
     net_started = tmp_path / "net-started"
-    nvidia_smi = fake_bin / "nvidia-smi"
-    nvidia_smi.write_text(
-        "#!/bin/sh\n"
+    fake_commands = (
+        "nvidia-smi() {\n"
         ': > "$DT_TEST_GPU_STARTED"\n'
         "i=0\n"
         'while [ ! -e "$DT_TEST_NET_STARTED" ]; do\n'
         "  i=$((i + 1))\n"
-        '  [ "$i" -ge 100 ] && exit 9\n'
+        '  [ "$i" -ge 100 ] && return 9\n'
         "  sleep 0.01\n"
         "done\n"
         'echo "570.1"\n'
-    )
-    nvidia_smi.chmod(0o755)
-    curl = fake_bin / "curl"
-    curl.write_text(
-        "#!/bin/sh\n"
+        "}\n"
+        "curl() {\n"
         ': > "$DT_TEST_NET_STARTED"\n'
         "i=0\n"
         'while [ ! -e "$DT_TEST_GPU_STARTED" ]; do\n'
         "  i=$((i + 1))\n"
-        '  [ "$i" -ge 100 ] && exit 9\n'
+        '  [ "$i" -ge 100 ] && return 9\n'
         "  sleep 0.01\n"
         "done\n"
-        "exit 1\n"
+        "return 1\n"
+        "}\n"
     )
-    curl.chmod(0o755)
 
     proc = subprocess.run(
-        ["bash", "-c", doctor.CHECK_SNIPPET],
+        ["bash", "-c", f"{fake_commands}\n{doctor.CHECK_SNIPPET}"],
         capture_output=True,
         text=True,
         timeout=3,
         env={
             **os.environ,
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "DT_TEST_GPU_STARTED": str(gpu_started),
             "DT_TEST_NET_STARTED": str(net_started),
         },

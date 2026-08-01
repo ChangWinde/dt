@@ -72,6 +72,13 @@ s and candidate median 7.2197 s over two observations each. That directional
 result is too small and variable for a general latency claim; deterministic
 tests instead prove the intended overlap and unchanged health records.
 
+After source synchronization to `psibot-hm`, four independent remote CLI
+processes completed together with median 0.9645 s. Every process returned all
+three configured nodes, all three GPUs, and no error. The deployed
+`dt doctor --json` then returned healthy SSH, GPU, and runtime contracts for
+`psibot-hm`, `psibot-ds`, and `psibot-ys`; their external package-network
+checks were correctly retained as slow rather than promoted to healthy speed.
+
 ## Verdict
 
 Accept the bounded-concurrency change for reliability and watch cadence. Do

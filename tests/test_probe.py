@@ -83,42 +83,35 @@ def test_duplicate_compute_app_identity_counts_once():
 
 
 def test_probe_batches_owner_lookup_and_deduplicates_apps(tmp_path):
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    nvidia_smi = fake_bin / "nvidia-smi"
-    nvidia_smi.write_text(
-        "#!/bin/sh\n"
-        'case "$*" in\n'
-        '  *--query-gpu=*) echo "0, GPU-test, 4096, 81920, 50, 42" ;;\n'
-        "  *--query-compute-apps=*)\n"
-        "    i=0\n"
-        '    while [ "$i" -lt 60 ]; do\n'
-        '      echo "GPU-test, $((1000 + i % 30))"\n'
-        "      i=$((i + 1))\n"
-        "    done\n"
-        "    ;;\n"
-        "  *) exit 1 ;;\n"
-        "esac\n"
-    )
-    nvidia_smi.chmod(0o755)
-    ps = fake_bin / "ps"
-    ps.write_text(
-        "#!/bin/sh\n"
-        'printf "call\\n" >> "$DT_TEST_PS_CALLS"\n'
-        "for arg do pids=$arg; done\n"
-        "old_ifs=$IFS\n"
-        "IFS=,\n"
-        "for pid in $pids; do printf '%s batchuser\\n' \"$pid\"; done\n"
-        "IFS=$old_ifs\n"
-    )
-    ps.chmod(0o755)
+    fake_commands = r"""
+    nvidia-smi() {
+        case "$*" in
+          *--query-gpu=*) echo "0, GPU-test, 4096, 81920, 50, 42" ;;
+          *--query-compute-apps=*)
+            i=0
+            while [ "$i" -lt 60 ]; do
+              echo "GPU-test, $((1000 + i % 30))"
+              i=$((i + 1))
+            done
+            ;;
+          *) return 1 ;;
+        esac
+    }
+    ps() {
+        printf "call\n" >> "$DT_TEST_PS_CALLS"
+        for arg do pids=$arg; done
+        old_ifs=$IFS
+        IFS=,
+        for pid in $pids; do printf '%s batchuser\n' "$pid"; done
+        IFS=$old_ifs
+    }
+    """
     calls = tmp_path / "ps-calls"
 
     proc = subprocess.run(
-        ["bash", "-c", PROBE_CMD],
+        ["bash", "-c", f"{fake_commands}\n{PROBE_CMD}"],
         env={
             **os.environ,
-            "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "DT_TEST_PS_CALLS": str(calls),
         },
         capture_output=True,
@@ -156,30 +149,26 @@ def test_dt_lease_exposes_exact_job_owner_from_lock_file():
 def test_concurrent_probe_readers_do_not_create_false_gpu_leases(tmp_path):
     import fcntl
 
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    nvidia_smi = fake_bin / "nvidia-smi"
-    nvidia_smi.write_text(
-        "#!/bin/sh\n"
-        'case "$*" in\n'
-        '  *--query-gpu=*) echo "0, GPU-test, 0, 24576, 0, 30" ;;\n'
-        "  *--query-compute-apps=*) exit 0 ;;\n"
-        "  *) exit 1 ;;\n"
-        "esac\n"
-    )
-    nvidia_smi.chmod(0o755)
+    fake_nvidia_smi = r"""
+    nvidia-smi() {
+        case "$*" in
+          *--query-gpu=*) echo "0, GPU-test, 0, 24576, 0, 30" ;;
+          *--query-compute-apps=*) return 0 ;;
+          *) return 1 ;;
+        esac
+    }
+    """
     lease = tmp_path / "dt/gpu-leases/gpu-0.lock"
     lease.parent.mkdir(parents=True)
     lease.write_text("stale-finished-owner\n")
     env = {
         **os.environ,
         "HOME": str(tmp_path),
-        "PATH": f"{fake_bin}:{os.environ['PATH']}",
     }
 
     def live_probe():
         proc = subprocess.run(
-            ["bash", "-c", PROBE_CMD],
+            ["bash", "-c", f"{fake_nvidia_smi}\n{PROBE_CMD}"],
             capture_output=True,
             text=True,
             env=env,
@@ -236,18 +225,15 @@ def test_system_resources_are_optional_for_old_probe_output():
     assert parse_system_output(SAMPLE) is None
 
 
-def test_probe_command_preserves_nvidia_smi_failure(tmp_path):
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    nvidia_smi = fake_bin / "nvidia-smi"
-    nvidia_smi.write_text(
-        "#!/usr/bin/env bash\necho 'driver unavailable sentinel' >&2\nexit 9\n"
+def test_probe_command_preserves_nvidia_smi_failure():
+    command = (
+        "nvidia-smi() { echo 'driver unavailable sentinel' >&2; return 9; };\n"
+        f"{PROBE_CMD}"
     )
-    nvidia_smi.chmod(0o755)
 
     proc = subprocess.run(
-        ["bash", "-c", PROBE_CMD],
-        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        ["bash", "-c", command],
+        env=os.environ,
         capture_output=True,
         text=True,
         timeout=10,
