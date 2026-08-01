@@ -1,6 +1,8 @@
 """v0.8 operator-visibility round: probe owners, snapshot stats, auto center,
 info parsing helpers."""
 
+from rich.text import Text
+
 from dt.config import Project
 from dt.dispatch import transferred_gib
 from dt.probe import SEP, parse_probe_output
@@ -14,6 +16,14 @@ SAMPLE_WHO = f"""0, GPU-aaa, 3, 81920, 0
 GPU-bbb, 12345, alice
 GPU-bbb, 12346, bob
 """
+
+
+def _max_terminal_width(output: str) -> int:
+    """Return the widest rendered line, ignoring ANSI styling bytes."""
+    return max(
+        (Text.from_ansi(line).cell_len for line in output.splitlines()),
+        default=0,
+    )
 
 
 # -- root onboarding -----------------------------------------------------------
@@ -61,7 +71,7 @@ def test_root_help_has_a_compact_end_to_end_quick_start():
     assert "Operations" in normalized
     assert not re.search(r"\btask\s+Safe fast path", normalized)
     assert "nodes whose own internet is too slow" not in normalized
-    assert max(map(len, output.splitlines())) <= 80
+    assert _max_terminal_width(result.output) <= 80
     command_lines = [
         line.strip()
         for line in output.splitlines()
@@ -98,7 +108,7 @@ def test_dense_submission_help_groups_everyday_and_advanced_options():
     ):
         assert heading in result.output
     assert result.output.index("Everyday") < result.output.index("Scheduling & safety")
-    assert max(map(len, result.output.splitlines())) <= 80
+    assert _max_terminal_width(result.output) <= 80
 
 
 # -- probe owners --------------------------------------------------------------
