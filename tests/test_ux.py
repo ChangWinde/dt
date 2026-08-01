@@ -1,6 +1,8 @@
 """v0.8 operator-visibility round: probe owners, snapshot stats, auto center,
 info parsing helpers."""
 
+from rich.text import Text
+
 from dt.config import Project
 from dt.dispatch import transferred_gib
 from dt.probe import SEP, parse_probe_output
@@ -16,7 +18,30 @@ GPU-bbb, 12346, bob
 """
 
 
+def _max_terminal_width(output: str) -> int:
+    """Return the widest rendered line, ignoring ANSI styling bytes."""
+    return max(
+        (Text.from_ansi(line).cell_len for line in output.splitlines()),
+        default=0,
+    )
+
+
 # -- root onboarding -----------------------------------------------------------
+
+
+def test_version_prefers_installed_source_commit(monkeypatch):
+    from typer.testing import CliRunner
+
+    from dt import __version__
+    from dt import cli
+
+    monkeypatch.setattr(cli, "SOURCE_COMMIT", "a" * 40)
+    monkeypatch.setattr(cli, "_git_sha", lambda: "wrong")
+
+    result = CliRunner().invoke(cli.app, ["--version"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output == f"dt {__version__} (aaaaaaaaaaaa)\n"
 
 
 def test_root_help_has_a_compact_end_to_end_quick_start():
@@ -46,7 +71,7 @@ def test_root_help_has_a_compact_end_to_end_quick_start():
     assert "Operations" in normalized
     assert not re.search(r"\btask\s+Safe fast path", normalized)
     assert "nodes whose own internet is too slow" not in normalized
-    assert max(map(len, output.splitlines())) <= 80
+    assert _max_terminal_width(result.output) <= 80
     command_lines = [
         line.strip()
         for line in output.splitlines()
@@ -65,6 +90,25 @@ def test_root_help_has_a_compact_end_to_end_quick_start():
 
     compatibility_help = CliRunner().invoke(cli.app, ["task", "--help"])
     assert compatibility_help.exit_code == 0, compatibility_help.output
+
+
+def test_dense_submission_help_groups_everyday_and_advanced_options():
+    from typer.testing import CliRunner
+
+    from dt import cli
+
+    result = CliRunner().invoke(cli.app, ["run", "--help"], terminal_width=80)
+
+    assert result.exit_code == 0, result.output
+    for heading in (
+        "Everyday",
+        "Scheduling & safety",
+        "Reproducibility",
+        "Follow & output",
+    ):
+        assert heading in result.output
+    assert result.output.index("Everyday") < result.output.index("Scheduling & safety")
+    assert _max_terminal_width(result.output) <= 80
 
 
 # -- probe owners --------------------------------------------------------------
@@ -112,10 +156,100 @@ def test_free_table_stays_compact_without_owner_column():
         "load",
         "VRAM free",
         "CPU",
-        "RAM",
+        "RAM G",
         "disk",
-        "IO / issue",
+        "IO",
     ]
+
+
+def test_resource_tables_treat_configured_node_labels_as_literal_text():
+    from rich.console import Console
+
+    from dt.render import doctor_table, free_table
+
+    node = "[b]x[/b]"
+    free_console = Console(width=120, record=True, color_system=None)
+    free_console.print(
+        free_table(
+            [
+                {
+                    "center": "c",
+                    "node": node,
+                    "gpus": [],
+                    "system": {},
+                }
+            ]
+        )
+    )
+    doctor_console = Console(width=120, record=True, color_system=None)
+    doctor_console.print(
+        doctor_table(
+            [
+                {
+                    "center": "c",
+                    "node": node,
+                    "checks": {"ssh": "ok"},
+                }
+            ]
+        )
+    )
+
+    assert node in free_console.export_text()
+    assert node in doctor_console.export_text()
+
+
+def test_free_table_headers_and_values_share_the_same_column_start():
+    from rich.console import Console
+
+    from dt.render import free_table
+
+    row = {
+        "center": "psibot",
+        "node": "psibot-hm",
+        "gpus": [
+            {
+                "index": 0,
+                "free": False,
+                "procs": 1,
+                "leased": False,
+                "users": ["alice"],
+                "mem_used": 15 * 1024,
+                "mem_total": 32 * 1024,
+                "util": 86,
+                "temperature": 81,
+            }
+        ],
+        "system": {
+            "cpu_cores": 32,
+            "cpu_load1": 1.4,
+            "mem_used_mib": 13 * 1024,
+            "mem_total_mib": 63 * 1024,
+            "disk_free_gib": 109,
+            "disk_total_gib": 1024,
+            "io_pressure": 0.0,
+        },
+    }
+    console = Console(width=80, record=True, color_system=None)
+
+    console.print(free_table([row]))
+    header, values = console.export_text().splitlines()
+
+    header_cursor = values_cursor = 0
+    for label, value in (
+        ("node", "psibot-hm"),
+        ("GPU free", "0/1"),
+        ("load", "86%/81°"),
+        ("VRAM free", "17/32G"),
+        ("CPU", "1.4/32"),
+        ("RAM G", "13/63"),
+        ("disk", "109G"),
+        ("IO", "0.0%"),
+    ):
+        header_start = header.index(label, header_cursor)
+        values_start = values.index(value, values_cursor)
+        assert header_start == values_start
+        header_cursor = header_start + len(label)
+        values_cursor = values_start + len(value)
 
 
 def test_free_table_gpu_availability_is_self_explanatory_at_80_columns():
@@ -172,6 +306,57 @@ def test_free_table_gpu_availability_is_self_explanatory_at_80_columns():
     assert "87%/69°" in rendered
     assert "alice×1" in rendered
     assert len(rendered.splitlines()) == 2
+
+
+def test_free_table_preserves_resource_values_at_60_columns():
+    from rich.console import Console
+
+    from dt.render import free_table
+
+    row = {
+        "center": "psibot",
+        "node": "psibot-hm",
+        "gpus": [
+            {
+                "index": 0,
+                "free": False,
+                "procs": 1,
+                "leased": False,
+                "users": ["alice"],
+                "mem_used": 15 * 1024,
+                "mem_total": 32 * 1024,
+                "util": 86,
+                "temperature": 81,
+            }
+        ],
+        "system": {
+            "cpu_cores": 32,
+            "cpu_load1": 1.4,
+            "mem_used_mib": 13 * 1024,
+            "mem_total_mib": 63 * 1024,
+            "disk_free_gib": 109,
+            "disk_total_gib": 1024,
+            "io_pressure": 0.0,
+        },
+    }
+    console = Console(width=60, record=True, color_system=None)
+
+    console.print(free_table([row]))
+    rendered = console.export_text()
+
+    for value in (
+        "psibot-hm",
+        "0/1",
+        "86%/81°",
+        "17/32G",
+        "1.4/32",
+        "13/63",
+        "109G",
+        "0.0%",
+    ):
+        assert value in rendered
+    assert "…" not in rendered
+    assert max(map(len, rendered.splitlines())) <= 60
 
 
 def test_free_table_surfaces_incomplete_gpu_inventory_at_80_columns():
@@ -356,16 +541,105 @@ def test_agent_status_card_stays_readable_at_80_columns():
         "log_max_bytes": 10 * 1024 * 1024,
         "log_backups": 2,
     }
+    compact_console = Console(width=80, record=True, color_system=None)
+    compact_console.print(_agent_status_table(status))
+    compact = compact_console.export_text()
+
+    assert max(map(len, compact.splitlines())) <= 80
+    assert "queued 12  ·  running 3  ·  history 561" in compact
+    assert "covered  ·  queued work covers the current runway" in compact
+    assert "dp-libero-screen · ref abcd" in compact
+    assert "scheduler" not in compact
+    assert "policy" not in compact
+    assert "log" not in compact
+    assert "20260725-0440_dp-libero-screen_abcd" not in compact
+
+    verbose_console = Console(width=80, record=True, color_system=None)
+    verbose_console.print(_agent_status_table(status, verbose=True))
+    verbose = verbose_console.export_text()
+
+    assert max(map(len, verbose.splitlines())) <= 80
+    assert "15s idle  ·  2s queued  ·  completion wake" in verbose
+    assert "445.0 KiB / 10.0 MiB  ·  2 backups" in verbose
+    assert "20260725-0440_dp-libero-screen_abcd" in verbose
+
+
+def test_stopped_agent_status_shows_the_recovery_command():
+    from rich.console import Console
+
+    from dt.cli import _agent_status_table
+
+    status = {
+        "alive": False,
+        "pid": None,
+        "queued": 2,
+        "running": 0,
+        "registry_entries": 2,
+        "registry_damage": 0,
+        "handoff_state": "agent_stopped",
+        "handoff_reason": "queue agent is not running",
+        "queue_head": None,
+        "poll_s": 15,
+        "active_poll_s": 2.0,
+        "completion_wake": True,
+        "max_my_jobs": None,
+        "reserve_free_per_node": 0,
+        "webhook": False,
+        "log_bytes": 0,
+        "log_max_bytes": 10 * 1024 * 1024,
+        "log_backups": 0,
+    }
     console = Console(width=80, record=True, color_system=None)
+
     console.print(_agent_status_table(status))
+
+    assert "next  dt agent start" in console.export_text()
+
+
+def test_verbose_agent_status_keeps_complete_queue_id_at_60_columns():
+    from rich.console import Console
+
+    from dt.cli import _agent_status_table
+
+    job_id = "20260731-1311_uo114-libero_object_dp-v1_2d0f4c7f75c473c4"
+    status = {
+        "alive": True,
+        "pid": 123,
+        "queued": 1,
+        "running": 1,
+        "registry_entries": 2,
+        "registry_damage": 0,
+        "handoff_state": "covered",
+        "handoff_reason": "queue has work",
+        "queue_head": job_id,
+        "poll_s": 15,
+        "active_poll_s": 2.0,
+        "completion_wake": True,
+        "max_my_jobs": None,
+        "reserve_free_per_node": 0,
+        "webhook": False,
+        "log_bytes": 0,
+        "log_max_bytes": 10 * 1024 * 1024,
+        "log_backups": 0,
+    }
+    console = Console(width=60, record=True, color_system=None)
+
+    console.print(_agent_status_table(status, verbose=True))
     rendered = console.export_text()
 
-    assert max(map(len, rendered.splitlines())) <= 80
-    assert "queued 12  ·  running 3  ·  history 561" in rendered
-    assert "covered  ·  queued work covers the current runway" in rendered
-    assert "15s idle  ·  2s queued  ·  completion wake" in rendered
-    assert "445.0 KiB / 10.0 MiB  ·  2 backups" in rendered
-    assert "20260725-0440_dp-libero-screen_abcd" in rendered
+    assert job_id in "".join(rendered.split())
+    assert "…" not in rendered
+
+
+def test_run_help_names_the_required_command_boundary():
+    from typer.testing import CliRunner
+
+    from dt import cli
+
+    result = CliRunner().invoke(cli.app, ["run", "--help"])
+
+    assert result.exit_code == 0, result.output
+    assert "-- COMMAND [ARGS]..." in result.output
 
 
 def test_free_table_who_keeps_resources_readable_with_offline_node():
@@ -432,7 +706,7 @@ def test_free_table_who_keeps_resources_readable_with_offline_node():
     assert "CPU" in rendered
     assert "RAM" in rendered
     assert "disk" in rendered
-    assert "IO / issue" in rendered
+    assert "IO" in rendered
     assert "in use" in rendered
     assert "offline" in rendered
     assert "no route" in rendered
@@ -1071,6 +1345,7 @@ def test_free_human_explains_queued_work_stalled_by_dead_agent(tmp_path, monkeyp
     monkeypatch.setattr(agent, "alive_pid", lambda cfg_: None)
 
     result = CliRunner().invoke(cli.app, ["free"])
+    explained = CliRunner().invoke(cli.app, ["free", "--explain"])
 
     assert result.exit_code == 0, result.output
     normalized = " ".join(result.output.split())
@@ -1078,7 +1353,11 @@ def test_free_human_explains_queued_work_stalled_by_dead_agent(tmp_path, monkeyp
     assert "1 queued" in normalized
     assert "stalled: queue agent is stopped" in normalized
     assert "dt agent start" in normalized
-    assert "waiting: batch FIFO" in normalized
+    assert "waiting: batch FIFO" not in normalized
+    assert explained.exit_code == 0, explained.output
+    explained_normalized = " ".join(explained.output.split())
+    assert "next job queued-id" in explained_normalized
+    assert "reason waiting: batch FIFO" in explained_normalized
 
 
 def test_laptop_free_human_requests_scheduler_context(monkeypatch):
@@ -1220,6 +1499,54 @@ def test_free_scheduler_explains_untracked_dt_lease():
     assert "occupied outside dt" not in normalized
 
 
+def test_free_scheduler_default_hides_verbose_queue_head_diagnosis():
+    from rich.console import Console
+
+    from dt.cli import _free_view
+
+    rows = [
+        _node("c", "psibot-hm", 0, total=1),
+        _node("c", "psibot-ds", 0, total=1),
+        {
+            "center": "c",
+            "node": "psibot-ys",
+            "gpus": [],
+            "system": None,
+            "error": "timeout",
+        },
+    ]
+    job_id = "20260731-1311_uo114-libero_spatial_dp-v1_544d1a0d6161d898"
+    reason = (
+        "waiting: no free capacity (psibot-hm: 0 free < 1 wanted; "
+        "busy: gpu0 another-long-running-job 16.5/31.8GiB util93%)"
+    )
+    context = {
+        "center": "c",
+        "running": 3,
+        "queued": 12,
+        "queue_head_job_id": job_id,
+        "queue_head_reason": reason,
+        "queue_head_pin_node": "psibot-hm",
+        "queue_head_gpus_requested": 1,
+        "reserve_free_per_node": 0,
+        "agent_alive": True,
+    }
+    for row in rows:
+        row["_scheduler"] = context
+    console = Console(width=80, record=True, color_system=None)
+
+    console.print(_free_view(rows, who=False))
+    rendered = console.export_text()
+    normalized = " ".join(rendered.split())
+
+    assert max(map(len, rendered.splitlines())) <= 80
+    assert "0/2 GPU free · 3 running · 12 queued" in normalized
+    assert "next needs 1 GPU on psibot-hm" in normalized
+    assert job_id not in normalized
+    assert reason not in normalized
+    assert "· head" not in normalized
+
+
 def test_free_scheduler_explains_pinned_queue_cannot_use_free_gpu_elsewhere():
     from rich.console import Console
 
@@ -1244,14 +1571,15 @@ def test_free_scheduler_explains_pinned_queue_cannot_use_free_gpu_elsewhere():
         row["_scheduler"] = context
     console = Console(width=80, record=True, color_system=None)
 
-    console.print(_free_view(rows, who=False))
+    console.print(_free_view(rows, who=False, explain=True))
     normalized = " ".join(console.export_text().split())
 
     assert "1/2 GPU free · 1 running · 1 queued" in normalized
-    assert "waiting for 1 GPU on pinned n2" in normalized
+    assert "next needs 1 GPU on n2" in normalized
     assert "1 free elsewhere is not eligible" in normalized
-    assert "dispatch pending" not in normalized
-    assert "head queued-on-n2: waiting: batch FIFO" in normalized
+    assert "dispatching" not in normalized
+    assert "next job queued-on-n2" in normalized
+    assert "reason waiting: batch FIFO" in normalized
 
 
 def test_free_scheduler_prioritizes_job_specific_block_over_free_capacity():
@@ -1273,12 +1601,12 @@ def test_free_scheduler_prioritizes_job_specific_block_over_free_capacity():
     }
     console = Console(width=80, record=True, color_system=None)
 
-    console.print(_free_view([row], who=False))
+    console.print(_free_view([row], who=False, explain=True))
     normalized = " ".join(console.export_text().split())
 
-    assert "blocked: queue head has a job-specific constraint" in normalized
+    assert "next is blocked by a job constraint" in normalized
     assert "path-missing: /data/libero" in normalized
-    assert "dispatch pending" not in normalized
+    assert "dispatching" not in normalized
 
 
 def test_laptop_free_human_falls_back_for_old_head_without_scheduler_option(
@@ -2098,7 +2426,11 @@ def test_doctor_human_suggests_seed_for_remote_slow_network(tmp_path, monkeypatc
 
     cfg = HeadConfig(
         center="c",
-        nodes=[Node(name="slow-node"), Node(name="fast-node")],
+        nodes=[
+            Node(name="slow-node-with-a-descriptive-name"),
+            Node(name="another-slow-node-with-a-long-name"),
+            Node(name="fast-node"),
+        ],
         projects={},
         default_project=None,
         root=tmp_path / "dt",
@@ -2115,8 +2447,13 @@ def test_doctor_human_suggests_seed_for_remote_slow_network(tmp_path, monkeypatc
     rows = [
         {
             "center": "c",
-            "node": "slow-node",
+            "node": "slow-node-with-a-descriptive-name",
             "checks": {**healthy, "net": "slow(40KB/s)"},
+        },
+        {
+            "center": "c",
+            "node": "another-slow-node-with-a-long-name",
+            "checks": {**healthy, "net": "blocked"},
         },
         {
             "center": "c",
@@ -2127,11 +2464,14 @@ def test_doctor_human_suggests_seed_for_remote_slow_network(tmp_path, monkeypatc
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli, "doctor_center", lambda cfg_: rows)
 
-    result = CliRunner().invoke(cli.app, ["doctor"])
+    result = CliRunner().invoke(cli.app, ["doctor"], env={"COLUMNS": "80"})
 
     assert result.exit_code == 0, result.output
-    assert "dt seed slow-node --plan" in result.output
+    assert "network slow/blocked on 2 nodes" in result.output
+    assert "dt seed slow-node-with-a-descriptive-name" in result.output
+    assert "another-slow-node-with-a-long-name --plan" in result.output
     assert "dt seed fast-node" not in result.output
+    assert max(map(len, result.output.splitlines())) <= 80
 
 
 def test_ps_table_defaults_to_one_compact_row_per_job_at_80_columns(monkeypatch):
@@ -2194,27 +2534,199 @@ def test_ps_table_defaults_to_one_compact_row_per_job_at_80_columns(monkeypatch)
     assert len([line for line in rendered.splitlines() if "short-canary" in line]) == 1
 
 
-def test_ps_table_wide_retains_full_identity_and_command():
+def test_ps_table_preserves_complete_historical_date_at_80_columns(monkeypatch):
+    from datetime import datetime
+
+    from rich.console import Console
+
+    import dt.render as render
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 8, 1, 12, 0)
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(render, "datetime", FrozenDatetime)
+    row = {
+        "name": "general-lossless-accel-gla06-local-a",
+        "job_id": "20260731-1311_general-lossless-accel-gla06-local-a_abcd",
+        "display_ref": "abcd",
+        "center": "psibot",
+        "node": "psibot-hm",
+        "pin_node": "psibot-hm",
+        "gpus": [],
+        "gpus_requested": 1,
+        "status": "queued",
+        "queue_position": 10,
+        "queue_depth": 10,
+        "exit_code": None,
+        "created_at": FrozenDatetime(2026, 7, 31, 13, 11).timestamp(),
+        "cmd": "python train.py",
+    }
+    console = Console(width=80, record=True, color_system=None)
+
+    console.print(render.ps_table([row]))
+    rendered = console.export_text()
+
+    assert max(map(len, rendered.splitlines())) <= 80
+    assert "07-31" in rendered
+    assert "07-3 " not in rendered
+
+
+def test_ps_issues_empty_state_does_not_render_an_empty_table(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from dt import cli
+    from dt.config import HeadConfig
+
+    cfg = HeadConfig(
+        center="c",
+        nodes=[],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "_gather_ps_rows",
+        lambda *args, **kwargs: ([], {}),
+    )
+
+    result = CliRunner().invoke(cli.app, ["ps", "--issues"])
+
+    assert result.exit_code == 0, result.output
+    assert "No jobs need attention." in result.output
+    assert "Recent issues" not in result.output
+    assert "name" not in result.output
+    assert "0 need attention" not in result.output
+
+
+def test_ps_human_issues_compact_dependency_ids_without_mutating_machine_rows():
+    from dt import cli
+
+    predecessor_id = "20260730-0047_long-predecessor-name_1234567890abcdef"
+    rows = cli._PsRows(
+        [
+            {
+                "job_id": predecessor_id,
+                "display_ref": "cdef",
+                "reason": "setup failed",
+            },
+            {
+                "job_id": "20260730-0100_dependent_fedcba0987654321",
+                "display_ref": "4321",
+                "reason": f"dependency {predecessor_id} did not succeed: failed",
+            },
+        ],
+        total=2,
+        applied_filters={"issues"},
+    )
+
+    human_rows = cli._humanize_ps_references(rows)
+
+    assert predecessor_id in rows[1]["reason"]
+    assert human_rows[1]["reason"] == "dependency cdef failed"
+    assert human_rows.total == 2
+    assert human_rows.applied_filters == frozenset({"issues"})
+
+
+def test_ps_table_wide_retains_full_identity_and_command_at_80_columns():
     from rich.console import Console
 
     from dt.render import ps_table
 
     row = {
         "name": "exp",
-        "job_id": "20260724-0510_exp_baea",
+        "job_id": (
+            "20260724-0510_exp-with-a-descriptive-name_0123456789abcdef0123456789abcdef"
+        ),
         "center": "psibot",
         "node": "psibot-ds",
         "gpus": [0],
         "status": "finished",
         "exit_code": 0,
         "created_at": 1784841026.0,
-        "cmd": "python train.py --lr 3e-4",
+        "cmd": (
+            "python train.py --configuration configs/long/research/baseline.yaml "
+            "--learning-rate 3e-4 --sentinel COMPLETE"
+        ),
     }
-    console = Console(width=180, record=True, color_system=None)
+    console = Console(width=80, record=True, color_system=None)
     console.print(ps_table([row], wide=True))
     rendered = console.export_text()
 
-    assert row["job_id"] in rendered
+    compact = "".join(rendered.split())
+    assert row["job_id"] in compact
+    assert "--sentinelCOMPLETE" in compact
+    assert "..." not in rendered
+    assert "…" not in rendered
+
+
+def test_ps_table_keeps_state_reference_target_and_time_at_60_columns(monkeypatch):
+    from datetime import datetime
+
+    from rich.console import Console
+
+    import dt.render as render
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 8, 1, 12, 0)
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr(render, "datetime", FrozenDatetime)
+    row = {
+        "name": "general-lossless-acceleration-experiment",
+        "job_id": "20260731-1311_general-lossless-acceleration-experiment_abcd",
+        "display_ref": "abcd",
+        "center": "psibot",
+        "node": "-",
+        "pin_node": "psibot-hm",
+        "gpus": [],
+        "gpus_requested": 1,
+        "status": "queued",
+        "queue_position": 10,
+        "queue_depth": 10,
+        "created_at": FrozenDatetime(2026, 7, 31, 13, 11).timestamp(),
+        "cmd": "python train.py",
+    }
+    console = Console(width=60, record=True, color_system=None)
+
+    console.print(render.ps_table([row]))
+    rendered = console.export_text()
+
+    assert "abcd" in rendered
+    assert "psibot-hm" in rendered
+    assert "queued #10/10" in rendered
+    assert "07-31" in rendered
+    assert max(map(len, rendered.splitlines())) <= 60
+
+
+def test_ps_table_treats_job_names_and_commands_as_literal_text():
+    from rich.console import Console
+
+    from dt.render import ps_table
+
+    row = {
+        "name": "[red]not-a-status[/red]",
+        "job_id": "20260724-0510_exp_baea",
+        "center": "psibot",
+        "node": "psibot-ds",
+        "gpus": [0],
+        "status": "running",
+        "created_at": 1784841026.0,
+        "cmd": "python -c '[link=file:///tmp/fake]text[/link]'",
+    }
+    console = Console(width=180, record=True, color_system=None)
+
+    console.print(ps_table([row], wide=True))
+    rendered = console.export_text()
+
+    assert row["name"] in rendered
     assert row["cmd"] in rendered
 
 

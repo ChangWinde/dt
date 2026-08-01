@@ -1051,6 +1051,102 @@ def test_storage_json_inventory_is_scoped_to_managed_paths(tmp_path, monkeypatch
     assert all(str(tmp_path) in row["path"] for row in payload["head"])
 
 
+def test_storage_defaults_to_scope_summary_and_keeps_details_explicit(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    payload = {
+        "schema_version": "dt_storage_v1",
+        "managed_root": str(cfg.root),
+        "results_root": str(cfg.results_dir()),
+        "head": [
+            {"kind": "state", "path": "/dt/head/state", "bytes": 100, "entries": 2},
+            {
+                "kind": "results",
+                "path": "/dt/head/results",
+                "bytes": 200,
+                "entries": 1,
+            },
+        ],
+        "nodes": [
+            {
+                "node": "n1",
+                "managed_root": "~/dt",
+                "error": None,
+                "jobs": {"path": "~/dt/worker/jobs", "bytes": 300, "entries": 3},
+                "envs": {"path": "~/dt/envs", "bytes": 400, "entries": 4},
+            },
+            {
+                "node": "offline",
+                "managed_root": "~/dt",
+                "error": "ssh timeout",
+                "jobs": {"path": "~/dt/worker/jobs", "bytes": None, "entries": None},
+                "envs": {"path": "~/dt/envs", "bytes": None, "entries": None},
+            },
+        ],
+        "total_bytes": 1000,
+    }
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "storage_inventory", lambda *args, **kwargs: payload)
+
+    summary = CliRunner().invoke(cli.app, ["storage"])
+    details = CliRunner().invoke(cli.app, ["storage", "--details"])
+    machine = CliRunner().invoke(cli.app, ["storage", "--json"])
+
+    assert summary.exit_code == 0, summary.output
+    assert "head" in summary.output
+    assert "n1" in summary.output
+    offline_row = next(
+        line
+        for line in summary.output.splitlines()
+        if line.strip().startswith("offline")
+    )
+    assert offline_row.split() == ["offline", "2", "-", "-", "ssh", "timeout"]
+    assert "observed ≥1000 B" in summary.output
+    assert "head/state" not in summary.output
+    assert "/dt/head/state" not in summary.output
+    assert "details: dt storage --details" in summary.output
+
+    assert details.exit_code == 0, details.output
+    assert "head/state" in details.output
+    assert "/dt/head/state" in details.output
+    assert "summary: dt storage" in details.output
+
+    assert machine.exit_code == 0, machine.output
+    assert json.loads(machine.stdout) == payload
+
+
+def test_storage_details_keep_complete_paths_at_60_columns():
+    from rich.console import Console
+
+    from dt.cli import _storage_table
+
+    path = (
+        "/srv/dt/results/a-very-long-research-project/"
+        "experiment-with-provenance/tail-sentinel"
+    )
+    payload = {
+        "head": [
+            {
+                "kind": "legacy_agent_agent_lock",
+                "path": path,
+                "bytes": 100,
+                "entries": 1,
+            }
+        ],
+        "nodes": [],
+    }
+    console = Console(width=60, record=True, color_system=None)
+
+    console.print(_storage_table(payload, center="research", details=True))
+    rendered = console.export_text()
+
+    assert path in "".join(rendered.split())
+    assert "head/legacy_agent_lock" in rendered
+    assert "legacy_agent_agent" not in rendered
+    assert "…" not in rendered
+
+
 def test_auto_clean_config_parsed():
     cfg = parse({"center": "c", "nodes": ["n1"], "queue": {"auto_clean_days": 14}})
     assert cfg.queue.auto_clean_days == 14.0

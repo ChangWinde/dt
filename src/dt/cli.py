@@ -39,8 +39,10 @@ from typing import (
 )
 
 import typer
+from rich.markup import escape
 
 from . import __version__
+from ._provenance import SOURCE_COMMIT
 from . import jobs as jobs_mod
 from .completion import CompletionSignals
 from .config import ConfigError, HeadConfig, LaptopConfig, config_path, load
@@ -81,6 +83,7 @@ from .remote import (
 from .render import (
     DISK_LOW_FREE_FRACTION,
     DISK_LOW_FREE_GIB,
+    compact_path,
     doctor_table,
     err,
     free_table,
@@ -157,7 +160,7 @@ def _cfg() -> HeadConfig | LaptopConfig:
     try:
         return load()
     except ConfigError as e:
-        err.print(f"[red]config error:[/red] {e}")
+        err.print(f"[red]config error:[/red] {escape(str(e))}")
         raise typer.Exit(1)
 
 
@@ -175,7 +178,7 @@ def _git_sha() -> str | None:
 
 def _version_cb(value: bool) -> None:
     if value:
-        sha = _git_sha()
+        sha = SOURCE_COMMIT[:12] if SOURCE_COMMIT else _git_sha()
         print(f"dt {__version__}" + (f" ({sha})" if sha else ""))
         raise typer.Exit()
 
@@ -255,12 +258,12 @@ def init_config(
             return
         write_config(target, payload, force=force)
     except InitError as exc:
-        err.print(f"[red]init error:[/red] {exc}")
+        err.print(f"[red]init error:[/red] {escape(str(exc))}")
         raise typer.Exit(1)
 
     normalized_role = role.strip().lower()
     next_steps = (
-        ["dt doctor", "dt agent install", "dt free"]
+        ["dt doctor", "dt agent install", "dt agent start", "dt free"]
         if normalized_role == "head"
         else ["dt doctor", "dt free"]
     )
@@ -276,7 +279,9 @@ def init_config(
             )
         )
         return
-    err.print(f"[green]created {target}[/green] · role {normalized_role}")
+    err.print(
+        f"[green]created {escape(str(target))}[/green] · role {escape(normalized_role)}"
+    )
     err.print("[dim]next: " + "  →  ".join(next_steps) + "[/dim]")
 
 
@@ -301,12 +306,39 @@ def _find_or_die(cfg: HeadConfig, ref: str) -> jobs_mod.JobEntry:
             if remainder:
                 choices += f", +{remainder} more"
             err.print(
-                f"[red]ambiguous job reference {ref!r}[/red]; use one of: {choices}"
+                f"[red]ambiguous job reference {escape(repr(ref))}[/red]; "
+                f"use one of: {escape(choices)}"
             )
             raise typer.Exit(EXIT_NOT_FOUND)
-        err.print(f"[red]no job matching {ref!r}[/red]")
+        err.print(f"[red]no job matching {escape(repr(ref))}[/red]")
         raise typer.Exit(EXIT_NOT_FOUND)
     return entry
+
+
+def _display_ref_for_entry(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> str:
+    """Return a collision-safe human ref, including a not-yet-listed entry."""
+    if entry.job_id == entry.name:
+        # Exact ids resolve before names; keep short legacy/test identifiers
+        # readable instead of turning ``follow`` into the cryptic ``llow``.
+        return entry.job_id
+    entries_by_id = {
+        candidate.job_id: candidate for candidate in jobs_mod.list_all(cfg)
+    }
+    entries_by_id[entry.job_id] = entry
+    return jobs_mod.compact_job_refs(list(entries_by_id.values())).get(
+        entry.job_id, entry.job_id
+    )
+
+
+def _display_refs_for_entries(
+    cfg: HeadConfig, entries: Iterable[jobs_mod.JobEntry]
+) -> dict[str, str]:
+    """Return one collision-safe ref map for an atomic submission receipt."""
+    entries_by_id = {
+        candidate.job_id: candidate for candidate in jobs_mod.list_all(cfg)
+    }
+    entries_by_id.update((entry.job_id, entry) for entry in entries)
+    return jobs_mod.compact_job_refs(list(entries_by_id.values()))
 
 
 def _complete_ref(incomplete: str) -> list[str]:
@@ -981,8 +1013,13 @@ def _free_explain_payload(
     }
 
 
-def _free_scheduler_table(rows: list[JsonDict], *, pin_centers: bool = False) -> Any:
-    """Compact explanation under the resource table; absent for older heads."""
+def _free_scheduler_table(
+    rows: list[JsonDict],
+    *,
+    pin_centers: bool = False,
+    explain: bool = False,
+) -> Any:
+    """Compact scheduler summary, with queue internals only when requested."""
     from rich.markup import escape
     from rich.table import Table
 
@@ -1000,7 +1037,7 @@ def _free_scheduler_table(rows: list[JsonDict], *, pin_centers: bool = False) ->
     table.add_column()
     one_center = len(contexts) == 1
     for center, context in contexts.items():
-        center_suffix = f" -c {escape(center)}" if pin_centers else ""
+        center_suffix = f" {escape(shlex.join(['-c', center]))}" if pin_centers else ""
         center_rows = [row for row in rows if row.get("center") == center]
         reachable = [row for row in center_rows if not row.get("error")]
         total = sum(len(row.get("gpus") or []) for row in reachable)
@@ -1028,7 +1065,7 @@ def _free_scheduler_table(rows: list[JsonDict], *, pin_centers: bool = False) ->
         }
         running = context.get("running")
         queued = context.get("queued")
-        label = "dt" if one_center else center
+        label = escape("dt" if one_center else center)
         if not isinstance(running, int) or not isinstance(queued, int):
             detail = escape(str(context.get("error") or "scheduler state unavailable"))
             table.add_row(label, f"[yellow]{detail}[/yellow]")
@@ -1071,34 +1108,31 @@ def _free_scheduler_table(rows: list[JsonDict], *, pin_centers: bool = False) ->
             wanted = requested if isinstance(requested, int) and requested >= 0 else 1
             gpu_word = "GPU" if wanted == 1 else "GPUs"
             if isinstance(reason, str) and reason.startswith("blocked:"):
-                action = (
-                    "[yellow]blocked: queue head has a job-specific constraint[/yellow]"
-                )
+                action = "[yellow]next is blocked by a job constraint[/yellow]"
             elif isinstance(reason, str) and "max_my_jobs=" in reason:
-                action = "[yellow]waiting for dt concurrency quota[/yellow]"
+                action = "[yellow]next waits for dt concurrency quota[/yellow]"
             elif isinstance(pin_node, str) and pin_node:
                 pin_free = free_by_node.get(pin_node)
                 if pin_free is None:
                     action = (
-                        f"[yellow]waiting for pinned {escape(pin_node)}; "
-                        "node is unavailable[/yellow]"
+                        f"[yellow]next waits for {escape(pin_node)}; "
+                        "node unavailable[/yellow]"
                     )
                 elif wanted == 0 or pin_free >= wanted:
                     action = (
-                        "[yellow]dispatch pending on pinned "
-                        f"{escape(pin_node)}[/yellow]"
+                        f"[yellow]next is dispatching on {escape(pin_node)}[/yellow]"
                     )
                 else:
                     elsewhere = max(0, free_count - pin_free)
                     action = (
-                        f"[yellow]waiting for {wanted} {gpu_word} on pinned "
+                        f"[yellow]next needs {wanted} {gpu_word} on "
                         f"{escape(pin_node)}[/yellow]"
                     )
-                    if elsewhere:
+                    if elsewhere and explain:
                         verb = "is" if elsewhere == 1 else "are"
                         action += f" · {elsewhere} free elsewhere {verb} not eligible"
             elif wanted == 0:
-                action = "[yellow]dispatch pending for CPU task[/yellow]"
+                action = "[yellow]next CPU task is dispatching[/yellow]"
             else:
                 reserve = context.get("reserve_free_per_node")
                 reserve_count = (
@@ -1111,22 +1145,22 @@ def _free_scheduler_table(rows: list[JsonDict], *, pin_centers: bool = False) ->
                 best = max(effective.values(), default=0)
                 raw_best = max(free_by_node.values(), default=0)
                 if best >= wanted:
-                    action = (
-                        "[yellow]dispatch pending: eligible capacity exists[/yellow]"
-                    )
+                    action = "[yellow]next is dispatching[/yellow]"
                 elif raw_best >= wanted and reserve_count:
                     action = (
-                        f"[yellow]waiting for {wanted} {gpu_word}; "
-                        f"reserve_free_per_node={reserve_count} holds capacity[/yellow]"
+                        f"[yellow]next needs {wanted} {gpu_word}; "
+                        "capacity held in reserve[/yellow]"
                     )
+                    if explain:
+                        action += f" · reserve_free_per_node={reserve_count}"
                 elif free_count:
                     action = (
-                        f"[yellow]waiting for {wanted} {gpu_word} on one node; "
+                        f"[yellow]next needs {wanted} {gpu_word} together; "
                         f"{free_count} free {'GPU is' if free_count == 1 else 'GPUs are'} "
-                        "fragmented[/yellow]"
+                        "split across nodes[/yellow]"
                     )
                 else:
-                    action = f"waiting for {wanted} {gpu_word} capacity"
+                    action = f"next needs {wanted} {gpu_word} capacity"
         else:
             running_nodes = context.get("running_nodes")
             successor_node = "NODE"
@@ -1157,13 +1191,12 @@ def _free_scheduler_table(rows: list[JsonDict], *, pin_centers: bool = False) ->
                     f"'COMMAND' -n NAME{center_suffix}"
                 )
 
+        table.add_row(label, f"{counts} · {action}")
         head = context.get("queue_head_job_id")
-        queue_detail = ""
-        if queued and isinstance(head, str):
-            queue_detail = f" · head {escape(head)}"
+        if explain and queued and isinstance(head, str):
+            table.add_row("", f"[dim]next job[/dim] {escape(head)}")
             if isinstance(reason, str) and reason:
-                queue_detail += f": {escape(reason)}"
-        table.add_row(label, f"{counts} · {action}{queue_detail}")
+                table.add_row("", f"[dim]reason[/dim] {escape(reason)}")
     return table
 
 
@@ -1172,11 +1205,16 @@ def _free_view(
     who: bool,
     *,
     pin_centers: bool = False,
+    explain: bool = False,
 ) -> Any:
     from rich.console import Group
 
     resources = free_table(rows, who)
-    scheduler = _free_scheduler_table(rows, pin_centers=pin_centers)
+    scheduler = _free_scheduler_table(
+        rows,
+        pin_centers=pin_centers,
+        explain=explain,
+    )
     return Group(resources, scheduler) if scheduler is not None else resources
 
 
@@ -1192,7 +1230,7 @@ def free(
     explain: bool = typer.Option(
         False,
         "--explain",
-        help="with --json, include scheduler state and executable next actions",
+        help="show detailed scheduler state and next actions",
     ),
     fresh: bool = typer.Option(False, "--fresh", hidden=True),
     scheduler_context: bool = typer.Option(
@@ -1292,7 +1330,7 @@ def free(
         try:
             rows, _errors = gather()
             with Live(
-                _free_view(rows, who, pin_centers=pin_centers),
+                _free_view(rows, who, pin_centers=pin_centers, explain=explain),
                 console=out,
                 auto_refresh=False,
             ) as live:
@@ -1300,7 +1338,12 @@ def free(
                     time.sleep(poll)
                     rows, _errors = gather()
                     live.update(
-                        _free_view(rows, who, pin_centers=pin_centers),
+                        _free_view(
+                            rows,
+                            who,
+                            pin_centers=pin_centers,
+                            explain=explain,
+                        ),
                         refresh=True,
                     )
         except KeyboardInterrupt:
@@ -1308,7 +1351,7 @@ def free(
     else:
         with err.status("probing nodes..."):
             rows, errors = gather()
-        out.print(_free_view(rows, who, pin_centers=pin_centers))
+        out.print(_free_view(rows, who, pin_centers=pin_centers, explain=explain))
         code = result_code(rows, errors)
         if code:
             raise typer.Exit(code)
@@ -1347,8 +1390,8 @@ def _fail_submission(
         )
     else:
         for node_name, reason in (reasons or {}).items():
-            err.print(f"[yellow]{node_name}[/yellow]: {reason}")
-        err.print(f"[red]{message}[/red]")
+            err.print(f"[yellow]{escape(node_name)}[/yellow]: {escape(reason)}")
+        err.print(f"[red]{escape(message)}[/red]")
     raise typer.Exit(exit_code)
 
 
@@ -1624,7 +1667,7 @@ def _submit_entry(
     """Shared head-side submission path for `run` and the compact `task` UX."""
 
     def log(msg: str) -> None:
-        err.print(f"[dim]{msg}[/dim]")
+        err.print(f"[dim]{escape(msg)}[/dim]")
 
     try:
         entry = submit(cfg, spec, Path.cwd(), log, no_queue=no_queue)
@@ -1798,29 +1841,34 @@ def _emit_submission(
     agent_started: bool | None,
     payload_extra: JsonDict | None = None,
 ) -> None:
+    from rich.markup import escape
+
     if json_:
         print(json.dumps(_submission_payload(entry, **(payload_extra or {}))))
         return
+    display_ref = _display_ref_for_entry(cfg, entry)
+    name = escape(entry.name)
+    project = escape(entry.project)
     if entry.status == "queued":
         pos = sum(
             1
             for queued in jobs_mod.queued_entries(cfg)
             if queued.created_at <= entry.created_at
         )
-        note = ""
+        agent_note = ""
         if agent_started:
-            note = " (agent started)"
+            agent_note = " · agent started"
         elif agent_started is False:
-            note = " [red](agent failed to start! run: dt agent run)[/red]"
-        if entry.reason:
-            from rich.markup import escape
-
-            note += f" · [yellow]{escape(entry.reason)}[/yellow]"
+            agent_note = " · [red]agent failed[/red]"
         err.print(
-            f"[cyan]queued[/cyan] {entry.name} project={entry.project} "
-            f"at position {pos}{note}  "
-            f"(dt watch {entry.job_id} follows it through completion)"
+            f"[cyan]queued[/cyan] {name} · project={project} · "
+            f"position {pos}{agent_note}"
         )
+        if entry.reason:
+            err.print(f"[yellow]reason: {escape(entry.reason)}[/yellow]")
+        if agent_started is False:
+            err.print("[red]next: dt agent run[/red]")
+        err.print(f"[dim]monitor: dt watch {escape(display_ref)}[/dim]")
     else:
         gpu_str = ",".join(map(str, entry.gpus)) or "cpu"
         details = []
@@ -1847,11 +1895,15 @@ def _emit_submission(
         setup_ran = getattr(entry, "setup_ran", None)
         if entry.setup and setup_ran is not None:
             details.append("setup ran" if setup_ran else "setup cached")
-        detail_text = f"  [dim]{' · '.join(details)}[/dim]" if details else ""
         err.print(
-            f"[green]started[/green] {entry.name} project={entry.project} "
-            f"on [bold]{entry.node}[/bold] gpus={gpu_str}{detail_text}  "
-            f"(watch: dt watch {entry.job_id})"
+            f"[green]started[/green] {name} · [bold]{escape(entry.node)}[/bold] · "
+            f"GPU {escape(gpu_str)} · project={project}"
+        )
+        if details:
+            err.print(f"[dim]prepare: {' · '.join(details)}[/dim]")
+        err.print(
+            f"[dim]next: dt logs {escape(display_ref)} -f · "
+            f"dt wait {escape(display_ref)}[/dim]"
         )
     print(entry.job_id)  # bare id, last stdout line: agents rely on this
 
@@ -1859,42 +1911,70 @@ def _emit_submission(
 def run(
     ctx: typer.Context,
     gpus: int = typer.Option(
-        1, "-g", "--gpus", help="GPUs needed on one node (0 = CPU job)"
+        1,
+        "-g",
+        "--gpus",
+        help="GPUs needed on one node (0 = CPU job)",
+        rich_help_panel="Everyday",
     ),
-    name: str = typer.Option("job", "-n", "--name"),
+    name: Optional[str] = typer.Option(
+        None,
+        "-n",
+        "--name",
+        help="experiment name (default: derived from the command)",
+        rich_help_panel="Everyday",
+    ),
     center: Optional[str] = typer.Option(
         None,
         "-c",
         "--center",
         help="center name, or 'auto' to pick the freest (laptop)",
+        rich_help_panel="Everyday",
     ),
-    project: Optional[str] = typer.Option(None, "-p", "--project"),
-    node: Optional[str] = typer.Option(None, "--node", help="pin a specific node"),
+    project: Optional[str] = typer.Option(
+        None, "-p", "--project", rich_help_panel="Everyday"
+    ),
+    node: Optional[str] = typer.Option(
+        None,
+        "--node",
+        help="pin a specific node",
+        rich_help_panel="Everyday",
+    ),
     require_path: Optional[str] = typer.Option(
-        None, "--require-path", help="path that must exist on the node"
+        None,
+        "--require-path",
+        help="path that must exist on the node",
+        rich_help_panel="Scheduling & safety",
     ),
     require_disk_gib: Optional[int] = typer.Option(
         None,
         "--require-disk-gib",
         help="minimum free space needed on the job filesystem (GiB)",
+        rich_help_panel="Scheduling & safety",
     ),
     max_hours: Optional[float] = typer.Option(
-        None, "--max-hours", help="kill the job group after N hours"
+        None,
+        "--max-hours",
+        help="kill the job group after N hours",
+        rich_help_panel="Scheduling & safety",
     ),
     max_vram_mib: Optional[int] = typer.Option(
         None,
         "--max-vram-mib",
         help="terminate the complete job if any selected GPU exceeds N MiB",
+        rich_help_panel="Scheduling & safety",
     ),
     max_job_memory_mib: Optional[int] = typer.Option(
         None,
         "--max-job-memory-mib",
         help="terminate the complete process tree above N MiB attributed host memory",
+        rich_help_panel="Scheduling & safety",
     ),
     artifact_manifest: Optional[str] = typer.Option(
         None,
         "--artifact-manifest",
         help="bind a dt sync --artifact content manifest SHA-256",
+        rich_help_panel="Reproducibility",
     ),
     artifact: Optional[list[str]] = typer.Option(
         None,
@@ -1903,34 +1983,40 @@ def run(
             "sync this project-relative input to the selected node and bind its "
             "content manifest (repeatable; requires --node or --after-success)"
         ),
+        rich_help_panel="Reproducibility",
     ),
     after_success: Optional[str] = typer.Option(
         None,
         "--after-success",
         help="queue until this predecessor finishes successfully",
+        rich_help_panel="Scheduling & safety",
     ),
     no_queue: bool = typer.Option(
         False,
         "--no-queue",
         help="fail fast (exit 2) instead of queueing when no card is free",
+        rich_help_panel="Scheduling & safety",
     ),
     follow: bool = typer.Option(
         False,
         "-f",
         "--follow",
         help="watch until terminal; laptop SSH auto-reconnects (Ctrl-C detaches)",
+        rich_help_panel="Follow & output",
     ),
     poll: float = typer.Option(
         2.0,
         "--poll",
         help="progress refresh/fallback interval used with --follow",
+        rich_help_panel="Follow & output",
     ),
     lines: int = typer.Option(
         20,
         "--lines",
         help="stdout/error lines used with --follow",
+        rich_help_panel="Follow & output",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(False, "--json", rich_help_panel="Follow & output"),
 ) -> None:
     """Submit once: dt run -g 2 -n exp42 -- python train.py --lr 3e-4"""
     cmd = list(ctx.args)
@@ -1944,6 +2030,7 @@ def run(
             exit_code=1,
             json_=json_,
         )
+    picked_name = name or _derived_task_name(shlex.join(cmd))
     _validate_submission_workflow(
         after_success=after_success,
         no_queue=no_queue,
@@ -2010,12 +2097,12 @@ def run(
                     exit_code=EXIT_NO_GPU,
                     json_=json_,
                 )
-            err.print(f"[dim]auto-selected center [bold]{picked}[/bold][/dim]")
+            err.print(f"[dim]auto-selected center [bold]{escape(picked)}[/bold][/dim]")
             center = picked
         route = (
             _head_command(cfg, center, "run")
             .option("-g", gpus)
-            .option("-n", name)
+            .option("-n", picked_name)
             .option("-p", project or None)
             .option("--node", node or None)
             .option("--require-path", require_path or None)
@@ -2034,7 +2121,7 @@ def run(
             route.head,
             route.argv(),
             action="run",
-            recovery_label=f"name {name!r}",
+            recovery_label=f"name {picked_name!r}",
             follow=follow,
             poll=poll,
             lines=lines,
@@ -2043,7 +2130,7 @@ def run(
         raise typer.Exit(rc)
 
     request = SubmissionRequest(
-        name=name,
+        name=picked_name,
         gpus=gpus,
         command=tuple(cmd),
         project=project,
@@ -2767,6 +2854,7 @@ def _batch_receipt(
     project: str | None,
     commands: list[str],
     entries: list[jobs_mod.JobEntry],
+    display_refs: dict[str, str],
     artifact_manifest: str | None,
     artifact_sync: JsonDict | None,
     agent_started: bool | None,
@@ -2783,6 +2871,7 @@ def _batch_receipt(
     jobs = [
         _submission_payload(
             entry,
+            name=entry.name,
             batch_index=index,
             batch_size=len(commands),
             command=commands[index - 1],
@@ -2792,6 +2881,8 @@ def _batch_receipt(
         )
         for index, entry in enumerate(entries, start=1)
     ]
+    for row, entry in zip(jobs, entries, strict=True):
+        row["display_ref"] = display_refs.get(entry.job_id, entry.job_id)
     if policy.dependency_policy is not None:
         for row, entry in zip(jobs, entries, strict=True):
             row["after_success"] = entry.after_success
@@ -2883,8 +2974,7 @@ def _emit_batch_human(
         return
     err.print(
         f"[green]{operation} submitted[/green]  {receipt['submitted']} jobs · "
-        f"{receipt['running']} running · {receipt['queued']} queued · "
-        f"snapshot {str(receipt.get('snapshot_sha256') or '-')[:12]}"
+        f"{receipt['running']} running · {receipt['queued']} queued"
     )
     runtime_policy = receipt.get("runtime_failure_policy", "continue")
     if runtime_policy == "stop":
@@ -2895,6 +2985,8 @@ def _emit_batch_human(
 
 
 def _emit_batch_next_commands(receipt: JsonDict) -> None:
+    from rich.markup import escape
+
     jobs = receipt.get("jobs")
     if not isinstance(jobs, list) or not jobs:
         return
@@ -2905,17 +2997,13 @@ def _emit_batch_next_commands(receipt: JsonDict) -> None:
             "`dt pull -F JOBS.txt`[/dim]"
         )
         return
-    commands = receipt.get("next_commands")
-    if not isinstance(commands, dict):
-        return
-    for key, label in (
-        ("watch", "monitor"),
-        ("wait", "wait"),
-        ("pull", "recover"),
-    ):
-        argv = commands.get(key)
-        if isinstance(argv, list) and all(isinstance(arg, str) for arg in argv):
-            err.print(f"[dim]{label}: {shlex.join(argv)}[/dim]")
+    refs = [
+        str(row.get("display_ref") or row.get("job_id"))
+        for row in jobs
+        if isinstance(row, dict) and (row.get("display_ref") or row.get("job_id"))
+    ]
+    if refs:
+        err.print(f"[dim]next: {escape(shlex.join(['dt', 'watch', *refs]))}[/dim]")
 
 
 def _forward_laptop_batch(
@@ -3199,7 +3287,10 @@ def _inventory_command(
             item_name = f"{prefix}-{index:03d}-{derived}"
 
             def log(message: str, *, item: int = index) -> None:
-                err.print(f"[dim]{policy.command} {item}/{len(items)}: {message}[/dim]")
+                err.print(
+                    f"[dim]{escape(policy.command)} {item}/{len(items)}: "
+                    f"{escape(message)}[/dim]"
+                )
 
             try:
                 if source is None:
@@ -3281,11 +3372,6 @@ def _inventory_command(
             ensure_agent(entry)
             if not json_:
                 print(entry.job_id, flush=True)
-                state = "queued" if entry.status == "queued" else "started"
-                err.print(
-                    f"[cyan]{index}/{len(items)}[/cyan] {state} "
-                    f"{entry.name}  [dim]{entry.job_id}[/dim]"
-                )
 
     receipt = _batch_receipt(
         server=server,
@@ -3293,6 +3379,7 @@ def _inventory_command(
         project=project,
         commands=items,
         entries=entries,
+        display_refs=_display_refs_for_entries(cfg, entries),
         artifact_manifest=artifact_manifest,
         artifact_sync=artifact_sync,
         agent_started=agent_started,
@@ -3320,49 +3407,63 @@ def batch(
         "--file",
         "-F",
         help="one shell command per line; '-' reads stdin",
+        rich_help_panel="Input",
     ),
-    gpus: int = typer.Option(1, "-g", "--gpus"),
+    gpus: int = typer.Option(1, "-g", "--gpus", rich_help_panel="Resources & safety"),
     name_prefix: Optional[str] = typer.Option(
         None,
         "-n",
         "--name-prefix",
         help="default: command-file stem or 'batch'",
+        rich_help_panel="Input",
     ),
-    project: Optional[str] = typer.Option(None, "-p", "--project"),
+    project: Optional[str] = typer.Option(
+        None, "-p", "--project", rich_help_panel="Input"
+    ),
     center: Optional[str] = typer.Option(
         None,
         "-c",
         "--center",
         help="(laptop) which center",
+        rich_help_panel="Input",
     ),
-    require_path: Optional[str] = typer.Option(None, "--require-path"),
+    require_path: Optional[str] = typer.Option(
+        None, "--require-path", rich_help_panel="Resources & safety"
+    ),
     require_disk_gib: Optional[int] = typer.Option(
         None,
         "--require-disk-gib",
         help="minimum free space needed by every item (GiB)",
+        rich_help_panel="Resources & safety",
     ),
-    max_hours: Optional[float] = typer.Option(None, "--max-hours"),
+    max_hours: Optional[float] = typer.Option(
+        None, "--max-hours", rich_help_panel="Resources & safety"
+    ),
     max_vram_mib: Optional[int] = typer.Option(
         None,
         "--max-vram-mib",
         help="terminate an item if any selected GPU exceeds N MiB",
+        rich_help_panel="Resources & safety",
     ),
     max_job_memory_mib: Optional[int] = typer.Option(
         None,
         "--max-job-memory-mib",
         help="terminate an item above N MiB attributed host memory",
+        rich_help_panel="Resources & safety",
     ),
     artifact_manifest: Optional[str] = typer.Option(
         None,
         "--artifact-manifest",
         help="bind one existing artifact manifest to every item",
+        rich_help_panel="Reproducibility",
     ),
     artifact: Optional[list[str]] = typer.Option(
         None,
         "--artifact",
         help="sync this project-relative input once and bind every item (repeatable)",
+        rich_help_panel="Reproducibility",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(False, "--json", rich_help_panel="Output"),
 ) -> None:
     """Submit a same-node FIFO queue; runtime failures continue."""
     _inventory_command(
@@ -3396,8 +3497,9 @@ def chain(
         "--file",
         "-F",
         help="one shell stage per line; '-' reads stdin",
+        rich_help_panel="Input",
     ),
-    gpus: int = typer.Option(1, "-g", "--gpus"),
+    gpus: int = typer.Option(1, "-g", "--gpus", rich_help_panel="Resources & safety"),
     stage_gpus: Optional[list[int]] = typer.Option(
         None,
         "--stage-gpus",
@@ -3405,48 +3507,62 @@ def chain(
             "GPU count for each stage, in order; repeat once per stage "
             "(overrides -g for those stages)"
         ),
+        rich_help_panel="Resources & safety",
     ),
     name_prefix: Optional[str] = typer.Option(
         None,
         "-n",
         "--name-prefix",
         help="default: command-file stem or 'chain'",
+        rich_help_panel="Input",
     ),
-    project: Optional[str] = typer.Option(None, "-p", "--project"),
+    project: Optional[str] = typer.Option(
+        None, "-p", "--project", rich_help_panel="Input"
+    ),
     center: Optional[str] = typer.Option(
         None,
         "-c",
         "--center",
         help="(laptop) which center",
+        rich_help_panel="Input",
     ),
-    require_path: Optional[str] = typer.Option(None, "--require-path"),
+    require_path: Optional[str] = typer.Option(
+        None, "--require-path", rich_help_panel="Resources & safety"
+    ),
     require_disk_gib: Optional[int] = typer.Option(
         None,
         "--require-disk-gib",
         help="minimum free space needed by every stage (GiB)",
+        rich_help_panel="Resources & safety",
     ),
-    max_hours: Optional[float] = typer.Option(None, "--max-hours"),
+    max_hours: Optional[float] = typer.Option(
+        None, "--max-hours", rich_help_panel="Resources & safety"
+    ),
     max_vram_mib: Optional[int] = typer.Option(
         None,
         "--max-vram-mib",
         help="terminate a stage if any selected GPU exceeds N MiB",
+        rich_help_panel="Resources & safety",
     ),
     max_job_memory_mib: Optional[int] = typer.Option(
         None,
         "--max-job-memory-mib",
         help="terminate a stage above N MiB attributed host memory",
+        rich_help_panel="Resources & safety",
     ),
     artifact_manifest: Optional[str] = typer.Option(
         None,
         "--artifact-manifest",
         help="bind one existing artifact manifest to every stage",
+        rich_help_panel="Reproducibility",
     ),
     artifact: Optional[list[str]] = typer.Option(
         None,
         "--artifact",
         help="sync this project-relative input once and bind every stage (repeatable)",
+        rich_help_panel="Reproducibility",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(False, "--json", rich_help_panel="Output"),
 ) -> None:
     """Submit a success-gated chain; failed predecessors stop later stages."""
     _inventory_command(
@@ -3502,6 +3618,45 @@ def _ps_rows_total(rows: list[JsonDict]) -> int:
 def _ps_rows_filters(rows: list[JsonDict]) -> frozenset[str]:
     value: frozenset[str] | set[str] = getattr(rows, "applied_filters", frozenset())
     return value if isinstance(value, frozenset) else frozenset(value)
+
+
+def _humanize_ps_references(rows: list[JsonDict]) -> _PsRows:
+    """Replace exact job ids in human diagnostics with their routable refs."""
+    replacements = sorted(
+        (
+            (str(row["job_id"]), str(row["display_ref"]))
+            for row in rows
+            if isinstance(row.get("job_id"), str)
+            and isinstance(row.get("display_ref"), str)
+            and row["job_id"] != row["display_ref"]
+        ),
+        key=lambda pair: len(pair[0]),
+        reverse=True,
+    )
+    rendered_rows: list[JsonDict] = []
+    for row in rows:
+        rendered = dict(row)
+        for field in ("reason", "progress_error", "status_probe_error"):
+            value = rendered.get(field)
+            if not isinstance(value, str):
+                continue
+            for job_id, display_ref in replacements:
+                value = value.replace(job_id, display_ref)
+            dependency_failure = re.fullmatch(
+                r"dependency (\S+) did not succeed: (.+)", value
+            )
+            if dependency_failure:
+                dependency_ref, detail = dependency_failure.groups()
+                exit_match = re.fullmatch(r"finished, exit (-?\d+)", detail)
+                detail = f"exit {exit_match.group(1)}" if exit_match else detail
+                value = f"dependency {dependency_ref} {detail}"
+            rendered[field] = value
+        rendered_rows.append(rendered)
+    return _PsRows(
+        rendered_rows,
+        total=_ps_rows_total(rows),
+        applied_filters=_ps_rows_filters(rows),
+    )
 
 
 def _limit_ps_rows(rows: list[JsonDict], limit: int | None) -> list[JsonDict]:
@@ -4140,6 +4295,7 @@ def ps(
         "-s",
         "--status",
         help="filter: queued/running/finished/killed/lost/failed",
+        rich_help_panel="Filters",
     ),
     active: bool = typer.Option(
         False,
@@ -4151,33 +4307,39 @@ def ps(
         False,
         "--recent",
         help=f"include the {PS_RECENT_LIMIT} most recent terminal jobs",
+        rich_help_panel="Filters",
     ),
     all_: bool = typer.Option(
         False,
         "-a",
         "--all",
         help="include the complete job history",
+        rich_help_panel="Filters",
     ),
     limit: Optional[int] = typer.Option(
         None,
         "--limit",
         help="return only the newest N matching jobs (default JSON remains full)",
+        rich_help_panel="Filters",
     ),
     wide: bool = typer.Option(
         False,
         "-w",
         "--wide",
         help="include job ids and commands",
+        rich_help_panel="View & output",
     ),
     watch_: bool = typer.Option(
         False,
         "--watch",
         help="continuously refresh until Ctrl-C",
+        rich_help_panel="View & output",
     ),
     poll: float = typer.Option(
         2.0,
         "--poll",
         help="watch refresh interval in seconds",
+        rich_help_panel="View & output",
     ),
     with_progress: bool = typer.Option(
         False,
@@ -4188,11 +4350,13 @@ def ps(
         False,
         "--issues",
         help="show only actionable failures, losses, blocks, and anomalies",
+        rich_help_panel="Filters",
     ),
     json_: bool = typer.Option(
         False,
         "--json",
         help="full array by default; explicit filters narrow it",
+        rich_help_panel="View & output",
     ),
     window: bool = typer.Option(False, "--window", hidden=True),
     window_schema: Optional[str] = typer.Option(
@@ -4308,13 +4472,17 @@ def ps(
                 while True:
                     rows, errors = gather(include_progress=True)
                     for center, message in errors.items():
-                        err.print(f"[yellow]{center} unreachable: {message}[/yellow]")
+                        err.print(
+                            f"[yellow]{escape(center)} unreachable: "
+                            f"{escape(message)}[/yellow]"
+                        )
                     print(json.dumps(rows), flush=True)
                     time.sleep(poll)
             else:
                 from rich.live import Live
 
                 rows, errors = gather(include_progress=True)
+                rows = _humanize_ps_references(rows)
                 with Live(
                     _ps_view(
                         rows,
@@ -4335,6 +4503,7 @@ def ps(
                     while True:
                         time.sleep(poll)
                         rows, errors = gather(include_progress=True)
+                        rows = _humanize_ps_references(rows)
                         live.update(
                             _ps_view(
                                 rows,
@@ -4356,7 +4525,7 @@ def ps(
 
     rows, errors = gather(include_progress=with_progress)
     for center, message in errors.items():
-        err.print(f"[yellow]{center} unreachable: {message}[/yellow]")
+        err.print(f"[yellow]{escape(center)} unreachable: {escape(message)}[/yellow]")
     all_centers_failed = (
         isinstance(cfg, LaptopConfig)
         and bool(errors)
@@ -4426,6 +4595,7 @@ def ps(
             )
         print(json.dumps(rows))  # stable default contract: json is never truncated
         return
+    rows = _humanize_ps_references(rows)
     visible = _visible_ps_rows(
         rows,
         all_=all_,
@@ -4461,14 +4631,26 @@ def ps(
         caption = f"{len(visible)} newest jobs"
     else:
         caption = None
-    if not visible and default_active_view:
-        if errors:
-            out.print("[yellow]No active jobs reported by reachable centers.[/yellow]")
+    if not visible:
+        if default_active_view:
+            if errors:
+                out.print(
+                    "[yellow]No active jobs reported by reachable centers.[/yellow]"
+                )
+            else:
+                out.print("[bold green]No active jobs.[/bold green]")
+            out.print(
+                "[dim]submit: dt run -n NAME -f -- COMMAND · "
+                "history: dt ps --recent[/dim]"
+            )
+        elif issues:
+            out.print("[bold green]No jobs need attention.[/bold green]")
+            if not all_:
+                out.print("[dim]complete issue history: dt ps --issues -a[/dim]")
+        elif status is not None:
+            out.print(f"[dim]No {escape(status)} jobs.[/dim]")
         else:
-            out.print("[bold green]No active jobs.[/bold green]")
-        out.print(
-            "[dim]submit: dt run -n NAME -f -- COMMAND · history: dt ps --recent[/dim]"
-        )
+            out.print("[dim]No jobs.[/dim]")
         if all_centers_failed:
             raise typer.Exit(_fan_failure_exit_code(errors))
         return
@@ -4566,10 +4748,11 @@ def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
         "fi; fi; "
         f"dt_resource_sample=$(tail -n 1 -- {node_path_expression(resources_path)} "
         "2>/dev/null || true); "
-        'case "$dt_log_source" in "$HOME"/*) '
-        'dt_log_source="~/${dt_log_source#"$HOME"/}";; esac; '
+        'dt_log_display="$dt_log_source"; '
+        'case "$dt_log_display" in "$HOME"/*) '
+        'dt_log_display="~/${dt_log_display#"$HOME"/}";; esac; '
         f"printf '%s\\n%s\\n%s\\n%s\\n%s\\n%s\\n' "
-        f'{shlex.quote(LOG_SOURCE_MARK)} "$dt_log_source" '
+        f'{shlex.quote(LOG_SOURCE_MARK)} "$dt_log_display" '
         f'{shlex.quote(LOG_MTIME_MARK)} "$dt_log_mtime" '
         f'{shlex.quote(RESOURCE_SAMPLE_MARK)} "$dt_resource_sample"; '
         f'tail -n {lines} -- "$dt_log_source"'
@@ -4946,7 +5129,12 @@ def _refuse_unplaced(
     what: str,
     *,
     json_: bool = False,
+    display_ref: str | None = None,
 ) -> None:
+    from rich.markup import escape
+
+    human_ref = escape(display_ref or entry.job_id)
+    identity = f"{escape(entry.name)} · ref {human_ref}"
     if entry.status == "queued":
         if json_:
             _fail_submission(
@@ -4958,10 +5146,8 @@ def _refuse_unplaced(
                 exit_code=1,
                 json_=True,
             )
-        err.print(
-            f"[yellow]{entry.job_id} is still queued; no {what} yet "
-            f"(dt wait {entry.job_id} blocks until it runs)[/yellow]"
-        )
+        err.print(f"[yellow]{identity} is still queued; no {what} yet[/yellow]")
+        err.print(f"[dim]next: dt wait {human_ref}[/dim]")
         raise typer.Exit(1)
     if entry.status == "failed" and not _is_uncertain_launch(entry):
         if what == "logs" and entry.node != "-":
@@ -4973,7 +5159,10 @@ def _refuse_unplaced(
                 exit_code=1,
                 json_=True,
             )
-        err.print(f"[red]{entry.job_id} failed before starting: {entry.reason}[/red]")
+        err.print(
+            f"[red]{identity} failed before starting: "
+            f"{escape(entry.reason or '')}[/red]"
+        )
         raise typer.Exit(1)
     if entry.node == "-":
         if json_:
@@ -4987,7 +5176,7 @@ def _refuse_unplaced(
                 json_=True,
             )
         err.print(
-            f"[yellow]{entry.job_id} never started (status {entry.status}); "
+            f"[yellow]{identity} never started (status {entry.status}); "
             f"no {what} exists[/yellow]"
         )
         raise typer.Exit(1)
@@ -5017,7 +5206,12 @@ def _log_terminal_exit_code(entry: jobs_mod.JobEntry) -> int | None:
     return None
 
 
-def _print_log_stream_complete(entry: jobs_mod.JobEntry, code: int) -> None:
+def _print_log_stream_complete(
+    entry: jobs_mod.JobEntry,
+    code: int,
+    *,
+    display_ref: str | None = None,
+) -> None:
     """Render a concise terminal edge after the final log bytes are visible."""
     from rich.markup import escape
 
@@ -5029,20 +5223,21 @@ def _print_log_stream_complete(entry: jobs_mod.JobEntry, code: int) -> None:
         summary = entry.status
         color = "yellow" if entry.status in {"killed", "lost"} else "red"
     err.print(
-        f"[{color}]log stream complete · {summary}[/{color}]  "
-        f"[dim]{escape(entry.job_id)}[/dim]"
+        f"[{color}]log stream complete · {summary}[/{color}] · "
+        f"{escape(entry.name)} · ref {escape(display_ref or entry.job_id)}"
     )
 
 
 def _wait_for_log_placement(
     cfg: HeadConfig,
     entry: jobs_mod.JobEntry,
+    display_ref: str,
 ) -> jobs_mod.JobEntry | None:
     """Wait locally through queue placement; ``None`` means Ctrl-C detach."""
     from rich.markup import escape
 
     err.print("[dim]queued; waiting for logs[/dim]")
-    err.print(f"[dim]job {escape(entry.job_id)}[/dim]")
+    err.print(f"[dim]{escape(entry.name)} · ref {escape(display_ref)}[/dim]")
     if entry.reason:
         err.print(f"[yellow]{escape(entry.reason)}[/yellow]")
     reason = entry.reason
@@ -5055,18 +5250,17 @@ def _wait_for_log_placement(
         if entry.status == "queued" and entry.reason != reason:
             if entry.reason:
                 err.print(
-                    f"[yellow]{escape(entry.job_id)} queue state: "
+                    f"[yellow]ref {escape(display_ref)} queue state: "
                     f"{escape(entry.reason)}[/yellow]"
                 )
             elif reason is not None:
                 err.print(
-                    f"[green]{escape(entry.job_id)} queue issue cleared; "
+                    f"[green]ref {escape(display_ref)} queue issue cleared; "
                     "waiting for dispatch[/green]"
                 )
             reason = entry.reason
     if entry.status == "running":
         err.print(f"[green]started on {escape(entry.node)}; following logs[/green]")
-        err.print(f"[dim]job {escape(entry.job_id)}[/dim]")
     return entry
 
 
@@ -5085,6 +5279,7 @@ def _follow_job_log(
     retry_delay = 2.0
     unavailable = False
     last_display: str | None = None
+    display_ref = _display_ref_for_entry(cfg, entry)
 
     while True:
         if unavailable:
@@ -5098,7 +5293,7 @@ def _follow_job_log(
             return None
         except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
             if entry.node_local:
-                err.print(f"[red]{exc}[/red]")
+                err.print(f"[red]{escape(str(exc))}[/red]")
                 return EXIT_UNREACHABLE
             first_failure = not unavailable
             if first_failure:
@@ -5106,7 +5301,7 @@ def _follow_job_log(
                     f"[yellow]{entry.node} log link unavailable; "
                     "reconnecting (job unaffected)[/yellow]"
                 )
-                err.print(f"[red]{exc}[/red]")
+                err.print(f"[red]{escape(str(exc))}[/red]")
             else:
                 retry_delay = min(retry_delay * 2, 10.0)
             unavailable = True
@@ -5138,7 +5333,7 @@ def _follow_job_log(
             if tail:
                 sys.stdout.write(tail)
                 sys.stdout.flush()
-            _print_log_stream_complete(entry, terminal_code)
+            _print_log_stream_complete(entry, terminal_code, display_ref=display_ref)
             return terminal_code
 
         if unavailable:
@@ -5150,7 +5345,9 @@ def _follow_job_log(
             unavailable = False
             retry_delay = 2.0
         if display != last_display and display != "logs/stdout.log":
-            err.print(f"[dim]following active log: {display}[/dim]")
+            err.print(
+                f"[dim]following active log: {escape(compact_path(display))}[/dim]"
+            )
         last_display = display
 
         wrapper_pgid = (
@@ -5208,7 +5405,9 @@ def _follow_job_log(
             entry = jobs_mod.refresh_status(cfg, entry)
             terminal_code = _log_terminal_exit_code(entry)
             if terminal_code is not None:
-                _print_log_stream_complete(entry, terminal_code)
+                _print_log_stream_complete(
+                    entry, terminal_code, display_ref=display_ref
+                )
                 return terminal_code
             # The wrapper PID disappeared just before its exit marker became
             # visible. Re-resolve the log and status instead of claiming a
@@ -5290,21 +5489,22 @@ def logs(
             )
     else:
         entry = _find_or_die(cfg, ref)
+    display_ref = _display_ref_for_entry(cfg, entry)
     if follow and entry.status == "queued":
-        placed = _wait_for_log_placement(cfg, entry)
+        placed = _wait_for_log_placement(cfg, entry, display_ref)
         if placed is None:
-            _print_log_follow_stopped(entry.job_id)
+            _print_log_follow_stopped(display_ref)
             return
         entry = placed
         terminal_code = _log_terminal_exit_code(entry)
         if terminal_code is not None and entry.node == "-":
-            _print_log_stream_complete(entry, terminal_code)
+            _print_log_stream_complete(entry, terminal_code, display_ref=display_ref)
             raise typer.Exit(terminal_code)
-    _refuse_unplaced(entry, "logs", json_=json_)
+    _refuse_unplaced(entry, "logs", json_=json_, display_ref=display_ref)
     if follow:
         rc = _follow_job_log(cfg, entry, lines)
         if rc is None:
-            _print_log_follow_stopped(entry.job_id)
+            _print_log_follow_stopped(display_ref)
             return
         raise typer.Exit(rc)
     try:
@@ -5317,7 +5517,7 @@ def logs(
                 exit_code=EXIT_UNREACHABLE,
                 json_=True,
             )
-        err.print(f"[red]{exc}[/red]")
+        err.print(f"[red]{escape(str(exc))}[/red]")
         raise typer.Exit(EXIT_UNREACHABLE)
     if proc.returncode != 0 and json_:
         code = _stable_remote_exit(proc.returncode)
@@ -5350,7 +5550,7 @@ def logs(
         )
         return
     if display != "logs/stdout.log":
-        err.print(f"[dim]active log: {display}[/dim]")
+        err.print(f"[dim]active log: {escape(compact_path(display))}[/dim]")
     sys.stdout.write(tail)
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
@@ -5365,7 +5565,11 @@ def attach(ref: str = REF_ARG) -> None:
         forward_exec(head, ["attach", ref], tty=True)
         return
     entry = _find_or_die(cfg, ref)
-    _refuse_unplaced(entry, "tmux session")
+    _refuse_unplaced(
+        entry,
+        "tmux session",
+        display_ref=_display_ref_for_entry(cfg, entry),
+    )
     # -L dt: jobs live on dt's dedicated tmux server (see launcher.sh)
     if entry.node_local:
         os.execvp("tmux", ["tmux", "-L", "dt", "attach", "-t", entry.session])
@@ -5725,6 +5929,7 @@ def _wait_terminal_result(
     emit: Callable[[str], None],
     write_tail: Callable[[str], object],
     primary_log_shown: bool = False,
+    display_ref: str | None = None,
 ) -> tuple[JsonDict, int]:
     """Build one terminal wait result and its stable process exit code."""
     if entry.status == "finished":
@@ -5733,11 +5938,12 @@ def _wait_terminal_result(
         code = entry.exit_code if entry.exit_code is not None else 0
         color = "green" if code == 0 else "red"
         summary = f"finished · exit {code}"
-        job_id = escape(entry.job_id)
-        if len(summary) + len(entry.job_id) + 2 <= 72:
-            emit(f"[{color}]{summary}[/{color}]  [dim]{job_id}[/dim]")
+        reference = escape(display_ref or entry.job_id)
+        identity = f"{escape(entry.name)} · ref {reference}"
+        if len(summary) + len(entry.name) + len(display_ref or entry.job_id) + 12 <= 72:
+            emit(f"[{color}]{summary}[/{color}] · {identity}")
         else:
-            emit(f"[{color}]{summary}[/{color}]\n[dim]job {job_id}[/dim]")
+            emit(f"[{color}]{summary}[/{color}]\n[dim]{identity}[/dim]")
         extra: JsonDict = {"exit_code": code}
         if code != 0 and error_lines:
             finished_failure_log = _read_finished_failure_log(
@@ -5852,6 +6058,15 @@ def _render_wait_group(payload: JsonDict) -> None:
 
     summary = payload["summary"]
     assert isinstance(summary, dict)
+    jobs = payload["jobs"]
+    assert isinstance(jobs, list)
+    display_refs = jobs_mod.compact_refs(
+        [
+            (str(raw["job_id"]), str(raw["name"]))
+            for raw in jobs
+            if isinstance(raw, dict)
+        ]
+    )
     table = Table(
         title=(
             f"wait complete · {summary['succeeded']}/{summary['total']} succeeded"
@@ -5862,12 +6077,10 @@ def _render_wait_group(payload: JsonDict) -> None:
     )
     table.add_column("result", no_wrap=True)
     table.add_column("job")
-    table.add_column("id", style="dim")
+    table.add_column("ref", style="dim", no_wrap=True)
     table.add_column("node / GPU", no_wrap=True)
     table.add_column("elapsed", justify="right", no_wrap=True)
     table.add_column("reason")
-    jobs = payload["jobs"]
-    assert isinstance(jobs, list)
     for raw in jobs:
         assert isinstance(raw, dict)
         code = int(raw["exit_code"])
@@ -5890,7 +6103,7 @@ def _render_wait_group(payload: JsonDict) -> None:
         table.add_row(
             result,
             escape(str(raw["name"])),
-            escape(str(raw["job_id"])),
+            escape(display_refs.get(str(raw["job_id"]), str(raw["job_id"]))),
             escape(node),
             _fmt_duration(float(duration)) if duration is not None else "-",
             escape(str(raw.get("reason") or "")),
@@ -5902,9 +6115,10 @@ def _render_wait_group(payload: JsonDict) -> None:
         failure_log = raw.get("failure_log")
         if not isinstance(failure_log, dict):
             continue
+        display_ref = display_refs.get(str(raw["job_id"]), str(raw["job_id"]))
         err.print(
             f"[red]failure evidence · {escape(str(raw['name']))} "
-            f"({escape(str(raw['job_id']))})[/red]"
+            f"(ref {escape(display_ref)})[/red]"
         )
         path = str(failure_log.get("path") or "failure log")
         tail = failure_log.get("tail")
@@ -5951,8 +6165,8 @@ def _wait_interrupted(
             exit_code=130,
             json_=True,
         )
-    err.print(f"[yellow]{message}[/yellow]")
-    err.print(f"[dim]resume: {resume_text}[/dim]")
+    err.print(f"[yellow]{escape(message)}[/yellow]")
+    err.print(f"[dim]resume: {escape(resume_text)}[/dim]")
     raise typer.Exit(130)
 
 
@@ -6105,6 +6319,7 @@ def wait(
                 emit=err.print,
                 write_tail=sys.stderr.write,
                 primary_log_shown=primary_log_shown,
+                display_ref=_display_ref_for_entry(cfg, entry),
             )
         except KeyboardInterrupt:
             _wait_interrupted(
@@ -6123,6 +6338,7 @@ def wait(
         entry: jobs_mod.JobEntry,
     ) -> tuple[jobs_mod.JobEntry, JsonDict, int]:
         def emit(message: str) -> None:
+            # `_wait_until_terminal` owns this Rich-formatted status fragment.
             err.print(f"[dim]{index}/{len(entries)}[/dim] · {message}")
 
         terminal_entry = _wait_until_terminal(
@@ -6242,7 +6458,9 @@ def _resource_rows(resources: JsonDict | None) -> list[tuple[str, str]]:
     if not resources:
         return []
     if resources.get("error"):
-        return [("live", f"[yellow]{resources['error']}[/yellow]")]
+        from rich.markup import escape
+
+        return [("live", f"[yellow]{escape(str(resources['error']))}[/yellow]")]
     phase = resources.get("phase")
     rows = [("live phase", str(phase))] if _safe_phase_name(phase) else []
     gpu_parts = []
@@ -6934,6 +7152,7 @@ def _resource_summary_rows(
             and busy_samples is not None
             and util_samples
             and busy_fraction is not None
+            and int(busy_samples) < int(util_samples)
         ):
             timing = []
             first_busy = gpu.get("first_busy_after_s")
@@ -7041,23 +7260,26 @@ def _resource_summary_rows(
         )
     errors = int(summary.get("gpu_error_samples") or 0)
     if errors:
+        from rich.markup import escape
+
         rows.append(
             (
                 "telemetry",
                 f"[yellow]{errors}/{summary.get('samples', 0)} GPU samples failed"
-                f" · {summary.get('gpu_error_last')}[/yellow]",
+                f" · {escape(str(summary.get('gpu_error_last')))}[/yellow]",
             )
         )
     return rows
 
 
 def _metrics_table(entry: jobs_mod.JobEntry, summary: JsonDict) -> Any:
+    from rich.markup import escape
     from rich.table import Table
     from rich.text import Text
 
     sample_label = f"{summary['samples']} samples"
     if summary.get("tail_limit"):
-        sample_label = f"last {sample_label}"
+        sample_label = f"last {summary['samples']}"
     caption_parts = []
     sampling_note = _gpu_sampling_note(summary)
     if sampling_note:
@@ -7072,6 +7294,7 @@ def _metrics_table(entry: jobs_mod.JobEntry, summary: JsonDict) -> Any:
             and busy_samples is not None
             and util_samples
             and busy_fraction is not None
+            and int(busy_samples) < int(util_samples)
         ):
             timing = []
             first_busy = gpu.get("first_busy_after_s")
@@ -7088,7 +7311,7 @@ def _metrics_table(entry: jobs_mod.JobEntry, summary: JsonDict) -> Any:
             )
     t = Table(
         title=(
-            f"{entry.name} · {entry.node} · {sample_label} · "
+            f"{escape(entry.name)} · {sample_label} · "
             f"{_fmt_duration(float(summary['duration_s']))}"
         ),
         header_style="bold",
@@ -7145,6 +7368,16 @@ def _metrics_table(entry: jobs_mod.JobEntry, summary: JsonDict) -> Any:
             fmt(gpu.get("power_peak_w"), "W"),
         )
     phase_spans, omitted = _phase_spans_for_human(summary, max_spans=8)
+    if (
+        len(phase_spans) == 1
+        and phase_spans[0] is not None
+        and int(phase_spans[0].get("samples") or 0) == int(summary.get("samples") or 0)
+    ):
+        # A single phase spanning the complete sample window repeats the global
+        # GPU and job rows without adding diagnostic information.  Keep phase
+        # rows when the application actually transitions or the phase covers
+        # only part of the requested window.
+        phase_spans = []
     for span in phase_spans:
         if span is None:
             t.add_row(f"… {omitted} phase spans omitted …", "-", "-")
@@ -7394,7 +7627,12 @@ def _info_live(
 INFO_COMMAND_PREVIEW_CHARS = 160
 
 
-def _info_command_text(command: str, *, full: bool) -> Any:
+def _info_command_text(
+    command: str,
+    *,
+    full: bool,
+    preview_chars: int = INFO_COMMAND_PREVIEW_CHARS,
+) -> Any:
     """Keep the human summary scannable without weakening the JSON contract."""
     from rich.text import Text
 
@@ -7402,11 +7640,11 @@ def _info_command_text(command: str, *, full: bool) -> Any:
         return Text(command)
     lines = command.splitlines() or [""]
     compact = " ".join(command.split())
-    if len(lines) == 1 and len(compact) <= INFO_COMMAND_PREVIEW_CHARS:
+    if len(lines) == 1 and len(compact) <= preview_chars:
         return Text(command)
     preview = compact
-    if len(preview) > INFO_COMMAND_PREVIEW_CHARS:
-        preview = preview[: INFO_COMMAND_PREVIEW_CHARS - 1].rstrip() + "…"
+    if len(preview) > preview_chars:
+        preview = preview[: preview_chars - 1].rstrip() + "…"
     result = Text(preview)
     byte_count = len(command.encode("utf-8"))
     detail = (
@@ -7421,6 +7659,12 @@ def _info_command_text(command: str, *, full: bool) -> Any:
 def info(
     ref: str = REF_ARG,
     json_: bool = typer.Option(False, "--json"),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="show complete provenance, paths, launch details, and resource history",
+    ),
     full_command: bool = typer.Option(
         False,
         "--full-command",
@@ -7432,7 +7676,7 @@ def info(
         help="include a summary of the last N resource samples (0 = all)",
     ),
 ) -> None:
-    """Everything about one job: state, placement, timeline, artifacts."""
+    """Show one job's state, progress, and recovery actions."""
     if metrics_tail < 0:
         _fail_submission(
             kind="invalid_argument",
@@ -7446,6 +7690,7 @@ def info(
         route = (
             HeadCommand.start(head, "info", ref)
             .flag("--json", json_)
+            .flag("--verbose", verbose)
             .flag("--full-command", full_command)
             .option(
                 "--metrics-tail",
@@ -7465,6 +7710,8 @@ def info(
             )
     else:
         entry = _find_or_die(cfg, ref)
+    display_refs = jobs_mod.compact_job_refs(jobs_mod.list_all(cfg))
+    display_ref = display_refs.get(entry.job_id, entry.job_id)
     initial_status = entry.status
     placed_prestart_failure = (
         initial_status == "failed"
@@ -7651,7 +7898,7 @@ def info(
 
     t = RTable(show_header=False, box=None, pad_edge=False)
     t.add_column(style="bold dim", justify="right")
-    t.add_column()
+    t.add_column(overflow="fold", ratio=1)
     style = {
         "running": "bold green",
         "finished": "cyan",
@@ -7680,16 +7927,25 @@ def info(
         else ""
     )
     rows = [
-        ("job id", entry.job_id),
+        ("name", escape(entry.name)),
+        ("ref", escape(display_ref)),
+        ("job id", escape(entry.job_id)),
         ("status", status_txt),
         (
             "where",
-            f"{entry.center} / {entry.node}"
-            + (f"  pin={entry.pin_node}" if entry.pin_node else ""),
+            f"{escape(entry.center)} / {escape(entry.node)}"
+            + (f"  pin={escape(entry.pin_node)}" if entry.pin_node else ""),
         ),
         ("gpus", gpus_txt),
-        ("cmd", _info_command_text(entry.cmd, full=full_command)),
-        ("project", f"{entry.project}  git {git_txt}"),
+        (
+            "cmd",
+            _info_command_text(
+                entry.cmd,
+                full=full_command,
+                preview_chars=(INFO_COMMAND_PREVIEW_CHARS if verbose else 80),
+            ),
+        ),
+        ("project", f"{escape(entry.project)}  git {git_txt}"),
         ("snapshot", entry.snapshot_sha256 or "-"),
         ("payload", entry.payload_sha256 or "-"),
         ("submitted (head)", _fmt_ts(entry.created_at)),
@@ -7706,7 +7962,7 @@ def info(
                 else "-"
             ),
         ),
-        ("session", entry.session),
+        ("session", escape(entry.session)),
         ("env", entry.env_hash or "-"),
     ]
     if cross_clock_intervals_approximate:
@@ -7726,8 +7982,24 @@ def info(
                 f"{data['queue_ahead_count']} ahead",
             ),
         )
-        rows.insert(3, ("queue head", data["queue_head_job_id"] or "-"))
-        rows.insert(4, ("previous", data["queue_predecessor_job_id"] or "-"))
+        queue_head = data["queue_head_job_id"]
+        previous = data["queue_predecessor_job_id"]
+        rows.insert(
+            5,
+            (
+                "queue head",
+                display_refs.get(str(queue_head), str(queue_head))
+                if queue_head
+                else "-",
+            ),
+        )
+        rows.insert(
+            6,
+            (
+                "previous",
+                display_refs.get(str(previous), str(previous)) if previous else "-",
+            ),
+        )
     if entry.artifact_manifest:
         rows.insert(8, ("artifacts", f"manifest {entry.artifact_manifest[:12]}"))
     if entry.placement_failures:
@@ -7766,9 +8038,14 @@ def info(
     if entry.setup and setup_ran is not None:
         rows.append(("setup hook", "ran" if setup_ran else "cached"))
     if entry.setup_inputs is not None:
-        rows.append(("setup inputs", ", ".join(entry.setup_inputs) or "(none)"))
+        rows.append(
+            (
+                "setup inputs",
+                ", ".join(escape(item) for item in entry.setup_inputs) or "(none)",
+            )
+        )
     if entry.extras:
-        rows.append(("extras", ", ".join(entry.extras)))
+        rows.append(("extras", ", ".join(escape(item) for item in entry.extras)))
     if failure_log is not None:
         from rich.text import Text
 
@@ -7787,11 +8064,29 @@ def info(
                 )
             )
     if entry.forked_from:
-        rows.insert(7, ("forked from", entry.forked_from))
+        rows.insert(
+            7,
+            (
+                "forked from",
+                display_refs.get(entry.forked_from, entry.forked_from),
+            ),
+        )
     if entry.after_success:
-        rows.insert(7, ("after success", entry.after_success))
+        rows.insert(
+            7,
+            (
+                "after success",
+                display_refs.get(entry.after_success, entry.after_success),
+            ),
+        )
     if entry.rerun_of:
-        rows.insert(7, ("rerun of", entry.rerun_of))
+        rows.insert(
+            7,
+            (
+                "rerun of",
+                display_refs.get(entry.rerun_of, entry.rerun_of),
+            ),
+        )
         if entry.rerun_snapshot_changed is True:
             rows.insert(
                 8,
@@ -7853,13 +8148,70 @@ def info(
             )
         rows.append(("guard trip", guard_text))
     if entry.require_path:
-        rows.append(("require", entry.require_path))
+        rows.append(("require", escape(entry.require_path)))
     if entry.require_disk_gib is not None:
         rows.append(("disk required", f"{entry.require_disk_gib} GiB"))
     rows.extend(_phase_summary_rows(phase_summary))
     rows.extend(_resource_rows(resources))
     rows.extend(_resource_summary_rows(resource_summary))
-    for k, v in rows:
+
+    next_action = (
+        f"dt wait {display_ref} · dt free"
+        if entry.status == "queued"
+        else f"dt logs {display_ref} -f · dt metrics {display_ref}"
+        if entry.status == "running"
+        else f"dt pull {display_ref} --lite · dt metrics {display_ref}"
+        if entry.status == "finished" and entry.exit_code == 0
+        else f"dt logs {display_ref} · dt pull {display_ref} --lite"
+    )
+    rows.append(("next", next_action))
+    compact_labels = {
+        "name",
+        "ref",
+        "status",
+        "queue",
+        "queue head",
+        "previous",
+        "placement failures",
+        "where",
+        "gpus",
+        "cmd",
+        "project",
+        "submitted (head)",
+        "duration",
+        "exit code",
+        "outputs",
+        "forked from",
+        "after success",
+        "rerun of",
+        "rerun code",
+        "failure log",
+        "guard trip",
+        "phase timeline",
+        "live gpu",
+        "live host",
+        "next",
+    }
+    rendered_rows = (
+        rows
+        if verbose
+        else [
+            row
+            for row in rows
+            if (
+                row[0] in compact_labels
+                or row[0].startswith(("started (", "finished ("))
+            )
+            and not (
+                row[1] == "-"
+                and (
+                    row[0] in {"exit code", "outputs"}
+                    or row[0].startswith("finished (")
+                )
+            )
+        ]
+    )
+    for k, v in rendered_rows:
         t.add_row(k, v)
     out.print(t)
 
@@ -8486,43 +8838,51 @@ def compare(
             "numeric JSON result as [outputs/]OUTPUT_GLOB::DOTTED_FIELD, "
             "or @job::duration_s"
         ),
+        rich_help_panel="Metric",
     ),
     groups: Optional[str] = typer.Option(
         None,
         "--groups",
         help="one label per job: compact ABBA or comma-separated labels",
+        rich_help_panel="Metric",
     ),
     lower_is_better: bool = typer.Option(
         False,
         "--lower-is-better",
         help="treat a lower metric mean as an improvement",
+        rich_help_panel="Metric",
     ),
     unit: Optional[str] = typer.Option(
         None,
         "--unit",
         help="display unit for --metric (for example samples/s or ms)",
+        rich_help_panel="Metric",
     ),
     min_improvement: Optional[float] = typer.Option(
         None,
         "--min-improvement",
         help="exit 1 unless the second group's improvement reaches this percent",
+        rich_help_panel="Gate",
     ),
     max_regression: Optional[float] = typer.Option(
         None,
         "--max-regression",
         help="exit 1 if the second group's regression exceeds this percent",
+        rich_help_panel="Gate",
     ),
     max_spread: Optional[float] = typer.Option(
         None,
         "--max-spread",
         help="exit 1 unless both groups' metric spread is at most this percent",
+        rich_help_panel="Gate",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(False, "--json", rich_help_panel="Input & output"),
     file: Optional[Path] = typer.Option(
         None,
         "--file",
         "-F",
         help="read ordered job refs from a file; '-' reads stdin",
+        rich_help_panel="Input & output",
     ),
 ) -> None:
     """Audit controls and optionally compare a numeric result across groups."""
@@ -8986,7 +9346,12 @@ def metrics(
             )
     else:
         entry = _find_or_die(cfg, ref)
-    _refuse_unplaced(entry, "resource telemetry", json_=json_)
+    _refuse_unplaced(
+        entry,
+        "resource telemetry",
+        json_=json_,
+        display_ref=_display_ref_for_entry(cfg, entry),
+    )
     query = ResourceTelemetryQuery(entry, tail)
     result = query.read(
         run_on,
@@ -9067,8 +9432,10 @@ def rerun(
         raise typer.Exit(rc)
 
     from .dispatch import spec_from_entry
+    from rich.markup import escape
 
     old = _find_or_die(cfg, ref)
+    old_display_ref = _display_ref_for_entry(cfg, old)
     if old.cache_source_job:
         _fail_submission(
             kind="invalid_request",
@@ -9082,10 +9449,12 @@ def rerun(
             json_=json_,
         )
     spec = spec_from_entry(old, name)
-    err.print(f"[dim]rerunning {old.job_id}: {old.cmd}[/dim]")
+    err.print(
+        f"[dim]rerun source: {escape(old.name)} · ref {escape(old_display_ref)}[/dim]"
+    )
 
     def log(msg: str) -> None:
-        err.print(f"[dim]{msg}[/dim]")
+        err.print(f"[dim]{escape(msg)}[/dim]")
 
     try:
         entry = submit(cfg, spec, Path.cwd(), log, no_queue=no_queue)
@@ -9129,17 +9498,21 @@ def rerun(
     if json_:
         print(json.dumps(_submission_payload(entry)))
     else:
-        state = (
-            "[cyan]queued[/cyan]"
-            if entry.status == "queued"
-            else f"[green]started[/green] on [bold]{entry.node}[/bold]"
-        )
-        reason_note = ""
-        if entry.status == "queued" and entry.reason:
-            from rich.markup import escape
-
-            reason_note = f" · [yellow]{escape(entry.reason)}[/yellow]"
-        err.print(f"{state} {entry.name} (rerun of {old.job_id}){reason_note}")
+        display_ref = _display_ref_for_entry(cfg, entry)
+        if entry.status == "queued":
+            err.print(
+                f"[cyan]queued[/cyan] {escape(entry.name)} · "
+                f"rerun of {escape(old_display_ref)}"
+            )
+            if entry.reason:
+                err.print(f"[yellow]reason: {escape(entry.reason)}[/yellow]")
+        else:
+            gpu_text = ",".join(map(str, entry.gpus)) or "cpu"
+            err.print(
+                f"[green]started[/green] {escape(entry.name)} · "
+                f"[bold]{escape(entry.node)}[/bold] · GPU {gpu_text} · "
+                f"rerun of {escape(old_display_ref)}"
+            )
         source_snapshot = entry.rerun_source_snapshot_sha256
         current_snapshot = entry.snapshot_sha256
         if entry.rerun_snapshot_changed is True:
@@ -9154,6 +9527,12 @@ def rerun(
             )
         else:
             err.print("[dim]code change unknown (source snapshot unavailable)[/dim]")
+        next_command = (
+            f"dt watch {display_ref}"
+            if entry.status == "queued"
+            else f"dt logs {display_ref} -f · dt wait {display_ref}"
+        )
+        err.print(f"[dim]next: {escape(next_command)}[/dim]")
         print(entry.job_id)  # bare id, last stdout line: agents rely on this
 
 
@@ -9172,6 +9551,7 @@ def _fork_repeat_receipt(
     name_prefix: str,
     requested: int,
     entries: list[jobs_mod.JobEntry],
+    display_refs: dict[str, str],
     cache_mode: str,
     cold_cache_env: str | None,
     agent_started: bool | None,
@@ -9185,6 +9565,7 @@ def _fork_repeat_receipt(
     rows = [
         _submission_payload(
             entry,
+            name=entry.name,
             repeat_index=index,
             repeat_size=requested,
             command=entry.cmd,
@@ -9196,6 +9577,8 @@ def _fork_repeat_receipt(
         )
         for index, entry in enumerate(entries, start=1)
     ]
+    for row, entry in zip(rows, entries, strict=True):
+        row["display_ref"] = display_refs.get(entry.job_id, entry.job_id)
     receipt: JsonDict = {
         "schema_version": FORK_REPEAT_SCHEMA,
         "status": (
@@ -9290,7 +9673,6 @@ def _emit_fork_repeat_human(
     err.print(
         f"[green]fork repeat submitted[/green]  {receipt['submitted']} jobs · "
         f"{receipt['running']} running · {receipt['queued']} queued · "
-        f"snapshot {str(receipt.get('snapshot_sha256') or '-')[:12]} · "
         f"cache {escape(str(receipt['cache_mode']))}"
     )
     err.print("[dim]policy: FIFO · runtime failures continue[/dim]")
@@ -9368,54 +9750,66 @@ def fork(
         "-n",
         "--name",
         help="new job name (default: <old-name>-fork)",
+        rich_help_panel="Everyday",
     ),
     reuse_cache: Optional[str] = typer.Option(
         None,
         "--reuse-cache",
         help="reuse a directory below the source job's outputs/",
+        rich_help_panel="Cache reuse",
     ),
     clone_cache: Optional[str] = typer.Option(
         None,
         "--clone-cache",
         help="clone a source outputs cache into one private writable copy per job",
+        rich_help_panel="Cache reuse",
     ),
     cache_env: str = typer.Option(
         "DT_REUSED_CACHE_DIR",
         "--cache-env",
         help="environment variable that receives the verified cache directory",
+        rich_help_panel="Cache reuse",
     ),
     inherit_cache: bool = typer.Option(
         False,
         "--inherit-cache",
         help="preserve REF's existing verified cache binding",
+        rich_help_panel="Cache reuse",
     ),
     artifact_manifest: Optional[str] = typer.Option(
         None,
         "--artifact-manifest",
         help="override REF's bound artifact manifest for the new fork(s)",
+        rich_help_panel="Reproducibility",
     ),
     max_hours: Optional[float] = typer.Option(
         None,
         "--max-hours",
         help="override the source job's runaway guard for the new fork(s)",
+        rich_help_panel="Scheduling & safety",
     ),
     max_vram_mib: Optional[int] = typer.Option(
         None,
         "--max-vram-mib",
         help="override the source job's per-GPU VRAM guard for the new fork(s)",
+        rich_help_panel="Scheduling & safety",
     ),
     max_job_memory_mib: Optional[int] = typer.Option(
         None,
         "--max-job-memory-mib",
         help="override the source job's host-memory guard for the new fork(s)",
+        rich_help_panel="Scheduling & safety",
     ),
     repeat: int = typer.Option(
         1,
         "--repeat",
         help="submit N sequential exact forks (N>1 returns one group receipt)",
+        rich_help_panel="Everyday",
     ),
-    no_queue: bool = typer.Option(False, "--no-queue"),
-    json_: bool = typer.Option(False, "--json"),
+    no_queue: bool = typer.Option(
+        False, "--no-queue", rich_help_panel="Scheduling & safety"
+    ),
+    json_: bool = typer.Option(False, "--json", rich_help_panel="Output"),
 ) -> None:
     """Fork exact code; --repeat N preloads a same-node FIFO runway."""
     command = list(ctx.args)
@@ -9526,8 +9920,10 @@ def fork(
         raise typer.Exit(rc)
 
     from . import dispatch as dispatch_mod
+    from rich.markup import escape
 
     old = _find_or_die(cfg, ref)
+    old_display_ref = _display_ref_for_entry(cfg, old)
     if max_vram_mib is not None and old.gpus_requested == 0:
         _fail_submission(
             kind="invalid_argument",
@@ -9562,6 +9958,8 @@ def fork(
                     json_=json_,
                 )
             cold_cache_env = old.cache_env
+
+    source_display_ref = _display_ref_for_entry(cfg, source)
 
     cold_cache_script = (
         'cache_dir="$DT_JOB_DIR/outputs/.cache/dt-cold"; '
@@ -9621,23 +10019,25 @@ def fork(
 
     if cold_cache_env:
         err.print(
-            f"[yellow]{old.job_id} used a verified cache; this fork is cold. "
-            f"Using job-local {old.cache_env}; add --inherit-cache to "
+            f"[yellow]{escape(old.name)} · ref {escape(old_display_ref)} used a "
+            f"verified cache; this fork is cold. Using job-local "
+            f"{escape(old.cache_env or '')}; add --inherit-cache to "
             "preserve the binding.[/yellow]"
         )
     err.print(
-        f"[dim]forking exact snapshot "
-        f"{(source.snapshot_sha256 or 'missing')[:12]} from {source.job_id}[/dim]"
+        f"[dim]fork source: {escape(source.name)} · ref "
+        f"{escape(source_display_ref)} · exact snapshot "
+        f"{(source.snapshot_sha256 or 'missing')[:12]}[/dim]"
     )
     if spec.cache_source_job:
         verb = "cloning" if spec.cache_mode == "clone" else "reusing"
         err.print(
-            f"[dim]{verb} {spec.cache_source_job}:{spec.cache_source_path} "
-            f"-> {spec.cache_env}[/dim]"
+            f"[dim]{verb} cache {escape(spec.cache_source_path or '')} → "
+            f"{escape(spec.cache_env or '')}[/dim]"
         )
 
     def log(msg: str) -> None:
-        err.print(f"[dim]{msg}[/dim]")
+        err.print(f"[dim]{escape(msg)}[/dim]")
 
     if repeat > 1:
         entries: list[jobs_mod.JobEntry] = []
@@ -9660,7 +10060,7 @@ def fork(
             item_spec = spec if index == 1 else build_spec(f"{prefix}-{index:03d}")
 
             def item_log(message: str, *, item: int = index) -> None:
-                err.print(f"[dim]fork repeat {item}/{repeat}: {message}[/dim]")
+                err.print(f"[dim]fork repeat {item}/{repeat}: {escape(message)}[/dim]")
 
             try:
                 entry = dispatch_mod.submit_fork(
@@ -9711,11 +10111,6 @@ def fork(
             ensure_agent(entry)
             if not json_:
                 print(entry.job_id, flush=True)
-                state = "queued" if entry.status == "queued" else "started"
-                err.print(
-                    f"[cyan]{index}/{repeat}[/cyan] {state} "
-                    f"{entry.name}  [dim]{entry.job_id}[/dim]"
-                )
 
         cache_mode = (
             "inherited"
@@ -9734,6 +10129,7 @@ def fork(
             name_prefix=prefix,
             requested=repeat,
             entries=entries,
+            display_refs=_display_refs_for_entries(cfg, entries),
             cache_mode=cache_mode,
             cold_cache_env=cold_cache_env,
             agent_started=agent_started,
@@ -9803,22 +10199,30 @@ def fork(
         )
         return
 
+    display_ref = _display_ref_for_entry(cfg, entry)
     if entry.status == "queued":
-        state = "[cyan]queued[/cyan]"
-        if agent_started:
-            state += " [dim](agent started)[/dim]"
+        agent_note = " · agent started" if agent_started else ""
+        err.print(
+            f"[cyan]queued[/cyan] {escape(entry.name)} · "
+            f"fork of {escape(source_display_ref)}{agent_note}"
+        )
+        if entry.reason:
+            err.print(f"[yellow]reason: {escape(entry.reason)}[/yellow]")
     else:
-        state = f"[green]started[/green] on [bold]{entry.node}[/bold]"
-    reason_note = ""
-    if entry.status == "queued" and entry.reason:
-        from rich.markup import escape
-
-        reason_note = f" · [yellow]{escape(entry.reason)}[/yellow]"
+        gpu_text = ",".join(map(str, entry.gpus)) or "cpu"
+        err.print(
+            f"[green]started[/green] {escape(entry.name)} · "
+            f"[bold]{escape(entry.node)}[/bold] · GPU {gpu_text} · "
+            f"fork of {escape(source_display_ref)}"
+        )
     exact_snapshot = (entry.snapshot_sha256 or "unknown")[:12]
-    err.print(
-        f"{state} {entry.name}  exact={exact_snapshot} "
-        f"(fork of {entry.forked_from or source.job_id}){reason_note}"
+    err.print(f"[dim]exact snapshot {exact_snapshot}[/dim]")
+    next_command = (
+        f"dt watch {display_ref}"
+        if entry.status == "queued"
+        else f"dt logs {display_ref} -f · dt wait {display_ref}"
     )
+    err.print(f"[dim]next: {escape(next_command)}[/dim]")
     print(entry.job_id)
 
 
@@ -9902,8 +10306,8 @@ def _pull_interrupted(
             exit_code=130,
             json_=True,
         )
-    err.print(f"[yellow]{message}[/yellow]")
-    err.print(f"[dim]resume: {resume_text}[/dim]")
+    err.print(f"[yellow]{escape(message)}[/yellow]")
+    err.print(f"[dim]resume: {escape(resume_text)}[/dim]")
     raise typer.Exit(130)
 
 
@@ -10014,8 +10418,6 @@ def _pull_unlocked(
         elif json_:
             print(json.dumps(payload))
         else:
-            from rich.markup import escape
-
             err.print(f"[red]{escape(message)}[/red]")
         raise typer.Exit(exit_code)
 
@@ -10062,7 +10464,11 @@ def _pull_unlocked(
             and not _is_uncertain_launch(entry)
             and entry.node != "-"
         ):
-            _refuse_unplaced(entry, "outputs")
+            _refuse_unplaced(
+                entry,
+                "outputs",
+                display_ref=_display_ref_for_entry(cfg, entry),
+            )
     dst = (
         Path(to).expanduser()
         if to
@@ -10132,8 +10538,6 @@ def _pull_unlocked(
         timeout=10,
     )
     if check.returncode not in (0, 1):
-        from rich.markup import escape
-
         detail = (
             check.stderr or check.stdout or f"outputs probe exited {check.returncode}"
         )
@@ -10174,7 +10578,7 @@ def _pull_unlocked(
                 job_id=entry.job_id,
                 node=entry.node,
             )
-        err.print(f"[red]{message}[/red]")
+        err.print(f"[red]{escape(message)}[/red]")
         raise typer.Exit(EXIT_NOT_FOUND)
     outputs_present = check.returncode == 0
     if outputs_present:
@@ -10236,8 +10640,6 @@ def _pull_unlocked(
             and remote_outputs_bytes is not None
             and remote_outputs_bytes >= PULL_LARGE_OUTPUT_BYTES
         ):
-            from rich.markup import escape
-
             filter_note = " before filters" if excludes else ""
             err.print(
                 "[yellow]large pull:[/yellow] remote outputs occupy "
@@ -10245,7 +10647,7 @@ def _pull_unlocked(
             )
             err.print(
                 "[dim]for quick evidence, use "
-                f"{escape(shlex.join(['dt', 'pull', entry.job_id, '--lite']))}; "
+                f"{escape(shlex.join(['dt', 'pull', _display_ref_for_entry(cfg, entry), '--lite']))}; "
                 "full pull remains resumable[/dim]"
             )
         pull_size = (
@@ -10298,7 +10700,7 @@ def _pull_unlocked(
                     records=records,
                     partial=True,
                 )
-            err.print(f"[red]{message}[/red]")
+            err.print(f"[red]{escape(message)}[/red]")
             err.print(
                 "[dim]partial data (if any) is kept; rerun dt pull to resume[/dim]"
             )
@@ -10364,7 +10766,7 @@ def _pull_unlocked(
                 records=records,
                 partial=True,
             )
-        err.print(f"[red]{message}[/red]")
+        err.print(f"[red]{escape(message)}[/red]")
         err.print(
             "[dim]recovered local data and job.json are kept; "
             "rerun dt pull to resume[/dim]"
@@ -10875,7 +11277,7 @@ def _kill_one(
     entry = jobs_mod.find(cfg, ref)
     if entry is None:
         message = f"no job matching {ref!r}"
-        err.print(f"[red]{message}[/red]")
+        err.print(f"[red]{escape(message)}[/red]")
         return finish("notfound", "not_found", None, message)
     if entry.status == "queued":
         if not yes:
@@ -10901,7 +11303,7 @@ def _kill_one(
                 jobs_mod.save(cfg, entry)
                 remove_staging(cfg, entry.job_id)
                 message = f"dequeued {entry.job_id}"
-                err.print(f"[yellow]{message}[/yellow]")
+                err.print(f"[yellow]{escape(message)}[/yellow]")
                 return finish("ok", "dequeued", entry, message)
     entry = jobs_mod.refresh_status(cfg, entry)
     # "lost" still gets the kill: the group leader may be dead while children
@@ -10955,7 +11357,7 @@ def _kill_one(
             proc = run_on(entry.node, entry.node_local, probe, timeout=20)
         except (RemoteError, subprocess.TimeoutExpired, OSError) as e:
             message = f"could not verify death of {target} on {entry.node}: {e}"
-            err.print(f"[red]{message}[/red]")
+            err.print(f"[red]{escape(message)}[/red]")
             return finish(
                 "unverified",
                 "unverified",
@@ -10969,7 +11371,7 @@ def _kill_one(
         )
         if verdict == "UNVERIFIED":
             message = f"could not verify death of {target} on {entry.node}: {detail}"
-            err.print(f"[red]{message}[/red]")
+            err.print(f"[red]{escape(message)}[/red]")
             return finish(
                 "unverified",
                 "unverified",
@@ -10980,9 +11382,9 @@ def _kill_one(
             retained = "failed" if uncertain_launch else "running"
             message = f"{target} on {entry.node} survived {sig}"
             err.print(
-                f"[red]{message}[/red] "
-                f"(job stays '{retained}'; try: "
-                f"dt kill {entry.job_id} -y --force)"
+                f"[red]{escape(message)}[/red] "
+                f"(job stays '{escape(retained)}'; try: "
+                f"dt kill {escape(entry.job_id)} -y --force)"
             )
             return finish("alive", "survived", entry, message)
         previous_reason = entry.reason
@@ -10997,7 +11399,7 @@ def _kill_one(
             entry.reason = f"killed by user ({sig})"
         jobs_mod.save(cfg, entry)
         message = f"sent {sig} to {target} on {entry.node}; confirmed dead"
-        err.print(f"[yellow]{message}[/yellow]")
+        err.print(f"[yellow]{escape(message)}[/yellow]")
         return finish("ok", "killed", entry, message)
 
 
@@ -11253,7 +11655,7 @@ def clean(
             ]
         )
         for target_center, head in targets:
-            err.print(f"[dim]cleaning {target_center}[/dim]")
+            err.print(f"[dim]cleaning {escape(target_center)}[/dim]")
             rc |= forward_call(
                 head, ["clean", "--before", before, *argv_tail], tty=not yes
             )
@@ -11285,18 +11687,18 @@ def clean(
             f" + {len(managed_results)} identity-verified managed results"
             + (" + stale shared venvs" if envs else "")
             + (
-                f" · projects {', '.join(sorted(projects))}"
+                f" · projects {escape(', '.join(sorted(projects)))}"
                 if projects is not None
                 else ""
             )
         )
         preview_limit = 20
         for entry in victims[:preview_limit]:
-            err.print(f"[dim]job {entry.job_id} · {entry.status}[/dim]")
+            err.print(f"[dim]job {escape(entry.job_id)} · {escape(entry.status)}[/dim]")
         if len(victims) > preview_limit:
             err.print(f"[dim]... {len(victims) - preview_limit} more jobs[/dim]")
         for job_id, path in managed_results[:preview_limit]:
-            err.print(f"[dim]result {job_id} · {path}[/dim]")
+            err.print(f"[dim]result {escape(job_id)} · {escape(str(path))}[/dim]")
         if len(managed_results) > preview_limit:
             err.print(
                 f"[dim]... {len(managed_results) - preview_limit} more results[/dim]"
@@ -11330,7 +11732,7 @@ def clean(
         cfg,
         cutoff,
         envs=envs,
-        log=lambda m: err.print(f"[dim]{m}[/dim]"),
+        log=lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
         projects=projects,
         before_registry_remove=remove_managed_results if results else None,
     )
@@ -11343,7 +11745,8 @@ def clean(
         )
         for failure in report.failures:
             err.print(
-                f"[red]{failure.job_id} · {failure.kind} · {failure.message}[/red]"
+                f"[red]{escape(failure.job_id)} · {escape(failure.kind)} · "
+                f"{escape(failure.message)}[/red]"
             )
         raise typer.Exit(1)
 
@@ -11353,16 +11756,147 @@ def _local_tree_disk_bytes(path: Path) -> int:
     return local_tree_disk_bytes(path, process_run=subprocess.run)
 
 
+def _storage_table(payload: JsonDict, *, center: str, details: bool) -> Any:
+    from rich.markup import escape
+    from rich.table import Table
+
+    head_rows = payload["head"]
+    node_rows = payload["nodes"]
+    assert isinstance(head_rows, list)
+    assert isinstance(node_rows, list)
+    table = Table(
+        title=f"DT storage · {escape(center)}",
+        title_justify="left",
+        header_style="bold",
+        box=None,
+        padding=(0, 1),
+        collapse_padding=True,
+        pad_edge=False,
+    )
+    if details:
+        table.show_header = False
+        table.add_column(
+            "field", style="bold dim", justify="right", no_wrap=True, width=7
+        )
+        table.add_column("value", overflow="fold", ratio=1)
+    else:
+        table.add_column("scope")
+        table.add_column("classes", justify="right")
+        table.add_column("entries", justify="right")
+        table.add_column("size", justify="right")
+        table.add_column("issue")
+
+    if details:
+        for row in head_rows:
+            assert isinstance(row, dict)
+            bytes_value = row.get("bytes")
+            kind = str(row["kind"]).replace("legacy_agent_agent_", "legacy_agent_", 1)
+            table.add_row("scope", escape(f"head/{kind}"))
+            table.add_row("path", escape(str(row["path"])))
+            table.add_row("entries", str(row["entries"]))
+            table.add_row(
+                "size",
+                _format_storage_bytes(bytes_value)
+                if isinstance(bytes_value, int)
+                else "-",
+                end_section=True,
+            )
+        for row in node_rows:
+            assert isinstance(row, dict)
+            for kind, section in row.items():
+                if kind in {"node", "error", "managed_root"}:
+                    continue
+                assert isinstance(section, dict)
+                bytes_value = section.get("bytes")
+                table.add_row("scope", escape(f"{row['node']}/{kind}"))
+                table.add_row("path", escape(str(section["path"])))
+                table.add_row(
+                    "entries",
+                    str(section["entries"] if section["entries"] is not None else "-"),
+                )
+                table.add_row(
+                    "size",
+                    _format_storage_bytes(bytes_value)
+                    if isinstance(bytes_value, int)
+                    else "-",
+                )
+                if row.get("error"):
+                    table.add_row("issue", escape(str(row["error"])))
+                table.add_section()
+        return table
+
+    def totals(sections: list[JsonDict]) -> tuple[int, str, str]:
+        known_bytes = [
+            int(section["bytes"])
+            for section in sections
+            if isinstance(section.get("bytes"), int)
+        ]
+        known_entries = [
+            int(section["entries"])
+            for section in sections
+            if isinstance(section.get("entries"), int)
+        ]
+        bytes_total = sum(known_bytes)
+        entries_total = sum(known_entries)
+
+        def observed(value: str, known: int) -> str:
+            if known == len(sections):
+                return value
+            return f"≥{value}" if known else "-"
+
+        return (
+            len(sections),
+            observed(str(entries_total), len(known_entries)),
+            observed(_format_storage_bytes(bytes_total), len(known_bytes)),
+        )
+
+    head_sections = [row for row in head_rows if isinstance(row, dict)]
+    classes, entries, size = totals(head_sections)
+    table.add_row(
+        "head",
+        str(classes),
+        entries,
+        size,
+        "",
+    )
+    for row in node_rows:
+        assert isinstance(row, dict)
+        sections = [
+            section
+            for kind, section in row.items()
+            if kind not in {"node", "error", "managed_root"}
+            and isinstance(section, dict)
+        ]
+        classes, entries, size = totals(sections)
+        table.add_row(
+            escape(str(row["node"])),
+            str(classes),
+            entries,
+            size,
+            escape(str(row.get("error") or "")),
+        )
+    return table
+
+
 def storage(
     center: Optional[str] = typer.Option(
         None, "-c", "--center", help="(laptop) which center's head"
     ),
+    details: bool = typer.Option(
+        False,
+        "--details",
+        help="show every managed storage class and path",
+    ),
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
-    """Inventory every DT-managed head and worker storage class."""
+    """Summarize DT-managed storage on the head and workers."""
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
-        route = _head_command(cfg, center, "storage").flag("--json", json_)
+        route = (
+            _head_command(cfg, center, "storage")
+            .flag("--details", details)
+            .flag("--json", json_)
+        )
         raise typer.Exit(route.invoke(forward_call))
 
     payload = storage_inventory(
@@ -11373,60 +11907,30 @@ def storage(
     if json_:
         print(json.dumps(payload))
         return
-    head_rows = payload["head"]
-    node_rows = payload["nodes"]
     total_bytes = payload["total_bytes"]
-    assert isinstance(head_rows, list)
-    assert isinstance(node_rows, list)
     assert isinstance(total_bytes, int)
-
-    from rich.markup import escape
-    from rich.table import Table
-
-    table = Table(title=f"DT managed storage · {cfg.center}", pad_edge=False)
-    table.add_column("scope")
-    table.add_column("path")
-    table.add_column("entries", justify="right")
-    table.add_column("size", justify="right")
-    table.add_column("issue")
-    for row in head_rows:
-        bytes_value = row.get("bytes")
-        table.add_row(
-            f"head/{row['kind']}",
-            escape(str(row["path"])),
-            str(row["entries"]),
-            (
-                _format_transfer_bytes(bytes_value)
-                if isinstance(bytes_value, int)
-                else "-"
-            ),
-            "",
-        )
-    for row in node_rows:
-        for kind, section in row.items():
-            if kind in {"node", "error", "managed_root"}:
-                continue
-            assert isinstance(section, dict)
-            bytes_value = section.get("bytes")
-            table.add_row(
-                f"{row['node']}/{kind}",
-                escape(str(section["path"])),
-                str(section["entries"] if section["entries"] is not None else "-"),
-                (
-                    _format_transfer_bytes(int(bytes_value))
-                    if isinstance(bytes_value, int)
-                    else "-"
-                ),
-                escape(str(row["error"] or "")),
-            )
-    out.print(table)
+    node_rows = payload["nodes"]
+    assert isinstance(node_rows, list)
+    unknown_bytes = any(
+        section.get("bytes") is None
+        for row in node_rows
+        if isinstance(row, dict)
+        for kind, section in row.items()
+        if kind not in {"node", "error", "managed_root"} and isinstance(section, dict)
+    )
+    total_label = "observed ≥" if unknown_bytes else "total "
+    out.print(_storage_table(payload, center=cfg.center, details=details))
     policy = (
         f"{cfg.queue.auto_clean_days:g} days" if cfg.queue.auto_clean_days else "off"
     )
     err.print(
-        f"[dim]total {_format_transfer_bytes(total_bytes)} · "
-        f"auto-clean {policy} · preview: dt clean --before YYYY-MM-DD "
-        "--results --envs --plan[/dim]"
+        f"[dim]{total_label}{_format_storage_bytes(total_bytes)} · "
+        f"auto-clean {policy} · "
+        f"{'summary: dt storage' if details else 'details: dt storage --details'}"
+        "[/dim]"
+    )
+    err.print(
+        "[dim]cleanup preview: dt clean --before DATE --results --envs --plan[/dim]"
     )
 
 
@@ -11618,7 +12122,7 @@ def migrate_layout(
         apply_layout(
             cfg,
             runner=run_on,
-            log=lambda message: err.print(f"[yellow]{message}[/yellow]"),
+            log=lambda message: err.print(f"[yellow]{escape(message)}[/yellow]"),
         )
         if yes
         else plan_layout(cfg, runner=run_on)
@@ -11710,7 +12214,12 @@ def agent_start(
         err.print("agent already running")
         return
     if agent_mod.start_detached(cfg):
-        err.print(f"[green]agent started[/green] (log: {agent_mod.log_path(cfg)})")
+        from rich.markup import escape
+
+        err.print(
+            f"[green]agent started[/green] "
+            f"(log: {escape(str(agent_mod.log_path(cfg)))})"
+        )
     else:
         err.print("[red]agent failed to start; try: dt agent run[/red]")
         raise typer.Exit(1)
@@ -11734,6 +12243,12 @@ def agent_stop(
 @_typed_cli_decorator(agent_app.command("status"))
 def agent_status(
     center: Optional[str] = typer.Option(None, "-c", "--center"),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="show scheduler policy, log rotation, and the complete queue-head id",
+    ),
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
     """Agent liveness + queue depth."""
@@ -11741,24 +12256,65 @@ def agent_status(
     if isinstance(cfg, LaptopConfig):
         head = cfg.centers[_laptop_center(cfg, center)]
         raise typer.Exit(
-            forward_call(head, ["agent", "status"] + (["--json"] if json_ else []))
+            forward_call(
+                head,
+                ["agent", "status"]
+                + (["--verbose"] if verbose else [])
+                + (["--json"] if json_ else []),
+            )
         )
     from . import agent as agent_mod
 
-    st = agent_mod.status(_need_head(cfg))
+    head_cfg = _need_head(cfg)
+    st = agent_mod.status(head_cfg)
     if json_:
         print(json.dumps(st))
         return
-    err.print(_agent_status_table(st))
+    queue_label = None
+    queue_head = st.get("queue_head")
+    if isinstance(queue_head, str):
+        entry = jobs_mod.load(head_cfg, queue_head)
+        if entry is not None:
+            refs = jobs_mod.compact_job_refs(jobs_mod.list_all(head_cfg))
+            queue_label = f"{entry.name} · ref {refs[entry.job_id]}"
+    err.print(
+        _agent_status_table(
+            st,
+            verbose=verbose,
+            queue_label=queue_label,
+        )
+    )
 
 
-def _agent_status_table(st: JsonDict) -> Any:
+def _agent_queue_label(job_id: str) -> str:
+    prefix, separator, rest = job_id.partition("_")
+    name, suffix_separator, suffix = rest.rpartition("_")
+    if (
+        separator
+        and suffix_separator
+        and name
+        and suffix
+        and len(prefix) == 13
+        and prefix[8:9] == "-"
+        and prefix.replace("-", "").isdigit()
+    ):
+        return f"{name} · ref {suffix[-4:]}"
+    return compact_path(job_id)
+
+
+def _agent_status_table(
+    st: JsonDict,
+    *,
+    verbose: bool = False,
+    queue_label: str | None = None,
+) -> Any:
     """Compact status card whose rows stay readable in an 80-column shell."""
+    from rich.markup import escape
     from rich.table import Table
 
     table = Table.grid(padding=(0, 2))
     table.add_column(style="bold dim", justify="right", no_wrap=True)
-    table.add_column()
+    table.add_column(overflow="fold", ratio=1)
     state = "[green]running[/green]" if st["alive"] else "[red]stopped[/red]"
     max_jobs = st["max_my_jobs"] if st["max_my_jobs"] is not None else "unlimited"
     wake = "completion wake" if st["completion_wake"] else "poll only"
@@ -11778,25 +12334,34 @@ def _agent_status_table(st: JsonDict) -> Any:
     table.add_row(
         "handoff",
         f"[{handoff_style}]{st['handoff_state']}[/{handoff_style}]  ·  "
-        f"{st['handoff_reason']}",
+        f"{escape(str(st['handoff_reason']))}",
     )
-    table.add_row(
-        "scheduler",
-        f"{st['poll_s']}s idle  ·  {st['active_poll_s']:g}s queued  ·  {wake}",
-    )
-    table.add_row(
-        "policy",
-        f"max jobs {max_jobs}  ·  reserve {st['reserve_free_per_node']}  ·  "
-        f"webhook {'on' if st['webhook'] else 'off'}",
-    )
-    table.add_row(
-        "log",
-        f"{_format_transfer_bytes(st['log_bytes'])} / "
-        f"{_format_transfer_bytes(st['log_max_bytes'])}  ·  "
-        f"{st['log_backups']} backups",
-    )
-    if st["queue_head"]:
-        table.add_row("queue head", st["queue_head"])
+    if not st["alive"]:
+        table.add_row("next", "dt agent start")
+    if verbose:
+        table.add_row(
+            "scheduler",
+            f"{st['poll_s']}s idle  ·  {st['active_poll_s']:g}s queued  ·  {wake}",
+        )
+        table.add_row(
+            "policy",
+            f"max jobs {max_jobs}  ·  reserve {st['reserve_free_per_node']}  ·  "
+            f"webhook {'on' if st['webhook'] else 'off'}",
+        )
+        table.add_row(
+            "log",
+            f"{_format_transfer_bytes(st['log_bytes'])} / "
+            f"{_format_transfer_bytes(st['log_max_bytes'])}  ·  "
+            f"{st['log_backups']} backups",
+        )
+    if isinstance(st.get("queue_head"), str):
+        head = str(st["queue_head"])
+        table.add_row(
+            "queue head",
+            escape(queue_label or _agent_queue_label(head)),
+        )
+        if verbose:
+            table.add_row("queue id", escape(head))
     return table
 
 
@@ -11810,7 +12375,9 @@ def agent_install(
 
     cfg = _need_head(_cfg())
     line = agent_mod.install_crontab(cfg)
-    err.print(f"crontab installed: [dim]{line}[/dim]")
+    from rich.markup import escape
+
+    err.print(f"crontab installed: [dim]{escape(line)}[/dim]")
 
 
 # --------------------------------------------------------------------------
@@ -11827,6 +12394,11 @@ def _format_transfer_bytes(value: int) -> str:
             return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
         size /= 1024
     raise AssertionError("unreachable")
+
+
+def _format_storage_bytes(value: int) -> str:
+    """Format inventory size; zero is data, not a transfer status."""
+    return "0 B" if value == 0 else _format_transfer_bytes(value)
 
 
 def _local_tree_apparent_bytes(path: Path) -> int:
@@ -11986,7 +12558,7 @@ def sync(
                 )
             )
         else:
-            err.print(f"[red]{message}[/red]")
+            err.print(f"[red]{escape(message)}[/red]")
         raise typer.Exit(1)
 
     try:
@@ -12143,9 +12715,9 @@ def sync(
         if json_:
             continue
         for message in messages:
-            err.print(f"[yellow]{name}: {message}[/yellow]")
+            err.print(f"[yellow]{escape(name)}: {escape(message)}[/yellow]")
         if failure_code is not None:
-            err.print(f"[red]{name}: {row['error']}[/red]")
+            err.print(f"[red]{escape(name)}: {escape(str(row['error']))}[/red]")
             continue
         transferred_bytes = row.get("transferred_bytes")
         gib = row.get("transferred_gib")
@@ -12183,10 +12755,14 @@ def sync(
                 moved = "no changes"
             elif not moved.startswith("no changed bytes"):
                 moved = f"would transfer {moved}"
-            err.print(f"[cyan]plan[/cyan] {name}  {moved}  [dim]{row['path']}[/dim]")
+            err.print(
+                f"[cyan]plan[/cyan] {escape(name)}  {escape(moved)}  "
+                f"[dim]{escape(str(row['path']))}[/dim]"
+            )
         else:
             err.print(
-                f"[green]synced[/green] {name}  {moved}  [dim]{row['path']}[/dim]"
+                f"[green]synced[/green] {escape(name)}  {escape(moved)}  "
+                f"[dim]{escape(str(row['path']))}[/dim]"
             )
     if json_:
         print(json.dumps(rows))
@@ -12288,8 +12864,6 @@ def seed(
                 )
             )
         else:
-            from rich.markup import escape
-
             err.print(f"[red]{escape(message)}[/red]")
         raise typer.Exit(1)
     names = list(dict.fromkeys(nodes))
@@ -12540,22 +13114,28 @@ def seed(
         if row["status"] == "error":
             failure_codes.append(int(row["exit_code"]))
             if not json_:
-                err.print(f"[red]{row['node']}: {row['message']}[/red]")
+                err.print(
+                    f"[red]{escape(str(row['node']))}: "
+                    f"{escape(str(row['message']))}[/red]"
+                )
         elif row["status"] == "skipped":
             if not json_:
-                err.print(f"[dim]{row['node']}: {row['reason']}[/dim]")
+                err.print(
+                    f"[dim]{escape(str(row['node']))}: "
+                    f"{escape(str(row['reason']))}[/dim]"
+                )
         elif row["status"] == "planned":
             if not json_:
                 size = _format_source_bytes(int(row["source_bytes"]))
                 count = len(row["components"])
                 err.print(
-                    f"[cyan]{row['node']} would seed[/cyan]  "
+                    f"[cyan]{escape(str(row['node']))} would seed[/cyan]  "
                     f"{size} local source  {count} components"
                 )
         else:
             if not json_:
                 moved = _format_transfer_bytes(int(row["transferred_bytes"]))
-                err.print(f"[green]{row['node']} seeded[/green]  {moved}")
+                err.print(f"[green]{escape(str(row['node']))} seeded[/green]  {moved}")
     if json_:
         print(json.dumps(rows))
     elif plan:
@@ -12675,10 +13255,15 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
                 and str(row["checks"].get("net", "")).startswith(("slow", "blocked"))
             ]
             if slow_nodes:
+                from rich.markup import escape
+
+                noun = "node" if len(slow_nodes) == 1 else "nodes"
                 err.print(
-                    "[dim]slow/blocked node network; pre-seed uv caches: "
-                    f"dt seed {' '.join(slow_nodes)} --plan[/dim]"
+                    f"[yellow]network slow/blocked on {len(slow_nodes)} {noun}[/yellow]"
                 )
+                for index, node_name in enumerate(slow_nodes):
+                    label = "next:" if index == 0 else "     "
+                    err.print(f"[dim]{label} dt seed {escape(node_name)} --plan[/dim]")
     if not hard_fail:
         raise typer.Exit(0)
     if unreachable_failure and not dependency_failure and not nontransport_ssh_failure:
@@ -12712,8 +13297,18 @@ app.command("task", hidden=True)(task)
 app.command("t", hidden=True)(task)
 app.command("batch", rich_help_panel="Experiments")(batch)
 app.command("chain", rich_help_panel="Experiments")(chain)
-app.command("run", context_settings=RUN_CTX, rich_help_panel="Everyday")(run)
-app.command("r", hidden=True, context_settings=RUN_CTX)(run)
+app.command(
+    "run",
+    context_settings=RUN_CTX,
+    options_metavar="[OPTIONS] -- COMMAND [ARGS]...",
+    rich_help_panel="Everyday",
+)(run)
+app.command(
+    "r",
+    hidden=True,
+    context_settings=RUN_CTX,
+    options_metavar="[OPTIONS] -- COMMAND [ARGS]...",
+)(run)
 app.command("ps", rich_help_panel="Everyday")(ps)
 app.command("p", hidden=True)(ps)
 app.command("logs", rich_help_panel="Everyday")(logs)
@@ -12748,7 +13343,7 @@ def main() -> None:
     try:
         app()
     except RemoteError as e:
-        err.print(f"[red]{e}[/red]")
+        err.print(f"[red]{escape(str(e))}[/red]")
         sys.exit(EXIT_UNREACHABLE)
 
 

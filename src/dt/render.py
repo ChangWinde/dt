@@ -6,6 +6,7 @@ promise and agents can pipe --json safely.
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Any, TypeAlias
 
 from rich.console import Console
@@ -26,6 +27,19 @@ STATUS_STYLE = {
     "failed": "bold red",
 }
 JsonRow: TypeAlias = dict[str, Any]
+
+
+def compact_path(path: str, *, max_chars: int = 56) -> str:
+    """Compact an informational path without changing its executable value."""
+    if len(path) <= max_chars:
+        return path
+    parts = PurePosixPath(path).parts
+    for count in (2, 1):
+        if len(parts) >= count:
+            candidate = "…/" + "/".join(parts[-count:])
+            if len(candidate) <= max_chars:
+                return candidate
+    return "…" + path[-(max_chars - 1) :]
 
 
 def compress_indices(indices: list[int]) -> str:
@@ -167,14 +181,33 @@ def free_table(rows: list[JsonRow], who: bool = False) -> Table:
         padding=(0, 1),
         collapse_padding=True,
         pad_edge=False,
+        expand=True,
     )
     one_center = len({r.get("center") for r in rows}) <= 1
+    target_width = max(
+        9,
+        min(
+            18,
+            max(
+                (
+                    len(
+                        str(
+                            row.get("node", "?")
+                            if one_center
+                            else f"{row.get('center', '?')}/{row.get('node', '?')}"
+                        )
+                    )
+                    for row in rows
+                ),
+                default=9,
+            ),
+        ),
+    )
     t.add_column(
         "node" if one_center else "target",
         no_wrap=True,
         overflow="ellipsis",
-        min_width=9,
-        max_width=18,
+        width=target_width,
     )
     t.add_column(
         "GPU free",
@@ -192,10 +225,10 @@ def free_table(rows: list[JsonRow], who: bool = False) -> Table:
         max_width=11,
     )
     t.add_column("CPU", no_wrap=True, overflow="ellipsis", min_width=6, max_width=8)
-    t.add_column("RAM", no_wrap=True, overflow="ellipsis", min_width=3, max_width=11)
+    t.add_column("RAM G", no_wrap=True, overflow="ellipsis", min_width=5, max_width=10)
     t.add_column("disk", no_wrap=True, overflow="ellipsis", min_width=4, max_width=7)
     t.add_column(
-        "IO / issue",
+        "IO",
         no_wrap=True,
         overflow="ellipsis",
         min_width=4,
@@ -210,7 +243,7 @@ def free_table(rows: list[JsonRow], who: bool = False) -> Table:
             max_width=12,
         )
     for r in rows:
-        target = r["node"] if one_center else f"{r['center']}/{r['node']}"
+        target = escape(str(r["node"] if one_center else f"{r['center']}/{r['node']}"))
         if r.get("error"):
             issue_text = _compact_remote_error(r["error"])
             if issue_text.startswith("offline: "):
@@ -266,7 +299,7 @@ def free_table(rows: list[JsonRow], who: bool = False) -> Table:
         )
         mem_total_mib = system.get("mem_total_mib", 0)
         ram = (
-            f"{_gib(system.get('mem_used_mib', 0))}/{_gib(mem_total_mib)}G"
+            f"{_gib(system.get('mem_used_mib', 0))}/{_gib(mem_total_mib)}"
             if mem_total_mib
             else "-"
         )
@@ -395,35 +428,22 @@ def ps_table(
         header_style="bold",
         box=None,
         padding=(0, 1),
+        collapse_padding=True,
         pad_edge=False,
         caption=caption,
         caption_justify="left",
+        expand=not wide,
     )
     if wide:
-        for col in (
-            "name",
-            "job id",
-            "center",
-            "node",
-            "live" if show_progress else "gpus",
-            "status",
-            "exit",
-            "created",
-            *(
-                ("progress / issue",)
-                if show_progress
-                else ("issue",)
-                if show_issue
-                else ()
-            ),
-            "cmd",
-        ):
-            t.add_column(col, no_wrap=True, overflow="ellipsis")
+        t.show_header = False
+        t.add_column("field", style="bold dim", justify="right", no_wrap=True, width=8)
+        t.add_column("value", overflow="fold", ratio=1)
     else:
         t.add_column(
             "name",
             no_wrap=True,
             overflow="ellipsis",
+            ratio=1,
             min_width=8 if detailed else 12,
             max_width=(
                 (17 if one_center else 15) if detailed else (34 if one_center else 26)
@@ -434,16 +454,14 @@ def ps_table(
                 "ref",
                 no_wrap=True,
                 overflow="ignore",
-                min_width=ref_width,
-                max_width=ref_width,
+                width=ref_width,
                 style="dim",
             )
         t.add_column(
             "node" if one_center else "target",
             no_wrap=True,
             overflow="ellipsis",
-            min_width=target_width,
-            max_width=target_width,
+            width=target_width,
         )
         t.add_column(
             "live" if show_progress else "GPU",
@@ -456,8 +474,7 @@ def ps_table(
             "state",
             no_wrap=True,
             overflow="ellipsis",
-            min_width=compact_status_width,
-            max_width=22,
+            width=compact_status_width,
         )
         if show_progress:
             t.add_column(
@@ -498,8 +515,8 @@ def ps_table(
             if created_at and created_at.date() == datetime.now().date()
             else (created_at.strftime("%m-%d") if created_at else "-")
         )
-        cmd = r.get("cmd", "")
-        if len(cmd) > 48:
+        cmd = str(r.get("cmd", ""))
+        if not wide and len(cmd) > 48:
             cmd = cmd[:45] + "..."
         gpus = ",".join(str(g) for g in r.get("gpus", []))
         if not gpus:
@@ -636,31 +653,31 @@ def ps_table(
             display_node = r.get("node", "?")
             if display_node in (None, "-", "?"):
                 display_node = r.get("pin_node") or display_node
-            values = [
-                r.get("name", "?"),
-                r.get("job_id", "?"),
-                r.get("center", "?"),
-                display_node,
-                gpus,
+            where = f"{r.get('center', '?')} / {display_node}"
+            t.add_row("name", escape(str(r.get("name", "?"))))
+            t.add_row("job id", escape(str(r.get("job_id", "?"))))
+            t.add_row("where", escape(where))
+            t.add_row("live" if show_progress else "gpus", gpus)
+            t.add_row(
+                "status",
                 f"[{display_style}]{display_status}[/{display_style}]",
-                "" if exit_code is None else str(exit_code),
-                created,
-            ]
+            )
+            t.add_row("exit", "" if exit_code is None else str(exit_code))
+            t.add_row("created", created)
             if detailed:
-                values.append(progress_text)
-            values.append(cmd)
-            t.add_row(*values)
+                t.add_row("progress" if show_progress else "issue", progress_text)
+            t.add_row("cmd", escape(cmd), end_section=True)
         else:
             target = row_target(r)
             result = (
                 display_status if exit_code is None else f"{display_status}/{exit_code}"
             )
-            values = [r.get("name", "?")]
+            values = [escape(str(r.get("name", "?")))]
             if show_ref:
-                values.append(display_ref)
+                values.append(escape(display_ref))
             values.extend(
                 [
-                    target,
+                    escape(target),
                     gpus,
                     f"[{display_style}]{result}[/{display_style}]",
                     progress_text if detailed else when,
@@ -672,22 +689,29 @@ def ps_table(
 
 def doctor_table(rows: list[JsonRow]) -> Table:
     def paint(v: str) -> str:
-        if v.startswith("off"):
-            return f"[yellow]{v}[/yellow]" if v == "off" else f"[red]{v}[/red]"
-        if v.startswith("slow"):
+        text = str(v)
+        safe: str = escape(text)
+        if text.startswith("off"):
+            return f"[yellow]{safe}[/yellow]" if text == "off" else f"[red]{safe}[/red]"
+        if text.startswith("slow"):
             # reachable but unusably slow (seed caches from the head: dt seed)
-            return f"[yellow]{v}[/yellow]"
-        if v in ("ok",) or (v and v not in ("missing", "blocked", "fail", "-")):
-            return f"[green]{v}[/green]"
-        if v in ("blocked",):
-            return f"[yellow]{v}[/yellow]"
-        if v in ("-",):
-            return v
-        return f"[red]{v}[/red]"
+            return f"[yellow]{safe}[/yellow]"
+        if text in ("ok",) or (
+            text and text not in ("missing", "blocked", "fail", "-")
+        ):
+            return f"[green]{safe}[/green]"
+        if text in ("blocked",):
+            return f"[yellow]{safe}[/yellow]"
+        if text in ("-",):
+            return safe
+        return f"[red]{safe}[/red]"
 
     def ssh_status(value: object) -> str:
         """Keep common transport failures actionable in a narrow terminal."""
-        return paint(_compact_remote_error(value))
+        status = _compact_remote_error(value)
+        if status == "ok":
+            return paint(status)
+        return f"[red]{escape(status)}[/red]"
 
     def tools(checks: JsonRow) -> str:
         labels = {"python3": "py", "timeout": "to"}
@@ -747,7 +771,9 @@ def doctor_table(rows: list[JsonRow]) -> Table:
 
     for r in rows:
         c = r.get("checks", {})
-        target = r["node"] if one_center else f"{r.get('center', '?')}/{r['node']}"
+        target = escape(
+            str(r["node"] if one_center else f"{r.get('center', '?')}/{r['node']}")
+        )
         t.add_row(
             target,
             ssh_status(c.get("ssh", "fail")),

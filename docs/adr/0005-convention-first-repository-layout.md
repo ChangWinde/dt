@@ -62,6 +62,7 @@ CHANGELOG.md
 LICENSE
 README.md
 bootstrap.sh
+install.sh
 pyproject.toml
 uv.lock
 ```
@@ -73,6 +74,11 @@ remains the explicit sanitized package-description source.
 
 `scripts/repo_hygiene.py` validates the tracked top-level allowlist in CI and
 the release gate.
+
+ADR 0007 later added `install.sh` as the intentional source-checkout
+installation entry point. `bootstrap.sh` remains the release-bundle entry
+point; the two names expose different trust contracts without adding a tools
+directory that users must discover first.
 
 ## Compatibility
 

@@ -10,7 +10,7 @@ _SPEC.loader.exec_module(repo_hygiene)
 
 def test_repository_root_matches_the_documented_allowlist(capsys):
     assert repo_hygiene.main() == 0
-    assert "repo-hygiene: OK (9 tracked root files)" in capsys.readouterr().out
+    assert "repo-hygiene: OK (10 tracked root files)" in capsys.readouterr().out
 
 
 def test_repository_hygiene_rejects_new_tracked_root_files(monkeypatch, capsys):

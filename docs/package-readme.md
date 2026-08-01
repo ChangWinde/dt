@@ -1,16 +1,19 @@
 # DistTrainer (`disttrainer`)
 
-DistTrainer (`dt`) is a command-line control plane for reproducible experiments
-on shared Linux GPU servers. It discovers capacity, captures immutable project
-snapshots, recreates `uv` environments, queues work without GPU collisions,
-monitors resources and failures, and recovers complete experiment records.
+DistTrainer (`dt`) is a command-line control plane installed on the head
+(master) of a Linux GPU center. It discovers worker capacity, captures
+immutable project snapshots, recreates `uv` environments, queues work without
+GPU collisions, monitors resources and failures, and recovers complete
+experiment records.
+Workers receive DT's runtime payload with each job and do not need an
+independent DT installation.
 
 The Python distribution is named `disttrainer`; the installed command and
 import package are both named `dt`.
 
 ## Requirements
 
-- Linux head and compute nodes reachable through non-interactive SSH;
+- Linux head and worker nodes reachable through non-interactive SSH;
 - Python 3.10–3.11 on the client/head;
 - `uv`, OpenSSH, rsync, tmux, flock, and timeout;
 - NVIDIA drivers and `nvidia-smi` on nodes used for GPU jobs.
@@ -21,10 +24,16 @@ before deployment.
 
 ## Install
 
-Install a reviewed wheel by exact path:
+From a clean, trusted repository checkout, `./install.sh` builds the committed
+snapshot and installs an isolated, non-editable tool. For a formal deployment,
+install the reviewed wheel with its release constraints and checksums through
+the adjacent `bootstrap.sh`:
 
 ```bash
-uv tool install ./disttrainer-0.6.2-py3-none-any.whl
+bash bootstrap.sh \
+  disttrainer-0.6.2-py3-none-any.whl \
+  runtime-constraints.txt
+export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
 dt --version
 ```
 
@@ -100,6 +109,11 @@ dt pull baseline --collection baseline
 When no GPU is free, submission queues by default. `dt wait` covers both queued
 and running phases and returns the experiment process's exit code. Use
 `--no-queue` only when fail-fast behavior is required.
+
+Human defaults prioritize current state, anomalies, compact references, and a
+next action. Expand only when needed with `dt info JOB --verbose`,
+`dt agent status --verbose`, `dt storage --details`, or `dt ps --wide`; use
+`--json` for automation.
 
 FIFO fairness is maintained per overlapping capacity: jobs pinned to one busy
 node do not prevent later jobs pinned to another node from using that other

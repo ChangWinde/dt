@@ -17,6 +17,12 @@ records.
 The package name `dt` must not be used: it belongs to another project on the
 public Python index.
 
+`install.sh` is a separate convenience path for a clean, trusted Git checkout.
+It builds and installs an immutable commit but does not produce a release
+manifest, SBOM, audit, reproducibility comparison, or publishable bundle. A
+source installation is therefore not release evidence and must not replace
+this procedure.
+
 ## Prepare
 
 1. Reconcile `CHANGELOG.md`, `docs/package-readme.md`,

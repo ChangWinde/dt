@@ -10,7 +10,7 @@ This page helps operators choose a command and handle its result. Run
 | `dt free` | Show reachable GPU, VRAM, CPU, memory, disk, I/O, and owner state |
 | `dt run` | Submit one command with automatic or pinned placement |
 | `dt ps` | Show active jobs; opt into recent, issue, or complete history |
-| `dt info` | Show one job's complete identity, timeline, state, and recovery data |
+| `dt info` | Show one job's state, timeline, and next recovery action |
 | `dt logs` | Read or follow the active job, setup, or nested failure log |
 | `dt wait` | Wait through queue and execution; return the job result |
 | `dt pull` | Recover outputs with resumable and isolated transfers |
@@ -48,9 +48,10 @@ This page helps operators choose a command and handle its result. Run
 dt run [OPTIONS] -- COMMAND [ARGS]...
 ```
 
-Always supply a meaningful `-n/--name`. The `--` boundary separates
-DistTrainer options from the remote command. `-g 0` creates a CPU-only job.
-Use `--no-queue` only when capacity absence must fail immediately.
+Use `-n/--name` when a campaign requires a specific label; otherwise DT derives
+a searchable name from the script or module in the command. The `--` boundary
+separates DistTrainer options from the remote command. `-g 0` creates a
+CPU-only job. Use `--no-queue` only when capacity absence must fail immediately.
 
 The non-follow human contract writes progress to stderr and the bare job ID as
 the last stdout line:
@@ -77,9 +78,32 @@ record the complete identity.
 Human tables are presentation surfaces and may compact columns for terminal
 width. JSON schemas and stable exit codes are automation surfaces.
 
+Defaults are operator-first: state, anomaly, progress, and the next useful
+action come before provenance and implementation detail. Dense commands group
+their help by everyday use, scheduling safeguards, reproducibility, and output.
+Submission, log-follow, and wait receipts use recognizable names plus compact,
+routable references; the complete submitted job ID remains the last stdout line.
+
+`dt free` keeps its default scheduler line compact. Use `dt free --explain` to
+show the complete next-job ID and scheduler reason, or add `--json` for the
+structured explanation contract.
+
 `dt ps --json` returns complete history by default for compatibility. Explicit
 filters such as `--limit`, `--issues`, or `-s` narrow it. Human `dt ps`
-defaults to active work.
+defaults to active work, uses a plain sentence for empty filters, and compacts
+dependency references in issue rows.
+
+Use command-specific detail views when diagnosing:
+
+- `dt info REF --verbose` for complete IDs, hashes, paths, launch stages, and
+  resource history;
+- `dt agent status --verbose` for scheduler policy, log path, and complete queue
+  identity;
+- `dt storage --details` for every managed storage class and path;
+- `dt ps --wide` for complete job IDs and commands.
+
+`dt metrics` omits a single phase that duplicates the complete sampling window,
+but retains phase rows when the application actually transitions between phases.
 
 Streaming JSON commands use one object or a documented JSONL stream. Progress
 and reconnect notices remain on stderr.

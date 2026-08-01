@@ -638,9 +638,11 @@ def test_batch_human_stdout_is_only_registered_job_ids(tmp_path, monkeypatch):
     assert "batch submitted" in result.stderr
     assert "2 jobs" in result.stderr
     assert "policy: runtime failures continue\n" in result.stderr
-    assert "monitor: dt watch " in result.stderr
-    assert "wait: dt wait " in result.stderr
-    assert "recover: dt pull " in result.stderr
+    assert "next: dt watch 0001 0002" in result.stderr
+    assert "human-001-first human-002-second" not in result.stderr
+    assert "wait: dt wait " not in result.stderr
+    assert "recover: dt pull " not in result.stderr
+    assert all(job_id not in result.stderr for job_id in result.stdout.splitlines())
     assert "runtime\nfailures" not in result.stderr
 
 

@@ -1,11 +1,13 @@
 # Getting started
 
-This guide installs DistTrainer, configures one head with one compute node, and
-runs a recoverable first experiment.
+This guide installs DistTrainer on one head (master), connects one worker, and
+runs a recoverable first experiment. Workers do not install the DT CLI; the
+head ships an attested runtime payload with every job.
 
 ## Prerequisites
 
-The client or head uses Python 3.10 or 3.11. Head and compute hosts require:
+The optional laptop client and the head use Python 3.10 or 3.11. Head and
+worker hosts require:
 
 - Linux;
 - non-interactive OpenSSH connectivity;
@@ -17,7 +19,31 @@ DistTrainer assumes the same trusted Unix identity across the configured hosts.
 Read the [security policy](../.github/SECURITY.md) before operating across a
 shared account or untrusted project tree.
 
-## Install a release
+## Install from a Git checkout
+
+For a trusted checkout on the head:
+
+```bash
+git clone https://github.com/ChangWinde/dt.git
+cd dt
+./install.sh --dry-run
+./install.sh
+export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
+dt --version
+```
+
+`install.sh` refuses local changes, archives the exact committed `HEAD`,
+exports runtime constraints from `uv.lock`, builds a non-editable wheel, and
+installs it as an isolated `uv` tool. The clone may be moved or deleted after
+installation. No configuration is created implicitly.
+
+When the uv tool directory is not already on `PATH`, the installer prints an
+absolute command that works immediately and the export above. Run
+`uv tool update-shell` once to persist the directory for future shells.
+
+This source path is convenient but does not replace formal release review.
+
+## Install a release bundle
 
 A verified release bundle contains a wheel, runtime constraints, an SBOM,
 release audit, manifest, checksums, and `bootstrap.sh`. Install directly from
@@ -27,13 +53,15 @@ that bundle:
 bash bootstrap.sh \
   dist/disttrainer-0.6.2-py3-none-any.whl \
   dist/runtime-constraints.txt
+export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
 dt --version
 ```
 
 The bootstrap script verifies the adjacent `SHA256SUMS`, refuses symlinks or
-content drift, and installs the command as a `uv` tool.
+content drift, and installs the command as a `uv` tool. It does not guess the
+center topology; configuration is the next explicit step.
 
-For repository development:
+For repository development without installation:
 
 ```bash
 uv sync --locked --all-groups
@@ -85,8 +113,10 @@ queue:
   active_poll_s: 2
 ```
 
-`gpu-node-1` must be a working SSH alias. A node marked `local: true` executes
-through the local host rather than SSH.
+`gpu-node-1` is a worker and must be a working SSH alias. It needs the runtime
+commands listed above, `uv`, and GPU drivers when it runs GPU work, but it does
+not need `dt` installed. A node marked `local: true` executes through the head
+host rather than SSH.
 
 For a laptop that forwards to this head:
 

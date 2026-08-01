@@ -90,7 +90,7 @@ uv run --no-sync mypy --strict --no-incremental \
     --cache-dir="$WORK_DIR/mypy" --follow-imports=skip \
     src/dt
 bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
-    scripts/release-check.sh
+    install.sh scripts/release-check.sh
 git diff --check
 
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
@@ -155,7 +155,7 @@ fi
 env "${BOOTSTRAP_ENV[@]}" bash "$OUT_DIR/bootstrap.sh" \
     "$OUT_DIR/$WHEEL_NAME" "$OUT_DIR/runtime-constraints.txt" >/dev/null
 [[ "$("$WORK_DIR/tool-bin/dt" --version)" == "dt $RELEASE_VERSION" ]]
-[[ -f "$WORK_DIR/config.yaml" ]]
+[[ ! -e "$WORK_DIR/config.yaml" ]]
 
 python3 - "$OUT_DIR" "$DISTRIBUTION" "$RELEASE_VERSION" <<'PY'
 import hashlib

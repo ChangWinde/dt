@@ -37,14 +37,38 @@ experiment.
 
 ## Quick start
 
-### 1. Install
+### 1. Install on the head
 
-Install a reviewed release bundle:
+The usual center has one DT head (master) and multiple SSH-reachable workers.
+Install the `dt` command on the head; workers receive the runtime payload with
+each job and do not need a separate DT installation.
+
+From a clean, trusted checkout:
+
+```bash
+git clone https://github.com/ChangWinde/dt.git
+cd dt
+./install.sh --dry-run
+./install.sh
+export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
+dt --version
+```
+
+The source installer archives the committed `HEAD`, builds a non-editable
+wheel with locked dependencies, installs it as an isolated `uv` tool, and
+prints the source commit in `dt --version`. It refuses a dirty checkout and
+does not guess or overwrite configuration. If the uv tool directory is not
+already on `PATH`, the installer prints both the immediately runnable absolute
+command and the one-line shell setup shown above; `uv tool update-shell`
+persists it for future shells.
+
+For a managed production rollout, install a reviewed release bundle instead:
 
 ```bash
 bash bootstrap.sh \
   dist/disttrainer-0.6.2-py3-none-any.whl \
   dist/runtime-constraints.txt
+export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
 dt --version
 ```
 
@@ -55,9 +79,9 @@ uv sync --locked --all-groups
 uv run dt --help
 ```
 
-DistTrainer supports Python 3.10 and 3.11. Head and compute hosts require Linux,
+DistTrainer supports Python 3.10 and 3.11. The head and workers require Linux,
 OpenSSH, rsync, tmux, flock, timeout, and an approved `uv` installation. GPU
-nodes also require NVIDIA drivers and `nvidia-smi`.
+workers also require NVIDIA drivers and `nvidia-smi`.
 
 ### 2. Configure a head
 
@@ -103,6 +127,7 @@ Then verify every host and runtime dependency:
 ```bash
 dt doctor
 dt agent install
+dt agent start
 dt agent status
 ```
 
@@ -131,6 +156,12 @@ dt pull baseline --collection baseline
 is free, the job enters the resident FIFO queue by default. FIFO is preserved
 among jobs that can use the same capacity; a job pinned to one busy node does
 not hold later work pinned to a different node.
+
+Human output defaults to current state, anomalies, compact job references, and
+the next useful action. Use `dt info JOB --verbose`, `dt agent status --verbose`,
+`dt storage --details`, or `dt ps --wide` only when complete provenance, paths,
+or identities are needed. Automation should use `--json` rather than parse
+tables.
 
 Write checkpoints, reports, and evaluation artifacts under
 `$DT_JOB_DIR/outputs/`. This is the recovery boundary used by `dt pull`.
