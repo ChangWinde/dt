@@ -47,6 +47,13 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- Concurrent `dt free --fresh` callers on one head now share a single live
+  probe instead of multiplying `nvidia-smi` load and causing avoidable node
+  timeouts. `dt free --watch` and `dt ps --watch` also interpret `--poll` as a
+  start-to-start refresh interval without overlapping refreshes.
+- `dt doctor` now overlaps independent head-version and node diagnostics,
+  checks head versions concurrently, and runs each node's network diagnostic
+  alongside its GPU/runtime checks while preserving output and exit contracts.
 - GPU availability probes now resolve process owners in one batched lookup and
   deduplicate repeated `(GPU UUID, PID)` records, preventing process-heavy
   nodes from exceeding the probe deadline. A telemetry deadline is reported as

@@ -389,6 +389,81 @@ def test_probe_cache_atomic_writes_do_not_collide_across_callers(tmp_path, monke
     assert not list(cfg.cache_dir().glob("*.tmp"))
 
 
+def test_concurrent_fresh_probes_share_one_inflight_refresh(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    first_probe_started = threading.Event()
+    second_lock_attempted = threading.Event()
+    release_probe = threading.Event()
+    calls = 0
+
+    def probe(node, threshold):
+        nonlocal calls
+        calls += 1
+        first_probe_started.set()
+        assert release_probe.wait(timeout=1)
+        return NodeStatus(node=node.name)
+
+    original_lock = probe_mod._probe_refresh_lock
+    lock_attempts = 0
+    attempts_guard = threading.Lock()
+
+    def observed_lock(path):
+        nonlocal lock_attempts
+        with attempts_guard:
+            lock_attempts += 1
+            if lock_attempts == 2:
+                second_lock_attempted.set()
+        return original_lock(path)
+
+    monkeypatch.setattr(probe_mod, "probe_node", probe)
+    monkeypatch.setattr(probe_mod, "_probe_refresh_lock", observed_lock)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(probe_mod.probe_center, cfg, False)
+        assert first_probe_started.wait(timeout=1)
+        second = pool.submit(probe_mod.probe_center, cfg, False)
+        assert second_lock_attempted.wait(timeout=1)
+        release_probe.set()
+        results = [first.result(), second.result()]
+
+    assert calls == 1
+    assert [[status.node for status in result] for result in results] == [
+        ["n1"],
+        ["n1"],
+    ]
+
+
+def test_sequential_fresh_probes_do_not_reuse_completed_refresh(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    calls = 0
+
+    def probe(node, threshold):
+        nonlocal calls
+        calls += 1
+        return NodeStatus(node=node.name)
+
+    monkeypatch.setattr(probe_mod, "probe_node", probe)
+
+    probe_mod.probe_center(cfg, use_cache=False)
+    probe_mod.probe_center(cfg, use_cache=False)
+
+    assert calls == 2
+
+
 def test_probe_results_survive_optional_cache_write_failure(tmp_path, monkeypatch):
     cfg = HeadConfig(
         center="c",

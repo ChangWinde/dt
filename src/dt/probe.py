@@ -15,7 +15,11 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+import fcntl
+from pathlib import Path
+from typing import Iterator, TypeAlias
 
 from .config import HeadConfig, Node
 from .layout import ROLE_LAYOUT, node_path_expression
@@ -93,6 +97,7 @@ PROBE_CMD = f"{GPU_Q}; echo {SEP}; {APP_Q}; echo {SYS_SEP}; {SYSTEM_Q}"
 CACHE_TTL_S = 3.0
 PROBE_TIMEOUT_EXIT = 124
 PROBE_TRANSPORT_GRACE_S = 5.0
+CacheSignature: TypeAlias = tuple[int, int, int, int]
 
 
 def probe_command(lease_root: str | None = None) -> str:
@@ -365,30 +370,75 @@ def _probe_configured_node(cfg: HeadConfig, node: Node) -> NodeStatus:
     return probe_node(node, cfg.mem_threshold_mib)
 
 
-def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
-    cache_file = cfg.cache_dir() / "probe.json"
-    if use_cache and cache_file.exists():
-        age = time.time() - cache_file.stat().st_mtime
-        if age < CACHE_TTL_S:
+def _probe_cache_signature(cache_file: Path) -> CacheSignature | None:
+    try:
+        stat = cache_file.stat()
+    except OSError:
+        return None
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _read_probe_cache(
+    cache_file: Path,
+    *,
+    max_age_s: float | None = None,
+) -> list[NodeStatus] | None:
+    try:
+        if max_age_s is not None:
+            age = time.time() - cache_file.stat().st_mtime
+            if age >= max_age_s:
+                return None
+        raw = json.loads(cache_file.read_text())
+        if not isinstance(raw, list):
+            return None
+        return [
+            NodeStatus(
+                node=n["node"],
+                gpus=[Gpu(**g) for g in n["gpus"]],
+                system=SystemStats(**n["system"]) if n.get("system") else None,
+                error=n.get("error"),
+                gpu_inventory_error=n.get("gpu_inventory_error"),
+                unreachable=bool(n.get("unreachable", False)),
+            )
+            for n in raw
+        ]
+    except (OSError, TypeError, ValueError, KeyError):
+        return None
+
+
+@contextmanager
+def _probe_refresh_lock(lock_file: Path) -> Iterator[bool]:
+    """Serialize cache refreshes across threads and independent dt processes.
+
+    The cache remains an optional latency optimization: if the coordination
+    file cannot be opened or locked, callers still perform a live probe.
+    """
+    try:
+        stream = lock_file.open("a")
+    except OSError:
+        yield False
+        return
+    with stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
             try:
-                raw = json.loads(cache_file.read_text())
-                return [
-                    NodeStatus(
-                        node=n["node"],
-                        gpus=[Gpu(**g) for g in n["gpus"]],
-                        system=SystemStats(**n["system"]) if n.get("system") else None,
-                        error=n.get("error"),
-                        gpu_inventory_error=n.get("gpu_inventory_error"),
-                        unreachable=bool(n.get("unreachable", False)),
-                    )
-                    for n in raw
-                ]
-            except Exception:
-                pass  # broken cache -> reprobe
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
 
+
+def _collect_center(cfg: HeadConfig) -> list[NodeStatus]:
     with ThreadPoolExecutor(max_workers=max(len(cfg.nodes), 1)) as pool:
-        statuses = list(pool.map(lambda n: _probe_configured_node(cfg, n), cfg.nodes))
+        return list(pool.map(lambda n: _probe_configured_node(cfg, n), cfg.nodes))
 
+
+def _write_probe_cache(cache_file: Path, statuses: list[NodeStatus]) -> None:
     tmp_name: str | None = None
     try:
         fd, tmp_name = tempfile.mkstemp(
@@ -410,7 +460,34 @@ def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
                 os.unlink(tmp_name)
             except OSError:
                 pass
-    return statuses
+
+
+def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
+    cache_file = cfg.cache_dir() / "probe.json"
+    initial_signature = _probe_cache_signature(cache_file)
+    if use_cache:
+        cached = _read_probe_cache(cache_file, max_age_s=CACHE_TTL_S)
+        if cached is not None:
+            return cached
+
+    with _probe_refresh_lock(cfg.cache_dir() / "probe.lock") as coordinated:
+        # A caller ahead of us may have completed while we waited. Normal
+        # callers accept the refreshed TTL; --fresh callers accept it only if
+        # the atomic cache generation changed after this invocation began.
+        if use_cache:
+            cached = _read_probe_cache(cache_file, max_age_s=CACHE_TTL_S)
+            if cached is not None:
+                return cached
+        elif (
+            coordinated
+            and _probe_cache_signature(cache_file) != initial_signature
+            and (cached := _read_probe_cache(cache_file)) is not None
+        ):
+            return cached
+
+        statuses = _collect_center(cfg)
+        _write_probe_cache(cache_file, statuses)
+        return statuses
 
 
 def status_as_dict(center: str, statuses: list[NodeStatus]) -> list[dict[str, object]]:

@@ -1218,6 +1218,12 @@ def _free_view(
     return Group(resources, scheduler) if scheduler is not None else resources
 
 
+def _sleep_for_poll_interval(started: float, poll: float) -> None:
+    """Keep watch refreshes start-to-start without overlapping work."""
+    elapsed = max(0.0, time.monotonic() - started)
+    time.sleep(max(0.0, poll - elapsed))
+
+
 def free(
     watch: bool = typer.Option(False, "--watch", help="continuously refresh resources"),
     poll: float = typer.Option(
@@ -1305,6 +1311,7 @@ def free(
         if watch:
             try:
                 while True:
+                    refresh_started = time.monotonic()
                     rows, _errors = gather()
                     payload = (
                         _free_explain_payload(rows, pin_centers=pin_centers)
@@ -1312,7 +1319,7 @@ def free(
                         else rows
                     )
                     print(json.dumps(payload), flush=True)
-                    time.sleep(poll)
+                    _sleep_for_poll_interval(refresh_started, poll)
             except KeyboardInterrupt:
                 return
         rows, errors = gather()
@@ -1328,6 +1335,7 @@ def free(
         from rich.live import Live
 
         try:
+            refresh_started = time.monotonic()
             rows, _errors = gather()
             with Live(
                 _free_view(rows, who, pin_centers=pin_centers, explain=explain),
@@ -1335,7 +1343,8 @@ def free(
                 auto_refresh=False,
             ) as live:
                 while True:
-                    time.sleep(poll)
+                    _sleep_for_poll_interval(refresh_started, poll)
+                    refresh_started = time.monotonic()
                     rows, _errors = gather()
                     live.update(
                         _free_view(
@@ -4470,6 +4479,7 @@ def ps(
         try:
             if json_:
                 while True:
+                    refresh_started = time.monotonic()
                     rows, errors = gather(include_progress=True)
                     for center, message in errors.items():
                         err.print(
@@ -4477,10 +4487,11 @@ def ps(
                             f"{escape(message)}[/yellow]"
                         )
                     print(json.dumps(rows), flush=True)
-                    time.sleep(poll)
+                    _sleep_for_poll_interval(refresh_started, poll)
             else:
                 from rich.live import Live
 
+                refresh_started = time.monotonic()
                 rows, errors = gather(include_progress=True)
                 rows = _humanize_ps_references(rows)
                 with Live(
@@ -4501,7 +4512,8 @@ def ps(
                     auto_refresh=False,
                 ) as live:
                     while True:
-                        time.sleep(poll)
+                        _sleep_for_poll_interval(refresh_started, poll)
+                        refresh_started = time.monotonic()
                         rows, errors = gather(include_progress=True)
                         rows = _humanize_ps_references(rows)
                         live.update(
@@ -13166,8 +13178,9 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
                     else (f"off ({n_queued} queued!)" if n_queued else "off")
                 )
     else:
-        rows = []
-        for center, head in cfg.centers.items():
+
+        def check_head(item: tuple[str, str]) -> JsonDict:
+            center, head = item
             proc = None
             detail = ""
             head_unreachable = False
@@ -13189,29 +13202,40 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
                 )
                 head_unreachable = proc.returncode == 255
             ver = proc.stdout.strip() if proc and proc.returncode == 0 else "missing"
-            rows.append(
-                {
-                    "center": center,
-                    "node": f"{head} (head)",
-                    "checks": {
-                        "ssh": ("ok" if ver != "missing" else (detail or "fail")),
-                        "dt": (
-                            ver.replace("dt ", "") or "missing"
-                            if ver != "missing"
-                            else ("unknown" if head_unreachable else "missing")
-                        ),
-                    },
-                    "unreachable": head_unreachable,
-                }
-            )
+            return {
+                "center": center,
+                "node": f"{head} (head)",
+                "checks": {
+                    "ssh": ("ok" if ver != "missing" else (detail or "fail")),
+                    "dt": (
+                        ver.replace("dt ", "") or "missing"
+                        if ver != "missing"
+                        else ("unknown" if head_unreachable else "missing")
+                    ),
+                },
+                "unreachable": head_unreachable,
+            }
+
+        def check_heads() -> list[JsonDict]:
+            with ThreadPoolExecutor(max_workers=max(len(cfg.centers), 1)) as pool:
+                return list(pool.map(check_head, cfg.centers.items()))
+
         unreachable_errors: set[str] = set()
-        node_rows, errors = fan_json(
-            cfg,
-            ["doctor"],
-            timeout=120,
-            accept_nonzero_json=True,
-            unreachable_errors=unreachable_errors,
-        )
+        # Version probes and full node diagnostics have no shared mutable
+        # state. Start both together so an unreachable center costs one
+        # timeout window rather than two consecutive windows.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            head_future = pool.submit(check_heads)
+            node_future = pool.submit(
+                fan_json,
+                cfg,
+                ["doctor"],
+                120,
+                accept_nonzero_json=True,
+                unreachable_errors=unreachable_errors,
+            )
+            rows = head_future.result()
+            node_rows, errors = node_future.result()
         rows += cast(list[JsonDict], node_rows)
         for center, e in errors.items():
             rows.append(
