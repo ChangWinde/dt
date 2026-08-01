@@ -15,6 +15,7 @@ from dt.probe import (
     parse_probe_output,
     parse_system_output,
 )
+from dt.sshio import RemoteError
 
 SAMPLE = f"""0, GPU-aaa, 3, 81920, 0
 1, GPU-bbb, 76000, 81920, 98
@@ -69,6 +70,66 @@ def test_empty_apps_section():
     text = f"0, GPU-x, 0, 81920, 0\n{SEP}\n"
     gpus = parse_probe_output(text, 500)
     assert len(gpus) == 1 and gpus[0].free
+
+
+def test_duplicate_compute_app_identity_counts_once():
+    text = f"0, GPU-x, 4096, 81920, 50\n{SEP}\nGPU-x, 123, alice\nGPU-x, 123, alice\n"
+
+    gpu = parse_probe_output(text, 500)[0]
+
+    assert gpu.procs == 1
+    assert gpu.users == ["alice"]
+    assert not gpu.free
+
+
+def test_probe_batches_owner_lookup_and_deduplicates_apps(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    nvidia_smi = fake_bin / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *--query-gpu=*) echo "0, GPU-test, 4096, 81920, 50, 42" ;;\n'
+        "  *--query-compute-apps=*)\n"
+        "    i=0\n"
+        '    while [ "$i" -lt 60 ]; do\n'
+        '      echo "GPU-test, $((1000 + i % 30))"\n'
+        "      i=$((i + 1))\n"
+        "    done\n"
+        "    ;;\n"
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    nvidia_smi.chmod(0o755)
+    ps = fake_bin / "ps"
+    ps.write_text(
+        "#!/bin/sh\n"
+        'printf "call\\n" >> "$DT_TEST_PS_CALLS"\n'
+        "for arg do pids=$arg; done\n"
+        "old_ifs=$IFS\n"
+        "IFS=,\n"
+        "for pid in $pids; do printf '%s batchuser\\n' \"$pid\"; done\n"
+        "IFS=$old_ifs\n"
+    )
+    ps.chmod(0o755)
+    calls = tmp_path / "ps-calls"
+
+    proc = subprocess.run(
+        ["bash", "-c", PROBE_CMD],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DT_TEST_PS_CALLS": str(calls),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    gpu = parse_probe_output(proc.stdout, 500)[0]
+
+    assert calls.read_text().splitlines() == ["call"]
+    assert gpu.procs == 30
+    assert gpu.users == ["batchuser"]
 
 
 def test_dt_lease_marks_pre_cuda_job_busy():
@@ -255,6 +316,41 @@ def test_probe_node_types_ssh_255_as_unreachable(monkeypatch):
     assert status.gpus == []
     assert status.unreachable is True
     assert status.error == "ssh: connect to host n1: No route to host"
+
+
+def test_probe_node_types_remote_probe_timeout_as_reachable_error(monkeypatch):
+    captured = {}
+
+    def timed_out(node_name, is_local, command, timeout, check=False):
+        captured.update(command=command, timeout=timeout)
+        return subprocess.CompletedProcess([], 124, "", "")
+
+    monkeypatch.setattr(probe_mod, "run_on", timed_out)
+
+    status = probe_mod.probe_node(
+        Node(name="n1"),
+        mem_threshold_mib=500,
+        timeout=7,
+    )
+
+    assert status.gpus == []
+    assert status.unreachable is False
+    assert status.error == "GPU probe timed out after 7s"
+    assert captured["command"].startswith("timeout ")
+    assert captured["timeout"] > 7
+
+
+def test_probe_node_types_outer_transport_timeout_as_unreachable(monkeypatch):
+    def timed_out(*args, **kwargs):
+        raise RemoteError("n1", "timed out after 12s")
+
+    monkeypatch.setattr(probe_mod, "run_on", timed_out)
+
+    status = probe_mod.probe_node(Node(name="n1"), mem_threshold_mib=500)
+
+    assert status.gpus == []
+    assert status.unreachable is True
+    assert status.error == "[n1] timed out after 12s"
 
 
 def test_probe_cache_atomic_writes_do_not_collide_across_callers(tmp_path, monkeypatch):

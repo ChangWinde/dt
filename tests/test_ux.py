@@ -390,6 +390,41 @@ def test_free_table_surfaces_incomplete_gpu_inventory_at_80_columns():
     assert max(map(len, rendered.splitlines())) <= 80
 
 
+def test_free_table_distinguishes_probe_timeout_from_offline_node():
+    from rich.console import Console
+
+    from dt.render import free_table
+
+    rows = [
+        {
+            "center": "c",
+            "node": "slow-probe",
+            "gpus": [],
+            "system": None,
+            "error": "GPU probe timed out after 10s",
+            "unreachable": False,
+        },
+        {
+            "center": "c",
+            "node": "offline-node",
+            "gpus": [],
+            "system": None,
+            "error": "ssh: Connection timed out",
+            "unreachable": True,
+        },
+    ]
+    console = Console(width=100, record=True, color_system=None)
+
+    console.print(free_table(rows))
+    rendered = console.export_text()
+
+    slow_row = next(line for line in rendered.splitlines() if "slow-probe" in line)
+    offline_row = next(line for line in rendered.splitlines() if "offline-node" in line)
+    assert "error" in slow_row
+    assert "offline" not in slow_row
+    assert "offline" in offline_row
+
+
 def test_free_table_labels_reserved_pre_cuda_gpu_as_initializing():
     from rich.console import Console
 

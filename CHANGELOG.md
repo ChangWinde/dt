@@ -47,6 +47,10 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- GPU availability probes now resolve process owners in one batched lookup and
+  deduplicate repeated `(GPU UUID, PID)` records, preventing process-heavy
+  nodes from exceeding the probe deadline. A telemetry deadline is reported as
+  a reachable probe error, while SSH transport failures remain offline.
 - Active nested logs under a worker home directory are now read through their
   canonical path while only the displayed path is compacted. Quoted `~/...`
   display paths no longer cause `dt logs` to report a missing file.
