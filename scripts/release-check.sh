@@ -13,43 +13,8 @@ for tool in uv git python3 sha256sum; do
     }
 done
 
-read -r DISTRIBUTION RELEASE_VERSION SOURCE_VERSION < <(
-    python3 - <<'PY'
-import pathlib
-import re
-
-root = pathlib.Path.cwd()
-text = (root / "pyproject.toml").read_text("utf-8")
-project_block = text.split("[project]", 1)[1].split("\n[", 1)[0]
-
-def field(name: str) -> str:
-    match = re.search(rf'(?m)^{name}\s*=\s*"([^"]+)"\s*$', project_block)
-    if match is None:
-        raise SystemExit(f"release-check: missing project field: {name}")
-    return match.group(1)
-
-source_text = (root / "src/dt/__init__.py").read_text("utf-8")
-source_match = re.search(
-    r'(?m)^__version__\s*=\s*["\']([^"\']+)["\']\s*$', source_text
-)
-if source_match is None:
-    raise SystemExit("release-check: could not parse source version")
-print(field("name"), field("version"), source_match.group(1))
-PY
-)
-
-if [[ "$DISTRIBUTION" != "disttrainer" ]]; then
-    echo "release-check: unexpected distribution name: $DISTRIBUTION" >&2
-    exit 1
-fi
-if [[ "$RELEASE_VERSION" != "$SOURCE_VERSION" ]]; then
-    echo "release-check: pyproject/source version mismatch" >&2
-    exit 1
-fi
-if [[ ! "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([a-z0-9.-]+)?$ ]]; then
-    echo "release-check: unsupported version format: $RELEASE_VERSION" >&2
-    exit 1
-fi
+RELEASE_FIELDS="$(python3 scripts/release_contract.py --root "$REPO_DIR")"
+read -r DISTRIBUTION RELEASE_VERSION SOURCE_VERSION <<< "$RELEASE_FIELDS"
 
 if [[ "${DT_RELEASE_ALLOW_DIRTY:-0}" != "1" ]] && \
    [[ -n "$(git status --porcelain)" ]]; then

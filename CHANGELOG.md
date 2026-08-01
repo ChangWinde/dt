@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.7.0 — 2026-08-01
+
 ### Added
 
 - A clean checkout can now install an immutable, commit-identified DT tool with
@@ -47,6 +49,21 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- The release gate now rejects reused or out-of-order versions, mismatched
+  source metadata, and changelogs with unsealed pending changes before doing
+  expensive build work. Release tags that already identify the candidate
+  commit remain reproducibly verifiable.
+- Concurrent `dt free --fresh` callers on one head now share a single live
+  probe instead of multiplying `nvidia-smi` load and causing avoidable node
+  timeouts. `dt free --watch` and `dt ps --watch` also interpret `--poll` as a
+  start-to-start refresh interval without overlapping refreshes.
+- `dt doctor` now overlaps independent head-version and node diagnostics,
+  checks head versions concurrently, and runs each node's network diagnostic
+  alongside its GPU/runtime checks while preserving output and exit contracts.
+- GPU availability probes now resolve process owners in one batched lookup and
+  deduplicate repeated `(GPU UUID, PID)` records, preventing process-heavy
+  nodes from exceeding the probe deadline. A telemetry deadline is reported as
+  a reachable probe error, while SSH transport failures remain offline.
 - Active nested logs under a worker home directory are now read through their
   canonical path while only the displayed path is compacted. Quoted `~/...`
   display paths no longer cause `dt logs` to report a missing file.

@@ -5,7 +5,7 @@ sessions, GPU selection, environment setup, or result copies.
 
 [![CI](https://github.com/ChangWinde/dt/actions/workflows/ci.yml/badge.svg)](https://github.com/ChangWinde/dt/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB.svg)](.github/SUPPORT.md)
-[![Release](https://img.shields.io/badge/release-0.6.2-0A7BBB.svg)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-0.7.0-0A7BBB.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey.svg)](LICENSE)
 
 DistTrainer, invoked as `dt`, is a command-line control plane for experiments
@@ -66,7 +66,7 @@ For a managed production rollout, install a reviewed release bundle instead:
 
 ```bash
 bash bootstrap.sh \
-  dist/disttrainer-0.6.2-py3-none-any.whl \
+  dist/disttrainer-0.7.0-py3-none-any.whl \
   dist/runtime-constraints.txt
 export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
 dt --version

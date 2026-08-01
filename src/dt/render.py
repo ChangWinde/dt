@@ -245,19 +245,28 @@ def free_table(rows: list[JsonRow], who: bool = False) -> Table:
     for r in rows:
         target = escape(str(r["node"] if one_center else f"{r['center']}/{r['node']}"))
         if r.get("error"):
-            issue_text = _compact_remote_error(r["error"])
+            compact_issue = _compact_remote_error(r["error"])
+            issue_text = compact_issue
             if issue_text.startswith("offline: "):
                 issue_text = issue_text.removeprefix("offline: ")
             issue = escape(issue_text)
+            unreachable_value = r.get("unreachable")
+            unreachable = (
+                bool(unreachable_value)
+                if isinstance(unreachable_value, bool)
+                else compact_issue.startswith("offline: ")
+            )
+            state = "offline" if unreachable else "error"
+            color = "red" if unreachable else "yellow"
             values = [
                 target,
-                "[red]offline[/red]",
+                f"[{color}]{state}[/{color}]",
                 "-",
                 "-",
                 "-",
                 "-",
                 "-",
-                f"[red]{issue}[/red]",
+                f"[{color}]{issue}[/{color}]",
             ]
             if who:
                 values.append("")

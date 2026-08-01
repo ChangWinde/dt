@@ -390,6 +390,41 @@ def test_free_table_surfaces_incomplete_gpu_inventory_at_80_columns():
     assert max(map(len, rendered.splitlines())) <= 80
 
 
+def test_free_table_distinguishes_probe_timeout_from_offline_node():
+    from rich.console import Console
+
+    from dt.render import free_table
+
+    rows = [
+        {
+            "center": "c",
+            "node": "slow-probe",
+            "gpus": [],
+            "system": None,
+            "error": "GPU probe timed out after 10s",
+            "unreachable": False,
+        },
+        {
+            "center": "c",
+            "node": "offline-node",
+            "gpus": [],
+            "system": None,
+            "error": "ssh: Connection timed out",
+            "unreachable": True,
+        },
+    ]
+    console = Console(width=100, record=True, color_system=None)
+
+    console.print(free_table(rows))
+    rendered = console.export_text()
+
+    slow_row = next(line for line in rendered.splitlines() if "slow-probe" in line)
+    offline_row = next(line for line in rendered.splitlines() if "offline-node" in line)
+    assert "error" in slow_row
+    assert "offline" not in slow_row
+    assert "offline" in offline_row
+
+
 def test_free_table_labels_reserved_pre_cuda_gpu_as_initializing():
     from rich.console import Console
 
@@ -1661,6 +1696,7 @@ def test_free_watch_json_streams_until_interrupted(tmp_path, monkeypatch):
         envs="~/dt/envs",
     )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.time, "monotonic", lambda: 10.0)
     monkeypatch.setattr(
         cli,
         "probe_center",
@@ -1711,6 +1747,7 @@ def test_free_watch_json_explain_streams_versioned_frames(tmp_path, monkeypatch)
         envs="~/dt/envs",
     )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.time, "monotonic", lambda: 10.0)
     monkeypatch.setattr(
         cli,
         "probe_center",
@@ -1750,6 +1787,7 @@ def test_free_watch_json_explain_streams_versioned_frames(tmp_path, monkeypatch)
 def test_laptop_free_watch_requests_fresh_frames_and_honors_poll(monkeypatch):
     import json
 
+    import pytest
     from typer.testing import CliRunner
 
     from dt import cli
@@ -1762,6 +1800,8 @@ def test_laptop_free_watch_requests_fresh_frames_and_honors_poll(monkeypatch):
     calls = []
     sleeps = []
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monotonic = iter([10.0, 10.2])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(monotonic))
     monkeypatch.setattr(
         cli,
         "fan_json",
@@ -1796,8 +1836,113 @@ def test_laptop_free_watch_requests_fresh_frames_and_honors_poll(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert calls == [["free", "--fresh"]]
-    assert sleeps == [0.25]
+    assert sleeps == [pytest.approx(0.05)]
     assert json.loads(result.stdout)[0]["node"] == "n1"
+
+
+def test_ps_watch_subtracts_collection_time_from_poll(tmp_path, monkeypatch):
+    import json
+
+    import pytest
+    from typer.testing import CliRunner
+
+    from dt import cli
+    from dt.config import HeadConfig
+
+    cfg = HeadConfig(
+        center="c",
+        nodes=[],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    monotonic = iter([10.0, 10.4])
+    sleeps = []
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(cli, "_gather_ps_rows", lambda *args, **kwargs: ([], {}))
+
+    def stop_after_first_frame(seconds):
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", stop_after_first_frame)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["ps", "--watch", "--json", "--poll", "0.5"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert sleeps == [pytest.approx(0.1)]
+    assert json.loads(result.stdout) == []
+
+
+def test_laptop_doctor_overlaps_head_and_node_diagnostics(monkeypatch):
+    import json
+    import subprocess
+    import threading
+
+    from typer.testing import CliRunner
+
+    from dt import cli
+    from dt.config import LaptopConfig
+
+    cfg = LaptopConfig(centers={"test": "head"}, default_center="test")
+    node_diagnostics_started = threading.Event()
+
+    def version(*args, **kwargs):
+        assert node_diagnostics_started.wait(timeout=1)
+        return subprocess.CompletedProcess([], 0, "dt 1.2.3\n", "")
+
+    def fan(*args, **kwargs):
+        node_diagnostics_started.set()
+        return [], {}
+
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "remote_dt", version)
+    monkeypatch.setattr(cli, "fan_json", fan)
+
+    result = CliRunner().invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)[0]["checks"] == {
+        "ssh": "ok",
+        "dt": "1.2.3",
+    }
+
+
+def test_laptop_doctor_checks_head_versions_in_parallel(monkeypatch):
+    import json
+    import subprocess
+    import threading
+
+    from typer.testing import CliRunner
+
+    from dt import cli
+    from dt.config import LaptopConfig
+
+    cfg = LaptopConfig(
+        centers={"east": "head-a", "west": "head-b"},
+        default_center="east",
+    )
+    both_versions_started = threading.Barrier(2, timeout=1)
+
+    def version(*args, **kwargs):
+        both_versions_started.wait()
+        return subprocess.CompletedProcess([], 0, "dt 1.2.3\n", "")
+
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "remote_dt", version)
+    monkeypatch.setattr(cli, "fan_json", lambda *args, **kwargs: ([], {}))
+
+    result = CliRunner().invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert [row["center"] for row in payload] == ["east", "west"]
+    assert all(row["checks"]["ssh"] == "ok" for row in payload)
 
 
 def test_laptop_free_all_heads_unreachable_returns_exit_5_rows(
@@ -2165,6 +2310,54 @@ def test_doctor_probe_reports_contract_runtime_dependencies(monkeypatch):
 
     assert checks["python3"] == "ok"
     assert checks["timeout"] == "ok"
+
+
+def test_doctor_overlaps_network_and_runtime_checks(tmp_path):
+    import os
+    import subprocess
+
+    from dt import doctor
+
+    gpu_started = tmp_path / "gpu-started"
+    net_started = tmp_path / "net-started"
+    fake_commands = (
+        "nvidia-smi() {\n"
+        ': > "$DT_TEST_GPU_STARTED"\n'
+        "i=0\n"
+        'while [ ! -e "$DT_TEST_NET_STARTED" ]; do\n'
+        "  i=$((i + 1))\n"
+        '  [ "$i" -ge 100 ] && return 9\n'
+        "  sleep 0.01\n"
+        "done\n"
+        'echo "570.1"\n'
+        "}\n"
+        "curl() {\n"
+        ': > "$DT_TEST_NET_STARTED"\n'
+        "i=0\n"
+        'while [ ! -e "$DT_TEST_GPU_STARTED" ]; do\n'
+        "  i=$((i + 1))\n"
+        '  [ "$i" -ge 100 ] && return 9\n'
+        "  sleep 0.01\n"
+        "done\n"
+        "return 1\n"
+        "}\n"
+    )
+
+    proc = subprocess.run(
+        ["bash", "-c", f"{fake_commands}\n{doctor.CHECK_SNIPPET}"],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        env={
+            **os.environ,
+            "DT_TEST_GPU_STARTED": str(gpu_started),
+            "DT_TEST_NET_STARTED": str(net_started),
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "DT_GPU=570.1" in proc.stdout
+    assert "DT_NET=blocked" in proc.stdout
 
 
 def test_doctor_json_keeps_health_failure_exit_code(tmp_path, monkeypatch):

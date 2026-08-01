@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
+import fcntl
+from pathlib import Path
+from typing import Iterator, TypeAlias
 
 from .config import HeadConfig, Node
 from .layout import ROLE_LAYOUT, node_path_expression
@@ -38,16 +43,31 @@ GPU_Q = (
     'leased=1; lease_owner=$(head -n 1 "$lease" 2>/dev/null); fi; '
     'echo "$idx,$uuid,$used,$total,$util,$temp,$leased,$lease_owner"; done; fi'
 )
-# compute apps + owning user (ps resolves each pid; '?' when it just exited)
+# Compute apps + owning user. Resolve all unique numeric PIDs in one ps call;
+# process-heavy nodes otherwise pay one remote fork per nvidia-smi row.
 APP_Q = (
     "dt_app_raw=$(nvidia-smi --query-compute-apps=gpu_uuid,pid "
     "--format=csv,noheader 2>&1); dt_app_rc=$?; "
     'if [ "$dt_app_rc" -ne 0 ]; then '
     f"echo {APP_ERROR}; printf '%s\\n' \"$dt_app_raw\"; "
-    "else printf '%s\\n' \"$dt_app_raw\" "
-    "| while IFS=, read -r g p; do p=$(printf %s \"$p\" | tr -d ' ');"
-    " u=$(ps -o user= -p \"$p\" 2>/dev/null | tr -d ' ');"
-    ' echo "$g,$p,${u:-?}"; done; fi'
+    "else dt_app_pids=$(printf '%s\\n' \"$dt_app_raw\" "
+    '| awk -F, \'{ p=$2; gsub(/[[:space:]]/, "", p); '
+    "if (p ~ /^[0-9]+$/ && !seen[p]++) { "
+    'if (out != "") out=out ","; out=out p } } END { print out }\'); '
+    "dt_app_users=; "
+    'if [ -n "$dt_app_pids" ]; then '
+    'dt_app_users=$(ps -o pid=,user= -p "$dt_app_pids" 2>/dev/null); fi; '
+    "{ printf '%s\\n' \"$dt_app_users\"; echo ---DT-APP-ROWS---; "
+    "printf '%s\\n' \"$dt_app_raw\"; } | awk '"
+    '$0 == "---DT-APP-ROWS---" { rows=1; next } '
+    "!rows { users[$1]=$2; next } "
+    '{ split($0, f, ","); '
+    'gsub(/[[:space:]]/, "", f[1]); '
+    'gsub(/[[:space:]]/, "", f[2]); '
+    'if (f[1] == "") next; '
+    'if (f[2] != "") { key=f[1] SUBSEP f[2]; if (seen[key]++) next } '
+    'u=(f[2] in users && users[f[2]] != "") ? users[f[2]] : "?"; '
+    'print f[1] "," f[2] "," u }\'; fi'
 )
 SEP = "---DT---"
 SYS_SEP = "---DT-SYS---"
@@ -75,6 +95,9 @@ printf '%s,%s,%s,%s,%s,%s,%s\n' \
 """
 PROBE_CMD = f"{GPU_Q}; echo {SEP}; {APP_Q}; echo {SYS_SEP}; {SYSTEM_Q}"
 CACHE_TTL_S = 3.0
+PROBE_TIMEOUT_EXIT = 124
+PROBE_TRANSPORT_GRACE_S = 5.0
+CacheSignature: TypeAlias = tuple[int, int, int, int]
 
 
 def probe_command(lease_root: str | None = None) -> str:
@@ -84,6 +107,19 @@ def probe_command(lease_root: str | None = None) -> str:
     return (
         f"DT_GPU_LEASE_ROOT={node_path_expression(lease_root)}; "
         f"export DT_GPU_LEASE_ROOT; {PROBE_CMD}"
+    )
+
+
+def bounded_probe_command(
+    timeout: float,
+    lease_root: str | None = None,
+) -> str:
+    """Bound remote telemetry separately from the surrounding SSH channel."""
+    duration = f"{timeout:g}s"
+    command = probe_command(lease_root)
+    return (
+        "timeout --signal=TERM --kill-after=2s "
+        f"{shlex.quote(duration)} sh -c {shlex.quote(command)}"
     )
 
 
@@ -135,6 +171,7 @@ def _parse_probe_inventory(
     app_part, _, _ = remainder.partition(SYS_SEP)
     gpus: dict[str, Gpu] = {}
     indices: set[int] = set()
+    processes: set[tuple[str, str]] = set()
     malformed_rows = 0
     for line in gpu_part.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
@@ -196,6 +233,12 @@ def _parse_probe_inventory(
             continue
         uuid = parts[0]
         if uuid in gpus:
+            pid = parts[1]
+            process = (uuid, pid)
+            if pid and process in processes:
+                continue
+            if pid:
+                processes.add(process)
             gpus[uuid].procs += 1
             user = parts[2] if len(parts) > 2 and parts[2] else "?"
             if user not in gpus[uuid].users:
@@ -278,8 +321,8 @@ def probe_node(
         proc = run_on(
             node.name,
             node.local,
-            probe_command(lease_root),
-            timeout=timeout,
+            bounded_probe_command(timeout, lease_root),
+            timeout=timeout + PROBE_TRANSPORT_GRACE_S,
         )
     except Exception as e:  # RemoteError / TimeoutExpired
         return NodeStatus(
@@ -289,6 +332,11 @@ def probe_node(
                 e,
                 (RemoteError, subprocess.TimeoutExpired, OSError),
             ),
+        )
+    if proc.returncode == PROBE_TIMEOUT_EXIT:
+        return NodeStatus(
+            node=node.name,
+            error=f"GPU probe timed out after {timeout:g}s",
         )
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip().splitlines()
@@ -322,30 +370,75 @@ def _probe_configured_node(cfg: HeadConfig, node: Node) -> NodeStatus:
     return probe_node(node, cfg.mem_threshold_mib)
 
 
-def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
-    cache_file = cfg.cache_dir() / "probe.json"
-    if use_cache and cache_file.exists():
-        age = time.time() - cache_file.stat().st_mtime
-        if age < CACHE_TTL_S:
+def _probe_cache_signature(cache_file: Path) -> CacheSignature | None:
+    try:
+        stat = cache_file.stat()
+    except OSError:
+        return None
+    return (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _read_probe_cache(
+    cache_file: Path,
+    *,
+    max_age_s: float | None = None,
+) -> list[NodeStatus] | None:
+    try:
+        if max_age_s is not None:
+            age = time.time() - cache_file.stat().st_mtime
+            if age >= max_age_s:
+                return None
+        raw = json.loads(cache_file.read_text())
+        if not isinstance(raw, list):
+            return None
+        return [
+            NodeStatus(
+                node=n["node"],
+                gpus=[Gpu(**g) for g in n["gpus"]],
+                system=SystemStats(**n["system"]) if n.get("system") else None,
+                error=n.get("error"),
+                gpu_inventory_error=n.get("gpu_inventory_error"),
+                unreachable=bool(n.get("unreachable", False)),
+            )
+            for n in raw
+        ]
+    except (OSError, TypeError, ValueError, KeyError):
+        return None
+
+
+@contextmanager
+def _probe_refresh_lock(lock_file: Path) -> Iterator[bool]:
+    """Serialize cache refreshes across threads and independent dt processes.
+
+    The cache remains an optional latency optimization: if the coordination
+    file cannot be opened or locked, callers still perform a live probe.
+    """
+    try:
+        stream = lock_file.open("a")
+    except OSError:
+        yield False
+        return
+    with stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
             try:
-                raw = json.loads(cache_file.read_text())
-                return [
-                    NodeStatus(
-                        node=n["node"],
-                        gpus=[Gpu(**g) for g in n["gpus"]],
-                        system=SystemStats(**n["system"]) if n.get("system") else None,
-                        error=n.get("error"),
-                        gpu_inventory_error=n.get("gpu_inventory_error"),
-                        unreachable=bool(n.get("unreachable", False)),
-                    )
-                    for n in raw
-                ]
-            except Exception:
-                pass  # broken cache -> reprobe
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
 
+
+def _collect_center(cfg: HeadConfig) -> list[NodeStatus]:
     with ThreadPoolExecutor(max_workers=max(len(cfg.nodes), 1)) as pool:
-        statuses = list(pool.map(lambda n: _probe_configured_node(cfg, n), cfg.nodes))
+        return list(pool.map(lambda n: _probe_configured_node(cfg, n), cfg.nodes))
 
+
+def _write_probe_cache(cache_file: Path, statuses: list[NodeStatus]) -> None:
     tmp_name: str | None = None
     try:
         fd, tmp_name = tempfile.mkstemp(
@@ -367,7 +460,34 @@ def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
                 os.unlink(tmp_name)
             except OSError:
                 pass
-    return statuses
+
+
+def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
+    cache_file = cfg.cache_dir() / "probe.json"
+    initial_signature = _probe_cache_signature(cache_file)
+    if use_cache:
+        cached = _read_probe_cache(cache_file, max_age_s=CACHE_TTL_S)
+        if cached is not None:
+            return cached
+
+    with _probe_refresh_lock(cfg.cache_dir() / "probe.lock") as coordinated:
+        # A caller ahead of us may have completed while we waited. Normal
+        # callers accept the refreshed TTL; --fresh callers accept it only if
+        # the atomic cache generation changed after this invocation began.
+        if use_cache:
+            cached = _read_probe_cache(cache_file, max_age_s=CACHE_TTL_S)
+            if cached is not None:
+                return cached
+        elif (
+            coordinated
+            and _probe_cache_signature(cache_file) != initial_signature
+            and (cached := _read_probe_cache(cache_file)) is not None
+        ):
+            return cached
+
+        statuses = _collect_center(cfg)
+        _write_probe_cache(cache_file, statuses)
+        return statuses
 
 
 def status_as_dict(center: str, statuses: list[NodeStatus]) -> list[dict[str, object]]:

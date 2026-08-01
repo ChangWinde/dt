@@ -12,6 +12,31 @@ from .sshio import RemoteError, run_on
 
 CHECK_SNIPPET = r"""
 echo DT_SSH=ok
+doctor_net() {
+    fmt_speed() {
+        awk -v s="${1:-0}" 'BEGIN{
+            if (s >= 1048576) printf "%.0fMB/s", s/1048576;
+            else if (s >= 1024) printf "%.0fKB/s", s/1024;
+            else printf "<1KB/s" }'
+    }
+    if curl -m 3 -sI https://pypi.org >/dev/null 2>&1; then
+        # reachability is not usability: measure actual download speed
+        spd=$(curl -m 8 -so /dev/null -w "%{speed_download}" https://pypi.org/simple/pip/ 2>/dev/null)
+        label=$(fmt_speed "$spd")
+        if awk -v s="${spd:-0}" 'BEGIN{exit !(s >= 1048576)}'; then
+            echo "DT_NET=ok($label)"
+        else
+            echo "DT_NET=slow($label)"
+        fi
+    elif curl -m 3 -sI https://mirrors.aliyun.com/pypi/simple/ >/dev/null 2>&1 \
+      || curl -m 3 -sI https://pypi.tuna.tsinghua.edu.cn/simple >/dev/null 2>&1; then echo DT_NET=mirror
+    else echo DT_NET=blocked; fi
+}
+# Network access and the local runtime contract are independent. Keep them in
+# one SSH channel but overlap their slow paths; every emitted record is one
+# short line, so the parser does not depend on output order.
+doctor_net &
+dt_net_pid=$!
 v=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
 echo DT_GPU=${v:-missing}
 if [ -x "$HOME/.local/bin/uv" ] || command -v uv >/dev/null 2>&1; then echo DT_UV=ok; else echo DT_UV=missing; fi
@@ -20,24 +45,7 @@ if command -v rsync >/dev/null 2>&1; then echo DT_RSYNC=ok; else echo DT_RSYNC=m
 if command -v flock >/dev/null 2>&1; then echo DT_FLOCK=ok; else echo DT_FLOCK=missing; fi
 if command -v python3 >/dev/null 2>&1; then echo DT_PYTHON3=ok; else echo DT_PYTHON3=missing; fi
 if command -v timeout >/dev/null 2>&1; then echo DT_TIMEOUT=ok; else echo DT_TIMEOUT=missing; fi
-fmt_speed() {
-    awk -v s="${1:-0}" 'BEGIN{
-        if (s >= 1048576) printf "%.0fMB/s", s/1048576;
-        else if (s >= 1024) printf "%.0fKB/s", s/1024;
-        else printf "<1KB/s" }'
-}
-if curl -m 3 -sI https://pypi.org >/dev/null 2>&1; then
-    # reachability is not usability: measure actual download speed
-    spd=$(curl -m 8 -so /dev/null -w "%{speed_download}" https://pypi.org/simple/pip/ 2>/dev/null)
-    label=$(fmt_speed "$spd")
-    if awk -v s="${spd:-0}" 'BEGIN{exit !(s >= 1048576)}'; then
-        echo "DT_NET=ok($label)"
-    else
-        echo "DT_NET=slow($label)"
-    fi
-elif curl -m 3 -sI https://mirrors.aliyun.com/pypi/simple/ >/dev/null 2>&1 \
-  || curl -m 3 -sI https://pypi.tuna.tsinghua.edu.cn/simple >/dev/null 2>&1; then echo DT_NET=mirror
-else echo DT_NET=blocked; fi
+wait "$dt_net_pid"
 """
 
 

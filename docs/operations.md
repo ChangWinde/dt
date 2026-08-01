@@ -49,6 +49,9 @@ The default human view keeps queue state to one compact summary. Add
 `--explain` only when you need the complete next-job ID and persisted scheduler
 reason. For automation, `dt free --json` preserves the resource-array contract,
 while `dt free --json --explain` returns the structured scheduler explanation.
+Concurrent live refreshes on the same head share one in-flight probe. Watch
+polling is start-to-start: if a refresh takes longer than `--poll`, the next
+refresh begins when the current one finishes and probes never overlap.
 
 Use `--node` when an experiment requires a specific host. Use `--require-path`
 and `--require-disk-gib` to declare job-specific eligibility rather than
@@ -64,6 +67,9 @@ dt info JOB
 dt logs JOB -f
 dt metrics JOB
 ```
+
+`dt ps --watch` uses the same non-overlapping, start-to-start `--poll`
+semantics as `dt free --watch`.
 
 The default `dt ps` view contains only queued and running jobs. Historical
 views are explicit:
