@@ -99,6 +99,25 @@ def test_task_shortcut_builds_shell_command_and_meaningful_name(tmp_path, monkey
     assert payload["project"] == "p"
 
 
+def test_run_derives_a_meaningful_name_when_name_is_omitted(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    seen = {}
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    def fake_submit(cfg_, spec, cwd, log, no_queue=False):
+        seen["spec"] = spec
+        return _entry(spec)
+
+    monkeypatch.setattr(cli, "submit", fake_submit)
+    result = CliRunner().invoke(
+        cli.app,
+        ["run", "-p", "p", "--json", "--", "python", "train.py", "--lr", "3e-4"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["spec"].name == "train"
+
+
 def test_task_can_append_current_code_after_existing_job(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     predecessor = _entry(
@@ -433,6 +452,10 @@ def test_task_human_submission_shows_snapshot_and_environment_preparation(
     assert "prepare 456 ms" in normalized
     assert "env abc123def456 existing" in normalized
     assert "setup cached" in normalized
+    assert "next: dt logs abcd -f · dt wait abcd" in normalized
+    assert result.output.splitlines()[-1] == entry.job_id
+    assert result.output.count(entry.job_id) == 1
+    assert max(map(len, result.output.splitlines())) <= 80
 
     machine = CliRunner().invoke(
         cli.app,
@@ -479,6 +502,28 @@ def test_task_surfaces_queued_block_reason_in_human_and_json_output(
     assert human_result.exit_code == 0, human_result.output
     assert "project=p" in human_result.output
     assert entry.reason in human_result.output
+
+
+def test_submission_receipt_treats_registry_labels_as_text(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = _entry(type("Spec", (), {"name": "safe", "project": "p"})())
+    entry.name = "[red]spoofed[/red]"
+    entry.project = "[link=file:///tmp/fake]project[/link]"
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "_submit_entry",
+        lambda cfg_, spec, no_queue, json_: (entry, None),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["task", "n1", "python train.py", "-p", "p"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "[red]spoofed[/red]" in result.output
+    assert "[link=file:///tmp/fake]project[/link]" in result.output
 
 
 def test_task_follow_enters_watch_and_preserves_job_exit_code(tmp_path, monkeypatch):
@@ -1972,6 +2017,31 @@ def test_task_keeps_real_no_capacity_on_exit_2(tmp_path, monkeypatch):
         "reasons": {"n1": "0 free < 1 wanted"},
         "exit_code": 2,
     }
+
+
+def test_task_human_failure_treats_remote_labels_as_literal_text(tmp_path, monkeypatch):
+    from dt.dispatch import NoCapacity
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "submit",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            NoCapacity(
+                {"[red]not-an-error[/red]": ("[link=file:///tmp/fake]0 free[/link]")}
+            )
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["task", "n1", "python train.py", "-p", "p", "--no-queue"],
+    )
+
+    assert result.exit_code == 2
+    assert "[red]not-an-error[/red]" in result.output
+    assert "[link=file:///tmp/fake]0 free[/link]" in result.output
 
 
 def test_task_json_environment_failure_is_machine_readable(tmp_path, monkeypatch):

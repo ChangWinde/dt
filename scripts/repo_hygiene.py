@@ -18,6 +18,7 @@ ROOT_FILE_ALLOWLIST = frozenset(
         "LICENSE",
         "README.md",
         "bootstrap.sh",
+        "install.sh",
         "pyproject.toml",
         "uv.lock",
     }

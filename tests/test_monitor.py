@@ -294,7 +294,7 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
     }
     assert data["cross_clock_intervals_approximate"] is True
 
-    human = CliRunner().invoke(cli.app, ["info", "j"])
+    human = CliRunner().invoke(cli.app, ["info", "j", "--verbose"])
     assert "payload" in human.output
     assert "e" * 12 in human.output
     assert "manifest dddddddddddd" in human.output
@@ -371,6 +371,108 @@ def test_info_compacts_multiline_command_by_default_and_can_show_full(
     assert json.loads(machine.stdout)["cmd"] == command
 
 
+def test_info_default_prioritizes_state_and_moves_internals_to_verbose(
+    tmp_path, monkeypatch
+):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entry = JobEntry(
+        job_id="20260801-0100_exp_abcd",
+        name="exp",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir=(
+            "~/dt/worker/jobs/20260801-0100_exp-with-a-descriptive-name_"
+            "0123456789abcdef/tail-sentinel"
+        ),
+        session="dt_20260801-0100_exp_abcd",
+        cmd="python train.py --lr 3e-4",
+        gpus=[0],
+        status="finished",
+        exit_code=0,
+        created_at=100.0,
+        started_at=101.0,
+        finished_at=111.0,
+        git_sha="a" * 40,
+        snapshot_sha256="0123456789abcdef" * 4,
+        payload_sha256="fedcba9876543210" * 4,
+        env_hash="env123",
+    )
+    cli.jobs_mod.save(cfg, entry)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "_info_live", lambda *args, **kwargs: {})
+
+    compact = CliRunner().invoke(cli.app, ["info", "abcd"])
+    verbose = CliRunner().invoke(
+        cli.app, ["info", "abcd", "--verbose"], env={"COLUMNS": "80"}
+    )
+    machine = CliRunner().invoke(cli.app, ["info", "abcd", "--json"])
+
+    assert compact.exit_code == 0, compact.output
+    assert "name  exp" in compact.output
+    assert "ref  abcd" in compact.output
+    assert "status  finished" in compact.output
+    assert "cmd  python train.py --lr 3e-4" in compact.output
+    assert "next  dt pull abcd --lite · dt metrics abcd" in compact.output
+    for internal in ("job id", "snapshot", "payload", "job dir", "session", "env"):
+        assert internal not in compact.output
+
+    assert verbose.exit_code == 0, verbose.output
+    assert entry.job_id in verbose.output
+    assert "snapshot" in verbose.output
+    assert "payload" in verbose.output
+    assert "job dir" in verbose.output
+    assert "session" in verbose.output
+    assert "env123" in verbose.output
+    lossless_verbose = "".join(verbose.output.split())
+    assert entry.snapshot_sha256 in lossless_verbose
+    assert entry.payload_sha256 in lossless_verbose
+    assert "tail-sentinel" in lossless_verbose
+
+    assert machine.exit_code == 0, machine.output
+    assert json.loads(machine.stdout)["job_id"] == entry.job_id
+
+
+def test_info_treats_registry_labels_as_literal_text(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entry = JobEntry(
+        job_id="20260801-0100_exp_abcd",
+        name="[red]not-a-status[/red]",
+        center="c",
+        project="[link=file:///tmp/fake]project[/link]",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/20260801-0100_exp_abcd",
+        session="dt_exp",
+        cmd="true",
+        status="finished",
+        exit_code=0,
+    )
+    cli.jobs_mod.save(cfg, entry)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, ["info", "abcd"])
+
+    assert result.exit_code == 0, result.output
+    assert entry.name in result.output
+    assert entry.project in result.output
+
+
 def test_info_queued_job_reports_fifo_context_in_json_and_human_output(
     tmp_path, monkeypatch
 ):
@@ -417,9 +519,9 @@ def test_info_queued_job_reports_fifo_context_in_json_and_human_output(
     assert human.exit_code == 0, human.output
     normalized = " ".join(human.output.split())
     assert "queue 2/3 · 1 ahead" in normalized
-    assert "queue head queue-head" in normalized
-    assert "previous queue-head" in normalized
-    assert "after success queue-head" in normalized
+    assert "queue head head" in normalized
+    assert "previous head" in normalized
+    assert "after success head" in normalized
 
 
 def test_info_json_missing_job_is_machine_readable(tmp_path, monkeypatch):
@@ -1753,8 +1855,8 @@ def test_watch_terminal_transition_includes_persisted_resource_summary(
     rendered = console.export_text()
     assert "recent gpu" in rendered
     assert "99% window / 99% peak" in rendered
-    assert "gpu activity" in rendered
-    assert "99% busy-only avg" in rendered
+    assert "gpu activity" not in rendered
+    assert "busy-only avg" not in rendered
 
 
 def test_watch_finished_without_telemetry_keeps_null_summary(tmp_path, monkeypatch):
@@ -2117,6 +2219,44 @@ def test_smart_log_tail_selects_newer_nested_log_on_disk(tmp_path):
     assert tail == "step 420 loss=0.05\n"
 
 
+def test_smart_log_tail_keeps_home_relative_display_separate_from_read_path(tmp_path):
+    job_dir = tmp_path / "dt" / "worker" / "jobs" / "nested"
+    stdout = job_dir / "logs" / "stdout.log"
+    nested = job_dir / "outputs" / "registry" / "train.log"
+    stdout.parent.mkdir(parents=True)
+    nested.parent.mkdir(parents=True)
+    stdout.write_text("outer setup only\n")
+    nested.write_text("step 420 loss=0.05\n")
+    os.utime(stdout, (100, 100))
+    os.utime(nested, (200, 200))
+    entry = JobEntry(
+        job_id="nested-home",
+        name="nested-home",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="~/dt/worker/jobs/nested",
+        session="dt_nested_home",
+        cmd="python train.py",
+        status="running",
+    )
+
+    proc = subprocess.run(
+        ["bash", "-c", cli._job_log_tail_command(entry, 20)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "HOME": str(tmp_path)},
+    )
+    selected, display, tail = cli._parse_job_log_tail(entry, proc.stdout)
+
+    assert proc.returncode == 0, proc.stderr
+    assert selected == "~/dt/worker/jobs/nested/outputs/registry/train.log"
+    assert display == "outputs/registry/train.log"
+    assert tail == "step 420 loss=0.05\n"
+
+
 def test_logs_human_and_json_replace_nul_padding_at_shared_tail_boundary(
     tmp_path, monkeypatch
 ):
@@ -2166,6 +2306,55 @@ def test_logs_human_and_json_replace_nul_padding_at_shared_tail_boundary(
     payload = json.loads(machine.stdout)
     assert "\x00" not in payload["text"]
     assert payload["text"] == "before[dt: omitted 3 NUL bytes]after\n"
+
+
+def test_logs_compacts_long_active_source_without_changing_log_text(
+    tmp_path, monkeypatch
+):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entry = JobEntry(
+        job_id="nested-log",
+        name="nested-log",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="~/dt/worker/jobs/nested-log",
+        session="dt_nested_log",
+        cmd="python train.py",
+        status="running",
+    )
+    cli.jobs_mod.save(cfg, entry)
+    display = (
+        "outputs/registry/libero_universal_optimization/"
+        "uo114_suite_local_expert_intent/libero_spatial_dp/train.log"
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "_read_job_log_tail",
+        lambda *args, **kwargs: (
+            subprocess.CompletedProcess([], 0, "", ""),
+            f"{entry.job_dir}/{display}",
+            display,
+            "step 42 loss=0.1\n",
+        ),
+    )
+
+    result = CliRunner().invoke(cli.app, ["logs", "nested-log"])
+
+    assert result.exit_code == 0, result.output
+    assert "active log: …/libero_spatial_dp/train.log" in result.output
+    assert "uo114_suite_local_expert_intent" not in result.output
+    assert "step 42 loss=0.1" in result.output
+    assert max(map(len, result.output.splitlines())) <= 80
 
 
 def test_smart_log_tail_rejects_source_outside_job():
@@ -2474,7 +2663,7 @@ def test_wait_nonzero_prints_error_tail_and_preserves_exit_code(tmp_path, monkey
     )
 
 
-def test_wait_long_job_id_keeps_terminal_summary_on_one_line(tmp_path, monkeypatch):
+def test_wait_long_job_id_uses_recognizable_name_and_compact_ref(tmp_path, monkeypatch):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -2504,9 +2693,9 @@ def test_wait_long_job_id_keeps_terminal_summary_on_one_line(tmp_path, monkeypat
 
     assert result.exit_code == 0
     assert result.output.splitlines() == [
-        "finished · exit 0",
-        f"job {job_id}",
+        "finished · exit 0 · long-id · ref efe9",
     ]
+    assert job_id not in result.output
 
 
 def test_wait_json_nonzero_includes_primary_and_referenced_failure_logs(
@@ -3283,6 +3472,56 @@ def test_wait_multiple_uses_first_nonzero_result_in_ref_order(tmp_path, monkeypa
     assert json.loads(first_killed.stdout)["summary"]["aggregate_exit_code"] == 66
     assert first_exit.exit_code == 7
     assert json.loads(first_exit.stdout)["summary"]["aggregate_exit_code"] == 7
+
+
+def test_wait_multiple_human_table_uses_compact_refs(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entries = [
+        JobEntry(
+            job_id="20260801-0100_control_12345678abcd",
+            name="control",
+            center="c",
+            project="p",
+            node="n1",
+            node_local=False,
+            job_dir="dt/jobs/control",
+            session="dt_control",
+            cmd="true",
+            status="finished",
+            exit_code=0,
+        ),
+        JobEntry(
+            job_id="20260801-0101_candidate_87654321dcba",
+            name="candidate",
+            center="c",
+            project="p",
+            node="n1",
+            node_local=False,
+            job_dir="dt/jobs/candidate",
+            session="dt_candidate",
+            cmd="true",
+            status="finished",
+            exit_code=0,
+        ),
+    ]
+    for entry in entries:
+        cli.jobs_mod.save(cfg, entry)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, ["wait", "control", "candidate"])
+
+    assert result.exit_code == 0, result.output
+    assert "ref" in result.output
+    assert "abcd" in result.output
+    assert "dcba" in result.output
+    assert all(entry.job_id not in result.output for entry in entries)
 
 
 def test_wait_multiple_waits_concurrently(tmp_path, monkeypatch):
@@ -7424,7 +7663,8 @@ def test_logs_follow_queue_edges_keep_actions_intact_with_long_job_id(
 
     assert result.exit_code == 0, result.output
     assert "queued; waiting for logs\n" in result.output
-    assert f"job {job_id}\n" in result.output
+    assert "queued-log · ref a8ec\n" in result.output
+    assert job_id not in result.output
     assert "started on n1; following logs\n" in result.output
     assert "waiting for \nlogs" not in result.output
 

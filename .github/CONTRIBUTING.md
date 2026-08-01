@@ -87,7 +87,7 @@ uv run --no-sync mypy --strict --no-incremental \
   --cache-dir=/tmp/dt-mypy --follow-imports=skip \
   src/dt
 python scripts/repo_hygiene.py
-bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
+bash -n src/dt/payload/*.sh bootstrap.sh install.sh scripts/deploy.sh \
   scripts/release-check.sh
 git diff --check
 ```

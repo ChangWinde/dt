@@ -139,7 +139,7 @@ def test_init_cli_writes_config_and_reports_machine_readable_next_steps(tmp_path
     payload = json.loads(result.stdout)
     assert payload == {
         "config": str(config),
-        "next": ["dt doctor", "dt agent install", "dt free"],
+        "next": ["dt doctor", "dt agent install", "dt agent start", "dt free"],
         "role": "head",
         "written": True,
     }

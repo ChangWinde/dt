@@ -1545,6 +1545,47 @@ def test_resource_ui_prefers_anonymous_pss_over_device_mappings_and_rss():
     assert "12.0G" not in rendered
 
 
+def test_metrics_omits_a_single_phase_that_duplicates_the_whole_window():
+    rows = [
+        {
+            "timestamp": float(second),
+            "phase": "runner",
+            "gpus": [{"index": 0, "utilization_pct": utilization}],
+            "host": {},
+            "job": {"cpu_pct": utilization, "rss_mib": 1024},
+        }
+        for second, utilization in enumerate((20, 40, 60))
+    ]
+    summary = _summarize_resources(rows)
+    summary["tail_limit"] = 3600
+    summary["duration_s"] = 3598.0
+    entry = JobEntry(
+        job_id="j",
+        name="uo114-libero_spatial_dp-v1",
+        center="c",
+        project="p",
+        node="psibot-hm",
+        node_local=False,
+        job_dir="dt/jobs/j",
+        session="dt_j",
+        cmd="true",
+    )
+
+    console = Console(width=120, record=True, color_system=None)
+    console.print(_metrics_table(entry, summary))
+    rendered = console.export_text()
+
+    assert "GPU 0 util (window)" in rendered
+    assert "Job CPU" in rendered
+    assert "Phase runner" not in rendered
+    assert "busy-only mean" not in rendered
+    title_lines = [
+        line.strip() for line in rendered.split("┏", 1)[0].splitlines() if line.strip()
+    ]
+    assert len(title_lines) == 1
+    assert "last 3" in title_lines[0]
+
+
 def test_resource_summary_and_table_surface_gpu_query_failures():
     rows = [
         {
@@ -1582,7 +1623,7 @@ def test_resource_summary_and_table_surface_gpu_query_failures():
     console.print(_metrics_table(entry, summary))
     rendered = " ".join(console.export_text().split())
 
-    assert "last 2 samples" in rendered
+    assert "last 2" in rendered
     assert "GPU telemetry" in rendered
     assert "2/2 failed" in rendered
     assert "NVIDIA driver unavailable" in rendered

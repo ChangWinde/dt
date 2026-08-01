@@ -15,8 +15,12 @@ private (`0600`), and refuse replacement unless `--force` is explicit.
 
 The file has one of two exclusive roles:
 
-- a head declares `center`, `nodes`, and `projects`;
+- a head (sometimes called the master) declares `center`, `nodes`, and
+  `projects`; this is the normal DT installation in a center;
 - a laptop declares `centers` and forwards commands to one or more heads.
+
+Configured nodes other than the head are workers. They need SSH and runtime
+prerequisites but not their own DT configuration or CLI installation.
 
 A file containing both roles is rejected. Unknown keys and wrong nested types
 are rejected as likely spelling or structure mistakes rather than silently

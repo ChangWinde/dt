@@ -4,6 +4,19 @@ DistTrainer separates operator intent, authoritative lifecycle state, remote
 execution, and recoverable experiment data. The head is the control-plane
 authority. Compute nodes execute only dispatched snapshots and runtime payloads.
 
+## Deployment roles
+
+The normal center installs `dt` once on the head (also called the master by
+operators). That installation owns configuration, projects, registry, queue,
+scheduling, and recovery. Every configured SSH-reachable compute node is a
+worker. A worker does not need the DT CLI or a second configuration; the head
+ships the exact launcher, wrapper, telemetry code, and job contract at
+dispatch time. A head may also be a worker when its node is configured as
+`local: true`.
+
+An optional laptop installation is only a forwarding client. It contacts the
+head and never places work directly on workers.
+
 ## System view
 
 ```mermaid
@@ -110,6 +123,23 @@ an explicit operational failure rather than a false terminal success.
 The CLI composes these policies from shared submission contracts. Workflow
 helpers do not implement secondary schedulers.
 
+## CLI presentation boundary
+
+Human output is an operator interface, while JSON, exit codes, and stdout/stderr
+separation are automation interfaces. Default human views show current state,
+anomalies, progress, and the next useful action. Complete provenance and
+diagnostic internals are explicit through command-specific detail flags; JSON
+retains the complete documented payload.
+
+Shared Rich behavior and reusable fleet/job tables live in `render.py`. The CLI
+composition root supplies already validated domain data and chooses default,
+detail, or machine presentation. A command-specific card may remain private to
+`cli.py` when it only composes that command's payload; reusable rendering policy
+does not move back into the composition root. Display compaction never alters
+executable paths or arguments. Empty results use concise state messages rather
+than empty tables. The full rationale and width contract are recorded in
+[ADR 0008](adr/0008-operator-first-cli-presentation.md).
+
 ## Source modules
 
 `src/dt/cli.py` is the Typer composition root. It preserves command names,
@@ -157,6 +187,7 @@ dt/
 ├── src/dt/             Installable Python package and node payload
 ├── tests/              Unit, integration, CLI, payload, and reliability tests
 ├── bootstrap.sh        Verified release installer
+├── install.sh          Immutable clean-checkout source installer
 └── README.md           Repository product entry point
 ```
 

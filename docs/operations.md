@@ -28,12 +28,15 @@ agent log bounds, and handoff state:
 | `registry_degraded` | Registry state cannot be trusted |
 
 Use these states to plan experiments. Do not submit filler work solely to raise
-GPU utilization.
+GPU utilization. The default human status shows only agent liveness, job counts,
+handoff state, and a compact queue-head reference. Add `--verbose` for scheduler
+policy, log path, and the complete queue-head ID.
 
 ## Capacity and placement
 
 ```bash
 dt free --who
+dt free --explain
 dt free --json
 dt doctor --json
 ```
@@ -41,6 +44,11 @@ dt doctor --json
 `dt free` includes active DistTrainer leases even before a job creates a CUDA
 context. A GPU that appears idle in `nvidia-smi` can still be reserved by a job
 performing CPU-side initialization.
+
+The default human view keeps queue state to one compact summary. Add
+`--explain` only when you need the complete next-job ID and persisted scheduler
+reason. For automation, `dt free --json` preserves the resource-array contract,
+while `dt free --json --explain` returns the structured scheduler explanation.
 
 Use `--node` when an experiment requires a specific host. Use `--require-path`
 and `--require-disk-gib` to declare job-specific eligibility rather than
@@ -67,9 +75,12 @@ dt ps -s failed
 dt ps -a
 ```
 
-Use `dt info JOB --json` instead of parsing table output. The
-`snapshot_sha256` field distinguishes exact source trees, including dirty
-snapshots that share a Git commit.
+The default `dt info JOB` card is deliberately operational: state, placement,
+command preview, timeline, current resources, and the next action. Add
+`--verbose` for full provenance, paths, launch stages, and resource history.
+Use `dt info JOB --json` instead of parsing table output. The `snapshot_sha256`
+field distinguishes exact source trees, including dirty snapshots that share a
+Git commit.
 
 ## Failure recovery
 
@@ -125,13 +136,14 @@ reviewed recovery case.
 
 ```bash
 dt storage
+dt storage --details
 dt storage --json
 ```
 
-The inventory covers every managed head class and each worker's jobs,
-environments, artifacts, cache, and runtime coordination directories. Legacy
-flat-layout residue is reported separately. Use it before changing retention
-policy.
+The default inventory aggregates one row for the head and one for each worker.
+`--details` exposes every managed storage class and path; JSON retains the full
+inventory. Legacy flat-layout residue is reported separately. Use the detail or
+JSON view before changing retention policy.
 
 ## Runtime layout migration
 

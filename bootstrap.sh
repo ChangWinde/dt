@@ -35,6 +35,12 @@ for tool in awk sha256sum; do
         exit 3
     }
 done
+UV_BIN="$(command -v uv || true)"
+if [[ -z "$UV_BIN" ]]; then
+    echo "[bootstrap] uv is required but was not found on the caller's PATH." >&2
+    echo "[bootstrap] install a reviewed uv binary, then rerun this command." >&2
+    exit 3
+fi
 
 verify_file() {
     local path="$1"
@@ -62,52 +68,18 @@ verify_file "$ARTIFACT" "${DT_ARTIFACT_SHA256:-}"
 verify_file "$CONSTRAINTS"
 
 TOOL_BIN_DIR="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}"
-export PATH="$TOOL_BIN_DIR:$PATH"
+CALLER_PATH="$PATH"
 export UV_SYSTEM_CERTS=1 UV_NATIVE_TLS=1
-if ! command -v uv >/dev/null 2>&1; then
-    echo "[bootstrap] uv is required but was not found." >&2
-    echo "[bootstrap] install a reviewed uv binary, then rerun this command." >&2
-    exit 3
-fi
 
 PYTHON_VERSION="${DT_PYTHON:-3.11}"
-if ! uv python find "$PYTHON_VERSION" >/dev/null 2>&1; then
+if ! "$UV_BIN" python find "$PYTHON_VERSION" >/dev/null 2>&1; then
     echo "[bootstrap] installing managed Python $PYTHON_VERSION"
-    uv python install "$PYTHON_VERSION"
+    "$UV_BIN" python install "$PYTHON_VERSION"
 fi
 
 echo "[bootstrap] installing verified $(basename "$ARTIFACT")"
-uv tool install --force --python "$PYTHON_VERSION" \
+"$UV_BIN" tool install --force --python "$PYTHON_VERSION" \
     --constraints "$CONSTRAINTS" "$ARTIFACT"
-
-CONF="${DT_CONFIG_PATH:-$HOME/.config/dt/config.yaml}"
-if [[ ! -f "$CONF" ]]; then
-    mkdir -p "$(dirname "$CONF")"
-    cat > "$CONF" <<'EOF'
-# DistTrainer config — choose one role and remove the other example.
-# Head role:
-# center: research
-# nodes:
-#   - {name: gpu-head, local: true}
-#   - {name: gpu-node-1}
-# projects:
-#   policy: ~/projects/policy
-# default_project: policy
-# paths:
-#   root: ~/dt
-#   envs: ~/dt/envs
-#   results: ~/dt/results
-# queue:
-#   poll_s: 60
-#   active_poll_s: 2
-#
-# Laptop role:
-# default_center: research
-# centers:
-#   research: {head: gpu-head}
-EOF
-    echo "[bootstrap] wrote $CONF; edit it before running dt doctor"
-fi
 
 DT_BIN="$TOOL_BIN_DIR/dt"
 [[ -x "$DT_BIN" ]] || DT_BIN="$(command -v dt || true)"
@@ -117,4 +89,18 @@ DT_BIN="$TOOL_BIN_DIR/dt"
 }
 INSTALLED_VERSION="$("$DT_BIN" --version)"
 echo "[bootstrap] installed $INSTALLED_VERSION"
-echo "[bootstrap] next: edit $CONF, then run dt doctor"
+if [[ "${DT_BOOTSTRAP_SKIP_NEXT:-0}" != "1" ]]; then
+    case ":$CALLER_PATH:" in
+        *":$TOOL_BIN_DIR:"*)
+            DT_COMMAND="dt"
+            ;;
+        *)
+            DT_COMMAND="$TOOL_BIN_DIR/dt"
+            echo "[bootstrap] PATH does not include $TOOL_BIN_DIR"
+            printf '[bootstrap] current shell: export PATH="%s:$PATH"\n' "$TOOL_BIN_DIR"
+            echo "[bootstrap] persist for future shells: uv tool update-shell"
+            ;;
+    esac
+    echo "[bootstrap] next (head/master): cd PROJECT && $DT_COMMAND init --role head --center CENTER"
+    echo "[bootstrap] next (laptop): $DT_COMMAND init --role laptop --center CENTER --head HEAD"
+fi

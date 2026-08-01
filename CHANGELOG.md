@@ -8,6 +8,9 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Added
 
+- A clean checkout can now install an immutable, commit-identified DT tool with
+  `./install.sh`; the normal deployment installs DT only on the head while
+  workers receive the job runtime payload automatically.
 - `dt init` now creates minimal, validated head or laptop configurations,
   supports a no-write preview, writes atomically with private permissions, and
   refuses accidental replacement.
@@ -18,9 +21,38 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Changed
 
+- Human CLI output now follows an operator-first contract: compact routable
+  references, explicit empty states, 60/80-column-safe tables, concise next
+  actions, and command-specific detail modes. `dt info --verbose`,
+  `dt agent status --verbose`, and `dt storage --details` retain complete
+  diagnostic data while their defaults prioritize current state.
+- `dt run`, `dt batch`, `dt chain`, and `dt ps` help now groups everyday options
+  separately from scheduling safeguards, reproducibility, filters, and machine
+  output. Submission, log-follow, and wait receipts avoid repeating full job
+  IDs while preserving the bare-ID stdout contract and compatible JSON schemas.
+- `dt run` now derives a searchable experiment name from the command when `-n`
+  is omitted, and its help makes the required `-- COMMAND [ARGS]...` boundary
+  explicit.
+- `dt metrics` suppresses phase rows when one phase merely duplicates the full
+  sample window; real phase transitions remain visible.
+- Human `dt free` now keeps queued work to one compact summary by default;
+  `--explain` reveals the complete next-job identity and scheduler reason when
+  diagnosis is needed. The legacy JSON output remains unchanged.
+- Installation no longer creates a commented, role-ambiguous configuration
+  skeleton. `dt init` is the single validated configuration entry point and
+  now guides a new head through installing and starting the queue agent.
 - Repository documentation now has a concise product README, task-oriented
   operator guides, an explicit architecture and directory map, generated
   evidence indexes, and deterministic relative-link validation.
+
+### Fixed
+
+- Active nested logs under a worker home directory are now read through their
+  canonical path while only the displayed path is compacted. Quoted `~/...`
+  display paths no longer cause `dt logs` to report a missing file.
+- User- or registry-controlled names, project labels, commands, and reasons are
+  escaped at Rich terminal boundaries so markup-like text cannot spoof status
+  styling or links.
 - Contribution guidance now defines branch names, atomic commit structure,
   compatibility surfaces, required checks, and documentation ownership.
 - The sanitized Python package description lives at
@@ -36,9 +68,16 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   lifecycle, pulls, compaction, and cleanup honor persisted layout provenance.
 - Cleanup and snapshot-store persistence now have isolated, strict-typed domain
   modules. The release type gate now covers the complete `src/dt` package.
-
-### Fixed
-
+- Source and release installers now detect when the uv tool directory is absent
+  from the caller's `PATH`, print an immediately runnable absolute command, and
+  provide explicit current-shell and persistent setup instructions. The release
+  bootstrap pins the caller-resolved `uv` executable before touching the target
+  directory, preventing a pre-existing target-side executable from shadowing it.
+- Batch, chain, and repeat receipts now use collision-safe job references in
+  executable next actions instead of mutable experiment names.
+- Narrow resource and job views preserve target, reference, state, time,
+  temperature, memory, and I/O values; explicit detail views fold rather than
+  ellipsize complete identifiers, paths, hashes, and commands.
 - Pinned capacity waits now preserve FIFO per node instead of globally
   blocking later jobs pinned to other nodes, preventing avoidable cross-node
   GPU idle time without allowing same-node jobs to overtake one another.
