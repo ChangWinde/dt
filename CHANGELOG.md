@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.7.0 — 2026-08-01
+
 ### Added
 
 - A clean checkout can now install an immutable, commit-identified DT tool with
@@ -47,6 +49,10 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- The release gate now rejects reused or out-of-order versions, mismatched
+  source metadata, and changelogs with unsealed pending changes before doing
+  expensive build work. Release tags that already identify the candidate
+  commit remain reproducibly verifiable.
 - Concurrent `dt free --fresh` callers on one head now share a single live
   probe instead of multiplying `nvidia-smi` load and causing avoidable node
   timeouts. `dt free --watch` and `dt ps --watch` also interpret `--poll` as a

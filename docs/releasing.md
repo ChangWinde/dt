@@ -28,8 +28,9 @@ this procedure.
 1. Reconcile `CHANGELOG.md`, `docs/package-readme.md`,
    `.github/SECURITY.md`, `.github/SUPPORT.md`, version metadata, and the
    intended source diff.
-2. Confirm the Git worktree is clean and the current commit is the reviewed
-   release source.
+2. Fetch the complete tag history, then confirm the Git worktree is clean and
+   the current commit is the reviewed release source. The gate fails closed if
+   it cannot see the most recent prior release tag.
 3. Run the CI matrix on Python 3.10 and 3.11.
 4. Run the local terminal gate:
 
@@ -64,7 +65,8 @@ environment, and produces:
 (cd dist && sha256sum -c SHA256SUMS)
 python3 -m json.tool dist/release-audit.json
 python3 -m json.tool dist/release-manifest.json
-git tag -a v0.6.2 -m "DistTrainer 0.6.2"
+VERSION=0.7.0
+git tag -a "v$VERSION" -m "DistTrainer $VERSION"
 ```
 
 The manifest must report `git_dirty: false` and the intended release commit.
@@ -78,8 +80,9 @@ from the verified bundle. For PyPI, first confirm the `disttrainer` name,
 copyright-holder authorization, and trusted-publisher configuration, then use:
 
 ```bash
-uv publish dist/disttrainer-0.6.2-py3-none-any.whl \
-  dist/disttrainer-0.6.2.tar.gz
+VERSION=0.7.0
+uv publish "dist/disttrainer-$VERSION-py3-none-any.whl" \
+  "dist/disttrainer-$VERSION.tar.gz"
 ```
 
 Never pass a token on the command line or store it in this repository.
@@ -97,8 +100,9 @@ Each host retains the complete verified bundle below
 `~/.local/share/disttrainer/releases/VERSION/`. To restore a retained version:
 
 ```bash
-scripts/deploy.sh --plan --rollback 0.6.2 HEAD_A
-scripts/deploy.sh --rollback 0.6.2 HEAD_A
+VERSION=0.7.0
+scripts/deploy.sh --plan --rollback "$VERSION" HEAD_A
+scripts/deploy.sh --rollback "$VERSION" HEAD_A
 ```
 
 After deployment, run `dt --version`, `dt doctor --json`, inspect agent status,

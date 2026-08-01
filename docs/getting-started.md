@@ -51,7 +51,7 @@ that bundle:
 
 ```bash
 bash bootstrap.sh \
-  dist/disttrainer-0.6.2-py3-none-any.whl \
+  dist/disttrainer-0.7.0-py3-none-any.whl \
   dist/runtime-constraints.txt
 export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
 dt --version
