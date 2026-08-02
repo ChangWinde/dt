@@ -1,6 +1,7 @@
 import os
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from dt.probe import (
     PROBE_CMD,
     SEP,
     SYS_SEP,
+    parse_probe_error,
     parse_probe_output,
     parse_system_output,
 )
@@ -123,6 +125,61 @@ def test_probe_batches_owner_lookup_and_deduplicates_apps(tmp_path):
     assert calls.read_text().splitlines() == ["call"]
     assert gpu.procs == 30
     assert gpu.users == ["batchuser"]
+
+
+def test_probe_overlaps_independent_nvidia_smi_queries(tmp_path):
+    fake_bin = tmp_path / "bin"
+    barrier = tmp_path / "barrier"
+    fake_bin.mkdir()
+    barrier.mkdir()
+    nvidia_smi = fake_bin / "nvidia-smi"
+    nvidia_smi.write_text(
+        r"""#!/bin/sh
+case "$*" in
+  *--query-gpu=*)
+    own="$DT_TEST_BARRIER/gpu"
+    peer="$DT_TEST_BARRIER/apps"
+    output="0, GPU-test, 4096, 81920, 50, 42"
+    ;;
+  *--query-compute-apps=*)
+    own="$DT_TEST_BARRIER/apps"
+    peer="$DT_TEST_BARRIER/gpu"
+    output="GPU-test, 123"
+    ;;
+  *) exit 9 ;;
+esac
+: > "$own"
+attempt=0
+while [ ! -e "$peer" ] && [ "$attempt" -lt 100 ]; do
+  sleep 0.01
+  attempt=$((attempt + 1))
+done
+[ -e "$peer" ] || exit 81
+printf '%s\n' "$output"
+""",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+
+    proc = subprocess.run(
+        ["bash", "-c", PROBE_CMD],
+        env={
+            **os.environ,
+            "DT_TEST_BARRIER": str(barrier),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TMPDIR": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+
+    assert parse_probe_error(proc.stdout) is None, proc.stdout
+    gpu = parse_probe_output(proc.stdout, 500)[0]
+    assert gpu.uuid == "GPU-test"
+    assert gpu.procs == 1
+    assert not gpu.free
 
 
 def test_dt_lease_marks_pre_cuda_job_busy():
@@ -243,6 +300,83 @@ def test_probe_command_preserves_nvidia_smi_failure():
     assert "driver unavailable sentinel" in proc.stdout
 
 
+def test_probe_command_preserves_compute_app_failure_and_fails_closed(monkeypatch):
+    command = (
+        r"""
+    nvidia-smi() {
+        case "$*" in
+          *--query-gpu=*) echo "0, GPU-test, 0, 24576, 0, 30" ;;
+          *--query-compute-apps=*)
+            echo "compute process sentinel" >&2
+            return 9
+            ;;
+          *) return 1 ;;
+        esac
+    }
+    """
+        + PROBE_CMD
+    )
+
+    proc = subprocess.run(
+        ["bash", "-c", command],
+        env=os.environ,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    monkeypatch.setattr(
+        probe_mod,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [], 0, proc.stdout, proc.stderr
+        ),
+    )
+
+    assert parse_probe_error(proc.stdout) == (
+        "GPU process query failed: compute process sentinel"
+    )
+    status = probe_mod.probe_node(Node(name="n1"), mem_threshold_mib=500)
+    assert status.gpus == []
+    assert status.error == "GPU process query failed: compute process sentinel"
+
+
+def test_bounded_probe_cleans_up_workers_and_temporary_directory(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    pids = tmp_path / "nvidia-pids"
+    nvidia_smi = fake_bin / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$$" >> "$DT_TEST_PIDS"\n'
+        "trap 'exit 0' TERM INT HUP\n"
+        "while :; do sleep 1; done\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+
+    proc = subprocess.run(
+        ["bash", "-c", probe_mod.bounded_probe_command(0.2)],
+        env={
+            **os.environ,
+            "DT_TEST_PIDS": str(pids),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TMPDIR": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert proc.returncode == probe_mod.PROBE_TIMEOUT_EXIT
+    assert not list(tmp_path.glob("dt-probe.*"))
+    worker_pids = [int(pid) for pid in pids.read_text().splitlines()]
+    deadline = time.monotonic() + 1
+    while any(Path(f"/proc/{pid}").exists() for pid in worker_pids):
+        assert time.monotonic() < deadline, "timed-out nvidia-smi worker leaked"
+        time.sleep(0.01)
+
+
 def test_probe_node_surfaces_query_failure_instead_of_zero_gpus(monkeypatch):
     output = (
         f"{GPU_ERROR}\ndriver unavailable sentinel\n"
@@ -324,6 +458,30 @@ def test_probe_node_types_remote_probe_timeout_as_reachable_error(monkeypatch):
     assert status.error == "GPU probe timed out after 7s"
     assert captured["command"].startswith("timeout ")
     assert captured["timeout"] > 7
+
+
+def test_probe_node_uses_node_specific_timeout_by_default(monkeypatch):
+    captured = {}
+
+    def completed(node_name, is_local, command, timeout, check=False):
+        captured.update(command=command, timeout=timeout)
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            f"0, GPU-x, 0, 24576, 0, 30, 0,\n{SEP}\n{SYS_SEP}\n",
+            "",
+        )
+
+    monkeypatch.setattr(probe_mod, "run_on", completed)
+
+    status = probe_mod.probe_node(
+        Node(name="slow", probe_timeout_s=23.5),
+        mem_threshold_mib=500,
+    )
+
+    assert status.error is None
+    assert "23.5s" in captured["command"]
+    assert captured["timeout"] == 28.5
 
 
 def test_probe_node_types_outer_transport_timeout_as_unreachable(monkeypatch):

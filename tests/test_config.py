@@ -20,6 +20,36 @@ def test_head_config():
     assert str(cfg.projects["vla"].path).endswith("proj/vla")
 
 
+def test_node_probe_timeout_is_bounded_and_configurable():
+    cfg = parse(
+        {
+            "center": "c",
+            "nodes": [
+                "default",
+                {"name": "slow", "probe_timeout_s": 23.5},
+            ],
+        }
+    )
+
+    assert isinstance(cfg, HeadConfig)
+    assert cfg.nodes[0].probe_timeout_s == 15.0
+    assert cfg.nodes[1].probe_timeout_s == 23.5
+
+
+@pytest.mark.parametrize(
+    "value",
+    [0, -1, 121, float("inf"), float("-inf"), float("nan"), True],
+)
+def test_node_probe_timeout_rejects_unbounded_values(value):
+    with pytest.raises(ConfigError, match="probe_timeout_s"):
+        parse(
+            {
+                "center": "c",
+                "nodes": [{"name": "n1", "probe_timeout_s": value}],
+            }
+        )
+
+
 def test_head_config_supports_dedicated_results_root(tmp_path):
     results = tmp_path / "experiment-results"
     cfg = parse(
