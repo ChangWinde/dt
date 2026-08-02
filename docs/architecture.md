@@ -165,6 +165,14 @@ identity, and removes the registry record only after node and related local
 cleanup succeed. Snapshot-store locking and persistence are likewise isolated
 from submission orchestration.
 
+GPU capacity probing overlaps inventory, compute-process inventory, and system
+statistics inside one bounded remote command. Output is reassembled in a stable
+protocol order, and any missing driver evidence fails closed before placement.
+Each node owns its finite telemetry deadline while SSH keeps a separate transport
+grace period. The concurrency boundary and the rejected resident-service
+alternative are recorded in
+[ADR 0009](adr/0009-bounded-parallel-gpu-probes.md).
+
 ## Repository layout
 
 ```text

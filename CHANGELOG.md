@@ -6,6 +6,14 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- Reachable, loaded GPU nodes no longer become `error timeout` merely because
+  independent inventory and compute-process queries exceed the telemetry
+  deadline when run serially. Probes overlap those bounded queries, clean up
+  workers on timeout, reject incomplete process data, and support a finite
+  per-node `probe_timeout_s` override for measured slow nodes.
+
 ## 0.7.0 — 2026-08-01
 
 ### Added

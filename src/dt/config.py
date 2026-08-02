@@ -21,6 +21,10 @@ class ConfigError(Exception):
     pass
 
 
+DEFAULT_PROBE_TIMEOUT_S = 15.0
+MAX_PROBE_TIMEOUT_S = 120.0
+
+
 def config_path() -> Path:
     return Path(os.environ.get("DT_CONFIG", "~/.config/dt/config.yaml")).expanduser()
 
@@ -30,6 +34,7 @@ class Node:
     name: str
     local: bool = False
     root: str | None = None
+    probe_timeout_s: float = DEFAULT_PROBE_TIMEOUT_S
 
 
 @dataclass
@@ -315,11 +320,24 @@ def _parse_nodes(raw: object) -> list[Node]:
             name = _nonempty_string(item, "nodes[].name")
             nodes.append(Node(name=name))
         elif isinstance(item, dict):
-            _reject_unknown(item, {"name", "local", "root"}, "node entry")
+            _reject_unknown(
+                item,
+                {"name", "local", "root", "probe_timeout_s"},
+                "node entry",
+            )
             name = _nonempty_string(item.get("name"), "nodes[].name")
             local = item.get("local", False)
             if not isinstance(local, bool):
                 raise ConfigError("`nodes[].local` must be true or false")
+            probe_timeout_s = _finite_number(
+                item.get("probe_timeout_s", DEFAULT_PROBE_TIMEOUT_S),
+                "nodes[].probe_timeout_s",
+            )
+            if not 0 < probe_timeout_s <= MAX_PROBE_TIMEOUT_S:
+                raise ConfigError(
+                    "`nodes[].probe_timeout_s` must be greater than 0 and at most "
+                    f"{MAX_PROBE_TIMEOUT_S:g}"
+                )
             raw_root = item.get("root")
             root: str | None = None
             if raw_root is not None:
@@ -328,7 +346,14 @@ def _parse_nodes(raw: object) -> list[Node]:
                     root = normalize_node_root(root_text)
                 except ValueError as exc:
                     raise ConfigError(f"`nodes[].root` {exc}") from None
-            nodes.append(Node(name=name, local=local, root=root))
+            nodes.append(
+                Node(
+                    name=name,
+                    local=local,
+                    root=root,
+                    probe_timeout_s=probe_timeout_s,
+                )
+            )
         else:
             raise ConfigError(f"bad node entry: {item!r}")
     if not nodes:

@@ -33,7 +33,7 @@ center: research
 
 nodes:
   - {name: gpu-head, local: true}
-  - {name: gpu-node-1}
+  - {name: gpu-node-1, probe_timeout_s: 20}
   - gpu-node-2
 
 projects:
@@ -78,10 +78,13 @@ proxy: http://proxy.example.invalid:8080
 | `nodes[].name` | SSH alias or local hostname known to the operator |
 | `nodes[].local` | Run node commands locally; use for at most the intended head-local node |
 | `nodes[].root` | Optional worker base override for that node; DT derives `worker/` below it |
+| `nodes[].probe_timeout_s` | Optional live telemetry deadline; defaults to 15 seconds and must be in `(0, 120]` |
 
 Node order does not grant a permanent placement preference. DistTrainer probes
 eligible nodes and selects fitting capacity while respecting explicit pins and
-queue limits.
+queue limits. Increase `probe_timeout_s` only for a node whose measured
+`nvidia-smi` tail latency needs it; SSH transport failures retain their separate
+bounded classification.
 
 ### Projects
 

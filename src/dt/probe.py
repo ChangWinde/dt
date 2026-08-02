@@ -93,7 +93,45 @@ printf '%s,%s,%s,%s,%s,%s,%s\n' \
   "${cores:-0}" "${load1:-0}" "${mem_total:-0}" "${mem_avail:-0}" \
   "${disk_total:-0}" "${disk_avail:-0}" "${io:--1}"
 """
-PROBE_CMD = f"{GPU_Q}; echo {SEP}; {APP_Q}; echo {SYS_SEP}; {SYSTEM_Q}"
+PROBE_CMD = (
+    'umask 077; dt_probe_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dt-probe.XXXXXX") '
+    '|| { echo "dt: failed to create probe temporary directory" >&2; exit 70; }; '
+    'dt_gpu_out="$dt_probe_tmp/gpu"; '
+    'dt_app_out="$dt_probe_tmp/apps"; '
+    'dt_system_out="$dt_probe_tmp/system"; '
+    "dt_probe_cleanup() { "
+    'rm -f -- "$dt_gpu_out" "$dt_app_out" "$dt_system_out"; '
+    'rmdir -- "$dt_probe_tmp" 2>/dev/null || true; '
+    "}; "
+    "dt_probe_stop() { "
+    "trap - 0 1 2 15; "
+    '[ -z "${dt_gpu_pid:-}" ] || kill "$dt_gpu_pid" 2>/dev/null || true; '
+    '[ -z "${dt_app_pid:-}" ] || kill "$dt_app_pid" 2>/dev/null || true; '
+    '[ -z "${dt_system_pid:-}" ] || kill "$dt_system_pid" 2>/dev/null || true; '
+    '[ -z "${dt_gpu_pid:-}" ] || wait "$dt_gpu_pid" 2>/dev/null || true; '
+    '[ -z "${dt_app_pid:-}" ] || wait "$dt_app_pid" 2>/dev/null || true; '
+    '[ -z "${dt_system_pid:-}" ] || wait "$dt_system_pid" 2>/dev/null || true; '
+    "dt_probe_cleanup; exit 124; "
+    "}; "
+    "trap dt_probe_cleanup 0; trap dt_probe_stop 1 2 15; "
+    f'( {GPU_Q}\n) >"$dt_gpu_out" 2>&1 & dt_gpu_pid=$!; '
+    f'( {APP_Q}\n) >"$dt_app_out" 2>&1 & dt_app_pid=$!; '
+    f'( {SYSTEM_Q}\n) >"$dt_system_out" 2>&1 & dt_system_pid=$!; '
+    'wait "$dt_gpu_pid"; dt_gpu_wait_rc=$?; '
+    'wait "$dt_app_pid"; dt_app_wait_rc=$?; '
+    'wait "$dt_system_pid"; dt_system_wait_rc=$?; '
+    'if [ "$dt_gpu_wait_rc" -ne 0 ]; then '
+    f'printf "%s\\n%s\\n" {GPU_ERROR} '
+    '"GPU probe worker exited $dt_gpu_wait_rc" >"$dt_gpu_out"; fi; '
+    'if [ "$dt_app_wait_rc" -ne 0 ]; then '
+    f'printf "%s\\n%s\\n" {APP_ERROR} '
+    '"GPU process probe worker exited $dt_app_wait_rc" >"$dt_app_out"; fi; '
+    'cat "$dt_gpu_out"; echo '
+    f"{SEP}; "
+    'cat "$dt_app_out"; echo '
+    f"{SYS_SEP}; "
+    'if [ "$dt_system_wait_rc" -eq 0 ]; then cat "$dt_system_out"; fi'
+)
 CACHE_TTL_S = 3.0
 PROBE_TIMEOUT_EXIT = 124
 PROBE_TRANSPORT_GRACE_S = 5.0
@@ -313,16 +351,17 @@ def parse_probe_error(text: str) -> str | None:
 def probe_node(
     node: Node,
     mem_threshold_mib: int,
-    timeout: float = 10,
+    timeout: float | None = None,
     *,
     lease_root: str | None = None,
 ) -> NodeStatus:
+    probe_timeout = node.probe_timeout_s if timeout is None else timeout
     try:
         proc = run_on(
             node.name,
             node.local,
-            bounded_probe_command(timeout, lease_root),
-            timeout=timeout + PROBE_TRANSPORT_GRACE_S,
+            bounded_probe_command(probe_timeout, lease_root),
+            timeout=probe_timeout + PROBE_TRANSPORT_GRACE_S,
         )
     except Exception as e:  # RemoteError / TimeoutExpired
         return NodeStatus(
@@ -336,7 +375,7 @@ def probe_node(
     if proc.returncode == PROBE_TIMEOUT_EXIT:
         return NodeStatus(
             node=node.name,
-            error=f"GPU probe timed out after {timeout:g}s",
+            error=f"GPU probe timed out after {probe_timeout:g}s",
         )
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip().splitlines()
