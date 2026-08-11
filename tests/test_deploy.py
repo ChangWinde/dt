@@ -22,6 +22,7 @@ def _release(
     marker: str = "release",
     *,
     audit_distribution: str = "disttrainer",
+    require_uv: bool = False,
 ) -> Path:
     root = tmp_path / f"release-{version}-{marker}"
     root.mkdir()
@@ -47,9 +48,9 @@ def _release(
     )
     _write_executable(
         root / "bootstrap.sh",
-        r"""#!/usr/bin/env bash
-set -euo pipefail
-wheel=$1
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        + ("command -v uv >/dev/null\n" if require_uv else "")
+        + r"""wheel=$1
 version=${wheel#disttrainer-}
 version=${version%-py3-none-any.whl}
 if [[ "${DT_FAIL_VERSION:-}" == "$version" ]]; then
@@ -119,7 +120,7 @@ host=$1
 shift
 home="$FAKE_REMOTE_ROOT/$host"
 mkdir -p "$home"
-HOME="$home" bash -c "$1"
+PATH="${FAKE_REMOTE_PATH:-$PATH}" HOME="$home" /bin/bash -c "$1"
 """,
     )
     _write_executable(
@@ -198,6 +199,25 @@ def test_deploy_upgrade_and_explicit_rollback_are_atomic(tmp_path):
     assert rollback.returncode == 0, rollback.stderr
     assert _installed_version(remote_home) == "dt 0.9.0"
     assert (base / "current").readlink() == Path("releases/0.9.0")
+
+
+def test_deploy_and_rollback_find_uv_when_ssh_path_omits_user_bin(tmp_path):
+    env, remote_home = _transport(tmp_path)
+    previous = _release(tmp_path, "0.9.0", require_uv=True)
+    current = _release(tmp_path, "0.9.1", require_uv=True)
+    user_bin = remote_home / ".local" / "bin"
+    user_bin.mkdir(parents=True)
+    _write_executable(user_bin / "uv", "#!/usr/bin/env bash\nexit 0\n")
+    env["FAKE_REMOTE_PATH"] = "/usr/bin:/bin"
+
+    initial = _deploy(env, str(previous), "head")
+    upgrade = _deploy(env, str(current), "head")
+    rollback = _deploy(env, "--rollback", "0.9.0", "head")
+
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+    assert upgrade.returncode == 0, upgrade.stdout + upgrade.stderr
+    assert rollback.returncode == 0, rollback.stdout + rollback.stderr
+    assert _installed_version(remote_home) == "dt 0.9.0"
 
 
 def test_failed_activation_automatically_restores_previous_version(tmp_path):

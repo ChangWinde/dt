@@ -79,7 +79,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   symlinked state, an unverifiable current release, and a non-symlink current
   marker before activation, atomically switches the current marker, and
   automatically restores a verified previous version when upgrade activation
-  fails.
+  fails. Remote activation also resolves a user-local `uv` installation when
+  non-interactive SSH omits `~/.local/bin` from `PATH`.
 - The installed command now uses a minimal audited bootstrap for exact
   `dt --version` probes. It preserves start/finish operation records and the
   existing version format without importing the full Typer control plane.
