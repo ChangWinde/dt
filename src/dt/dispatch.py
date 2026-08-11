@@ -3012,6 +3012,12 @@ def _try_nodes(
     spec.payload_sha256 = payload_sha256
     reasons: dict[str, str] = {}
     failure_kinds: set[str] = set()
+
+    def cancel_launch_orphan(node: Node, node_job_dir: str) -> str | None:
+        if cfg.layout == ROLE_LAYOUT:
+            return _cancel_orphan(node, node_job_dir, session, layout=cfg.layout)
+        return _cancel_orphan(node, node_job_dir, session)
+
     for node in candidates:
         node_job_dir = job_dir(node) if callable(job_dir) else job_dir
         log(f"snapshot -> {node.name}")
@@ -3043,16 +3049,7 @@ def _try_nodes(
             )
         except RemoteError as e:
             failure_kinds.add("unreachable")
-            cancel_error = (
-                _cancel_orphan(
-                    node,
-                    node_job_dir,
-                    session,
-                    layout=cfg.layout,
-                )
-                if cfg.layout == ROLE_LAYOUT
-                else _cancel_orphan(node, node_job_dir, session)
-            )
+            cancel_error = cancel_launch_orphan(node, node_job_dir)
             if cancel_error is not None:
                 failure_kinds.add("cancel-unverified")
                 reasons[node.name] = (
@@ -3074,8 +3071,21 @@ def _try_nodes(
             gpu_values = raw_gpus if isinstance(raw_gpus, list) else []
             pgid_value = result.get("pgid")
             if not isinstance(pgid_value, (str, int)) or isinstance(pgid_value, bool):
+                # The launcher exited 0, so the tmux session is already
+                # running; abort without a verified cancel and a manual
+                # retry would run the same experiment twice.
                 failure_kinds.add("fatal")
-                reasons[node.name] = "internal: launcher returned no valid pgid"
+                cancel_error = cancel_launch_orphan(node, node_job_dir)
+                if cancel_error is not None:
+                    failure_kinds.add("cancel-unverified")
+                    reasons[node.name] = (
+                        "internal: launcher returned no valid pgid; "
+                        f"cancellation unverified: {cancel_error}"
+                    )
+                else:
+                    reasons[node.name] = (
+                        "internal: launcher returned no valid pgid; cancelled on node"
+                    )
                 return None, reasons, True, failure_kinds
             env_value = result.get("env")
             boot_id_value = result.get("boot_id")
@@ -3151,6 +3161,23 @@ def _try_nodes(
         if code in FATAL:
             failure_kinds.add("fatal")
             return None, reasons, True, failure_kinds
+        if code not in RETRYABLE:
+            # Retryable codes are pre-session preflight refusals. Anything
+            # else (an unknown exit, ssh dying with 255 mid-launch, or exit 0
+            # whose stdout did not parse) may have left the session running;
+            # failing over without a verified cancel starts a duplicate.
+            cancel_error = cancel_launch_orphan(node, node_job_dir)
+            if cancel_error is not None:
+                failure_kinds.add("cancel-unverified")
+                reasons[node.name] = (
+                    f"{reasons[node.name]}; cancellation unverified: {cancel_error}"
+                )
+                log(
+                    f"{node.name} launcher outcome unknown and cancellation "
+                    "is unverified; stopping failover"
+                )
+                return None, reasons, True, failure_kinds
+            reasons[node.name] = f"{reasons[node.name]}; cancelled on node"
         failure_kinds.add("retryable")
         log(f"{node.name} {reason}, trying next node")
     return None, reasons, False, failure_kinds

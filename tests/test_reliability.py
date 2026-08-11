@@ -604,6 +604,171 @@ def test_launch_drop_stops_failover_when_orphan_cancel_is_unverified(
     )
 
 
+def test_unknown_launcher_exit_cancels_orphan_then_fails_over(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    cancelled: list[str] = []
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda node, job_dir, session: cancelled.append(node.name),
+    )
+
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+        if node.name == "n1":
+            return 255, "ssh: connection reset during launch"
+        return 0, {"gpus": [0], "pgid": 42}
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+
+    entry, reasons, fatal, _failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda message: None,
+    )
+
+    assert entry is not None and entry.node == "n2"
+    assert not fatal
+    assert cancelled == ["n1"]
+    assert "cancelled on node" in reasons["n1"]
+
+
+def test_unknown_launcher_exit_stops_failover_when_cancel_unverified(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    launched: list[str] = []
+
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+        launched.append(node.name)
+        return 255, "ssh: connection reset during launch"
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda node, job_dir, session: "ssh: No route to host",
+    )
+
+    entry, reasons, fatal, failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda message: None,
+    )
+
+    assert entry is None
+    assert fatal
+    assert launched == ["n1"]
+    assert "cancel-unverified" in failure_kinds
+    assert "cancellation unverified: ssh: No route to host" in reasons["n1"]
+
+
+def test_zero_exit_with_unparsable_output_cancels_before_failover(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    cancelled: list[str] = []
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda node, job_dir, session: cancelled.append(node.name),
+    )
+
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+        if node.name == "n1":
+            return 0, "launcher stdout was not json"
+        return 0, {"gpus": [0], "pgid": 42}
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+
+    entry, reasons, fatal, _failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda message: None,
+    )
+
+    assert entry is not None and entry.node == "n2"
+    assert cancelled == ["n1"]
+    assert "cancelled on node" in reasons["n1"]
+
+
+def test_invalid_pgid_cancels_running_session_before_abort(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    cancelled: list[str] = []
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda node, job_dir, session: cancelled.append(node.name),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "launch",
+        lambda *args, **kwargs: (0, {"gpus": [0], "pgid": None}),
+    )
+
+    entry, reasons, fatal, failure_kinds = _try_nodes(
+        cfg,
+        [cfg.nodes[0]],
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda message: None,
+    )
+
+    assert entry is None
+    assert fatal
+    assert cancelled == ["n1"]
+    assert "no valid pgid; cancelled on node" in reasons["n1"]
+
+
+def test_retryable_launcher_exit_fails_over_without_cancel(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda *args, **kwargs: pytest.fail(
+            "preflight refusals must not trigger orphan cancellation"
+        ),
+    )
+
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+        if node.name == "n1":
+            return 10, "busy"
+        return 0, {"gpus": [0], "pgid": 42}
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+
+    entry, reasons, _fatal, _failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda message: None,
+    )
+
+    assert entry is not None and entry.node == "n2"
+    assert reasons["n1"] == "busy: busy"
+
+
 def test_cancel_orphan_requires_verified_death_without_a_known_pgid(
     tmp_path, monkeypatch
 ):
