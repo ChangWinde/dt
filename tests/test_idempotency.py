@@ -145,6 +145,43 @@ def test_equal_request_with_different_intent_conflicts(tmp_path, monkeypatch):
         _submit(cfg, changed, source)
 
 
+def test_git_metadata_is_not_part_of_request_intent(tmp_path, monkeypatch):
+    # A retry after `git commit` (working tree byte-identical, so the same
+    # source snapshot) must replay the confirmed receipt, not raise a spurious
+    # idempotency conflict. Git sha/dirty/diff are provenance recorded on the
+    # entry; they must never enter the intent digest.
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+
+    def fake_submit_once(cfg_, spec, **kwargs):
+        return _entry(cfg_, spec, kwargs["allocated_job_id"], kwargs["submitted_at"])
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", fake_submit_once)
+
+    def submit(git_sha, git_dirty, git_diff):
+        return dispatch._submit_prepared(
+            cfg,
+            RunSpec(
+                name="train",
+                gpus=1,
+                cmd=["python", "train.py"],
+                project="p",
+                request_id="agent-run-git",
+            ),
+            source_factory=lambda: source,
+            git_sha=git_sha,
+            git_dirty=git_dirty,
+            git_diff=git_diff,
+            log=lambda _message: None,
+            no_queue=False,
+        )
+
+    first = submit("a" * 40, True, "+a dirty change\n")
+    # Equivalent to `git commit -a`: identical tree, but every git field flips.
+    replay = submit("c" * 40, False, None)
+    assert replay.job_id == first.job_id
+
+
 def test_interrupted_request_fails_closed_instead_of_launching_again(
     tmp_path,
     monkeypatch,

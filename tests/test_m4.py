@@ -767,6 +767,30 @@ def test_clean_jobs_selection_and_staging(tmp_path):
     assert {e.job_id for e in list_all(cfg)} == {"old-queued", "new-done"}
 
 
+def test_clean_keeps_shared_snapshot_when_a_live_row_is_unreadable(tmp_path):
+    # DT-07: the snapshot GC must not treat an UNREADABLE registry row as "no
+    # reference". A live job whose row cannot be parsed still owns its snapshot;
+    # deleting it (because an old job shared the digest) destroys the live job's
+    # only recovery source. Fail closed instead of guessing unreferenced.
+    cfg = _cfg(tmp_path)
+    digest = "a" * 64
+    snapshot = cfg.snapshots_dir() / digest
+    snapshot.mkdir(parents=True)
+    (snapshot / "code.txt").write_text("recoverable")
+    os.utime(snapshot, (10.0, 10.0))  # older than the cutoff
+
+    save(cfg, _entry("old-done", "finished", created_at=1.0, snapshot_sha256=digest))
+    save(cfg, _entry("live-run", "running", created_at=1.0, snapshot_sha256=digest))
+    # Corrupt the live row so list_all reports damage for it.
+    (cfg.registry_dir() / "live-run.json").write_text("{ not json")
+
+    report = clean_jobs(cfg, cutoff_ts=100.0, envs=False, log=lambda _: None)
+
+    assert report.removed == 1  # old-done cleaned; live-run is not terminal
+    assert snapshot.is_dir(), "shared snapshot of a live unreadable row was deleted"
+    assert (snapshot / "code.txt").read_text() == "recoverable"
+
+
 def test_clean_jobs_project_filter(tmp_path):
     cfg = _cfg(tmp_path)
     save(cfg, _entry("smoke-done", "finished", created_at=1.0, project="smoke"))

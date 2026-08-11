@@ -2,6 +2,7 @@
 and rsync retries must resume."""
 
 import json
+import math
 import shutil
 import subprocess
 import time
@@ -199,6 +200,75 @@ def test_refresh_status_preserves_typed_scientific_result(tmp_path, monkeypatch)
     assert refreshed.exit_code == 0
     assert refreshed.result_state == "scientific_reject"
     assert jobs.effective_result_state(refreshed) == "scientific_reject"
+
+
+def _refresh_with_probe_output(tmp_path, monkeypatch, stdout, **entry_kwargs):
+    cfg = _cfg(tmp_path)
+    fields = {
+        "job_id": "jid",
+        "name": "job",
+        "center": "test",
+        "project": "p",
+        "node": "n1",
+        "node_local": False,
+        "job_dir": "dt/jobs/jid",
+        "session": "dt_jid",
+        "cmd": "true",
+        "pgid": 1234,
+        "started_at": 90.0,
+    }
+    fields.update(entry_kwargs)
+    entry = JobEntry(**fields)
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout, ""),
+    )
+    return jobs.refresh_status(cfg, entry)
+
+
+def test_refresh_status_rejects_out_of_range_exit_code(tmp_path, monkeypatch):
+    # A managed exit_code file holds a byte in [0, 255]. An out-of-range value
+    # is corrupt evidence: refresh must not raise (it once let save() throw and
+    # took down every dt ps), must not fabricate a finished state.
+    for bad in ("999", "-3", "100000"):
+        refreshed = _refresh_with_probe_output(
+            tmp_path,
+            monkeypatch,
+            f"boot-a\n{jobs.STATUS_MARK}\n{bad}\n100.125\n112.875\n",
+        )
+        assert refreshed.status != "finished", bad
+        assert refreshed.exit_code != int(bad), bad
+
+
+def test_refresh_status_rejects_non_finite_remote_timestamps(tmp_path, monkeypatch):
+    # inf/nan satisfy ">0"/comparison traps; they must not reach save() as a
+    # lifecycle timestamp. A valid exit code still completes the job with a
+    # finite clock.
+    refreshed = _refresh_with_probe_output(
+        tmp_path,
+        monkeypatch,
+        f"boot-a\n{jobs.STATUS_MARK}\n0\ninf\nnan\n",
+    )
+    assert refreshed.status == "finished"
+    assert refreshed.exit_code == 0
+    assert refreshed.started_at == 90.0  # unchanged; the inf was rejected
+    assert refreshed.finished_at is not None and math.isfinite(refreshed.finished_at)
+
+
+def test_refresh_status_anchors_on_the_first_status_marker(tmp_path, monkeypatch):
+    # A job that writes a second marker plus fake fields into its own state file
+    # must not move the parse anchor. The real fields follow the FIRST marker
+    # (emitted right after the trusted /proc boot_id line).
+    injected = (
+        f"boot-a\n{jobs.STATUS_MARK}\n0\n100.125\n112.875\nsuccess\n"
+        f"{jobs.STATUS_MARK}\n7\n555.0\n666.0\nscientific_reject\n"
+    )
+    refreshed = _refresh_with_probe_output(tmp_path, monkeypatch, injected)
+    assert refreshed.exit_code == 0
+    assert refreshed.started_at == 100.125
+    assert refreshed.finished_at == 112.875
+    assert refreshed.result_state == "success"
 
 
 def test_refresh_status_identifies_node_reboot_before_pid_reuse(tmp_path, monkeypatch):

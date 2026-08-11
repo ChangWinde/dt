@@ -453,6 +453,32 @@ def test_phase_helper_records_safe_marker_and_rejects_unsafe_names(tmp_path):
     assert current.read_text().strip() == "dataset.load"
 
 
+def test_parse_resource_jsonl_rejects_non_finite_values():
+    text = "\n".join(
+        [
+            json.dumps({"timestamp": 1.0, "cpu_pct": 10.0}),
+            '{"timestamp": Infinity, "cpu_pct": 5.0}',
+            '{"timestamp": 2.0, "cpu_pct": NaN}',
+            json.dumps({"timestamp": 3.0, "cpu_pct": 20.0}),
+        ]
+    )
+    rows, invalid = _parse_resource_jsonl(text)
+    assert invalid == 2
+    assert [row["timestamp"] for row in rows] == [1.0, 3.0]
+
+
+def test_summary_drops_non_finite_and_stays_valid_json():
+    # A worker-written inf/nan must never reach the summary, so metrics/info
+    # --json can always serialize with allow_nan=False.
+    rows = [
+        {"timestamp": 1.0, "cpu_pct": float("inf")},
+        {"timestamp": 2.0, "cpu_pct": 20.0},
+    ]
+    summary = _summarize_resources(rows)
+    json.dumps(summary, allow_nan=False)  # raises if any residual inf/nan
+    assert summary["duration_s"] == 1.0
+
+
 def test_phase_summary_preserves_order_and_terminal_durations():
     entry = JobEntry(
         job_id="phase-summary",
