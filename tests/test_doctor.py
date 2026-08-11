@@ -138,6 +138,28 @@ def test_lan_annotation_flags_drifted_pinned_address(tmp_path):
     assert "lan" not in rows[3]["checks"]
 
 
+def test_lan_annotation_hostname_pin_is_unknown_not_stale(tmp_path):
+    cfg = _cfg(
+        tmp_path,
+        nodes=[
+            Node(name="host-pin", lan_address="node1.cluster.local", lan_port=2222),
+            Node(name="v6-ok", lan_address="2001:db8::1"),
+            Node(name="v6-drift", lan_address="2001:db8::9"),
+        ],
+    )
+    rows = [
+        {"node": "host-pin", "checks": {"addrs": "10.0.0.5,172.17.0.1"}},
+        {"node": "v6-ok", "checks": {"addrs": "2001:0db8:0000::0001,10.0.0.5"}},
+        {"node": "v6-drift", "checks": {"addrs": "2001:db8::1"}},
+    ]
+
+    doctor.annotate_lan_addresses(cfg, rows)
+
+    assert rows[0]["checks"]["lan"] == "unknown"
+    assert rows[1]["checks"]["lan"] == "ok"
+    assert rows[2]["checks"]["lan"] == "stale: 2001:db8::9 not on node"
+
+
 def test_check_node_parses_advertised_addresses(monkeypatch):
     def fake_run_on(name, local, snippet, timeout):
         return subprocess.CompletedProcess(

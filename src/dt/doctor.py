@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import ipaddress
+
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -143,6 +145,19 @@ def relay_agent_status(
     return failure
 
 
+def _parse_ip_literal(
+    value: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse one IP literal, tolerating surrounding whitespace and brackets."""
+    candidate = value.strip().strip("[]")
+    if not candidate:
+        return None
+    try:
+        return ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+
+
 def annotate_lan_addresses(cfg: HeadConfig, rows: list[dict[str, Any]]) -> None:
     """Flag nodes whose pinned ``lan_address`` is no longer on the node.
 
@@ -161,12 +176,23 @@ def annotate_lan_addresses(cfg: HeadConfig, rows: list[dict[str, Any]]) -> None:
         if lan_address is None:
             continue
         checks = row["checks"]
+        pinned_ip = _parse_ip_literal(lan_address)
+        if pinned_ip is None:
+            # Hostnames and other non-literal pins cannot be checked against
+            # the advertised IP list; report unknown instead of failing a
+            # healthy cluster on a representation mismatch.
+            checks["lan"] = "unknown"
+            continue
         raw_addresses = str(checks.get("addrs", "missing"))
         if raw_addresses in ("missing", ""):
             checks["lan"] = "unknown"
             continue
-        addresses = {part.strip() for part in raw_addresses.split(",") if part.strip()}
-        if lan_address in addresses:
+        advertised = {
+            parsed
+            for part in raw_addresses.split(",")
+            if (parsed := _parse_ip_literal(part)) is not None
+        }
+        if pinned_ip in advertised:
             checks["lan"] = "ok"
         else:
             checks["lan"] = f"stale: {lan_address} not on node"
