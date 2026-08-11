@@ -13,6 +13,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -181,7 +182,13 @@ def _fallback_state_root() -> Path:
         candidate = Path(raw).expanduser()
         if candidate.is_absolute():
             return candidate
-    return Path.home() / ".local" / "state"
+    try:
+        return Path.home() / ".local" / "state"
+    except (RuntimeError, OSError):
+        # HOME is unset and the uid is absent from the passwd database
+        # (bare containers, some CI). The journal is fail-open, so degrade
+        # to a temp root rather than crashing every dt command.
+        return Path(tempfile.gettempdir()) / "dt-state"
 
 
 def resolve_target(
@@ -192,7 +199,10 @@ def resolve_target(
     if cfg is None:
         try:
             cfg = load()
-        except ConfigError:
+        except (ConfigError, OSError, RuntimeError):
+            # RuntimeError/OSError here is HOME/path resolution failing while
+            # expanding the config path; the journal degrades to the fallback
+            # root instead of propagating and crashing the command.
             cfg = None
     if isinstance(cfg, HeadConfig):
         role = "head"
@@ -371,7 +381,17 @@ def _base_event(session: OperationSession, phase: str) -> dict[str, Any]:
 
 def begin(argv: list[str]) -> OperationSession:
     global _CURRENT
-    target = resolve_target()
+    try:
+        target = resolve_target()
+    except Exception:
+        # The journal must never stop a command from running. If target
+        # resolution fails for any reason, degrade to a best-effort temp
+        # target; append_event already tolerates an unwritable directory.
+        target = JournalTarget(
+            directory=Path(tempfile.gettempdir()) / "dt-state" / "dt" / "operations",
+            role="unknown",
+            settings=OperationsCfg(),
+        )
     session = OperationSession(
         operation_id=uuid.uuid4().hex,
         parent_operation_id=_safe_parent_id(),
