@@ -55,6 +55,10 @@ NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
 MAX_SAFE_NAME_LENGTH = 64
 SAFE_NAME_DIGEST_LENGTH = 12
 STATUS_MARK = "@@DT_STATUS_V2@@"
+# How long a freshly lost job stays eligible for rescue: the agent
+# rechecks it (a late exit marker can flip it back) and dependency gates
+# must not permanently skip dependents inside this window.
+LOST_RECHECK_S = 5 * 60
 CANCEL_UNVERIFIED_PREFIX = "dequeue raced with dispatch; cancellation unverified: "
 UNCERTAIN_LAUNCH_PREFIX = "launch outcome uncertain: "
 RESULT_STATES = frozenset(

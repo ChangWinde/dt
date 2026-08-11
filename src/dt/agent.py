@@ -42,6 +42,7 @@ from . import completion as completion_mod
 from .config import HeadConfig
 from .dispatch import clean_jobs, dispatch_queued
 from .jobs import (
+    LOST_RECHECK_S as jobs_lost_recheck_s,
     JobEntry,
     RegistryDamage,
     agent_wake_path,
@@ -65,7 +66,7 @@ _stop_completion_watcher = completion_mod.stop_completion_watcher
 CRON_MARK = "# dt-agent"
 SYSTEMD_UNIT = "disttrainer-agent.service"
 AUTOCLEAN_EVERY_S = 24 * 3600
-LOST_RECHECK_S = 5 * 60
+LOST_RECHECK_S = jobs_lost_recheck_s
 AGENT_LOG_MAX_BYTES = 10 * 1024 * 1024
 AGENT_LOG_BACKUPS = 2
 SYSTEMD_UNIT_MAX_BYTES = 64 * 1024

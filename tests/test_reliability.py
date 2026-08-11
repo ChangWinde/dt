@@ -547,6 +547,90 @@ def test_zero_disk_floor_stays_out_of_the_job_contract(tmp_path, monkeypatch):
     dispatch._validate_run_spec(spec)  # must not raise ConfigError
 
 
+def test_lost_predecessor_blocks_inside_rescue_window(tmp_path):
+    """A guarded chain must survive a transient lost blip (audit I4)."""
+    import time as time_mod
+
+    cfg = _cfg(tmp_path)
+    predecessor = JobEntry(
+        job_id="pred",
+        name="pred",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/pred",
+        session="dt_pred",
+        cmd="true",
+        status="lost",
+        finished_at=time_mod.time(),
+    )
+    jobs.save(cfg, predecessor)
+    dependent = JobEntry(
+        job_id="dep",
+        name="dep",
+        center="test",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/dep",
+        session="dt_dep",
+        cmd="true",
+        status="queued",
+        after_success="pred",
+    )
+    jobs.save(cfg, dependent)
+
+    outcome, detail = dispatch.dispatch_queued(cfg, dependent, lambda m: None)
+
+    assert outcome == "blocked"
+    assert "rescue window" in detail
+    stored = jobs.load(cfg, "dep")
+    assert stored is not None
+    assert stored.status == "queued"
+
+
+def test_lost_predecessor_skips_after_rescue_window(tmp_path):
+    import time as time_mod
+
+    cfg = _cfg(tmp_path)
+    predecessor = JobEntry(
+        job_id="pred-old",
+        name="pred-old",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/pred-old",
+        session="dt_pred_old",
+        cmd="true",
+        status="lost",
+        finished_at=time_mod.time() - (jobs.LOST_RECHECK_S + 60),
+    )
+    jobs.save(cfg, predecessor)
+    dependent = JobEntry(
+        job_id="dep-old",
+        name="dep-old",
+        center="test",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/dep-old",
+        session="dt_dep_old",
+        cmd="true",
+        status="queued",
+        after_success="pred-old",
+    )
+    jobs.save(cfg, dependent)
+
+    outcome, _detail = dispatch.dispatch_queued(cfg, dependent, lambda m: None)
+
+    assert outcome == "skipped"
+    stored = jobs.load(cfg, "dep-old")
+    assert stored is not None
+    assert stored.status == "skipped"
+
+
 def test_launch_drop_fails_over_to_next_node(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     cancelled: list[str] = []

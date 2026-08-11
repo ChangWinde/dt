@@ -55,6 +55,7 @@ from .maintenance import (
     clean_jobs as _clean_jobs,
 )
 from .jobs import (
+    LOST_RECHECK_S,
     CANCEL_UNVERIFIED_PREFIX,
     UNCERTAIN_LAUNCH_PREFIX,
     RESULT_STATES,
@@ -4223,6 +4224,21 @@ def dispatch_queued(
                 return "failed", detail
             if predecessor.status in {"queued", "running"}:
                 detail = f"dependency {dependency} is {predecessor.status}"
+                reason = f"waiting: {detail}"
+                if current.reason != reason:
+                    current.reason = reason
+                    save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                return "blocked", detail
+            if (
+                predecessor.status == "lost"
+                and predecessor.finished_at is not None
+                and time.time() - predecessor.finished_at <= LOST_RECHECK_S
+            ):
+                # The agent still rechecks freshly lost jobs (a late exit
+                # marker rescues them); skipping dependents now would turn a
+                # transient network blip into a permanently dead chain.
+                detail = f"dependency {dependency} is lost but inside the rescue window"
                 reason = f"waiting: {detail}"
                 if current.reason != reason:
                     current.reason = reason
