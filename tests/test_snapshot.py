@@ -125,3 +125,30 @@ def test_git_cleanup_reaps_before_restoring_repeated_interrupt(monkeypatch):
         (4321, git_provenance.signal.SIGTERM),
         (4321, git_provenance.signal.SIGKILL),
     ]
+
+
+def test_stop_git_process_survives_eperm_on_zombie_group(monkeypatch):
+    """macOS raises EPERM for zombie process groups; reap instead of crashing."""
+
+    class Process:
+        pid = 4321
+
+        def __init__(self):
+            self.waited = False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.waited = True
+            return 0
+
+    process = Process()
+
+    def deny(pid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(git_provenance.os, "killpg", deny)
+
+    assert git_provenance.stop_git_process(process) is False
+    assert process.waited

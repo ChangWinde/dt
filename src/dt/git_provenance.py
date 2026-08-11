@@ -25,7 +25,9 @@ def stop_git_process(process: subprocess.Popen[bytes]) -> bool:
         return interrupted
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
+        # macOS raises EPERM when signalling a zombie process group; the
+        # group is already dead either way, so fall through to reaping.
         while True:
             try:
                 process.wait()
@@ -41,7 +43,7 @@ def stop_git_process(process: subprocess.Popen[bytes]) -> bool:
         pass
     try:
         os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     while True:
         try:
