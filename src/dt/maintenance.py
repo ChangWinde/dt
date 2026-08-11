@@ -12,7 +12,14 @@ from datetime import datetime
 from pathlib import PurePosixPath
 
 from .config import HeadConfig
-from .jobs import JobEntry, job_lock, list_all, load, remove_record
+from .jobs import (
+    JobEntry,
+    RegistryDamage,
+    job_lock,
+    list_all,
+    load,
+    remove_record,
+)
 from .layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
@@ -226,12 +233,18 @@ def _remove_unreferenced_snapshots(
         return
     removed_digests: set[str] = set()
     with lock(cfg):
+        damage: list[RegistryDamage] = []
         referenced = {
             entry.snapshot_sha256
-            for entry in list_all(cfg)
+            for entry in list_all(cfg, damage=damage)
             if entry.snapshot_sha256
             and re.fullmatch(r"[0-9a-f]{64}", entry.snapshot_sha256)
         }
+        if damage:
+            # An unreadable registry row may still reference a snapshot, so
+            # "unreferenced" cannot be proven. Skip snapshot GC entirely
+            # rather than risk deleting a damaged job's recovery snapshot.
+            return
         for digest in victim_digests - referenced:
             roots = {cfg.snapshots_dir(), cfg.legacy_snapshots_dir()}
             removed_any = False

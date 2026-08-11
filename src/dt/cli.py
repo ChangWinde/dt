@@ -25,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from threading import Event
 from typing import (
     Any,
@@ -4618,7 +4618,8 @@ def _gather_ps_rows(
             _scope_laptop_ps_refs(cfg, rows)
         return _limit_ps_rows(rows, limit), errors
 
-    entries = jobs_mod.list_all(cfg)
+    registry_damage: list[jobs_mod.RegistryDamage] = []
+    entries = jobs_mod.list_all(cfg, damage=registry_damage)
     display_refs = jobs_mod.compact_job_refs(entries)
     refresh_statuses = {"running", "lost"}
     if active_only:
@@ -4781,7 +4782,13 @@ def _gather_ps_rows(
             row.setdefault("log_source", None)
             row.setdefault("progress_error", None)
             row.setdefault("resources", None)
-    return _limit_ps_rows(rows, limit), {}
+    damage_errors = {
+        f"registry:{PurePath(item.path).name}": (
+            f"unreadable registry entry: {item.detail}"
+        )
+        for item in registry_damage
+    }
+    return _limit_ps_rows(rows, limit), damage_errors
 
 
 def _select_ps_rows(
