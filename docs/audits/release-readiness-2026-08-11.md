@@ -145,6 +145,11 @@ release-sealing commit.
   before manifest publication. A disposable in-tree-output run exposed the old
   gap; the corrected outside-tree run emitted a clean seven-artifact 0.7.1
   manifest with every listed checksum verified.
+- Development package qualification now binds `uv build --no-build-isolation`
+  to the requested matrix Python. A clean Python 3.10 CI environment previously
+  fell back to the repository's 3.11 preference after its test environment had
+  been prepared, so the build could not see the 3.10 environment's Hatchling
+  backend even though all 1,416 Python 3.10 tests passed.
 
 ## Remaining promotion blockers
 

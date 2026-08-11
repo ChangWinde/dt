@@ -19,6 +19,13 @@ read -r DISTRIBUTION PACKAGE_VERSION SOURCE_VERSION < <(
 )
 [[ "$PACKAGE_VERSION" == "$SOURCE_VERSION" ]]
 
+# Build and install against the same supported Python minor.  Without this
+# binding, uv can fall back to .python-version after CI has prepared a different
+# matrix environment, making --no-build-isolation miss that environment's
+# build backend.
+PACKAGE_PYTHON="${DT_PACKAGE_PYTHON:-3.11}"
+export UV_PYTHON="$PACKAGE_PYTHON"
+
 WORK_DIR="$(mktemp -d /tmp/disttrainer-package.XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 BUILD_A="$WORK_DIR/build-a"
@@ -65,7 +72,7 @@ python3 scripts/audit_release.py \
 uv export --format requirements.txt --no-dev --no-emit-project --locked \
     --no-annotate --no-header "${UV_NETWORK[@]}" \
     -o "$WORK_DIR/runtime-constraints.txt" >/dev/null
-uv venv --python "${DT_PACKAGE_PYTHON:-3.11}" "$INSTALL_ENV" >/dev/null
+uv venv --python "$PACKAGE_PYTHON" "$INSTALL_ENV" >/dev/null
 uv --no-config pip install "${UV_NETWORK[@]}" --python "$INSTALL_ENV/bin/python" \
     --require-hashes --only-binary :all: \
     -r "$WORK_DIR/runtime-constraints.txt" >/dev/null
