@@ -5756,7 +5756,14 @@ _LOG_NUL_RUN_RE = re.compile(r"\x00+")
 
 def _stable_remote_exit(returncode: int) -> int:
     """Hide SSH's process-specific 255 behind dt's stable unreachable code."""
-    return EXIT_UNREACHABLE if returncode == 255 else returncode
+    if returncode == 255:
+        return EXIT_UNREACHABLE
+    if returncode < 0:
+        # subprocess reports signal death as a negative number; without
+        # normalizing it, `dt logs -f | head` (SIGPIPE, -13) surfaces as a
+        # wrapped 243. Use the shell-standard 128+signal convention.
+        return 128 + min(-returncode, 127)
+    return returncode
 
 
 def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
