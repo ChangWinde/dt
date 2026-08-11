@@ -85,6 +85,7 @@ from .private_state import (
 )
 from .probe import NodeStatus, probe_center, probe_node, status_as_dict
 from .remote import (
+    FULL_JOB_ID_RE,
     center_worker_count,
     fan_json,
     fan_json_by_center,
@@ -1479,7 +1480,9 @@ def free(
 # dt options before that boundary fail locally instead of becoming the remote
 # executable.
 RUN_CTX = {"allow_extra_args": True}
-_JOB_ID_LINE_RE = re.compile(r"^\d{8}-\d{4}_[A-Za-z0-9_-]+_[0-9a-f]{4}$")
+# Job ids moved from token_hex(2) to token_hex(8); reuse the shared
+# pattern so the laptop line filter can never drift from head again.
+_JOB_ID_LINE_RE = FULL_JOB_ID_RE
 
 
 def _fail_submission(
