@@ -10,12 +10,19 @@ from ._provenance import SOURCE_COMMIT
 
 
 def repository_sha() -> str | None:
-    """Return the source checkout's short commit when running from a worktree."""
-    for parent in Path(__file__).resolve().parents:
-        if not (parent / ".git").exists():
+    """Return the source checkout's short commit when running from a worktree.
+
+    The search is bounded to the package's own repository. Walking every
+    ancestor made ``dt --version`` report the commit of whatever repository
+    happened to contain ``$HOME``, which flipped the string and broke the
+    deploy assertion of an exact ``dt <version>``.
+    """
+    package_root = Path(__file__).resolve().parent.parent
+    for candidate in (package_root, package_root.parent):
+        if not (candidate / ".git").exists():
             continue
         proc = subprocess.run(
-            ["git", "-C", str(parent), "rev-parse", "--short", "HEAD"],
+            ["git", "-C", str(candidate), "rev-parse", "--short", "HEAD"],
             capture_output=True,
             text=True,
             check=False,

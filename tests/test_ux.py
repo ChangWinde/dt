@@ -31,6 +31,36 @@ def _max_terminal_width(output: str) -> int:
 # -- root onboarding -----------------------------------------------------------
 
 
+def test_repository_sha_is_bounded_to_the_package_repo(monkeypatch, tmp_path):
+    """dt --version must not read a commit from a repo that merely contains HOME."""
+    import subprocess as subprocess_mod
+
+    from dt import version
+
+    monkeypatch.setattr(version, "SOURCE_COMMIT", None)
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess_mod.CompletedProcess(argv, 0, "deadbee\n", "")
+
+    monkeypatch.setattr(version.subprocess, "run", fake_run)
+
+    fake_pkg_file = tmp_path / "pkg" / "dt" / "version.py"
+    fake_pkg_file.parent.mkdir(parents=True)
+    monkeypatch.setattr(version, "__file__", str(fake_pkg_file))
+
+    # No .git anywhere near the package: must not walk up to $HOME's repo.
+    assert version.repository_sha() is None
+    assert calls == []
+
+    # A .git at the package repo root is honored.
+    (tmp_path / "pkg" / ".git").mkdir()
+    assert version.repository_sha() == "deadbee"
+    assert len(calls) == 1
+
+
 def test_version_prefers_installed_source_commit(monkeypatch):
     from typer.testing import CliRunner
 
