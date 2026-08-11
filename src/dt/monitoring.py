@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -123,14 +124,22 @@ def safe_phase_name(value: object) -> bool:
     )
 
 
+def _reject_non_finite(constant: str) -> float:
+    # json.loads accepts Infinity/-Infinity/NaN by default. Telemetry is
+    # worker-writable; a non-finite value serializes back to invalid JSON in
+    # `metrics --json`/`info --json` and overflows duration formatting. Treat
+    # the whole line as corrupt rather than letting it poison the summary.
+    raise ValueError(f"non-finite JSON constant: {constant}")
+
+
 def parse_resource_jsonl(text: str) -> tuple[list[JsonDict], int]:
     """Parse telemetry JSONL while tolerating an interrupted final write."""
     rows: list[JsonDict] = []
     invalid = 0
     for line in text.splitlines():
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
+            row = json.loads(line, parse_constant=_reject_non_finite)
+        except (json.JSONDecodeError, ValueError):
             invalid += 1
             continue
         if isinstance(row, dict):
@@ -144,7 +153,9 @@ def _numbers(values: list[object]) -> list[int | float]:
     return [
         value
         for value in values
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and (not isinstance(value, float) or math.isfinite(value))
     ]
 
 
