@@ -2,6 +2,7 @@
 and rsync retries must resume."""
 
 import json
+import math
 import shutil
 import subprocess
 import time
@@ -199,6 +200,70 @@ def test_refresh_status_preserves_typed_scientific_result(tmp_path, monkeypatch)
     assert refreshed.exit_code == 0
     assert refreshed.result_state == "scientific_reject"
     assert jobs.effective_result_state(refreshed) == "scientific_reject"
+
+
+def test_refresh_status_rejects_out_of_range_exit_code(tmp_path, monkeypatch):
+    """A job-writable state file with a bogus code must not poison the row."""
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="oob-exit",
+        name="oob-exit",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/oob-exit",
+        session="dt_oob",
+        cmd="true",
+        pgid=1234,
+    )
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, "boot-1\n99999999\n", ""
+        ),
+    )
+
+    observation = {}
+    refreshed = jobs.refresh_status(cfg, entry, observation=observation)
+
+    assert refreshed.status == "running"
+    assert refreshed.exit_code is None
+    assert "out-of-range exit code" in observation["status_probe_error"]
+    assert jobs.load(cfg, "oob-exit") is None  # damaged probe was not persisted
+
+
+def test_refresh_status_rejects_non_finite_remote_timestamps(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="inf-times",
+        name="inf-times",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/inf-times",
+        session="dt_inf",
+        cmd="true",
+        pgid=1234,
+    )
+    stdout = "boot-1\n" + jobs.STATUS_MARK + "\n0\ninf\ninf\nsuccess\n"
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout, ""),
+    )
+
+    refreshed = jobs.refresh_status(cfg, entry, observation={})
+
+    assert refreshed.status == "finished"
+    assert refreshed.exit_code == 0
+    assert refreshed.started_at is None or math.isfinite(refreshed.started_at)
+    assert refreshed.finished_at is not None
+    assert math.isfinite(refreshed.finished_at)
+    stored = jobs.load(cfg, "inf-times")
+    assert stored is not None
 
 
 def test_refresh_status_identifies_node_reboot_before_pid_reuse(tmp_path, monkeypatch):

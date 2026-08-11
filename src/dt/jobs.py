@@ -953,25 +953,42 @@ def _refresh_status_locked(
             timestamp = float(value)
         except (TypeError, ValueError):
             return None
+        if not math.isfinite(timestamp):
+            # inf/nan from a job-writable state file must never reach the
+            # registry: json round-trips reject it and every later consumer
+            # of this row would crash.
+            return None
         return timestamp if timestamp > 0 else None
 
     remote_started_at = positive_timestamp(started_token)
     remote_finished_at = positive_timestamp(finished_token)
     if token not in ("RUNNING", "LOST", "STALE"):
         try:
-            entry.exit_code = int(token)
-            entry.status = "finished"
-            entry.reason = None
-            if remote_started_at is not None:
-                entry.started_at = remote_started_at
-            entry.finished_at = remote_finished_at or time.time()
-            entry.result_state = (
-                result_token
-                if result_token in RESULT_STATES
-                else ("success" if entry.exit_code == 0 else "execution_failure")
-            )
+            exit_code = int(token)
         except ValueError:
             return entry
+        if not 0 <= exit_code <= 255:
+            # The state file is job-writable; an out-of-range code is damage,
+            # not a result. Keep the last known state and surface the problem
+            # instead of persisting a row every consumer would choke on.
+            if observation is not None:
+                observation.update(
+                    status_probe_error=(
+                        f"out-of-range exit code {exit_code} in state probe"
+                    ),
+                )
+            return entry
+        entry.exit_code = exit_code
+        entry.status = "finished"
+        entry.reason = None
+        if remote_started_at is not None:
+            entry.started_at = remote_started_at
+        entry.finished_at = remote_finished_at or time.time()
+        entry.result_state = (
+            result_token
+            if result_token in RESULT_STATES
+            else ("success" if entry.exit_code == 0 else "execution_failure")
+        )
         save(cfg, entry)
         return entry
     if (
