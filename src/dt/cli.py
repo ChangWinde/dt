@@ -4782,6 +4782,11 @@ def _gather_ps_rows(
             row.setdefault("log_source", None)
             row.setdefault("progress_error", None)
             row.setdefault("resources", None)
+    if issues_only:
+        # Filter before the newest-N window: otherwise the oldest failing
+        # jobs silently vanish from --issues and the bounded-query envelope
+        # reports an eligible count that cursors can never enumerate.
+        rows = list(_ps_issue_rows(rows))
     damage_errors = {
         f"registry:{PurePath(item.path).name}": (
             f"unreadable registry entry: {item.detail}"
@@ -5428,7 +5433,10 @@ def ps(
         window_kwargs: JsonDict = {"remote_window": True} if remote_window else {}
         if limit is not None and not legacy_issue_window and not query_mode:
             window_kwargs["limit"] = limit
-        if issues:
+        if issues and not legacy_issue_window:
+            # The legacy v1 window contract ships the full superset and lets
+            # the old laptop client filter; every other path filters on the
+            # head before the newest-N window (audit A4).
             window_kwargs["issues_only"] = True
         if active_only:
             rows, errors = _gather_ps_rows(

@@ -110,3 +110,34 @@ def test_list_all_reports_split_brain_rows(tmp_path):
 
     assert [entry.job_id for entry in entries] == ["split-job"]
     assert any("split-brain" in item.detail for item in damage)
+
+
+def test_ps_issues_filter_applies_before_limit(tmp_path):
+    """--issues --limit N must keep old failing jobs visible (audit A4)."""
+    cfg = _cfg(tmp_path)
+    for index in range(3):
+        save(
+            cfg,
+            _entry(
+                f"failed-{index}",
+                status="failed",
+                exit_code=1,
+                created_at=100.0 + index,
+                reason="env-fail: broken",
+            ),
+        )
+    for index in range(2):
+        save(
+            cfg,
+            _entry(
+                f"ok-{index}",
+                status="finished",
+                exit_code=0,
+                created_at=1000.0 + index,
+            ),
+        )
+
+    rows, _errors = cli._gather_ps_rows(cfg, status=None, issues_only=True, limit=2)
+
+    job_ids = {row["job_id"] for row in rows}
+    assert job_ids == {"failed-1", "failed-2"}
