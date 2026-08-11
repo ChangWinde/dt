@@ -129,8 +129,13 @@ def termination_probe(
     script = (
         process_identity_shell() + "owned_group() { "
         'dt_process_owned "$DT_KPG" "$DT_KIDENT" "$DT_KJD" "$DT_KBOOT"; }; '
-        + "emit_cwd_pid() { dt_ec_pid=$1; "
-        'if [ "$DT_KGROUP_OWNED" -eq 0 ] && [ "$DT_KPG" -gt 0 ]; then '
+        # A live-but-unproven leader (rc=2) means the PGID may belong to a
+        # reused, unrelated process group: never signal its members. A dead
+        # leader (rc=1) cannot have been reused as a group, so in-group
+        # orphans whose cwd stayed inside the capsule are ours to signal.
+         + "emit_cwd_pid() { dt_ec_pid=$1; "
+        'if [ "$DT_KGROUP_OWNED" -eq 0 ] && [ "$DT_KLEADER_GONE" -eq 0 ] '
+        '&& [ "$DT_KPG" -gt 0 ]; then '
         'dt_ec_group=$(dt_pid_group "$dt_ec_pid") || return 0; '
         '[ "$dt_ec_group" = "$DT_KPG" ] && return 0; fi; '
         "printf '%s\\n' \"$dt_ec_pid\"; }; "
@@ -140,7 +145,10 @@ def termination_probe(
         + '|| DT_KBOOT_MATCH=0; [ "$dt_k_current_boot" = "$DT_KBOOT" ] '
         + "|| DT_KBOOT_MATCH=0; fi; "
         + prefix
-        + "DT_KGROUP_OWNED=0; owned_group && DT_KGROUP_OWNED=1; "
+        + "owned_group; dt_k_owned_rc=$?; "
+        "DT_KGROUP_OWNED=0; DT_KLEADER_GONE=0; "
+        '[ "$dt_k_owned_rc" -eq 0 ] && DT_KGROUP_OWNED=1; '
+        '[ "$dt_k_owned_rc" -eq 1 ] && DT_KLEADER_GONE=1; '
         + 'list() { [ "$DT_KBOOT_MATCH" -eq 1 ] || return 0; '
         '[ "$DT_KGROUP_OWNED" -eq 1 ] && '
         'pgrep -g "$DT_KPG" 2>/dev/null; '

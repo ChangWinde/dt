@@ -4,6 +4,7 @@ and rsync retries must resume."""
 import json
 import shutil
 import subprocess
+import time
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -4280,6 +4281,55 @@ def test_termination_probe_does_not_signal_reused_process_group(tmp_path):
     finally:
         unrelated.terminate()
         unrelated.wait(timeout=2)
+
+
+def test_termination_probe_signals_orphans_after_leader_death(tmp_path):
+    """A dead leader cannot be a reused group: cwd-owned orphans get killed."""
+    job_dir = tmp_path / "jobs" / "orphan-job"
+    job_dir.mkdir(parents=True)
+    (job_dir / "process_start_ticks").write_text("1\n")
+    leader = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            'cd "$0" && { sleep 30 >/dev/null 2>&1 & } && printf \'%s\\n\' "$!"',
+            str(job_dir),
+        ],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert leader.stdout is not None
+    orphan_pid = int(leader.stdout.readline().strip())
+    leader_pid = leader.pid
+    assert leader.wait(timeout=5) == 0
+    assert Path(f"/proc/{orphan_pid}").exists()
+
+    try:
+        command = lifecycle.termination_probe(
+            str(job_dir), leader_pid, "TERM", job_id="orphan-job"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        ) == ("DEAD", None)
+        deadline = time.monotonic() + 2
+        while Path(f"/proc/{orphan_pid}").exists():
+            assert time.monotonic() < deadline, "orphan survived the probe"
+            time.sleep(0.05)
+    finally:
+        subprocess.run(
+            ["kill", "-9", str(orphan_pid)],
+            capture_output=True,
+            check=False,
+        )
 
 
 @pytest.mark.parametrize(
