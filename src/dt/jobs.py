@@ -892,27 +892,31 @@ def _refresh_status_locked(
     state_dir = job_state_dir(entry.job_dir, entry.storage_layout)
     state = node_path_expression(state_dir)
     wrapper_pid = int(entry.pgid) if entry.pgid is not None else 0
+    # Every field below comes from a job-writable file. dt_probe_field
+    # flattens it to one bounded line so an embedded newline (for example a
+    # forged status marker followed by a fake token stream) cannot change the
+    # probe's line protocol and rewrite a running job into a terminal state.
     probe = (
-        process_identity_shell()
+        process_identity_shell() + "dt_probe_field() { "
+        'if [ -f "$1" ]; then head -c 128 -- "$1" 2>/dev/null '
+        "| tr -d '\\r\\n'; echo; else echo UNKNOWN; fi; }; "
         + f"DT_WPID={wrapper_pid}; "
         + f"DT_WIDENT={state}/process_start_ticks; "
         + f"DT_WJOB={node_path_expression(entry.job_dir)}; "
         + f"DT_WBOOT={shlex.quote(entry.boot_id or '')}; "
         + "cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo UNKNOWN; "
         f"echo {STATUS_MARK}; "
-        f"if dt_rc=$(cat {state}/exit_code 2>/dev/null); then "
-        'printf "%s\\n" "$dt_rc"; '
-        f"cat {state}/started_at 2>/dev/null || echo UNKNOWN; "
-        f"cat {state}/finished_at 2>/dev/null || echo UNKNOWN; "
+        f"if [ -f {state}/exit_code ]; then "
+        f"dt_probe_field {state}/exit_code; "
+        f"dt_probe_field {state}/started_at; "
+        f"dt_probe_field {state}/finished_at; "
         'elif dt_process_owned "$DT_WPID" "$DT_WIDENT" "$DT_WJOB" '
         '"$DT_WBOOT"; then '
-        f"echo RUNNING; cat {state}/started_at 2>/dev/null "
-        "|| echo UNKNOWN; echo UNKNOWN; "
+        f"echo RUNNING; dt_probe_field {state}/started_at; echo UNKNOWN; "
         "else dt_identity_rc=$?; "
         f'[ "$dt_identity_rc" -eq 2 ] && echo STALE || echo LOST; '
-        f"cat {state}/started_at 2>/dev/null "
-        "|| echo UNKNOWN; echo UNKNOWN; fi; "
-        f"cat {state}/result_state 2>/dev/null || echo UNKNOWN"
+        f"dt_probe_field {state}/started_at; echo UNKNOWN; fi; "
+        f"dt_probe_field {state}/result_state"
     )
     try:
         proc = run_on(entry.node, entry.node_local, probe, timeout=timeout)
@@ -930,7 +934,9 @@ def _refresh_status_locked(
             return entry  # ssh/shell failure is not evidence that the job died
         tokens = (proc.stdout or "").strip().splitlines()
         if STATUS_MARK in tokens:
-            marker_index = len(tokens) - 1 - tokens[::-1].index(STATUS_MARK)
+            # The genuine marker is echoed before any job-writable content;
+            # forged markers can only appear later, so take the first one.
+            marker_index = tokens.index(STATUS_MARK)
             current_boot_id = tokens[marker_index - 1] if marker_index else None
             token = (
                 tokens[marker_index + 1] if len(tokens) > marker_index + 1 else "LOST"

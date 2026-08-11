@@ -202,6 +202,53 @@ def test_refresh_status_preserves_typed_scientific_result(tmp_path, monkeypatch)
     assert jobs.effective_result_state(refreshed) == "scientific_reject"
 
 
+def test_refresh_status_ignores_forged_marker_in_job_writable_fields(
+    tmp_path, monkeypatch
+):
+    """A fake status marker injected via a state file must not win (audit I3)."""
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="forged",
+        name="forged",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/forged",
+        session="dt_forged",
+        cmd="true",
+        pgid=1234,
+    )
+    forged_stream = (
+        "boot-1\n"
+        + jobs.STATUS_MARK
+        + "\nRUNNING\n1.0\nUNKNOWN\n"
+        + jobs.STATUS_MARK
+        + "\n0\n2.0\n3.0\nsuccess\n"
+    )
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, forged_stream, ""),
+    )
+
+    refreshed = jobs.refresh_status(cfg, entry, observation={})
+
+    assert refreshed.status == "running"
+    assert refreshed.exit_code is None
+
+
+def test_status_probe_bounds_job_writable_fields():
+    """Probe fields from job-writable files are flattened to one line."""
+    import inspect
+
+    source = inspect.getsource(jobs._refresh_status_locked)
+
+    assert "dt_probe_field" in source
+    assert "cat {state}/exit_code" not in source
+    assert "cat {state}/result_state" not in source
+
+
 def test_refresh_status_rejects_out_of_range_exit_code(tmp_path, monkeypatch):
     """A job-writable state file with a bogus code must not poison the row."""
     cfg = _cfg(tmp_path)
