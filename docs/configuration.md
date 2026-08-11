@@ -142,6 +142,19 @@ configuration loading fail. DT never infers a site from a hostname.
 | `sites.NAME.route_circuit_cooldown_s` | `60` | Initial cooldown before one half-open route probe; range 1–3600 seconds |
 | `sites.NAME.route_circuit_max_cooldown_s` | `900` | Maximum exponential cooldown; at least the initial cooldown and at most 86400 seconds |
 
+Both `site-cache-first` and `topology-aware` authenticate their site-internal
+SSH hops by forwarding the head operator's ssh-agent to the selected trusted
+source; DT never copies a private key to a worker. The head therefore needs a
+reachable agent that holds every key able to log in to the site's nodes.
+Export `SSH_AUTH_SOCK` for interactive submissions, and inject the same
+socket into the queue agent service (for example a systemd user drop-in with
+`Environment=SSH_AUTH_SOCK=%t/dt-ssh-agent.sock`). `dt doctor` reports this
+contract as `relay` on the head row: it checks `SSH_AUTH_SOCK` first, falls
+back to `$XDG_RUNTIME_DIR/dt-ssh-agent.sock`, and fails when no reachable
+agent holds keys. A pinned `nodes[].lan_address` that the node no longer
+reports (for example a recreated container Pod) is flagged as `lan: stale`
+and fails `dt doctor` before a transfer can fail at use time.
+
 Under `site-cache-first`, a snapshot digest is verified before atomic cache
 publication. Concurrent deliveries of the same `(site, digest)` share one
 head-side lock; later nodes receive it from the cache node over

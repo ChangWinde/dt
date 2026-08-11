@@ -60,7 +60,7 @@ from .dispatch import (
     reconcile_submission_request,
     submit,
 )
-from .doctor import doctor_center
+from .doctor import doctor_center, relay_agent_status
 from .forwarding import HeadCommand
 from .lifecycle import termination_probe, termination_verdict
 from .layout import (
@@ -14780,6 +14780,7 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
 
         n_queued = len(jobs_mod.queued_entries(cfg))
         agent_ok = agent_mod.alive_pid(cfg) is not None
+        relay_status = relay_agent_status(cfg)
         for r in rows:  # agent runs on the head itself -> its local node row
             if r["node"] in {n.name for n in cfg.nodes if n.local}:
                 r["checks"]["agent"] = (
@@ -14787,6 +14788,8 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
                     if agent_ok
                     else (f"off ({n_queued} queued!)" if n_queued else "off")
                 )
+                if relay_status is not None:
+                    r["checks"]["relay"] = relay_status
     else:
 
         def check_head(item: tuple[str, str]) -> JsonDict:
@@ -14877,7 +14880,20 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
     nontransport_ssh_failure = any(
         row.get("unreachable") is False for row in ssh_failures
     )
-    hard_fail = bool(ssh_failures) or dependency_failure
+    relay_failure = any(
+        str(row["checks"].get("relay", "")).startswith("fail") for row in rows
+    )
+    lan_stale_nodes = [
+        str(row["node"])
+        for row in rows
+        if str(row["checks"].get("lan", "")).startswith("stale")
+    ]
+    hard_fail = (
+        bool(ssh_failures)
+        or dependency_failure
+        or relay_failure
+        or bool(lan_stale_nodes)
+    )
     if json_:
         print(json.dumps(rows))
     else:
@@ -14900,6 +14916,29 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
                 for index, node_name in enumerate(slow_nodes):
                     label = "next:" if index == 0 else "     "
                     err.print(f"[dim]{label} dt seed {escape(node_name)} --plan[/dim]")
+            if relay_failure:
+                relay_detail = next(
+                    str(row["checks"]["relay"])
+                    for row in rows
+                    if str(row["checks"].get("relay", "")).startswith("fail")
+                )
+                err.print(f"[red]relay agent {escape(relay_detail)}[/red]")
+                err.print(
+                    "[dim]next: start a persistent ssh-agent holding the site "
+                    "node keys (docs/configuration.md, relay authentication)"
+                    "[/dim]"
+                )
+            if lan_stale_nodes:
+                noun = "node" if len(lan_stale_nodes) == 1 else "nodes"
+                err.print(
+                    f"[red]stale lan_address on {len(lan_stale_nodes)} {noun}[/red]"
+                )
+                for index, node_name in enumerate(lan_stale_nodes):
+                    label = "next:" if index == 0 else "     "
+                    err.print(
+                        f"[dim]{label} update nodes[].lan_address for "
+                        f"{escape(node_name)} in the head configuration[/dim]"
+                    )
     if not hard_fail:
         raise typer.Exit(0)
     if unreachable_failure and not dependency_failure and not nontransport_ssh_failure:
