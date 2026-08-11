@@ -77,6 +77,45 @@ def test_launcher_clears_stale_attempt_markers_before_new_session():
     assert '"$DT_STATE_DIR/process_start_ticks"' in LAUNCHER[marker_clear:session_start]
 
 
+def _cancel_supersede_block() -> str:
+    start = LAUNCHER.index("DT_CANCEL_STAMP=")
+    end = LAUNCHER.index("cancelled() {")
+    return LAUNCHER[start:end]
+
+
+def test_launcher_supersedes_only_cancel_sentinels_from_before_launch(tmp_path):
+    """A sentinel racing in during launch targets this run and must survive."""
+    import os
+    import time as time_mod
+
+    block = _cancel_supersede_block()
+    cancel = tmp_path / "state" / "cancel"
+    cancel.parent.mkdir(parents=True)
+
+    # Stale sentinel from a previous dispatch attempt: strictly older.
+    cancel.write_text("")
+    past = time_mod.time() - 10
+    os.utime(cancel, (past, past))
+    subprocess.run(
+        ["bash", "-uc", f'DT_CANCEL_PATH="{cancel}"\n' + block],
+        check=True,
+        timeout=10,
+    )
+    assert not cancel.exists()
+
+    # Fresh sentinel written after this launcher started: must survive.
+    cancel.write_text("")
+    future = time_mod.time() + 10
+    os.utime(cancel, (future, future))
+    subprocess.run(
+        ["bash", "-uc", f'DT_CANCEL_PATH="{cancel}"\n' + block],
+        check=True,
+        timeout=10,
+    )
+    assert cancel.exists()
+    assert not Path(f"{cancel}.launch").exists()
+
+
 def test_launcher_rechecks_cancel_sentinel_after_session_start():
     session_start = LAUNCHER.index('start_session "$ids" || return 14')
     post_start = LAUNCHER.index(
