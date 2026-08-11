@@ -556,7 +556,18 @@ def _trip_resource_guard(
         "root_pid": root_pid,
         "term_descendants": len(descendants),
     }
-    _write_json_atomic(output, record)
+    try:
+        _write_json_atomic(output, record)
+    except OSError as exc:
+        # A full disk is precisely when a resource guard must still act:
+        # losing the evidence file must never disarm the guard or take the
+        # telemetry process (and the armed contract) down with it.
+        print(
+            f"[telemetry] resource guard evidence write failed ({exc}); "
+            "terminating the job anyway",
+            file=sys.stderr,
+            flush=True,
+        )
     if kind == "max_vram_mib":
         subject = f"GPU {violation.get('gpu_index')} memory"
     else:
