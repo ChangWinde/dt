@@ -1745,6 +1745,10 @@ def _failed_start_has_env_log(entry: jobs_mod.JobEntry) -> bool:
 
 def _failed_start_kind(entry: jobs_mod.JobEntry) -> str:
     reason = entry.reason or ""
+    if _is_uncertain_launch(entry):
+        # The node may still be running this item; the caller must treat the
+        # whole submission as unresolved, never as a confirmed terminal state.
+        return "uncertain_launch"
     if "payload-integrity:" in reason:
         return "payload_integrity"
     if _failed_start_has_env_log(entry):
@@ -3925,29 +3929,35 @@ def _inventory_command(
                     item_label=f"{policy.command} item",
                 )
                 if failed_entry is not None:
-                    try:
-                        persist_group_entry(index, failed_entry)
-                    except (
-                        OSError,
-                        ValueError,
-                        intent_mod.RequestRecordError,
-                        group_mod.GroupRequestError,
-                    ) as persistence_exc:
-                        failure = {
-                            "kind": "submission_unknown",
-                            "message": (
-                                f"job {failed_entry.job_id} was registered but "
-                                f"request {request_id!r} progress could not be "
-                                "persisted"
-                            ),
-                            "reasons": {
-                                "request_id": request_id,
-                                "job_id": failed_entry.job_id,
-                                "detail": str(persistence_exc),
-                            },
-                            "exit_code": EXIT_UNREACHABLE,
-                        }
-                        failure_code = EXIT_UNREACHABLE
+                    # An uncertain launch may still be running on the node, so
+                    # it is not part of the durably confirmed prefix; trying to
+                    # record it would fail on the non-confirmed receipt and
+                    # bury the accurate uncertain_launch classification under
+                    # submission_unknown.
+                    if failure.get("kind") != "uncertain_launch":
+                        try:
+                            persist_group_entry(index, failed_entry)
+                        except (
+                            OSError,
+                            ValueError,
+                            intent_mod.RequestRecordError,
+                            group_mod.GroupRequestError,
+                        ) as persistence_exc:
+                            failure = {
+                                "kind": "submission_unknown",
+                                "message": (
+                                    f"job {failed_entry.job_id} was registered "
+                                    f"but request {request_id!r} progress could "
+                                    "not be persisted"
+                                ),
+                                "reasons": {
+                                    "request_id": request_id,
+                                    "job_id": failed_entry.job_id,
+                                    "detail": str(persistence_exc),
+                                },
+                                "exit_code": EXIT_UNREACHABLE,
+                            }
+                            failure_code = EXIT_UNREACHABLE
                     entries.append(failed_entry)
                     ensure_agent(failed_entry)
                     if not json_:
@@ -3990,6 +4000,10 @@ def _inventory_command(
                 f"{policy.command}_submission_interrupted",
                 "submission_unknown",
                 "idempotency_conflict",
+                # An unverified orphan cancel means the item may be running;
+                # confirming the group would invite a duplicate under a new
+                # request id (audit H4).
+                "uncertain_launch",
             }
         )
         try:
