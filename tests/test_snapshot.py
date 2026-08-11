@@ -4,6 +4,7 @@ import subprocess
 import pytest
 
 import dt.dispatch as dispatch
+import dt.git_provenance as git_provenance
 from dt.snapshot_hash import tree_sha256
 
 
@@ -114,13 +115,13 @@ def test_git_cleanup_reaps_before_restoring_repeated_interrupt(monkeypatch):
 
     process = Process()
     monkeypatch.setattr(
-        dispatch.os,
+        git_provenance.os,
         "killpg",
         lambda pid, sig: signals.append((pid, sig)),
     )
 
-    assert dispatch._stop_git_process(process) is True
+    assert git_provenance.stop_git_process(process) is True
     assert signals == [
-        (4321, dispatch.signal.SIGTERM),
-        (4321, dispatch.signal.SIGKILL),
+        (4321, git_provenance.signal.SIGTERM),
+        (4321, git_provenance.signal.SIGKILL),
     ]
