@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Mapping, Sequence
 
@@ -13,12 +14,13 @@ SCHEDULER_SCHEMA = "dt_scheduler_state_v1"
 
 def _resource_capacity(
     resources: Sequence[Mapping[str, object]] | None,
-) -> tuple[dict[str, int], dict[str, int], set[str]] | None:
+) -> tuple[dict[str, int], dict[str, int], set[str], dict[str, float]] | None:
     if resources is None:
         return None
     free: dict[str, int] = {}
     total: dict[str, int] = {}
     unavailable: set[str] = set()
+    disk_free: dict[str, float] = {}
     for row in resources:
         node = row.get("node")
         if not isinstance(node, str) or not node:
@@ -32,7 +34,16 @@ def _resource_capacity(
         free[node] = sum(
             gpu.get("free") is True for gpu in gpus if isinstance(gpu, dict)
         )
-    return free, total, unavailable
+        system = row.get("system")
+        if isinstance(system, Mapping):
+            reported = system.get("disk_free_gib")
+            if (
+                isinstance(reported, (int, float))
+                and not isinstance(reported, bool)
+                and math.isfinite(float(reported))
+            ):
+                disk_free[node] = float(reported)
+    return free, total, unavailable, disk_free
 
 
 def _dependency_state(
@@ -158,7 +169,7 @@ def _persisted_wait(
 def _capacity_state(
     cfg: HeadConfig,
     entry: JobEntry,
-    capacity: tuple[dict[str, int], dict[str, int], set[str]] | None,
+    capacity: tuple[dict[str, int], dict[str, int], set[str], dict[str, float]] | None,
 ) -> tuple[str, str, str]:
     if capacity is None:
         return (
@@ -166,7 +177,7 @@ def _capacity_state(
             entry.reason or "waiting for the next scheduler pass",
             "the agent must complete a fresh capacity probe",
         )
-    free, total, unavailable = capacity
+    free, total, unavailable, disk_free = capacity
     configured = {node.name for node in cfg.nodes}
     candidates = {entry.pin_node} if entry.pin_node is not None else configured
     if entry.pin_node is not None and entry.pin_node in unavailable:
@@ -184,14 +195,32 @@ def _capacity_state(
         )
     wanted = max(0, entry.gpus_requested)
     reserve = max(0, cfg.queue.reserve_free_per_node)
-    fitting = [
+    # The launcher refuses a job whose node lacks the effective disk floor
+    # (max of the center floor and the per-job request). Apply the same gate
+    # here so the explanation cannot promise a run the launcher will reject.
+    required_disk = max(0, cfg.disk_min_gib, entry.require_disk_gib or 0)
+
+    def disk_ok(node: str) -> bool:
+        have = disk_free.get(node)
+        # Unknown disk is not gated: fall back to the prior GPU-only view.
+        return have is None or have >= required_disk
+
+    gpu_fitting = [
         node for node in reachable if max(0, free.get(node, 0) - reserve) >= wanted
     ]
+    fitting = [node for node in gpu_fitting if disk_ok(node)]
     if fitting:
         return (
             "runnable",
             f"{fitting[0]} currently satisfies the resource request",
             "the live agent can dispatch this job now",
+        )
+    if gpu_fitting and required_disk > 0:
+        return (
+            "waiting_disk",
+            entry.reason
+            or f"eligible nodes have GPUs free but under {required_disk} GiB disk",
+            f"one eligible node must free at least {required_disk} GiB of disk",
         )
     max_inventory = max((total.get(node, 0) for node in reachable), default=0)
     if wanted > max_inventory:

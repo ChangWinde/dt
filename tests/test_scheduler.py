@@ -214,6 +214,69 @@ def test_unpinned_capacity_wait_preserves_overlapping_fifo(tmp_path):
     )
 
 
+def test_disk_floor_blocks_runnable_when_node_lacks_disk(tmp_path):
+    """A node with free GPUs but insufficient disk must not read as runnable."""
+    cfg = _cfg(tmp_path)
+    resources = [
+        {
+            "node": "n1",
+            "gpus": [{"free": True}, {"free": True}],
+            "error": None,
+            "system": {"disk_free_gib": 3.0, "disk_total_gib": 100.0},
+        },
+    ]
+    job = _entry("needs-disk", 1, gpus_requested=1, require_disk_gib=50)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [job],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    row = snapshot["queue"][0]
+    assert row["state"] == "waiting_disk"
+    assert snapshot["runnable_queued"] == 0
+
+
+def test_disk_floor_allows_runnable_when_disk_is_sufficient(tmp_path):
+    cfg = _cfg(tmp_path)
+    resources = [
+        {
+            "node": "n1",
+            "gpus": [{"free": True}],
+            "error": None,
+            "system": {"disk_free_gib": 500.0, "disk_total_gib": 1000.0},
+        },
+    ]
+    job = _entry("needs-disk", 1, gpus_requested=1, require_disk_gib=50)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [job],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    assert snapshot["queue"][0]["state"] == "runnable"
+
+
+def test_unknown_disk_is_not_gated(tmp_path):
+    """Rows without a system probe keep the prior GPU-only runnable view."""
+    cfg = _cfg(tmp_path)
+    resources = [{"node": "n1", "gpus": [{"free": True}], "error": None}]
+    job = _entry("needs-disk", 1, gpus_requested=1, require_disk_gib=50)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [job],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    assert snapshot["queue"][0]["state"] == "runnable"
+
+
 def test_fresh_resources_supersede_stale_unreachable_reason(tmp_path):
     cfg = _cfg(tmp_path)
     entry = _entry(
