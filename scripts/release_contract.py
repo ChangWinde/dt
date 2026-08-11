@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -14,10 +16,55 @@ from pathlib import Path
 EXPECTED_DISTRIBUTION = "disttrainer"
 STABLE_VERSION = re.compile(r"^(\d+)\.(\d+)\.(\d+)$")
 SUPPORTED_VERSION = re.compile(r"^([0-9]+)\.([0-9]+)\.([0-9]+)(?:[a-z0-9.-]+)?$")
+MAX_METADATA_FILE_BYTES = 4 * 1024 * 1024
 
 
 class ContractError(ValueError):
     """A release candidate violates an immutable release contract."""
+
+
+def _read_metadata_file(path: Path) -> str:
+    """Read one bounded, stable regular file without following its final link."""
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = -1
+    try:
+        descriptor = os.open(path, flags)
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ContractError(f"release metadata is not a regular file: {path}")
+        if before.st_size > MAX_METADATA_FILE_BYTES:
+            raise ContractError(f"release metadata exceeds size limit: {path}")
+        chunks: list[bytes] = []
+        remaining = MAX_METADATA_FILE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content = b"".join(chunks)
+        if len(content) > MAX_METADATA_FILE_BYTES:
+            raise ContractError(f"release metadata exceeds size limit: {path}")
+        after = os.fstat(descriptor)
+        if (
+            after.st_dev != before.st_dev
+            or after.st_ino != before.st_ino
+            or after.st_size != before.st_size
+            or after.st_mtime_ns != before.st_mtime_ns
+            or after.st_ctime_ns != before.st_ctime_ns
+            or len(content) != after.st_size
+        ):
+            raise ContractError(f"release metadata changed while reading: {path}")
+        return content.decode("utf-8")
+    except ContractError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ContractError(f"cannot read release metadata: {path}: {exc}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _project_field(project_text: str, name: str) -> str:
@@ -173,14 +220,10 @@ def _validate_tag_history(
         )
 
 
-def validate(root: Path) -> tuple[str, str, str]:
-    """Return distribution and versions after validating release metadata."""
-    try:
-        project_text = (root / "pyproject.toml").read_text(encoding="utf-8")
-        source_text = (root / "src" / "dt" / "__init__.py").read_text(encoding="utf-8")
-        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    except OSError as exc:
-        raise ContractError(f"cannot read release metadata: {exc}") from exc
+def _read_metadata(root: Path) -> tuple[str, str, str, str]:
+    project_text = _read_metadata_file(root / "pyproject.toml")
+    source_text = _read_metadata_file(root / "src" / "dt" / "__init__.py")
+    changelog = _read_metadata_file(root / "CHANGELOG.md")
 
     distribution = _project_field(project_text, "name")
     project_version = _project_field(project_text, "version")
@@ -191,6 +234,45 @@ def validate(root: Path) -> tuple[str, str, str]:
         raise ContractError("pyproject/source version mismatch")
     if SUPPORTED_VERSION.fullmatch(project_version) is None:
         raise ContractError(f"unsupported version format: {project_version}")
+    return distribution, project_version, source_version, changelog
+
+
+def _validate_development_changelog(changelog: str, version: str) -> None:
+    """Validate an evolving source tree without pretending it is sealed."""
+    headings = list(re.finditer(r"(?m)^## ([^\n]+?)\s*$", changelog))
+    if not headings or headings[0].group(1) != "Unreleased":
+        raise ContractError("CHANGELOG must begin with an Unreleased section")
+    released: list[str] = []
+    for heading in headings[1:]:
+        match = re.fullmatch(
+            r"([0-9]+\.[0-9]+\.[0-9]+) — \d{4}-\d{2}-\d{2}",
+            heading.group(1),
+        )
+        if match is not None:
+            released.append(match.group(1))
+    if not released:
+        raise ContractError("CHANGELOG has no stable release history")
+    latest = max(released, key=lambda item: _stable_tuple(item) or (-1, -1, -1))
+    candidate = _version_core(version)
+    latest_tuple = _stable_tuple(latest)
+    if latest_tuple is None:
+        raise ContractError("CHANGELOG stable release history is malformed")
+    if candidate < latest_tuple or (candidate == latest_tuple and version != latest):
+        raise ContractError(
+            f"development version {version} is older than released version {latest}"
+        )
+
+
+def validate_development(root: Path) -> tuple[str, str, str]:
+    """Validate metadata needed for a non-promotable package smoke test."""
+    distribution, project_version, source_version, changelog = _read_metadata(root)
+    _validate_development_changelog(changelog, project_version)
+    return distribution, project_version, source_version
+
+
+def validate(root: Path) -> tuple[str, str, str]:
+    """Return distribution and versions after validating sealed release metadata."""
+    distribution, project_version, source_version, changelog = _read_metadata(root)
 
     previous_versions = _validate_changelog(changelog, project_version)
     _validate_tag_history(root, project_version, previous_versions)
@@ -200,9 +282,15 @@ def validate(root: Path) -> tuple[str, str, str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path.cwd())
+    parser.add_argument(
+        "--development",
+        action="store_true",
+        help="validate an evolving source tree without release sealing or tag checks",
+    )
     args = parser.parse_args()
     try:
-        fields = validate(args.root.resolve())
+        validator = validate_development if args.development else validate
+        fields = validator(args.root.resolve())
     except ContractError as exc:
         print(f"release-check: {exc}", file=sys.stderr)
         return 1

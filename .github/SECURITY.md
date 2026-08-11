@@ -23,9 +23,27 @@ Required assumptions:
   GPU access policy.
 - Webhook and proxy values are trusted operator configuration.
 
+`topology-aware` transfer treats configured site membership as its finite
+discovery boundary. Nodes advertise only their own interfaces and public SSH
+host keys through an already-authenticated control session; DT does not scan
+address ranges or disable host-key checking. A direct peer connection pins
+those keys under a DT-private alias and explicitly disables ProxyJump. The
+short-lived artifact-relay session forwards the operator's SSH agent to the
+selected trusted source but never copies private keys to a worker. Do not place
+an untrusted host in a topology-enabled site.
+
 DistTrainer provides collision-safe GPU leases, bounded remote operations,
 content identities, path validation, previewable destructive maintenance, and
 process-tree cleanup within that trust model.
+
+The private operation journal records allowlisted command categories, timing,
+build identity, exit state, and problem fingerprints derived only from
+exception type and code location. It never records or fingerprints argument
+values and does not store exception text, environment variables, working
+directories, hostnames, or usernames. Journal directories and files are
+private to the Unix account and symlink targets are refused. The journal is
+same-user operational evidence, not a tamper-proof audit or authorization
+boundary; operation IDs passed over SSH are correlation identifiers only.
 
 Destructive cleanup validates a registry job directory against the exact
 `dt/jobs/JOB_ID` slot before invoking `rm`. A failed remote or related local

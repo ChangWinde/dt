@@ -1,15 +1,18 @@
-# DistTrainer (`disttrainer`)
+# dt (`disttrainer` distribution)
 
-DistTrainer (`dt`) is a command-line control plane installed on the head
-(master) of a Linux GPU center. It discovers worker capacity, captures
-immutable project snapshots, recreates `uv` environments, queues work without
-GPU collisions, monitors resources and failures, and recovers complete
-experiment records.
+`dt` is an AI-native SSH execution control plane installed on the head of a
+Linux compute center. It uses idle remote capacity to run a local project with
+a local-equivalent observable outcome: immutable source, environment identity,
+lifecycle and result semantics, logs, metrics, and declared outputs remain
+available through the local CLI.
 Workers receive DT's runtime payload with each job and do not need an
 independent DT installation.
+The optional laptop client forwards intent only; the configured head worktree
+is the source snapshot authority and a laptop-only worktree is not implicitly
+uploaded.
 
-The Python distribution is named `disttrainer`; the installed command and
-import package are both named `dt`.
+The product, installed command, and import package are named `dt`; the Python
+distribution remains `disttrainer` for compatibility.
 
 ## Requirements
 
@@ -36,6 +39,10 @@ bash bootstrap.sh \
 export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
 dt --version
 ```
+
+The bootstrap verifies the bundle checksums, requires the locked dependency
+hashes, and activates the new isolated environment atomically. Installation
+failure leaves the previously working `dt` command unchanged.
 
 For development:
 
@@ -115,6 +122,12 @@ next action. Expand only when needed with `dt info JOB --verbose`,
 `dt agent status --verbose`, `dt storage --details`, or `dt ps --wide`; use
 `--json` for automation.
 
+For bounded Agent context, prefer `dt ps --summary --json` or
+`dt ps --compact --active --limit 50 --json`. The versioned query response
+supports field projection, lifecycle `--since` filtering, and opaque cursor
+pagination; the legacy `dt ps --json` array remains the complete compatibility
+surface.
+
 FIFO fairness is maintained per overlapping capacity: jobs pinned to one busy
 node do not prevent later jobs pinned to another node from using that other
 node.
@@ -150,13 +163,26 @@ dt chain gpu-node-1 \
 `batch` continues after an individual runtime failure. `chain` starts each
 stage only after its predecessor succeeds.
 
+Automated callers can add `--request-id` and recover a lost response with
+`dt request REQUEST_ID --json`; DT will not launch the same intent twice. The
+contract also covers `batch`, `chain`, and `fork --repeat`: a retry validates
+the durable prefix and resumes only at a child whose launch is proven absent.
+Use `--after-complete` or `--after-result ... --when-result ...` for cross-node
+typed routing, and `dt exec JOB -- COMMAND` for exact-environment diagnosis
+without project or package synchronization.
+
 ## Safe maintenance
 
 ```bash
+dt events --issues
 dt storage
 dt compact --before 2026-07-01 --plan
 dt clean --before 2026-07-01 --plan
 ```
+
+`dt events` queries the private, bounded operation journal locally; from a
+laptop, add `-c CENTER` to inspect the correlated head journal. It records
+redacted operation state and never raw command arguments or exception text.
 
 Preview destructive maintenance first. Non-interactive mutation requires
 explicit confirmation. Cleanup uses terminal completion time and retains

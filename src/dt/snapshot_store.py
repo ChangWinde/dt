@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .config import HeadConfig
 from .layout import ROLE_LAYOUT
+from .private_state import PrivateStateError, atomic_write, private_lock, read_bounded
+
+MAX_SNAPSHOT_STATE_BYTES = 1024 * 1024
 
 
 def state_path(cfg: HeadConfig) -> Path:
@@ -28,32 +30,27 @@ def lock(cfg: HeadConfig) -> Iterator[None]:
     if cfg.layout == ROLE_LAYOUT and legacy.parent.is_dir():
         paths.append(legacy)
     paths.append(cfg.state_dir() / "snapshot-store.lock")
-    descriptors = []
-    try:
+    with ExitStack() as stack:
         for lock_path in paths:
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            descriptor = lock_path.open("w", encoding="utf-8")
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            descriptors.append(descriptor)
-        try:
-            yield
-        finally:
-            for descriptor in reversed(descriptors):
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-    finally:
-        for descriptor in reversed(descriptors):
-            descriptor.close()
+            acquired = stack.enter_context(private_lock(lock_path))
+            if not acquired:
+                raise PrivateStateError("snapshot-store lock was not acquired")
+        yield
 
 
 def load_state(cfg: HeadConfig) -> dict[str, str]:
     state: dict[str, str] = {}
     paths = [_legacy_state_path(cfg), state_path(cfg)]
     for path in dict.fromkeys(paths):
-        if not path.exists():
+        try:
+            result = read_bounded(path, max_bytes=MAX_SNAPSHOT_STATE_BYTES)
+        except PrivateStateError:
+            continue
+        if result is None:
             continue
         try:
-            raw: object = json.loads(path.read_text("utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
+            raw: object = json.loads(result[0])
+        except (UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(raw, dict):
             continue
@@ -72,9 +69,10 @@ def load_state(cfg: HeadConfig) -> dict[str, str]:
 
 def save_state(cfg: HeadConfig, state: dict[str, str]) -> None:
     path = state_path(cfg)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state, indent=1), encoding="utf-8")
-    temporary.replace(path)
+    encoded = (json.dumps(state, indent=1) + "\n").encode("utf-8")
+    if len(encoded) > MAX_SNAPSHOT_STATE_BYTES:
+        raise PrivateStateError("snapshot-store state exceeds its size limit")
+    atomic_write(path, encoded)
 
 
 def code_path(cfg: HeadConfig, digest: str) -> Path:

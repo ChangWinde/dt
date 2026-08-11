@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from dt import cli, compact as compact_mod
 from dt.config import HeadConfig, LaptopConfig, Node, Project
-from dt.jobs import JobEntry, save
+from dt.jobs import JobEntry, load, save
 from dt.snapshot_hash import tree_sha256
 
 
@@ -187,6 +187,71 @@ def test_compact_is_idempotent_when_code_is_already_absent(tmp_path, monkeypatch
     assert (root / "outputs" / "model.pt").is_file()
 
 
+def test_compact_apply_reloads_registry_and_skips_recovered_job(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(digest)
+    save(cfg, entry)
+    real_preflight = compact_mod.preflight
+
+    def racing_preflight(cfg_, cutoff_ts):
+        checked = real_preflight(cfg_, cutoff_ts)
+        current = load(cfg_, entry.job_id)
+        assert current is not None
+        current.status = "running"
+        current.exit_code = None
+        current.finished_at = None
+        current.pgid = os.getpid()
+        save(cfg_, current)
+        return checked
+
+    monkeypatch.setattr(compact_mod, "preflight", racing_preflight)
+    monkeypatch.setattr(
+        compact_mod,
+        "run_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("changed job must not be contacted")
+        ),
+    )
+
+    report = compact_mod.compact_jobs(
+        cfg,
+        cutoff_ts=100.0,
+        before="1970-01-01",
+        apply=True,
+    )
+
+    assert report.exit_code == 0
+    assert report.payload["state_changed_jobs"] == 1
+    assert report.payload["compacted_jobs"] == 0
+
+
+def test_compact_refuses_lost_job_whose_process_is_alive(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(
+        digest,
+        status="lost",
+        exit_code=None,
+        pgid=os.getpid(),
+    )
+    save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    root = _workdir(node_home, entry)
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg,
+        cutoff_ts=100.0,
+        before="1970-01-01",
+        apply=True,
+    )
+
+    assert report.exit_code == 0
+    assert report.payload["state_changed_jobs"] == 1
+    assert (root / "code").is_dir()
+
+
 def test_compact_refuses_corrupt_archive_before_contacting_node(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     digest = _archive(cfg)
@@ -212,6 +277,20 @@ def test_compact_refuses_corrupt_archive_before_contacting_node(tmp_path, monkey
     assert report.exit_code == 1
     assert report.payload["preflight_errors"]
     assert contacted is False
+
+
+def test_compact_preflight_rejects_oversized_snapshot_metadata(tmp_path):
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(digest)
+    save(cfg, entry)
+    metadata = cfg.snapshots_dir() / digest / "meta.json"
+    metadata.write_bytes(b" " * (compact_mod._SNAPSHOT_METADATA_MAX_BYTES + 1))
+
+    preflight = compact_mod.preflight(cfg, cutoff_ts=100.0)
+
+    assert preflight.candidates == ()
+    assert preflight.skipped == {"snapshot_metadata_invalid": 1}
 
 
 def test_compact_never_follows_a_remote_code_symlink(tmp_path, monkeypatch):

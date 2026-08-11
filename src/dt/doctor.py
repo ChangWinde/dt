@@ -47,6 +47,7 @@ if command -v python3 >/dev/null 2>&1; then echo DT_PYTHON3=ok; else echo DT_PYT
 if command -v timeout >/dev/null 2>&1; then echo DT_TIMEOUT=ok; else echo DT_TIMEOUT=missing; fi
 wait "$dt_net_pid"
 """
+DOCTOR_MAX_WORKERS = 32
 
 
 def check_node(node: Node) -> dict[str, Any]:
@@ -75,7 +76,9 @@ def check_node(node: Node) -> dict[str, Any]:
 
 
 def doctor_center(cfg: HeadConfig) -> list[dict[str, Any]]:
-    with ThreadPoolExecutor(max_workers=max(len(cfg.nodes), 1)) as pool:
+    with ThreadPoolExecutor(
+        max_workers=min(DOCTOR_MAX_WORKERS, max(len(cfg.nodes), 1))
+    ) as pool:
         rows = list(pool.map(check_node, cfg.nodes))
     for r in rows:
         r["center"] = cfg.center

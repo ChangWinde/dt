@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import stat
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import IO
 
 FORBIDDEN_PATH_PARTS = {
     ".git",
@@ -40,9 +43,61 @@ REQUIRED_PAYLOADS = {
 ALLOWED_SDIST_PATHS = {
     ("docs", "package-readme.md"),
 }
+MAX_ARCHIVE_MEMBERS = 4096
+MAX_ARCHIVE_MEMBER_BYTES = 16 * 1024 * 1024
+MAX_ARCHIVE_TOTAL_BYTES = 128 * 1024 * 1024
+MAX_BUNDLE_FILE_BYTES = 64 * 1024 * 1024
+
+
+def _stable_identity(value: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _read_stable_regular_file(path: Path, *, name: str, limit: int) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValueError(f"release bundle entry is not a regular file: {name}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"release bundle entry is not a regular file: {name}")
+        if before.st_size > limit:
+            raise ValueError(f"release bundle entry exceeds size limit: {name}")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            content = stream.read(limit + 1)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if _stable_identity(before) != _stable_identity(after):
+        raise ValueError(f"release bundle entry changed while reading: {name}")
+    try:
+        current = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError(f"release bundle entry changed after reading: {name}") from exc
+    if _stable_identity(after) != _stable_identity(current):
+        raise ValueError(f"release bundle entry changed after reading: {name}")
+    if len(content) != before.st_size or len(content) > limit:
+        raise ValueError(f"release bundle entry size is invalid: {name}")
+    return content
 
 
 def _safe_parts(name: str) -> tuple[str, ...]:
+    if "\x00" in name or "\\" in name:
+        raise ValueError(f"non-canonical archive path: {name!r}")
+    raw_parts = name.split("/")
+    if raw_parts and raw_parts[-1] == "":
+        raw_parts.pop()
+    if not raw_parts or any(part in {"", "."} for part in raw_parts):
+        raise ValueError(f"non-canonical archive path: {name!r}")
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts or not path.parts:
         raise ValueError(f"unsafe archive path: {name!r}")
@@ -56,11 +111,25 @@ def _check_content(name: str, content: bytes) -> None:
         raise ValueError(f"potential secret marker in release file: {name}")
 
 
+def _bounded_content(stream: IO[bytes], *, name: str, declared_size: int) -> bytes:
+    if declared_size < 0 or declared_size > MAX_ARCHIVE_MEMBER_BYTES:
+        raise ValueError(f"release file exceeds size limit: {name}")
+    content = stream.read(MAX_ARCHIVE_MEMBER_BYTES + 1)
+    if len(content) > MAX_ARCHIVE_MEMBER_BYTES or len(content) != declared_size:
+        raise ValueError(f"release file size is invalid: {name}")
+    return content
+
+
 def audit_sdist(path: str, distribution: str, version: str) -> dict[str, object]:
     prefix = f"{distribution}-{version}"
     files = 0
+    members = 0
+    total_bytes = 0
     with tarfile.open(path, "r:gz") as archive:
-        for member in archive.getmembers():
+        for member in archive:
+            members += 1
+            if members > MAX_ARCHIVE_MEMBERS:
+                raise ValueError("sdist contains too many members")
             parts = _safe_parts(member.name)
             if parts[0] != prefix:
                 raise ValueError(f"sdist path outside expected prefix: {member.name}")
@@ -74,10 +143,18 @@ def audit_sdist(path: str, distribution: str, version: str) -> dict[str, object]
                 raise ValueError(f"forbidden release path: {member.name}")
             if not member.isfile():
                 continue
+            total_bytes += member.size
+            if total_bytes > MAX_ARCHIVE_TOTAL_BYTES:
+                raise ValueError("sdist exceeds total uncompressed size limit")
             extracted = archive.extractfile(member)
             if extracted is None:
                 raise ValueError(f"cannot read sdist member: {member.name}")
-            _check_content(member.name, extracted.read())
+            content = _bounded_content(
+                extracted,
+                name=member.name,
+                declared_size=member.size,
+            )
+            _check_content(member.name, content)
             files += 1
     if files < 10:
         raise ValueError(f"sdist unexpectedly small: {files} files")
@@ -85,39 +162,77 @@ def audit_sdist(path: str, distribution: str, version: str) -> dict[str, object]
 
 
 def audit_wheel(path: str, distribution: str, version: str) -> dict[str, object]:
+    dist_info = f"{distribution.replace('-', '_')}-{version}.dist-info"
+    required_metadata = {
+        f"{dist_info}/METADATA",
+        f"{dist_info}/WHEEL",
+        f"{dist_info}/entry_points.txt",
+        f"{dist_info}/RECORD",
+    }
     with zipfile.ZipFile(path) as archive:
-        names = set(archive.namelist())
-        for name in names:
-            _safe_parts(name)
-            _check_content(name, archive.read(name))
+        infos = archive.infolist()
+        if len(infos) > MAX_ARCHIVE_MEMBERS:
+            raise ValueError("wheel contains too many members")
+        ordered_names = [info.filename for info in infos]
+        names = set(ordered_names)
+        if len(names) != len(ordered_names):
+            raise ValueError("wheel contains duplicate member names")
+        total_bytes = 0
+        metadata_payloads: list[bytes] = []
+        entry_point_payloads: list[bytes] = []
+        for info in infos:
+            name = info.filename
+            parts = _safe_parts(name)
+            if parts[0] not in {"dt", dist_info}:
+                raise ValueError(f"unexpected wheel path: {name}")
+            if info.flag_bits & 0x1:
+                raise ValueError(f"encrypted wheel member is unsupported: {name}")
+            unix_mode = (info.external_attr >> 16) & 0xFFFF
+            if stat.S_ISLNK(unix_mode):
+                raise ValueError(f"wheel symlink is unsupported: {name}")
+            if info.is_dir():
+                continue
+            total_bytes += info.file_size
+            if total_bytes > MAX_ARCHIVE_TOTAL_BYTES:
+                raise ValueError("wheel exceeds total uncompressed size limit")
+            with archive.open(info) as stream:
+                content = _bounded_content(
+                    stream,
+                    name=name,
+                    declared_size=info.file_size,
+                )
+            _check_content(name, content)
+            if name.endswith(".dist-info/METADATA"):
+                metadata_payloads.append(content)
+            if name.endswith(".dist-info/entry_points.txt"):
+                entry_point_payloads.append(content)
 
         missing_payloads = sorted(REQUIRED_PAYLOADS - names)
         if missing_payloads:
             raise ValueError(f"wheel missing payloads: {missing_payloads}")
+        missing_metadata = sorted(required_metadata - names)
+        if missing_metadata:
+            raise ValueError(f"wheel missing metadata: {missing_metadata}")
 
-        metadata_names = [
-            name for name in names if name.endswith(".dist-info/METADATA")
-        ]
-        entry_point_names = [
-            name for name in names if name.endswith(".dist-info/entry_points.txt")
-        ]
-        if len(metadata_names) != 1 or len(entry_point_names) != 1:
+        if len(metadata_payloads) != 1 or len(entry_point_payloads) != 1:
             raise ValueError("wheel must contain one METADATA and one entry_points.txt")
-        metadata = archive.read(metadata_names[0]).decode("utf-8")
+        metadata = metadata_payloads[0].decode("utf-8")
         if f"Name: {distribution}\n" not in metadata:
             raise ValueError("wheel distribution name does not match release contract")
         if f"Version: {version}\n" not in metadata:
             raise ValueError("wheel version does not match release contract")
         if "License-Expression: LicenseRef-Proprietary\n" not in metadata:
             raise ValueError("wheel is missing the declared license expression")
-        entry_points = archive.read(entry_point_names[0]).decode("utf-8")
-        if "dt = dt.cli:main" not in entry_points:
+        entry_points = entry_point_payloads[0].decode("utf-8")
+        if "dt = dt.entrypoint:main" not in entry_points:
             raise ValueError("wheel is missing the public dt command")
     return {"path": PurePosixPath(path).name, "files": len(names)}
 
 
 def audit_bundle(path: str, excluded_names: set[str]) -> list[str]:
     root = Path(path)
+    if root.is_symlink():
+        raise ValueError(f"release bundle directory must not be a symlink: {path}")
     if not root.is_dir():
         raise ValueError(f"release bundle directory is missing: {path}")
 
@@ -125,9 +240,11 @@ def audit_bundle(path: str, excluded_names: set[str]) -> list[str]:
     for item in sorted(root.iterdir()):
         if item.name in excluded_names:
             continue
-        if not item.is_file() or item.is_symlink():
-            raise ValueError(f"unsupported release bundle entry: {item.name}")
-        content = item.read_bytes()
+        content = _read_stable_regular_file(
+            item,
+            name=item.name,
+            limit=MAX_BUNDLE_FILE_BYTES,
+        )
         _check_content(item.name, content)
         if LOCAL_PATH_PATTERN.search(content):
             raise ValueError(f"absolute local path in release metadata: {item.name}")

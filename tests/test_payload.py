@@ -6,6 +6,7 @@ import json
 import os
 import re
 import signal
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -21,11 +22,23 @@ from dt.dispatch import (
     spec_from_entry,
 )
 from dt.jobs import JobEntry
+from dt.payload.artifact_verify import verify as verify_artifacts
+from dt.payload_hash import payload_files_from_dir
 
 PAYLOAD = Path(__file__).parent.parent / "src" / "dt" / "payload"
 LAUNCHER = (PAYLOAD / "launcher.sh").read_text()
 WRAPPER = (PAYLOAD / "wrapper.sh").read_text()
 WRAPPER_TIMEOUT_SECONDS = 15
+
+
+def test_runtime_payload_uses_private_umask_before_creating_state():
+    assert LAUNCHER.index("umask 077") < LAUNCHER.index("mkdir -p")
+    assert WRAPPER.index("umask 077") < WRAPPER.index("mkdir -p")
+
+
+def _tmux_session_env_names() -> set[str]:
+    block = LAUNCHER.split("local -a session_env_names=(", 1)[1].split(")", 1)[0]
+    return set(block.replace("\\", " ").split())
 
 
 def test_launcher_prechecks_busy_before_env_sync():
@@ -39,16 +52,18 @@ def test_launcher_prechecks_busy_before_env_sync():
 def test_launcher_uses_dedicated_tmux_server():
     # user tmux servers can be systemd-managed (kill-server on stop):
     # jobs must live on dt's own socket
-    assert "tmux -L dt new-session" in LAUNCHER
+    assert "run_tmux_new_session -L dt new-session" in LAUNCHER
     assert "tmux -L dt kill-session" in LAUNCHER
     assert "set-option -g exit-empty off" in LAUNCHER
+    assert "systemd-run --user --scope --quiet" in LAUNCHER
+    assert "systemctl --user show-environment" in LAUNCHER
 
 
 def test_launcher_does_not_leak_node_launch_lock_into_tmux():
     # A fresh tmux server inherits open descriptors from its client. If fd 9
     # leaks, the server holds the node launch flock until the whole GPU job
     # exits and concurrent CPU submissions stall at "launching".
-    start = LAUNCHER.index("tmux -L dt new-session")
+    start = LAUNCHER.index("run_tmux_new_session -L dt new-session")
     end = LAUNCHER.index("\n}", start)
     assert "9>&-" in LAUNCHER[start:end]
 
@@ -59,6 +74,7 @@ def test_launcher_clears_stale_attempt_markers_before_new_session():
     session_start = LAUNCHER.index('start_session "$ids"')
 
     assert session_check < marker_clear < session_start
+    assert '"$DT_STATE_DIR/process_start_ticks"' in LAUNCHER[marker_clear:session_start]
 
 
 def test_launcher_rechecks_cancel_sentinel_after_session_start():
@@ -108,6 +124,7 @@ def _run_launcher_with_fake_uv(
     tmp_path: Path,
     mode: str,
     cache_mode: str | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     job = tmp_path / "job"
     code = job / "code"
@@ -142,6 +159,7 @@ def _run_launcher_with_fake_uv(
         "set -u\n"
         'state="$DT_TEST_STATE"\n'
         'if [ "${1:-}" = sync ]; then\n'
+        '  printf "%s\\n" "$*" >> "$state/sync-argv"\n'
         '  mkdir -p "$UV_PROJECT_ENVIRONMENT"\n'
         '  count=$(cat "$state/sync-count" 2>/dev/null || echo 0)\n'
         "  count=$((count + 1))\n"
@@ -197,7 +215,11 @@ def _run_launcher_with_fake_uv(
         "#!/usr/bin/env bash\n"
         'case " $* " in\n'
         '  *" has-session "*) exit 1 ;;\n'
-        '  *" new-session "*) echo 4242 > "$DT_JOB_DIR/pgid"; exit 0 ;;\n'
+        '  *" new-session "*)\n'
+        '    if [ -n "${DT_TEST_TMUX_CAPTURE:-}" ]; then\n'
+        '      printf "%s" "${7:-}" > "$DT_TEST_STATE/session-command"\n'
+        "    fi\n"
+        '    echo 4242 > "$DT_JOB_DIR/pgid"; exit 0 ;;\n'
         '  *" kill-session "*) exit 0 ;;\n'
         "esac\n"
         "exit 99\n"
@@ -215,6 +237,13 @@ def _run_launcher_with_fake_uv(
         "DT_TEST_STATE": str(state),
         "DT_TEST_UV_MODE": mode,
     }
+    if mode in {"reuse", "reuse_missing"}:
+        env["DT_ENV_MODE"] = "reuse"
+    if mode == "reuse":
+        interpreter = tmp_path / "envs" / "0123456789ab" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True)
+        interpreter.write_text("#!/usr/bin/env bash\nexit 0\n")
+        interpreter.chmod(0o755)
     if cache_mode is not None:
         source = fake_home / "dt" / "jobs" / "source"
         source_cache = source / "outputs" / ".cache" / "torchinductor"
@@ -241,6 +270,7 @@ def _run_launcher_with_fake_uv(
         )
         if cache_mode == "clone":
             env["DT_CACHE_MODE"] = "clone"
+    env.update(env_overrides or {})
     return subprocess.run(
         ["bash", str(PAYLOAD / "launcher.sh")],
         env=env,
@@ -264,6 +294,19 @@ def test_launcher_repairs_one_invalid_cached_wheel_then_retries(tmp_path):
     env_log = (tmp_path / "job" / "logs" / "env.log").read_text()
     assert "Invalid Wheel-Version" in env_log
     assert "cleaning package cache and retrying once" in env_log
+
+
+def test_launcher_passes_extras_as_literal_uv_argument_pairs(tmp_path):
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={"DT_EXTRAS": "sim data"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "state" / "sync-argv").read_text().splitlines() == [
+        "sync --frozen --inexact --extra sim --extra data"
+    ]
 
 
 def test_launcher_does_not_retry_deterministic_dependency_failure(tmp_path):
@@ -345,6 +388,59 @@ def test_launcher_reports_when_project_setup_runs(tmp_path):
     )
 
 
+def test_launcher_exact_environment_reuse_skips_uv_and_setup(tmp_path):
+    proc = _run_launcher_with_fake_uv(tmp_path, "reuse")
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["env"] == "0123456789ab"
+    assert payload["env_preexisting"] is True
+    assert payload["setup_ran"] is False
+    assert not (tmp_path / "state" / "sync-count").exists()
+    assert "without sync or setup" in proc.stderr
+
+
+def test_launcher_exact_environment_reuse_fails_closed_when_missing(tmp_path):
+    proc = _run_launcher_with_fake_uv(tmp_path, "reuse_missing")
+
+    assert proc.returncode == 13
+    assert "inherited environment 0123456789ab is unavailable" in proc.stderr
+    assert not (tmp_path / "state" / "sync-count").exists()
+
+
+def test_wrapper_exact_environment_reuse_does_not_require_uv(tmp_path):
+    (tmp_path / "code").mkdir()
+    env_dir = tmp_path / "envs" / "0123456789ab"
+    (env_dir / "bin").mkdir(parents=True)
+    (env_dir / "bin" / "python").symlink_to(shutil.which("python3"))
+    (tmp_path / "cmd.sh").write_text(
+        f"python -c \"import os; assert os.environ['VIRTUAL_ENV'] == '{env_dir}'\"\n"
+    )
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "",
+        "DT_MAX_HOURS": "",
+        "DT_ENV_MODE": "reuse",
+        "DT_UV": "",
+        "DT_UV_ENV": str(env_dir),
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "result_state").read_text().strip() == "success"
+    assert "DT_ENV_MODE" in _tmux_session_env_names()
+
+
 def test_launcher_setup_hook_stops_at_first_failed_command(tmp_path):
     proc = _run_launcher_with_fake_uv(tmp_path, "setup_failure")
 
@@ -392,7 +488,37 @@ def test_proxy_injection_contract():
     for script in (LAUNCHER, WRAPPER):
         assert 'HTTPS_PROXY="$DT_PROXY"' in script
         assert 'NO_PROXY="localhost,127.0.0.1"' in script
-    assert "DT_PROXY='${DT_PROXY:-}'" in LAUNCHER  # forwarded into the tmux session
+    assert "DT_WEBHOOK DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME DT_PROXY" in LAUNCHER
+    assert 'DT_SESSION_COMMAND+=" $name=$DT_SHELL_QUOTED"' in LAUNCHER
+    assert "$(dt_shell_quote" not in LAUNCHER
+
+
+def test_launcher_shell_quotes_tmux_environment_values(tmp_path):
+    sentinel = tmp_path / "injected"
+    hostile_name = f"trainer'; touch {sentinel}; printf '"
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={
+            "DT_JOB_NAME": hostile_name,
+            "DT_TEST_TMUX_CAPTURE": "1",
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    command = (tmp_path / "state" / "session-command").read_text()
+    wrapper = tmp_path / "job" / "wrapper.sh"
+    wrapper.write_text('printf "%s" "$DT_JOB_NAME" > received-name\n')
+    executed = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert executed.returncode == 0, executed.stderr
+    assert (tmp_path / "job" / "received-name").read_text() == hostile_name
+    assert not sentinel.exists()
 
 
 def test_launch_propagates_configured_node_identity_to_telemetry(tmp_path, monkeypatch):
@@ -432,7 +558,7 @@ def test_launch_propagates_configured_node_identity_to_telemetry(tmp_path, monke
 
     assert rc == 0
     assert "DT_NODE=configured-node-alias" in commands[0]
-    assert "DT_NODE='${DT_NODE:-}'" in LAUNCHER
+    assert "DT_NODE" in _tmux_session_env_names()
 
 
 def test_launch_uses_task_disk_contract_above_config_floor(tmp_path, monkeypatch):
@@ -528,8 +654,23 @@ def test_launch_propagates_resource_guards(tmp_path, monkeypatch):
     assert rc == 0
     assert "DT_MAX_VRAM_MIB=23500" in commands[0]
     assert "DT_MAX_JOB_MEMORY_MIB=60000" in commands[0]
-    assert "DT_MAX_VRAM_MIB='${DT_MAX_VRAM_MIB:-}'" in LAUNCHER
-    assert "DT_MAX_JOB_MEMORY_MIB='${DT_MAX_JOB_MEMORY_MIB:-}'" in LAUNCHER
+    assert {"DT_MAX_VRAM_MIB", "DT_MAX_JOB_MEMORY_MIB"} <= (_tmux_session_env_names())
+    assert "DT_GPU_ISOLATION=advisory" in commands[0]
+    assert "DT_GPU_ISOLATION" in _tmux_session_env_names()
+
+
+def test_run_spec_rejects_unimplemented_physical_gpu_isolation():
+    import dt.dispatch as dispatch
+
+    with pytest.raises(dispatch.ConfigError, match="no physical GPU"):
+        dispatch._validate_run_spec(  # noqa: SLF001
+            RunSpec(
+                name="physical-isolation",
+                gpus=1,
+                cmd=["true"],
+                gpu_isolation="physical",
+            )
+        )
 
 
 def test_launch_propagates_project_artifact_root(tmp_path, monkeypatch):
@@ -570,7 +711,7 @@ def test_launch_propagates_project_artifact_root(tmp_path, monkeypatch):
     assert rc == 0
     assert "DT_ARTIFACT_ROOT=dt/artifacts/Omni-Stack" in commands[0]
     assert 'DT_ARTIFACT_ROOT="$HOME/$DT_ARTIFACT_ROOT"' in LAUNCHER
-    assert "DT_ARTIFACT_ROOT='${DT_ARTIFACT_ROOT:-}'" in LAUNCHER
+    assert "DT_ARTIFACT_ROOT" in _tmux_session_env_names()
 
 
 def test_launch_exposes_successful_same_node_predecessor_outputs(tmp_path, monkeypatch):
@@ -629,8 +770,8 @@ def test_launch_exposes_successful_same_node_predecessor_outputs(tmp_path, monke
     assert rc == 0
     assert "DT_PREDECESSOR_JOB_ID=guard" in commands[0]
     assert "DT_PREDECESSOR_JOB_DIR=dt/jobs/guard" in commands[0]
-    assert "DT_PREDECESSOR_OUTPUTS='$DT_PREDECESSOR_OUTPUTS'" in LAUNCHER
-    assert "DT_PREDECESSOR_META_PATH='$DT_PREDECESSOR_META_PATH'" in LAUNCHER
+    assert "DT_PREDECESSOR_OUTPUTS" in _tmux_session_env_names()
+    assert "DT_PREDECESSOR_META_PATH" in _tmux_session_env_names()
 
 
 def test_launch_propagates_exact_fork_cache_contract(tmp_path, monkeypatch):
@@ -686,8 +827,8 @@ def test_launch_propagates_exact_fork_cache_contract(tmp_path, monkeypatch):
     assert "DT_CACHE_SOURCE_ENV=6fb61a247969" in command
     assert f"DT_CACHE_SOURCE_SNAPSHOT={'a' * 64}" in command
     assert "DT_CACHE_MODE=shared" in command
-    assert "DT_CACHE_SOURCE_SNAPSHOT='$DT_CACHE_SOURCE_SNAPSHOT'" in LAUNCHER
-    assert "DT_CACHE_MODE='$DT_CACHE_MODE'" in LAUNCHER
+    assert "DT_CACHE_SOURCE_SNAPSHOT" in _tmux_session_env_names()
+    assert "DT_CACHE_MODE" in _tmux_session_env_names()
     assert "cache source resolves outside" in LAUNCHER
     assert "target environment identity does not match cache source" in LAUNCHER
 
@@ -947,6 +1088,41 @@ def test_artifact_verifier_detects_content_drift(tmp_path):
     assert "mismatch" in drifted.stderr
 
 
+def test_artifact_verifier_refuses_symlinked_trust_roots(tmp_path):
+    real_root = tmp_path / "real-artifacts"
+    real_root.mkdir()
+    root_alias = tmp_path / "artifact-alias"
+    root_alias.symlink_to(real_root, target_is_directory=True)
+    manifest_payload = json.dumps(
+        {"schema_version": "dt_artifact_manifest_v1", "artifacts": []}
+    ).encode()
+    outside_manifest = tmp_path / "outside-manifest.json"
+    outside_manifest.write_bytes(manifest_payload)
+    manifest_alias = tmp_path / "manifest.json"
+    manifest_alias.symlink_to(outside_manifest)
+    digest = hashlib.sha256(manifest_payload).hexdigest()
+
+    with pytest.raises(ValueError, match="artifact root"):
+        verify_artifacts(root_alias, outside_manifest, digest)
+    with pytest.raises(OSError):
+        verify_artifacts(real_root, manifest_alias, digest)
+
+
+def test_payload_attestation_refuses_a_symlinked_runtime_file(tmp_path):
+    support = _support_files(["true"], {})
+    payload = tmp_path / "payload"
+    payload.mkdir()
+    for name in RUNTIME_PAYLOAD_NAMES:
+        (payload / name).write_text(support[name], encoding="utf-8")
+    outside = tmp_path / "outside-runtime"
+    outside.write_text(support["launcher.sh"], encoding="utf-8")
+    (payload / "launcher.sh").unlink()
+    (payload / "launcher.sh").symlink_to(outside)
+
+    with pytest.raises(OSError):
+        payload_files_from_dir(payload)
+
+
 def test_wrapper_unbuffers_logs():
     # block-buffered stdout hides training progress from `dt logs -f`
     assert "PYTHONUNBUFFERED=1" in WRAPPER
@@ -1011,6 +1187,9 @@ def test_payload_clears_caller_virtualenv_before_managed_uv(tmp_path):
     (tmp_path / "cmd.sh").write_text(
         'printf "%s|%s\\n" "${VIRTUAL_ENV-unset}" '
         '"$UV_PROJECT_ENVIRONMENT" > "$DT_JOB_DIR/env-seen"\n'
+        'expected=$(awk \'{ line=$0; sub(/^.*\\) /, "", line); '
+        'split(line, f, " "); print f[20] }\' "/proc/$PPID/stat")\n'
+        'test "$(cat "$DT_JOB_DIR/process_start_ticks")" = "$expected"\n'
     )
     fake_uv = tmp_path / "fake-uv"
     fake_uv.write_text(
@@ -1047,6 +1226,8 @@ def test_payload_clears_caller_virtualenv_before_managed_uv(tmp_path):
     assert (tmp_path / "env-seen").read_text().strip() == (
         f"unset|{tmp_path / 'managed-env'}"
     )
+    assert (tmp_path / "process_start_ticks").read_text().strip().isdigit()
+    assert (tmp_path / "pgid").read_text().strip().isdigit()
 
 
 def test_wrapper_reaps_group_escapees():
@@ -1058,15 +1239,25 @@ def test_wrapper_reaps_group_escapees():
 
 
 def test_gpu_lease_closes_pre_cuda_startup_race():
-    assert "DT_GPU_IDS='$ids'" in LAUNCHER
+    assert "DT_GPU_IDS" in _tmux_session_env_names()
     assert 'lease_available "$idx"' in LAUNCHER
     assert LAUNCHER.find("start_session") < LAUNCHER.find(
         "wrapper did not acquire GPU lease/start"
     )
     assert "attempt < 100" in LAUNCHER
     assert "sleep 0.1" in LAUNCHER
-    assert WRAPPER.find("flock -n") < WRAPPER.find('echo $$ > "$DT_STATE_DIR/pgid"')
+    assert WRAPPER.find("flock -n") < WRAPPER.find(
+        'printf \'%s\\n\' "$$" > "$DT_STATE_DIR/pgid"'
+    )
     assert "gpu-$dt_gpu_index.lock" in WRAPPER
+
+
+def test_wrapper_publishes_process_identity_before_pgid():
+    identity = WRAPPER.index('"$DT_STATE_DIR/process_start_ticks"')
+    pgid = WRAPPER.index('"$DT_STATE_DIR/pgid"')
+
+    assert "/proc/$$/stat" in WRAPPER
+    assert identity < pgid
 
 
 def test_gpu_probe_uses_direct_cuda_driver_allocation():
@@ -1189,6 +1380,7 @@ def test_wrapper_records_subsecond_start_and_finish_timestamps(tmp_path):
     assert re.fullmatch(r"\d+\.\d+", started_text)
     assert re.fullmatch(r"\d+\.\d+", finished_text)
     assert float(finished_text) >= float(started_text)
+    assert (tmp_path / "result_state").read_text().strip() == "success"
 
     lifecycle_rows = [
         json.loads(line)
@@ -1207,6 +1399,201 @@ def test_wrapper_records_subsecond_start_and_finish_timestamps(tmp_path):
     assert lifecycle_timestamps == sorted(lifecycle_timestamps)
     by_event = {row["event"]: row["timestamp"] for row in lifecycle_rows}
     assert by_event["escapees_reaped"] - by_event["telemetry_stopped"] < 0.75
+
+
+def test_wrapper_preserves_explicit_scientific_rejection(tmp_path):
+    (tmp_path / "code").mkdir()
+    (tmp_path / "result.py").write_text((PAYLOAD / "result.py").read_text())
+    result_path = tmp_path / "outputs" / "dt" / "result.json"
+    (tmp_path / "cmd.sh").write_text(
+        f"python3 {tmp_path / 'result.py'} --output {result_path} emit "
+        "--state scientific_reject --reason 'hypothesis not supported'\n"
+    )
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "",
+        "DT_MAX_HOURS": "",
+        "DT_UV": "",
+        "DT_UV_ENV": "",
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "result_state").read_text().strip() == "scientific_reject"
+    result = json.loads(result_path.read_text())
+    assert result["schema_version"] == "dt_result_v1"
+    assert result["reason"] == "hypothesis not supported"
+
+
+def test_result_helper_is_first_writer_and_rejects_control_states(tmp_path):
+    helper = PAYLOAD / "result.py"
+    output = tmp_path / "result.json"
+    base = ["python3", str(helper), "--output", str(output), "emit"]
+
+    first = subprocess.run(
+        [*base, "--state", "scientific_reject", "--metadata-json", '{"score":0.1}'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    replay = subprocess.run(
+        [*base, "--state", "scientific_reject", "--metadata-json", '{"score":0.1}'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    metadata_conflict = subprocess.run(
+        [*base, "--state", "scientific_reject", "--metadata-json", '{"score":0.2}'],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    conflict = subprocess.run(
+        [*base, "--state", "success"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    forbidden = subprocess.run(
+        [
+            "python3",
+            str(helper),
+            "--output",
+            str(tmp_path / "infra.json"),
+            "emit",
+            "--state",
+            "infra_failure",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert first.returncode == replay.returncode == 0
+    assert metadata_conflict.returncode == 2
+    assert "different result" in metadata_conflict.stderr
+    assert conflict.returncode == 2
+    assert "different result" in conflict.stderr
+    assert forbidden.returncode == 2
+    assert "applications may emit only" in forbidden.stderr
+
+
+def test_result_reader_rejects_forged_control_state(tmp_path):
+    helper = PAYLOAD / "result.py"
+    output = tmp_path / "forged.json"
+    output.write_text(
+        json.dumps(
+            {
+                "schema_version": "dt_result_v1",
+                "state": "infra_failure",
+                "reason": None,
+                "metadata": {},
+                "emitted_at": time.time(),
+            }
+        )
+    )
+
+    read = subprocess.run(
+        ["python3", str(helper), "--output", str(output), "state"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert read.returncode == 2
+    assert "invalid application result state" in read.stderr
+
+
+def test_result_helper_refuses_a_symlinked_result_document(tmp_path):
+    helper = PAYLOAD / "result.py"
+    outside = tmp_path / "outside-result.json"
+    outside.write_text(
+        json.dumps(
+            {
+                "schema_version": "dt_result_v1",
+                "state": "scientific_reject",
+                "reason": None,
+                "metadata": {},
+                "emitted_at": time.time(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = tmp_path / "result.json"
+    output.symlink_to(outside)
+    before = outside.read_bytes()
+
+    emitted = subprocess.run(
+        [
+            "python3",
+            str(helper),
+            "--output",
+            str(output),
+            "emit",
+            "--state",
+            "scientific_reject",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    read = subprocess.run(
+        ["python3", str(helper), "--output", str(output), "state"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert emitted.returncode == 2
+    assert read.returncode == 2
+    assert outside.read_bytes() == before
+
+
+def test_concurrent_equal_result_emission_publishes_complete_document(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    helper = PAYLOAD / "result.py"
+    output = tmp_path / "result.json"
+    command = [
+        "python3",
+        str(helper),
+        "--output",
+        str(output),
+        "emit",
+        "--state",
+        "scientific_reject",
+        "--metadata-json",
+        '{"score":0.1}',
+    ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda _index: subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ),
+                range(2),
+            )
+        )
+
+    assert [result.returncode for result in results] == [0, 0]
+    payload = json.loads(output.read_text())
+    assert payload["state"] == "scientific_reject"
+    assert payload["metadata"] == {"score": 0.1}
+    assert not list(tmp_path.glob(".result.json.*.tmp"))
 
 
 def test_wrapper_exports_phase_helper_and_records_automatic_markers(tmp_path):
@@ -1364,7 +1751,7 @@ def test_wrapper_unexpected_exit_stops_telemetry(tmp_path):
         # The helper waits until telemetry is definitely live, then forces an
         # unhandled shell signal. EXIT must still reap the sidecar.
         "DT_UV": str(fake_uv),
-        "DT_UV_ENV": "broken",
+        "DT_UV_ENV": str(tmp_path / "broken-env"),
         "DT_WEBHOOK": "",
         "DT_PROXY": "",
     }

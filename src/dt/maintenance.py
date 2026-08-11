@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import PurePosixPath
 
 from .config import HeadConfig
-from .jobs import JobEntry, list_all, remove_record
+from .jobs import JobEntry, job_lock, list_all, load, remove_record
 from .layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
@@ -21,6 +21,7 @@ from .layout import (
     normalize_node_root,
 )
 from .snapshot_store import load_state, lock, save_state
+from .sshio import diagnostic_excerpt
 
 Log = Callable[[str], None]
 BeforeRegistryRemove = Callable[[JobEntry], None]
@@ -49,7 +50,10 @@ def envs_in_use(cfg: HeadConfig) -> dict[str, set[str]]:
     """Return environment identities referenced by live jobs, grouped by node."""
     used: dict[str, set[str]] = {}
     for entry in list_all(cfg):
-        if entry.status == "running" and entry.env_hash:
+        # Exact-environment jobs already carry their identity while queued.
+        # Protect them as well as running jobs so a retention sweep cannot
+        # invalidate a future `dt exec` before the agent places it.
+        if entry.status in {"queued", "running"} and entry.env_hash:
             used.setdefault(entry.node, set()).add(entry.env_hash)
     return used
 
@@ -66,12 +70,17 @@ def clean_envs_command(
     stamp = cutoff.strftime("%Y-%m-%d %H:%M:%S")
     script = (
         f"cd {node_path_expression(envs_dir)} 2>/dev/null || exit 0; "
+        "command -v flock >/dev/null 2>&1 || "
+        '{ echo "flock is required for safe environment cleanup" >&2; exit 69; }; '
         'for d in */; do d="${d%/}"; '
         '[[ "$d" =~ ^[0-9a-f]{12}$ ]] || continue; '
         f'case "{keep_csv}" in *",$d,"*) continue;; esac; '
+        # Synchronize with environment construction and the shared lock held
+        # by every running wrapper. Re-check age only after taking the lock:
+        # a just-launched job may have refreshed mtime while cleanup waited.
+        '( flock -n 9 || exit 0; [ -d "$d" ] || exit 0; '
         f'[ -n "$(find "$d" -maxdepth 0 -newermt "{stamp}" 2>/dev/null)" ] '
-        "&& continue; "
-        'rm -rf -- "$d" "$d.lock" && echo "$d"; done'
+        '&& exit 0; rm -rf -- "$d" && echo "$d" ) 9<>"$d.lock"; done'
     )
     return f"bash -c {shlex.quote(script)}"
 
@@ -99,7 +108,7 @@ def clean_envs(
             log(f"{node.name}: env clean skipped ({exc})")
             continue
         if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
+            detail = diagnostic_excerpt(proc.stderr, proc.stdout)
             suffix = f": {detail}" if detail else ""
             log(
                 f"{node.name}: env clean skipped "
@@ -125,18 +134,52 @@ def clean_job_victims(
         source_job
         for entry in entries
         if entry.status in ("queued", "running")
-        for source_job in (entry.cache_source_job, entry.after_success)
+        for source_job in (
+            entry.cache_source_job,
+            entry.after_success,
+            entry.after_complete,
+            entry.after_result,
+        )
         if source_job
     }
     return [
         entry
         for entry in entries
-        if entry.status in ("finished", "killed", "lost", "failed")
+        if entry.status in ("finished", "killed", "lost", "failed", "skipped")
         and entry.finished_at is not None
         and entry.finished_at < cutoff_ts
         and (projects is None or entry.project in projects)
         and entry.job_id not in active_source_jobs
     ]
+
+
+def _still_cleanable(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    cutoff_ts: float,
+    projects: set[str] | None,
+) -> bool:
+    """Revalidate one victim and every live reference while its lock is held."""
+    if (
+        entry.status not in {"finished", "killed", "lost", "failed", "skipped"}
+        or entry.finished_at is None
+        or entry.finished_at >= cutoff_ts
+        or (projects is not None and entry.project not in projects)
+    ):
+        return False
+    active_references = {
+        source_job
+        for candidate in list_all(cfg)
+        if candidate.status in {"queued", "running"}
+        for source_job in (
+            candidate.cache_source_job,
+            candidate.after_success,
+            candidate.after_complete,
+            candidate.after_result,
+        )
+        if source_job
+    }
+    return entry.job_id not in active_references
 
 
 def _managed_job_dir(cfg: HeadConfig, entry: JobEntry) -> str | None:
@@ -225,75 +268,112 @@ def clean_jobs(
     victims = clean_job_victims(cfg, cutoff_ts, projects=projects)
     removed_entries: list[JobEntry] = []
     failures: list[CleanFailure] = []
-    for entry in victims:
-        managed_dir = _managed_job_dir(cfg, entry)
-        if managed_dir is None:
-            message = f"refusing unmanaged job_dir {entry.job_dir!r}"
-            log(f"{entry.job_id}: {message}")
-            failures.append(
-                CleanFailure(
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    kind="unsafe_job_dir",
-                    message=message,
+    for selected in victims:
+        with job_lock(cfg, selected.job_id):
+            entry = load(cfg, selected.job_id)
+            if entry is None or not _still_cleanable(
+                cfg,
+                entry,
+                cutoff_ts,
+                projects,
+            ):
+                message = "job state or active references changed after cleanup plan"
+                log(f"{selected.job_id}: {message}; registry retained")
+                failures.append(
+                    CleanFailure(
+                        job_id=selected.job_id,
+                        node=selected.node,
+                        kind="state_changed",
+                        message=message,
+                    )
                 )
-            )
-            continue
-        if entry.node != "-":
+                continue
+            managed_dir = _managed_job_dir(cfg, entry)
+            if managed_dir is None:
+                message = f"refusing unmanaged job_dir {entry.job_dir!r}"
+                log(f"{entry.job_id}: {message}")
+                failures.append(
+                    CleanFailure(
+                        job_id=entry.job_id,
+                        node=entry.node,
+                        kind="unsafe_job_dir",
+                        message=message,
+                    )
+                )
+                continue
+            if entry.node != "-":
+                live_guard = ""
+                if entry.status == "lost" and entry.pgid is not None:
+                    live_guard = (
+                        f"if kill -0 {entry.pgid} 2>/dev/null; then "
+                        "echo DT_CLEAN_LIVE >&2; exit 75; fi; "
+                    )
+                try:
+                    proc = runner(
+                        entry.node,
+                        entry.node_local,
+                        f"{live_guard}rm -rf -- {node_path_expression(managed_dir)}",
+                        60,
+                        False,
+                    )
+                except Exception as exc:
+                    message = f"remote delete on {entry.node} failed: {exc}"
+                    log(f"{entry.job_id}: {message}; registry retained")
+                    failures.append(
+                        CleanFailure(
+                            job_id=entry.job_id,
+                            node=entry.node,
+                            kind="remote_delete_failed",
+                            message=message,
+                        )
+                    )
+                    continue
+                if proc.returncode != 0:
+                    detail = diagnostic_excerpt(proc.stderr, proc.stdout)
+                    if proc.returncode == 75 and "DT_CLEAN_LIVE" in detail:
+                        message = "lost job process is running; cleanup refused"
+                        log(f"{entry.job_id}: {message}; registry retained")
+                        failures.append(
+                            CleanFailure(
+                                job_id=entry.job_id,
+                                node=entry.node,
+                                kind="state_changed",
+                                message=message,
+                            )
+                        )
+                        continue
+                    message = f"remote delete on {entry.node} exited {proc.returncode}"
+                    if detail:
+                        message += f": {detail}"
+                    log(f"{entry.job_id}: {message}; registry retained")
+                    failures.append(
+                        CleanFailure(
+                            job_id=entry.job_id,
+                            node=entry.node,
+                            kind="remote_delete_failed",
+                            message=message,
+                        )
+                    )
+                    continue
             try:
-                proc = runner(
-                    entry.node,
-                    entry.node_local,
-                    f"rm -rf -- {node_path_expression(managed_dir)}",
-                    60,
-                    False,
-                )
+                if before_registry_remove is not None:
+                    before_registry_remove(entry)
+                for queue in {cfg.queue_dir(), cfg.legacy_queue_dir()}:
+                    shutil.rmtree(queue / entry.job_id, ignore_errors=True)
+                remove_record(cfg, entry.job_id)
             except Exception as exc:
-                message = f"remote delete on {entry.node} failed: {exc}"
+                message = f"local cleanup failed: {exc}"
                 log(f"{entry.job_id}: {message}; registry retained")
                 failures.append(
                     CleanFailure(
                         job_id=entry.job_id,
                         node=entry.node,
-                        kind="remote_delete_failed",
+                        kind="local_cleanup_failed",
                         message=message,
                     )
                 )
                 continue
-            if proc.returncode != 0:
-                detail = (proc.stderr or proc.stdout or "").strip()
-                message = f"remote delete on {entry.node} exited {proc.returncode}"
-                if detail:
-                    message += f": {detail}"
-                log(f"{entry.job_id}: {message}; registry retained")
-                failures.append(
-                    CleanFailure(
-                        job_id=entry.job_id,
-                        node=entry.node,
-                        kind="remote_delete_failed",
-                        message=message,
-                    )
-                )
-                continue
-        try:
-            if before_registry_remove is not None:
-                before_registry_remove(entry)
-            for queue in {cfg.queue_dir(), cfg.legacy_queue_dir()}:
-                shutil.rmtree(queue / entry.job_id, ignore_errors=True)
-            remove_record(cfg, entry.job_id)
-        except Exception as exc:
-            message = f"local cleanup failed: {exc}"
-            log(f"{entry.job_id}: {message}; registry retained")
-            failures.append(
-                CleanFailure(
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    kind="local_cleanup_failed",
-                    message=message,
-                )
-            )
-            continue
-        removed_entries.append(entry)
+            removed_entries.append(entry)
 
     _remove_unreferenced_snapshots(cfg, removed_entries, cutoff_ts)
     if envs:

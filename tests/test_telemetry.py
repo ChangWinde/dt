@@ -161,6 +161,41 @@ def test_telemetry_copies_only_safe_current_phase(tmp_path):
     assert json.loads(output.read_text())["phase"] is None
 
 
+def test_telemetry_refuses_symlinked_phase_and_history_files(tmp_path):
+    outside_phase = tmp_path / "outside-phase"
+    outside_phase.write_text("secret_phase\n", encoding="utf-8")
+    phase = tmp_path / "phase-current"
+    phase.symlink_to(outside_phase)
+    outside_history = tmp_path / "outside-history"
+    outside_history.write_text("must survive\n", encoding="utf-8")
+    output = tmp_path / "resources.jsonl"
+    output.symlink_to(outside_history)
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(PAYLOAD_DIR / "telemetry.py"),
+            "--output",
+            str(output),
+            "--gpus",
+            "",
+            "--phase-file",
+            str(phase),
+            "--samples",
+            "1",
+            "--interval",
+            "0.01",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert proc.returncode == 0
+    assert "resource history unavailable" in proc.stderr
+    assert outside_history.read_text(encoding="utf-8") == "must survive\n"
+
+
 def test_telemetry_attributes_cpu_ram_and_io_to_the_job_process_tree(tmp_path):
     output = tmp_path / "resources.jsonl"
     script = PAYLOAD_DIR / "telemetry.py"
@@ -593,7 +628,8 @@ def test_sample_write_failure_never_disarms_the_guard():
     )
 
     assert proc.returncode == 0, proc.stderr
-    assert proc.stderr.count("sample write failed") == 3
+    assert "resource history unavailable" in proc.stderr
+    assert "guards stay armed" in proc.stderr
 
 
 def test_unopenable_history_stream_still_leaves_the_guard_armed(tmp_path):
@@ -948,6 +984,21 @@ def test_job_memory_guard_prefers_anon_pss_and_uses_strict_threshold():
         "observed_metric": "pss_mib",
     }
     assert telemetry._job_memory_violation(None, 100) is None
+
+
+def test_guard_evidence_atomically_replaces_a_symlink(tmp_path):
+    telemetry = _load_telemetry_payload()
+    outside = tmp_path / "outside-guard"
+    outside.write_text("must survive\n", encoding="utf-8")
+    guard = tmp_path / "resource-guard.json"
+    guard.symlink_to(outside)
+
+    telemetry._write_json_atomic(guard, {"kind": "proof"})
+
+    assert not guard.is_symlink()
+    assert json.loads(guard.read_text(encoding="utf-8")) == {"kind": "proof"}
+    assert outside.read_text(encoding="utf-8") == "must survive\n"
+    assert not list(tmp_path.glob(".resource-guard.json.*.tmp"))
 
 
 def test_telemetry_job_memory_guard_persists_evidence_and_terminates_group(

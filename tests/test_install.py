@@ -51,6 +51,9 @@ def _fake_commands(tmp_path: Path) -> tuple[Path, Path]:
         fake_bin / "uv",
         r"""#!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == "--no-config" ]]; then
+    shift
+fi
 printf '%s\n' "$*" >> "$FAKE_UV_LOG"
 case "${1:-}" in
     export)
@@ -92,6 +95,62 @@ case "${1:-}" in
         ;;
     python)
         [[ "${2:-}" == "find" ]]
+        if [[ -n "${FAKE_UV_MUTATE_CONSTRAINTS:-}" \
+              && ! -e "${FAKE_UV_MUTATION_FLAG:-}" ]]; then
+            printf 'tampered==9.9\n' > "$FAKE_UV_MUTATE_CONSTRAINTS"
+            : > "$FAKE_UV_MUTATION_FLAG"
+        fi
+        ;;
+    venv)
+        target="${!#}"
+        if [[ -n "${FAKE_UV_VENV_DELAY:-}" ]]; then
+            sleep "$FAKE_UV_VENV_DELAY"
+        fi
+        mkdir -p "$target/bin"
+        cat > "$target/bin/python" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+        chmod +x "$target/bin/python"
+        ;;
+    pip)
+        if [[ "${2:-}" == "check" ]]; then
+            exit 0
+        fi
+        [[ "${2:-}" == "install" ]]
+        if [[ " $* " == *" --require-hashes "* ]] \
+           && [[ "${FAKE_UV_FAIL_HASH_INSTALL:-0}" == "1" ]]; then
+            echo "simulated dependency hash failure" >&2
+            exit 42
+        fi
+        python_path=""
+        artifact=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --python)
+                    python_path="$2"
+                    shift 2
+                    ;;
+                *.whl)
+                    artifact="$1"
+                    shift
+                    ;;
+                *) shift ;;
+            esac
+        done
+        if [[ -n "$artifact" ]]; then
+            [[ -n "$python_path" ]]
+            target_bin="$(dirname "$python_path")"
+            artifact_name="$(basename "$artifact")"
+            artifact_version="${artifact_name#disttrainer-}"
+            artifact_version="${artifact_version%-py3-none-any.whl}"
+            installed_version="${FAKE_DT_VERSION:-$artifact_version}"
+            cat > "$target_bin/dt" <<EOF
+#!/usr/bin/env bash
+echo 'dt $installed_version (source-test)'
+EOF
+            chmod +x "$target_bin/dt"
+        fi
         ;;
     tool)
         [[ "${2:-}" == "install" ]]
@@ -109,7 +168,7 @@ EOF
 esac
 """,
     )
-    for command in ("flock", "rsync", "ssh", "timeout", "tmux"):
+    for command in ("rsync", "ssh", "tmux"):
         _write_executable(fake_bin / command, "#!/usr/bin/env bash\nexit 0\n")
     _write_executable(
         fake_bin / "git",
@@ -138,17 +197,34 @@ def _install_env(tmp_path: Path, fake_bin: Path, log: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
         {
-            "DT_CONFIG_PATH": str(tmp_path / "config.yaml"),
+            "DT_CONFIG": str(tmp_path / "config.yaml"),
+            "DT_INSTALL_ROOT": str(tmp_path / "installations"),
             "FAKE_UV_LOG": str(log),
             "HOME": str(tmp_path / "home"),
             "PATH": f"{fake_bin}:{env['PATH']}",
             "REAL_GIT": shutil.which("git") or "git",
             "TMPDIR": str(work),
             "UV_TOOL_BIN_DIR": str(tmp_path / "tool-bin"),
-            "UV_TOOL_DIR": str(tmp_path / "tools"),
         }
     )
     return env
+
+
+def _release_bundle(tmp_path: Path, version: str = "0.6.2") -> tuple[Path, Path]:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir(parents=True)
+    wheel = bundle / f"disttrainer-{version}-py3-none-any.whl"
+    constraints = bundle / "runtime-constraints.txt"
+    wheel.write_bytes(f"wheel fixture {version}\n".encode())
+    constraints.write_text(
+        "pyyaml==6.0 --hash=sha256:" + "0" * 64 + "\n", encoding="utf-8"
+    )
+    checksums = "".join(
+        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+        for path in (wheel, constraints)
+    )
+    (bundle / "SHA256SUMS").write_text(checksums, encoding="utf-8")
+    return wheel, constraints
 
 
 def test_source_installer_builds_committed_snapshot_without_creating_config(tmp_path):
@@ -189,7 +265,10 @@ def test_source_installer_builds_committed_snapshot_without_creating_config(tmp_
     calls = log.read_text("utf-8")
     assert "export --project" in calls
     assert "build --wheel" in calls
-    assert "tool install --force --python 3.10" in calls
+    assert "venv --relocatable --python 3.10" in calls
+    assert "pip install --require-hashes" in calls
+    assert "pip install --no-deps" in calls
+    assert "tool install" not in calls
     assert f'SOURCE_COMMIT: str | None = "{commit}"' in calls
 
 
@@ -281,17 +360,7 @@ def test_source_installer_rejects_unsupported_python_before_mutation(tmp_path):
 def test_release_bootstrap_reports_an_immediately_runnable_command_when_path_is_missing(
     tmp_path,
 ):
-    bundle = tmp_path / "bundle"
-    bundle.mkdir()
-    wheel = bundle / "disttrainer-0.6.2-py3-none-any.whl"
-    constraints = bundle / "runtime-constraints.txt"
-    wheel.write_bytes(b"wheel fixture\n")
-    constraints.write_text("pyyaml==6.0\n", encoding="utf-8")
-    checksums = "".join(
-        f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
-        for path in (wheel, constraints)
-    )
-    (bundle / "SHA256SUMS").write_text(checksums, encoding="utf-8")
+    wheel, constraints = _release_bundle(tmp_path)
     fake_bin, log = _fake_commands(tmp_path)
     env = _install_env(tmp_path, fake_bin, log)
     tool_bin = tmp_path / "tool-bin"
@@ -317,3 +386,229 @@ def test_release_bootstrap_reports_an_immediately_runnable_command_when_path_is_
     assert f'export PATH="{tool_bin}:$PATH"' in result.stdout
     assert f"cd PROJECT && {tool_bin}/dt init --role head" in result.stdout
     assert not malicious_marker.exists()
+
+
+def test_release_bootstrap_fails_closed_on_dependency_hash_failure(tmp_path):
+    wheel, constraints = _release_bundle(tmp_path)
+    fake_bin, log = _fake_commands(tmp_path)
+    env = _install_env(tmp_path, fake_bin, log)
+    env["FAKE_UV_FAIL_HASH_INSTALL"] = "1"
+    tool_bin = tmp_path / "tool-bin"
+    tool_bin.mkdir()
+    existing = tool_bin / "dt"
+    _write_executable(existing, "#!/usr/bin/env bash\necho 'dt 0.6.1'\n")
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bootstrap.sh"), str(wheel), str(constraints)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert subprocess.check_output([str(existing)], text=True).strip() == "dt 0.6.1"
+    calls = log.read_text("utf-8")
+    assert "pip install --require-hashes" in calls
+    assert "tool install" not in calls
+    install_root = tmp_path / "installations"
+    assert not list(install_root.glob(".incoming.*"))
+
+
+def test_concurrent_release_bootstraps_publish_one_complete_environment(tmp_path):
+    wheel, constraints = _release_bundle(tmp_path)
+    fake_bin, log = _fake_commands(tmp_path)
+    env = _install_env(tmp_path, fake_bin, log)
+    env["FAKE_UV_VENV_DELAY"] = "0.2"
+    argv = ["bash", str(ROOT / "bootstrap.sh"), str(wheel), str(constraints)]
+
+    first = subprocess.Popen(
+        argv,
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second = subprocess.Popen(
+        argv,
+        cwd=tmp_path,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    first_stdout, first_stderr = first.communicate(timeout=10)
+    second_stdout, second_stderr = second.communicate(timeout=10)
+
+    assert first.returncode == 0, (first_stdout, first_stderr)
+    assert second.returncode == 0, (second_stdout, second_stderr)
+    assert (
+        subprocess.check_output([str(tmp_path / "tool-bin" / "dt")], text=True).strip()
+        == "dt 0.6.2 (source-test)"
+    )
+    calls = log.read_text("utf-8").splitlines()
+    assert sum(call.startswith("venv ") for call in calls) == 1
+    assert sum("pip install --require-hashes" in call for call in calls) == 1
+    install_root = tmp_path / "installations"
+    assert not list(install_root.glob(".incoming.*"))
+
+
+def test_release_bootstrap_keeps_python_minor_in_environment_identity(tmp_path):
+    wheel, constraints = _release_bundle(tmp_path)
+    fake_bin, log = _fake_commands(tmp_path)
+    env = _install_env(tmp_path, fake_bin, log)
+    argv = ["bash", str(ROOT / "bootstrap.sh"), str(wheel), str(constraints)]
+
+    for minor in ("3.10", "3.11"):
+        env["DT_PYTHON"] = minor
+        result = subprocess.run(
+            argv,
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+
+    roots = tmp_path / "installations"
+    assert len(list(roots.glob("py3.10-*"))) == 1
+    assert len(list(roots.glob("py3.11-*"))) == 1
+    calls = log.read_text("utf-8").splitlines()
+    assert sum(call.startswith("venv ") for call in calls) == 2
+
+
+def test_release_bootstrap_recovers_abandoned_private_stage(tmp_path):
+    wheel, constraints = _release_bundle(tmp_path)
+    fake_bin, log = _fake_commands(tmp_path)
+    env = _install_env(tmp_path, fake_bin, log)
+    abandoned = tmp_path / "installations" / ".incoming.abandoned"
+    abandoned.mkdir(parents=True)
+    (abandoned / "partial").write_text("interrupted\n", encoding="utf-8")
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bootstrap.sh"), str(wheel), str(constraints)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not abandoned.exists()
+    assert not list((tmp_path / "installations").glob(".incoming.*"))
+
+
+def test_release_bootstrap_refuses_symlinked_abandoned_stage(tmp_path):
+    wheel, constraints = _release_bundle(tmp_path)
+    fake_bin, log = _fake_commands(tmp_path)
+    env = _install_env(tmp_path, fake_bin, log)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "keep"
+    sentinel.write_text("owned elsewhere\n", encoding="utf-8")
+    install_root = tmp_path / "installations"
+    install_root.mkdir()
+    (install_root / ".incoming.attack").symlink_to(outside, target_is_directory=True)
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bootstrap.sh"), str(wheel), str(constraints)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "unsafe abandoned staging path" in result.stderr
+    assert sentinel.read_text("utf-8") == "owned elsewhere\n"
+    assert not (tmp_path / "tool-bin" / "dt").exists()
+
+
+def test_release_bootstrap_revalidates_private_copy_after_input_replacement(tmp_path):
+    wheel, constraints = _release_bundle(tmp_path)
+    fake_bin, log = _fake_commands(tmp_path)
+    env = _install_env(tmp_path, fake_bin, log)
+    env["FAKE_UV_MUTATE_CONSTRAINTS"] = str(constraints)
+    env["FAKE_UV_MUTATION_FLAG"] = str(tmp_path / "mutated")
+    tool_bin = tmp_path / "tool-bin"
+    tool_bin.mkdir()
+    existing = tool_bin / "dt"
+    _write_executable(existing, "#!/usr/bin/env bash\necho 'dt 0.6.1'\n")
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bootstrap.sh"), str(wheel), str(constraints)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "changed after verification" in result.stderr
+    assert subprocess.check_output([str(existing)], text=True).strip() == "dt 0.6.1"
+    calls = log.read_text("utf-8")
+    assert "pip install --require-hashes" not in calls
+    assert not list((tmp_path / "installations").glob(".incoming.*"))
+
+
+def test_release_bootstrap_rejects_installed_version_mismatch(tmp_path):
+    wheel, constraints = _release_bundle(tmp_path, version="0.6.3")
+    fake_bin, log = _fake_commands(tmp_path)
+    env = _install_env(tmp_path, fake_bin, log)
+    env["FAKE_DT_VERSION"] = "0.6.2"
+    tool_bin = tmp_path / "tool-bin"
+    tool_bin.mkdir()
+    existing = tool_bin / "dt"
+    _write_executable(existing, "#!/usr/bin/env bash\necho 'dt 0.6.1'\n")
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bootstrap.sh"), str(wheel), str(constraints)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "version does not match wheel" in result.stderr
+    assert subprocess.check_output([str(existing)], text=True).strip() == "dt 0.6.1"
+    assert not list((tmp_path / "installations").glob(".incoming.*"))
+
+
+def test_release_bootstrap_upgrade_and_rollback_reuse_verified_environments(tmp_path):
+    first_wheel, first_constraints = _release_bundle(tmp_path / "first", "0.6.2")
+    second_wheel, second_constraints = _release_bundle(tmp_path / "second", "0.6.3")
+    fake_bin, log = _fake_commands(tmp_path)
+    env = _install_env(tmp_path, fake_bin, log)
+
+    sequence = (
+        (first_wheel, first_constraints, "dt 0.6.2 (source-test)"),
+        (second_wheel, second_constraints, "dt 0.6.3 (source-test)"),
+        (first_wheel, first_constraints, "dt 0.6.2 (source-test)"),
+    )
+    targets = []
+    for wheel, constraints, expected in sequence:
+        result = subprocess.run(
+            ["bash", str(ROOT / "bootstrap.sh"), str(wheel), str(constraints)],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        command = tmp_path / "tool-bin" / "dt"
+        assert subprocess.check_output([str(command)], text=True).strip() == expected
+        targets.append(command.readlink())
+
+    assert targets[0] != targets[1]
+    assert targets[2] == targets[0]
+    calls = log.read_text("utf-8").splitlines()
+    assert sum(call.startswith("venv ") for call in calls) == 2

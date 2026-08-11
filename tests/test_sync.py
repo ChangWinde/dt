@@ -4,13 +4,14 @@ import subprocess
 import stat
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
 
 import dt.dispatch as dispatch
 import dt.sshio as sshio
-from dt.config import HeadConfig, LaptopConfig, Node, Project
+from dt.config import HeadConfig, LaptopConfig, Node, Project, Site
 from dt.sshio import RemoteError
 
 
@@ -1028,6 +1029,233 @@ def test_snapshot_code_and_support_transfers_share_retry_contract(
     assert any("retry 2/3 in 5s" in message for message in logs)
 
 
+def test_private_remote_directory_guard_sets_mode_and_refuses_leaf_symlink(tmp_path):
+    private = tmp_path / "job" / "logs"
+    created = subprocess.run(
+        ["bash", "-c", dispatch._private_remote_directories(str(private))],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert created.returncode == 0
+    assert private.stat().st_mode & 0o777 == 0o700
+
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o755)
+    alias = tmp_path / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+    refused = subprocess.run(
+        [
+            "bash",
+            "-c",
+            dispatch._private_remote_directories(str(alias), str(alias / "logs")),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert refused.returncode != 0
+    assert outside.stat().st_mode & 0o777 == 0o755
+    assert not (outside / "logs").exists()
+
+
+def test_snapshot_known_digest_uses_fast_path_then_checksum_repairs_mismatch(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "train.py").write_text("print('train')\n")
+    node = Node(name="n1")
+    expected = "a" * 64
+    observed_hashes = iter(["b" * 64, expected])
+    code_modes = []
+    logs = []
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_snapshot_baselines",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_remote_tree_sha256",
+        lambda *args: next(observed_hashes),
+    )
+    monkeypatch.setattr(dispatch, "_remember_snapshot", lambda *args: None)
+
+    def fake_rsync(src, dst, **kwargs):
+        if dst == "n1:dt/jobs/proof/code/":
+            code_modes.append(kwargs["checksum"])
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            "Total transferred file size: 10 bytes\n",
+            "",
+        )
+
+    monkeypatch.setattr(dispatch, "rsync", fake_rsync)
+
+    result = dispatch.snapshot(
+        cfg,
+        "omni",
+        project,
+        node,
+        "proof",
+        "dt/jobs/proof",
+        dispatch.RunSpec(name="proof", gpus=1, cmd=["true"], project="omni"),
+        {},
+        logs.append,
+        expected_sha256=expected,
+        pre_filtered=True,
+    )
+
+    assert result == expected
+    assert code_modes == [False, True]
+    assert any("integrity mismatch" in message for message in logs)
+    assert any("checksum repair verified" in message for message in logs)
+
+
+def test_snapshot_known_digest_fails_when_checksum_repair_is_still_corrupt(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    node = Node(name="n1")
+    expected = "a" * 64
+    modes = []
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_snapshot_baselines",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(dispatch, "_remote_tree_sha256", lambda *args: "b" * 64)
+
+    def fake_rsync(*args, **kwargs):
+        modes.append(kwargs.get("checksum"))
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(dispatch, "rsync", fake_rsync)
+
+    with pytest.raises(dispatch.DispatchError, match="remained corrupt"):
+        dispatch.snapshot(
+            cfg,
+            "omni",
+            project,
+            node,
+            "proof",
+            "dt/jobs/proof",
+            dispatch.RunSpec(name="proof", gpus=1, cmd=["true"], project="omni"),
+            {},
+            lambda message: None,
+            expected_sha256=expected,
+            pre_filtered=True,
+        )
+
+    assert modes == [False, True]
+
+
+def test_snapshot_routes_exact_source_through_configured_site_cache(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    node = Node(
+        name="psibot-ds",
+        site="psibot",
+        lan_address="lyf@172.16.6.91",
+    )
+    cfg.nodes = [Node(name="psibot-hm", site="psibot"), node]
+    cfg.sites = {
+        "psibot": Site(
+            name="psibot",
+            nodes=("psibot-hm", "psibot-ds"),
+            gateway="psibot-hm",
+            cache_node="psibot-hm",
+            artifact_policy="site-cache-first",
+        )
+    }
+    project = tmp_path / "snapshot"
+    project.mkdir()
+    (project / "train.py").write_text("print('train')\n")
+    digest = "a" * 64
+    observed = {}
+
+    class FakeExecutor:
+        def __init__(self, configured):
+            assert configured is cfg
+
+        def ensure(self, source, expected, destination, code_dir, **kwargs):
+            observed.update(
+                source=source,
+                expected=expected,
+                destination=destination,
+                code_dir=code_dir,
+                kwargs=kwargs,
+            )
+            return SimpleNamespace(cross_site_bytes=11, site_bytes=13)
+
+    monkeypatch.setattr(dispatch, "TransferExecutor", FakeExecutor)
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_snapshot_baselines",
+        lambda *args, **kwargs: (None, None),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "_remote_tree_sha256",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("the distribution verifier already attested the tree")
+        ),
+    )
+    monkeypatch.setattr(dispatch, "_remember_snapshot", lambda *args: None)
+    rsync_calls = []
+    monkeypatch.setattr(
+        dispatch,
+        "rsync",
+        lambda *args, **kwargs: (
+            rsync_calls.append((args, kwargs))
+            or subprocess.CompletedProcess([], 0, "", "")
+        ),
+    )
+
+    result = dispatch.snapshot(
+        cfg,
+        "omni",
+        project,
+        node,
+        "proof",
+        "~/dt/worker/jobs/proof",
+        dispatch.RunSpec(name="proof", gpus=1, cmd=["true"], project="omni"),
+        {},
+        expected_sha256=digest,
+        pre_filtered=True,
+    )
+
+    assert result == digest
+    assert observed["source"] == project
+    assert observed["destination"] is node
+    assert observed["code_dir"] == "~/dt/worker/jobs/proof/code"
+    assert observed["expected"] == digest
+    # The only head-origin rsync is the small runtime/support bundle.
+    assert len(rsync_calls) == 1
+    assert rsync_calls[0][0][1].endswith("/worker/jobs/proof/")
+
+
 def test_sync_project_reports_rsync_failure(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     project = tmp_path / "project"
@@ -1314,6 +1542,31 @@ def test_sync_cli_rejects_negative_retries_before_config(monkeypatch):
     }
 
 
+def test_sync_cli_rejects_excessive_retries_before_config(monkeypatch):
+    import dt.cli as cli
+
+    monkeypatch.setattr(
+        cli,
+        "_cfg",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("invalid retries must fail before config access")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["sync", "n1", "--retries", "11", "--json"],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout) == {
+        "error": "invalid_argument",
+        "message": "sync --retries must be at most 10",
+        "reasons": {},
+        "exit_code": 1,
+    }
+
+
 def test_sync_cli_reports_retry_event_without_polluting_json(tmp_path, monkeypatch):
     import dt.cli as cli
 
@@ -1372,6 +1625,7 @@ def test_sync_cli_reports_retry_event_without_polluting_json(tmp_path, monkeypat
             "delay_s": 5,
             "returncode": 255,
             "message": "ssh: transient sync link",
+            "kind": "transport",
         }
     ]
     assert result.stdout.count("\n") == 1

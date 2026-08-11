@@ -47,8 +47,8 @@ def _entry(spec) -> JobEntry:
 
 def test_forward_capture_can_defer_machine_stdout(monkeypatch, capsys):
     monkeypatch.setattr(
-        remote.subprocess,
-        "run",
+        remote,
+        "run_capture_stdout",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             [], 255, "partial-response", ""
         ),
@@ -63,6 +63,26 @@ def test_forward_capture_can_defer_machine_stdout(monkeypatch, capsys):
     assert rc == 255
     assert captured == "partial-response"
     assert capsys.readouterr().out == ""
+
+
+def test_forward_capture_timeout_is_an_unknown_outcome(monkeypatch, capsys):
+    monkeypatch.setattr(
+        remote,
+        "run_capture_stdout",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired([], 1, output="partial-receipt")
+        ),
+    )
+
+    rc, captured = remote.forward_capture_stdout(
+        "head",
+        ["run", "--", "true"],
+        emit_stdout=False,
+    )
+
+    assert rc == 255
+    assert captured == "partial-receipt"
+    assert "outcome may be unknown" in capsys.readouterr().err
 
 
 def test_task_shortcut_builds_shell_command_and_meaningful_name(tmp_path, monkeypatch):
@@ -97,6 +117,23 @@ def test_task_shortcut_builds_shell_command_and_meaningful_name(tmp_path, monkey
     payload = json.loads(result.stdout)
     assert payload["job_id"] == "20260724-0200_train_abcd"
     assert payload["project"] == "p"
+
+
+@pytest.mark.parametrize("poll", ["nan", "inf", "-inf"])
+def test_run_rejects_non_finite_follow_poll_before_loading_config(monkeypatch, poll):
+    monkeypatch.setattr(
+        cli,
+        "_cfg",
+        lambda: (_ for _ in ()).throw(AssertionError("config must not load")),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["run", "--follow", "--poll", poll, "--", "true"],
+    )
+
+    assert result.exit_code != 0
+    assert "--poll must be finite and positive" in result.output
 
 
 def test_run_derives_a_meaningful_name_when_name_is_omitted(tmp_path, monkeypatch):
@@ -197,6 +234,123 @@ def test_run_after_success_automatically_pins_predecessor_node(
     assert seen["spec"].node == "n1"
 
 
+def test_task_after_complete_keeps_explicit_cross_node_target(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(
+        type("Spec", (), {"name": "train", "project": "p"})(),
+    )
+    predecessor.job_id = "train"
+    predecessor.name = "train"
+    predecessor.node = "n1"
+    predecessor.status = "running"
+    cli.jobs_mod.save(cfg, predecessor)
+    seen = {}
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    def fake_submit(cfg_, spec, cwd, log, no_queue=False):
+        seen["spec"] = spec
+        return _entry(spec)
+
+    monkeypatch.setattr(cli, "submit", fake_submit)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "task",
+            "n-other",
+            "python finalize.py",
+            "-p",
+            "p",
+            "--after-complete",
+            "train",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["spec"].after_complete == "train"
+    assert seen["spec"].node == "n-other"
+
+
+def test_task_can_route_cross_node_by_typed_result(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(type("Spec", (), {"name": "train", "project": "p"})())
+    predecessor.job_id = "train-result"
+    predecessor.node = "n2"
+    predecessor.status = "running"
+    cli.jobs_mod.save(cfg, predecessor)
+    seen = {}
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    def fake_submit(cfg_, spec, cwd, log, no_queue=False):
+        seen["spec"] = spec
+        return _entry(spec)
+
+    monkeypatch.setattr(cli, "submit", fake_submit)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "task",
+            "n1",
+            "python analyze.py",
+            "--after-result",
+            "train-result",
+            "--when-result",
+            "success",
+            "--when-result",
+            "scientific_reject",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["spec"].node == "n1"
+    assert seen["spec"].after_result == predecessor.job_id
+    assert seen["spec"].after_result_states == ["success", "scientific_reject"]
+
+
+def test_task_result_state_requires_result_dependency_before_config(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "_cfg",
+        lambda: (_ for _ in ()).throw(AssertionError("config must not be loaded")),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["task", "n1", "true", "--when-result", "success", "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "invalid_argument"
+    assert "requires --after-result" in payload["message"]
+
+
+def test_dependency_modes_are_mutually_exclusive_before_config(monkeypatch):
+    monkeypatch.setattr(
+        cli,
+        "_cfg",
+        lambda: (_ for _ in ()).throw(AssertionError("must validate first")),
+    )
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "task",
+            "n1",
+            "true",
+            "--after-success",
+            "a",
+            "--after-complete",
+            "b",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"] == "invalid_argument"
+
+
 def test_task_after_success_rejects_no_queue_before_config(monkeypatch):
     monkeypatch.setattr(
         cli,
@@ -255,7 +409,14 @@ def test_task_binds_artifact_manifest_in_spec_and_submission_payload(
 
     assert result.exit_code == 0, result.output
     assert seen["spec"].artifact_manifest == manifest
-    assert json.loads(result.stdout)["artifact_manifest"] == manifest
+    payload = json.loads(result.stdout)
+    assert payload["artifact_manifest"] == manifest
+    assert payload["gpu_isolation"] == {
+        "mode": "advisory",
+        "enforced": False,
+        "cuda_visibility": "restricted",
+        "graphics_device_access": "unrestricted",
+    }
 
 
 def test_task_artifact_syncs_then_binds_manifest_in_one_command(
@@ -1626,7 +1787,9 @@ def test_task_rejects_invalid_follow_options_before_submission(tmp_path, monkeyp
     )
 
     assert result.exit_code == 1
-    assert "--poll and --lines must be positive" in result.output
+    assert (
+        "--poll must be finite and positive; --lines must be positive" in result.output
+    )
     assert submitted == []
 
 

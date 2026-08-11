@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -8,7 +9,7 @@ from typer.testing import CliRunner
 
 from dt import agent, cli, dispatch
 from dt.config import HeadConfig, LaptopConfig, Node, Project
-from dt.jobs import JobEntry
+from dt.jobs import JobEntry, save
 
 
 def _cfg(tmp_path: Path) -> HeadConfig:
@@ -593,6 +594,31 @@ def test_batch_file_is_local_and_laptop_forwards_validated_commands(
     assert json.loads(result.stdout)["submitted"] == 2
 
 
+def test_batch_file_reader_rejects_oversized_and_special_inputs(tmp_path, monkeypatch):
+    cfg = LaptopConfig(centers={"test": "head"}, default_center="test")
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    oversized = tmp_path / "oversized.commands"
+    oversized.write_bytes(b"#" * (cli.BATCH_MAX_INPUT_BYTES + 1))
+    fifo = tmp_path / "commands.fifo"
+    os.mkfifo(fifo)
+
+    oversized_result = CliRunner().invoke(
+        cli.app,
+        ["batch", "n1", "--file", str(oversized), "--json"],
+    )
+    fifo_result = CliRunner().invoke(
+        cli.app,
+        ["batch", "n1", "--file", str(fifo), "--json"],
+    )
+
+    assert oversized_result.exit_code == 1
+    assert json.loads(oversized_result.stdout)["error"] == "invalid_argument"
+    assert "size limit" in json.loads(oversized_result.stdout)["message"]
+    assert fifo_result.exit_code == 1
+    assert json.loads(fifo_result.stdout)["error"] == "invalid_argument"
+    assert "not a regular file" in json.loads(fifo_result.stdout)["message"]
+
+
 def test_batch_human_stdout_is_only_registered_job_ids(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
@@ -920,6 +946,7 @@ def test_force_queued_fork_bypasses_capacity_probe_and_uses_caller_label(
         gpus_requested=1,
         pin_node="n1",
     )
+    save(cfg, source)
     spec = dispatch.fork_spec_from_entry(
         source,
         name="batch-002-next",

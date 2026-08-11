@@ -24,7 +24,8 @@ def tree_sha256(root: Path) -> str:
     alter executable snapshot semantics.
     """
     root = Path(root)
-    if not root.is_dir():
+    root_info = root.lstat()
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
         raise NotADirectoryError(root)
 
     digest = hashlib.sha256(_SCHEMA)
@@ -54,9 +55,32 @@ def tree_sha256(root: Path) -> str:
         digest.update(_bytes_field(relative))
         digest.update(payload_size.to_bytes(8, "big"))
         if kind == b"f":
-            with path.open("rb") as stream:
-                while chunk := stream.read(_CHUNK_SIZE):
-                    digest.update(chunk)
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(path, flags)
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_dev != metadata.st_dev
+                    or opened.st_ino != metadata.st_ino
+                    or stat.S_IMODE(opened.st_mode) != mode
+                    or opened.st_size != metadata.st_size
+                ):
+                    raise OSError(f"snapshot entry changed while hashing: {path}")
+                with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                    while chunk := stream.read(_CHUNK_SIZE):
+                        digest.update(chunk)
+                finished = os.fstat(descriptor)
+                if (
+                    finished.st_dev != opened.st_dev
+                    or finished.st_ino != opened.st_ino
+                    or finished.st_size != opened.st_size
+                    or finished.st_mtime_ns != opened.st_mtime_ns
+                    or finished.st_ctime_ns != opened.st_ctime_ns
+                ):
+                    raise OSError(f"snapshot entry changed while hashing: {path}")
+            finally:
+                os.close(descriptor)
         elif kind == b"l":
             digest.update(target)
     return digest.hexdigest()

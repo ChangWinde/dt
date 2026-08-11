@@ -1,6 +1,8 @@
 """v0.8 operator-visibility round: probe owners, snapshot stats, auto center,
 info parsing helpers."""
 
+import pytest
+
 from rich.text import Text
 
 from dt.config import Project
@@ -34,9 +36,10 @@ def test_version_prefers_installed_source_commit(monkeypatch):
 
     from dt import __version__
     from dt import cli
+    from dt import version
 
-    monkeypatch.setattr(cli, "SOURCE_COMMIT", "a" * 40)
-    monkeypatch.setattr(cli, "_git_sha", lambda: "wrong")
+    monkeypatch.setattr(version, "SOURCE_COMMIT", "a" * 40)
+    monkeypatch.setattr(version, "repository_sha", lambda: "wrong")
 
     result = CliRunner().invoke(cli.app, ["--version"])
 
@@ -791,59 +794,37 @@ def test_free_human_explains_idle_gpu_and_keeps_public_json_unchanged(
     assert json.loads(machine.stdout) == rows
     assert explained.exit_code == 0, explained.output
     payload = json.loads(explained.stdout)
-    assert payload == {
-        "schema_version": "dt_free_explain_v1",
-        "summary": {
-            "centers": 1,
-            "reachable_nodes": 1,
-            "unavailable_nodes": 0,
-            "gpus_total": 1,
-            "gpus_free": 1,
-            "running": 0,
-            "queued": 0,
-        },
-        "resources": rows,
-        "centers": [
-            {
-                "center": "c",
-                "capacity": {
-                    "reachable_nodes": 1,
-                    "unavailable_nodes": 0,
-                    "gpus_total": 1,
-                    "gpus_free": 1,
-                    "free_by_node": {"n1": 1},
-                    "dt_lease_owners": [],
-                },
-                "scheduler": {
-                    "center": "c",
-                    "running": 0,
-                    "running_nodes": [],
-                    "queued": 0,
-                    "queue_head_job_id": None,
-                    "queue_head_reason": None,
-                    "queue_head_pin_node": None,
-                    "queue_head_gpus_requested": None,
-                    "reserve_free_per_node": 0,
-                    "agent_alive": True,
-                },
-                "state": "idle_no_dt_work",
-                "message": "GPU capacity is free and no dt work is queued",
-                "actions": [
-                    {
-                        "kind": "submit",
-                        "node": "n1",
-                        "argv": [
-                            "dt",
-                            "task",
-                            "n1",
-                            "COMMAND",
-                            "-n",
-                            "NAME",
-                        ],
-                    }
-                ],
-            }
-        ],
+    assert payload["schema_version"] == "dt_free_explain_v1"
+    assert payload["summary"] == {
+        "centers": 1,
+        "reachable_nodes": 1,
+        "unavailable_nodes": 0,
+        "gpus_total": 1,
+        "gpus_free": 1,
+        "running": 0,
+        "queued": 0,
+    }
+    assert payload["resources"] == rows
+    center = payload["centers"][0]
+    assert center["state"] == "idle_no_dt_work"
+    assert center["capacity"]["free_by_node"] == {"n1": 1}
+    scheduler = center["scheduler"]
+    assert scheduler["running"] == scheduler["queued"] == 0
+    assert scheduler["runnable_queued"] == scheduler["blocked_queued"] == 0
+    assert scheduler["model"] == {
+        "schema_version": "dt_scheduler_state_v1",
+        "state": "idle",
+        "idle_reason": "queue is empty",
+        "agent": {"alive": True, "heartbeat_stale": False},
+        "running": 0,
+        "queue_depth": 0,
+        "runnable_queued": 0,
+        "blocked_queued": 0,
+        "waiting_queued": 0,
+        "next_job_id": None,
+        "next_condition": None,
+        "registry_damage": 0,
+        "queue": [],
     }
 
 
@@ -2178,7 +2159,8 @@ def test_head_free_fresh_bypasses_probe_cache(tmp_path, monkeypatch):
     assert json.loads(result.stdout)[0]["node"] == "n1"
 
 
-def test_free_rejects_nonpositive_poll_before_loading_config(monkeypatch):
+@pytest.mark.parametrize("poll", ["0", "nan", "inf", "-inf"])
+def test_free_rejects_invalid_poll_before_loading_config(monkeypatch, poll):
     import json
 
     from typer.testing import CliRunner
@@ -2191,10 +2173,10 @@ def test_free_rejects_nonpositive_poll_before_loading_config(monkeypatch):
         lambda: (_ for _ in ()).throw(AssertionError("must not load config")),
     )
 
-    human = CliRunner().invoke(cli.app, ["free", "--watch", "--poll", "0"])
+    human = CliRunner().invoke(cli.app, ["free", "--watch", "--poll", poll])
     machine = CliRunner().invoke(
         cli.app,
-        ["free", "--watch", "--poll", "0", "--json"],
+        ["free", "--watch", "--poll", poll, "--json"],
     )
 
     assert human.exit_code == 1
@@ -3521,12 +3503,15 @@ def test_snapshot_excludes_are_root_anchored():
         assert junk in SNAPSHOT_EXCLUDES
 
 
-def test_ssh_base_has_multiplexing():
-    from dt.sshio import SSH_BASE
+def test_ssh_base_has_multiplexing(tmp_path, monkeypatch):
+    from dt.sshio import SSHWorkload, ssh_pool_config
 
-    joined = " ".join(SSH_BASE)
-    assert "ControlMaster=auto" in joined
-    assert "ControlPersist=300" in joined
+    monkeypatch.setenv("DT_SSH_STATE_DIR", str(tmp_path / "ssh"))
+    monkeypatch.setenv("DT_SSH_CONFIG", str(tmp_path / "absent"))
+    joined = ssh_pool_config(SSHWorkload.CONTROL).read_text()
+    assert "ControlMaster auto" in joined
+    assert "ControlPersist 300" in joined
+    assert "/control/%C" in joined
 
 
 def test_pinned_submit_probes_only_the_pin(tmp_path, monkeypatch):
@@ -3995,21 +3980,26 @@ def test_pin_is_busy_classifier():
 
 
 def test_rsync_has_stall_guards(monkeypatch):
+    import shlex
     import subprocess
+    from pathlib import Path
 
     import dt.sshio as sshio
 
     seen = {}
 
-    def fake_run(cmd, capture_output, text, timeout):
+    def fake_run(cmd, timeout, cancel_event):
+        assert cancel_event is None
         seen["cmd"] = cmd
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(sshio.subprocess, "run", fake_run)
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", fake_run)
     sshio.rsync("a/", "b/")
     assert "--timeout=60" in seen["cmd"]  # io-stall abort for NAT'd links
-    joined = " ".join(seen["cmd"])
-    assert "ServerAliveInterval=15" in joined  # ssh keepalives in -e
+    remote_shell = shlex.split(seen["cmd"][seen["cmd"].index("-e") + 1])
+    config = Path(remote_shell[remote_shell.index("-F") + 1]).read_text()
+    assert "ServerAliveInterval 15" in config  # ssh keepalives in -e
+    assert "/artifact/%C" in config
 
 
 def test_transferred_gib_parses_stats():

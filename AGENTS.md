@@ -1,4 +1,4 @@
-# DistTrainer agent guide
+# dt agent guide
 
 Use `dt` for every experiment on configured shared GPU nodes. Do not bypass its
 leases and registry with manual SSH placement or ad hoc `nvidia-smi` polling.
@@ -36,9 +36,15 @@ agent dispatches queued work as capacity becomes available.
 
 ```bash
 dt free --json
-dt ps
+dt ps --summary --json
+dt ps --compact --active --limit 50 --json
 dt agent status --json
 ```
+
+Use the bounded `dt_ps_query_v1` response for routine agent polling. Follow
+`page.next_cursor` when more rows are needed, use `--since` for lifecycle
+changes, and request expensive fields explicitly with `--fields`. Reserve the
+legacy full-array `dt ps --json` contract for offline inventory or compatibility.
 
 `dt run --no-queue` restores fail-fast behavior and returns exit 2 when no
 capacity fits. A job-specific blocker does not hold up runnable work behind it.
@@ -55,6 +61,9 @@ dt batch NODE \
 ```
 
 Use `dt chain` when each stage requires predecessor success.
+Use `--after-complete` for a cross-node finalizer and `--after-result` for a
+typed scientific branch. Automated retries must carry a stable `--request-id`
+and recover uncertain responses with `dt request REQUEST_ID --json`.
 
 ## Reproducibility
 
@@ -83,14 +92,21 @@ dt run --node NODE -p PROJECT \
 ## Observation and recovery
 
 ```bash
+dt events --issues
 dt ps --watch
 dt ps --issues
+dt ps --compact --issues --limit 50 --json
 dt info JOB
 dt logs JOB -f
 dt metrics JOB
 dt wait JOB
 dt pull JOB --collection CAMPAIGN
 ```
+
+`dt events --json` is the bounded, redacted operation index. On a laptop,
+`dt events -c CENTER --json` queries the correlated head journal. It never
+contains raw command arguments or exception text; follow the request or job ID
+into `info`, `logs`, and `agent status` for detailed evidence.
 
 Pull retries and resumes interrupted transfers. Use `--lite` or repeatable
 `--exclude` filters when large checkpoints are not needed.
@@ -134,7 +150,7 @@ General command codes:
 - 130: local interruption.
 
 `dt wait` returns the experiment code from 0 through 125, or 65 not found,
-66 killed, 67 lost, and 68 failed before start.
+66 killed, 67 lost, 68 failed before start, and 69 dependency-skipped.
 
 ## Development gate
 

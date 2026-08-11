@@ -25,6 +25,22 @@ this procedure.
 
 ## Prepare
 
+During ordinary development and pull-request validation, run:
+
+```bash
+scripts/package-check.sh
+scripts/security-check.sh
+```
+
+This builds reproducible package artifacts, installs mandatory-hash runtime
+dependencies and the audited wheel in a temporary directory, constructs every
+public top-level command plus representative
+nested commands, and proves that help inspection creates no configuration. It
+deliberately creates no release manifest or deployable bundle, accepts a
+non-empty `Unreleased` section, and is not release evidence. The separate
+security gate runs pinned static analysis and audits the fully pinned runtime
+dependency export; CI repeats it in an isolated security job.
+
 1. Reconcile `CHANGELOG.md`, `docs/package-readme.md`,
    `.github/SECURITY.md`, `.github/SUPPORT.md`, version metadata, and the
    intended source diff.
@@ -45,10 +61,12 @@ run the identical gate without network access:
 DT_RELEASE_OFFLINE=1 scripts/release-check.sh dist
 ```
 
-The gate refuses a dirty worktree. It runs the full tests and static checks,
+The gate refuses a dirty worktree both before qualification and again before
+manifest publication. It runs the full tests and static checks,
 builds wheel and sdist twice, compares their SHA-256 identities, audits package
-paths and disclosure markers, installs the wheel in a clean Python
-environment, and produces:
+paths and disclosure markers, enforces the locked dependency hashes before
+installing the wheel in clean Python 3.10 and 3.11 environments, runs the
+verified bootstrap independently on both minors, and produces:
 
 - `disttrainer-VERSION-py3-none-any.whl`
 - `disttrainer-VERSION.tar.gz`
@@ -104,6 +122,16 @@ VERSION=0.7.0
 scripts/deploy.sh --plan --rollback "$VERSION" HEAD_A
 scripts/deploy.sh --rollback "$VERSION" HEAD_A
 ```
+
+Deployment uploads to an invocation-private staging directory, verifies it,
+and atomically promotes it to the immutable retained version under the same
+global activation lock used by rollback. Reusing a version for different
+content is rejected. Before an upgrade changes the installed command, the
+current marker and retained predecessor must verify. The `current` marker
+changes only after the installed command reports the requested version; if
+activation fails, deployment reinstalls and verifies the predecessor while
+still returning failure. Explicit rollback uses the same checksum and
+atomic-marker contract.
 
 After deployment, run `dt --version`, `dt doctor --json`, inspect agent status,
 and execute one bounded CPU-only or authorized GPU canary before broad

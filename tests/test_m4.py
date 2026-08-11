@@ -2,7 +2,9 @@
 
 import json
 import os
+import shutil
 import subprocess
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -236,7 +238,7 @@ def test_started_notifies_webhook(tmp_path, monkeypatch):
         lambda cfg_, entry_, lease_: ("started", "n1"),
     )
     monkeypatch.setattr(
-        agent, "notify", lambda c, payload: events.append(payload["event"])
+        agent, "notify", lambda c, payload, log=None: events.append(payload["event"])
     )
     process_once(cfg, lambda m: None)
     assert events == ["started"]
@@ -268,7 +270,9 @@ def test_agent_reconciles_running_job_without_a_queue(tmp_path, monkeypatch):
         return entry_
 
     monkeypatch.setattr(agent, "refresh_status", finish, raising=False)
-    monkeypatch.setattr(agent, "notify", lambda cfg_, payload: events.append(payload))
+    monkeypatch.setattr(
+        agent, "notify", lambda cfg_, payload, log=None: events.append(payload)
+    )
 
     assert process_once(cfg, logs.append) == []
     assert refreshed == ["run"]
@@ -333,7 +337,9 @@ def test_agent_lost_transition_notifies_once(tmp_path, monkeypatch):
         return entry_
 
     monkeypatch.setattr(agent, "refresh_status", lose, raising=False)
-    monkeypatch.setattr(agent, "notify", lambda cfg_, payload: events.append(payload))
+    monkeypatch.setattr(
+        agent, "notify", lambda cfg_, payload, log=None: events.append(payload)
+    )
 
     process_once(cfg, logs.append)
     process_once(cfg, logs.append)
@@ -534,6 +540,12 @@ def test_rerun_cli_uses_standard_submission_payload_and_reason(tmp_path, monkeyp
         "project": "p",
         "node": "-",
         "gpus": [],
+        "gpu_isolation": {
+            "mode": "advisory",
+            "enforced": False,
+            "cuda_visibility": "restricted",
+            "graphics_device_access": "unrestricted",
+        },
         "session": "dt_new",
         "job_dir": "dt/jobs/new",
         "snapshot_sha256": "a" * 64,
@@ -899,6 +911,65 @@ def test_environment_cleanup_rejects_corrupt_live_identity(tmp_path):
         )
 
 
+def test_environment_cleanup_respects_lifetime_lock(tmp_path):
+    import fcntl
+
+    from dt.maintenance import clean_envs_command
+
+    envs = tmp_path / "envs"
+    stale = envs / "a1b2c3d4e5f6"
+    stale.mkdir(parents=True)
+    os.utime(stale, (1.0, 1.0))
+    lock_path = envs / "a1b2c3d4e5f6.lock"
+    lock_path.touch()
+    command = clean_envs_command(
+        str(envs),
+        datetime.now() + timedelta(days=1),
+        keep=set(),
+    )
+
+    with lock_path.open("r+") as descriptor:
+        fcntl.flock(descriptor, fcntl.LOCK_SH)
+        held = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        assert held.returncode == 0, held.stderr
+        assert stale.exists()
+
+    released = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert released.returncode == 0, released.stderr
+    assert not stale.exists()
+
+
+def test_environment_cleanup_protects_queued_exact_environment(tmp_path):
+    from dt.maintenance import envs_in_use
+
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry(
+            "queued-exec",
+            "queued",
+            created_at=1.0,
+            node="n1",
+            env_hash="a1b2c3d4e5f6",
+            env_mode="reuse",
+        ),
+    )
+
+    assert envs_in_use(cfg) == {"n1": {"a1b2c3d4e5f6"}}
+
+
 def test_clean_cli_project_filter_plan(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     save(cfg, _entry("smoke-done", "finished", created_at=1.0, project="smoke"))
@@ -988,6 +1059,80 @@ def test_clean_results_failure_retains_retryable_registry_record(tmp_path, monke
     assert load(cfg, old.job_id) is not None
 
 
+def test_clean_results_refuses_path_replaced_after_ownership_scan(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    old = _entry("old-done", "finished", created_at=1.0)
+    save(cfg, old)
+    owned = cfg.results_dir() / old.job_id
+    (owned / "dt").mkdir(parents=True)
+    (owned / "dt" / "job.json").write_text(json.dumps({"job_id": old.job_id}))
+    original_scan = cli._owned_managed_results
+
+    def replace_after_scan(cfg_, job_ids):
+        scanned = original_scan(cfg_, job_ids)
+        shutil.rmtree(owned)
+        (owned / "dt").mkdir(parents=True)
+        (owned / "dt" / "job.json").write_text(
+            json.dumps({"job_id": "replacement-job"})
+        )
+        (owned / "keep.txt").write_text("new data")
+        return scanned
+
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "_owned_managed_results", replace_after_scan)
+
+    cleaned = CliRunner().invoke(
+        cli.app,
+        ["clean", "--before", "1970-01-02", "--results", "-y"],
+    )
+
+    assert cleaned.exit_code == 1
+    assert "local_cleanup_failed" in cleaned.output
+    assert (owned / "keep.txt").read_text() == "new data"
+    assert load(cfg, old.job_id) is not None
+
+
+def test_clean_results_holds_pull_destination_lock_while_deleting(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    old = _entry("old-done", "finished", created_at=1.0)
+    save(cfg, old)
+    owned = cfg.results_dir() / old.job_id
+    (owned / "dt").mkdir(parents=True)
+    (owned / "dt" / "job.json").write_text(json.dumps({"job_id": old.job_id}))
+    events: list[tuple[str, Path]] = []
+
+    @contextmanager
+    def destination_lock(cfg_, destination):
+        events.append(("enter", destination))
+        try:
+            yield
+        finally:
+            events.append(("exit", destination))
+
+    real_rmtree = shutil.rmtree
+
+    def checked_rmtree(path, *args, **kwargs):
+        if Path(path) == owned:
+            assert events[-1] == ("enter", owned)
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "pull_destination_lock", destination_lock)
+    monkeypatch.setattr(cli.shutil, "rmtree", checked_rmtree)
+
+    cleaned = CliRunner().invoke(
+        cli.app,
+        ["clean", "--before", "1970-01-02", "--results", "-y"],
+    )
+
+    assert cleaned.exit_code == 0, cleaned.output
+    assert events == [("enter", owned), ("exit", owned)]
+
+
 def test_clean_rejects_invalid_date_without_traceback(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_cfg", lambda: _cfg(tmp_path))
 
@@ -1039,6 +1184,7 @@ def test_storage_json_inventory_is_scoped_to_managed_paths(tmp_path, monkeypatch
         "recovery",
         "registry",
         "queue",
+        "state",
     }
     assert payload["nodes"] == [
         {
@@ -1049,6 +1195,35 @@ def test_storage_json_inventory_is_scoped_to_managed_paths(tmp_path, monkeypatch
         }
     ]
     assert all(str(tmp_path) in row["path"] for row in payload["head"])
+
+
+def test_legacy_storage_inventory_counts_agent_state_and_log_rotations(tmp_path):
+    from dt.storage import inventory
+
+    cfg = _cfg(tmp_path)
+    cfg.root.mkdir(parents=True)
+    (cfg.root / "agent.log").write_bytes(b"active")
+    (cfg.root / "agent.log.1").write_bytes(b"rotated")
+    (cfg.root / "agent.heartbeat").write_bytes(b"heartbeat")
+    (cfg.root / "last_autoclean").write_bytes(b"stamp")
+
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 0, "jobs\t0\t0\nenvs\t0\t0\n", "")
+
+    payload = inventory(
+        cfg,
+        runner=runner,
+        disk_bytes=lambda path: path.stat().st_size if path.is_file() else 0,
+    )
+
+    head = {row["kind"]: row for row in payload["head"]}
+    assert {
+        "agent_agent_log",
+        "agent_agent_log_1",
+        "agent_agent_heartbeat",
+        "agent_last_autoclean",
+    } <= set(head)
+    assert payload["total_bytes"] >= len(b"activerotatedheartbeatstamp")
 
 
 def test_storage_defaults_to_scope_summary_and_keeps_details_explicit(

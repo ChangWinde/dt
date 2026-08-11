@@ -58,6 +58,28 @@ def test_role_layout_separates_head_and_worker_paths(tmp_path):
     assert cfg.envs_for(remote) == "/data/dt/worker/envs"
 
 
+def test_storage_inventory_handles_programmatic_head_without_workers(tmp_path):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+
+    payload = inventory(
+        cfg,
+        runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("no worker probe expected")
+        ),
+        disk_bytes=lambda _path: 0,
+    )
+
+    assert payload["nodes"] == []
+    assert payload["total_bytes"] == 0
+
+
 def test_explicit_env_root_remains_a_supported_override(tmp_path):
     cfg = parse(
         {
@@ -94,6 +116,23 @@ def test_worker_roots_reject_broad_or_ambiguous_paths(field):
     payload.update(field)
     with pytest.raises(ConfigError, match="root"):
         parse(payload)
+
+
+@pytest.mark.parametrize(
+    "root",
+    [
+        "/data/" + "x" * 256,
+        "/" + "/".join(["segment" * 20] * 40),
+    ],
+)
+def test_worker_roots_reject_filesystem_inexpressible_paths(root):
+    with pytest.raises(ConfigError, match="root"):
+        parse({"center": "c", "nodes": ["n1"], "paths": {"worker_root": root}})
+
+
+def test_derived_node_path_rejects_oversized_component():
+    with pytest.raises(ValueError, match="component"):
+        node_path("~/dt", "x" * 256)
 
 
 def test_node_paths_have_shell_and_rsync_safe_renderings(tmp_path, monkeypatch):
@@ -238,7 +277,14 @@ def test_role_storage_inventory_covers_every_managed_worker_class(tmp_path):
             0,
             "\n".join(
                 f"{kind}\t1\t1"
-                for kind in ("jobs", "envs", "artifacts", "cache", "runtime")
+                for kind in (
+                    "jobs",
+                    "envs",
+                    "artifacts",
+                    "cache",
+                    "runtime",
+                    "legacy_jobs",
+                )
             ),
             "",
         )
@@ -252,9 +298,96 @@ def test_role_storage_inventory_covers_every_managed_worker_class(tmp_path):
         "artifacts",
         "cache",
         "runtime",
+        "legacy_jobs",
     }
     assert node["jobs"]["path"] == "/data/dt/worker/jobs"
     assert node["runtime"]["path"] == "/data/dt/worker/runtime"
+    assert node["legacy_jobs"]["path"] == "dt/jobs"
+    assert payload["accounting"] == {
+        "complete": True,
+        "known_bytes": 6,
+        "legacy_bytes": 1,
+        "unknown_sections": [],
+    }
+
+
+def test_role_storage_inventory_counts_dedicated_site_artifact_cache(tmp_path):
+    cfg = parse(
+        {
+            "center": "c",
+            "nodes": [{"name": "n1", "site": "s"}],
+            "paths": {
+                "root": str(tmp_path / "dt"),
+                "worker_root": "/data/dt",
+            },
+            "sites": {
+                "s": {
+                    "gateway": "n1",
+                    "nodes": ["n1"],
+                    "cache_root": "/mnt/dt-site-cache",
+                    "artifact_policy": "topology-aware",
+                }
+            },
+        }
+    )
+    assert isinstance(cfg, HeadConfig)
+
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            "\n".join(
+                f"{kind}\t{size}\t1"
+                for kind, size in (
+                    ("jobs", 1),
+                    ("envs", 1),
+                    ("artifacts", 1),
+                    ("cache", 100),
+                    ("runtime", 1),
+                    ("site_artifact_cache", 40),
+                    ("legacy_jobs", 1),
+                )
+            ),
+            "",
+        )
+
+    payload = inventory(cfg, runner=runner, disk_bytes=lambda _path: 0)
+    node = payload["nodes"][0]
+    assert node["site_artifact_cache"]["path"] == "/mnt/dt-site-cache"
+    assert payload["total_bytes"] == 145
+
+
+def test_head_scan_failure_keeps_storage_accounting_incomplete(tmp_path):
+    cfg = parse(
+        {
+            "center": "c",
+            "nodes": ["n1"],
+            "paths": {"root": str(tmp_path / "dt")},
+        }
+    )
+    assert isinstance(cfg, HeadConfig)
+    cfg.root.joinpath("results").mkdir(parents=True)
+
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 0, "jobs\t0\t0\nenvs\t0\t0\n", "")
+
+    payload = inventory(cfg, runner=runner, disk_bytes=lambda _path: None)
+
+    assert payload["total_bytes"] == 0
+    assert payload["accounting"]["complete"] is False
+    assert "head:results" in payload["accounting"]["unknown_sections"]
+
+
+def test_local_directory_scan_failure_is_unknown_not_zero(tmp_path):
+    from dt.storage import local_tree_disk_bytes
+
+    tree = tmp_path / "tree"
+    tree.mkdir()
+
+    def failed_du(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 1, "", "permission denied")
+
+    assert local_tree_disk_bytes(tree, process_run=failed_du) is None
 
 
 def test_role_cleanup_uses_persisted_worker_root_after_config_change(tmp_path):

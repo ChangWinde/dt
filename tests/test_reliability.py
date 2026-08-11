@@ -39,6 +39,11 @@ def _spec() -> RunSpec:
     return RunSpec(name="j", gpus=1, cmd=["true"], project="p")
 
 
+def _proc_start_ticks(pid: int) -> str:
+    stat_line = Path(f"/proc/{pid}/stat").read_text()
+    return stat_line[stat_line.rfind(") ") + 2 :].split()[19]
+
+
 def test_refresh_status_records_and_clears_lost_diagnostic(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     entry = JobEntry(
@@ -162,6 +167,39 @@ def test_refresh_status_uses_remote_completion_time(tmp_path, monkeypatch):
     assert "/finished_at" in commands[0]
 
 
+def test_refresh_status_preserves_typed_scientific_result(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="scientific-result",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/scientific-result",
+        session="dt_scientific-result",
+        cmd="true",
+        pgid=1234,
+    )
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args,
+            0,
+            (f"boot-a\n{jobs.STATUS_MARK}\n0\n100.125\n112.875\nscientific_reject\n"),
+            "",
+        ),
+    )
+
+    refreshed = jobs.refresh_status(cfg, entry)
+
+    assert refreshed.status == "finished"
+    assert refreshed.exit_code == 0
+    assert refreshed.result_state == "scientific_reject"
+    assert jobs.effective_result_state(refreshed) == "scientific_reject"
+
+
 def test_refresh_status_identifies_node_reboot_before_pid_reuse(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     entry = JobEntry(
@@ -192,6 +230,117 @@ def test_refresh_status_identifies_node_reboot_before_pid_reuse(tmp_path, monkey
         "node rebooted since launch (boot_id boot-before -> boot-after); "
         "exit_code is missing"
     )
+
+
+def test_refresh_status_rejects_live_pid_with_mismatched_start_time(tmp_path):
+    job_dir = tmp_path / "jobs" / "reused-pid"
+    job_dir.mkdir(parents=True)
+    (job_dir / "process_start_ticks").write_text("1\n")
+    wrapper = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        entry = JobEntry(
+            job_id="reused-pid",
+            name="reused-pid",
+            center="test",
+            project="p",
+            node="local",
+            node_local=True,
+            job_dir=str(job_dir),
+            session="dt_reused_pid",
+            cmd="sleep 30",
+            pgid=wrapper.pid,
+        )
+
+        refreshed = jobs.refresh_status(_cfg(tmp_path), entry)
+
+        assert refreshed.status == "lost"
+        assert refreshed.reason == (
+            f"wrapper pid {wrapper.pid} is alive but its process identity "
+            "does not match this job; refusing to adopt a reused process"
+        )
+        assert wrapper.poll() is None
+    finally:
+        wrapper.terminate()
+        wrapper.wait(timeout=2)
+
+
+def test_refresh_status_legacy_pid_requires_cwd_inside_job(tmp_path):
+    outside_job_dir = tmp_path / "jobs" / "legacy-outside"
+    inside_job_dir = tmp_path / "jobs" / "legacy-inside"
+    outside_job_dir.mkdir(parents=True)
+    inside_job_dir.mkdir()
+    outside = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    inside = subprocess.Popen(
+        ["sleep", "30"], cwd=inside_job_dir, start_new_session=True
+    )
+    try:
+        outside_entry = JobEntry(
+            job_id="legacy-outside",
+            name="legacy-outside",
+            center="test",
+            project="p",
+            node="local",
+            node_local=True,
+            job_dir=str(outside_job_dir),
+            session="dt_legacy_outside",
+            cmd="sleep 30",
+            pgid=outside.pid,
+        )
+        inside_entry = JobEntry(
+            job_id="legacy-inside",
+            name="legacy-inside",
+            center="test",
+            project="p",
+            node="local",
+            node_local=True,
+            job_dir=str(inside_job_dir),
+            session="dt_legacy_inside",
+            cmd="sleep 30",
+            pgid=inside.pid,
+        )
+
+        assert jobs.refresh_status(_cfg(tmp_path), outside_entry).status == "lost"
+        assert jobs.refresh_status(_cfg(tmp_path), inside_entry).status == "running"
+    finally:
+        outside.terminate()
+        inside.terminate()
+        outside.wait(timeout=2)
+        inside.wait(timeout=2)
+
+
+def test_refresh_status_refuses_unsafe_capsule_before_remote_access(
+    tmp_path, monkeypatch
+):
+    entry = JobEntry(
+        job_id="unsafe-capsule",
+        name="unsafe-capsule",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/../../outside",
+        session="dt_unsafe_capsule",
+        cmd="sleep 30",
+        pgid=1234,
+    )
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe capsule must fail before remote access")
+        ),
+    )
+    observation = {}
+
+    refreshed = jobs.refresh_status(_cfg(tmp_path), entry, observation=observation)
+
+    assert refreshed.status == "running"
+    assert observation == {
+        "node_unreachable": False,
+        "status_probe_error": (
+            "job capsule path must name a dedicated nested directory"
+        ),
+    }
 
 
 def test_refresh_status_preserves_last_state_when_ssh_returns_nonzero(
@@ -805,12 +954,13 @@ def test_rsync_retries_until_success(monkeypatch):
     calls = {"n": 0}
     events = []
 
-    def fake_run(cmd, capture_output, text, timeout):
+    def fake_run(cmd, timeout, cancel_event):
+        assert cancel_event is None
         calls["n"] += 1
         rc = 12 if calls["n"] == 1 else 0  # first attempt: network error
         return subprocess.CompletedProcess(cmd, rc, "", "broken pipe")
 
-    monkeypatch.setattr(sshio.subprocess, "run", fake_run)
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", fake_run)
     monkeypatch.setattr(sshio.time, "sleep", lambda s: None)
     proc = sshio.rsync("a/", "b/", retries=2, on_retry=events.append)
     assert proc.returncode == 0 and calls["n"] == 2
@@ -822,8 +972,44 @@ def test_rsync_retries_until_success(monkeypatch):
             delay_s=5,
             returncode=12,
             message="broken pipe",
+            kind="broken_pipe",
         )
     ]
+
+
+@pytest.mark.parametrize("retries", [-1, 11, True])
+def test_rsync_rejects_unbounded_retry_policies(retries):
+    with pytest.raises(ValueError, match="between 0 and 10"):
+        sshio.rsync("a/", "b/", retries=retries)
+
+
+@pytest.mark.parametrize(
+    ("message", "kind"),
+    [
+        ("Permission denied (publickey,password).", "authentication"),
+        ("Host key verification failed.", "host_key"),
+        ("rsync: write failed: No space left on device", "space"),
+    ],
+)
+def test_rsync_does_not_retry_permanent_transport_failures(monkeypatch, message, kind):
+    calls = 0
+    sleeps = []
+
+    def fake_run(cmd, timeout, cancel_event):
+        assert cancel_event is None
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(cmd, 255, "", message)
+
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", fake_run)
+    monkeypatch.setattr(sshio.time, "sleep", sleeps.append)
+
+    proc = sshio.rsync("a/", "b/", retries=2)
+
+    assert proc.returncode == 255
+    assert sshio.classify_rsync_failure(255, "", message) == kind
+    assert calls == 1
+    assert sleeps == []
 
 
 def test_rsync_retry_preserves_all_attempt_stats_for_command_accounting(monkeypatch):
@@ -848,10 +1034,10 @@ def test_rsync_retry_preserves_all_attempt_stats_for_command_accounting(monkeypa
         ]
     )
     monkeypatch.setattr(
-        sshio.subprocess,
-        "run",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args[0],
+        sshio,
+        "_run_rsync_attempt",
+        lambda cmd, timeout, cancel_event: subprocess.CompletedProcess(
+            cmd,
             *(next(outputs)),
         ),
     )
@@ -868,11 +1054,12 @@ def test_rsync_retry_preserves_all_attempt_stats_for_command_accounting(monkeypa
 def test_rsync_gives_up_after_retries(monkeypatch):
     calls = {"n": 0}
 
-    def fake_run(cmd, capture_output, text, timeout):
+    def fake_run(cmd, timeout, cancel_event):
+        assert cancel_event is None
         calls["n"] += 1
         return subprocess.CompletedProcess(cmd, 30, "", "timeout in data send")
 
-    monkeypatch.setattr(sshio.subprocess, "run", fake_run)
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", fake_run)
     monkeypatch.setattr(sshio.time, "sleep", lambda s: None)
     proc = sshio.rsync("a/", "b/", retries=2)
     assert proc.returncode == 30 and calls["n"] == 3
@@ -886,12 +1073,13 @@ def test_rsync_deterministic_errors_fail_without_retry_delay(monkeypatch, return
     calls = 0
     sleeps = []
 
-    def fake_run(cmd, capture_output, text, timeout):
+    def fake_run(cmd, timeout, cancel_event):
+        assert cancel_event is None
         nonlocal calls
         calls += 1
         return subprocess.CompletedProcess(cmd, returncode, "", "deterministic failure")
 
-    monkeypatch.setattr(sshio.subprocess, "run", fake_run)
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", fake_run)
     monkeypatch.setattr(sshio.time, "sleep", sleeps.append)
 
     proc = sshio.rsync("a/", "b/", retries=2)
@@ -905,7 +1093,8 @@ def test_rsync_retries_vanished_source_then_reconciles(monkeypatch):
     calls = 0
     sleeps = []
 
-    def fake_run(cmd, capture_output, text, timeout):
+    def fake_run(cmd, timeout, cancel_event):
+        assert cancel_event is None
         nonlocal calls
         calls += 1
         return subprocess.CompletedProcess(
@@ -915,7 +1104,7 @@ def test_rsync_retries_vanished_source_then_reconciles(monkeypatch):
             "file vanished" if calls == 1 else "",
         )
 
-    monkeypatch.setattr(sshio.subprocess, "run", fake_run)
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", fake_run)
     monkeypatch.setattr(sshio.time, "sleep", sleeps.append)
 
     proc = sshio.rsync("a/", "b/", retries=2)
@@ -928,11 +1117,12 @@ def test_rsync_retries_vanished_source_then_reconciles(monkeypatch):
 def test_rsync_uses_partial(monkeypatch):
     seen = {}
 
-    def fake_run(cmd, capture_output, text, timeout):
+    def fake_run(cmd, timeout, cancel_event):
+        assert cancel_event is None
         seen["cmd"] = cmd
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(sshio.subprocess, "run", fake_run)
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", fake_run)
     sshio.rsync("a/", "b/")
     assert "--partial" in seen["cmd"]
 
@@ -997,6 +1187,81 @@ def test_rsync_keyboard_interrupt_terminates_child_before_propagating(monkeypatc
 
     assert child.terminated is True
     assert child.calls == 2
+
+
+def test_rsync_timeout_terminates_isolated_rsync_and_ssh_process_group(monkeypatch):
+    import signal
+
+    class Child:
+        pid = 4321
+        returncode = -15
+        calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                raise subprocess.TimeoutExpired(["rsync"], timeout)
+            return "partial stats", ""
+
+        def terminate(self):
+            raise AssertionError("real process groups use killpg")
+
+        def kill(self):
+            raise AssertionError("TERM should be enough for this child")
+
+    child = Child()
+    popen_kwargs = {}
+
+    def fake_popen(*args, **kwargs):
+        popen_kwargs.update(kwargs)
+        return child
+
+    signals = []
+    monkeypatch.setattr(sshio.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(sshio.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    proc = sshio.rsync("a/", "b/", timeout=0)
+
+    assert proc.returncode == 255
+    assert proc.stdout == "partial stats"
+    assert proc.stderr == "rsync timed out after 0s"
+    assert popen_kwargs["start_new_session"] is True
+    assert signals == [(4321, signal.SIGTERM)]
+
+
+def test_rsync_absolute_deadline_does_not_repeat_the_same_congested_route(
+    monkeypatch,
+):
+    calls = 0
+
+    def deadline(cmd, timeout, cancel_event):
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(
+            cmd,
+            255,
+            "",
+            f"rsync timed out after {timeout}s",
+        )
+
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", deadline)
+    proc = sshio.rsync(
+        "source/",
+        "worker:target/",
+        timeout=sshio.BULK_TRANSFER_TIMEOUT_S,
+        retries=2,
+    )
+
+    assert proc.returncode == 255
+    assert calls == 1
+    assert (
+        sshio.classify_rsync_failure(
+            proc.returncode,
+            proc.stdout,
+            proc.stderr,
+        )
+        == "deadline"
+    )
 
 
 def test_pull_multiple_json_recovers_jobs_concurrently_into_isolated_dirs(
@@ -1644,11 +1909,12 @@ def test_pull_zero_retries_fails_immediately_without_retry_claim(tmp_path, monke
         lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
     )
 
-    def link_failure(cmd, capture_output, text, timeout):
+    def link_failure(cmd, timeout, cancel_event):
+        assert cancel_event is None
         calls.append(cmd)
         return subprocess.CompletedProcess(cmd, 255, "", "ssh: link lost")
 
-    monkeypatch.setattr(sshio.subprocess, "run", link_failure)
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", link_failure)
     monkeypatch.setattr(sshio.time, "sleep", sleeps.append)
 
     result = CliRunner().invoke(
@@ -1702,7 +1968,8 @@ def test_pull_reports_structured_retry_progress_without_polluting_json(
         lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
     )
 
-    def transient_link_failure(cmd, capture_output, text, timeout):
+    def transient_link_failure(cmd, timeout, cancel_event):
+        assert cancel_event is None
         calls.append(cmd)
         returncode = next(returncodes)
         return subprocess.CompletedProcess(
@@ -1712,7 +1979,7 @@ def test_pull_reports_structured_retry_progress_without_polluting_json(
             "ssh: link lost" if returncode else "",
         )
 
-    monkeypatch.setattr(sshio.subprocess, "run", transient_link_failure)
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", transient_link_failure)
     monkeypatch.setattr(sshio.time, "sleep", sleeps.append)
 
     result = CliRunner().invoke(
@@ -1739,6 +2006,7 @@ def test_pull_reports_structured_retry_progress_without_polluting_json(
             "delay_s": 5,
             "returncode": 255,
             "message": "ssh: link lost",
+            "kind": "transport",
         }
     ]
     assert result.stdout.count("\n") == 1
@@ -2642,6 +2910,45 @@ def test_pull_force_claims_conflicting_destination(tmp_path, monkeypatch):
     assert json.loads(result.stdout)["destination"] == str(destination)
 
 
+def test_pull_rejects_symlink_destination_before_remote_access(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+    )
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    destination = tmp_path / "result"
+    destination.symlink_to(actual, target_is_directory=True)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe destination must fail before remote access")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["pull", "jid", "--to", str(destination), "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "destination_conflict"
+    assert "symbolic link" in payload["message"]
+    assert not any(actual.iterdir())
+
+
 def test_laptop_pull_json_reconnects_without_leaking_partial_stdout(
     monkeypatch,
 ):
@@ -3272,6 +3579,23 @@ def test_kill_json_requires_noninteractive_confirmation(tmp_path, monkeypatch):
     }
 
 
+def test_job_ref_file_reader_rejects_oversized_input(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    refs_file = tmp_path / "oversized.jobs"
+    refs_file.write_bytes(b"x" * (cli.JOB_REFS_MAX_BYTES + 1))
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["kill", "--file", str(refs_file), "-y", "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "invalid_argument"
+    assert "size limit" in payload["message"]
+
+
 def test_kill_json_unverified_contract_keeps_running_state(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     entry = JobEntry(
@@ -3596,11 +3920,11 @@ def test_registry_atomic_save_uses_unique_temp_files_for_concurrent_writers(
     replace_sources = []
     sources_lock = threading.Lock()
 
-    def racing_replace(source, target):
+    def racing_replace(source, target, **kwargs):
         with sources_lock:
             replace_sources.append(source)
         rendezvous.wait()
-        return original_replace(source, target)
+        return original_replace(source, target, **kwargs)
 
     monkeypatch.setattr(jobs.os, "replace", racing_replace)
     errors = []
@@ -3932,6 +4256,149 @@ def test_kill_uses_single_procfs_scan_instead_of_one_readlink_per_pid():
     assert "find /proc -mindepth 2 -maxdepth 2" in source
 
 
+def test_termination_probe_does_not_signal_reused_process_group(tmp_path):
+    job_dir = tmp_path / "jobs" / "stale-job"
+    job_dir.mkdir(parents=True)
+    (job_dir / "process_start_ticks").write_text("1\n")
+    unrelated = subprocess.Popen(["sleep", "30"], cwd=job_dir, start_new_session=True)
+    try:
+        command = lifecycle.termination_probe(
+            str(job_dir), unrelated.pid, "TERM", job_id="stale-job"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        assert lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        ) == ("DEAD", None)
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=2)
+
+
+@pytest.mark.parametrize(
+    "job_dir",
+    ["/", "~/", "../../outside", "dt/jobs/../../outside", "single"],
+)
+def test_termination_probe_rejects_unsafe_capsule(job_dir):
+    with pytest.raises(ValueError, match="job capsule path"):
+        lifecycle.termination_probe(job_dir, 1234, "TERM")
+
+
+def test_termination_probe_requires_capsule_to_match_task_identity():
+    with pytest.raises(ValueError, match="does not match the task identity"):
+        lifecycle.termination_probe(
+            "dt/jobs/different", 1234, "TERM", job_id="expected"
+        )
+
+
+def test_kill_refuses_unsafe_capsule_without_remote_signal(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="unsafe-kill",
+        name="unsafe-kill",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/../../outside",
+        session="dt_unsafe_kill",
+        cmd="sleep 30",
+        pgid=1234,
+    )
+    jobs.save(cfg, entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe capsule must never be signalled")
+        ),
+    )
+
+    assert cli._kill_one(cfg, entry.job_id, yes=True, force=False) == "unverified"
+    retained = jobs.load(cfg, entry.job_id)
+    assert retained is not None
+    assert retained.status == "running"
+
+
+def test_termination_probe_does_not_signal_after_node_boot_change(tmp_path):
+    job_dir = tmp_path / "jobs" / "prior-boot-job"
+    job_dir.mkdir(parents=True)
+    unrelated = subprocess.Popen(["sleep", "30"], cwd=job_dir, start_new_session=True)
+    try:
+        (job_dir / "process_start_ticks").write_text(
+            f"{_proc_start_ticks(unrelated.pid)}\n"
+        )
+        command = lifecycle.termination_probe(
+            str(job_dir),
+            unrelated.pid,
+            "TERM",
+            boot_id="definitely-not-the-current-boot",
+            job_id="prior-boot-job",
+            session="dt_prior_boot",
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        assert lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        ) == ("DEAD", None)
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=2)
+
+
+def test_termination_probe_signals_matching_process_group(tmp_path):
+    job_dir = tmp_path / "jobs" / "owned-job"
+    job_dir.mkdir(parents=True)
+    owner = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            'setsid sleep 30 & child=$!; printf \'%s\\n\' "$child"; wait "$child"',
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert owner.stdout is not None
+    owned_pid = int(owner.stdout.readline().strip())
+    try:
+        (job_dir / "process_start_ticks").write_text(
+            f"{_proc_start_ticks(owned_pid)}\n"
+        )
+        command = lifecycle.termination_probe(
+            str(job_dir), owned_pid, "TERM", job_id="owned-job"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        assert lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        ) == ("DEAD", None)
+        assert owner.wait(timeout=2) == 143
+    finally:
+        if owner.poll() is None:
+            owner.terminate()
+            owner.wait(timeout=2)
+
+
 def test_termination_verdict_requires_explicit_dead_marker():
     assert lifecycle.termination_verdict(0, "DEAD\n", "") == ("DEAD", None)
     assert lifecycle.termination_verdict(0, "ALIVE\n", "") == ("ALIVE", None)
@@ -3943,3 +4410,12 @@ def test_termination_verdict_requires_explicit_dead_marker():
         "UNVERIFIED",
         "connection closed",
     )
+
+
+def test_termination_verdict_bounds_untrusted_remote_diagnostics():
+    verdict, detail = lifecycle.termination_verdict(255, "", "x" * 100_000)
+
+    assert verdict == "UNVERIFIED"
+    assert detail is not None
+    assert len(detail) <= 4096
+    assert "[omitted]" in detail

@@ -2,7 +2,7 @@
 
 ## Supported environment
 
-DistTrainer 0.6 supports:
+The current DistTrainer minor line supports:
 
 - Linux head and compute nodes;
 - Python 3.10 or 3.11 on the client/head;

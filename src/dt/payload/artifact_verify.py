@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -15,13 +16,64 @@ try:
 except ImportError:  # standalone copy beside snapshot_hash.py on compute nodes
     from snapshot_hash import tree_sha256  # type: ignore[import-not-found,no-redef]
 
+MAX_MANIFEST_BYTES = 8 * 1024 * 1024
+
 
 def _sha256(path: Path) -> str:
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError(f"artifact is not a regular file: {path}")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(8 * 1024 * 1024):
-            digest.update(chunk)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+            or opened.st_size != metadata.st_size
+        ):
+            raise ValueError(f"artifact changed while hashing: {path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while chunk := stream.read(8 * 1024 * 1024):
+                digest.update(chunk)
+        finished = os.fstat(descriptor)
+        if (
+            finished.st_size != opened.st_size
+            or finished.st_mtime_ns != opened.st_mtime_ns
+            or finished.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise ValueError(f"artifact changed while hashing: {path}")
+    finally:
+        os.close(descriptor)
     return digest.hexdigest()
+
+
+def _read_manifest(path: Path) -> bytes:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+    )
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("artifact manifest is not a regular file")
+        if info.st_size > MAX_MANIFEST_BYTES:
+            raise ValueError("artifact manifest is too large")
+        payload = bytearray()
+        while len(payload) <= MAX_MANIFEST_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, MAX_MANIFEST_BYTES + 1 - len(payload)),
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+        if len(payload) > MAX_MANIFEST_BYTES:
+            raise ValueError("artifact manifest is too large")
+        return bytes(payload)
+    finally:
+        os.close(descriptor)
 
 
 def _directory_bytes(path: Path) -> int:
@@ -38,8 +90,11 @@ def _directory_bytes(path: Path) -> int:
 
 
 def verify(root: Path, manifest_path: Path, expected_sha256: str) -> dict[str, object]:
+    root_info = root.lstat()
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError("artifact root is not a regular directory")
     root = root.resolve(strict=True)
-    manifest_bytes = manifest_path.read_bytes()
+    manifest_bytes = _read_manifest(manifest_path)
     actual_manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
     if actual_manifest_sha256 != expected_sha256:
         raise ValueError(

@@ -8,9 +8,13 @@ from __future__ import annotations
 
 import math
 import os
+import re
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml  # type: ignore[import-untyped]
 
@@ -23,10 +27,47 @@ class ConfigError(Exception):
 
 DEFAULT_PROBE_TIMEOUT_S = 15.0
 MAX_PROBE_TIMEOUT_S = 120.0
+MAX_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_CENTERS = 128
+MAX_NODES = 256
+MAX_PROJECTS = 1024
+MAX_SITES = 256
+MAX_PROJECT_EXTRAS = 64
+MAX_SETUP_INPUTS = 256
+MAX_SNAPSHOT_EXCLUDES = 256
+MAX_SSH_DESTINATION_LENGTH = 512
+MAX_QUEUE_POLL_S = 24 * 3600
+MAX_QUEUE_ACTIVE_POLL_S = 3600.0
+SITE_ARTIFACT_POLICIES = frozenset({"direct", "site-cache-first", "topology-aware"})
+_SSH_DESTINATION_RE = re.compile(r"^[A-Za-z0-9_.@:%+\[\]-]+$")
+_CONFIG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_LOAD_CACHE_LOCK = Lock()
+_LOAD_CACHE: (
+    tuple[
+        tuple[str, int, int, int, int, int, int],
+        HeadConfig | LaptopConfig,
+    ]
+    | None
+) = None
 
 
 def config_path() -> Path:
     return Path(os.environ.get("DT_CONFIG", "~/.config/dt/config.yaml")).expanduser()
+
+
+def _config_file_signature(
+    path: Path,
+    metadata: os.stat_result,
+) -> tuple[str, int, int, int, int, int, int]:
+    return (
+        str(path),
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 @dataclass
@@ -35,6 +76,28 @@ class Node:
     local: bool = False
     root: str | None = None
     probe_timeout_s: float = DEFAULT_PROBE_TIMEOUT_S
+    site: str | None = None
+    lan_address: str | None = None
+    lan_port: int = 22
+    artifact_seed: bool = True
+    transfer_cost: float = 1.0
+
+
+@dataclass(frozen=True)
+class Site:
+    """Explicit network domain and its first cross-site artifact landing node."""
+
+    name: str
+    nodes: tuple[str, ...]
+    gateway: str
+    cache_node: str
+    lan_transport: str = "ssh"
+    artifact_policy: str = "direct"
+    cache_root: str | None = None
+    fallback_direct: bool = False
+    route_circuit_failures: int = 2
+    route_circuit_cooldown_s: float = 60.0
+    route_circuit_max_cooldown_s: float = 900.0
 
 
 @dataclass
@@ -60,6 +123,18 @@ class QueueCfg:
     )
 
 
+@dataclass(frozen=True)
+class OperationsCfg:
+    """Bounded local operation-journal retention.
+
+    The journal is always enabled.  These knobs bound disk use without making
+    the evidence contract depend on an opt-in setting.
+    """
+
+    max_file_mib: int = 16
+    keep_files: int = 8
+
+
 @dataclass
 class HeadConfig:
     center: str
@@ -76,6 +151,8 @@ class HeadConfig:
     mem_threshold_mib: int = 500
     disk_min_gib: int = 10
     queue: QueueCfg = field(default_factory=QueueCfg)
+    operations: OperationsCfg = field(default_factory=OperationsCfg)
+    sites: dict[str, Site] = field(default_factory=dict)
     webhook: str | None = None  # POST job-end notifications here
     snapshot_excludes: list[str] = field(default_factory=list)  # extra rsync excludes
     snapshot_warn_gib: float = 2.0  # warn when a snapshot transfers more
@@ -245,6 +322,7 @@ class HeadConfig:
 class LaptopConfig:
     centers: dict[str, str]  # center name -> head ssh alias
     default_center: str | None = None
+    operations: OperationsCfg = field(default_factory=OperationsCfg)
     role: str = "laptop"
 
     def head(self, center: str) -> str:
@@ -283,6 +361,46 @@ def _nonempty_string(value: object, label: str) -> str:
     return value.strip()
 
 
+def _config_id(value: object, label: str) -> str:
+    identity = _nonempty_string(value, label)
+    if _CONFIG_ID_RE.fullmatch(identity) is None:
+        raise ConfigError(
+            f"`{label}` must use 1-64 letters, digits, dots, underscores, or dashes "
+            "and start with a letter or digit"
+        )
+    return identity
+
+
+def is_config_id(value: object) -> bool:
+    return isinstance(value, str) and _CONFIG_ID_RE.fullmatch(value) is not None
+
+
+def _require_item_limit(size: int, label: str, maximum: int) -> None:
+    if size > maximum:
+        raise ConfigError(f"`{label}` has {size} entries; maximum is {maximum}")
+
+
+def _webhook_url(value: object) -> str:
+    webhook = _nonempty_string(value, "webhook")
+    parsed = urlsplit(webhook)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        raise ConfigError("`webhook` must be an HTTP(S) URL with a hostname")
+    return webhook
+
+
+def _ssh_destination(value: object, label: str) -> str:
+    destination = _nonempty_string(value, label)
+    if (
+        len(destination) > MAX_SSH_DESTINATION_LENGTH
+        or destination.startswith("-")
+        or _SSH_DESTINATION_RE.fullmatch(destination) is None
+    ):
+        raise ConfigError(
+            f"`{label}` must be a safe SSH alias, host, or user@host destination"
+        )
+    return destination
+
+
 def _integer(value: object, label: str) -> int:
     if isinstance(value, bool):
         raise ConfigError(f"`{label}` must be an integer")
@@ -314,18 +432,29 @@ def _finite_number(value: object, label: str) -> float:
 def _parse_nodes(raw: object) -> list[Node]:
     if not isinstance(raw, list):
         raise ConfigError("`nodes` must be a list")
+    _require_item_limit(len(raw), "nodes", MAX_NODES)
     nodes: list[Node] = []
     for item in raw:
         if isinstance(item, str):
-            name = _nonempty_string(item, "nodes[].name")
+            name = _ssh_destination(item, "nodes[].name")
             nodes.append(Node(name=name))
         elif isinstance(item, dict):
             _reject_unknown(
                 item,
-                {"name", "local", "root", "probe_timeout_s"},
+                {
+                    "name",
+                    "local",
+                    "root",
+                    "probe_timeout_s",
+                    "site",
+                    "lan_address",
+                    "lan_port",
+                    "artifact_seed",
+                    "transfer_cost",
+                },
                 "node entry",
             )
-            name = _nonempty_string(item.get("name"), "nodes[].name")
+            name = _ssh_destination(item.get("name"), "nodes[].name")
             local = item.get("local", False)
             if not isinstance(local, bool):
                 raise ConfigError("`nodes[].local` must be true or false")
@@ -346,12 +475,43 @@ def _parse_nodes(raw: object) -> list[Node]:
                     root = normalize_node_root(root_text)
                 except ValueError as exc:
                     raise ConfigError(f"`nodes[].root` {exc}") from None
+            raw_site = item.get("site")
+            site = (
+                _nonempty_string(raw_site, "nodes[].site")
+                if raw_site is not None
+                else None
+            )
+            raw_lan_address = item.get("lan_address")
+            lan_address = (
+                _ssh_destination(raw_lan_address, "nodes[].lan_address")
+                if raw_lan_address is not None
+                else None
+            )
+            lan_port = _integer(item.get("lan_port", 22), "nodes[].lan_port")
+            if not 1 <= lan_port <= 65535:
+                raise ConfigError("`nodes[].lan_port` must be between 1 and 65535")
+            if lan_address is None and "lan_port" in item:
+                raise ConfigError("`nodes[].lan_port` requires `lan_address`")
+            artifact_seed = item.get("artifact_seed", True)
+            if not isinstance(artifact_seed, bool):
+                raise ConfigError("`nodes[].artifact_seed` must be true or false")
+            transfer_cost = _finite_number(
+                item.get("transfer_cost", 1.0),
+                "nodes[].transfer_cost",
+            )
+            if transfer_cost < 0:
+                raise ConfigError("`nodes[].transfer_cost` must be non-negative")
             nodes.append(
                 Node(
                     name=name,
                     local=local,
                     root=root,
                     probe_timeout_s=probe_timeout_s,
+                    site=site,
+                    lan_address=lan_address,
+                    lan_port=lan_port,
+                    artifact_seed=artifact_seed,
+                    transfer_cost=transfer_cost,
                 )
             )
         else:
@@ -366,11 +526,183 @@ def _parse_nodes(raw: object) -> list[Node]:
     return nodes
 
 
+def _parse_sites(raw: object, nodes: list[Node]) -> dict[str, Site]:
+    if raw is None:
+        if any(node.site is not None for node in nodes):
+            raise ConfigError("`nodes[].site` requires a top-level `sites` mapping")
+        return {}
+    mapping = _mapping(raw, "sites")
+    if not mapping:
+        raise ConfigError("`sites` must not be empty when configured")
+    _require_item_limit(len(mapping), "sites", MAX_SITES)
+    known = {node.name: node for node in nodes}
+    assigned: dict[str, str] = {}
+    sites: dict[str, Site] = {}
+    for raw_name, value in mapping.items():
+        name = _config_id(raw_name, "site names")
+        site = _mapping(value, f"sites.{name}")
+        _reject_unknown(
+            site,
+            {
+                "gateway",
+                "nodes",
+                "cache_node",
+                "cache_root",
+                "lan_transport",
+                "artifact_policy",
+                "fallback_direct",
+                "route_circuit_failures",
+                "route_circuit_cooldown_s",
+                "route_circuit_max_cooldown_s",
+            },
+            f"site {name!r}",
+        )
+        raw_members = site.get("nodes")
+        if not isinstance(raw_members, list) or not raw_members:
+            raise ConfigError(f"site {name!r} `nodes` must be a non-empty list")
+        _require_item_limit(
+            len(raw_members),
+            f"sites.{name}.nodes",
+            MAX_NODES,
+        )
+        members = tuple(
+            _nonempty_string(member, f"sites.{name}.nodes[]") for member in raw_members
+        )
+        if len(set(members)) != len(members):
+            raise ConfigError(f"site {name!r} has duplicate node names")
+        for member in members:
+            if member not in known:
+                raise ConfigError(f"site {name!r} references unknown node {member!r}")
+            prior = assigned.get(member)
+            if prior is not None:
+                raise ConfigError(
+                    f"node {member!r} belongs to both sites {prior!r} and {name!r}"
+                )
+            configured = known[member].site
+            if configured is not None and configured != name:
+                raise ConfigError(
+                    f"node {member!r} declares site {configured!r}, not {name!r}"
+                )
+            known[member].site = name
+            assigned[member] = name
+
+        gateway = _nonempty_string(site.get("gateway"), f"sites.{name}.gateway")
+        if gateway not in members:
+            raise ConfigError(
+                f"site {name!r} gateway {gateway!r} must be one of its nodes"
+            )
+        raw_cache_node = site.get("cache_node", gateway)
+        cache_node = _nonempty_string(
+            raw_cache_node,
+            f"sites.{name}.cache_node",
+        )
+        if cache_node not in members:
+            raise ConfigError(
+                f"site {name!r} cache_node {cache_node!r} must be one of its nodes"
+            )
+        if not known[cache_node].artifact_seed:
+            raise ConfigError(
+                f"site {name!r} cache_node {cache_node!r} disables artifact_seed"
+            )
+        lan_transport = _nonempty_string(
+            site.get("lan_transport", "ssh"),
+            f"sites.{name}.lan_transport",
+        )
+        if lan_transport != "ssh":
+            raise ConfigError(f"site {name!r} lan_transport must currently be `ssh`")
+        artifact_policy = _nonempty_string(
+            site.get("artifact_policy", "direct"),
+            f"sites.{name}.artifact_policy",
+        )
+        if artifact_policy not in SITE_ARTIFACT_POLICIES:
+            raise ConfigError(
+                f"site {name!r} artifact_policy must be one of "
+                f"{sorted(SITE_ARTIFACT_POLICIES)}"
+            )
+        raw_cache_root = site.get("cache_root")
+        cache_root: str | None = None
+        if raw_cache_root is not None:
+            cache_root_text = _nonempty_string(
+                raw_cache_root,
+                f"sites.{name}.cache_root",
+            )
+            try:
+                cache_root = normalize_node_root(cache_root_text)
+            except ValueError as exc:
+                raise ConfigError(f"`sites.{name}.cache_root` {exc}") from None
+        fallback_direct = site.get("fallback_direct", False)
+        if not isinstance(fallback_direct, bool):
+            raise ConfigError(f"`sites.{name}.fallback_direct` must be true or false")
+        route_circuit_failures = _integer(
+            site.get("route_circuit_failures", 2),
+            f"sites.{name}.route_circuit_failures",
+        )
+        if not 1 <= route_circuit_failures <= 10:
+            raise ConfigError(
+                f"sites.{name}.route_circuit_failures must be between 1 and 10"
+            )
+        route_circuit_cooldown_s = _finite_number(
+            site.get("route_circuit_cooldown_s", 60.0),
+            f"sites.{name}.route_circuit_cooldown_s",
+        )
+        route_circuit_max_cooldown_s = _finite_number(
+            site.get("route_circuit_max_cooldown_s", 900.0),
+            f"sites.{name}.route_circuit_max_cooldown_s",
+        )
+        if not 1 <= route_circuit_cooldown_s <= 3600:
+            raise ConfigError(
+                f"sites.{name}.route_circuit_cooldown_s must be between 1 and 3600"
+            )
+        if not route_circuit_cooldown_s <= route_circuit_max_cooldown_s <= 86400:
+            raise ConfigError(
+                f"sites.{name}.route_circuit_max_cooldown_s must be between "
+                "the base cooldown and 86400"
+            )
+        if artifact_policy == "site-cache-first":
+            missing_lan = [
+                member
+                for member in members
+                if member != cache_node
+                and not known[member].local
+                and known[member].lan_address is None
+            ]
+            if missing_lan:
+                raise ConfigError(
+                    f"site {name!r} site-cache-first nodes need explicit "
+                    f"lan_address: {', '.join(missing_lan)}"
+                )
+        sites[name] = Site(
+            name=name,
+            nodes=members,
+            gateway=gateway,
+            cache_node=cache_node,
+            lan_transport=lan_transport,
+            artifact_policy=artifact_policy,
+            cache_root=cache_root,
+            fallback_direct=fallback_direct,
+            route_circuit_failures=route_circuit_failures,
+            route_circuit_cooldown_s=route_circuit_cooldown_s,
+            route_circuit_max_cooldown_s=route_circuit_max_cooldown_s,
+        )
+    unassigned = [node.name for node in nodes if node.name not in assigned]
+    if unassigned:
+        raise ConfigError(
+            "topology is incomplete; every node must belong to one site: "
+            + ", ".join(unassigned)
+        )
+    return sites
+
+
 def _parse_setup_inputs(project: str, raw: object) -> list[str] | None:
     if raw is None:
         return None
     if not isinstance(raw, list):
         raise ConfigError(f"project {project!r} `setup_inputs` must be a list")
+    _require_item_limit(
+        len(raw),
+        f"projects.{project}.setup_inputs",
+        MAX_SETUP_INPUTS,
+    )
     inputs: list[str] = []
     for value in raw:
         if not isinstance(value, str) or not value.strip():
@@ -389,6 +721,23 @@ def _parse_setup_inputs(project: str, raw: object) -> list[str] | None:
     return inputs
 
 
+def _parse_operations(data: dict[str, Any]) -> OperationsCfg:
+    raw = _optional_mapping(data, "operations")
+    _reject_unknown(raw, {"max_file_mib", "keep_files"}, "operations")
+    max_file_mib = _integer(
+        raw.get("max_file_mib", 16),
+        "operations.max_file_mib",
+    )
+    keep_files = _integer(raw.get("keep_files", 8), "operations.keep_files")
+    if not 1 <= max_file_mib <= 256:
+        raise ConfigError("`operations.max_file_mib` must be between 1 and 256")
+    if not 1 <= keep_files <= 32:
+        raise ConfigError("`operations.keep_files` must be between 1 and 32")
+    if max_file_mib * keep_files > 4096:
+        raise ConfigError("operation journal retention must not exceed 4096 MiB")
+    return OperationsCfg(max_file_mib=max_file_mib, keep_files=keep_files)
+
+
 def parse(data: object) -> HeadConfig | LaptopConfig:
     if not isinstance(data, dict) or not data:
         raise ConfigError("config file is empty or not a mapping")
@@ -398,18 +747,23 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         )
 
     if "centers" in data:
-        _reject_unknown(data, {"centers", "default_center"}, "laptop config")
+        _reject_unknown(
+            data,
+            {"centers", "default_center", "operations"},
+            "laptop config",
+        )
         raw_centers = _mapping(data["centers"], "centers")
         if not raw_centers:
             raise ConfigError("laptop config has empty `centers`")
+        _require_item_limit(len(raw_centers), "centers", MAX_CENTERS)
         centers: dict[str, str] = {}
         for raw_name, val in raw_centers.items():
-            name = _nonempty_string(raw_name, "centers name")
+            name = _config_id(raw_name, "centers name")
             if isinstance(val, dict):
                 _reject_unknown(val, {"head"}, f"centers.{name}")
-                head = _nonempty_string(val.get("head"), f"centers.{name}.head")
+                head = _ssh_destination(val.get("head"), f"centers.{name}.head")
             else:
-                head = _nonempty_string(val, f"centers.{name}")
+                head = _ssh_destination(val, f"centers.{name}")
             centers[name] = head
         default_center = data.get("default_center")
         if default_center is not None:
@@ -418,7 +772,11 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 raise ConfigError(
                     f"`default_center` {default_center!r} is not in configured centers"
                 )
-        return LaptopConfig(centers=centers, default_center=default_center)
+        return LaptopConfig(
+            centers=centers,
+            default_center=default_center,
+            operations=_parse_operations(data),
+        )
 
     if "center" in data:
         _reject_unknown(
@@ -432,6 +790,8 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 "mem_threshold_mib",
                 "disk_min_gib",
                 "queue",
+                "operations",
+                "sites",
                 "webhook",
                 "snapshot_excludes",
                 "snapshot_warn_gib",
@@ -439,7 +799,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             },
             "head config",
         )
-        center = _nonempty_string(data["center"], "center")
+        center = _config_id(data["center"], "center")
         paths = _optional_mapping(data, "paths")
         _reject_unknown(
             paths,
@@ -486,9 +846,10 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         else:
             results_root = None
         raw_projects = _optional_mapping(data, "projects")
+        _require_item_limit(len(raw_projects), "projects", MAX_PROJECTS)
         projects: dict[str, Project] = {}
         for raw_name, p in raw_projects.items():
-            name = _nonempty_string(raw_name, "projects name")
+            name = _config_id(raw_name, "projects name")
             if isinstance(p, dict):
                 _reject_unknown(
                     p,
@@ -515,13 +876,19 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 elif not isinstance(raw_extras, list):
                     raise ConfigError(f"project {name!r} `extras` must be a list")
                 else:
-                    extras = [
-                        _nonempty_string(
+                    _require_item_limit(
+                        len(raw_extras),
+                        f"projects.{name}.extras",
+                        MAX_PROJECT_EXTRAS,
+                    )
+                    extras = []
+                    for extra in raw_extras:
+                        normalized_extra = _config_id(
                             extra,
                             f"projects.{name}.extras[]",
                         )
-                        for extra in raw_extras
-                    ]
+                        if normalized_extra not in extras:
+                            extras.append(normalized_extra)
                 projects[name] = Project(
                     path=Path(project_path).expanduser(),
                     setup=setup,
@@ -549,10 +916,15 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         active_poll_s = _finite_number(
             qraw.get("active_poll_s", 2.0), "queue.active_poll_s"
         )
-        if poll_s <= 0:
-            raise ConfigError("queue `poll_s` must be a positive integer")
-        if active_poll_s <= 0:
-            raise ConfigError("queue `active_poll_s` must be a finite positive number")
+        if not 0 < poll_s <= MAX_QUEUE_POLL_S:
+            raise ConfigError(
+                f"queue `poll_s` must be between 1 and {MAX_QUEUE_POLL_S} seconds"
+            )
+        if not 0 < active_poll_s <= MAX_QUEUE_ACTIVE_POLL_S:
+            raise ConfigError(
+                "queue `active_poll_s` must be a finite positive number no greater "
+                f"than {MAX_QUEUE_ACTIVE_POLL_S:g} seconds"
+            )
         parsed_max_jobs = (
             _integer(max_jobs, "queue.max_my_jobs") if max_jobs is not None else None
         )
@@ -606,20 +978,23 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         elif not isinstance(raw_excludes, list):
             raise ConfigError("`snapshot_excludes` must be a list of strings")
         else:
+            _require_item_limit(
+                len(raw_excludes),
+                "snapshot_excludes",
+                MAX_SNAPSHOT_EXCLUDES,
+            )
             excludes = [
                 _nonempty_string(item, "snapshot_excludes[]") for item in raw_excludes
             ]
         raw_webhook = data.get("webhook")
-        webhook = (
-            _nonempty_string(raw_webhook, "webhook")
-            if raw_webhook is not None
-            else None
-        )
+        webhook = _webhook_url(raw_webhook) if raw_webhook is not None else None
         raw_proxy = data.get("proxy")
         proxy = _nonempty_string(raw_proxy, "proxy") if raw_proxy is not None else None
+        nodes = _parse_nodes(data.get("nodes") or [])
+        sites = _parse_sites(data.get("sites"), nodes)
         return HeadConfig(
             center=center,
-            nodes=_parse_nodes(data.get("nodes") or []),
+            nodes=nodes,
             projects=projects,
             default_project=default_project,
             root=root,
@@ -630,6 +1005,8 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             mem_threshold_mib=mem_threshold_mib,
             disk_min_gib=disk_min_gib,
             queue=queue,
+            operations=_parse_operations(data),
+            sites=sites,
             webhook=webhook,
             snapshot_excludes=excludes,
             snapshot_warn_gib=snapshot_warn_gib,
@@ -641,17 +1018,63 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
 
 
 def load() -> HeadConfig | LaptopConfig:
+    global _LOAD_CACHE
     path = config_path()
-    if not path.exists():
-        raise ConfigError(
-            f"config not found: {path}\n"
-            "run `dt init --help` to create a laptop or head configuration"
-        )
-    try:
-        with open(path, encoding="utf-8") as stream:
-            data = yaml.safe_load(stream)
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"cannot parse config {path}: {exc}") from None
-    except OSError as exc:
-        raise ConfigError(f"cannot read config {path}: {exc}") from None
-    return parse(data)
+    with _LOAD_CACHE_LOCK:
+        try:
+            metadata = path.stat()
+        except FileNotFoundError:
+            raise ConfigError(
+                f"config not found: {path}\n"
+                "run `dt init --help` to create a laptop or head configuration"
+            ) from None
+        except OSError as exc:
+            raise ConfigError(f"cannot read config {path}: {exc}") from None
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ConfigError(f"config is not a regular file: {path}")
+        if metadata.st_size > MAX_CONFIG_BYTES:
+            raise ConfigError(
+                f"config exceeds {MAX_CONFIG_BYTES // 1024**2} MiB: {path}"
+            )
+        signature = _config_file_signature(path, metadata)
+        if _LOAD_CACHE is not None and _LOAD_CACHE[0] == signature:
+            return _LOAD_CACHE[1]
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | getattr(os, "O_NONBLOCK", 0),
+            )
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ConfigError(f"config is not a regular file: {path}")
+            if _config_file_signature(path, opened) != signature:
+                raise ConfigError(f"config changed before it could be read: {path}")
+            if opened.st_size > MAX_CONFIG_BYTES:
+                raise ConfigError(
+                    f"config exceeds {MAX_CONFIG_BYTES // 1024**2} MiB: {path}"
+                )
+            with os.fdopen(descriptor, "r", encoding="utf-8", closefd=False) as stream:
+                payload = stream.read(MAX_CONFIG_BYTES + 1)
+            if len(payload.encode("utf-8")) > MAX_CONFIG_BYTES:
+                raise ConfigError(
+                    f"config exceeds {MAX_CONFIG_BYTES // 1024**2} MiB: {path}"
+                )
+            finished = os.fstat(descriptor)
+        except ConfigError:
+            raise
+        except (OSError, UnicodeError) as exc:
+            raise ConfigError(f"cannot read config {path}: {exc}") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        opened_signature = _config_file_signature(path, opened)
+        if opened_signature != _config_file_signature(path, finished):
+            raise ConfigError(f"config changed while being read: {path}")
+        try:
+            data = yaml.safe_load(payload)
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"cannot parse config {path}: {exc}") from None
+        parsed = parse(data)
+        _LOAD_CACHE = (opened_signature, parsed)
+        return parsed

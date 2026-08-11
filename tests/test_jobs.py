@@ -19,6 +19,26 @@ def test_sanitize():
     assert sanitize_name("ok_name-1") == "ok_name-1"
 
 
+def test_sanitize_bounds_long_names_without_collapsing_distinct_inputs():
+    common = "experiment-" + "x" * 300
+
+    first = sanitize_name(common + "-first")
+    second = sanitize_name(common + "-second")
+
+    assert len(first) == 64
+    assert len(second) == 64
+    assert first != second
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", first)
+    assert re.fullmatch(r"[A-Za-z0-9_-]+", second)
+
+
+def test_new_job_id_stays_below_filesystem_component_limit_for_long_name():
+    jid = new_job_id("experiment-" + "x" * 1000)
+
+    assert len(jid.encode("utf-8")) < 255
+    assert re.fullmatch(r"\d{8}-\d{4}_[A-Za-z0-9_-]{1,64}_[0-9a-f]{16}", jid)
+
+
 def test_job_id_shape_uses_a_64_bit_random_suffix(monkeypatch):
     requested_sizes = []
 
