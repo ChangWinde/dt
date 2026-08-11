@@ -11,6 +11,7 @@ skipped  - a dependency predicate completed false; no user command ran
 
 from __future__ import annotations
 
+import bisect
 import fcntl
 import hashlib
 import json
@@ -260,36 +261,53 @@ def is_uncertain_launch(entry: JobEntry) -> bool:
 _JOB_ENTRY_FIELDS = frozenset(item.name for item in fields(JobEntry))
 
 
+def _count_starting_with(sorted_values: list[str], prefix: str) -> int:
+    """Count entries of ``sorted_values`` that start with ``prefix``.
+
+    Job ids are ASCII, so ``prefix + "\uffff"`` is a strict upper bound for
+    every value that begins with ``prefix``.
+    """
+    low = bisect.bisect_left(sorted_values, prefix)
+    high = bisect.bisect_right(sorted_values, prefix + "\uffff")
+    return high - low
+
+
 def compact_refs(records: list[tuple[str, str]], minimum: int = 4) -> dict[str, str]:
     """Return the shortest resolver-safe suffix for every job id.
 
     Four characters remain the normal display size.  Older registries can
     contain suffix collisions, so only the colliding references expand.
+
+    A suffix is safe when it is not an exact job name and no other record
+    matches it as a prefix or suffix.  Collisions are counted with binary
+    searches over the sorted ids and sorted reversed ids, so a full-registry
+    call costs O(N log N) instead of the historical O(N^2) scan while
+    producing byte-identical references.
     """
     if minimum < 1:
         raise ValueError("minimum compact ref length must be positive")
     job_ids = [job_id for job_id, _name in records]
     names = {name for _job_id, name in records}
-    unresolved = set(job_ids)
+    sorted_ids = sorted(job_ids)
+    sorted_reversed_ids = sorted(job_id[::-1] for job_id in job_ids)
     refs: dict[str, str] = {}
-    max_length = max((len(job_id) for job_id in job_ids), default=0)
-    for width in range(minimum, max_length + 1):
-        for job_id in tuple(unresolved):
+    for job_id in job_ids:
+        # Exact ids are resolved before names and partial matches.
+        assigned = job_id
+        for width in range(minimum, len(job_id) + 1):
             candidate = job_id[-width:]
             if candidate in names:
                 continue
-            matches = sum(
-                other.startswith(candidate) or other.endswith(candidate)
-                for other in job_ids
-            )
-            if matches == 1:
-                refs[job_id] = candidate
-                unresolved.remove(job_id)
-        if not unresolved:
+            # The id itself always ends with its own suffix; any second
+            # suffix match means another record collides.
+            if _count_starting_with(sorted_reversed_ids, candidate[::-1]) != 1:
+                continue
+            own_prefix_matches = 1 if job_id.startswith(candidate) else 0
+            if _count_starting_with(sorted_ids, candidate) != own_prefix_matches:
+                continue
+            assigned = candidate
             break
-    for job_id in unresolved:
-        # Exact ids are resolved before names and partial matches.
-        refs[job_id] = job_id
+        refs[job_id] = assigned
     return refs
 
 

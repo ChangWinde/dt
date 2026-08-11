@@ -1,9 +1,11 @@
+import random
 import re
 
 from dt.config import HeadConfig
 from dt.jobs import (
     JobEntry,
     compact_job_refs,
+    compact_refs,
     find,
     load,
     new_job_id,
@@ -152,3 +154,77 @@ def test_compact_job_refs_expand_collisions_and_resolver_fails_closed(tmp_path):
     assert (
         find(cfg, f"region:west:{refs[entries[0].job_id]}").job_id == entries[0].job_id
     )
+
+
+def _reference_compact_refs(
+    records: list[tuple[str, str]], minimum: int = 4
+) -> dict[str, str]:
+    """Historical O(N^2) scan kept verbatim as the equivalence oracle."""
+    job_ids = [job_id for job_id, _name in records]
+    names = {name for _job_id, name in records}
+    unresolved = set(job_ids)
+    refs: dict[str, str] = {}
+    max_length = max((len(job_id) for job_id in job_ids), default=0)
+    for width in range(minimum, max_length + 1):
+        for job_id in tuple(unresolved):
+            candidate = job_id[-width:]
+            if candidate in names:
+                continue
+            matches = sum(
+                other.startswith(candidate) or other.endswith(candidate)
+                for other in job_ids
+            )
+            if matches == 1:
+                refs[job_id] = candidate
+                unresolved.remove(job_id)
+        if not unresolved:
+            break
+    for job_id in unresolved:
+        refs[job_id] = job_id
+    return refs
+
+
+def test_compact_refs_matches_the_quadratic_reference_on_adversarial_registries():
+    rng = random.Random(20260812)
+
+    def hex_tail(width: int) -> str:
+        return "".join(rng.choice("0123456789abcdef") for _ in range(width))
+
+    cases: list[list[tuple[str, str]]] = [
+        [],
+        [("20260812-0100_solo_" + hex_tail(16), "solo")],
+    ]
+    # A shared hex tail forces suffix collisions at every width up to the
+    # point where the distinct names start to disambiguate the references.
+    shared = hex_tail(16)
+    cases.append(
+        [(f"20260812-010{i}_twin-{i}_{shared}", f"twin-{i}") for i in range(6)]
+    )
+    # Names that shadow another id's suffix must push that id to a wider ref.
+    shadow_id = "20260812-0200_shadow_" + hex_tail(16)
+    cases.append(
+        [
+            (shadow_id, shadow_id[-4:]),
+            ("20260812-0201_other_" + hex_tail(16), shadow_id[-6:]),
+        ]
+    )
+    # Ids that are exact prefixes or suffixes of one another collide through
+    # the prefix arm of the resolver, not just the suffix arm.
+    base = "20260812-0300_stack_" + hex_tail(16)
+    cases.append([(base, "stack"), (base + "00", "stack-longer"), (base[4:], "tail")])
+    for _trial in range(30):
+        rows = []
+        for _index in range(rng.randrange(1, 40)):
+            name = rng.choice(["run", "sweep", "eval"]) + str(rng.randrange(4))
+            stamp = (
+                f"2026081{rng.randrange(10)}-"
+                f"{rng.randrange(24):02d}{rng.randrange(60):02d}"
+            )
+            rows.append((f"{stamp}_{name}_{hex_tail(rng.choice([4, 6, 16]))}", name))
+        cases.append(rows)
+
+    for records in cases:
+        for minimum in (1, 4, 9):
+            assert compact_refs(records, minimum=minimum) == _reference_compact_refs(
+                records, minimum=minimum
+            ), (minimum, records)
