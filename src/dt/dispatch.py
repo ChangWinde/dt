@@ -1396,7 +1396,7 @@ def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
         project=entry.project,
         node=entry.pin_node,
         require_path=entry.require_path,
-        require_disk_gib=entry.require_disk_gib,
+        require_disk_gib=entry.require_disk_gib or None,
         max_hours=entry.max_hours,
         max_vram_mib=entry.max_vram_mib,
         max_job_memory_mib=entry.max_job_memory_mib,
@@ -1474,7 +1474,7 @@ def fork_spec_from_entry(
         project=entry.project,
         node=actual_node,
         require_path=entry.require_path,
-        require_disk_gib=entry.require_disk_gib,
+        require_disk_gib=entry.require_disk_gib or None,
         max_hours=entry.max_hours,
         max_vram_mib=entry.max_vram_mib,
         max_job_memory_mib=entry.max_job_memory_mib,
@@ -3421,7 +3421,10 @@ def _submit_prepared(
     _require_submission_references(cfg, spec)
     # Freeze the effective floor into the job contract. This keeps queued,
     # rerun, and exact-fork behavior stable even if center config changes.
-    spec.require_disk_gib = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    # A floor of zero stays None: freezing a literal 0 would fail the
+    # positive-integer validation on every requeue/rerun of the entry.
+    _frozen_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    spec.require_disk_gib = _frozen_floor if _frozen_floor > 0 else None
     spec.name = sanitize_name(spec.name)
     if spec.request_id is None:
         return _submit_prepared_once(
@@ -4495,7 +4498,7 @@ def _dispatch_queued_active(
         project=entry.project,
         node=entry.pin_node,
         require_path=entry.require_path,
-        require_disk_gib=entry.require_disk_gib,
+        require_disk_gib=entry.require_disk_gib or None,
         max_hours=entry.max_hours,
         max_vram_mib=entry.max_vram_mib,
         max_job_memory_mib=entry.max_job_memory_mib,

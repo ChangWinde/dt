@@ -478,6 +478,28 @@ def test_refresh_status_preserves_unverified_cancel_warning_while_running(
     assert refreshed.reason == warning
 
 
+def test_zero_disk_floor_stays_out_of_the_job_contract(tmp_path, monkeypatch):
+    """disk_min_gib=0 must not freeze a 0 that later validation rejects."""
+    cfg = _cfg(tmp_path)
+    assert cfg.disk_min_gib == 0 or cfg.disk_min_gib > 0  # config-defined
+
+    entry = JobEntry(
+        job_id="floor-zero",
+        name="floor-zero",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/floor-zero",
+        session="dt_floor",
+        cmd="true",
+        require_disk_gib=0,
+    )
+    spec = dispatch.fork_spec_from_entry(entry, name="fork", cmd=["true"])
+    assert spec.require_disk_gib is None
+    dispatch._validate_run_spec(spec)  # must not raise ConfigError
+
+
 def test_launch_drop_fails_over_to_next_node(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     cancelled: list[str] = []
