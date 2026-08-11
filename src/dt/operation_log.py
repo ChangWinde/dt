@@ -13,6 +13,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -181,7 +182,12 @@ def _fallback_state_root() -> Path:
         candidate = Path(raw).expanduser()
         if candidate.is_absolute():
             return candidate
-    return Path.home() / ".local" / "state"
+    try:
+        return Path.home() / ".local" / "state"
+    except RuntimeError:
+        # No HOME and no passwd entry (minimal containers/cron): the journal
+        # is fail-open evidence and must never take a dt command down.
+        return Path(tempfile.gettempdir()) / f"dt-operation-log-{os.getuid()}"
 
 
 def resolve_target(
@@ -192,7 +198,9 @@ def resolve_target(
     if cfg is None:
         try:
             cfg = load()
-        except ConfigError:
+        except (ConfigError, RuntimeError):
+            # RuntimeError: config paths expand "~" and a HOME-less
+            # environment must degrade to the fallback journal target.
             cfg = None
     if isinstance(cfg, HeadConfig):
         role = "head"

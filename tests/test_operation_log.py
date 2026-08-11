@@ -389,3 +389,23 @@ def test_main_records_remote_failures(tmp_path, monkeypatch):
     assert finish_record["status"] == "failed"
     assert finish_record["exit_code"] == cli.EXIT_UNREACHABLE
     assert finish_record["problem"]["kind"] == "ssh_unreachable"
+
+
+def test_begin_survives_home_less_environment(tmp_path, monkeypatch):
+    """No HOME and no passwd entry must never take a dt command down."""
+    from pathlib import Path as PathType
+
+    from dt import operation_log
+
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("DT_CONFIG", str(tmp_path / "missing-config.yaml"))
+
+    def no_home():
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(PathType, "home", staticmethod(no_home))
+
+    session = operation_log.begin(["dt", "--version"])
+    assert session.operation_id
+    operation_log.finish(session, status="ok", exit_code=0)
