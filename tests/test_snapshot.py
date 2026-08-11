@@ -152,3 +152,61 @@ def test_stop_git_process_survives_eperm_on_zombie_group(monkeypatch):
 
     assert git_provenance.stop_git_process(process) is False
     assert process.waited
+
+
+def test_tree_sha256_fails_closed_on_unreadable_directory(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses directory read permissions")
+    root = tmp_path / "code"
+    root.mkdir()
+    (root / "train.py").write_text("print('v1')\n")
+    secret = root / "secret"
+    secret.mkdir()
+    (secret / "payload.py").write_text("print('hidden')\n")
+    secret.chmod(0o000)
+    try:
+        with pytest.raises(OSError):
+            tree_sha256(root)
+    finally:
+        secret.chmod(0o755)
+
+
+def test_git_info_ignores_ambient_git_env(tmp_path, monkeypatch):
+    def make_repo(path, content):
+        path.mkdir()
+
+        def git(*args):
+            subprocess.run(
+                ["git", "-C", str(path), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        git("init", "-q")
+        git("config", "user.email", "dt-test@example.invalid")
+        git("config", "user.name", "DT Test")
+        (path / "f.py").write_text(content)
+        git("add", "f.py")
+        git("commit", "-qm", "c")
+        return subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    proj = tmp_path / "proj"
+    other = tmp_path / "other"
+    proj_head = make_repo(proj, "print('proj')\n")
+    other_head = make_repo(other, "print('other')\n")
+    assert proj_head != other_head
+
+    # A surrounding git hook exports these; provenance must still resolve
+    # against the project directory, not the ambient repository.
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(other / ".git" / "index"))
+
+    sha, _dirty, _diff = git_provenance.git_info(proj)
+    assert sha == proj_head
