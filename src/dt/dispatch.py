@@ -81,6 +81,8 @@ from .private_state import (
     PrivateStateError,
     atomic_write,
     ensure_private_directory,
+    fsync_dir,
+    fsync_tree,
     private_lock,
     read_bounded,
 )
@@ -1903,6 +1905,12 @@ def _commit_snapshot_dir(
             )
         )
         os.replace(temp_root, final_root)
+        # Make the "immutable" snapshot durable before any job record can
+        # reference it: sync the published tree contents and the rename itself
+        # so a crash cannot leave a registry row pointing at a missing or
+        # partially written source.
+        fsync_tree(final_root)
+        fsync_dir(cfg.snapshots_dir())
         stored = StoredSnapshot(digest, final_code)
 
     state = _load_snapshot_store_state(cfg)

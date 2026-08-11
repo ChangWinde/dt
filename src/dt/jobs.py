@@ -46,6 +46,7 @@ from .private_state import (
     PrivateStateError,
     atomic_write,
     ensure_private_directory,
+    fsync_dir,
     open_private_regular,
     read_bounded,
 )
@@ -649,6 +650,9 @@ def remove_record(cfg: HeadConfig, job_id: str) -> None:
         paths.add(legacy / f"{job_id}.json")
     for path in paths:
         path.unlink(missing_ok=True)
+        # Persist the deletion's directory entry so a crash cannot roll it back
+        # and resurrect a stale row whose remote data is already gone.
+        fsync_dir(path.parent)
 
 
 @contextmanager
