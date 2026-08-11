@@ -46,6 +46,7 @@ from .private_state import (
     PrivateStateError,
     atomic_write,
     ensure_private_directory,
+    fsync_dir,
     open_private_regular,
     read_bounded,
 )
@@ -240,6 +241,20 @@ def effective_result_state(entry: JobEntry) -> str | None:
     if entry.status == "skipped":
         return "dependency_skipped"
     return None
+
+
+def is_uncertain_launch(entry: JobEntry) -> bool:
+    """Whether a failed record may still own live remote processes/evidence.
+
+    These rows are created when a launch attempt could not be proven dead (for
+    example an SSH transport drop after the remote session may have started).
+    They carry no pgid, so destructive cleanup or compaction must skip them
+    until an explicit, verified ``dt kill`` confirms the remote side is dead;
+    otherwise a still-running job's capsule and only control record are deleted.
+    """
+    return entry.status == "failed" and (entry.reason or "").startswith(
+        UNCERTAIN_LAUNCH_PREFIX
+    )
 
 
 _JOB_ENTRY_FIELDS = frozenset(item.name for item in fields(JobEntry))
@@ -635,6 +650,9 @@ def remove_record(cfg: HeadConfig, job_id: str) -> None:
         paths.add(legacy / f"{job_id}.json")
     for path in paths:
         path.unlink(missing_ok=True)
+        # Persist the deletion's directory entry so a crash cannot roll it back
+        # and resurrect a stale row whose remote data is already gone.
+        fsync_dir(path.parent)
 
 
 @contextmanager

@@ -791,6 +791,47 @@ def test_clean_keeps_shared_snapshot_when_a_live_row_is_unreadable(tmp_path):
     assert (snapshot / "code.txt").read_text() == "recoverable"
 
 
+def test_dependency_settled_treats_recoverable_lost_as_pending():
+    from dt.dispatch import LOST_RECOVERY_WINDOW_S, _dependency_settled
+
+    lost = _entry("prev-lost", "lost", created_at=1000.0, finished_at=1000.0)
+    # Inside the recovery window a lost predecessor is not yet settled, so a
+    # dependent must keep waiting instead of being permanently skipped.
+    assert _dependency_settled(lost, now=1000.0 + 10) is False
+    # Once the window closes and it is still lost, it settles as an infra
+    # failure and the dependent can be finalized.
+    assert _dependency_settled(lost, now=1000.0 + LOST_RECOVERY_WINDOW_S + 1) is True
+
+    finished = _entry("prev-done", "finished", created_at=1.0, exit_code=0)
+    assert _dependency_settled(finished, now=1e12) is True
+    running = _entry("prev-run", "running", created_at=1.0)
+    assert _dependency_settled(running, now=1e12) is False
+
+
+def test_clean_never_deletes_uncertain_launch(tmp_path):
+    from dt.jobs import UNCERTAIN_LAUNCH_PREFIX
+
+    cfg = _cfg(tmp_path)
+    # An uncertain launch is a failed record with no proven-dead remote side
+    # and no pgid; automatic cleanup must never delete it.
+    save(
+        cfg,
+        _entry(
+            "old-uncertain",
+            "failed",
+            created_at=1.0,
+            reason=f"{UNCERTAIN_LAUNCH_PREFIX}ssh dropped after session start",
+        ),
+    )
+    save(cfg, _entry("old-done", "finished", created_at=1.0))
+
+    report = clean_jobs(cfg, cutoff_ts=100.0, envs=False, log=lambda m: None)
+
+    assert report.removed == 1
+    assert load(cfg, "old-uncertain") is not None
+    assert load(cfg, "old-done") is None
+
+
 def test_clean_jobs_project_filter(tmp_path):
     cfg = _cfg(tmp_path)
     save(cfg, _entry("smoke-done", "finished", created_at=1.0, project="smoke"))

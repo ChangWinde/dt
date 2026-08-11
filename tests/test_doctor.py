@@ -121,6 +121,8 @@ def test_lan_annotation_flags_drifted_pinned_address(tmp_path):
             Node(name="pinned-drifted", lan_address="10.0.0.9", lan_port=2222),
             Node(name="pinned-silent", lan_address="10.0.0.7"),
             Node(name="unpinned"),
+            Node(name="pinned-user", lan_address="lyf@10.0.0.5"),
+            Node(name="pinned-alias", lan_address="gpu-host"),
         ],
     )
     rows = [
@@ -128,6 +130,8 @@ def test_lan_annotation_flags_drifted_pinned_address(tmp_path):
         {"node": "pinned-drifted", "checks": {"addrs": "10.0.0.8"}},
         {"node": "pinned-silent", "checks": {"addrs": "missing"}},
         {"node": "unpinned", "checks": {"addrs": "10.0.0.6"}},
+        {"node": "pinned-user", "checks": {"addrs": "10.0.0.5"}},
+        {"node": "pinned-alias", "checks": {"addrs": "10.0.0.5"}},
     ]
 
     doctor.annotate_lan_addresses(cfg, rows)
@@ -136,28 +140,10 @@ def test_lan_annotation_flags_drifted_pinned_address(tmp_path):
     assert rows[1]["checks"]["lan"] == "stale: 10.0.0.9 not on node"
     assert rows[2]["checks"]["lan"] == "unknown"
     assert "lan" not in rows[3]["checks"]
-
-
-def test_lan_annotation_hostname_pin_is_unknown_not_stale(tmp_path):
-    cfg = _cfg(
-        tmp_path,
-        nodes=[
-            Node(name="host-pin", lan_address="node1.cluster.local", lan_port=2222),
-            Node(name="v6-ok", lan_address="2001:db8::1"),
-            Node(name="v6-drift", lan_address="2001:db8::9"),
-        ],
-    )
-    rows = [
-        {"node": "host-pin", "checks": {"addrs": "10.0.0.5,172.17.0.1"}},
-        {"node": "v6-ok", "checks": {"addrs": "2001:0db8:0000::0001,10.0.0.5"}},
-        {"node": "v6-drift", "checks": {"addrs": "2001:db8::1"}},
-    ]
-
-    doctor.annotate_lan_addresses(cfg, rows)
-
-    assert rows[0]["checks"]["lan"] == "unknown"
-    assert rows[1]["checks"]["lan"] == "ok"
-    assert rows[2]["checks"]["lan"] == "stale: 2001:db8::9 not on node"
+    # A user@ip endpoint compares by its host part and never leaks the user.
+    assert rows[4]["checks"]["lan"] == "ok"
+    # A bare hostname/alias cannot be verified against an IP list.
+    assert rows[5]["checks"]["lan"] == "unknown"
 
 
 def test_check_node_parses_advertised_addresses(monkeypatch):

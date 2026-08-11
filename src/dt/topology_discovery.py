@@ -686,9 +686,16 @@ class TopologyDiscovery:
                 workload=SSHWorkload.ARTIFACT_RELAY,
                 retry_stale_mux=True,
             )
-        except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        except subprocess.TimeoutExpired:
             latency_ms = max(0.0, (time.monotonic() - started) * 1000)
-            return False, latency_ms, type(exc).__name__
+            return False, latency_ms, "timeout"
+        except (RemoteError, OSError):
+            # A probe that could not complete or start is a transport-level
+            # outcome. Return a stable ROUTE_TRANSPORT_FAILURE_KINDS category so
+            # the circuit accumulates the failure instead of a Python class name
+            # ("RemoteError"/"OSError") that never matches and silently drops it.
+            latency_ms = max(0.0, (time.monotonic() - started) * 1000)
+            return False, latency_ms, "transport"
         latency_ms = max(0.0, (time.monotonic() - started) * 1000)
         if proc.returncode == 0:
             return True, latency_ms, "ok"
