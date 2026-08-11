@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.8.0 — 2026-08-11
+
 ### Added
 
 - A private, bounded `dt_operation_event_v1` journal records every installed

@@ -9,11 +9,11 @@ still a dirty feature branch rather than a reviewed release commit. No version,
 tag, release bundle, deployment, or public-license decision is inferred from
 the evidence below.
 
-The planned next version is **0.8.0**. DT 0.7.0 is already the version reported
-by the current main-branch source, and this candidate adds several coherent
-public capabilities rather than a narrow patch. Source metadata intentionally
-remains at 0.7.0 until the reviewed feature commit is followed by a separate
-release-sealing commit.
+The candidate version is **0.8.0**. DT 0.7.0 is already the version reported by
+the current main-branch source, and this candidate adds several coherent public
+capabilities rather than a narrow patch. Version metadata and the changelog were
+sealed only after the reviewed feature commit passed the complete GitHub Python
+3.10, Python 3.11, and security matrix.
 
 ## Verified candidate evidence
 

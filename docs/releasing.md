@@ -83,7 +83,7 @@ verified bootstrap independently on both minors, and produces:
 (cd dist && sha256sum -c SHA256SUMS)
 python3 -m json.tool dist/release-audit.json
 python3 -m json.tool dist/release-manifest.json
-VERSION=0.7.0
+VERSION=0.8.0
 git tag -a "v$VERSION" -m "DistTrainer $VERSION"
 ```
 
@@ -98,7 +98,7 @@ from the verified bundle. For PyPI, first confirm the `disttrainer` name,
 copyright-holder authorization, and trusted-publisher configuration, then use:
 
 ```bash
-VERSION=0.7.0
+VERSION=0.8.0
 uv publish "dist/disttrainer-$VERSION-py3-none-any.whl" \
   "dist/disttrainer-$VERSION.tar.gz"
 ```
@@ -118,7 +118,7 @@ Each host retains the complete verified bundle below
 `~/.local/share/disttrainer/releases/VERSION/`. To restore a retained version:
 
 ```bash
-VERSION=0.7.0
+VERSION=0.8.0
 scripts/deploy.sh --plan --rollback "$VERSION" HEAD_A
 scripts/deploy.sh --rollback "$VERSION" HEAD_A
 ```
