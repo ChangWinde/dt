@@ -376,8 +376,16 @@ class PersistentRouteHealth:
             if (
                 prior is not None
                 and prior.failures > 0
-                and now - prior.last_failure_at <= site.route_circuit_max_cooldown_s
+                and now - prior.open_until <= site.route_circuit_max_cooldown_s
             ):
+                # Measure the recovery gap from when the cooldown ended
+                # (open_until), not from the recorded failure time. A
+                # half-open trial always fires after open_until, so at the
+                # plateau (open_for == max_cooldown) a comparison against
+                # last_failure_at always exceeds the window and reset the
+                # ladder to 1, collapsing the breaker and hammering a dead
+                # route. Pre-open, open_until == last_failure_at, so early
+                # backoff behaviour is unchanged.
                 failures = min(prior.failures + 1, MAX_FAILURES)
             open_for = 0.0
             if failures >= site.route_circuit_failures:
