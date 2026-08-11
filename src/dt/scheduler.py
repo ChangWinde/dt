@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping, Sequence
 
 from .config import HeadConfig
-from .jobs import JobEntry, effective_result_state
+from .jobs import JobEntry, LOST_RECHECK_S, effective_result_state
 
 SCHEDULER_SCHEMA = "dt_scheduler_state_v1"
 
@@ -105,6 +106,22 @@ def _dependency_state(
             "waiting_dependency",
             f"dependency {dependency} is {predecessor.status}",
             f"dependency {dependency} must finish successfully",
+        )
+    if (
+        predecessor.status == "lost"
+        and predecessor.finished_at is not None
+        and time.time() - predecessor.finished_at <= LOST_RECHECK_S
+    ):
+        # dispatch_queued holds (does not skip) a dependent while a lost
+        # predecessor is still inside the agent's rescue window, because a
+        # late exit marker can flip it back to finished. Explain it the same
+        # way so `dt free --explain` does not claim a skip that will not
+        # happen yet.
+        return (
+            "waiting_dependency",
+            f"dependency {dependency} is lost but inside the rescue window",
+            f"dependency {dependency} must finish successfully or exhaust "
+            "its rescue window",
         )
     if (
         predecessor.status != "finished"

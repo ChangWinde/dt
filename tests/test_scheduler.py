@@ -101,6 +101,53 @@ def test_scheduler_snapshot_exposes_dependency_and_agent_stall(tmp_path):
     )
 
 
+def test_lost_predecessor_in_rescue_window_is_waiting_not_skipped(tmp_path):
+    """A lost predecessor inside the rescue window must explain as waiting,
+    matching dispatch_queued which blocks rather than skips (audit I4/scheduler)."""
+    import time
+
+    cfg = _cfg(tmp_path)
+    predecessor = _entry("parent", 1, status="lost", node="n1", finished_at=time.time())
+    dependent = _entry("child", 2, after_success="parent")
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [predecessor, dependent],
+        resources=_resources(),
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    child = next(row for row in snapshot["queue"] if row["job_id"] == "child")
+    assert child["state"] == "waiting_dependency"
+    assert "rescue window" in child["reason"]
+
+
+def test_lost_predecessor_past_rescue_window_is_blocked_skipped(tmp_path):
+    import time
+
+    from dt.jobs import LOST_RECHECK_S
+
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(
+        "parent",
+        1,
+        status="lost",
+        node="n1",
+        finished_at=time.time() - (LOST_RECHECK_S + 60),
+    )
+    dependent = _entry("child", 2, after_success="parent")
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [predecessor, dependent],
+        resources=_resources(),
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    child = next(row for row in snapshot["queue"] if row["job_id"] == "child")
+    assert child["state"] == "blocked_dependency_false"
+
+
 def test_scheduler_snapshot_explains_false_typed_result_predicate(tmp_path):
     cfg = _cfg(tmp_path)
     predecessor = _entry(
