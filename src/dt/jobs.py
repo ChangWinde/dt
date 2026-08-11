@@ -713,6 +713,7 @@ def list_all(
     show state to a human receive it through ``damage``.
     """
     entries: dict[str, JobEntry] = {}
+    origins: dict[str, str] = {}
     directories = [(cfg.legacy_registry_dir(), LEGACY_LAYOUT)]
     current = cfg.registry_dir()
     if current != cfg.legacy_registry_dir():
@@ -733,7 +734,23 @@ def list_all(
                     layout=layout,
                     expected_job_id=f.stem,
                 )
+                if entry.job_id in entries and damage is not None:
+                    # A crashed migration window can leave the same job in
+                    # both registries. save() routes by storage_layout, so
+                    # lifecycle writes may land in the copy this listing does
+                    # not prefer; surface the split instead of hiding it.
+                    damage.append(
+                        RegistryDamage(
+                            path=f.name,
+                            detail=(
+                                "split-brain registry row: exists in both "
+                                f"{origins[entry.job_id]} and {directory}; "
+                                "run dt migrate to reconcile"
+                            ),
+                        )
+                    )
                 entries[entry.job_id] = entry
+                origins[entry.job_id] = str(directory)
             except Exception as exc:
                 if damage is not None:
                     detail = " ".join(str(exc).split()) or type(exc).__name__

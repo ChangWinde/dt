@@ -1,5 +1,8 @@
-"""Damaged registry rows must fail closed and stay visible (audit R3/R4)."""
+"""Damaged registry rows must fail closed and stay visible (audit R2/R3/R4)."""
 
+import json
+
+import dt.jobs as jobs_mod
 from dt import cli, maintenance
 from dt.config import HeadConfig, Node, QueueCfg
 from dt.jobs import JobEntry, save
@@ -25,6 +28,22 @@ def _write_damaged_row(cfg, name="damaged-row"):
     return path
 
 
+def _entry(job_id, **overrides):
+    fields = {
+        "job_id": job_id,
+        "name": job_id,
+        "center": "test",
+        "project": "p",
+        "node": "n1",
+        "node_local": False,
+        "job_dir": f"dt/jobs/{job_id}",
+        "session": f"dt_{job_id}",
+        "cmd": "true",
+    }
+    fields.update(overrides)
+    return JobEntry(**fields)
+
+
 def test_snapshot_gc_skips_when_registry_has_unreadable_rows(tmp_path):
     cfg = _cfg(tmp_path)
     digest = "a" * 64
@@ -33,18 +52,7 @@ def test_snapshot_gc_skips_when_registry_has_unreadable_rows(tmp_path):
     (snapshot / "payload").write_text("evidence", encoding="utf-8")
     _write_damaged_row(cfg)
 
-    removed = JobEntry(
-        job_id="removed-job",
-        name="removed-job",
-        center="test",
-        project="p",
-        node="n1",
-        node_local=False,
-        job_dir="dt/jobs/removed-job",
-        session="dt_removed",
-        cmd="true",
-        snapshot_sha256=digest,
-    )
+    removed = _entry("removed-job", snapshot_sha256=digest)
 
     maintenance._remove_unreferenced_snapshots(cfg, [removed], cutoff_ts=2**60)
 
@@ -57,18 +65,7 @@ def test_snapshot_gc_removes_unreferenced_when_registry_is_clean(tmp_path):
     snapshot = cfg.snapshots_dir() / digest
     snapshot.mkdir(parents=True)
 
-    removed = JobEntry(
-        job_id="removed-job",
-        name="removed-job",
-        center="test",
-        project="p",
-        node="n1",
-        node_local=False,
-        job_dir="dt/jobs/removed-job",
-        session="dt_removed",
-        cmd="true",
-        snapshot_sha256=digest,
-    )
+    removed = _entry("removed-job", snapshot_sha256=digest)
 
     maintenance._remove_unreferenced_snapshots(cfg, [removed], cutoff_ts=2**60)
 
@@ -77,20 +74,7 @@ def test_snapshot_gc_removes_unreferenced_when_registry_is_clean(tmp_path):
 
 def test_ps_reports_unreadable_registry_rows(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
-    healthy = JobEntry(
-        job_id="healthy-job",
-        name="healthy-job",
-        center="test",
-        project="p",
-        node="n1",
-        node_local=False,
-        job_dir="dt/jobs/healthy-job",
-        session="dt_healthy",
-        cmd="true",
-        status="finished",
-        exit_code=0,
-    )
-    save(cfg, healthy)
+    save(cfg, _entry("healthy-job", status="finished", exit_code=0))
     damaged_path = _write_damaged_row(cfg)
 
     rows, errors = cli._gather_ps_rows(cfg, status=None)
@@ -99,3 +83,30 @@ def test_ps_reports_unreadable_registry_rows(tmp_path, monkeypatch):
     key = f"registry:{damaged_path.name}"
     assert key in errors
     assert "unreadable registry entry" in errors[key]
+
+
+def test_list_all_reports_split_brain_rows(tmp_path):
+    """A job present in both registries is a migration split, not silence."""
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("split-job", status="finished", exit_code=0))
+
+    registry_dir = cfg.registry_dir()
+    legacy_dir = cfg.legacy_registry_dir()
+    if registry_dir == legacy_dir:
+        # Legacy layout: only one registry exists, nothing can split.
+        return
+    saved_path = next(
+        path
+        for path in (registry_dir / "split-job.json", legacy_dir / "split-job.json")
+        if path.exists()
+    )
+    row = json.loads(saved_path.read_text())
+    other_dir = legacy_dir if saved_path.parent == registry_dir else registry_dir
+    other_dir.mkdir(parents=True, exist_ok=True)
+    (other_dir / "split-job.json").write_text(json.dumps(row))
+
+    damage = []
+    entries = jobs_mod.list_all(cfg, damage=damage)
+
+    assert [entry.job_id for entry in entries] == ["split-job"]
+    assert any("split-brain" in item.detail for item in damage)
