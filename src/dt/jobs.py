@@ -883,19 +883,19 @@ def _refresh_status_locked(
         + f"DT_WBOOT={shlex.quote(entry.boot_id or '')}; "
         + "cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo UNKNOWN; "
         f"echo {STATUS_MARK}; "
-        f"if dt_rc=$(cat {state}/exit_code 2>/dev/null); then "
+        f"if dt_rc=$(head -n 1 {state}/exit_code 2>/dev/null); then "
         'printf "%s\\n" "$dt_rc"; '
-        f"cat {state}/started_at 2>/dev/null || echo UNKNOWN; "
-        f"cat {state}/finished_at 2>/dev/null || echo UNKNOWN; "
+        f"head -n 1 {state}/started_at 2>/dev/null || echo UNKNOWN; "
+        f"head -n 1 {state}/finished_at 2>/dev/null || echo UNKNOWN; "
         'elif dt_process_owned "$DT_WPID" "$DT_WIDENT" "$DT_WJOB" '
         '"$DT_WBOOT"; then '
-        f"echo RUNNING; cat {state}/started_at 2>/dev/null "
+        f"echo RUNNING; head -n 1 {state}/started_at 2>/dev/null "
         "|| echo UNKNOWN; echo UNKNOWN; "
         "else dt_identity_rc=$?; "
         f'[ "$dt_identity_rc" -eq 2 ] && echo STALE || echo LOST; '
-        f"cat {state}/started_at 2>/dev/null "
+        f"head -n 1 {state}/started_at 2>/dev/null "
         "|| echo UNKNOWN; echo UNKNOWN; fi; "
-        f"cat {state}/result_state 2>/dev/null || echo UNKNOWN"
+        f"head -n 1 {state}/result_state 2>/dev/null || echo UNKNOWN"
     )
     try:
         proc = run_on(entry.node, entry.node_local, probe, timeout=timeout)
@@ -913,7 +913,11 @@ def _refresh_status_locked(
             return entry  # ssh/shell failure is not evidence that the job died
         tokens = (proc.stdout or "").strip().splitlines()
         if STATUS_MARK in tokens:
-            marker_index = len(tokens) - 1 - tokens[::-1].index(STATUS_MARK)
+            # Anchor on the FIRST marker: it is emitted right after the trusted
+            # /proc boot_id line, before any worker-written state file. A job
+            # that writes a fake marker into its own state file cannot move the
+            # anchor (and head -n 1 above already caps each file to one token).
+            marker_index = tokens.index(STATUS_MARK)
             current_boot_id = tokens[marker_index - 1] if marker_index else None
             token = (
                 tokens[marker_index + 1] if len(tokens) > marker_index + 1 else "LOST"
@@ -953,25 +957,36 @@ def _refresh_status_locked(
             timestamp = float(value)
         except (TypeError, ValueError):
             return None
-        return timestamp if timestamp > 0 else None
+        if not math.isfinite(timestamp) or timestamp <= 0:
+            return None
+        return timestamp
 
     remote_started_at = positive_timestamp(started_token)
     remote_finished_at = positive_timestamp(finished_token)
     if token not in ("RUNNING", "LOST", "STALE"):
         try:
-            entry.exit_code = int(token)
-            entry.status = "finished"
-            entry.reason = None
-            if remote_started_at is not None:
-                entry.started_at = remote_started_at
-            entry.finished_at = remote_finished_at or time.time()
-            entry.result_state = (
-                result_token
-                if result_token in RESULT_STATES
-                else ("success" if entry.exit_code == 0 else "execution_failure")
-            )
+            exit_code = int(token)
         except ValueError:
             return entry
+        if not 0 <= exit_code <= 255:
+            # A managed exit_code file is always a byte in [0, 255]. Treat an
+            # out-of-range value as corrupt evidence: never fabricate a
+            # "finished" state from it, and never let it reach save() and crash
+            # every dt ps / kill / wait that reads this registry row.
+            if observation is not None:
+                observation.update(status_probe_error=f"invalid exit_code {token!r}")
+            return entry
+        entry.exit_code = exit_code
+        entry.status = "finished"
+        entry.reason = None
+        if remote_started_at is not None:
+            entry.started_at = remote_started_at
+        entry.finished_at = remote_finished_at or time.time()
+        entry.result_state = (
+            result_token
+            if result_token in RESULT_STATES
+            else ("success" if entry.exit_code == 0 else "execution_failure")
+        )
         save(cfg, entry)
         return entry
     if (
