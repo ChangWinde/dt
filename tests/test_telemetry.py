@@ -76,6 +76,25 @@ def test_resource_telemetry_query_owns_path_tail_and_identity_contract():
     assert summary["invalid_lines"] == 1
 
 
+def test_parse_resource_jsonl_rejects_non_finite_rows():
+    """Job-writable telemetry with Infinity/NaN must not reach consumers."""
+    from dt.monitoring import parse_resource_jsonl, summarize_resources
+
+    text = "\n".join(
+        [
+            '{"timestamp": 1.0, "cpu": 0.5}',
+            '{"timestamp": Infinity, "cpu": NaN}',
+            '{"timestamp": 2.0, "cpu": -Infinity}',
+        ]
+    )
+    rows, invalid = parse_resource_jsonl(text)
+
+    assert len(rows) == 1
+    assert invalid == 2
+    summary = summarize_resources(rows)
+    assert "inf" not in repr(summary).lower()
+
+
 def test_telemetry_payload_emits_one_host_sample(tmp_path):
     output = tmp_path / "resources.jsonl"
     script = PAYLOAD_DIR / "telemetry.py"

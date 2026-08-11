@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -123,14 +124,25 @@ def safe_phase_name(value: object) -> bool:
     )
 
 
+def _reject_non_finite(value: str) -> float:
+    """json.loads hook: Infinity/NaN are not JSON and poison every consumer."""
+    raise ValueError(f"non-finite JSON constant {value!r}")
+
+
 def parse_resource_jsonl(text: str) -> tuple[list[JsonDict], int]:
-    """Parse telemetry JSONL while tolerating an interrupted final write."""
+    """Parse telemetry JSONL while tolerating an interrupted final write.
+
+    The telemetry file is job-writable: a row carrying ``Infinity``/``NaN``
+    (accepted by Python's json module but invalid JSON) would round-trip into
+    ``dt metrics --json`` output and break standard parsers downstream, so
+    such rows count as invalid instead.
+    """
     rows: list[JsonDict] = []
     invalid = 0
     for line in text.splitlines():
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError:
+            row = json.loads(line, parse_constant=_reject_non_finite)
+        except (json.JSONDecodeError, ValueError):
             invalid += 1
             continue
         if isinstance(row, dict):
@@ -144,7 +156,9 @@ def _numbers(values: list[object]) -> list[int | float]:
     return [
         value
         for value in values
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
     ]
 
 
