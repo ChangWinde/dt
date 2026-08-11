@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from pathlib import Path
 
 _MODULE_PATH = Path(__file__).parents[1] / "scripts" / "repo_hygiene.py"
@@ -22,3 +23,9 @@ def test_repository_hygiene_rejects_new_tracked_root_files(monkeypatch, capsys):
 
     assert repo_hygiene.main() == 1
     assert "unexpected tracked root files: notes.txt" in capsys.readouterr().err
+
+
+def test_ambient_git_configuration_is_neutralized_for_fixtures():
+    """conftest must isolate fixture git calls from user/system git policy."""
+    assert os.environ["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert os.environ["GIT_CONFIG_SYSTEM"] == os.devnull
