@@ -6,6 +6,13 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Changed
+
+- `dt ps` agent-query flags (`--compact`, `--fields`, `--summary`, `--since`,
+  `--cursor`) now imply `--json` instead of rejecting the invocation, so a
+  bounded agent query can no longer fail for omitting a redundant flag.
+  Explicit `--json` invocations are unchanged.
+
 ## 0.8.0 — 2026-08-11
 
 ### Added

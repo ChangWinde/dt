@@ -5193,31 +5193,34 @@ def ps(
     compact: bool = typer.Option(
         False,
         "--compact",
-        help="emit a bounded, versioned agent query instead of the legacy array",
+        help="emit a bounded, versioned agent query (implies --json)",
         rich_help_panel="Agent query",
     ),
     fields_: Optional[str] = typer.Option(
         None,
         "--fields",
-        help="comma-separated job fields for the bounded query",
+        help="comma-separated job fields for the bounded query (implies --json)",
         rich_help_panel="Agent query",
     ),
     summary: bool = typer.Option(
         False,
         "--summary",
-        help="emit aggregate counts without job rows",
+        help="emit aggregate counts without job rows (implies --json)",
         rich_help_panel="Agent query",
     ),
     since: Optional[str] = typer.Option(
         None,
         "--since",
-        help="only registry changes since Unix seconds or timezone-qualified ISO time",
+        help=(
+            "only registry changes since Unix seconds or timezone-qualified "
+            "ISO time (implies --json)"
+        ),
         rich_help_panel="Agent query",
     ),
     cursor: Optional[str] = typer.Option(
         None,
         "--cursor",
-        help="continue a bounded query from an opaque next_cursor",
+        help="continue a bounded query from an opaque next_cursor (implies --json)",
         rich_help_panel="Agent query",
     ),
     wide: bool = typer.Option(
@@ -5271,6 +5274,10 @@ def ps(
         or since is not None
         or (cursor is not None)
     )
+    if query_mode:
+        # Agent-query flags exist only to shape the bounded JSON envelope, so
+        # they imply --json instead of rejecting the invocation.
+        json_ = True
     if active and status is not None:
         _fail_submission(
             kind="invalid_argument",
@@ -5301,13 +5308,6 @@ def ps(
             message="--limit must be positive",
             exit_code=1,
             json_=json_,
-        )
-    if query_mode and not json_:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--compact/--fields/--summary/--since/--cursor require --json",
-            exit_code=1,
-            json_=False,
         )
     if query_mode and (watch_ or recent or window):
         _fail_submission(
