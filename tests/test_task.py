@@ -1121,6 +1121,78 @@ def test_laptop_task_follow_submits_once_then_uses_reconnecting_watch_and_wait(
     ]
 
 
+def test_run_rejects_auto_center_with_request_id(monkeypatch):
+    # -c auto reselects a center on every attempt, so pairing it with an
+    # idempotency key could duplicate a job across centers; refuse it.
+    cfg = LaptopConfig(centers={"test": "head"}, default_center="test")
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["run", "-c", "auto", "--request-id", "req-1", "--", "true"],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "auto cannot be combined with --request-id" in result.output
+
+
+def test_finished_without_exit_code_is_infra_failure_not_success():
+    from dt.jobs import effective_result_state
+
+    entry = JobEntry(
+        job_id="20260724-0200_anomaly_abcd",
+        name="anomaly",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/20260724-0200_anomaly_abcd",
+        session="dt_20260724-0200_anomaly_abcd",
+        cmd="true",
+        status="finished",
+        exit_code=None,
+    )
+    # A finished record with no exit code is an infrastructure anomaly, never
+    # a success, across the shared result classifier and both consumers.
+    assert effective_result_state(entry) == "infra_failure"
+    assert cli._log_terminal_exit_code(entry) == 68
+
+    emitted: list[str] = []
+    payload, code = cli._wait_terminal_result(
+        entry,
+        error_lines=0,
+        emit=emitted.append,
+        write_tail=lambda _text: None,
+    )
+    assert code == 68
+    assert payload["result_state"] == "infra_failure"
+    assert payload["exit_code"] is None
+    assert any("no exit code" in line for line in emitted)
+
+
+def test_captured_submission_identity_accepts_current_job_id_suffix():
+    # The plain human-mode parser must recognize a real id produced by
+    # new_job_id (a 16-hex token_hex suffix), otherwise a successful laptop
+    # submission is misreported as a protocol error.
+    from dt.jobs import new_job_id
+
+    job_id = new_job_id("laptop proof")
+    assert re.fullmatch(r"\d{8}-\d{4}_[a-z0-9-]+_[0-9a-f]{16}", job_id)
+
+    ref, payload = cli._captured_submission_identity(
+        f"warming up\n{job_id}\n", json_=False
+    )
+    assert ref == job_id
+    assert payload is None
+    # Historical four-hex ids stay recognized, and both parsers agree.
+    assert cli._JOB_ID_LINE_RE.fullmatch("20260724-1500_legacy_abcd")
+    assert remote.FULL_JOB_ID_RE.fullmatch(job_id)
+    assert cli._captured_submission_identity("not a job id\n", json_=False) == (
+        None,
+        None,
+    )
+
+
 def test_laptop_task_follow_json_submits_once_then_streams_reconnecting_json(
     monkeypatch,
 ):

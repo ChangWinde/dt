@@ -242,6 +242,20 @@ def effective_result_state(entry: JobEntry) -> str | None:
     return None
 
 
+def is_uncertain_launch(entry: JobEntry) -> bool:
+    """Whether a failed record may still own live remote processes/evidence.
+
+    These rows are created when a launch attempt could not be proven dead (for
+    example an SSH transport drop after the remote session may have started).
+    They carry no pgid, so destructive cleanup or compaction must skip them
+    until an explicit, verified ``dt kill`` confirms the remote side is dead;
+    otherwise a still-running job's capsule and only control record are deleted.
+    """
+    return entry.status == "failed" and (entry.reason or "").startswith(
+        UNCERTAIN_LAUNCH_PREFIX
+    )
+
+
 _JOB_ENTRY_FIELDS = frozenset(item.name for item in fields(JobEntry))
 
 

@@ -427,7 +427,10 @@ def probe_node(
         return NodeStatus(
             node=node.name,
             error=str(e),
-            unreachable=isinstance(
+            # A local probe runs no SSH, so its failure is a reachable probe
+            # error, never a node-unreachable condition (which maps to exit 5).
+            unreachable=(not node.local)
+            and isinstance(
                 e,
                 (RemoteError, subprocess.TimeoutExpired, OSError),
             ),
@@ -442,20 +445,28 @@ def probe_node(
         return NodeStatus(
             node=node.name,
             error=err[-1] if err else f"exit {proc.returncode}",
-            unreachable=proc.returncode == 255,
+            unreachable=(not node.local) and proc.returncode == 255,
         )
+    # A failed nvidia-smi query means "reachable node, GPU inventory
+    # unavailable", not a dead node. Record it as a soft gpu_inventory_error and
+    # keep the parsed system telemetry so a CPU-only (gpus=0) job can still be
+    # placed here, while a GPU job is still rejected (its free_gpus stay empty).
     probe_error = parse_probe_error(proc.stdout)
-    if probe_error:
-        return NodeStatus(node=node.name, error=probe_error)
-    gpus, gpu_inventory_error = _parse_probe_inventory(
+    gpus, inventory_error = _parse_probe_inventory(
         proc.stdout,
         mem_threshold_mib,
     )
+    if APP_ERROR in proc.stdout:
+        # The compute-app query failed, so GPU occupancy is unknown. Fail closed
+        # for GPU scheduling by never advertising a card as free, while the node
+        # remains reachable for CPU-only work.
+        for gpu in gpus:
+            gpu.free = False
     return NodeStatus(
         node=node.name,
         gpus=gpus,
         system=parse_system_output(proc.stdout),
-        gpu_inventory_error=gpu_inventory_error,
+        gpu_inventory_error=probe_error or inventory_error,
     )
 
 

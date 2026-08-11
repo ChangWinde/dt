@@ -1001,6 +1001,39 @@ def test_guard_evidence_atomically_replaces_a_symlink(tmp_path):
     assert not list(tmp_path.glob(".resource-guard.json.*.tmp"))
 
 
+def test_resource_guard_terminates_even_when_evidence_write_fails(
+    tmp_path, monkeypatch
+):
+    telemetry = _load_telemetry_payload()
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(telemetry, "_write_json_atomic", boom)
+    monkeypatch.setattr(telemetry, "_job_process_pids", lambda _root: set())
+    monkeypatch.setattr(
+        telemetry.os, "killpg", lambda pid, sig: signalled.append((pid, sig))
+    )
+
+    result = telemetry._trip_resource_guard(
+        root_pid=4321,
+        output=tmp_path / "resources.jsonl",
+        kind="max_job_memory_mib",
+        violation={
+            "observed_mib": 100,
+            "limit_mib": 50,
+            "observed_metric": "pss_anon_mib",
+        },
+        sampled_at=1.0,
+        phase=None,
+    )
+
+    # A failed evidence write must not disarm the guard.
+    assert result is True
+    assert (4321, signal.SIGTERM) in signalled
+
+
 def test_telemetry_job_memory_guard_persists_evidence_and_terminates_group(
     tmp_path,
 ):

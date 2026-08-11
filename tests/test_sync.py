@@ -1029,6 +1029,50 @@ def test_snapshot_code_and_support_transfers_share_retry_contract(
     assert any("retry 2/3 in 5s" in message for message in logs)
 
 
+def test_snapshot_transport_failure_is_unreachable_not_dispatch_error(
+    tmp_path, monkeypatch
+):
+    # A transport-level rsync failure during code transfer must be an
+    # unreachable RemoteError so _try_nodes can fail over, not a DispatchError
+    # that reads as a capacity/dispatch problem on the current node.
+    cfg = _cfg(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "train.py").write_text("print('x')\n")
+    node = Node(name="n1")
+
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        dispatch, "_snapshot_baselines", lambda *args, **kwargs: (None, None)
+    )
+    monkeypatch.setattr(dispatch, "_remote_tree_sha256", lambda *args: "a" * 64)
+    monkeypatch.setattr(dispatch, "_remember_snapshot", lambda *args: None)
+    monkeypatch.setattr(
+        dispatch,
+        "rsync",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [], 255, "", "ssh: connection closed"
+        ),
+    )
+
+    with pytest.raises(RemoteError, match="code snapshot to n1 failed"):
+        dispatch.snapshot(
+            cfg,
+            "omni",
+            project,
+            node,
+            "proof",
+            "dt/jobs/proof",
+            dispatch.RunSpec(name="proof", gpus=1, cmd=["true"], project="omni"),
+            {},
+            lambda message: None,
+        )
+
+
 def test_private_remote_directory_guard_sets_mode_and_refuses_leaf_symlink(tmp_path):
     private = tmp_path / "job" / "logs"
     created = subprocess.run(
