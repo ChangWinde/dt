@@ -87,7 +87,8 @@ if [[ -n "$ROLLBACK_VERSION" ]]; then
             cd \"\$retained\"
             sha256sum -c SHA256SUMS
             wheel='disttrainer-$ROLLBACK_VERSION-py3-none-any.whl'
-            DT_ARTIFACT_SHA256=\"\$(sha256sum \"\$wheel\" | cut -d' ' -f1)\" \
+            PATH=\"\$HOME/.local/bin\${PATH:+:\$PATH}\" \
+                DT_ARTIFACT_SHA256=\"\$(sha256sum \"\$wheel\" | cut -d' ' -f1)\" \
                 bash bootstrap.sh \"\$wheel\" runtime-constraints.txt
             next=\"\$base/.current.next.\$\$\"
             trap 'rm -f -- \"\$next\"' EXIT
@@ -389,7 +390,8 @@ for host in "${TARGETS[@]}"; do
         fi
         activate() {
             cd \"\$final\"
-            DT_ARTIFACT_SHA256='$DIGEST' \
+            PATH=\"\$HOME/.local/bin\${PATH:+:\$PATH}\" \
+                DT_ARTIFACT_SHA256='$DIGEST' \
                 bash bootstrap.sh '$WHEEL' runtime-constraints.txt
             test \"\$(\"\$HOME/.local/bin/dt\" --version)\" = 'dt $VERSION'
         }
@@ -401,7 +403,9 @@ for host in "${TARGETS[@]}"; do
                 previous_wheel=\"disttrainer-\$previous_version-py3-none-any.whl\"
                 (cd \"\$previous\" && sha256sum -c SHA256SUMS)
                 previous_digest=\"\$(sha256sum \"\$previous/\$previous_wheel\" | cut -d' ' -f1)\"
-                (cd \"\$previous\" && DT_ARTIFACT_SHA256=\"\$previous_digest\" \
+                (cd \"\$previous\" && \
+                    PATH=\"\$HOME/.local/bin\${PATH:+:\$PATH}\" \
+                    DT_ARTIFACT_SHA256=\"\$previous_digest\" \
                     bash bootstrap.sh \"\$previous_wheel\" runtime-constraints.txt)
                 ln -s \"releases/\$previous_version\" \"\$next\"
                 mv -Tf \"\$next\" \"\$current\"

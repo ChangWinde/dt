@@ -131,7 +131,9 @@ current marker and retained predecessor must verify. The `current` marker
 changes only after the installed command reports the requested version; if
 activation fails, deployment reinstalls and verifies the predecessor while
 still returning failure. Explicit rollback uses the same checksum and
-atomic-marker contract.
+atomic-marker contract. Activation and rollback also make a user-local
+`~/.local/bin/uv` visible to the verified bootstrap even when a
+non-interactive SSH session omits that directory from `PATH`.
 
 After deployment, run `dt --version`, `dt doctor --json`, inspect agent status,
 and execute one bounded CPU-only or authorized GPU canary before broad
