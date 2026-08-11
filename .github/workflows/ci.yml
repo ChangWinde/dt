@@ -36,10 +36,10 @@ jobs:
           sudo apt-get update --quiet
           sudo apt-get install --yes --no-install-recommends zsh
 
-      - name: Sync locked environment
+      - name: Sync locked development environment
         env:
           UV_PYTHON: ${{ matrix.python-version }}
-        run: uv sync --locked --all-groups
+        run: uv sync --locked --group dev
 
       - name: Test
         env:
@@ -75,15 +75,40 @@ jobs:
           uv run --no-sync mypy --strict --no-incremental \
             --cache-dir=/tmp/dt-mypy \
             --follow-imports=skip \
-            src/dt
+            src/dt scripts/audit_release.py scripts/release_contract.py
           bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
-            scripts/release-check.sh
+            install.sh scripts/package-check.sh scripts/release-check.sh \
+            scripts/security-check.sh
           git diff --check
 
-      - name: Build and install release artifacts
-        if: matrix.python-version == '3.11'
+      - name: Build and install package artifacts
         env:
-          DT_RELEASE_PYTHON: "3.11"
-          DT_RELEASE_SKIP_SYNC: "1"
+          DT_PACKAGE_PYTHON: "${{ matrix.python-version }}"
+          DT_PACKAGE_SKIP_SYNC: "1"
           TZ: UTC
-        run: env -u FORCE_COLOR scripts/release-check.sh dist
+        run: env -u FORCE_COLOR scripts/package-check.sh
+
+  security:
+    name: Security
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9
+        with:
+          version: "0.11.32"
+          enable-cache: true
+
+      - name: Install Python
+        run: uv python install 3.11
+
+      - name: Sync locked security environment
+        env:
+          UV_PYTHON: "3.11"
+        run: uv sync --locked --no-dev --group security
+
+      - name: Audit source and runtime dependencies
+        run: scripts/security-check.sh

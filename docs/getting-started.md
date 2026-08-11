@@ -33,9 +33,10 @@ dt --version
 ```
 
 `install.sh` refuses local changes, archives the exact committed `HEAD`,
-exports runtime constraints from `uv.lock`, builds a non-editable wheel, and
-installs it as an isolated `uv` tool. The clone may be moved or deleted after
-installation. No configuration is created implicitly.
+exports hashed runtime requirements from `uv.lock`, builds a non-editable
+wheel, and installs it in a content-addressed isolated environment. The clone
+may be moved or deleted after installation. No configuration is created
+implicitly.
 
 When the uv tool directory is not already on `PATH`, the installer prints an
 absolute command that works immediately and the export above. Run
@@ -51,15 +52,17 @@ that bundle:
 
 ```bash
 bash bootstrap.sh \
-  dist/disttrainer-0.7.0-py3-none-any.whl \
+  dist/disttrainer-0.8.0-py3-none-any.whl \
   dist/runtime-constraints.txt
 export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
 dt --version
 ```
 
 The bootstrap script verifies the adjacent `SHA256SUMS`, refuses symlinks or
-content drift, and installs the command as a `uv` tool. It does not guess the
-center topology; configuration is the next explicit step.
+content drift, enforces every dependency hash, and atomically exposes the
+command only after dependency and version checks pass. A failed install keeps
+the previous command active. It does not guess the center topology;
+configuration is the next explicit step.
 
 For repository development without installation:
 

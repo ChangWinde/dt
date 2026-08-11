@@ -18,6 +18,7 @@ import signal
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -41,9 +42,9 @@ from typing import (
 import typer
 from rich.markup import escape
 
-from . import __version__
-from ._provenance import SOURCE_COMMIT
 from . import jobs as jobs_mod
+from . import ps_query as ps_query_mod
+from . import submission_group as group_mod
 from .completion import CompletionSignals
 from .config import ConfigError, HeadConfig, LaptopConfig, config_path, load
 from .dispatch import (
@@ -51,7 +52,11 @@ from .dispatch import (
     FailedBeforeStart,
     NoCapacity,
     NoReachableNode,
+    RequestConflict,
+    RequestOutcomeUnknown,
+    RequestRejected,
     RunSpec,
+    reconcile_submission_request,
     submit,
 )
 from .doctor import doctor_center
@@ -71,8 +76,15 @@ from .monitoring import parse_resource_jsonl as _parse_resource_jsonl  # noqa: F
 from .monitoring import safe_phase_name as _safe_phase_name
 from .monitoring import summarize_resources as _summarize_resources  # noqa: F401
 from .onboarding import InitError, build_config, render_config, write_config
+from .path_contract import job_path_contract as _job_path_contract
+from .private_state import (
+    PrivateStateError,
+    atomic_write_regular,
+    read_bounded_regular,
+)
 from .probe import NodeStatus, probe_center, probe_node, status_as_dict
 from .remote import (
+    center_worker_count,
     fan_json,
     fan_json_by_center,
     find_center,
@@ -91,15 +103,17 @@ from .render import (
     ps_table,
 )
 from .sshio import (
+    MAX_TRANSFER_RETRIES,
     RSYNC_RETRYABLE_EXIT_CODES,
     RSYNC_UNREACHABLE_EXIT_CODES,
-    SSH_BASE,
+    ssh_base,
     RemoteError,
     RsyncRetryEvent,
     remote_dt,
     rsync,
     run_on,
 )
+from .storage import deduplicated_storage_bytes
 from .storage import inventory as storage_inventory
 from .storage import local_tree_disk_bytes
 from .submission import (
@@ -109,18 +123,38 @@ from .submission import (
     validate_resources,
     validate_workflow,
 )
+from . import submission_intent as intent_mod
+from . import operation_log as operation_log_mod
 from .transfers import collection_parts as _collection_parts
 from .transfers import collection_root as _collection_root
 from .transfers import pull_job_record as _pull_job_record
 from .transfers import pull_outputs_probe_bytes as _pull_outputs_probe_bytes
 from .transfers import pull_outputs_probe_command as _pull_outputs_probe_command
+from .version import version_text
 
 EXIT_NO_GPU = 2
 EXIT_ENV = 3
 EXIT_NOT_FOUND = 4
 EXIT_UNREACHABLE = 5
 
+LOCAL_JOB_RECORD_MAX_BYTES = 8 * 1024 * 1024
+JOB_REFS_MAX_COUNT = 10_000
+JOB_REFS_MAX_BYTES = 2 * 1024 * 1024
+
 JsonDict: TypeAlias = dict[str, Any]
+
+
+def _read_bounded_text_input(path: Path, *, max_bytes: int) -> str:
+    """Read an explicit CLI input without accepting unbounded or special files."""
+    if str(path) == "-":
+        text = sys.stdin.read(max_bytes + 1)
+        if len(text.encode("utf-8")) > max_bytes:
+            raise ValueError(f"stdin exceeds the {max_bytes:,}-byte limit")
+        return text
+    result = read_bounded_regular(path, max_bytes=max_bytes)
+    if result is None:
+        raise OSError(f"file does not exist: {path}")
+    return result[0].decode("utf-8")
 
 
 class _RsyncCancelKwargs(TypedDict, total=False):
@@ -160,26 +194,14 @@ def _cfg() -> HeadConfig | LaptopConfig:
     try:
         return load()
     except ConfigError as e:
+        operation_log_mod.mark_problem("configuration", e)
         err.print(f"[red]config error:[/red] {escape(str(e))}")
         raise typer.Exit(1)
 
 
-def _git_sha() -> str | None:
-    for parent in Path(__file__).resolve().parents:
-        if (parent / ".git").exists():
-            proc = subprocess.run(
-                ["git", "-C", str(parent), "rev-parse", "--short", "HEAD"],
-                capture_output=True,
-                text=True,
-            )
-            return proc.stdout.strip() or None
-    return None
-
-
 def _version_cb(value: bool) -> None:
     if value:
-        sha = SOURCE_COMMIT[:12] if SOURCE_COMMIT else _git_sha()
-        print(f"dt {__version__}" + (f" ({sha})" if sha else ""))
+        print(version_text())
         raise typer.Exit()
 
 
@@ -193,7 +215,7 @@ def _root(
         help="show version (+ git sha when running from a repo)",
     ),
 ) -> None:
-    """DistTrainer: dispatch experiments onto whatever shared GPU is free."""
+    """dt: run local projects on idle SSH-accessible compute."""
 
 
 def init_config(
@@ -394,8 +416,8 @@ def _job_refs(
         )
     if file is not None:
         try:
-            text = sys.stdin.read() if str(file) == "-" else file.read_text("utf-8")
-        except (OSError, UnicodeError) as exc:
+            text = _read_bounded_text_input(file, max_bytes=JOB_REFS_MAX_BYTES)
+        except (OSError, UnicodeError, ValueError, PrivateStateError) as exc:
             _fail_submission(
                 kind="invalid_argument",
                 message=f"cannot read job ref file {str(file)!r}: {exc}",
@@ -420,6 +442,27 @@ def _job_refs(
         _fail_submission(
             kind="invalid_argument",
             message=f"{operation} has no job refs",
+            exit_code=1,
+            json_=json_,
+        )
+    if len(refs) > JOB_REFS_MAX_COUNT:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"{operation} has {len(refs):,} job refs; "
+                f"maximum is {JOB_REFS_MAX_COUNT:,}"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    refs_bytes = sum(len(ref.encode("utf-8")) for ref in refs)
+    if refs_bytes > JOB_REFS_MAX_BYTES:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"{operation} job refs are {refs_bytes:,} bytes; "
+                f"maximum is {JOB_REFS_MAX_BYTES:,}"
+            ),
             exit_code=1,
             json_=json_,
         )
@@ -631,18 +674,34 @@ def _fan_failure_exit_code(errors: dict[str, str]) -> int:
     return EXIT_UNREACHABLE if errors and set(errors) == set(unreachable) else 1
 
 
-def _free_scheduler_context(cfg: HeadConfig) -> JsonDict:
+def _free_scheduler_context(
+    cfg: HeadConfig,
+    resources: list[JsonDict] | None = None,
+) -> JsonDict:
     """One local registry read that explains dt-owned idle or queued capacity."""
     from . import agent as agent_mod
 
     try:
-        entries = jobs_mod.list_all(cfg)
+        damage: list[jobs_mod.RegistryDamage] = []
+        entries = jobs_mod.list_all(cfg, damage=damage)
         queued = sorted(
             (entry for entry in entries if entry.status == "queued"),
             key=lambda entry: entry.created_at,
         )
         running = [entry for entry in entries if entry.status == "running"]
         head = queued[0] if queued else None
+        agent_pid = agent_mod.alive_pid(cfg)
+        health = agent_mod.heartbeat_health(cfg, alive=agent_pid is not None)
+        from .scheduler import scheduler_snapshot
+
+        model = scheduler_snapshot(
+            cfg,
+            entries,
+            resources=resources,
+            agent_alive=agent_pid is not None,
+            agent_heartbeat_stale=bool(health["heartbeat_stale"]),
+            registry_damage=len(damage),
+        )
         return {
             "center": cfg.center,
             "running": len(running),
@@ -661,7 +720,14 @@ def _free_scheduler_context(cfg: HeadConfig) -> JsonDict:
                 head.gpus_requested if head is not None else None
             ),
             "reserve_free_per_node": cfg.queue.reserve_free_per_node,
-            "agent_alive": agent_mod.alive_pid(cfg) is not None,
+            "agent_alive": agent_pid is not None,
+            "agent_heartbeat_stale": health["heartbeat_stale"],
+            "runnable_queued": model["runnable_queued"],
+            "blocked_queued": model["blocked_queued"],
+            "waiting_queued": model["waiting_queued"],
+            "next_job_id": model["next_job_id"],
+            "next_condition": model["next_condition"],
+            "model": model,
         }
     except Exception as exc:
         return {
@@ -675,6 +741,13 @@ def _free_scheduler_context(cfg: HeadConfig) -> JsonDict:
             "queue_head_gpus_requested": None,
             "reserve_free_per_node": None,
             "agent_alive": None,
+            "agent_heartbeat_stale": None,
+            "runnable_queued": None,
+            "blocked_queued": None,
+            "waiting_queued": None,
+            "next_job_id": None,
+            "next_condition": None,
+            "model": None,
             "error": str(exc),
         }
 
@@ -683,7 +756,7 @@ def _with_free_scheduler_context(
     cfg: HeadConfig,
     rows: list[JsonDict],
 ) -> list[JsonDict]:
-    context = _free_scheduler_context(cfg)
+    context = _free_scheduler_context(cfg, rows)
     return [{**row, "_scheduler": context} for row in rows]
 
 
@@ -874,6 +947,23 @@ def _free_center_explanation(
                     "dt",
                     "agent",
                     "start",
+                    *(["-c", center] if pin_center else []),
+                ],
+            }
+        )
+    elif queued and context.get("agent_heartbeat_stale") is True:
+        result["state"] = "queue_agent_stale"
+        result["message"] = (
+            "queued work is stalled because the agent heartbeat is stale"
+        )
+        actions.append(
+            {
+                "kind": "inspect_agent",
+                "argv": [
+                    "dt",
+                    "agent",
+                    "status",
+                    "--verbose",
                     *(["-c", center] if pin_center else []),
                 ],
             }
@@ -1102,6 +1192,11 @@ def _free_scheduler_table(
                 "[red]stalled: queue agent is stopped[/red]"
                 f" · run: dt agent start{center_suffix}"
             )
+        elif queued and context.get("agent_heartbeat_stale") is True:
+            action = (
+                "[red]stalled: queue agent heartbeat is stale[/red]"
+                f" · inspect: dt agent status -v{center_suffix}"
+            )
         elif queued:
             pin_node = context.get("queue_head_pin_node")
             requested = context.get("queue_head_gpus_requested")
@@ -1197,6 +1292,15 @@ def _free_scheduler_table(
             table.add_row("", f"[dim]next job[/dim] {escape(head)}")
             if isinstance(reason, str) and reason:
                 table.add_row("", f"[dim]reason[/dim] {escape(reason)}")
+            model = context.get("model")
+            if isinstance(model, dict):
+                table.add_row(
+                    "",
+                    "[dim]queue model[/dim] "
+                    f"{model.get('runnable_queued', 0)} runnable · "
+                    f"{model.get('blocked_queued', 0)} blocked · "
+                    f"{model.get('waiting_queued', 0)} waiting",
+                )
     return table
 
 
@@ -1246,7 +1350,7 @@ def free(
     ),
 ) -> None:
     """Show free GPUs across all centers."""
-    if poll <= 0:
+    if not math.isfinite(poll) or poll <= 0:
         _fail_submission(
             kind="invalid_argument",
             message="--poll must be positive",
@@ -1386,6 +1490,7 @@ def _fail_submission(
     reasons: dict[str, str] | None = None,
 ) -> NoReturn:
     """Emit one stable submission error contract, then exit."""
+    operation_log_mod.mark_problem(kind)
     if json_:
         print(
             json.dumps(
@@ -1435,17 +1540,24 @@ def _forward_laptop_submission(
     action: str,
     recovery_label: str,
     json_: bool,
+    request_id: str | None = None,
 ) -> tuple[int, str | None]:
     """Forward one submission without ever retrying an ambiguous mutation."""
+    recovery_action = (
+        f"Do not change the intent; retry the exact command with --request-id "
+        f"{request_id!r}, or query `dt request {request_id} --json`"
+        if request_id is not None
+        else (
+            "Do not resubmit blindly; reconnect and inspect `dt ps -w` "
+            f"for {recovery_label}"
+        )
+    )
     unknown_message = (
         f"link to head dropped during {action} submission; outcome unknown. "
-        "Do not resubmit blindly; reconnect and inspect `dt ps -w` "
-        f"for {recovery_label}."
+        f"{recovery_action}."
     )
     interrupted_message = (
-        f"{action} submission interrupted; outcome unknown. "
-        "Do not resubmit blindly; reconnect and inspect `dt ps -w` "
-        f"for {recovery_label}."
+        f"{action} submission interrupted; outcome unknown. {recovery_action}."
     )
     try:
         rc, captured = forward_capture_stdout(
@@ -1539,9 +1651,26 @@ def _validate_submission_resources(
         )
 
 
+def _validate_submission_request_id(request_id: str | None, *, json_: bool) -> None:
+    if request_id is None:
+        return
+    try:
+        intent_mod.validate_request_id(request_id)
+    except intent_mod.InvalidRequestId as exc:
+        _fail_submission(
+            kind="invalid_argument",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+
+
 def _validate_submission_workflow(
     *,
     after_success: str | None,
+    after_complete: str | None,
+    after_result: str | None,
+    after_result_states: list[str],
     no_queue: bool,
     follow: bool,
     poll: float,
@@ -1555,6 +1684,9 @@ def _validate_submission_workflow(
     try:
         validate_workflow(
             after_success=after_success,
+            after_complete=after_complete,
+            after_result=after_result,
+            after_result_states=after_result_states,
             no_queue=no_queue,
             follow=follow,
             poll=poll,
@@ -1688,6 +1820,28 @@ def _submit_entry(
             json_=json_,
             exit_code=EXIT_ENV,
         )
+    except RequestConflict as e:
+        _fail_submission(
+            kind="idempotency_conflict",
+            message=str(e),
+            exit_code=1,
+            json_=json_,
+        )
+    except RequestOutcomeUnknown as e:
+        _fail_submission(
+            kind="submission_unknown",
+            message=str(e),
+            reasons={"request_id": e.request_id, "job_id": e.job_id},
+            exit_code=EXIT_UNREACHABLE,
+            json_=json_,
+        )
+    except RequestRejected as e:
+        _fail_submission(
+            kind="submission_rejected",
+            message=str(e),
+            exit_code=EXIT_ENV,
+            json_=json_,
+        )
     except NoReachableNode as e:
         _fail_submission(
             kind="unreachable",
@@ -1737,7 +1891,9 @@ def _resolve_submission_dependency(
             json_=json_,
         )
     if predecessor.status not in {"queued", "running"} and not (
-        predecessor.status == "finished" and predecessor.exit_code == 0
+        predecessor.status == "finished"
+        and predecessor.exit_code == 0
+        and jobs_mod.effective_result_state(predecessor) == "success"
     ):
         exit_note = (
             f", exit {predecessor.exit_code}"
@@ -1773,6 +1929,33 @@ def _resolve_submission_dependency(
     return predecessor.job_id, requested_node or predecessor_node
 
 
+def _resolve_completion_dependency(
+    cfg: HeadConfig,
+    ref: str,
+    *,
+    json_: bool,
+) -> str:
+    predecessor = jobs_mod.find(cfg, ref)
+    if predecessor is None:
+        _fail_submission(
+            kind="dependency_not_found",
+            message=f"no predecessor job matching {ref!r}",
+            exit_code=EXIT_NOT_FOUND,
+            json_=json_,
+        )
+    return predecessor.job_id
+
+
+def _gpu_isolation_contract(entry: jobs_mod.JobEntry) -> JsonDict:
+    """Describe the enforced device boundary without overstating a GPU lease."""
+    return {
+        "mode": entry.gpu_isolation,
+        "enforced": False,
+        "cuda_visibility": "restricted" if entry.gpus_requested > 0 else "none",
+        "graphics_device_access": "unrestricted",
+    }
+
+
 def _submission_payload(
     entry: jobs_mod.JobEntry,
     **extra: object,
@@ -1783,6 +1966,7 @@ def _submission_payload(
         "project": entry.project,
         "node": entry.node,
         "gpus": entry.gpus,
+        "gpu_isolation": _gpu_isolation_contract(entry),
         "session": entry.session,
         "job_dir": entry.job_dir,
         "snapshot_sha256": entry.snapshot_sha256,
@@ -1801,6 +1985,25 @@ def _submission_payload(
         payload["artifact_manifest"] = entry.artifact_manifest
     if entry.after_success:
         payload["after_success"] = entry.after_success
+    if entry.after_complete:
+        payload["after_complete"] = entry.after_complete
+    if entry.after_result:
+        payload["after_result"] = {
+            "job_id": entry.after_result,
+            "states": list(entry.after_result_states),
+        }
+    if entry.request_id:
+        payload["request_id"] = entry.request_id
+        payload["idempotent_replay"] = bool(getattr(entry, "_request_replayed", False))
+    if entry.env_hash or entry.env_mode or entry.env_source_job:
+        payload["environment"] = {
+            "mode": entry.env_mode or "sync",
+            "identity": entry.env_hash,
+            "source_job_id": entry.env_source_job,
+        }
+    result_state = jobs_mod.effective_result_state(entry)
+    if result_state is not None:
+        payload["result_state"] = result_state
     if entry.rerun_of:
         payload["rerun_of"] = entry.rerun_of
     if entry.rerun_source_snapshot_sha256:
@@ -1858,6 +2061,11 @@ def _emit_submission(
     display_ref = _display_ref_for_entry(cfg, entry)
     name = escape(entry.name)
     project = escape(entry.project)
+    if getattr(entry, "_request_replayed", False):
+        err.print(
+            f"[cyan]replayed durable request[/cyan] "
+            f"{escape(entry.request_id or '')} · no new job created"
+        )
     if entry.status == "queued":
         pos = sum(
             1
@@ -2000,6 +2208,30 @@ def run(
         help="queue until this predecessor finishes successfully",
         rich_help_panel="Scheduling & safety",
     ),
+    after_complete: Optional[str] = typer.Option(
+        None,
+        "--after-complete",
+        help="queue until this predecessor reaches any terminal result",
+        rich_help_panel="Scheduling & safety",
+    ),
+    after_result: Optional[str] = typer.Option(
+        None,
+        "--after-result",
+        help="queue until this predecessor reaches a selected typed result",
+        rich_help_panel="Scheduling & safety",
+    ),
+    when_result: Optional[list[str]] = typer.Option(
+        None,
+        "--when-result",
+        help="accepted result state for --after-result (repeatable)",
+        rich_help_panel="Scheduling & safety",
+    ),
+    request_id: Optional[str] = typer.Option(
+        None,
+        "--request-id",
+        help="retry-safe caller identity; reuse returns the original job",
+        rich_help_panel="Reproducibility",
+    ),
     no_queue: bool = typer.Option(
         False,
         "--no-queue",
@@ -2030,6 +2262,7 @@ def run(
     """Submit once: dt run -g 2 -n exp42 -- python train.py --lr 3e-4"""
     cmd = list(ctx.args)
     artifacts = artifact or []
+    result_states = when_result or []
     while cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd or not any(part.strip() for part in cmd):
@@ -2042,6 +2275,9 @@ def run(
     picked_name = name or _derived_task_name(shlex.join(cmd))
     _validate_submission_workflow(
         after_success=after_success,
+        after_complete=after_complete,
+        after_result=after_result,
+        after_result_states=result_states,
         no_queue=no_queue,
         follow=follow,
         poll=poll,
@@ -2060,6 +2296,7 @@ def run(
         artifact_manifest=artifact_manifest,
         json_=json_,
     )
+    _validate_submission_request_id(request_id, json_=json_)
 
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
@@ -2122,6 +2359,10 @@ def run(
             .option("--artifact-manifest", artifact_manifest or None)
             .repeat("--artifact", artifacts)
             .option("--after-success", after_success or None)
+            .option("--after-complete", after_complete or None)
+            .option("--after-result", after_result or None)
+            .repeat("--when-result", result_states)
+            .option("--request-id", request_id or None)
             .flag("--no-queue", no_queue)
             .flag("--json", json_)
             .passthrough(cmd)
@@ -2135,6 +2376,7 @@ def run(
             poll=poll,
             lines=lines,
             json_=json_,
+            request_id=request_id,
         )
         raise typer.Exit(rc)
 
@@ -2151,6 +2393,10 @@ def run(
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
         after_success=after_success,
+        after_complete=after_complete,
+        after_result=after_result,
+        after_result_states=tuple(result_states),
+        request_id=request_id,
     )
     entry, agent_started, artifact_sync = _submit_request(
         cfg,
@@ -2382,6 +2628,20 @@ def _submit_request(
             requested_node=node,
             json_=json_,
         )
+    after_complete_id = None
+    if request.after_complete:
+        after_complete_id = _resolve_completion_dependency(
+            cfg,
+            request.after_complete,
+            json_=json_,
+        )
+    after_result_id = None
+    if request.after_result:
+        after_result_id = _resolve_completion_dependency(
+            cfg,
+            request.after_result,
+            json_=json_,
+        )
 
     project = request.project
     artifact_manifest = request.artifact_manifest
@@ -2410,6 +2670,8 @@ def _submit_request(
         project=project,
         artifact_manifest=artifact_manifest,
         after_success=after_success_id,
+        after_complete=after_complete_id,
+        after_result=after_result_id,
     )
     entry, agent_started = _submit_entry(
         cfg,
@@ -2448,6 +2710,7 @@ def _forward_submission_workflow(
     poll: float,
     lines: int,
     json_: bool,
+    request_id: str | None = None,
 ) -> int:
     """Submit exactly once from a laptop and optionally follow by job identity."""
     rc, job_id = _forward_laptop_submission(
@@ -2456,6 +2719,7 @@ def _forward_submission_workflow(
         action=action,
         recovery_label=recovery_label,
         json_=json_,
+        request_id=request_id,
     )
     if rc != 0 or not follow:
         return rc
@@ -2568,6 +2832,26 @@ def task(
         "--after-success",
         help="queue until this predecessor finishes successfully",
     ),
+    after_complete: Optional[str] = typer.Option(
+        None,
+        "--after-complete",
+        help="queue until this predecessor reaches any terminal result",
+    ),
+    after_result: Optional[str] = typer.Option(
+        None,
+        "--after-result",
+        help="queue until this predecessor reaches a selected typed result",
+    ),
+    when_result: Optional[list[str]] = typer.Option(
+        None,
+        "--when-result",
+        help="accepted result state for --after-result (repeatable)",
+    ),
+    request_id: Optional[str] = typer.Option(
+        None,
+        "--request-id",
+        help="retry-safe caller identity; reuse returns the original job",
+    ),
     no_queue: bool = typer.Option(False, "--no-queue"),
     follow: bool = typer.Option(
         False,
@@ -2590,6 +2874,7 @@ def task(
     """
     command = command.strip()
     artifacts = artifact or []
+    result_states = when_result or []
     if not command:
         _fail_submission(
             kind="invalid_argument",
@@ -2599,6 +2884,9 @@ def task(
         )
     _validate_submission_workflow(
         after_success=after_success,
+        after_complete=after_complete,
+        after_result=after_result,
+        after_result_states=result_states,
         no_queue=no_queue,
         follow=follow,
         poll=poll,
@@ -2617,6 +2905,7 @@ def task(
         artifact_manifest=artifact_manifest,
         json_=json_,
     )
+    _validate_submission_request_id(request_id, json_=json_)
 
     cfg = _cfg()
     picked_name = name or _derived_task_name(command)
@@ -2634,6 +2923,10 @@ def task(
             .option("--artifact-manifest", artifact_manifest or None)
             .repeat("--artifact", artifacts)
             .option("--after-success", after_success or None)
+            .option("--after-complete", after_complete or None)
+            .option("--after-result", after_result or None)
+            .repeat("--when-result", result_states)
+            .option("--request-id", request_id or None)
             .flag("--no-queue", no_queue)
             .flag("--json", json_)
         )
@@ -2646,6 +2939,7 @@ def task(
             poll=poll,
             lines=lines,
             json_=json_,
+            request_id=request_id,
         )
         raise typer.Exit(rc)
 
@@ -2662,6 +2956,10 @@ def task(
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
         after_success=after_success,
+        after_complete=after_complete,
+        after_result=after_result,
+        after_result_states=tuple(result_states),
+        request_id=request_id,
     )
     entry, agent_started, artifact_sync = _submit_request(
         cfg,
@@ -2690,6 +2988,7 @@ def task(
 
 BATCH_MAX_TASKS = 10_000
 BATCH_MAX_COMMAND_BYTES = 1024 * 1024
+BATCH_MAX_INPUT_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -2729,8 +3028,8 @@ def _batch_commands(
         )
     if file is not None:
         try:
-            text = sys.stdin.read() if str(file) == "-" else file.read_text("utf-8")
-        except (OSError, UnicodeError) as exc:
+            text = _read_bounded_text_input(file, max_bytes=BATCH_MAX_INPUT_BYTES)
+        except (OSError, UnicodeError, ValueError, PrivateStateError) as exc:
             _fail_submission(
                 kind="invalid_argument",
                 message=f"cannot read batch file {str(file)!r}: {exc}",
@@ -2831,6 +3130,42 @@ def _batch_error(
             EXIT_NO_GPU,
             None,
         )
+    if isinstance(exc, RequestConflict):
+        return (
+            {
+                "kind": "idempotency_conflict",
+                "message": str(exc),
+                "reasons": {},
+                "exit_code": 1,
+            },
+            1,
+            None,
+        )
+    if isinstance(exc, RequestOutcomeUnknown):
+        return (
+            {
+                "kind": "submission_unknown",
+                "message": str(exc),
+                "reasons": {
+                    "request_id": exc.request_id,
+                    "job_id": exc.job_id,
+                },
+                "exit_code": EXIT_UNREACHABLE,
+            },
+            EXIT_UNREACHABLE,
+            None,
+        )
+    if isinstance(exc, RequestRejected):
+        return (
+            {
+                "kind": "submission_rejected",
+                "message": str(exc),
+                "reasons": {},
+                "exit_code": EXIT_ENV,
+            },
+            EXIT_ENV,
+            None,
+        )
     if isinstance(exc, _OperationFailure):
         return (
             {
@@ -2871,6 +3206,8 @@ def _batch_receipt(
     exit_code: int,
     policy: _InventoryPolicy = _BATCH_POLICY,
     stage_gpus: list[int] | None = None,
+    request_id: str | None = None,
+    idempotent_replay: bool = False,
 ) -> JsonDict:
     shared_snapshot = entries[0].snapshot_sha256 if entries else None
     interrupted = (
@@ -2929,6 +3266,9 @@ def _batch_receipt(
         receipt["dependency_policy"] = policy.dependency_policy
         if stage_gpus is not None:
             receipt["stage_gpus"] = stage_gpus
+    if request_id is not None:
+        receipt["request_id"] = request_id
+        receipt["idempotent_replay"] = idempotent_replay
     job_ids = [str(row["job_id"]) for row in jobs]
     if job_ids:
         next_commands: dict[str, list[str]] = {
@@ -3022,7 +3362,14 @@ def _forward_laptop_batch(
     name_prefix: str,
     json_: bool,
     policy: _InventoryPolicy = _BATCH_POLICY,
+    request_id: str | None = None,
 ) -> int:
+    recovery = (
+        f"Retry the exact command with --request-id {request_id!r}, or query "
+        f"`dt request {request_id} --json`."
+        if request_id is not None
+        else f"Do not resubmit blindly; inspect `dt ps -w` for prefix {name_prefix!r}."
+    )
     try:
         rc, captured = forward_capture_stdout(
             head,
@@ -3034,9 +3381,7 @@ def _forward_laptop_batch(
         _fail_submission(
             kind=f"{policy.command}_submission_unknown",
             message=(
-                f"{policy.command} submission interrupted; outcome unknown. "
-                f"Do not resubmit blindly; inspect `dt ps -w` for prefix "
-                f"{name_prefix!r}."
+                f"{policy.command} submission interrupted; outcome unknown. {recovery}"
             ),
             exit_code=130,
             json_=json_,
@@ -3062,9 +3407,7 @@ def _forward_laptop_batch(
             kind=f"{policy.command}_submission_unknown",
             message=(
                 f"link ended before a complete {policy.command} receipt arrived; "
-                "outcome "
-                "unknown. Do not resubmit blindly; inspect `dt ps -w` for "
-                f"prefix {name_prefix!r}."
+                f"outcome unknown. {recovery}"
             ),
             exit_code=EXIT_UNREACHABLE if rc == 255 else 130,
             json_=json_,
@@ -3078,6 +3421,17 @@ def _forward_laptop_batch(
         exit_code=1,
         json_=json_,
     )
+
+
+def _group_failure(record: group_mod.GroupRequestRecord) -> JsonDict | None:
+    if record.error_kind is None:
+        return None
+    return {
+        "kind": record.error_kind,
+        "message": record.error_message or "group submission failed",
+        "reasons": {},
+        "exit_code": record.exit_code or 1,
+    }
 
 
 def _inventory_command(
@@ -3134,6 +3488,11 @@ def _inventory_command(
         None,
         "--artifact",
         help="sync this project-relative input once and bind every item (repeatable)",
+    ),
+    request_id: Optional[str] = typer.Option(
+        None,
+        "--request-id",
+        help="retry-safe identity for the complete multi-job submission",
     ),
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
@@ -3202,6 +3561,7 @@ def _inventory_command(
         artifact_manifest=artifact_manifest,
         json_=json_,
     )
+    _validate_submission_request_id(request_id, json_=json_)
     default_prefix = (
         file.stem
         if file is not None and str(file) != "-" and file.stem
@@ -3224,6 +3584,7 @@ def _inventory_command(
             .option("--max-job-memory-mib", max_job_memory_mib)
             .option("--artifact-manifest", artifact_manifest or None)
             .repeat("--artifact", artifacts)
+            .option("--request-id", request_id or None)
             .flag("--json", True)
             .passthrough(items)
         )
@@ -3234,6 +3595,7 @@ def _inventory_command(
                 name_prefix=prefix,
                 json_=json_,
                 policy=policy,
+                request_id=request_id,
             )
         )
 
@@ -3272,6 +3634,77 @@ def _inventory_command(
                 )
 
     entries: list[jobs_mod.JobEntry] = []
+    group_record: group_mod.GroupRequestRecord | None = None
+    group_intent_sha256: str | None = None
+    group_terminal_replay = False
+    if request_id is not None and failure is None:
+        group_intent_sha256 = intent_mod.canonical_intent(
+            {
+                "schema": group_mod.GROUP_REQUEST_SCHEMA,
+                "operation": policy.command,
+                "center": cfg.center,
+                "server": server,
+                "commands": items,
+                "gpus": requested_gpus,
+                "name_prefix": prefix,
+                "project": project,
+                "require_path": require_path,
+                "require_disk_gib": require_disk_gib,
+                "max_hours": max_hours,
+                "max_vram_mib": max_vram_mib,
+                "max_job_memory_mib": max_job_memory_mib,
+                "artifact_manifest": artifact_manifest,
+            }
+        )
+        try:
+            group_record = group_mod.locked_claim(
+                cfg,
+                request_id,
+                group_intent_sha256,
+                operation=policy.command,
+                requested=len(items),
+            )
+            entries = group_mod.load_entries_or_fail(cfg, group_record)
+            if group_record.state == "confirmed":
+                group_terminal_replay = True
+                failure = _group_failure(group_record)
+                failure_code = group_record.exit_code or 0
+        except group_mod.GroupRequestConflict as exc:
+            failure = {
+                "kind": "idempotency_conflict",
+                "message": str(exc),
+                "reasons": {"request_id": request_id},
+                "exit_code": 1,
+            }
+            failure_code = 1
+        except intent_mod.RequestLockError as exc:
+            failure = {
+                "kind": "submission_rejected",
+                "message": (
+                    f"request {request_id!r} was not advanced because its "
+                    f"durable lock could not be acquired: {exc}"
+                ),
+                "reasons": {"request_id": request_id},
+                "exit_code": EXIT_ENV,
+            }
+            failure_code = EXIT_ENV
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} has unreadable durable group state; "
+                    "refusing to submit any additional jobs"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+
     agent_started: bool | None = None
     agent_checked = False
 
@@ -3285,12 +3718,109 @@ def _inventory_command(
         if agent_mod.alive_pid(cfg) is None:
             agent_started = agent_mod.start_detached(cfg)
 
-    if failure is None:
+    for existing_entry in entries:
+        ensure_agent(existing_entry)
+        if not json_:
+            print(existing_entry.job_id, flush=True)
+
+    def persist_group_entry(index: int, entry: jobs_mod.JobEntry) -> None:
+        nonlocal group_record
+        if request_id is None or group_intent_sha256 is None:
+            return
+        group_record = group_mod.locked_record_job(
+            cfg,
+            request_id,
+            intent_sha256=group_intent_sha256,
+            index=index,
+            job_id=entry.job_id,
+        )
+
+    # A terminal parent is a receipt cache, not a shortcut around exact
+    # intent comparison. Re-enter the first child boundary to detect changed
+    # source/runtime identity; its confirmed child record makes this replay
+    # incapable of launching a second job.
+    if group_terminal_replay and entries:
+        if request_id is None:
+            _fail_submission(
+                kind="submission_unknown",
+                message="terminal batch receipt has no durable request identity",
+                exit_code=EXIT_UNREACHABLE,
+                json_=json_,
+            )
+        first_gpus = requested_gpus[0]
+        first_spec = RunSpec(
+            name=f"{prefix}-001-{_derived_task_name(items[0])}",
+            gpus=first_gpus,
+            cmd=["bash", "-c", items[0]],
+            project=project,
+            node=server,
+            require_path=require_path,
+            require_disk_gib=require_disk_gib,
+            max_hours=max_hours,
+            max_vram_mib=max_vram_mib if first_gpus > 0 else None,
+            max_job_memory_mib=max_job_memory_mib,
+            artifact_manifest=artifact_manifest,
+            request_id=group_mod.item_request_id(request_id, 1),
+        )
+
+        def replay_log(message: str) -> None:
+            err.print(f"[dim]{escape(policy.command)} replay: {escape(message)}[/dim]")
+
+        try:
+            verified_entry = submit(cfg, first_spec, Path.cwd(), replay_log)
+            if verified_entry.job_id != entries[0].job_id:
+                raise group_mod.GroupRequestError(
+                    "terminal group replay resolved to a different first job"
+                )
+        except FailedBeforeStart as exc:
+            if exc.entry.job_id != entries[0].job_id:
+                failure = {
+                    "kind": "submission_unknown",
+                    "message": (
+                        f"request {request_id!r} terminal receipt resolved to "
+                        "a different failed first job"
+                    ),
+                    "reasons": {"request_id": request_id},
+                    "exit_code": EXIT_UNREACHABLE,
+                }
+                failure_code = EXIT_UNREACHABLE
+                group_terminal_replay = False
+        except (
+            NoReachableNode,
+            NoCapacity,
+            DispatchError,
+            ConfigError,
+        ) as exc:
+            failure, failure_code, _failed_entry = _batch_error(
+                exc,
+                item_label=f"{policy.command} replay",
+            )
+            group_terminal_replay = False
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} terminal receipt could not be "
+                    "verified without risking a duplicate"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+            group_terminal_replay = False
+
+    if failure is None and not group_terminal_replay:
         from . import dispatch as dispatch_mod
 
-        source: jobs_mod.JobEntry | None = None
-        predecessor: jobs_mod.JobEntry | None = None
-        for index, command in enumerate(items, start=1):
+        source = entries[0] if entries else None
+        predecessor = entries[-1] if entries else None
+        for index in range(len(entries) + 1, len(items) + 1):
+            command = items[index - 1]
             item_gpus = requested_gpus[index - 1]
             derived = _derived_task_name(command)
             item_name = f"{prefix}-{index:03d}-{derived}"
@@ -3315,6 +3845,11 @@ def _inventory_command(
                         max_vram_mib=max_vram_mib if item_gpus > 0 else None,
                         max_job_memory_mib=max_job_memory_mib,
                         artifact_manifest=artifact_manifest,
+                        request_id=(
+                            group_mod.item_request_id(request_id, index)
+                            if request_id is not None
+                            else None
+                        ),
                     )
                     entry = submit(cfg, spec, Path.cwd(), log)
                     source = entry
@@ -3327,8 +3862,16 @@ def _inventory_command(
                     )
                     spec.gpus = item_gpus
                     spec.max_vram_mib = max_vram_mib if item_gpus > 0 else None
+                    spec.request_id = (
+                        group_mod.item_request_id(request_id, index)
+                        if request_id is not None
+                        else None
+                    )
                     if policy.dependency_policy == "previous_success":
-                        assert predecessor is not None
+                        if predecessor is None:
+                            raise group_mod.GroupRequestError(
+                                "success-dependent inventory lost its predecessor"
+                            )
                         spec.after_success = predecessor.job_id
                     fork_kwargs: JsonDict = {"force_queue": True}
                     if policy.command != "batch":
@@ -3340,6 +3883,7 @@ def _inventory_command(
                         log,
                         **fork_kwargs,
                     )
+                persist_group_entry(index, entry)
             except KeyboardInterrupt:
                 confirmed = len(entries)
                 noun = "registration" if confirmed == 1 else "registrations"
@@ -3349,8 +3893,14 @@ def _inventory_command(
                         f"{policy.command} submission interrupted after {confirmed} "
                         "confirmed "
                         f"{noun}; item {index} outcome unknown. Confirmed jobs were "
-                        "not cancelled. Do not resubmit blindly; inspect `dt ps -w` "
-                        f"for prefix {prefix!r}."
+                        "not cancelled. "
+                        + (
+                            f"Retry the same command with --request-id {request_id!r} "
+                            "to reconcile this exact item."
+                            if request_id is not None
+                            else "Do not resubmit blindly; inspect `dt ps -w` "
+                            f"for prefix {prefix!r}."
+                        )
                     ),
                     "reasons": {},
                     "exit_code": 130,
@@ -3371,16 +3921,101 @@ def _inventory_command(
                     item_label=f"{policy.command} item",
                 )
                 if failed_entry is not None:
+                    try:
+                        persist_group_entry(index, failed_entry)
+                    except (
+                        OSError,
+                        ValueError,
+                        intent_mod.RequestRecordError,
+                        group_mod.GroupRequestError,
+                    ) as persistence_exc:
+                        failure = {
+                            "kind": "submission_unknown",
+                            "message": (
+                                f"job {failed_entry.job_id} was registered but "
+                                f"request {request_id!r} progress could not be "
+                                "persisted"
+                            ),
+                            "reasons": {
+                                "request_id": request_id,
+                                "job_id": failed_entry.job_id,
+                                "detail": str(persistence_exc),
+                            },
+                            "exit_code": EXIT_UNREACHABLE,
+                        }
+                        failure_code = EXIT_UNREACHABLE
                     entries.append(failed_entry)
                     ensure_agent(failed_entry)
                     if not json_:
                         print(failed_entry.job_id, flush=True)
+                break
+            except (
+                OSError,
+                ValueError,
+                intent_mod.RequestRecordError,
+                group_mod.GroupRequestError,
+            ) as exc:
+                failure = {
+                    "kind": "submission_unknown",
+                    "message": (
+                        f"{policy.command} item {index} did not produce a "
+                        "complete durable group receipt; retry only with the "
+                        "same request id"
+                    ),
+                    "reasons": {"request_id": request_id, "detail": str(exc)},
+                    "exit_code": EXIT_UNREACHABLE,
+                }
+                failure_code = EXIT_UNREACHABLE
                 break
             entries.append(entry)
             predecessor = entry
             ensure_agent(entry)
             if not json_:
                 print(entry.job_id, flush=True)
+
+    if (
+        request_id is not None
+        and group_record is not None
+        and group_intent_sha256 is not None
+        and not group_terminal_replay
+    ):
+        uncertain = bool(
+            failure
+            and failure.get("kind")
+            in {
+                f"{policy.command}_submission_interrupted",
+                "submission_unknown",
+                "idempotency_conflict",
+            }
+        )
+        try:
+            group_record = group_mod.locked_transition(
+                cfg,
+                request_id,
+                intent_sha256=group_intent_sha256,
+                state="uncertain" if uncertain else "confirmed",
+                exit_code=None if uncertain else failure_code,
+                error_kind=(str(failure["kind"]) if failure is not None else None),
+                error_message=(
+                    str(failure.get("message")) if failure is not None else None
+                ),
+            )
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} did not produce a durable final "
+                    "group receipt; retry only with the same request id"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
 
     receipt = _batch_receipt(
         server=server,
@@ -3396,6 +4031,8 @@ def _inventory_command(
         exit_code=failure_code,
         policy=policy,
         stage_gpus=stage_gpus,
+        request_id=request_id,
+        idempotent_replay=group_terminal_replay,
     )
     if json_:
         print(json.dumps(receipt))
@@ -3472,6 +4109,12 @@ def batch(
         help="sync this project-relative input once and bind every item (repeatable)",
         rich_help_panel="Reproducibility",
     ),
+    request_id: Optional[str] = typer.Option(
+        None,
+        "--request-id",
+        help="retry-safe identity for the complete batch",
+        rich_help_panel="Reliability",
+    ),
     json_: bool = typer.Option(False, "--json", rich_help_panel="Output"),
 ) -> None:
     """Submit a same-node FIFO queue; runtime failures continue."""
@@ -3491,6 +4134,7 @@ def batch(
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
         artifact=artifact,
+        request_id=request_id,
         json_=json_,
     )
 
@@ -3571,6 +4215,12 @@ def chain(
         help="sync this project-relative input once and bind every stage (repeatable)",
         rich_help_panel="Reproducibility",
     ),
+    request_id: Optional[str] = typer.Option(
+        None,
+        "--request-id",
+        help="retry-safe identity for the complete chain",
+        rich_help_panel="Reliability",
+    ),
     json_: bool = typer.Option(False, "--json", rich_help_panel="Output"),
 ) -> None:
     """Submit a success-gated chain; failed predecessors stop later stages."""
@@ -3591,6 +4241,7 @@ def chain(
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
         artifact=artifact,
+        request_id=request_id,
         json_=json_,
     )
 
@@ -4045,6 +4696,7 @@ def _gather_ps_rows(
             **asdict(entry),
             "display_ref": display_refs[entry.job_id],
         }
+        row["result_state"] = jobs_mod.effective_result_state(entry)
         row.update(
             {
                 "queue_position": None,
@@ -4200,6 +4852,214 @@ def _ps_issue_rows(rows: list[JsonDict]) -> list[JsonDict]:
     )
 
 
+def _legacy_ps_query_rows(
+    payload: object,
+    *,
+    center: str,
+    status: str | None,
+    active_only: bool,
+    issues_only: bool,
+) -> list[JsonDict] | None:
+    """Validate and select a full-array response from a pre-query head."""
+    if not isinstance(payload, list) or not all(
+        isinstance(row, dict) for row in payload
+    ):
+        return None
+    rows = cast(list[JsonDict], payload)
+    for row in rows:
+        row.setdefault("center", center)
+        row.setdefault("updated_at", row.get("created_at"))
+        row["result_state"] = ps_query_mod.effective_result_state(row)
+    if status is not None:
+        rows = [row for row in rows if row.get("status") == status]
+    elif active_only:
+        rows = [row for row in rows if row.get("status") in {"queued", "running"}]
+    if issues_only:
+        rows = list(_ps_issue_rows(rows))
+    return rows
+
+
+def _gather_laptop_ps_query(
+    cfg: LaptopConfig,
+    *,
+    status: str | None,
+    active_only: bool,
+    issues_only: bool,
+    with_progress: bool,
+    since: float | None,
+    selected_fields: tuple[str, ...],
+    limit: int,
+    cursor: str | None,
+    summary_only: bool,
+) -> tuple[JsonDict, dict[str, str]]:
+    """Fetch projected center pages, then form one deterministic global page."""
+    internal_fields = tuple(
+        dict.fromkeys([*selected_fields, *sorted(ps_query_mod.MERGE_FIELDS)])
+    )
+    remote_argv = ps_query_mod.remote_argv(
+        status=status,
+        active_only=active_only,
+        issues_only=issues_only,
+        with_progress=with_progress,
+        since=since,
+        selected_fields=internal_fields,
+        limit=limit,
+        cursor=cursor,
+        summary_only=summary_only,
+    )
+    data_by_center, fan_errors = fan_json_by_center(cfg, remote_argv)
+
+    fallback_centers = [
+        center
+        for center, message in fan_errors.items()
+        if ps_query_mod.unsupported_remote_query(message)
+    ]
+    if fallback_centers and since is None:
+        fallback_cfg = LaptopConfig(
+            centers={center: cfg.centers[center] for center in fallback_centers},
+            default_center=(
+                cfg.default_center if cfg.default_center in fallback_centers else None
+            ),
+        )
+        legacy_argv = ["ps"]
+        if status is not None:
+            legacy_argv.extend(["--status", status])
+        if active_only:
+            legacy_argv.append("--active")
+        if issues_only:
+            legacy_argv.append("--issues")
+        if with_progress:
+            legacy_argv.append("--with-progress")
+        fallback_data, fallback_errors = fan_json_by_center(fallback_cfg, legacy_argv)
+        for center in fallback_centers:
+            rows = _legacy_ps_query_rows(
+                fallback_data.get(center),
+                center=center,
+                status=status,
+                active_only=active_only,
+                issues_only=issues_only,
+            )
+            if rows is not None:
+                data_by_center[center] = ps_query_mod.build_payload(
+                    rows,
+                    center=center,
+                    status=status,
+                    active_only=active_only,
+                    issues_only=issues_only,
+                    since=None,
+                    selected_fields=internal_fields,
+                    limit=limit,
+                    cursor=cursor,
+                    summary_only=summary_only,
+                )
+                fan_errors.pop(center, None)
+                fan_errors.unreachable.discard(center)
+            elif center in fallback_errors:
+                fan_errors[center] = fallback_errors[center]
+                if center in fallback_errors.unreachable:
+                    fan_errors.unreachable.add(center)
+            else:
+                fan_errors[center] = "invalid legacy ps response from head"
+    elif fallback_centers:
+        for center in fallback_centers:
+            fan_errors[center] = (
+                "head does not support incremental ps queries; upgrade it before "
+                "using --since"
+            )
+
+    summaries: list[JsonDict] = []
+    candidates: list[JsonDict] = []
+    eligible = 0
+    for center in cfg.centers:
+        payload = data_by_center.get(center)
+        if payload is None:
+            continue
+        if not isinstance(payload, dict) or payload.get("schema_version") != (
+            ps_query_mod.SCHEMA_VERSION
+        ):
+            fan_errors[center] = "invalid ps query object from head"
+            continue
+        summary = payload.get("summary")
+        page = payload.get("page")
+        jobs = payload.get("jobs")
+        if (
+            not isinstance(summary, dict)
+            or not isinstance(page, dict)
+            or not isinstance(jobs, list)
+            or not all(isinstance(row, dict) for row in jobs)
+            or not isinstance(page.get("eligible"), int)
+            or isinstance(page.get("eligible"), bool)
+            or int(page["eligible"]) < len(jobs)
+        ):
+            fan_errors[center] = "invalid ps query contract from head"
+            continue
+        typed_jobs = cast(list[JsonDict], jobs)
+        if any(row.get("center") != center for row in typed_jobs):
+            fan_errors[center] = "ps query rows have the wrong owning center"
+            continue
+        summaries.append(cast(JsonDict, summary))
+        candidates.extend(typed_jobs)
+        eligible += int(page["eligible"])
+
+    try:
+        merged_summary = ps_query_mod.merge_summaries(summaries)
+    except ps_query_mod.QueryError as exc:
+        merged_summary = ps_query_mod.summarize([])
+        fan_errors["query"] = str(exc)
+    _scope_laptop_ps_refs(cfg, candidates)
+    digest = ps_query_mod.selection_digest(
+        status=status,
+        active_only=active_only,
+        issues_only=issues_only,
+        since=since,
+    )
+    order = ps_query_mod.order_field(since)
+    global_page = ps_query_mod.paginate(
+        candidates,
+        limit=limit,
+        cursor=None,
+        digest=digest,
+        order=order,
+    )
+    next_cursor = None
+    if eligible > len(global_page.rows) and global_page.rows:
+        next_cursor = ps_query_mod.continuation_cursor(
+            global_page.rows[-1],
+            digest=digest,
+            order=order,
+        )
+    failures = dict(fan_errors)
+    payload = {
+        "schema_version": ps_query_mod.SCHEMA_VERSION,
+        "generated_at": time.time(),
+        "center": "all",
+        "query": ps_query_mod.query_contract(
+            status=status,
+            active_only=active_only,
+            issues_only=issues_only,
+            since=since,
+            selected_fields=selected_fields,
+            limit=None if summary_only else limit,
+            cursor=cursor,
+            summary_only=summary_only,
+        ),
+        "summary": merged_summary,
+        "page": {
+            "eligible": eligible,
+            "returned": 0 if summary_only else len(global_page.rows),
+            "next_cursor": None if summary_only else next_cursor,
+        },
+        "jobs": (
+            []
+            if summary_only
+            else ps_query_mod.project(global_page.rows, selected_fields)
+        ),
+        "partial": bool(failures),
+        "errors": failures,
+    }
+    return payload, fan_errors
+
+
 def _ps_queue_runway_note(
     rows: list[JsonDict],
     *,
@@ -4222,8 +5082,7 @@ def _ps_queue_runway_note(
         if status == "running":
             node = row.get("node")
             if isinstance(node, str) and node not in {"", "-", "?"}:
-                nodes = state["running_nodes"]
-                assert isinstance(nodes, set)
+                nodes = cast(set[str], state["running_nodes"])
                 nodes.add(node)
 
     exhausted = [
@@ -4241,8 +5100,7 @@ def _ps_queue_runway_note(
 
     center, state = exhausted[0]
     running = int(state["running"])
-    nodes = state["running_nodes"]
-    assert isinstance(nodes, set)
+    nodes = cast(set[str], state["running_nodes"])
     node = next(iter(nodes)) if len(nodes) == 1 else "NODE"
     noun = "job" if running == 1 else "jobs"
     command = f"dt task {escape(node)} 'COMMAND' -n NAME"
@@ -4303,7 +5161,7 @@ def ps(
         None,
         "-s",
         "--status",
-        help="filter: queued/running/finished/killed/lost/failed",
+        help="filter: queued/running/finished/killed/lost/failed/skipped",
         rich_help_panel="Filters",
     ),
     active: bool = typer.Option(
@@ -4330,6 +5188,36 @@ def ps(
         "--limit",
         help="return only the newest N matching jobs (default JSON remains full)",
         rich_help_panel="Filters",
+    ),
+    compact: bool = typer.Option(
+        False,
+        "--compact",
+        help="emit a bounded, versioned agent query instead of the legacy array",
+        rich_help_panel="Agent query",
+    ),
+    fields_: Optional[str] = typer.Option(
+        None,
+        "--fields",
+        help="comma-separated job fields for the bounded query",
+        rich_help_panel="Agent query",
+    ),
+    summary: bool = typer.Option(
+        False,
+        "--summary",
+        help="emit aggregate counts without job rows",
+        rich_help_panel="Agent query",
+    ),
+    since: Optional[str] = typer.Option(
+        None,
+        "--since",
+        help="only registry changes since Unix seconds or timezone-qualified ISO time",
+        rich_help_panel="Agent query",
+    ),
+    cursor: Optional[str] = typer.Option(
+        None,
+        "--cursor",
+        help="continue a bounded query from an opaque next_cursor",
+        rich_help_panel="Agent query",
     ),
     wide: bool = typer.Option(
         False,
@@ -4375,6 +5263,13 @@ def ps(
     ),
 ) -> None:
     """Show active jobs; opt into recent or complete history."""
+    query_mode = (
+        compact
+        or fields_ is not None
+        or summary
+        or since is not None
+        or (cursor is not None)
+    )
     if active and status is not None:
         _fail_submission(
             kind="invalid_argument",
@@ -4392,7 +5287,7 @@ def ps(
             exit_code=1,
             json_=json_,
         )
-    if poll <= 0:
+    if not math.isfinite(poll) or poll <= 0:
         _fail_submission(
             kind="invalid_argument",
             message="--poll must be positive",
@@ -4403,6 +5298,60 @@ def ps(
         _fail_submission(
             kind="invalid_argument",
             message="--limit must be positive",
+            exit_code=1,
+            json_=json_,
+        )
+    if query_mode and not json_:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--compact/--fields/--summary/--since/--cursor require --json",
+            exit_code=1,
+            json_=False,
+        )
+    if query_mode and (watch_ or recent or window):
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "bounded ps queries cannot be combined with --watch, --recent, "
+                "or internal --window"
+            ),
+            exit_code=1,
+            json_=True,
+        )
+    if summary and (
+        fields_ is not None or cursor is not None or limit is not None or with_progress
+    ):
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "--summary cannot be combined with --fields, --cursor, --limit, "
+                "or --with-progress"
+            ),
+            exit_code=1,
+            json_=True,
+        )
+    query_limit = limit or ps_query_mod.DEFAULT_LIMIT
+    try:
+        selected_fields = ps_query_mod.parse_fields(fields_)
+        parsed_since = ps_query_mod.parse_since(since)
+        if query_mode:
+            digest = ps_query_mod.selection_digest(
+                status=status,
+                active_only=active,
+                issues_only=issues,
+                since=parsed_since,
+            )
+            ps_query_mod.paginate(
+                [],
+                limit=query_limit,
+                cursor=cursor,
+                digest=digest,
+                order=ps_query_mod.order_field(parsed_since),
+            )
+    except ps_query_mod.QueryError as exc:
+        _fail_submission(
+            kind="invalid_argument",
+            message=str(exc),
             exit_code=1,
             json_=json_,
         )
@@ -4452,7 +5401,7 @@ def ps(
 
     def gather(include_progress: bool) -> tuple[list[JsonDict], dict[str, str]]:
         window_kwargs: JsonDict = {"remote_window": True} if remote_window else {}
-        if limit is not None and not legacy_issue_window:
+        if limit is not None and not legacy_issue_window and not query_mode:
             window_kwargs["limit"] = limit
         if issues:
             window_kwargs["issues_only"] = True
@@ -4474,6 +5423,51 @@ def ps(
         if issues and not legacy_issue_window:
             rows = _limit_ps_rows(_ps_issue_rows(rows), limit)
         return rows, errors
+
+    if query_mode:
+        if isinstance(cfg, LaptopConfig):
+            payload, query_errors = _gather_laptop_ps_query(
+                cfg,
+                status=status,
+                active_only=active,
+                issues_only=issues,
+                with_progress=with_progress,
+                since=parsed_since,
+                selected_fields=selected_fields,
+                limit=query_limit,
+                cursor=cursor,
+                summary_only=summary,
+            )
+            if query_errors and set(query_errors) == set(cfg.centers):
+                code = _fan_failure_exit_code(query_errors)
+                _fail_submission(
+                    kind=(
+                        "unreachable"
+                        if code == EXIT_UNREACHABLE
+                        else "center_query_failed"
+                    ),
+                    message="cannot query jobs: every center query failed",
+                    reasons=query_errors,
+                    exit_code=code,
+                    json_=True,
+                )
+        else:
+            query_rows, query_errors = gather(include_progress=with_progress)
+            payload = ps_query_mod.build_payload(
+                query_rows,
+                center=cfg.center,
+                status=status,
+                active_only=active,
+                issues_only=issues,
+                since=parsed_since,
+                selected_fields=selected_fields,
+                limit=query_limit,
+                cursor=cursor,
+                summary_only=summary,
+                errors=query_errors,
+            )
+        print(json.dumps(payload))
+        return
 
     if watch_:
         try:
@@ -4672,7 +5666,10 @@ def ps(
             wide=wide,
             caption=caption,
             show_progress=with_progress,
-            show_issue=(not with_progress and (issues or status in ("failed", "lost"))),
+            show_issue=(
+                not with_progress
+                and (issues or status in ("failed", "lost", "skipped"))
+            ),
             title=view_title,
             empty_text=empty_text,
         )
@@ -5393,7 +6390,7 @@ def _follow_job_log(
             follow_cmd = (
                 safe_tail
                 if entry.node_local
-                else [*SSH_BASE, entry.node, shlex.join(safe_tail)]
+                else [*ssh_base(), entry.node, shlex.join(safe_tail)]
             )
             follower = subprocess.run(
                 follow_cmd,
@@ -5543,9 +6540,7 @@ def logs(
             json_=True,
         )
     if json_:
-        node_path = (
-            log_path if PurePosixPath(log_path).is_absolute() else f"~/{log_path}"
-        )
+        node_path = display_node_path(log_path)
         print(
             json.dumps(
                 {
@@ -5587,7 +6582,7 @@ def attach(ref: str = REF_ARG) -> None:
         os.execvp("tmux", ["tmux", "-L", "dt", "attach", "-t", entry.session])
     remote = subprocess.run(
         [
-            *SSH_BASE,
+            *ssh_base(),
             "-t",
             entry.node,
             f"tmux -L dt attach -t {shlex.quote(entry.session)}",
@@ -6020,7 +7015,7 @@ def _wait_terminal_result(
         return _submission_payload(entry, **extra), 68
 
     emit(f"[yellow]{entry.job_id} ended as {entry.status}[/yellow]")
-    code = 66 if entry.status == "killed" else 67
+    code = 66 if entry.status == "killed" else 69 if entry.status == "skipped" else 67
     return _submission_payload(entry, exit_code=code), code
 
 
@@ -6105,6 +7100,8 @@ def _render_wait_group(payload: JsonDict) -> None:
             result = "[yellow]■ killed[/yellow]"
         elif status == "lost":
             result = "[yellow]? lost[/yellow]"
+        elif status == "skipped":
+            result = "[yellow]↷ skipped[/yellow]"
         else:
             result = "[red]✗ setup[/red]"
         node = str(raw["node"])
@@ -6218,7 +7215,7 @@ def wait(
     exact resume command. With --json it emits one wait_interrupted object.
     """
     refs = _job_refs(refs, file, operation="wait", json_=json_)
-    if poll <= 0:
+    if not math.isfinite(poll) or poll <= 0:
         _fail_submission(
             kind="invalid_argument",
             message="--poll must be positive",
@@ -6545,6 +7542,10 @@ def _compact_watch_snapshot(snapshot: JsonDict) -> JsonDict:
         "queue_head_job_id",
         "queue_predecessor_job_id",
         "after_success",
+        "after_complete",
+        "after_result",
+        "after_result_states",
+        "result_state",
         "node",
         "gpus",
         "duration_s",
@@ -6585,7 +7586,7 @@ def _watch_snapshot(
     # watch frame can redraw. Keep the registry entry as the durable fallback
     # and bound refresh latency to the slowest read instead.
     initial_status = entry.status
-    terminal_statuses = {"finished", "killed", "lost", "failed"}
+    terminal_statuses = {"finished", "killed", "lost", "failed", "skipped"}
     should_refresh = initial_status in ("running", "lost")
     should_read_log = entry.node != "-" and initial_status != "queued"
     status_observation: JsonDict = {}
@@ -6712,8 +7713,14 @@ def _watch_snapshot(
         "last_dispatch_reason": last_dispatch_reason,
         **queue_fields,
         "after_success": entry.after_success,
+        "after_complete": entry.after_complete,
+        "after_result": entry.after_result,
+        "after_result_states": list(entry.after_result_states),
+        "request_id": entry.request_id,
+        "result_state": jobs_mod.effective_result_state(entry),
         "node": entry.node,
         "gpus": entry.gpus,
+        "gpu_isolation": _gpu_isolation_contract(entry),
         "duration_s": duration,
         "max_hours": entry.max_hours,
         "max_vram_mib": entry.max_vram_mib,
@@ -6776,13 +7783,21 @@ def _watch_group_payload(
     compact: bool = False,
 ) -> JsonDict:
     """Build one stable machine-readable multi-job watch frame."""
-    statuses = ("queued", "running", "finished", "killed", "lost", "failed")
+    statuses = (
+        "queued",
+        "running",
+        "finished",
+        "killed",
+        "lost",
+        "failed",
+        "skipped",
+    )
     counts = {
         status: sum(snapshot.get("status") == status for snapshot in snapshots)
         for status in statuses
     }
     terminal_count = sum(
-        counts[status] for status in ("finished", "killed", "lost", "failed")
+        counts[status] for status in ("finished", "killed", "lost", "failed", "skipped")
     )
     issue_count = sum(
         snapshot.get("status") in {"killed", "lost", "failed"}
@@ -6825,6 +7840,7 @@ def _watch_view(snapshot: JsonDict) -> Any:
         "killed": "yellow",
         "lost": "red",
         "failed": "bold red",
+        "skipped": "yellow",
     }.get(status, "white")
     display_status = status
     if status == "running" and snapshot.get("node_unreachable"):
@@ -6937,6 +7953,7 @@ def _watch_group_view(payload: JsonDict) -> Any:
             "killed": "yellow",
             "lost": "red",
             "failed": "bold red",
+            "skipped": "yellow",
         }.get(status, "white")
         display_status = status
         if status == "running" and snapshot.get("node_unreachable"):
@@ -7030,7 +8047,7 @@ def _watch_group_view(payload: JsonDict) -> Any:
                 if exit_code == 0
                 else f"[red]exit {exit_code if exit_code is not None else '?'}[/red]"
             )
-        elif status in {"killed", "lost", "failed"}:
+        elif status in {"killed", "lost", "failed", "skipped"}:
             suffix = f" · exit {exit_code}" if exit_code is not None else ""
             detail = f"[red]{escape(str(reason or status))}{suffix}[/red]"
         elif snapshot.get("node_unreachable"):
@@ -7046,7 +8063,7 @@ def _watch_group_view(payload: JsonDict) -> Any:
             detail or "-",
         )
 
-        has_issue = status in {"killed", "lost", "failed"} or (
+        has_issue = status in {"killed", "lost", "failed", "skipped"} or (
             status == "finished" and exit_code not in (None, 0)
         )
         if status == "running" or has_issue:
@@ -7828,6 +8845,7 @@ def info(
         "node": entry.node,
         "gpus": entry.gpus,
         "gpus_requested": entry.gpus_requested,
+        "gpu_isolation": _gpu_isolation_contract(entry),
         "cmd": entry.cmd,
         "project": entry.project,
         "git_sha": entry.git_sha,
@@ -7836,7 +8854,12 @@ def info(
         "payload_sha256": entry.payload_sha256,
         "artifact_manifest": entry.artifact_manifest,
         "forked_from": entry.forked_from,
+        "request_id": entry.request_id,
         "after_success": entry.after_success,
+        "after_complete": entry.after_complete,
+        "after_result": entry.after_result,
+        "after_result_states": list(entry.after_result_states),
+        "result_state": jobs_mod.effective_result_state(entry),
         "rerun_of": entry.rerun_of,
         "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
         "rerun_snapshot_changed": entry.rerun_snapshot_changed,
@@ -7869,8 +8892,11 @@ def info(
         "exit_code": entry.exit_code,
         "session": entry.session,
         "job_dir": entry.job_dir,
+        "paths": _job_path_contract(cfg, entry),
         "outputs_size": live.get("outputs_size"),
         "env_hash": entry.env_hash,
+        "env_mode": entry.env_mode or "sync",
+        "env_source_job": entry.env_source_job,
         "setup_inputs": entry.setup_inputs,
         "extras": entry.extras,
         "boot_id": entry.boot_id,
@@ -7918,6 +8944,7 @@ def info(
         "killed": "yellow",
         "lost": "red",
         "failed": "bold red",
+        "skipped": "yellow",
     }.get(entry.status, "white")
     status_txt = f"[{style}]{entry.status}[/{style}]"
     if entry.reason:
@@ -7943,6 +8970,10 @@ def info(
         ("ref", escape(display_ref)),
         ("job id", escape(entry.job_id)),
         ("status", status_txt),
+        (
+            "result",
+            jobs_mod.effective_result_state(entry) or "-",
+        ),
         (
             "where",
             f"{escape(entry.center)} / {escape(entry.node)}"
@@ -8089,6 +9120,23 @@ def info(
             (
                 "after success",
                 display_refs.get(entry.after_success, entry.after_success),
+            ),
+        )
+    if entry.after_complete:
+        rows.insert(
+            7,
+            (
+                "after complete",
+                display_refs.get(entry.after_complete, entry.after_complete),
+            ),
+        )
+    if entry.after_result:
+        rows.insert(
+            7,
+            (
+                "after result",
+                f"{display_refs.get(entry.after_result, entry.after_result)} in "
+                f"[{', '.join(entry.after_result_states)}]",
             ),
         )
     if entry.rerun_of:
@@ -8256,6 +9304,7 @@ COMPARE_REQUIRED_VALUES = {
 COMPARE_METRIC_SEPARATOR = "::"
 COMPARE_JOB_METRIC_SOURCE = "@job"
 COMPARE_JOB_METRICS = {"duration_s"}
+COMPARE_METRIC_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _compare_payload(entries: list[jobs_mod.JobEntry]) -> JsonDict:
@@ -8374,6 +9423,7 @@ import glob
 import json
 import math
 import os
+import stat
 import sys
 
 root = os.path.expanduser({root!r})
@@ -8387,8 +9437,35 @@ if len(matches) != 1:
     }}))
     sys.exit(4 if not matches else 1)
 try:
-    with open(matches[0], encoding="utf-8") as handle:
-        value = json.load(handle)
+    path = matches[0]
+    root_real = os.path.realpath(root)
+    path_real = os.path.realpath(path)
+    if os.path.commonpath([root_real, path_real]) != root_real:
+        raise ValueError("metric artifact resolves outside outputs/")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("metric artifact is not a regular file")
+        if before.st_size > {COMPARE_METRIC_MAX_BYTES}:
+            raise ValueError("metric artifact exceeds the {COMPARE_METRIC_MAX_BYTES:,}-byte limit")
+        raw = bytearray()
+        while len(raw) <= {COMPARE_METRIC_MAX_BYTES}:
+            chunk = os.read(descriptor, min(65536, {COMPARE_METRIC_MAX_BYTES} + 1 - len(raw)))
+            if not chunk:
+                break
+            raw.extend(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if len(raw) > {COMPARE_METRIC_MAX_BYTES}:
+        raise ValueError("metric artifact exceeds the {COMPARE_METRIC_MAX_BYTES:,}-byte limit")
+    before_identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+    after_identity = (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+    if before_identity != after_identity or len(raw) != after.st_size:
+        raise ValueError("metric artifact changed while being read")
+    value = json.loads(bytes(raw).decode("utf-8"))
     for component in {field!r}.split("."):
         value = value[component]
 except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
@@ -9143,7 +10220,7 @@ def watch(
             json_=False,
         )
     refs = _job_refs(refs, file, operation="watch", json_=json_)
-    if poll <= 0 or lines <= 0:
+    if not math.isfinite(poll) or poll <= 0 or lines <= 0:
         _fail_submission(
             kind="invalid_argument",
             message="--poll and --lines must be positive",
@@ -9218,7 +10295,7 @@ def watch(
             exit_code=1,
             json_=json_,
         )
-    terminal = {"finished", "killed", "lost", "failed"}
+    terminal = {"finished", "killed", "lost", "failed", "skipped"}
     completion_signals = CompletionSignals() if completion_wake else None
 
     def pause(current: list[jobs_mod.JobEntry]) -> None:
@@ -9422,15 +10499,22 @@ def rerun(
         None, "-n", "--name", help="new job name (default: same as before)"
     ),
     no_queue: bool = typer.Option(False, "--no-queue"),
+    request_id: Optional[str] = typer.Option(
+        None,
+        "--request-id",
+        help="retry-safe identity for this rerun",
+    ),
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
     """Resubmit once: same command/GPUs/pins, today's project code."""
+    _validate_submission_request_id(request_id, json_=json_)
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         _, head = _locate(cfg, ref, json_=json_)  # rerun goes to the center that ran it
         route = (
             HeadCommand.start(head, "rerun", ref)
             .option("-n", name or None)
+            .option("--request-id", request_id or None)
             .flag("--no-queue", no_queue)
             .flag("--json", json_)
         )
@@ -9440,6 +10524,7 @@ def rerun(
             action="rerun",
             recovery_label=(f"name {name!r}" if name else f"a new rerun of {ref!r}"),
             json_=json_,
+            request_id=request_id,
         )
         raise typer.Exit(rc)
 
@@ -9461,6 +10546,7 @@ def rerun(
             json_=json_,
         )
     spec = spec_from_entry(old, name)
+    spec.request_id = request_id
     err.print(
         f"[dim]rerun source: {escape(old.name)} · ref {escape(old_display_ref)}[/dim]"
     )
@@ -9477,6 +10563,28 @@ def rerun(
             failure_log,
             json_=json_,
             exit_code=EXIT_ENV,
+        )
+    except RequestConflict as e:
+        _fail_submission(
+            kind="idempotency_conflict",
+            message=str(e),
+            exit_code=1,
+            json_=json_,
+        )
+    except RequestOutcomeUnknown as e:
+        _fail_submission(
+            kind="submission_unknown",
+            message=str(e),
+            reasons={"request_id": e.request_id, "job_id": e.job_id},
+            exit_code=EXIT_UNREACHABLE,
+            json_=json_,
+        )
+    except RequestRejected as e:
+        _fail_submission(
+            kind="submission_rejected",
+            message=str(e),
+            exit_code=EXIT_ENV,
+            json_=json_,
         )
     except NoReachableNode as e:
         _fail_submission(
@@ -9511,6 +10619,11 @@ def rerun(
         print(json.dumps(_submission_payload(entry)))
     else:
         display_ref = _display_ref_for_entry(cfg, entry)
+        if getattr(entry, "_request_replayed", False):
+            err.print(
+                f"[cyan]replayed durable request[/cyan] "
+                f"{escape(entry.request_id or '')} · no new job created"
+            )
         if entry.status == "queued":
             err.print(
                 f"[cyan]queued[/cyan] {escape(entry.name)} · "
@@ -9549,6 +10662,196 @@ def rerun(
 
 
 # --------------------------------------------------------------------------
+# exact-snapshot / exact-environment diagnostic execution
+# --------------------------------------------------------------------------
+
+
+def exec_job(
+    ctx: typer.Context,
+    ref: str = REF_ARG,
+    gpus: int = typer.Option(
+        0,
+        "-g",
+        "--gpus",
+        help="GPUs needed by the diagnostic (default: CPU-only)",
+    ),
+    name: Optional[str] = typer.Option(
+        None,
+        "-n",
+        "--name",
+        help="new job name (default: <source-name>-exec)",
+    ),
+    request_id: Optional[str] = typer.Option(
+        None,
+        "--request-id",
+        help="retry-safe caller identity; reuse returns the original job",
+    ),
+    no_queue: bool = typer.Option(False, "--no-queue"),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Run a command in REF's exact snapshot and existing environment."""
+    command = list(ctx.args)
+    while command and command[0] == "--":
+        command = command[1:]
+    if not command or not any(part.strip() for part in command):
+        _fail_submission(
+            kind="invalid_argument",
+            message="no command; usage: dt exec REF [opts] -- python diagnose.py",
+            exit_code=1,
+            json_=json_,
+        )
+    if gpus < 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--gpus must be non-negative",
+            exit_code=1,
+            json_=json_,
+        )
+    _validate_submission_request_id(request_id, json_=json_)
+
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref, json_=json_)
+        route = (
+            HeadCommand.start(head, "exec", ref)
+            .option("-g", gpus)
+            .option("-n", name or None)
+            .option("--request-id", request_id or None)
+            .flag("--no-queue", no_queue)
+            .flag("--json", json_)
+            .passthrough(command)
+        )
+        recovery = (
+            f"request id {request_id!r} (`dt request {request_id} --json`)"
+            if request_id
+            else f"an environment exec of {ref!r}"
+        )
+        rc, _job_id = _forward_laptop_submission(
+            route.head,
+            route.argv(),
+            action="exec",
+            recovery_label=recovery,
+            json_=json_,
+            request_id=request_id,
+        )
+        raise typer.Exit(rc)
+
+    from . import dispatch as dispatch_mod
+
+    source = _find_or_die(cfg, ref)
+    try:
+        spec = dispatch_mod.environment_reuse_spec_from_entry(
+            source,
+            cmd=command,
+            name=name,
+            gpus=gpus,
+            request_id=request_id,
+        )
+    except ConfigError as exc:
+        _fail_submission(
+            kind="environment",
+            message=str(exc),
+            exit_code=EXIT_ENV,
+            json_=json_,
+        )
+
+    def log(message: str) -> None:
+        err.print(f"[dim]{escape(message)}[/dim]")
+
+    try:
+        entry = dispatch_mod.submit_fork(
+            cfg,
+            source,
+            spec,
+            log,
+            no_queue=no_queue,
+        )
+    except FailedBeforeStart as exc:
+        _emit_failed_start(
+            exc.entry,
+            _maybe_read_failed_start_log(exc.entry),
+            json_=json_,
+            exit_code=EXIT_ENV,
+        )
+    except RequestConflict as exc:
+        _fail_submission(
+            kind="idempotency_conflict",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    except RequestOutcomeUnknown as exc:
+        _fail_submission(
+            kind="submission_unknown",
+            message=str(exc),
+            reasons={"request_id": exc.request_id, "job_id": exc.job_id},
+            exit_code=EXIT_UNREACHABLE,
+            json_=json_,
+        )
+    except RequestRejected as exc:
+        _fail_submission(
+            kind="submission_rejected",
+            message=str(exc),
+            exit_code=EXIT_ENV,
+            json_=json_,
+        )
+    except NoReachableNode as exc:
+        _fail_submission(
+            kind="unreachable",
+            message="source node is unreachable",
+            reasons=exc.reasons,
+            exit_code=EXIT_UNREACHABLE,
+            json_=json_,
+        )
+    except NoCapacity as exc:
+        _fail_submission(
+            kind="no_capacity",
+            message="source node cannot take the diagnostic job",
+            reasons=exc.reasons,
+            exit_code=EXIT_NO_GPU,
+            json_=json_,
+        )
+    except (DispatchError, ConfigError) as exc:
+        _fail_submission(
+            kind="environment",
+            message=str(exc),
+            exit_code=EXIT_ENV,
+            json_=json_,
+        )
+
+    agent_started = None
+    if entry.status == "queued":
+        from . import agent as agent_mod
+
+        if agent_mod.alive_pid(cfg) is None:
+            agent_started = agent_mod.start_detached(cfg)
+    if json_:
+        payload = _submission_payload(
+            entry,
+            exec_of=source.job_id,
+            exact_snapshot=True,
+            project_sync=False,
+            environment_sync=False,
+        )
+        if agent_started is not None:
+            payload["agent_started"] = agent_started
+        print(json.dumps(payload))
+        return
+
+    display_ref = _display_ref_for_entry(cfg, entry)
+    state = "queued" if entry.status == "queued" else "started"
+    style = "cyan" if entry.status == "queued" else "green"
+    err.print(
+        f"[{style}]{state}[/{style}] {escape(entry.name)} · "
+        f"exact environment {(entry.env_hash or 'unknown')[:12]} from "
+        f"{escape(_display_ref_for_entry(cfg, source))}"
+    )
+    err.print("[dim]project sync off · environment sync off[/dim]")
+    err.print(f"[dim]next: dt watch {escape(display_ref)}[/dim]")
+    print(entry.job_id)
+
+
+# --------------------------------------------------------------------------
 # exact-snapshot fork
 # --------------------------------------------------------------------------
 
@@ -9569,6 +10872,8 @@ def _fork_repeat_receipt(
     agent_started: bool | None,
     error: JsonDict | None,
     exit_code: int,
+    request_id: str | None = None,
+    idempotent_replay: bool = False,
 ) -> JsonDict:
     interrupted = (
         isinstance(error, dict)
@@ -9622,6 +10927,9 @@ def _fork_repeat_receipt(
         "jobs": rows,
         "exit_code": exit_code,
     }
+    if request_id is not None:
+        receipt["request_id"] = request_id
+        receipt["idempotent_replay"] = idempotent_replay
     if cold_cache_env:
         receipt["cold_cache"] = {
             "env_var": cold_cache_env,
@@ -9698,7 +11006,17 @@ def _forward_laptop_fork_repeat(
     ref: str,
     name_prefix: str,
     json_: bool,
+    request_id: str | None = None,
 ) -> int:
+    recovery = (
+        f"Retry the exact command with --request-id {request_id!r}, or query "
+        f"`dt request {request_id} --json`."
+        if request_id is not None
+        else (
+            "Do not resubmit blindly; inspect `dt ps -w` for prefix "
+            f"{name_prefix!r} or source ref {ref!r}."
+        )
+    )
     try:
         rc, captured = forward_capture_stdout(
             head,
@@ -9710,8 +11028,7 @@ def _forward_laptop_fork_repeat(
         _fail_submission(
             kind="fork_repeat_submission_unknown",
             message=(
-                "fork repeat submission interrupted; outcome unknown. Do not "
-                f"resubmit blindly; inspect `dt ps -w` for prefix {name_prefix!r}."
+                f"fork repeat submission interrupted; outcome unknown. {recovery}"
             ),
             exit_code=130,
             json_=json_,
@@ -9737,8 +11054,7 @@ def _forward_laptop_fork_repeat(
             kind="fork_repeat_submission_unknown",
             message=(
                 "link ended before a complete fork-repeat receipt arrived; "
-                "outcome unknown. Do not resubmit blindly; inspect `dt ps -w` "
-                f"for prefix {name_prefix!r} or source ref {ref!r}."
+                f"outcome unknown. {recovery}"
             ),
             exit_code=EXIT_UNREACHABLE if rc == 255 else 130,
             json_=json_,
@@ -9752,6 +11068,394 @@ def _forward_laptop_fork_repeat(
         exit_code=1,
         json_=json_,
     )
+
+
+def _run_fork_repeat(
+    *,
+    cfg: HeadConfig,
+    old: jobs_mod.JobEntry,
+    source: jobs_mod.JobEntry,
+    spec: RunSpec,
+    build_spec: Callable[[str | None], RunSpec],
+    log: Callable[[str], None],
+    prefix: str,
+    repeat: int,
+    request_id: str | None,
+    command: list[str],
+    reuse_cache: str | None,
+    clone_cache: str | None,
+    cache_env: str,
+    inherit_cache: bool,
+    artifact_manifest: str | None,
+    max_hours: float | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+    cold_cache_env: str | None,
+    json_: bool,
+) -> None:
+    """Submit or reconcile a durable same-node fork group."""
+    from . import dispatch as dispatch_mod
+
+    entries: list[jobs_mod.JobEntry] = []
+    failure: JsonDict | None = None
+    failure_code = 0
+    group_record: group_mod.GroupRequestRecord | None = None
+    group_terminal_replay = False
+    group_intent_sha256: str | None = None
+    if request_id is not None:
+        group_intent_sha256 = intent_mod.canonical_intent(
+            {
+                "schema": group_mod.GROUP_REQUEST_SCHEMA,
+                "operation": "fork_repeat",
+                "center": cfg.center,
+                "repeat_ref_job_id": old.job_id,
+                "source_job_id": source.job_id,
+                "source_snapshot_sha256": source.snapshot_sha256,
+                "command": command,
+                "name_prefix": prefix,
+                "repeat": repeat,
+                "reuse_cache": reuse_cache,
+                "clone_cache": clone_cache,
+                "cache_env": cache_env,
+                "inherit_cache": inherit_cache,
+                "artifact_manifest": artifact_manifest,
+                "max_hours": max_hours,
+                "max_vram_mib": max_vram_mib,
+                "max_job_memory_mib": max_job_memory_mib,
+            }
+        )
+        try:
+            group_record = group_mod.locked_claim(
+                cfg,
+                request_id,
+                group_intent_sha256,
+                operation="fork_repeat",
+                requested=repeat,
+            )
+            entries = group_mod.load_entries_or_fail(cfg, group_record)
+            if group_record.state == "confirmed":
+                group_terminal_replay = True
+                failure = _group_failure(group_record)
+                failure_code = group_record.exit_code or 0
+        except group_mod.GroupRequestConflict as exc:
+            failure = {
+                "kind": "idempotency_conflict",
+                "message": str(exc),
+                "reasons": {"request_id": request_id},
+                "exit_code": 1,
+            }
+            failure_code = 1
+        except intent_mod.RequestLockError as exc:
+            failure = {
+                "kind": "submission_rejected",
+                "message": (
+                    f"request {request_id!r} was not advanced because its "
+                    f"durable lock could not be acquired: {exc}"
+                ),
+                "reasons": {"request_id": request_id},
+                "exit_code": EXIT_ENV,
+            }
+            failure_code = EXIT_ENV
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} has unreadable durable group "
+                    "state; refusing to submit any additional jobs"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+    agent_started: bool | None = None
+    agent_checked = False
+
+    def ensure_agent(repeat_entry: jobs_mod.JobEntry) -> None:
+        nonlocal agent_checked, agent_started
+        if repeat_entry.status != "queued" or agent_checked:
+            return
+        from . import agent as agent_mod
+
+        agent_checked = True
+        if agent_mod.alive_pid(cfg) is None:
+            agent_started = agent_mod.start_detached(cfg)
+
+    for existing_entry in entries:
+        ensure_agent(existing_entry)
+        if not json_:
+            print(existing_entry.job_id, flush=True)
+
+    if group_terminal_replay and entries:
+        if request_id is None:
+            _fail_submission(
+                kind="submission_unknown",
+                message="terminal fork receipt has no durable request identity",
+                exit_code=EXIT_UNREACHABLE,
+                json_=json_,
+            )
+        try:
+            replay_spec = build_spec(f"{prefix}-001")
+            replay_spec.request_id = group_mod.item_request_id(request_id, 1)
+            verified_entry = dispatch_mod.submit_fork(
+                cfg,
+                source,
+                replay_spec,
+                log,
+                force_queue=False,
+                force_queue_label="fork repeat",
+            )
+            if verified_entry.job_id != entries[0].job_id:
+                raise group_mod.GroupRequestError(
+                    "terminal group replay resolved to a different first job"
+                )
+        except FailedBeforeStart as exc:
+            if exc.entry.job_id != entries[0].job_id:
+                failure = {
+                    "kind": "submission_unknown",
+                    "message": (
+                        f"request {request_id!r} terminal receipt resolved "
+                        "to a different failed first job"
+                    ),
+                    "reasons": {"request_id": request_id},
+                    "exit_code": EXIT_UNREACHABLE,
+                }
+                failure_code = EXIT_UNREACHABLE
+                group_terminal_replay = False
+        except (
+            NoReachableNode,
+            NoCapacity,
+            DispatchError,
+            ConfigError,
+        ) as exc:
+            failure, failure_code, _failed_entry = _batch_error(
+                exc,
+                item_label="fork repeat replay",
+            )
+            group_terminal_replay = False
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} terminal receipt could not be "
+                    "verified without risking a duplicate"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+            group_terminal_replay = False
+
+    for index in range(len(entries) + 1, repeat + 1):
+        if failure is not None or group_terminal_replay:
+            break
+        item_spec = spec if index == 1 else build_spec(f"{prefix}-{index:03d}")
+        item_spec.request_id = (
+            group_mod.item_request_id(request_id, index)
+            if request_id is not None
+            else None
+        )
+
+        def item_log(message: str, *, item: int = index) -> None:
+            err.print(f"[dim]fork repeat {item}/{repeat}: {escape(message)}[/dim]")
+
+        try:
+            entry = dispatch_mod.submit_fork(
+                cfg,
+                source,
+                item_spec,
+                item_log,
+                force_queue=index > 1,
+                force_queue_label="fork repeat",
+            )
+            if request_id is not None and group_intent_sha256 is not None:
+                group_record = group_mod.locked_record_job(
+                    cfg,
+                    request_id,
+                    intent_sha256=group_intent_sha256,
+                    index=index,
+                    job_id=entry.job_id,
+                )
+        except KeyboardInterrupt:
+            confirmed = len(entries)
+            noun = "registration" if confirmed == 1 else "registrations"
+            failure = {
+                "kind": "fork_repeat_submission_interrupted",
+                "message": (
+                    "fork repeat submission interrupted after "
+                    f"{confirmed} confirmed {noun}; item {index} outcome "
+                    "unknown. Confirmed jobs were not cancelled. "
+                    + (
+                        f"Retry the same command with --request-id "
+                        f"{request_id!r} to reconcile this exact item."
+                        if request_id is not None
+                        else "Do not resubmit blindly; inspect `dt ps -w` "
+                        f"for prefix {prefix!r}."
+                    )
+                ),
+                "reasons": {},
+                "exit_code": 130,
+                "confirmed_submitted": confirmed,
+                "uncertain_repeat_index": index,
+            }
+            failure_code = 130
+            break
+        except (
+            FailedBeforeStart,
+            NoReachableNode,
+            NoCapacity,
+            DispatchError,
+            ConfigError,
+        ) as exc:
+            failure, failure_code, failed_entry = _batch_error(
+                exc,
+                item_label="fork repeat item",
+            )
+            if failed_entry is not None:
+                if request_id is not None and group_intent_sha256 is not None:
+                    try:
+                        group_record = group_mod.locked_record_job(
+                            cfg,
+                            request_id,
+                            intent_sha256=group_intent_sha256,
+                            index=index,
+                            job_id=failed_entry.job_id,
+                        )
+                    except (
+                        OSError,
+                        ValueError,
+                        intent_mod.RequestRecordError,
+                        group_mod.GroupRequestError,
+                    ) as persistence_exc:
+                        failure = {
+                            "kind": "submission_unknown",
+                            "message": (
+                                f"job {failed_entry.job_id} was registered "
+                                f"but request {request_id!r} progress could "
+                                "not be persisted"
+                            ),
+                            "reasons": {
+                                "request_id": request_id,
+                                "job_id": failed_entry.job_id,
+                                "detail": str(persistence_exc),
+                            },
+                            "exit_code": EXIT_UNREACHABLE,
+                        }
+                        failure_code = EXIT_UNREACHABLE
+                entries.append(failed_entry)
+                ensure_agent(failed_entry)
+                if not json_:
+                    print(failed_entry.job_id, flush=True)
+            break
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"fork repeat item {index} did not produce a complete "
+                    "durable group receipt; retry only with the same "
+                    "request id"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+            break
+        entries.append(entry)
+        ensure_agent(entry)
+        if not json_:
+            print(entry.job_id, flush=True)
+
+    if (
+        request_id is not None
+        and group_record is not None
+        and group_intent_sha256 is not None
+        and not group_terminal_replay
+    ):
+        uncertain = bool(
+            failure
+            and failure.get("kind")
+            in {
+                "fork_repeat_submission_interrupted",
+                "submission_unknown",
+                "idempotency_conflict",
+            }
+        )
+        try:
+            group_record = group_mod.locked_transition(
+                cfg,
+                request_id,
+                intent_sha256=group_intent_sha256,
+                state="uncertain" if uncertain else "confirmed",
+                exit_code=None if uncertain else failure_code,
+                error_kind=(str(failure["kind"]) if failure is not None else None),
+                error_message=(
+                    str(failure.get("message")) if failure is not None else None
+                ),
+            )
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} did not produce a durable final "
+                    "group receipt; retry only with the same request id"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+
+    cache_mode = (
+        "inherited"
+        if inherit_cache
+        else "isolated_clone"
+        if clone_cache
+        else "explicit"
+        if reuse_cache
+        else "job_local_cold"
+        if cold_cache_env
+        else "none"
+    )
+    receipt = _fork_repeat_receipt(
+        old=old,
+        source=source,
+        name_prefix=prefix,
+        requested=repeat,
+        entries=entries,
+        display_refs=_display_refs_for_entries(cfg, entries),
+        cache_mode=cache_mode,
+        cold_cache_env=cold_cache_env,
+        agent_started=agent_started,
+        error=failure,
+        exit_code=failure_code,
+        request_id=request_id,
+        idempotent_replay=group_terminal_replay,
+    )
+    if json_:
+        print(json.dumps(receipt))
+    else:
+        _emit_fork_repeat_human(receipt, emit_job_ids=False)
+    if failure_code:
+        raise typer.Exit(failure_code)
+    return
 
 
 def fork(
@@ -9821,12 +11525,19 @@ def fork(
     no_queue: bool = typer.Option(
         False, "--no-queue", rich_help_panel="Scheduling & safety"
     ),
+    request_id: Optional[str] = typer.Option(
+        None,
+        "--request-id",
+        help="retry-safe identity for this fork or complete repeat group",
+        rich_help_panel="Reliability",
+    ),
     json_: bool = typer.Option(False, "--json", rich_help_panel="Output"),
 ) -> None:
     """Fork exact code; --repeat N preloads a same-node FIFO runway."""
     command = list(ctx.args)
     while command and command[0] == "--":
         command = command[1:]
+    _validate_submission_request_id(request_id, json_=json_)
     if max_hours is not None and (not math.isfinite(max_hours) or max_hours <= 0):
         _fail_submission(
             kind="invalid_argument",
@@ -9905,6 +11616,7 @@ def fork(
             .option("--max-hours", max_hours)
             .option("--max-vram-mib", max_vram_mib)
             .option("--max-job-memory-mib", max_job_memory_mib)
+            .option("--request-id", request_id or None)
             .flag("--no-queue", no_queue)
             .flag("--json", json_)
         )
@@ -9920,6 +11632,7 @@ def fork(
                     ref=ref,
                     name_prefix=prefix,
                     json_=json_,
+                    request_id=request_id,
                 )
             )
         rc, _job_id = _forward_laptop_submission(
@@ -9928,6 +11641,7 @@ def fork(
             action="fork",
             recovery_label=(f"name {name!r}" if name else f"a new fork of {ref!r}"),
             json_=json_,
+            request_id=request_id,
         )
         raise typer.Exit(rc)
 
@@ -10021,6 +11735,8 @@ def fork(
     first_name = name if repeat == 1 else f"{prefix}-001"
     try:
         spec = build_spec(first_name)
+        if repeat == 1:
+            spec.request_id = request_id
     except ConfigError as exc:
         _fail_submission(
             kind="environment",
@@ -10052,108 +11768,28 @@ def fork(
         err.print(f"[dim]{escape(msg)}[/dim]")
 
     if repeat > 1:
-        entries: list[jobs_mod.JobEntry] = []
-        failure: JsonDict | None = None
-        failure_code = 0
-        agent_started: bool | None = None
-        agent_checked = False
-
-        def ensure_agent(repeat_entry: jobs_mod.JobEntry) -> None:
-            nonlocal agent_checked, agent_started
-            if repeat_entry.status != "queued" or agent_checked:
-                return
-            from . import agent as agent_mod
-
-            agent_checked = True
-            if agent_mod.alive_pid(cfg) is None:
-                agent_started = agent_mod.start_detached(cfg)
-
-        for index in range(1, repeat + 1):
-            item_spec = spec if index == 1 else build_spec(f"{prefix}-{index:03d}")
-
-            def item_log(message: str, *, item: int = index) -> None:
-                err.print(f"[dim]fork repeat {item}/{repeat}: {escape(message)}[/dim]")
-
-            try:
-                entry = dispatch_mod.submit_fork(
-                    cfg,
-                    source,
-                    item_spec,
-                    item_log,
-                    force_queue=index > 1,
-                    force_queue_label="fork repeat",
-                )
-            except KeyboardInterrupt:
-                confirmed = len(entries)
-                noun = "registration" if confirmed == 1 else "registrations"
-                failure = {
-                    "kind": "fork_repeat_submission_interrupted",
-                    "message": (
-                        "fork repeat submission interrupted after "
-                        f"{confirmed} confirmed {noun}; item {index} outcome "
-                        "unknown. Confirmed jobs were not cancelled. Do not "
-                        "resubmit blindly; inspect `dt ps -w` for prefix "
-                        f"{prefix!r}."
-                    ),
-                    "reasons": {},
-                    "exit_code": 130,
-                    "confirmed_submitted": confirmed,
-                    "uncertain_repeat_index": index,
-                }
-                failure_code = 130
-                break
-            except (
-                FailedBeforeStart,
-                NoReachableNode,
-                NoCapacity,
-                DispatchError,
-                ConfigError,
-            ) as exc:
-                failure, failure_code, failed_entry = _batch_error(
-                    exc,
-                    item_label="fork repeat item",
-                )
-                if failed_entry is not None:
-                    entries.append(failed_entry)
-                    ensure_agent(failed_entry)
-                    if not json_:
-                        print(failed_entry.job_id, flush=True)
-                break
-            entries.append(entry)
-            ensure_agent(entry)
-            if not json_:
-                print(entry.job_id, flush=True)
-
-        cache_mode = (
-            "inherited"
-            if inherit_cache
-            else "isolated_clone"
-            if clone_cache
-            else "explicit"
-            if reuse_cache
-            else "job_local_cold"
-            if cold_cache_env
-            else "none"
-        )
-        receipt = _fork_repeat_receipt(
+        _run_fork_repeat(
+            cfg=cfg,
             old=old,
             source=source,
-            name_prefix=prefix,
-            requested=repeat,
-            entries=entries,
-            display_refs=_display_refs_for_entries(cfg, entries),
-            cache_mode=cache_mode,
+            spec=spec,
+            build_spec=build_spec,
+            log=log,
+            prefix=prefix,
+            repeat=repeat,
+            request_id=request_id,
+            command=command,
+            reuse_cache=reuse_cache,
+            clone_cache=clone_cache,
+            cache_env=cache_env,
+            inherit_cache=inherit_cache,
+            artifact_manifest=artifact_manifest,
+            max_hours=max_hours,
+            max_vram_mib=max_vram_mib,
+            max_job_memory_mib=max_job_memory_mib,
             cold_cache_env=cold_cache_env,
-            agent_started=agent_started,
-            error=failure,
-            exit_code=failure_code,
+            json_=json_,
         )
-        if json_:
-            print(json.dumps(receipt))
-        else:
-            _emit_fork_repeat_human(receipt, emit_job_ids=False)
-        if failure_code:
-            raise typer.Exit(failure_code)
         return
 
     try:
@@ -10165,6 +11801,28 @@ def fork(
             failure_log,
             json_=json_,
             exit_code=EXIT_ENV,
+        )
+    except RequestConflict as exc:
+        _fail_submission(
+            kind="idempotency_conflict",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    except RequestOutcomeUnknown as exc:
+        _fail_submission(
+            kind="submission_unknown",
+            message=str(exc),
+            reasons={"request_id": exc.request_id, "job_id": exc.job_id},
+            exit_code=EXIT_UNREACHABLE,
+            json_=json_,
+        )
+    except RequestRejected as exc:
+        _fail_submission(
+            kind="submission_rejected",
+            message=str(exc),
+            exit_code=EXIT_ENV,
+            json_=json_,
         )
     except NoReachableNode as exc:
         _fail_submission(
@@ -10212,6 +11870,11 @@ def fork(
         return
 
     display_ref = _display_ref_for_entry(cfg, entry)
+    if getattr(entry, "_request_replayed", False):
+        err.print(
+            f"[cyan]replayed durable request[/cyan] "
+            f"{escape(entry.request_id or '')} · no new job created"
+        )
     if entry.status == "queued":
         agent_note = " · agent started" if agent_started else ""
         err.print(
@@ -10297,6 +11960,13 @@ def _validated_retries(
         _fail_submission(
             kind="invalid_argument",
             message=f"{operation} --retries must be non-negative",
+            exit_code=1,
+            json_=json_,
+        )
+    if retries > MAX_TRANSFER_RETRIES:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(f"{operation} --retries must be at most {MAX_TRANSFER_RETRIES}"),
             exit_code=1,
             json_=json_,
         )
@@ -10490,6 +12160,44 @@ def _pull_unlocked(
             else cfg.job_results_dir(entry.job_id)
         )
     )
+    if dst.is_symlink():
+        fail(
+            "destination_conflict",
+            f"{dst} is a symbolic link; choose its resolved directory explicitly",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+            existing_job_id=None,
+        )
+    records_dir = dst / "dt"
+    try:
+        existing_records_info = records_dir.lstat()
+    except FileNotFoundError:
+        existing_records_info = None
+    except OSError as exc:
+        fail(
+            "destination_conflict",
+            f"cannot inspect {records_dir}: {exc}",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+            existing_job_id=None,
+        )
+    if existing_records_info is not None and (
+        stat.S_ISLNK(existing_records_info.st_mode)
+        or not stat.S_ISDIR(existing_records_info.st_mode)
+    ):
+        fail(
+            "destination_conflict",
+            f"{records_dir} is not a safe directory for DT-owned records",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+            existing_job_id=None,
+        )
     existing_record = dst / "dt" / "job.json"
     if not force and dst.exists():
         if not dst.is_dir():
@@ -10504,13 +12212,24 @@ def _pull_unlocked(
             )
         if existing_record.is_file():
             try:
-                existing_data = json.loads(existing_record.read_text())
+                existing_result = read_bounded_regular(
+                    existing_record,
+                    max_bytes=LOCAL_JOB_RECORD_MAX_BYTES,
+                )
+                if existing_result is None:
+                    raise PrivateStateError("local job record disappeared")
+                existing_data = json.loads(existing_result[0])
                 existing_job_id = (
                     existing_data.get("job_id")
                     if isinstance(existing_data, dict)
                     else None
                 )
-            except (OSError, json.JSONDecodeError):
+            except (
+                PrivateStateError,
+                TypeError,
+                UnicodeError,
+                json.JSONDecodeError,
+            ):
                 existing_job_id = None
             if existing_job_id != entry.job_id:
                 message = (
@@ -10596,17 +12315,46 @@ def _pull_unlocked(
     if outputs_present:
         remote_outputs_bytes = _pull_outputs_probe_bytes(check.stdout)
     dst.mkdir(parents=True, exist_ok=True)
-    records_dir = dst / "dt"
     records_dir.mkdir(parents=True, exist_ok=True)
-    record_path = records_dir / "job.json"
-    record_tmp = records_dir / f".job.json.{os.getpid()}.tmp"
     try:
-        record_tmp.write_text(
-            json.dumps(_pull_job_record(entry), indent=2, sort_keys=True) + "\n"
+        records_info = records_dir.lstat()
+    except OSError as exc:
+        fail(
+            "destination_unusable",
+            f"cannot inspect local records directory {records_dir}: {exc}",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
         )
-        os.replace(record_tmp, record_path)
-    finally:
-        record_tmp.unlink(missing_ok=True)
+    if stat.S_ISLNK(records_info.st_mode) or not stat.S_ISDIR(records_info.st_mode):
+        fail(
+            "destination_unusable",
+            f"{records_dir} is not a safe records directory",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+        )
+    record_path = records_dir / "job.json"
+    try:
+        record_payload = (
+            json.dumps(_pull_job_record(entry), indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        if len(record_payload) > LOCAL_JOB_RECORD_MAX_BYTES:
+            raise PrivateStateError(
+                f"local record exceeds its size limit: {record_path}"
+            )
+        atomic_write_regular(record_path, record_payload)
+    except PrivateStateError as exc:
+        fail(
+            "destination_unusable",
+            str(exc),
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+        )
     records = ["dt/job.json"]
     cancel_kwargs: _RsyncCancelKwargs = (
         {"cancel_event": _cancel_event} if _cancel_event is not None else {}
@@ -11310,6 +13058,7 @@ def _kill_one(
                 entry = current
             if entry.status == "queued":
                 entry.status = "killed"
+                entry.result_state = "cancelled"
                 entry.finished_at = time.time()
                 entry.reason = "dequeued by user"
                 jobs_mod.save(cfg, entry)
@@ -11352,19 +13101,26 @@ def _kill_one(
         # escaped it with setpgrp, then require a positive death verdict.  An
         # uncertain launch has no known PGID, so also leave the launch sentinel
         # and close its tmux session while the procfs cwd scan finds survivors.
-        probe = termination_probe(
-            entry.job_dir,
-            entry.pgid,
-            sig,
-            session=entry.session if uncertain_launch else None,
-            cancel_sentinel=uncertain_launch,
-            layout=entry.storage_layout,
-        )
         target = (
             f"uncertain launch {entry.job_id}"
             if uncertain_launch
             else f"group {entry.pgid}"
         )
+        try:
+            probe = termination_probe(
+                entry.job_dir,
+                entry.pgid,
+                sig,
+                boot_id=entry.boot_id,
+                job_id=entry.job_id,
+                session=entry.session if uncertain_launch else None,
+                cancel_sentinel=uncertain_launch,
+                layout=entry.storage_layout,
+            )
+        except ValueError as exc:
+            message = f"could not verify death of {target} on {entry.node}: {exc}"
+            err.print(f"[red]{escape(message)}[/red]")
+            return finish("unverified", "unverified", entry, message)
         try:
             proc = run_on(entry.node, entry.node_local, probe, timeout=20)
         except (RemoteError, subprocess.TimeoutExpired, OSError) as e:
@@ -11401,6 +13157,7 @@ def _kill_one(
             return finish("alive", "survived", entry, message)
         previous_reason = entry.reason
         entry.status = "killed"
+        entry.result_state = "cancelled"
         entry.finished_at = time.time()
         if uncertain_launch:
             entry.reason = (
@@ -11569,40 +13326,86 @@ def kill(
     raise typer.Exit(1)
 
 
+@dataclass(frozen=True)
+class _ManagedResult:
+    job_id: str
+    path: Path
+    device: int
+    inode: int
+
+
+def _managed_result_evidence(root: Path, result_dir: Path) -> _ManagedResult:
+    """Read a managed-result identity without following path-component links."""
+    relative = result_dir.relative_to(root)
+    if not relative.parts:
+        raise PrivateStateError("managed result cannot be the results root")
+    cursor = root
+    result_info: os.stat_result | None = None
+    for part in relative.parts:
+        cursor = cursor / part
+        info = cursor.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise PrivateStateError(f"managed result path contains a symlink: {cursor}")
+        result_info = info
+    if result_info is None or not stat.S_ISDIR(result_info.st_mode):
+        raise PrivateStateError(f"managed result is not a directory: {result_dir}")
+    if not result_dir.resolve().is_relative_to(root.resolve()):
+        raise PrivateStateError(
+            f"managed result escapes the results root: {result_dir}"
+        )
+    record = result_dir / "dt" / "job.json"
+    record_result = read_bounded_regular(
+        record,
+        max_bytes=LOCAL_JOB_RECORD_MAX_BYTES,
+    )
+    if record_result is None:
+        raise PrivateStateError("managed result record disappeared")
+    payload = json.loads(record_result[0])
+    job_id = payload.get("job_id") if isinstance(payload, dict) else None
+    if not isinstance(job_id, str):
+        raise PrivateStateError(f"managed result record has no job_id: {record}")
+    final_info = result_dir.lstat()
+    if (
+        not stat.S_ISDIR(final_info.st_mode)
+        or final_info.st_dev != result_info.st_dev
+        or final_info.st_ino != result_info.st_ino
+    ):
+        raise PrivateStateError(
+            f"managed result changed while it was inspected: {result_dir}"
+        )
+    return _ManagedResult(
+        job_id=job_id,
+        path=result_dir,
+        device=final_info.st_dev,
+        inode=final_info.st_ino,
+    )
+
+
 def _owned_managed_results(
     cfg: HeadConfig,
     job_ids: set[str],
-) -> list[tuple[str, Path]]:
+) -> list[_ManagedResult]:
     """Find pull directories whose reserved record proves DT ownership."""
     if not job_ids:
         return []
     root = cfg.results_dir()
-    root_resolved = root.resolve()
-    owned: list[tuple[str, Path]] = []
+    owned: list[_ManagedResult] = []
     for record in root.rglob("dt/job.json"):
         result_dir = record.parent.parent
         try:
-            relative = result_dir.relative_to(root)
-            if not relative.parts:
-                continue
-            cursor = root
-            if record.is_symlink():
-                continue
-            for part in relative.parts:
-                cursor = cursor / part
-                if cursor.is_symlink():
-                    raise ValueError
-            if not result_dir.is_dir():
-                continue
-            if not result_dir.resolve().is_relative_to(root_resolved):
-                continue
-            payload = json.loads(record.read_text("utf-8"))
-            job_id = payload.get("job_id") if isinstance(payload, dict) else None
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+            candidate = _managed_result_evidence(root, result_dir)
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+            PrivateStateError,
+            TypeError,
+            json.JSONDecodeError,
+        ):
             continue
-        if job_id in job_ids:
-            owned.append((str(job_id), result_dir))
-    return sorted(owned, key=lambda item: str(item[1]))
+        if candidate.job_id in job_ids:
+            owned.append(candidate)
+    return sorted(owned, key=lambda item: str(item.path))
 
 
 def clean(
@@ -11709,8 +13512,11 @@ def clean(
             err.print(f"[dim]job {escape(entry.job_id)} · {escape(entry.status)}[/dim]")
         if len(victims) > preview_limit:
             err.print(f"[dim]... {len(victims) - preview_limit} more jobs[/dim]")
-        for job_id, path in managed_results[:preview_limit]:
-            err.print(f"[dim]result {escape(job_id)} · {escape(str(path))}[/dim]")
+        for managed_result in managed_results[:preview_limit]:
+            err.print(
+                f"[dim]result {escape(managed_result.job_id)} · "
+                f"{escape(str(managed_result.path))}[/dim]"
+            )
         if len(managed_results) > preview_limit:
             err.print(
                 f"[dim]... {len(managed_results) - preview_limit} more results[/dim]"
@@ -11730,15 +13536,28 @@ def clean(
             what += " + stale shared venvs"
         typer.confirm(f"{what}?", abort=True)
     removed_results = 0
-    managed_results_by_job: dict[str, list[Path]] = {}
-    for job_id, path in managed_results:
-        managed_results_by_job.setdefault(job_id, []).append(path)
+    managed_results_by_job: dict[str, list[_ManagedResult]] = {}
+    for managed_result in managed_results:
+        managed_results_by_job.setdefault(managed_result.job_id, []).append(
+            managed_result
+        )
 
     def remove_managed_results(entry: jobs_mod.JobEntry) -> None:
         nonlocal removed_results
-        for path in managed_results_by_job.get(entry.job_id, []):
-            shutil.rmtree(path)
-            removed_results += 1
+        for expected in managed_results_by_job.get(entry.job_id, []):
+            with jobs_mod.pull_destination_lock(cfg, expected.path):
+                observed = _managed_result_evidence(cfg.results_dir(), expected.path)
+                if (
+                    observed.job_id != expected.job_id
+                    or observed.device != expected.device
+                    or observed.inode != expected.inode
+                ):
+                    raise PrivateStateError(
+                        "managed result changed after ownership verification: "
+                        f"{expected.path}"
+                    )
+                shutil.rmtree(expected.path)
+                removed_results += 1
 
     report = clean_jobs(
         cfg,
@@ -11763,9 +13582,147 @@ def clean(
         raise typer.Exit(1)
 
 
-def _local_tree_disk_bytes(path: Path) -> int:
+def _local_tree_disk_bytes(path: Path) -> int | None:
     """Compatibility hook for callers/tests that customize local accounting."""
     return local_tree_disk_bytes(path, process_run=subprocess.run)
+
+
+def events(
+    center: Optional[str] = typer.Option(
+        None,
+        "-c",
+        "--center",
+        help="(laptop) read the selected head journal instead of this laptop",
+    ),
+    limit: int = typer.Option(
+        100,
+        "--limit",
+        min=1,
+        max=operation_log_mod.MAX_QUERY_LIMIT,
+        help="maximum newest events to return",
+    ),
+    issues: bool = typer.Option(
+        False,
+        "--issues",
+        help="show only failed or interrupted completed operations",
+    ),
+    operation_id: Optional[str] = typer.Option(
+        None,
+        "--operation-id",
+        help="show one exact 32-character operation trace",
+    ),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Inspect the private, redacted DT operation journal."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig) and center is not None:
+        head = cfg.centers[_laptop_center(cfg, center)]
+        argv = ["events", "--limit", str(limit)]
+        if issues:
+            argv.append("--issues")
+        if operation_id is not None:
+            argv.extend(["--operation-id", operation_id])
+        if json_:
+            argv.append("--json")
+        raise typer.Exit(forward_call(head, argv))
+    if isinstance(cfg, HeadConfig) and center is not None:
+        operation_log_mod.mark_problem("invalid_argument")
+        err.print("[red]--center is available only in laptop mode[/red]")
+        raise typer.Exit(1)
+
+    try:
+        result = operation_log_mod.query(
+            operation_log_mod.resolve_target(cfg),
+            limit=limit,
+            issues_only=issues,
+            operation_id=operation_id,
+            exclude_operation_id=operation_log_mod.current_operation_id(),
+        )
+    except (ValueError, operation_log_mod.OperationJournalError) as exc:
+        operation_log_mod.mark_problem("operation_journal", exc)
+        if json_:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": operation_log_mod.QUERY_SCHEMA_VERSION,
+                        "error": "operation_journal",
+                        "message": str(exc),
+                        "exit_code": 1,
+                    }
+                )
+            )
+        else:
+            err.print(f"[red]operation journal error:[/red] {escape(str(exc))}")
+        raise typer.Exit(1)
+
+    payload = {
+        "schema_version": operation_log_mod.QUERY_SCHEMA_VERSION,
+        "role": cfg.role,
+        "journal": str(result.journal),
+        "healthy": result.corrupt_records == 0,
+        "count": len(result.events),
+        "truncated": result.truncated,
+        "corrupt_records": result.corrupt_records,
+        "files_scanned": result.files_scanned,
+        "events": result.events,
+    }
+    if json_:
+        print(json.dumps(payload))
+    else:
+        from rich.table import Table
+
+        table = Table(
+            title=f"DT operations · {cfg.role}",
+            title_justify="left",
+            box=None,
+            pad_edge=False,
+        )
+        table.add_column("time", no_wrap=True)
+        table.add_column("command", no_wrap=True)
+        table.add_column("state", no_wrap=True)
+        table.add_column("duration", justify="right", no_wrap=True)
+        table.add_column("operation", no_wrap=True)
+        table.add_column("problem")
+        for event in result.events:
+            recorded_at = str(event.get("recorded_at", "-"))
+            time_label = recorded_at[5:19].replace("T", " ")
+            phase = str(event.get("phase", "-"))
+            status = str(event.get("status", phase))
+            duration = event.get("duration_ms")
+            duration_label = f"{duration}ms" if isinstance(duration, int) else "-"
+            problem = event.get("problem")
+            problem_label = (
+                str(problem.get("kind", "")) if isinstance(problem, dict) else ""
+            )
+            operation = str(event.get("operation_id", ""))
+            parent = event.get("parent_operation_id")
+            operation_label = (
+                f"{str(parent)[:6]}→{operation[:6]}"
+                if isinstance(parent, str)
+                else operation[:12]
+            )
+            table.add_row(
+                escape(time_label),
+                escape(str(event.get("command", "unknown"))),
+                escape(status),
+                duration_label,
+                escape(operation_label),
+                escape(problem_label),
+            )
+        out.print(table)
+        suffix = " · more available" if result.truncated else ""
+        err.print(
+            f"[dim]{len(result.events)} events{suffix} · "
+            f"journal {escape(str(result.journal))}[/dim]"
+        )
+        if result.corrupt_records:
+            err.print(
+                f"[red]{result.corrupt_records} malformed journal record(s) "
+                "were skipped[/red]"
+            )
+    if result.corrupt_records:
+        operation_log_mod.mark_problem("operation_journal_corrupt")
+        raise typer.Exit(1)
 
 
 def _storage_table(payload: JsonDict, *, center: str, details: bool) -> Any:
@@ -11774,8 +13731,8 @@ def _storage_table(payload: JsonDict, *, center: str, details: bool) -> Any:
 
     head_rows = payload["head"]
     node_rows = payload["nodes"]
-    assert isinstance(head_rows, list)
-    assert isinstance(node_rows, list)
+    if not isinstance(head_rows, list) or not isinstance(node_rows, list):
+        raise ValueError("invalid storage inventory row contract")
     table = Table(
         title=f"DT storage · {escape(center)}",
         title_justify="left",
@@ -11848,7 +13805,7 @@ def _storage_table(payload: JsonDict, *, center: str, details: bool) -> Any:
             for section in sections
             if isinstance(section.get("entries"), int)
         ]
-        bytes_total = sum(known_bytes)
+        bytes_total = deduplicated_storage_bytes(sections)
         entries_total = sum(known_entries)
 
         def observed(value: str, known: int) -> str:
@@ -11920,16 +13877,40 @@ def storage(
         print(json.dumps(payload))
         return
     total_bytes = payload["total_bytes"]
-    assert isinstance(total_bytes, int)
+    if not isinstance(total_bytes, int) or isinstance(total_bytes, bool):
+        raise ValueError("invalid storage inventory total")
+    head_rows = payload["head"]
+    if not isinstance(head_rows, list):
+        raise ValueError("invalid storage inventory head rows")
     node_rows = payload["nodes"]
-    assert isinstance(node_rows, list)
-    unknown_bytes = any(
-        section.get("bytes") is None
-        for row in node_rows
-        if isinstance(row, dict)
-        for kind, section in row.items()
-        if kind not in {"node", "error", "managed_root"} and isinstance(section, dict)
-    )
+    if not isinstance(node_rows, list):
+        raise ValueError("invalid storage inventory node rows")
+    accounting = payload.get("accounting")
+    if isinstance(accounting, dict):
+        unknown_bytes = not bool(accounting.get("complete"))
+    else:
+        # Compatibility with injected/older inventory payloads.
+        unknown_bytes = any(
+            section.get("bytes") is None
+            for row in [*head_rows, *node_rows]
+            if isinstance(row, dict)
+            for kind, section in row.items()
+            if (
+                kind
+                not in {
+                    "kind",
+                    "path",
+                    "bytes",
+                    "entries",
+                    "node",
+                    "error",
+                    "managed_root",
+                }
+                and isinstance(section, dict)
+            )
+        ) or any(
+            isinstance(row, dict) and row.get("bytes") is None for row in head_rows
+        )
     total_label = "observed ≥" if unknown_bytes else "total "
     out.print(_storage_table(payload, center=cfg.center, details=details))
     policy = (
@@ -12331,6 +14312,13 @@ def _agent_status_table(
     max_jobs = st["max_my_jobs"] if st["max_my_jobs"] is not None else "unlimited"
     wake = "completion wake" if st["completion_wake"] else "poll only"
     table.add_row("agent", f"{state}  pid {st['pid']}")
+    supervisor = str(st.get("supervisor") or "unknown")
+    supervisor_state = st.get("supervisor_state")
+    table.add_row(
+        "supervisor",
+        supervisor
+        + (f"  ·  {escape(str(supervisor_state))}" if supervisor_state else ""),
+    )
     table.add_row(
         "jobs",
         f"queued {st['queued']}  ·  running {st['running']}  ·  "
@@ -12350,6 +14338,17 @@ def _agent_status_table(
     )
     if not st["alive"]:
         table.add_row("next", "dt agent start")
+    elif st.get("heartbeat_stale"):
+        age = st.get("heartbeat_age_s")
+        age_text = (
+            f"{float(age):.0f}s old" if isinstance(age, (int, float)) else "missing"
+        )
+        table.add_row("heartbeat", f"[red]stale[/red]  ·  {age_text}")
+    elif verbose and st["alive"] and not st.get("heartbeat_available"):
+        table.add_row(
+            "heartbeat",
+            "unavailable  ·  restart the agent after upgrading DT",
+        )
     if verbose:
         table.add_row(
             "scheduler",
@@ -12360,6 +14359,10 @@ def _agent_status_table(
             f"max jobs {max_jobs}  ·  reserve {st['reserve_free_per_node']}  ·  "
             f"webhook {'on' if st['webhook'] else 'off'}",
         )
+        if st.get("supervisor") == "systemd-user":
+            linger = st.get("linger_enabled")
+            linger_text = "on" if linger is True else "off" if linger is False else "?"
+            table.add_row("logout survival", f"user lingering {linger_text}")
         table.add_row(
             "log",
             f"{_format_transfer_bytes(st['log_bytes'])} / "
@@ -12381,15 +14384,29 @@ def _agent_status_table(
 def agent_install(
     center: Optional[str] = typer.Option(None, "-c", "--center"),
 ) -> None:
-    """Install the crontab @reboot line so the agent survives head reboots."""
+    """Install a restartable user service (or a visible cron fallback)."""
     _agent_forward(["install"], center)
     from . import agent as agent_mod
 
     cfg = _need_head(_cfg())
-    line = agent_mod.install_crontab(cfg)
+    result = agent_mod.install_supervisor(cfg)
     from rich.markup import escape
 
-    err.print(f"crontab installed: [dim]{escape(line)}[/dim]")
+    if result["supervisor"] == "systemd-user":
+        err.print(
+            f"[green]systemd user service installed[/green]: "
+            f"[dim]{escape(str(result['path']))}[/dim]"
+        )
+        if result.get("linger_enabled") is False:
+            err.print(
+                "[yellow]user lingering is disabled; the service may stop at "
+                "logout. Ask an administrator to run: "
+                f"loginctl enable-linger {escape(str(os.getuid()))}[/yellow]"
+            )
+        err.print("[dim]start now: dt agent start[/dim]")
+    else:
+        err.print(f"crontab installed: [dim]{escape(str(result['line']))}[/dim]")
+        err.print(f"[yellow]{escape(str(result['warning']))}[/yellow]")
 
 
 # --------------------------------------------------------------------------
@@ -12986,7 +15003,16 @@ def seed(
                 ],
             }
         parents = sorted({str(component["remote_parent"]) for component in components})
-        prepare_cmd = "mkdir -p " + " ".join(shlex.quote(path) for path in parents)
+        prepare_parts = ["set -eu", "umask 077"]
+        for parent in parents:
+            rendered_parent = shlex.quote(parent)
+            prepare_parts.append(
+                f"if test -e {rendered_parent} || test -L {rendered_parent}; then "
+                f"test -d {rendered_parent} && test ! -L {rendered_parent}; "
+                f"else mkdir -p {rendered_parent}; fi"
+            )
+            prepare_parts.append(f"chmod 700 {rendered_parent}")
+        prepare_cmd = "; ".join(prepare_parts)
         try:
             prepared = run_on(name, False, prepare_cmd, timeout=15)
         except Exception as exc:
@@ -13027,6 +15053,7 @@ def seed(
                         retry_events,
                     ),
                     stats=True,
+                    private_destination=True,
                 )
             except Exception as exc:
                 detail = " ".join(str(exc).split()) or type(exc).__name__
@@ -13161,6 +15188,173 @@ def seed(
 # --------------------------------------------------------------------------
 
 
+def topology(
+    site: Optional[str] = typer.Option(
+        None,
+        "--site",
+        help="probe only one configured site",
+    ),
+    center: Optional[str] = typer.Option(
+        None,
+        "-c",
+        "--center",
+        help="(laptop) which center",
+    ),
+    source: Optional[str] = typer.Option(
+        None,
+        "--source",
+        help="probe only directed edges originating at this configured node",
+    ),
+    destination: Optional[str] = typer.Option(
+        None,
+        "--destination",
+        help="probe only directed edges ending at this configured node",
+    ),
+    max_edges: int = typer.Option(
+        256,
+        "--max-edges",
+        min=1,
+        max=4096,
+        help="explicit upper bound on active directed-edge probes",
+    ),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Discover direct node-to-node data edges without transferring artifacts."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        head = cfg.centers[_laptop_center(cfg, center)]
+        argv = ["topology"]
+        if site is not None:
+            argv += ["--site", site]
+        if source is not None:
+            argv += ["--source", source]
+        if destination is not None:
+            argv += ["--destination", destination]
+        if max_edges != 256:
+            argv += ["--max-edges", str(max_edges)]
+        if json_:
+            argv.append("--json")
+        raise typer.Exit(forward_call(head, argv, tty=False))
+    if center is not None:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--center is a laptop-only option",
+            exit_code=1,
+            json_=json_,
+        )
+    cfg = _need_head(cfg)
+    if site is not None and site not in cfg.sites:
+        _fail_submission(
+            kind="unknown_site",
+            message=f"unknown site {site!r}; configured: {sorted(cfg.sites)}",
+            exit_code=1,
+            json_=json_,
+        )
+
+    from .topology import TopologyRegistry
+    from .topology_discovery import TopologyDiscovery, TopologyDiscoveryError
+
+    discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
+    selected = [cfg.sites[site]] if site is not None else list(cfg.sites.values())
+    if source is not None or destination is not None:
+        selected = [
+            configured_site
+            for configured_site in selected
+            if (source is None or source in configured_site.nodes)
+            and (destination is None or destination in configured_site.nodes)
+        ]
+        if not selected:
+            _fail_submission(
+                kind="topology_scope_invalid",
+                message=(
+                    "the selected source and destination are not configured in "
+                    "the same selected site"
+                ),
+                exit_code=1,
+                json_=json_,
+            )
+    site_rows: list[JsonDict] = []
+    direct_edges = 0
+    unavailable_edges = 0
+    for configured_site in selected:
+        try:
+            discovered = discovery.discover_edges(
+                configured_site,
+                source=source,
+                destination=destination,
+                max_edges=max_edges,
+            )
+        except TopologyDiscoveryError as exc:
+            _fail_submission(
+                kind="topology_discovery_failed",
+                message=str(exc),
+                exit_code=1,
+                json_=json_,
+            )
+        edges = [asdict(edge) for edge in discovered]
+        direct_edges += sum(edge["status"] == "direct" for edge in edges)
+        unavailable_edges += sum(edge["status"] != "direct" for edge in edges)
+        site_rows.append(
+            {
+                "site": configured_site.name,
+                "artifact_policy": configured_site.artifact_policy,
+                "gateway": configured_site.gateway,
+                "cache_node": configured_site.cache_node,
+                "route_circuit": {
+                    "failures": configured_site.route_circuit_failures,
+                    "cooldown_s": configured_site.route_circuit_cooldown_s,
+                    "max_cooldown_s": (configured_site.route_circuit_max_cooldown_s),
+                },
+                "nodes": list(configured_site.nodes),
+                "edges": edges,
+            }
+        )
+    payload: JsonDict = {
+        "schema_version": "dt_topology_v1",
+        "center": cfg.center,
+        "sites": site_rows,
+        "summary": {
+            "sites": len(site_rows),
+            "edge_limit": max_edges,
+            "direct_edges": direct_edges,
+            "unavailable_edges": unavailable_edges,
+        },
+    }
+    if json_:
+        print(json.dumps(payload))
+        return
+    if not site_rows:
+        out.print("[dim]No sites configured; artifact routing is direct.[/dim]")
+        return
+    for site_row in site_rows:
+        out.print(
+            f"[bold]{escape(str(site_row['site']))}[/bold] · "
+            f"{escape(str(site_row['artifact_policy']))} · "
+            f"gateway {escape(str(site_row['gateway']))}"
+        )
+        edges = cast(list[JsonDict], site_row["edges"])
+        if not edges:
+            out.print("  [dim]single-node site[/dim]")
+            continue
+        for edge in edges:
+            source = escape(str(edge["source"]))
+            destination = escape(str(edge["destination"]))
+            if edge["status"] == "direct":
+                latency = float(edge["latency_ms"])
+                endpoint = escape(str(edge["endpoint"]))
+                origin = escape(str(edge["endpoint_origin"]))
+                out.print(
+                    f"  [green]direct[/green] {source} → {destination}  "
+                    f"{latency:.1f}ms  {endpoint}  [dim]{origin}[/dim]"
+                )
+            else:
+                kind = escape(str(edge["error_kind"] or "unavailable"))
+                out.print(
+                    f"  [yellow]unavailable[/yellow] {source} → "
+                    f"{destination}  [dim]{kind}[/dim]"
+                )
+
+
 def doctor(json_: bool = typer.Option(False, "--json")) -> None:
     """Verify SSH, GPU, transfer tools, runtime contracts, and network."""
     cfg = _cfg()
@@ -13217,7 +15411,9 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
             }
 
         def check_heads() -> list[JsonDict]:
-            with ThreadPoolExecutor(max_workers=max(len(cfg.centers), 1)) as pool:
+            with ThreadPoolExecutor(
+                max_workers=center_worker_count(len(cfg.centers))
+            ) as pool:
                 return list(pool.map(check_head, cfg.centers.items()))
 
         unreachable_errors: set[str] = set()
@@ -13310,6 +15506,173 @@ def _find(ref: str) -> None:
     print(json.dumps(asdict(entry)))
 
 
+def request_status(
+    request_id: str = typer.Argument(..., help="durable submission request id"),
+    center: Optional[str] = typer.Option(
+        None, "-c", "--center", help="(laptop) which center's head"
+    ),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Inspect a retry-safe submission without creating another job."""
+    _validate_submission_request_id(request_id, json_=json_)
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        head = cfg.centers[_laptop_center(cfg, center)]
+        argv = ["request", request_id]
+        if json_:
+            argv.append("--json")
+        raise typer.Exit(forward_call(head, argv, tty=False))
+    if center is not None:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--center is a laptop-only option",
+            exit_code=1,
+            json_=json_,
+        )
+    try:
+        with intent_mod.lock(cfg, request_id):
+            group_record = group_mod.load(cfg, request_id)
+            record = intent_mod.load(cfg, request_id)
+            if group_record is not None and record is not None:
+                raise group_mod.GroupRequestError(
+                    "request identity has both single- and multi-job records"
+                )
+            if record is not None:
+                record, entry = reconcile_submission_request(cfg, record)
+            else:
+                entry = None
+    except (
+        OSError,
+        intent_mod.RequestRecordError,
+        group_mod.GroupRequestError,
+        ValueError,
+    ) as exc:
+        _fail_submission(
+            kind="request_state_damaged",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if group_record is not None:
+        try:
+            group_entries = group_mod.load_entries_or_fail(cfg, group_record)
+        except group_mod.GroupRequestError as exc:
+            _fail_submission(
+                kind="request_state_damaged",
+                message=str(exc),
+                exit_code=1,
+                json_=json_,
+            )
+        next_index = group_record.submitted + 1
+        unresolved: JsonDict | None = None
+        if next_index <= group_record.requested:
+            child_request_id = group_mod.item_request_id(request_id, next_index)
+            try:
+                child_record = intent_mod.load(cfg, child_request_id)
+            except intent_mod.RequestRecordError as exc:
+                _fail_submission(
+                    kind="request_state_damaged",
+                    message=str(exc),
+                    exit_code=1,
+                    json_=json_,
+                )
+            if child_record is not None:
+                child_entry = jobs_mod.load(cfg, child_record.job_id)
+                unresolved = {
+                    "index": next_index,
+                    "request_id": child_request_id,
+                    "state": child_record.state,
+                    "job_id": child_record.job_id,
+                    "job_found": child_entry is not None,
+                }
+        group_payload: JsonDict = asdict(group_record)
+        group_payload["job_ids"] = [entry.job_id for entry in group_entries]
+        group_payload["submitted"] = len(group_entries)
+        group_payload["jobs"] = [
+            {
+                "index": index,
+                "job_id": group_entry.job_id,
+                "status": group_entry.status,
+                "node": group_entry.node,
+                "reason": group_entry.reason,
+                "exit_code": group_entry.exit_code,
+            }
+            for index, group_entry in enumerate(group_entries, start=1)
+        ]
+        group_payload["next_index"] = (
+            next_index if next_index <= group_record.requested else None
+        )
+        group_payload["unresolved_child"] = unresolved
+        group_payload["retry_with_same_request_id"] = group_record.state != "confirmed"
+        if json_:
+            print(json.dumps(group_payload))
+            return
+        state_style = {
+            "confirmed": "green",
+            "preparing": "yellow",
+            "uncertain": "yellow",
+        }[group_record.state]
+        out.print(
+            f"[{state_style}]{group_record.state}[/{state_style}] "
+            f"{escape(group_record.request_id)} · {group_record.operation} · "
+            f"{len(group_entries)}/{group_record.requested} jobs"
+        )
+        if unresolved is not None:
+            err.print(
+                "[yellow]next child outcome is unresolved; retry the exact "
+                "original command with the same request id[/yellow]"
+            )
+        elif group_record.state != "confirmed":
+            err.print(
+                "[yellow]retry the exact original command with the same "
+                "request id to resume from this prefix[/yellow]"
+            )
+        return
+    if record is None:
+        _fail_submission(
+            kind="not_found",
+            message=f"no submission request matching {request_id!r}",
+            exit_code=EXIT_NOT_FOUND,
+            json_=json_,
+        )
+    payload: JsonDict = asdict(record)
+    payload["job_found"] = entry is not None
+    payload["job"] = (
+        {
+            "job_id": entry.job_id,
+            "status": entry.status,
+            "node": entry.node,
+            "reason": entry.reason,
+            "exit_code": entry.exit_code,
+        }
+        if entry is not None
+        else None
+    )
+    if json_:
+        print(json.dumps(payload))
+        return
+    state_style = {
+        "confirmed": "green",
+        "preparing": "yellow",
+        "uncertain": "yellow",
+        "rejected": "red",
+    }[record.state]
+    out.print(
+        f"[{state_style}]{record.state}[/{state_style}] "
+        f"{escape(record.request_id)} · job {escape(record.job_id)}"
+    )
+    if entry is not None:
+        out.print(
+            f"[dim]job: {escape(entry.status)} on {escape(entry.node)}"
+            f"{f' · {escape(entry.reason)}' if entry.reason else ''}[/dim]"
+        )
+    elif record.state in {"preparing", "uncertain"}:
+        err.print(
+            "[yellow]the launch outcome is not proven; do not submit this "
+            "request id again[/yellow]"
+        )
+
+
 # --------------------------------------------------------------------------
 # registration (incl. single-letter aliases)
 # --------------------------------------------------------------------------
@@ -13340,6 +15703,7 @@ app.command("l", hidden=True)(logs)
 app.command("attach", rich_help_panel="Operations")(attach)
 app.command("wait", rich_help_panel="Everyday")(wait)
 app.command("info", rich_help_panel="Everyday")(info)
+app.command("request", rich_help_panel="Everyday")(request_status)
 app.command("compare", rich_help_panel="Experiments")(compare)
 app.command(
     "watch",
@@ -13348,15 +15712,23 @@ app.command(
 )(watch)
 app.command("metrics", rich_help_panel="Experiments")(metrics)
 app.command("rerun", rich_help_panel="Experiments")(rerun)
+app.command(
+    "exec",
+    context_settings=RUN_CTX,
+    options_metavar="REF [OPTIONS] -- COMMAND [ARGS]...",
+    rich_help_panel="Experiments",
+)(exec_job)
 app.command("fork", context_settings=RUN_CTX, rich_help_panel="Experiments")(fork)
 app.command("pull", rich_help_panel="Everyday")(pull)
 app.command("kill", rich_help_panel="Operations")(kill)
 app.command("k", hidden=True)(kill)
 app.command("clean", rich_help_panel="Operations")(clean)
+app.command("events", rich_help_panel="Operations")(events)
 app.command("storage", rich_help_panel="Operations")(storage)
 app.command("compact", rich_help_panel="Operations")(compact)
 app.command("sync", rich_help_panel="Operations")(sync)
 app.command("seed", rich_help_panel="Operations")(seed)
+app.command("topology", rich_help_panel="Operations")(topology)
 app.command("doctor", rich_help_panel="Operations")(doctor)
 app.add_typer(agent_app, name="agent", rich_help_panel="Operations")
 app.add_typer(migrate_app, name="migrate", rich_help_panel="Operations")
@@ -13364,11 +15736,52 @@ app.command("_find", hidden=True)(_find)
 
 
 def main() -> None:
+    session = operation_log_mod.begin(sys.argv[1:])
+    exit_code = 0
+    status = "success"
+    failure: BaseException | None = None
     try:
         app()
     except RemoteError as e:
+        exit_code = EXIT_UNREACHABLE
+        status = "failed"
+        failure = e
+        operation_log_mod.mark_problem("ssh_unreachable", e)
         err.print(f"[red]{escape(str(e))}[/red]")
         sys.exit(EXIT_UNREACHABLE)
+    except SystemExit as exc:
+        failure = exc
+        code = exc.code
+        exit_code = code if isinstance(code, int) else (0 if code is None else 1)
+        if exit_code:
+            status = "failed"
+            operation_log_mod.mark_problem("command_failed")
+        raise
+    except KeyboardInterrupt as exc:
+        exit_code = 130
+        status = "interrupted"
+        failure = exc
+        operation_log_mod.mark_problem("interrupted", exc)
+        raise
+    except BaseException as exc:
+        exit_code = 1
+        status = "failed"
+        failure = exc
+        operation_log_mod.mark_problem("internal_exception", exc)
+        raise
+    finally:
+        operation_log_mod.finish(
+            session,
+            exit_code=exit_code,
+            status=status,
+            exc=failure if status != "success" else None,
+        )
+        if session.journal_errors:
+            kinds = ", ".join(sorted(set(session.journal_errors)))
+            err.print(
+                "[yellow]operation journal unavailable; this command was not "
+                f"fully recorded ({escape(kinds)})[/yellow]"
+            )
 
 
 if __name__ == "__main__":

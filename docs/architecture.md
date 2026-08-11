@@ -1,8 +1,10 @@
-# DistTrainer architecture
+# dt architecture
 
-DistTrainer separates operator intent, authoritative lifecycle state, remote
-execution, and recoverable experiment data. The head is the control-plane
-authority. Compute nodes execute only dispatched snapshots and runtime payloads.
+`dt` is an AI-native SSH execution control plane for running a local project on
+idle remote compute with a local-equivalent observable outcome. It separates
+operator intent, authoritative lifecycle state, remote execution, and
+recoverable experiment data. The head is the control-plane authority. Compute
+nodes execute only dispatched snapshots and runtime payloads.
 
 ## Deployment roles
 
@@ -21,13 +23,16 @@ head and never places work directly on workers.
 
 ```mermaid
 flowchart LR
-    LAPTOP["Laptop CLI"] -->|SSH forwarding| HEAD
+    LAPTOP["Laptop CLI"] -->|SSH + parent operation ID| HEAD
+    LAPTOP --> LOPS["Private laptop operation journal"]
     HEAD["Head CLI and registry"] --> QUEUE["Resident queue agent"]
+    HEAD --> HOPS["Private head operation journal"]
     HEAD --> SNAPSHOTS["Content-addressed snapshots"]
+    SNAPSHOTS -->|once per digest/site| SITECACHE["Site cache"]
+    SITECACHE -->|site LAN| NODE1
+    SITECACHE -->|site LAN| NODE2
     QUEUE -->|probe and dispatch| NODE1["Compute node"]
     QUEUE -->|probe and dispatch| NODE2["Compute node"]
-    SNAPSHOTS --> NODE1
-    SNAPSHOTS --> NODE2
     NODE1 --> RECORDS["Logs, telemetry, metadata, outputs"]
     NODE2 --> RECORDS
     RECORDS --> HEAD
@@ -39,9 +44,27 @@ arguments to a configured head. The head validates the project and submission,
 records the job, archives exact source and payload objects, and either
 dispatches immediately or queues a small job-specific control bundle.
 
+Local equivalence means the submitted snapshot, execution intent, environment
+identity, lifecycle/result semantics, logs, and declared outputs are observable
+and recoverable through the local CLI. It does not imply identical hardware,
+paths, undeclared remote side effects, or a transparent shared filesystem.
+
 ## Control plane
 
-The head registry is the lifecycle source of truth. A registered job contains:
+Every CLI process also writes a bounded `dt_operation_event_v1` start/finish
+trace. Laptop and head traces are linked by a generated parent operation ID.
+The private journal records command categories, timing, build, exit status, and
+redacted problem fingerprints, never raw arguments or exception messages. It is
+an operation index over the authoritative request, registry, job, and agent
+evidence, not a tamper-proof audit system. `dt events` exposes its bounded query
+contract; ADR 0016 defines the security and retention boundary.
+
+The head registry is the lifecycle source of truth. A separate durable request
+store binds an optional caller request ID and normalized intent digest to one
+allocated job ID before the compute launch boundary. Multi-job commands add a
+secret-free parent intent whose ordered prefix points to deterministic child
+requests; this makes partial submission resumable without weakening the
+single-job launch boundary. A registered job contains:
 
 - stable job and center identity;
 - source snapshot and runtime payload hashes;
@@ -51,10 +74,17 @@ The head registry is the lifecycle source of truth. A registered job contains:
 - terminal result or explicit failed/lost reason;
 - artifact, environment, and recovery metadata.
 
-The resident agent reconciles queued and running entries. It resolves
-dependencies before probing GPU capacity. A pending dependency is a
-job-specific blocker, so unrelated runnable work can pass it. A failed
-dependency becomes failed before start and never consumes a GPU lease.
+The resident agent reconciles queued and running entries. A restartable user
+systemd service is preferred, with a visible cron compatibility fallback; its
+heartbeat distinguishes an owned lock from a responsive scheduler. Runtime
+tmux servers enter independent user scopes when available so stopping an
+invoking service does not inherit ownership of active jobs.
+
+The agent resolves dependencies before probing GPU capacity. Dependencies can
+require success, any terminal completion, or selected typed result states. A
+false predicate becomes `skipped / dependency_skipped`. A pending dependency
+is a job-specific blocker, so unrelated runnable work can pass it. A failed or
+false dependency never consumes a GPU lease.
 
 Capacity waits retain FIFO fairness among jobs that can use the same capacity.
 A busy pinned node preserves FIFO for later jobs on that node but does not
@@ -68,6 +98,11 @@ candidates.
 Source snapshots are immutable and content-addressed. Editing a project after
 submission cannot change queued work. Every dispatched job receives a private
 code tree derived from the attested snapshot.
+
+Git commit and dirty-state probes are read-only, process-group bounded, and
+time bounded. A small tracked diff is retained as convenience evidence, but
+capture stops at 4 MiB; the complete snapshot hash and private code tree remain
+the authoritative identity even when that optional patch is omitted.
 
 Large generated or reusable inputs are excluded from normal snapshots. The
 operator can stage them explicitly and bind a content manifest. The compute
@@ -89,6 +124,81 @@ Managed pulls copy `outputs/` and the recovery record to the head results root.
 Compaction can remove an old private `code/` copy only after validating its
 content-addressed recovery snapshot.
 
+### Site-aware snapshot distribution
+
+The control plane remains centralized on the head, but control traffic,
+cross-site bytes, and site-LAN bytes are distinct routes. Configuration assigns
+every topology-enabled node to an explicit site; DT never guesses network
+domains from hostnames. `TopologyRegistry`, `ArtifactSourceResolver`, and
+`TransferPlanner` decide where a digest comes from. `TransferExecutor` performs
+the selected rsync route, while `ArtifactVerifier` owns full-tree identity and
+atomic publication.
+
+The first delivery of a digest to a `site-cache-first` site is:
+
+```text
+head authoritative snapshot -> site cache -> destination job directory
+                         WAN       site LAN
+```
+
+Later destinations omit the WAN leg. A head-side `(site, digest)` lock prevents
+concurrent duplicate uploads; a stable partial directory makes interrupted
+uploads resumable. The cache is published only after its complete tree hash
+matches the authoritative digest, and each destination is verified again. The
+upload lock ends at publication; independent destination locks then allow
+parallel LAN fan-out while preventing two writers from mutating one job tree.
+Cache probe transport or permission failures remain unknown and fail closed;
+they are never reclassified as a cache miss that could trigger more WAN load.
+
+`topology-aware` replaces the fixed cache-to-worker edge with a bounded live
+graph. `TopologyDiscovery` obtains interface advertisements and SSH host keys
+through already-authenticated node control routes, finds at most the newest
+same-digest job replica per configured seed node, and proves candidate direct
+edges without ProxyJump. A local destination replica ranks first; healthy peer
+replicas rank ahead of the site cache at equal configured cost. Only a true
+cold miss uses the head-to-cache WAN leg. The selected peer tree and final
+destination are both fully re-hashed, so registry provenance alone is never
+treated as content proof.
+
+Discovery never scans address ranges or trusts names as topology. Automatic
+endpoints normally require a subnet advertised by both source and destination.
+Minimal container/overlay nodes in one explicitly configured site may instead
+offer their exact advertised RFC1918 `/32` address; DT probes that one endpoint
+only. Interface discovery has a bounded `hostname -I` fallback when `ip -j` is
+absent. DT pins the keys actually served by the destination SSH port, learned
+inside its authenticated control route, in a private source-side known-hosts
+file and keeps strict host-key checking on the direct edge. An unknown route
+fails before a speculative WAN upload;
+operators can still declare the separately observable one-attempt direct
+fallback when availability outweighs WAN cost.
+
+Direct P2P edges also have a private persistent circuit in head control state.
+Probe failures and typed bulk-route failures update one atomically locked,
+bounded file per configured directed edge. Success under bulk transfer closes
+a transport circuit; an `ssh true` probe cannot erase evidence that an edge
+failed only under load. Successive short-lived dispatchers therefore avoid a
+known-bad route until its bounded exponential cooldown permits a half-open
+probe. This state changes route availability only: SSH identity and complete
+artifact digest verification remain mandatory.
+
+SSH workload overlays separate `control`, `artifact`, and short-lived
+`artifact-relay` multiplexers. OpenSSH receives the overlay through `-F`, so
+its implicit ProxyJump process uses the same private pool instead of falling
+back to a user's global bastion socket. Relay sessions alone forward the local
+SSH agent so a trusted gateway can authenticate to a LAN worker without copied
+private keys. Host-key verification remains enabled and missing trust fails
+closed.
+
+Every completed site delivery writes a private `dt_artifact_transfer_v1` event
+under head control state (`transfers/events.jsonl`) and emits a concise human log
+with digest, source/destination sites and nodes, selected legs, cache hit,
+cross-site bytes, site bytes, file count, lock wait, and duration. Generic
+rsync retry events add a stable failure kind and do not retry authentication,
+host-key, permission, or disk-space failures. Only transport evidence such as
+timeouts, resets, unreachable routes, and broken pipes updates the edge
+circuit; artifact data, capacity, permission, and identity failures do not
+misclassify a healthy route.
+
 ## Remote execution
 
 The head sends a small attested payload with every job:
@@ -101,10 +211,31 @@ The head sends a small attested payload with every job:
 | `cuda_probe.py` | Driver-level allocation check before application start |
 | `artifact_verify.py` | Bound-input size, identity, and path verification |
 | `phase.sh` | Application-visible phase markers |
+| `result.py` | Bounded, atomic application result emission and validation |
 
 The wrapper owns advisory GPU lease file descriptors for its lifetime. A GPU
 can therefore be reserved during CPU-only initialization even when
 `nvidia-smi` shows no CUDA process.
+
+The bare-process lease is not physical device isolation. `CUDA_VISIBLE_DEVICES`
+controls CUDA enumeration, while Vulkan, EGL, OpenGL, and direct NVIDIA/DRM
+device-node access remain outside that environment-variable boundary. DT does
+not currently claim strong isolation for graphics workloads. ADR 0014 records
+the proposed OCI/CDI enforcement backend and the rejected environment-only
+alternative.
+
+## Agent job query boundary
+
+The complete `ps --json` array remains a compatibility and offline-inventory
+surface. Bounded polling uses `dt_ps_query_v1`: each head filters, summarizes,
+projects, and keyset-pages its own registry before laptop transfer. The laptop
+merges one bounded page per center, scopes references, applies the global page,
+and preserves partial-center errors. Registry file modification time supplies
+`updated_at` for legacy rows; subsequent atomic saves persist it directly.
+
+Cursors bind their created/updated keyset anchor to the query filters. They are
+validated opaque state, not credentials. Pagination is deterministic in a live
+view but does not promise snapshot isolation across lifecycle changes.
 
 Signal handling records a terminal code and reaps processes whose groups or
 sessions escaped the main application group. Unverifiable process death remains
@@ -117,13 +248,22 @@ an explicit operational failure rather than a false terminal success.
 | `run` | One independent current-snapshot job |
 | `batch` | Independent same-node, same-snapshot items; runtime failures continue |
 | `chain` | Same-snapshot linear dependency graph; predecessor failure stops successors |
+| `run --after-complete/--after-result` | Cross-node terminal or typed-result dependency |
 | `rerun` | Historical command and resources with current project code |
 | `fork` | Historical exact snapshot with explicit overrides |
+| `exec` | Historical exact snapshot and existing same-node environment, without sync |
 
 The CLI composes these policies from shared submission contracts. Workflow
 helpers do not implement secondary schedulers.
 
 ## CLI presentation boundary
+
+The installed console script enters through a minimal audited bootstrap. Exact
+`dt --version` probes render shared build identity without importing the full
+Typer command graph, while still writing the same private operation start and
+finish events. All other invocations load the application lazily and preserve
+the existing CLI contract. ADR 0019 records why this bounded Python split was
+chosen before a wholesale CLI decomposition or native launcher.
 
 Human output is an operator interface, while JSON, exit codes, and stdout/stderr
 separation are automation interfaces. Default human views show current state,
@@ -147,10 +287,10 @@ stdout/stderr separation, JSON schemas, and stable exit codes.
 
 | Area | Modules |
 |---|---|
-| Configuration and state | `config.py`, `layout.py`, `onboarding.py`, `jobs.py`, `submission.py` |
-| Placement and queueing | `dispatch.py`, `agent.py`, `probe.py`, `completion.py` |
-| Remote boundaries | `remote.py`, `forwarding.py`, `sshio.py`, `lifecycle.py` |
-| Observation | `monitoring.py`, `doctor.py`, `render.py` |
+| Configuration and state | `config.py`, `layout.py`, `path_contract.py`, `onboarding.py`, `jobs.py`, `submission.py`, `submission_intent.py`, `submission_group.py`, `operation_log.py` |
+| Placement and queueing | `dispatch.py`, `agent.py`, `scheduler.py`, `probe.py`, `completion.py` |
+| Remote boundaries | `remote.py`, `forwarding.py`, `sshio.py`, `topology.py`, `artifact_distribution.py`, `lifecycle.py` |
+| Observation | `monitoring.py`, `ps_query.py`, `doctor.py`, `render.py` |
 | Data recovery and retention | `transfers.py`, `storage.py`, `migration.py`, `compact.py`, `maintenance.py` |
 | Identity | `snapshot_hash.py`, `snapshot_store.py`, `payload_hash.py` |
 | Node runtime | `payload/` |

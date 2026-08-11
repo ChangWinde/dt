@@ -13,14 +13,29 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from typing import Any, TypeAlias, cast
 
 from .config import LaptopConfig
-from .sshio import RemoteError, SSH_BASE, remote_dt, remote_dt_cmd
+from .operation_log import record_handoff
+from .sshio import (
+    BULK_TRANSFER_TIMEOUT_S,
+    RemoteError,
+    remote_dt,
+    remote_dt_cmd,
+    run_capture_stdout,
+    ssh_base,
+)
 
 PREFERRED_LOOKUP_GRACE_S = 0.15
+MAX_CENTER_FANOUT_WORKERS = 32
+FORWARD_CAPTURE_TIMEOUT_S = BULK_TRANSFER_TIMEOUT_S + 300
 # Four hex characters cover historical ids; current ids use a longer suffix.
 FULL_JOB_ID_RE = re.compile(r"^\d{8}-\d{4}_[A-Za-z0-9_-]+_[0-9a-f]{4,}$")
 JsonDict: TypeAlias = dict[str, Any]
 LookupHit: TypeAlias = tuple[str, str, JsonDict]
 LookupResult: TypeAlias = tuple[str, LookupHit | None, str | None, bool]
+
+
+def center_worker_count(center_count: int) -> int:
+    """Bound SSH fan-out without serializing normal small installations."""
+    return max(1, min(center_count, MAX_CENTER_FANOUT_WORKERS))
 
 
 class FanErrors(dict[str, str]):
@@ -110,7 +125,7 @@ def fan_json_by_center(
 
     data_by_center: dict[str, object] = {}
     errors = FanErrors()
-    with ThreadPoolExecutor(max_workers=max(len(cfg.centers), 1)) as pool:
+    with ThreadPoolExecutor(max_workers=center_worker_count(len(cfg.centers))) as pool:
         for center, data, err, is_unreachable in pool.map(one, cfg.centers.items()):
             if err is not None:
                 errors[center] = err
@@ -211,11 +226,11 @@ def find_center(
         None,
     )
     if preferred_item is None or len(items) <= 1:
-        with ThreadPoolExecutor(max_workers=max(len(items), 1)) as pool:
+        with ThreadPoolExecutor(max_workers=center_worker_count(len(items))) as pool:
             results = list(pool.map(one, items))
     else:
         remaining = [item for item in items if item[0] != preferred]
-        with ThreadPoolExecutor(max_workers=len(items)) as pool:
+        with ThreadPoolExecutor(max_workers=center_worker_count(len(items))) as pool:
             preferred_future = pool.submit(one, preferred_item)
             try:
                 preferred_result = preferred_future.result(
@@ -263,7 +278,7 @@ def find_center(
 
 def forward_call(head: str, argv: list[str], tty: bool = False) -> int:
     """Run remote dt inheriting stdio (streams pass through, exit code kept)."""
-    cmd = [*SSH_BASE, *(["-t"] if tty else []), head, remote_dt_cmd(argv)]
+    cmd = [*ssh_base(), *(["-t"] if tty else []), head, remote_dt_cmd(argv)]
     return subprocess.call(cmd)
 
 
@@ -279,13 +294,17 @@ def forward_capture_stdout(
     Callers handling transport ambiguity can defer stdout until they know
     whether it is a complete job identity or a partial response.
     """
-    cmd = [*SSH_BASE, *(["-t"] if tty else []), head, remote_dt_cmd(argv)]
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
+    cmd = [*ssh_base(), *(["-t"] if tty else []), head, remote_dt_cmd(argv)]
+    try:
+        proc = run_capture_stdout(cmd, timeout=FORWARD_CAPTURE_TIMEOUT_S)
+    except subprocess.TimeoutExpired as exc:
+        captured = exc.output if isinstance(exc.output, str) else ""
+        print(
+            f"dt: head operation exceeded {FORWARD_CAPTURE_TIMEOUT_S:g}s; "
+            "outcome may be unknown",
+            file=sys.stderr,
+        )
+        return 255, captured
     stdout = proc.stdout or ""
     if emit_stdout:
         sys.stdout.write(stdout)
@@ -295,6 +314,13 @@ def forward_capture_stdout(
 
 def forward_exec(head: str, argv: list[str], tty: bool = True) -> None:
     """Replace this process with ssh for a non-reconnecting interactive command."""
-    cmd = [*SSH_BASE, *(["-t"] if tty else []), head, remote_dt_cmd(argv)]
+    cmd = [*ssh_base(), *(["-t"] if tty else []), head, remote_dt_cmd(argv)]
     sys.stderr.flush()
+    journal_errors = record_handoff()
+    if journal_errors:
+        print(
+            "operation journal unavailable; this command was not fully recorded "
+            f"({', '.join(journal_errors)})",
+            file=sys.stderr,
+        )
     os.execvp("ssh", cmd)

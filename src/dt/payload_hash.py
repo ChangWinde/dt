@@ -10,7 +10,9 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
 import re
+import stat
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -21,10 +23,12 @@ RUNTIME_PAYLOAD_NAMES = (
     "cuda_probe.py",
     "telemetry.py",
     "phase.sh",
+    "result.py",
     "snapshot_hash.py",
     "artifact_verify.py",
 )
 PAYLOAD_INTEGRITY_EXIT = 17
+MAX_PAYLOAD_FILE_BYTES = 4 * 1024 * 1024
 
 
 def payload_sha256(files: Mapping[str, str]) -> str:
@@ -46,10 +50,35 @@ def payload_sha256(files: Mapping[str, str]) -> str:
 
 def payload_files_from_dir(directory: Path) -> dict[str, str]:
     """Read exactly the files covered by the node-runtime identity."""
-    return {
-        name: (directory / name).read_text(encoding="utf-8")
-        for name in RUNTIME_PAYLOAD_NAMES
-    }
+    root = directory.lstat()
+    if stat.S_ISLNK(root.st_mode) or not stat.S_ISDIR(root.st_mode):
+        raise OSError("runtime payload root is not a regular directory")
+    files: dict[str, str] = {}
+    for name in RUNTIME_PAYLOAD_NAMES:
+        path = directory / name
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_PAYLOAD_FILE_BYTES:
+                raise OSError(f"runtime payload file is unsafe: {name}")
+            payload = bytearray()
+            while len(payload) <= MAX_PAYLOAD_FILE_BYTES:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, MAX_PAYLOAD_FILE_BYTES + 1 - len(payload)),
+                )
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            if len(payload) > MAX_PAYLOAD_FILE_BYTES:
+                raise OSError(f"runtime payload file is too large: {name}")
+            files[name] = payload.decode("utf-8")
+        finally:
+            os.close(descriptor)
+    return files
 
 
 def verify_payload(directory: Path, expected: str) -> int:

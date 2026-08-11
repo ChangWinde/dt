@@ -621,6 +621,47 @@ def test_compare_authoritative_job_duration_rejects_negative_interval(
     assert "missing or invalid started_at/finished_at" in payload["message"]
 
 
+def test_compare_metric_reader_rejects_external_symlink_and_oversized_json(tmp_path):
+    job_root = tmp_path / "job"
+    outputs = job_root / "outputs"
+    outputs.mkdir(parents=True)
+    entry = _entry(
+        "20260724-1900_metric_aaaa",
+        "metric",
+        job_dir=str(job_root),
+    )
+    metric = outputs / "metrics.json"
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"score": 1}\n')
+    metric.symlink_to(outside)
+    command = cli._compare_metric_command(entry, "metrics.json", "score")
+
+    symlink_result = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert symlink_result.returncode == 1
+    assert json.loads(symlink_result.stdout)["error"] == "metric_read_failed"
+    assert "outside outputs" in json.loads(symlink_result.stdout)["message"]
+
+    metric.unlink()
+    with metric.open("wb") as stream:
+        stream.truncate(cli.COMPARE_METRIC_MAX_BYTES + 1)
+    oversized_result = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert oversized_result.returncode == 1
+    assert json.loads(oversized_result.stdout)["error"] == "metric_read_failed"
+    assert "byte limit" in json.loads(oversized_result.stdout)["message"]
+
+
 def test_compare_metric_human_output_shows_group_effect(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     first = _entry("20260724-1900_a1_aaaa", "baseline")

@@ -60,8 +60,8 @@ Choose Option C.
 The repository root exposes two deliberately separate entry points:
 
 ```text
-install.sh     clean Git checkout -> immutable source wheel -> uv tool
-bootstrap.sh   verified release bundle -> uv tool
+install.sh     clean Git checkout -> immutable source wheel -> verified environment
+bootstrap.sh   verified release bundle -> verified environment
 ```
 
 `install.sh` archives `HEAD` into a temporary directory, adds the validated
@@ -86,6 +86,11 @@ command when the caller's `PATH` is missing the tool directory. They recommend
 files. `bootstrap.sh` resolves the approved `uv` from the caller's original
 `PATH` and invokes that absolute executable throughout installation; the target
 tool directory never gets an opportunity to shadow the installer dependency.
+
+ADR 0023 strengthens both paths: runtime dependencies are installed with
+mandatory hashes in a private relocatable environment, the verified wheel is
+installed without dependency resolution, and the public command changes only
+after complete environment validation.
 
 `bootstrap.sh` likewise stops creating a commented, role-ambiguous config
 skeleton. Configuration ownership belongs to the validated `dt init` command.

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
+from threading import Event
 
+import pytest
 from typer.testing import CliRunner
 
-from dt import cli
+from dt import cli, migration as migration_mod
 from dt.config import HeadConfig, parse
 from dt.dispatch import (
     RunSpec,
@@ -16,9 +19,9 @@ from dt.dispatch import (
     capture_snapshot,
     payload_sha256,
 )
-from dt.jobs import JobEntry
+from dt.jobs import JobEntry, job_lock
 from dt.layout import LEGACY_LAYOUT, ROLE_LAYOUT
-from dt.migration import _worker_copy_command, apply_layout, plan_layout
+from dt.migration import _disk_bytes, _worker_copy_command, apply_layout, plan_layout
 from dt.snapshot_hash import tree_sha256
 
 
@@ -87,10 +90,96 @@ def test_layout_plan_and_apply_migrate_verified_head_records_and_snapshots(tmp_p
 
     applied = apply_layout(cfg, runner=unused_runner)
     assert applied["applied_summary"]["failed"] == 0
+    assert applied["verification"]["complete"] is True
+    assert applied["verification"]["accounting_delta_bytes"] == 0
+    assert applied["verification"]["post_legacy_known_bytes"] == 0
     assert not (legacy_registry / f"{entry.job_id}.json").exists()
     assert (cfg.registry_dir() / f"{entry.job_id}.json").is_file()
     assert not snapshot.exists()
     assert (cfg.snapshots_dir() / digest / "code" / "train.py").is_file()
+
+
+def test_layout_plan_bounds_legacy_registry_and_snapshot_metadata(tmp_path):
+    cfg = _cfg(tmp_path)
+    legacy_registry = cfg.legacy_registry_dir()
+    legacy_registry.mkdir(parents=True)
+    registry = legacy_registry / "oversized.json"
+    registry.write_bytes(b" " * (migration_mod.MAX_JOB_RECORD_BYTES + 1))
+
+    code = tmp_path / "snapshot-code"
+    code.mkdir()
+    (code / "train.py").write_text("print('exact')\n")
+    digest = tree_sha256(code)
+    snapshot = cfg.legacy_snapshots_dir() / digest
+    (snapshot / "code").mkdir(parents=True)
+    (snapshot / "code" / "train.py").write_text("print('exact')\n")
+    (snapshot / "meta.json").write_bytes(
+        b" " * (migration_mod._SNAPSHOT_METADATA_MAX_BYTES + 1)
+    )
+
+    plan = plan_layout(
+        cfg,
+        runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("head-only plan must not contact workers")
+        ),
+    )
+    rows = {(row["kind"], row["identity"]): row for row in plan["rows"]}
+
+    assert rows[("registry", "oversized")]["status"] == "blocked"
+    assert "size limit" in rows[("registry", "oversized")]["blocker"]
+    assert rows[("snapshot", digest)]["status"] == "blocked"
+    assert "size limit" in rows[("snapshot", digest)]["blocker"]
+
+
+def test_registry_migration_revalidates_duplicate_before_deleting_source(tmp_path):
+    source = tmp_path / "legacy" / "job.json"
+    destination = tmp_path / "current" / "job.json"
+    source.parent.mkdir()
+    destination.parent.mkdir()
+    source.write_bytes(b'{"job_id":"job"}\n')
+    destination.write_bytes(b'{"job_id":"changed"}\n')
+
+    with pytest.raises(OSError, match="duplicate changed"):
+        migration_mod._copy_registry_row(
+            {
+                "source": str(source),
+                "destination": str(destination),
+                "status": "duplicate_verified",
+            }
+        )
+
+    assert source.is_file()
+    assert destination.read_bytes() == b'{"job_id":"changed"}\n'
+
+
+def test_registry_migration_rolls_back_if_source_changes_during_publish(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "legacy" / "job.json"
+    destination = tmp_path / "current" / "job.json"
+    source.parent.mkdir()
+    destination.parent.mkdir()
+    source.write_bytes(b'{"job_id":"job"}\n')
+    real_link = migration_mod.os.link
+
+    def racing_link(*args, **kwargs):
+        result = real_link(*args, **kwargs)
+        source.write_bytes(b'{"job_id":"changed"}\n')
+        return result
+
+    monkeypatch.setattr(migration_mod.os, "link", racing_link)
+
+    with pytest.raises(OSError, match="verification failed|changed during"):
+        migration_mod._copy_registry_row(
+            {
+                "source": str(source),
+                "destination": str(destination),
+                "status": "movable",
+            }
+        )
+
+    assert source.is_file()
+    assert not destination.exists()
 
 
 def test_layout_plan_never_contacts_active_legacy_job(tmp_path):
@@ -126,6 +215,52 @@ def test_worker_copy_verifies_bytes_and_refuses_control_symlinks():
     assert "diff -qr --no-dereference" in command
     assert '[ ! -e "$tmp/.dt" ] && [ ! -L "$tmp/.dt" ]' in command
     assert "dt_layout_v1" in command
+    assert "umask 077" in command
+    assert 'chmod 700 "$tmp"' in command
+
+
+def test_worker_probe_never_trusts_an_existing_destination_without_full_proof():
+    command = migration_mod._worker_probe_command(
+        _entry("interrupted-copy", node="n1"),
+        "/data/dt/worker/jobs/interrupted-copy",
+    )
+
+    assert "copy_verified" not in command
+    assert "destination_requires_review" in command
+
+
+def test_worker_copy_preserves_data_inside_a_private_capsule(tmp_path):
+    source = tmp_path / "legacy" / "job"
+    destination = tmp_path / "worker" / "jobs" / "private-copy"
+    (source / "code").mkdir(parents=True)
+    (source / "code" / "train.py").write_text("print('exact')\n")
+    (source / "logs").mkdir()
+    (source / "logs" / "stdout.log").write_text("done\n")
+    (source / "outputs").mkdir()
+    (source / "outputs" / "result.json").write_text('{"ok": true}\n')
+    (source / "meta.json").write_text(json.dumps({"job_id": "private-copy"}))
+    (source / "cmd.sh").write_text("python train.py\n")
+    source.chmod(0o755)
+    entry = _entry("private-copy", node="n1")
+    entry.job_dir = str(source)
+
+    copied = subprocess.run(
+        ["bash", "-c", _worker_copy_command(entry, str(destination))],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert copied.returncode == 0, copied.stderr
+    assert "DT_MIGRATE_LAYOUT_V1\tcopied" in copied.stdout
+    assert destination.stat().st_mode & 0o777 == 0o700
+    assert (destination / ".dt").stat().st_mode & 0o777 == 0o700
+    assert (destination / "code" / "train.py").read_text() == "print('exact')\n"
+    assert (destination / "logs" / "stdout.log").read_text() == "done\n"
+    assert (destination / "outputs" / "result.json").read_text() == ('{"ok": true}\n')
+    assert (destination / ".dt" / "meta.json").is_file()
+    assert (destination / ".dt" / "command.sh").is_file()
+    assert source.is_dir()
 
 
 def test_role_queue_references_immutable_objects_without_copying_source(tmp_path):
@@ -183,3 +318,113 @@ def test_migrate_layout_defaults_to_a_read_only_json_plan(tmp_path, monkeypatch)
     assert payload["mode"] == "plan"
     assert payload["destination_layout"] == ROLE_LAYOUT
     assert payload["summary"]["total"] == 0
+
+
+def test_migration_size_failure_remains_unknown(tmp_path, monkeypatch):
+    target = tmp_path / "legacy"
+    target.mkdir()
+    monkeypatch.setattr(
+        "dt.migration.subprocess.run",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 124, "", "timeout"),
+    )
+
+    assert _disk_bytes(target) is None
+
+
+def test_worker_probe_timeout_makes_accounting_incomplete(tmp_path):
+    cfg = _cfg(tmp_path)
+    entry = _entry("unknown-size", node="n1")
+    cfg.legacy_registry_dir().mkdir(parents=True)
+    (cfg.legacy_registry_dir() / f"{entry.job_id}.json").write_text(
+        json.dumps(asdict(entry))
+    )
+
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            "DT_MIGRATE_LAYOUT_V1\tmovable\t-1\t-\n",
+            "",
+        )
+
+    planned = plan_layout(cfg, runner=runner)
+    accounting = planned["summary"]["accounting"]
+    assert accounting["complete"] is False
+    assert accounting["unknown_rows"] == ["worker:n1:job:unknown-size"]
+
+
+def test_worker_source_delete_failure_is_not_reported_as_complete(tmp_path):
+    cfg = _cfg(tmp_path)
+    entry = _entry("retained-legacy", node="n1")
+    cfg.legacy_registry_dir().mkdir(parents=True)
+    (cfg.legacy_registry_dir() / f"{entry.job_id}.json").write_text(
+        json.dumps(asdict(entry))
+    )
+
+    def runner(_node, _local, command, *_args, **_kwargs):
+        if "DT_MSRC=" in command:
+            return subprocess.CompletedProcess(
+                [], 0, "DT_MIGRATE_LAYOUT_V1\tcopied\n", ""
+            )
+        if 'find "$src" -xdev -depth -delete' in command:
+            return subprocess.CompletedProcess([], 1, "", "permission denied")
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            "DT_MIGRATE_LAYOUT_V1\tmovable\t100\t-\n",
+            "",
+        )
+
+    applied = apply_layout(cfg, runner=runner)
+
+    assert applied["applied_summary"]["failed"] == 1
+    assert applied["verification"]["complete"] is False
+    failed = next(row for row in applied["applied"] if row["status"] == "failed")
+    assert "legacy duplicate was retained" in failed["blocker"]
+
+
+def test_worker_migration_holds_job_lock_across_copy_and_source_delete(tmp_path):
+    cfg = _cfg(tmp_path)
+    entry = _entry("serialized-worker", node="n1")
+    cfg.legacy_registry_dir().mkdir(parents=True)
+    (cfg.legacy_registry_dir() / f"{entry.job_id}.json").write_text(
+        json.dumps(asdict(entry))
+    )
+    copy_started = Event()
+    permit_copy = Event()
+    delete_finished = Event()
+    competing_lock_acquired = Event()
+
+    def runner(_node, _local, command, *_args, **_kwargs):
+        if "DT_MSRC=" in command:
+            copy_started.set()
+            assert permit_copy.wait(2)
+            return subprocess.CompletedProcess(
+                [], 0, "DT_MIGRATE_LAYOUT_V1\tcopied\n", ""
+            )
+        if 'find "$src" -xdev -depth -delete' in command:
+            delete_finished.set()
+            return subprocess.CompletedProcess([], 0, "", "")
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            "DT_MIGRATE_LAYOUT_V1\tmovable\t100\t-\n",
+            "",
+        )
+
+    def take_competing_lock():
+        with job_lock(cfg, entry.job_id):
+            competing_lock_acquired.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        migrating = pool.submit(apply_layout, cfg, runner=runner)
+        assert copy_started.wait(2)
+        competing = pool.submit(take_competing_lock)
+        assert not competing_lock_acquired.wait(0.1)
+        permit_copy.set()
+        applied = migrating.result(timeout=2)
+        competing.result(timeout=2)
+
+    assert delete_finished.is_set()
+    assert competing_lock_acquired.is_set()
+    assert applied["applied_summary"]["failed"] == 0

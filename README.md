@@ -1,47 +1,64 @@
-# DistTrainer
+# dt
 
-Run reproducible experiments on shared GPU servers without hand-managed SSH
-sessions, GPU selection, environment setup, or result copies.
+**dt — local work, remote compute.**
 
 [![CI](https://github.com/ChangWinde/dt/actions/workflows/ci.yml/badge.svg)](https://github.com/ChangWinde/dt/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB.svg)](.github/SUPPORT.md)
-[![Release](https://img.shields.io/badge/release-0.7.0-0A7BBB.svg)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-0.8.0-0A7BBB.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey.svg)](LICENSE)
 
-DistTrainer, invoked as `dt`, is a command-line control plane for experiments
-across SSH-accessible NVIDIA GPU servers. One submission captures the code
-snapshot, selects collision-free capacity, recreates the locked environment,
-queues the job, records telemetry, and preserves outputs for recovery.
+`dt` is an AI-native remote execution tool for trusted, SSH-accessible Linux
+machines. It runs a command from a configured local project on idle remote
+compute, then exposes the job's state, logs, metrics, result, and declared
+outputs through the same local CLI.
 
 ```bash
 dt run -n baseline -f -- python train.py --config configs/baseline.yaml
 ```
 
-The Python distribution is named `disttrainer`. The installed command and
-import package are both named `dt`.
+The goal is a local-equivalent workflow without hand-managed SSH sessions, GPU
+selection, environment setup, or result copies. The product, command, and
+import package are named `dt`; the Python distribution remains `disttrainer`
+for compatibility.
 
-## Why DistTrainer
+## Why dt
 
-| Problem | DistTrainer contract |
-|---|---|
-| Shared GPUs race between users and tools | Capacity probes and per-GPU leases prevent duplicate placement |
-| Queued code changes before execution | Every job runs an immutable submit-time snapshot |
-| Remote environments drift | `uv.lock`, Python version, extras, and setup inputs define reusable environments |
-| SSH disconnects hide job state | Jobs continue in managed sessions; follow commands reconnect safely |
-| Results scatter across machines | Logs, metadata, telemetry, and `outputs/` are recoverable by job ID |
-| Performance claims lack controls | Fork, compare, batch, and chain preserve experiment lineage and inputs |
+- **Reproducible execution:** every job uses an immutable submit-time source
+  snapshot, identified environment, command, resource request, and runtime
+  payload.
+- **Safe scheduling:** capacity probes, advisory GPU leases, resource guards,
+  and a fair runnable queue coordinate `dt`-managed placements and explain why
+  a job is waiting.
+- **AI-native control:** stable JSON, exit codes, structured states, bounded
+  queries, persistent request receipts, and a redacted operation journal let
+  an agent act without scraping terminal output.
+- **Durable recovery:** remote jobs survive client disconnection; `info`,
+  `logs`, `metrics`, `wait`, `pull`, `rerun`, and `exec` recover their state or
+  continue work.
+- **Experiment workflows:** `batch`, `chain`, typed results, cross-node
+  dependencies, `fork`, and `compare` preserve lineage across iterations.
+- **Efficient transfer:** control and bulk-data SSH connections are isolated;
+  verified site caches or direct same-site peers can avoid repeated transfer
+  through slow ProxyJump or FRP routes.
+- **Safe operation:** maintenance is plan-first and identity-checked;
+  installation and deployment are checksum-verified, atomic, and rollbackable.
 
-DistTrainer uses stable exit codes and machine-readable responses. Add `--json`
-to automation-facing commands, and use `dt info JOB --json` when inspecting one
-experiment.
+AI-native describes the execution contract, not autonomous experiment design.
+The project still owns its command, data, scientific logic, and outputs.
+
+This README describes the 0.8.0 release candidate. Promotion still requires a
+verified release bundle, a live upgrade/rollback canary, and explicit release
+authority.
 
 ## Quick start
 
-### 1. Install on the head
+Install `dt` on one head machine. Workers receive the runtime payload with each
+job and do not require a separate installation.
 
-The usual center has one DT head (master) and multiple SSH-reachable workers.
-Install the `dt` command on the head; workers receive the runtime payload with
-each job and do not need a separate DT installation.
+Requirements: Linux, Python 3.10 or 3.11, `uv`, OpenSSH, rsync, tmux, flock,
+and timeout. GPU workers also require NVIDIA drivers and `nvidia-smi`.
+
+### Install
 
 From a clean, trusted checkout:
 
@@ -54,260 +71,127 @@ export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
 dt --version
 ```
 
-The source installer archives the committed `HEAD`, builds a non-editable
-wheel with locked dependencies, installs it as an isolated `uv` tool, and
-prints the source commit in `dt --version`. It refuses a dirty checkout and
-does not guess or overwrite configuration. If the uv tool directory is not
-already on `PATH`, the installer prints both the immediately runnable absolute
-command and the one-line shell setup shown above; `uv tool update-shell`
-persists it for future shells.
+The installer builds committed `HEAD`, installs locked dependencies with
+mandatory hashes, and leaves an existing installation unchanged on failure.
+Use the [release procedure](docs/releasing.md) for managed deployment.
 
-For a managed production rollout, install a reviewed release bundle instead:
+### Configure
 
-```bash
-bash bootstrap.sh \
-  dist/disttrainer-0.7.0-py3-none-any.whl \
-  dist/runtime-constraints.txt
-export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
-dt --version
-```
-
-For development:
-
-```bash
-uv sync --locked --all-groups
-uv run dt --help
-```
-
-DistTrainer supports Python 3.10 and 3.11. The head and workers require Linux,
-OpenSSH, rsync, tmux, flock, timeout, and an approved `uv` installation. GPU
-workers also require NVIDIA drivers and `nvidia-smi`.
-
-### 2. Configure a head
-
-Create a validated config in one command:
+Create a head with one local node, one SSH worker, and one project:
 
 ```bash
 dt init --role head --center research \
   --node gpu-head --local-node gpu-head \
   --node gpu-node-1 \
   --project policy=~/projects/policy
-```
 
-For a single machine and the current project, the short form is enough:
-
-```bash
-dt init --role head --center research
-```
-
-It uses the current hostname as a local node and the current directory as the
-default project. Preview the generated YAML with `--dry-run`; an existing
-config is never replaced unless `--force` is explicit.
-
-The resulting `~/.config/dt/config.yaml` is equivalent to:
-
-```yaml
-center: research
-nodes:
-  - {name: gpu-head, local: true}
-  - {name: gpu-node-1}
-projects:
-  policy: ~/projects/policy
-default_project: policy
-paths:
-  root: ~/dt
-  worker_root: ~/dt
-queue:
-  poll_s: 60
-  active_poll_s: 2
-```
-
-Then verify every host and runtime dependency:
-
-```bash
 dt doctor
 dt agent install
 dt agent start
 dt agent status
 ```
 
-Read the [configuration guide](docs/configuration.md) before adding setup hooks,
-multiple centers, storage policy, or queue limits.
+Use `dt init --dry-run` to preview configuration. Existing configuration is
+not replaced without `--force`. See [Configuration](docs/configuration.md) for
+multiple centers, laptops, site topology, environments, and storage policy.
 
-From a laptop, create a forwarding config with:
-
-```bash
-dt init --role laptop --center research --head gpu-head
-```
-
-### 3. Run and recover an experiment
+### Run, observe, and recover
 
 ```bash
-dt free --who
-dt run -n baseline -f -- python train.py
-dt ps
-dt info baseline
-dt logs baseline -f
-dt pull baseline --collection baseline
+dt free --explain
+job_id=$(dt run -n baseline -- python train.py | tail -1)
+dt wait "$job_id"
+dt info "$job_id"
+dt logs "$job_id" -n 200
+dt pull "$job_id" --collection baseline
 ```
 
-`-f` follows the submitted job and returns its process exit code. Without `-f`,
-`dt run` prints the job ID and returns after registration. When no fitting GPU
-is free, the job enters the resident FIFO queue by default. FIFO is preserved
-among jobs that can use the same capacity; a job pinned to one busy node does
-not hold later work pinned to a different node.
+Without `-f`, `dt run` returns after durable registration. With `-f`, it
+follows the job and returns the remote process exit code; Ctrl-C detaches
+without cancelling the job. Write recoverable files below
+`$DT_JOB_DIR/outputs/`.
 
-Human output defaults to current state, anomalies, compact job references, and
-the next useful action. Use `dt info JOB --verbose`, `dt agent status --verbose`,
-`dt storage --details`, or `dt ps --wide` only when complete provenance, paths,
-or identities are needed. Automation should use `--json` rather than parse
-tables.
-
-Write checkpoints, reports, and evaluation artifacts under
-`$DT_JOB_DIR/outputs/`. This is the recovery boundary used by `dt pull`.
-
-## Core workflows
-
-### Keep a GPU fed
-
-Submit independent commands as one same-snapshot queue:
+For retry-safe submission from an agent:
 
 ```bash
-dt batch gpu-node-1 \
-  "python train.py --lr 1e-4" \
-  "python train.py --lr 3e-4" \
-  -n lr-sweep
-
-dt ps --watch
+dt run --request-id campaign-42-train -- python train.py
+dt request campaign-42-train --json
 ```
 
-Each item remains an independent job with its own state, logs, metrics, and
-outputs. A failed batch item does not stop later items.
-
-### Gate stages on success
+For context-efficient polling:
 
 ```bash
-dt chain gpu-node-1 \
-  "python preflight.py" \
-  "python train.py" \
-  "python evaluate.py" \
-  -n guarded-training
+dt ps --summary --json
+dt ps --compact --active --limit 50 --json
+dt ps --compact --issues --fields job_id,status,node,reason --limit 50 --json
 ```
-
-Each stage starts only after its predecessor exits successfully. Waiting stages
-do not consume GPU leases and do not block unrelated runnable jobs.
-
-### Compare a controlled variant
-
-```bash
-dt fork baseline -n candidate -- python train.py --variant candidate
-dt wait baseline candidate
-dt compare baseline candidate
-```
-
-Fork preserves the original source snapshot by default. Compare reports
-differences in code, environment, placement, resources, and selected metrics.
-
-### Diagnose a failure
-
-```bash
-dt ps --issues
-dt info failed-run
-dt logs failed-run -n 200
-dt rerun failed-run
-```
-
-`rerun` preserves the command and resource request but captures current project
-code, which makes fix-and-retry lineage explicit.
-
-### Recover outputs and control storage
-
-```bash
-dt pull baseline --lite
-dt storage
-dt migrate layout --plan
-dt compact --before 2026-07-01 --plan
-dt clean --before 2026-07-01 --plan
-```
-
-Maintenance commands are previewable and fail closed on identity, path, or
-snapshot inconsistencies. Cleanup retention is measured from terminal
-completion, and failed node/result deletion retains the registry record for a
-safe retry. From a laptop, cleanup defaults to one selected center; use
-`--all-centers` only when that wider scope is intentional. Run mutation only
-after reviewing its plan.
-
-## How it works
-
-```mermaid
-flowchart LR
-    CLI["dt CLI"] --> HEAD["Head registry and queue agent"]
-    HEAD --> SNAP["Immutable snapshot store"]
-    HEAD --> N1["GPU node A"]
-    HEAD --> N2["GPU node B"]
-    HEAD --> N3["GPU node C"]
-    N1 --> REC["Logs, telemetry, outputs"]
-    N2 --> REC
-    N3 --> REC
-    REC --> HEAD
-    HEAD --> CLI
-```
-
-The head registry is the lifecycle source of truth. The queue agent resolves
-dependencies and capacity, then dispatches an immutable snapshot and attested
-runtime payload. Compute nodes hold GPU leases and execute the job in a managed
-session. Every terminal path records an exit marker or an explicit lost-state
-reason.
-
-Runtime data is role-scoped below the configured base:
-
-```text
-~/dt/
-├── head/       registry, queue, immutable objects, managed pulls, cache
-└── worker/     job capsules, environments, artifacts, cache, leases
-```
-
-Each worker job is one capsule containing `code/`, `outputs/`, `logs/`, and a
-private `.dt/` control directory. Project worktrees and DT configuration stay
-outside this runtime root. Existing flat-layout jobs remain readable; use
-`dt migrate layout --plan` before moving any verified terminal data.
-
-See [Architecture](docs/architecture.md) for module boundaries, data flow, and
-the repository layout.
 
 ## Command map
 
 | Goal | Commands |
 |---|---|
-| Find capacity | `dt free`, `dt doctor` |
-| Submit work | `dt run`, `dt batch`, `dt chain` |
-| Observe work | `dt ps`, `dt watch`, `dt info`, `dt logs`, `dt metrics` |
+| Find capacity and routes | `dt free`, `dt doctor`, `dt topology` |
+| Submit work | `dt run`, `dt batch`, `dt chain`, `dt request` |
+| Observe work | `dt events`, `dt ps`, `dt info`, `dt logs`, `dt metrics` |
 | Wait or recover | `dt wait`, `dt pull`, `dt attach` |
-| Iterate | `dt rerun`, `dt fork`, `dt compare` |
+| Iterate | `dt rerun`, `dt fork`, `dt exec`, `dt compare` |
 | Operate the service | `dt agent`, `dt storage`, `dt migrate`, `dt compact`, `dt clean`, `dt kill` |
 | Prepare remote data | `dt sync`, `dt seed` |
 
-The [command reference](docs/command-reference.md) explains command selection,
-stable exit codes, JSON behavior, and destructive-operation safeguards. Exact
-options remain available through `dt COMMAND --help`.
+Use `dt COMMAND --help` for exact options and the
+[command reference](docs/command-reference.md) for JSON and exit-code
+contracts.
+
+## How it works
+
+```mermaid
+flowchart LR
+    CLI["Local dt CLI"] -->|intent and control| HEAD["Head registry and agent"]
+    HEAD --> STORE["Snapshots and receipts"]
+    HEAD -->|SSH control| NODE["Compute node"]
+    STORE -->|verified data| SITE["Site cache or peer"]
+    SITE -->|LAN or direct SSH| NODE
+    NODE --> EVIDENCE["State, logs, metrics, outputs"]
+    EVIDENCE --> HEAD
+    HEAD --> CLI
+```
+
+The head registry is the lifecycle source of truth. Its agent resolves
+dependencies and capacity, then dispatches an immutable snapshot and attested
+runtime payload. Workers execute jobs in managed sessions and publish explicit
+terminal state.
+
+Site topology is configured, never inferred from hostnames. Direct-transfer
+discovery verifies advertised endpoints and pinned SSH identity; it does not
+scan subnets or perform UDP hole punching. Site caches and existing peers avoid
+sending the same content digest across a site boundary separately for every
+worker.
+
+The local-equivalent contract covers observable execution: source, environment
+identity, lifecycle, result, evidence, and declared outputs. Hardware and paths
+may differ, and side effects outside declared outputs remain remote. A laptop
+client forwards intent to its configured head; it does not implicitly upload a
+laptop-only worktree.
+
+## Scope and security
+
+`dt` assumes one trusted Unix identity across trusted SSH hosts. It is not a
+tenant-isolation boundary or a sandbox for untrusted code. Bare-process GPU
+leases and `CUDA_VISIBLE_DEVICES` are advisory; they do not physically isolate
+Vulkan, EGL, OpenGL, or device files. Read the
+[security policy](.github/SECURITY.md) and
+[support contract](.github/SUPPORT.md) before deployment.
 
 ## Documentation
 
-Start with the [documentation index](docs/README.md).
-
-| Audience | Guide |
+| Topic | Guide |
 |---|---|
-| New operator | [Getting started](docs/getting-started.md) |
-| Center administrator | [Configuration](docs/configuration.md) and [Operations](docs/operations.md) |
-| Researcher | [Experiment workflows](docs/workflows.md) |
-| Contributor | [Architecture](docs/architecture.md) and [Contributing](.github/CONTRIBUTING.md) |
-| Release maintainer | [Release procedure](docs/releasing.md) |
-| Security reviewer | [Security policy](.github/SECURITY.md) and [Support contract](.github/SUPPORT.md) |
-
-Design decisions, validation audits, experiment records, and performance
-reports remain in `docs/adr/`, `docs/audits/`, `docs/experiments/`, and
-`docs/performance/`. Their generated indexes make the evidence searchable
-without mixing it into the user path.
+| First deployment | [Getting started](docs/getting-started.md) |
+| Configuration and topology | [Configuration](docs/configuration.md) |
+| Experiments and recovery | [Workflows](docs/workflows.md) |
+| Service and storage | [Operations](docs/operations.md) |
+| Design and data flow | [Architecture](docs/architecture.md) |
+| All documentation | [Documentation index](docs/README.md) |
 
 ## Development
 
@@ -317,19 +201,13 @@ uv run --no-sync pytest -q -p no:cacheprovider
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync python scripts/docs.py
+scripts/security-check.sh
 ```
 
-Changes to queueing, process cleanup, transfer, identity, or destructive
-maintenance require both success-path and denied/failure-path regression tests.
-Read the [contribution guide](.github/CONTRIBUTING.md) before submitting a
-change.
+See [Contributing](.github/CONTRIBUTING.md) for the complete quality gate.
 
-## Security and license
+## License
 
-DistTrainer assumes one trusted Unix identity across trusted SSH hosts. It is
-not a tenant-isolation boundary or a sandbox for untrusted project code. Read
-[security policy](.github/SECURITY.md) before deployment.
-
-This repository is currently distributed under the
-[DistTrainer Proprietary License](LICENSE). No open-source usage rights are
-granted by that license.
+This repository is distributed under the
+[DistTrainer Proprietary License](LICENSE). It currently grants no open-source
+usage rights.

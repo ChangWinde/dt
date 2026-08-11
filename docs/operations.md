@@ -16,6 +16,26 @@ The agent owns queue reconciliation and dispatch. It does not invent
 experiments. When stopped, running jobs continue and queued jobs remain
 registered.
 
+On a usable user systemd manager, installation creates
+`disttrainer-agent.service` with `Restart=always`. Runtime tmux creation enters
+an independent user scope so stopping the agent's invoking service does not
+take running jobs with it. `agent status --json` reports the supervisor,
+heartbeat age, and user-lingering state. If lingering is disabled, enable it
+through the host's normal administrator policy so the user manager survives
+logout. Crontab remains a reported compatibility fallback only.
+Unit installation is atomic: a reload or enable failure restores the prior
+unit, while a first-time failure removes the candidate and reloads the user
+manager. An install error therefore must be investigated; it is never evidence
+that the new supervisor became authoritative.
+
+Queue limits, nodes, projects, routes, and other operational settings reload on
+the next poll. `center`, `paths.root`, and the runtime layout are agent identity,
+not hot-reload knobs: changing one makes the old process exit before it can mix
+locks or registry state across roots, and systemd starts a coherent replacement.
+If the file changes from head to laptop role, the service stops instead of
+entering a restart loop. Re-run `dt agent install` after moving `paths.root` so
+the supervisor's append-only log target also follows the new root.
+
 `dt agent status --json` reports queue depth, the queue head, registry size,
 agent log bounds, and handoff state:
 
@@ -44,6 +64,12 @@ dt doctor --json
 `dt free` includes active DistTrainer leases even before a job creates a CUDA
 context. A GPU that appears idle in `nvidia-smi` can still be reserved by a job
 performing CPU-side initialization.
+
+That lease is advisory for a bare process. `CUDA_VISIBLE_DEVICES` constrains
+CUDA enumeration but does not deny Vulkan, EGL, OpenGL, or direct NVIDIA/DRM
+device access. Until a node advertises a future OCI/CDI physical-isolation
+backend, graphics workloads must not assume the lease is an enforcement
+boundary.
 
 The default human view keeps queue state to one compact summary. Add
 `--explain` only when you need the complete next-job ID and persisted scheduler
@@ -90,13 +116,77 @@ Git commit.
 
 ## Failure recovery
 
+Artifact, seed, and pull transfers accept 0-10 retries after the first
+attempt. The bound keeps automated recovery finite and prevents a mistaken AI
+argument from creating an effectively permanent retry loop; interrupted rsync
+partials remain resumable on a later explicit invocation.
+
 Start with:
 
 ```bash
+dt events --issues
 dt info JOB
 dt logs JOB -n 200
 dt wait JOB
 ```
+
+`dt events` is the redacted cross-command index. It records command category,
+role, build, timing, exit state, and a stable problem classification. On a
+laptop the default is the private laptop journal; add `-c CENTER` to inspect
+the authoritative head-side invocation. Use an operation ID to correlate the
+two sides. The journal intentionally excludes command arguments, exception
+messages, environment variables, hostnames, and usernames.
+
+An operation-journal warning means the command continued without complete
+index evidence. Fix the reported file permission or type problem before
+relying on subsequent traces. A malformed journal record makes `dt events`
+unhealthy and exits nonzero rather than silently ignoring the damage.
+
+Site-aware snapshot deliveries also keep a private, rotating structured record
+at `<head-root>/state/transfers/events.jsonl`. `dt_artifact_transfer_v1`
+separates cross-site and site-LAN bytes, route legs, cache and replica hits,
+active discovery duration, selected source kind, lock wait, duration, and
+sanitized failure type. Detailed transport text remains in the
+normal submit/agent log; the JSONL record never stores source or destination
+filesystem paths, private keys, or command text. An evidence-write warning is
+fail-open for job availability and must be repaired before treating later
+transfer history as complete.
+
+When an entire site appears offline during a large copy, first distinguish
+transport congestion from a dead gateway. DT control, bulk upload, and LAN
+relay sockets live below `~/.ssh/dt/{control,artifact,artifact-relay}` and must
+not resolve to the user's interactive or monitoring ControlPath. Increasing
+the rsync deadline is not a fix for a shared socket or missing site route.
+With `topology-aware`, inspect `source_kind`, `route`, `replica_hit`, and
+`discovery_seconds`: a peer hit must have zero cross-site bytes, and every
+site-LAN edge is probed with ProxyJump disabled before transfer.
+`dt topology --json` exposes each site's circuit policy and reports a cooling
+edge as `error_kind: circuit_open`; wait for the configured cooldown or repair
+the underlying direct route instead of forcing repeated WAN retries. Circuit
+files live below `<head-root>/state/route-health`, use hashed edge identities,
+and are intentionally not an authorization or integrity bypass. Only typed
+transport failures open them; a digest mismatch, full disk, permission failure,
+or bad artifact path remains an artifact/configuration incident and must not
+suppress a healthy network edge.
+
+A full site probe is capped at 256 directed edges by default. For a large site,
+scope the dry run with `dt topology --site SITE --source NODE --json` or
+`--destination NODE`; raise `--max-edges` only when that larger active probe is
+intentional. The hard ceiling is 4,096 edges, and discovery still performs no
+Artifact transfer or subnet scan.
+
+Read-only topology and GPU telemetry probes may retry once through a fresh,
+non-multiplexed DT overlay when stderr proves a stale ControlMaster. The retry
+shares the original deadline and bypasses both final-target and implicit
+ProxyJump masters. Submission and other mutating commands never use this
+automatic retry, so an uncertain response cannot duplicate work.
+
+DT records a wrapper's Linux process start identity before publishing its
+PGID. Lifecycle observation and `dt kill` verify that identity and the node
+boot before treating the process group as task-owned. Jobs started by an older
+DT build have no identity marker and are accepted only while their wrapper cwd
+is still inside the job capsule. An identity mismatch is reported as `lost`;
+DT fails closed instead of signaling a possibly reused process or tmux session.
 
 Then choose one action:
 
@@ -109,6 +199,8 @@ Then choose one action:
 | Transfer interrupted | Rerun the same `dt pull` command |
 | SSH disconnected | Reconnect with `dt watch`, `dt logs -f`, or `dt wait`; do not resubmit blindly |
 | Launch outcome uncertain | Inspect, then use verified `dt kill JOB -y` cleanup before retrying |
+| Submission response lost with `--request-id` | `dt request REQUEST_ID --json`; never blindly resubmit |
+| Package index unavailable during diagnosis | `dt exec JOB -- COMMAND` to reuse the exact existing environment |
 
 Stable `dt wait` terminal codes:
 
@@ -119,6 +211,7 @@ Stable `dt wait` terminal codes:
 | 66 | Job killed |
 | 67 | Job lost |
 | 68 | Failed before start |
+| 69 | Dependency predicate skipped the job |
 
 Submission uses exit 2 for `--no-queue` capacity failure, 3 for environment
 failure, 4 for local not-found paths, and 5 for unreachable infrastructure.
@@ -148,8 +241,10 @@ dt storage --json
 
 The default inventory aggregates one row for the head and one for each worker.
 `--details` exposes every managed storage class and path; JSON retains the full
-inventory. Legacy flat-layout residue is reported separately. Use the detail or
-JSON view before changing retention policy.
+inventory. Legacy flat-layout residue, including old worker jobs and durable
+request state, is reported separately. `accounting.complete=false` means one or
+more sections timed out and `known_bytes` is a lower bound, never a fabricated
+zero. Use the detail or JSON view before changing retention policy.
 
 ## Runtime layout migration
 

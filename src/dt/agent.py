@@ -7,8 +7,9 @@ stay FIFO so large jobs do not starve; job-specific blockers (for example a
 missing required path or an incompatible pin) do not hold runnable jobs behind
 them.
 
-Survival: `dt agent install` writes a crontab @reboot line; `dt run` also
-starts the agent on demand when it queues a job and none is alive.
+Survival: `dt agent install` prefers a restartable systemd user service and
+retains crontab as an explicit compatibility fallback. `dt run` also starts
+the installed supervisor (or a detached fallback) when it queues work.
 
 While a queue is active, one quiet completion channel watches each running dt
 wrapper and wakes the loop as soon as its exit marker appears. The normal
@@ -24,10 +25,13 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
+from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -41,8 +45,17 @@ from .jobs import (
     JobEntry,
     RegistryDamage,
     agent_wake_path,
+    effective_result_state,
     list_all,
     refresh_status,
+)
+from .private_state import (
+    PrivateStateError,
+    atomic_write,
+    atomic_write_regular,
+    open_private_regular,
+    read_bounded,
+    read_bounded_regular,
 )
 
 _completion_watch_command = completion_mod.completion_watch_command
@@ -50,10 +63,20 @@ _spawn_completion_watcher = completion_mod.spawn_completion_watcher
 _stop_completion_watcher = completion_mod.stop_completion_watcher
 
 CRON_MARK = "# dt-agent"
+SYSTEMD_UNIT = "disttrainer-agent.service"
 AUTOCLEAN_EVERY_S = 24 * 3600
 LOST_RECHECK_S = 5 * 60
 AGENT_LOG_MAX_BYTES = 10 * 1024 * 1024
 AGENT_LOG_BACKUPS = 2
+SYSTEMD_UNIT_MAX_BYTES = 64 * 1024
+AGENT_CONFIG_RESTART_EXIT = 75
+AGENT_CONFIG_INVALID_ROLE_EXIT = 78
+
+
+def _runtime_identity(cfg: HeadConfig) -> tuple[str, str, str]:
+    """Fields that cannot be changed while the agent holds its singleton lock."""
+    root = os.path.abspath(os.fspath(cfg.root.expanduser()))
+    return cfg.center, cfg.layout, root
 
 
 def _lock_path(cfg: HeadConfig) -> Path:
@@ -68,39 +91,300 @@ def log_path(cfg: HeadConfig) -> Path:
     return cfg.agent_dir() / "agent.log"
 
 
+def heartbeat_path(cfg: HeadConfig) -> Path:
+    return cfg.agent_dir() / "agent.heartbeat"
+
+
+def _open_private_regular(path: Path, flags: int, *, mode: int = 0o600) -> int:
+    try:
+        return open_private_regular(path, flags, mode=mode)
+    except PrivateStateError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            raise FileNotFoundError(path) from exc
+        raise OSError("unsafe DT agent state file") from exc
+
+
+def _atomic_private_write(path: Path, payload: bytes) -> None:
+    try:
+        atomic_write(path, payload)
+    except PrivateStateError as exc:
+        raise OSError("cannot publish DT agent state") from exc
+
+
+def _read_private_text(path: Path, *, max_bytes: int) -> str:
+    try:
+        result = read_bounded(path, max_bytes=max_bytes)
+    except PrivateStateError as exc:
+        raise OSError(str(exc)) from exc
+    if result is None:
+        raise FileNotFoundError(path)
+    return result[0].decode("utf-8")
+
+
+def _prepare_agent_log(cfg: HeadConfig) -> Path:
+    """Create the supervisor's append target before it can choose mode 0644."""
+    path = log_path(cfg)
+    descriptor = _open_private_regular(
+        path,
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+    )
+    os.close(descriptor)
+    return path
+
+
+def systemd_unit_path() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT
+
+
+def _systemctl(*args: str, timeout: float = 10) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["systemctl", "--user", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _systemd_user_available() -> bool:
+    if shutil.which("systemctl") is None:
+        return False
+    try:
+        return _systemctl("show-environment", timeout=3).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _linger_enabled() -> bool | None:
+    """Whether the user manager survives logout; None when not observable."""
+    if shutil.which("loginctl") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["loginctl", "show-user", str(os.getuid()), "--property=Linger", "--value"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    value = proc.stdout.strip().lower()
+    return True if value == "yes" else False if value == "no" else None
+
+
+def _systemd_quote(value: str) -> str:
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("%", "%%")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+    )
+    return '"' + escaped + '"'
+
+
+def _systemd_output_spec(path: Path) -> str:
+    """Encode an absolute append path for systemd's non-shell output grammar."""
+    raw = str(path)
+    if not path.is_absolute() or "\x00" in raw or "\n" in raw or "\r" in raw:
+        raise ValueError("systemd log path must be absolute and single-line")
+    escaped = (
+        raw.replace("\\", "\\x5c")
+        .replace(" ", "\\x20")
+        .replace("\t", "\\x09")
+        .replace('"', "\\x22")
+        .replace("'", "\\x27")
+        .replace("%", "%%")
+    )
+    return f"append:{escaped}"
+
+
+def render_systemd_unit(cfg: HeadConfig, dt_bin: Path | None = None) -> str:
+    """Return the rootless supervisor contract for the queue agent."""
+    binary = dt_bin or Path(shutil.which("dt") or Path.home() / ".local/bin/dt")
+    agent_log = _systemd_output_spec(log_path(cfg))
+    lines = [
+        "[Unit]",
+        "Description=DistTrainer queue agent",
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        f"ExecStart={_systemd_quote(str(binary))} agent run",
+        f"StandardOutput={agent_log}",
+        f"StandardError={agent_log}",
+        "Restart=always",
+        "RestartSec=2s",
+        f"RestartPreventExitStatus={AGENT_CONFIG_INVALID_ROLE_EXIT}",
+        "KillMode=control-group",
+    ]
+    config_override = os.environ.get("DT_CONFIG")
+    if config_override:
+        lines.insert(
+            lines.index("Type=simple") + 1,
+            f"Environment={_systemd_quote(f'DT_CONFIG={config_override}')}",
+        )
+    lines.extend(
+        [
+            "",
+            "[Install]",
+            "WantedBy=default.target",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _systemd_unit_snapshot(path: Path) -> tuple[bytes, int] | None:
+    try:
+        result = read_bounded_regular(path, max_bytes=SYSTEMD_UNIT_MAX_BYTES)
+    except PrivateStateError as exc:
+        raise RuntimeError("systemd unit path cannot be safely opened") from exc
+    if result is None:
+        return None
+    return result[0], stat.S_IMODE(result[1].st_mode)
+
+
+def _write_systemd_unit(path: Path, payload: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent = path.parent.lstat()
+    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+        raise RuntimeError("systemd user directory is unsafe")
+    try:
+        atomic_write_regular(path, payload, mode=mode)
+    except PrivateStateError as exc:
+        raise RuntimeError("cannot publish systemd user unit") from exc
+
+
+def _restore_systemd_unit(
+    path: Path,
+    snapshot: tuple[bytes, int] | None,
+) -> None:
+    if snapshot is None:
+        path.unlink(missing_ok=True)
+        return
+    payload, mode = snapshot
+    _write_systemd_unit(path, payload, mode)
+
+
+def install_systemd_service(cfg: HeadConfig) -> Path:
+    """Atomically install and enable the user unit, or raise with evidence."""
+    if not _systemd_user_available():
+        raise RuntimeError("systemd user manager is unavailable")
+    try:
+        _prepare_agent_log(cfg)
+    except OSError as exc:
+        raise RuntimeError("cannot prepare private agent log") from exc
+    path = systemd_unit_path()
+    previous = _systemd_unit_snapshot(path)
+    _write_systemd_unit(path, render_systemd_unit(cfg).encode("utf-8"))
+    try:
+        for args in (("daemon-reload",), ("enable", SYSTEMD_UNIT)):
+            proc = _systemctl(*args)
+            if proc.returncode != 0:
+                detail = (
+                    proc.stderr or proc.stdout or f"systemctl exited {proc.returncode}"
+                )
+                raise RuntimeError(" ".join(detail.split()))
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        rollback_errors: list[str] = []
+        try:
+            _restore_systemd_unit(path, previous)
+        except (OSError, RuntimeError) as rollback_exc:
+            rollback_errors.append(type(rollback_exc).__name__)
+        if previous is None:
+            try:
+                disabled = _systemctl("disable", SYSTEMD_UNIT)
+            except (OSError, subprocess.TimeoutExpired):
+                rollback_errors.append("disable")
+            else:
+                if disabled.returncode != 0:
+                    rollback_errors.append("disable")
+        try:
+            reloaded = _systemctl("daemon-reload")
+        except (OSError, subprocess.TimeoutExpired):
+            rollback_errors.append("daemon-reload")
+        else:
+            if reloaded.returncode != 0:
+                rollback_errors.append("daemon-reload")
+        suffix = (
+            f"; rollback incomplete ({', '.join(rollback_errors)})"
+            if rollback_errors
+            else "; previous unit restored"
+        )
+        raise RuntimeError(f"systemd service install failed: {exc}{suffix}") from exc
+    return path
+
+
 def _rotate_agent_log(cfg: HeadConfig) -> bool:
     """Copy-truncate an oversized log without invalidating stdout's open fd."""
     path = log_path(cfg)
     try:
-        if path.stat().st_size <= AGENT_LOG_MAX_BYTES:
-            return False
+        descriptor = _open_private_regular(path, os.O_RDWR)
     except FileNotFoundError:
         return False
+    try:
+        if os.fstat(descriptor).st_size <= AGENT_LOG_MAX_BYTES:
+            return False
 
-    for index in range(AGENT_LOG_BACKUPS, 1, -1):
-        older = path.with_name(f"{path.name}.{index - 1}")
-        newer = path.with_name(f"{path.name}.{index}")
-        if older.exists():
+        for index in range(AGENT_LOG_BACKUPS, 1, -1):
+            older = path.with_name(f"{path.name}.{index - 1}")
+            newer = path.with_name(f"{path.name}.{index}")
+            try:
+                older_metadata = older.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(older_metadata.st_mode) or not stat.S_ISREG(
+                older_metadata.st_mode
+            ):
+                raise OSError("unsafe DT agent log backup")
             os.replace(older, newer)
 
-    temporary = path.with_name(f".{path.name}.rotate-{os.getpid()}")
-    try:
-        shutil.copyfile(path, temporary)
-        os.replace(temporary, path.with_name(f"{path.name}.1"))
+        temporary_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.rotate-",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            with os.fdopen(temporary_descriptor, "wb") as target:
+                while True:
+                    block = os.read(descriptor, 1024 * 1024)
+                    if not block:
+                        break
+                    target.write(block)
+                target.flush()
+                os.fsync(target.fileno())
+            os.chmod(temporary_name, 0o600)
+            os.replace(temporary_name, path.with_name(f"{path.name}.1"))
+        finally:
+            try:
+                os.unlink(temporary_name)
+            except FileNotFoundError:
+                pass
         # Do not replace `path`: nohup/crontab already redirected stdout to
         # this inode. O_APPEND makes subsequent writes resume at the new EOF.
-        with path.open("r+b") as stream:
-            stream.truncate(0)
+        os.ftruncate(descriptor, 0)
+        os.fsync(descriptor)
+        return True
     finally:
-        temporary.unlink(missing_ok=True)
-    return True
+        os.close(descriptor)
+
+
+def _write_heartbeat(cfg: HeadConfig) -> None:
+    path = heartbeat_path(cfg)
+    _atomic_private_write(path, f"{time.time():.6f}\n".encode("ascii"))
 
 
 def alive_pid(cfg: HeadConfig) -> int | None:
     """The running agent's pid, or None. Truth is the flock, not the pid file."""
     cfg.agent_dir().mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(_lock_path(cfg), os.O_RDWR | os.O_CREAT, 0o644)
+        fd = _open_private_regular(_lock_path(cfg), os.O_RDWR | os.O_CREAT)
     except OSError:
         return None
     try:
@@ -108,7 +392,7 @@ def alive_pid(cfg: HeadConfig) -> int | None:
     except OSError:
         os.close(fd)
         try:
-            return int(_pid_path(cfg).read_text().strip())
+            return int(_read_private_text(_pid_path(cfg), max_bytes=64).strip())
         except Exception:
             return -1  # locked but pid unknown
     fcntl.flock(fd, fcntl.LOCK_UN)
@@ -116,19 +400,34 @@ def alive_pid(cfg: HeadConfig) -> int | None:
     return None
 
 
-def notify(cfg: HeadConfig, payload: dict[str, object]) -> None:
-    """POST a job event to the configured webhook. Never raises."""
+def notify(
+    cfg: HeadConfig,
+    payload: dict[str, object],
+    log: Callable[[str], None] | None = None,
+) -> bool:
+    """POST a job event; report a redacted failure without stopping dispatch."""
     if not cfg.webhook:
-        return
+        return True
+    parsed = urlsplit(cfg.webhook)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        if log is not None:
+            log("webhook notification refused: unsafe URL")
+        return False
     try:
         req = urllib.request.Request(
             cfg.webhook,
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"},
         )
-        urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
+        # The URL was restricted to HTTP(S) above.  The response is closed
+        # promptly so a long-running agent does not leak sockets.
+        with urllib.request.urlopen(req, timeout=10):  # nosec B310
+            pass
+    except Exception as exc:
+        if log is not None:
+            log(f"webhook notification failed: {type(exc).__name__}")
+        return False
+    return True
 
 
 def _reconcile_jobs(
@@ -194,8 +493,10 @@ def _reconcile_jobs(
                     "center": entry.center,
                     "node": entry.node,
                     "exit_code": None,
+                    "result_state": effective_result_state(entry),
                     "reason": detail,
                 },
+                log,
             )
         elif entry.status == "running":
             log(f"{entry.job_id} recovered: running")
@@ -210,7 +511,7 @@ def _process_once_with_snapshot(
 ) -> tuple[list[tuple[str, str]], list[JobEntry]]:
     """One poll tick: reconcile active jobs, then walk the queue FIFO.
 
-    - started / failed / killed / cancel-failed: move on to the next queued job
+    - started / failed / skipped / killed / cancel-failed: move on to the next job
     - blocked (job-specific: missing dataset path, unfit nodes): skip it so
       it cannot starve the jobs behind it; retried next tick
     - busy (GPU capacity): preserve FIFO for every job that could use the same
@@ -270,6 +571,7 @@ def _process_once_with_snapshot(
                     "node": detail,
                     "exit_code": None,
                 },
+                log,
             )
         elif outcome == "failed":
             log(f"{entry.job_id} failed: {detail}")
@@ -284,6 +586,23 @@ def _process_once_with_snapshot(
                     "exit_code": None,
                     "reason": detail,
                 },
+                log,
+            )
+        elif outcome == "skipped":
+            log(f"{entry.job_id} skipped: {detail}")
+            notify(
+                cfg,
+                {
+                    "event": "skipped",
+                    "job_id": entry.job_id,
+                    "name": entry.name,
+                    "center": cfg.center,
+                    "node": None,
+                    "exit_code": None,
+                    "result_state": "dependency_skipped",
+                    "reason": detail,
+                },
+                log,
             )
         elif outcome == "killed":
             if detail:
@@ -310,6 +629,7 @@ def _process_once_with_snapshot(
                     "exit_code": None,
                     "reason": reason,
                 },
+                log,
             )
         elif outcome == "blocked":
             blocked_detail = detail or "reason unavailable"
@@ -405,9 +725,20 @@ def _maybe_autoclean(cfg: HeadConfig, log: Callable[[str], None]) -> None:
         log(f"auto-clean disabled: invalid retention {days!r} days")
         return
     stamp = cfg.agent_dir() / "last_autoclean"
-    if stamp.exists() and time.time() - stamp.stat().st_mtime < AUTOCLEAN_EVERY_S:
+    try:
+        prior = read_bounded(stamp, max_bytes=128)
+    except PrivateStateError as exc:
+        log(f"auto-clean skipped: unsafe retention state ({type(exc).__name__})")
         return
-    stamp.touch()  # stamp first: a failing clean must not retry every tick
+    if prior is not None and time.time() - prior[1].st_mtime < AUTOCLEAN_EVERY_S:
+        return
+    try:
+        # Stamp first: a failing clean must not retry every tick. Atomic private
+        # publication replaces, rather than follows, any destination entry.
+        atomic_write(stamp, f"{time.time():.6f}\n".encode("ascii"))
+    except PrivateStateError as exc:
+        log(f"auto-clean skipped: retention state unavailable ({type(exc).__name__})")
+        return
     report = clean_jobs(cfg, time.time() - days * 86400, envs=True, log=log)
     log(
         f"auto-clean: removed {report.removed}/{report.eligible} ended jobs "
@@ -538,13 +869,13 @@ def run_loop(cfg: HeadConfig) -> int:
     """Foreground loop (what crontab/nohup runs). Exit 1 if another agent
     already holds the lock."""
     cfg.agent_dir().mkdir(parents=True, exist_ok=True)
-    fd = os.open(_lock_path(cfg), os.O_RDWR | os.O_CREAT, 0o644)
+    fd = _open_private_regular(_lock_path(cfg), os.O_RDWR | os.O_CREAT)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("another dt agent is already running", file=sys.stderr)
         return 1
-    _pid_path(cfg).write_text(str(os.getpid()))
+    _atomic_private_write(_pid_path(cfg), f"{os.getpid()}\n".encode("ascii"))
 
     stop = {"flag": False}
 
@@ -576,6 +907,7 @@ def run_loop(cfg: HeadConfig) -> int:
         f"{cfg.queue.active_poll_s:g}s queued, completion wake on)"
     )
     born_with = _code_fingerprint()
+    born_identity = _runtime_identity(cfg)
     rejected_restart_fingerprint: int | None = None
     completion_watchers: dict[str, subprocess.Popen[bytes]] = {}
     blocked_log_state: dict[str, str] = {}
@@ -587,8 +919,21 @@ def run_loop(cfg: HeadConfig) -> int:
                 from .config import HeadConfig as _HC, load as _load
 
                 fresh = _load()
-                if isinstance(fresh, _HC):
-                    cfg = fresh
+                if not isinstance(fresh, _HC):
+                    log(
+                        "agent configuration no longer has the head role; "
+                        "exiting instead of running against stale state"
+                    )
+                    return AGENT_CONFIG_INVALID_ROLE_EXIT
+                if _runtime_identity(fresh) != born_identity:
+                    log(
+                        "agent runtime identity changed "
+                        "(center, paths.root, or layout); exiting so the "
+                        "supervisor can restart with one coherent state root"
+                    )
+                    return AGENT_CONFIG_RESTART_EXIT
+                cfg = fresh
+                _write_heartbeat(cfg)
                 _consume_agent_wake(cfg)
                 _, entries = _process_once_with_snapshot(
                     cfg,
@@ -647,22 +992,33 @@ def run_loop(cfg: HeadConfig) -> int:
 
 
 def start_detached(cfg: HeadConfig) -> bool:
-    """Spawn `dt agent run` in the background, logging below head agent state.
-    Returns False if one is already alive."""
+    """Start the installed supervisor or a detached compatibility process."""
     if alive_pid(cfg) is not None:
         return False
+    if systemd_unit_path().is_file() and _systemd_user_available():
+        proc = _systemctl("start", SYSTEMD_UNIT)
+        if proc.returncode != 0:
+            return False
+        for _ in range(30):
+            if alive_pid(cfg) is not None:
+                return True
+            time.sleep(0.1)
+        return alive_pid(cfg) is not None
     dt_bin = str(Path.home() / ".local/bin/dt")
     if not Path(dt_bin).exists():
         dt_bin = sys.argv[0]
-    logf = open(log_path(cfg), "a")
-    subprocess.Popen(
-        [dt_bin, "agent", "run"],
-        stdout=logf,
-        stderr=subprocess.STDOUT,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
+    log_descriptor = _open_private_regular(
+        log_path(cfg),
+        os.O_WRONLY | os.O_APPEND | os.O_CREAT,
     )
-    logf.close()
+    with os.fdopen(log_descriptor, "a", encoding="utf-8") as logf:
+        subprocess.Popen(
+            [dt_bin, "agent", "run"],
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     # brief grace so an immediate `agent status` sees it
     for _ in range(20):
         if alive_pid(cfg) is not None:
@@ -675,6 +1031,15 @@ def stop_agent(cfg: HeadConfig) -> bool:
     pid = alive_pid(cfg)
     if pid is None:
         return False
+    if systemd_unit_path().is_file() and _systemd_user_available():
+        proc = _systemctl("stop", SYSTEMD_UNIT)
+        if proc.returncode != 0:
+            return False
+        for _ in range(50):
+            if alive_pid(cfg) is None:
+                return True
+            time.sleep(0.1)
+        return alive_pid(cfg) is None
     if pid > 0:
         try:
             os.kill(pid, signal.SIGTERM)
@@ -692,8 +1057,12 @@ def install_crontab(cfg: HeadConfig | None = None) -> str:
     dt_bin = str(Path.home() / ".local/bin/dt")
     agent_dir = cfg.agent_dir() if cfg is not None else Path.home() / "dt"
     agent_log = log_path(cfg) if cfg is not None else agent_dir / "agent.log"
+    if cfg is not None:
+        _prepare_agent_log(cfg)
     line = (
-        f"@reboot sleep 30 && mkdir -p {shlex.quote(str(agent_dir))} && "
+        f"@reboot sleep 30 && umask 077 && "
+        f"mkdir -p {shlex.quote(str(agent_dir))} && "
+        f"chmod 700 {shlex.quote(str(agent_dir))} && "
         f"{shlex.quote(dt_bin)} agent run >> {shlex.quote(str(agent_log))} "
         f"2>&1 {CRON_MARK}"
     )
@@ -704,6 +1073,159 @@ def install_crontab(cfg: HeadConfig | None = None) -> str:
     new_tab = "\n".join(kept) + "\n"
     subprocess.run(["crontab", "-"], input=new_tab, text=True, check=True)
     return line
+
+
+def remove_agent_crontab() -> bool:
+    """Remove only DT's marked legacy entry; preserve every unrelated row."""
+    if shutil.which("crontab") is None:
+        return False
+    proc = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    if proc.returncode != 0 or CRON_MARK not in proc.stdout:
+        return False
+    kept = [row for row in proc.stdout.splitlines() if CRON_MARK not in row]
+    new_tab = "\n".join(kept) + ("\n" if kept else "")
+    subprocess.run(["crontab", "-"], input=new_tab, text=True, check=True)
+    return True
+
+
+def install_supervisor(cfg: HeadConfig) -> dict[str, object]:
+    """Install the strongest available rootless lifetime supervisor."""
+    if _systemd_user_available():
+        unit_path = systemd_unit_path()
+        previous = _systemd_unit_snapshot(unit_path)
+        previously_enabled = False
+        if previous is not None:
+            try:
+                previously_enabled = (
+                    _systemctl("is-enabled", SYSTEMD_UNIT, timeout=3).returncode == 0
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise RuntimeError(
+                    "cannot determine existing systemd unit state"
+                ) from exc
+        path = install_systemd_service(cfg)
+        try:
+            cron_removed = remove_agent_crontab()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            # Two reboot supervisors would race forever because the systemd
+            # unit has Restart=always.  Roll back the newly enabled unit and
+            # retain the existing cron contract instead of creating that loop.
+            rollback_errors: list[str] = []
+            try:
+                _restore_systemd_unit(path, previous)
+            except (OSError, RuntimeError):
+                rollback_errors.append("unit-restore")
+            for args in (
+                ("daemon-reload",),
+                (
+                    "enable" if previously_enabled else "disable",
+                    SYSTEMD_UNIT,
+                ),
+            ):
+                try:
+                    proc = _systemctl(*args)
+                except (OSError, subprocess.TimeoutExpired):
+                    rollback_errors.append(args[0])
+                else:
+                    if proc.returncode != 0:
+                        rollback_errors.append(args[0])
+            detail = (
+                f"; rollback incomplete ({', '.join(rollback_errors)})"
+                if rollback_errors
+                else ""
+            )
+            raise RuntimeError(
+                "systemd service rolled back: legacy crontab cleanup failed: "
+                f"{exc}{detail}"
+            ) from exc
+        return {
+            "supervisor": "systemd-user",
+            "unit": SYSTEMD_UNIT,
+            "path": str(path),
+            "restart_policy": "always",
+            "fallback": False,
+            "legacy_cron_removed": cron_removed,
+            "linger_enabled": _linger_enabled(),
+        }
+    line = install_crontab(cfg)
+    return {
+        "supervisor": "crontab",
+        "line": line,
+        "restart_policy": "reboot-only",
+        "fallback": True,
+        "warning": (
+            "systemd user manager unavailable; crontab cannot isolate the agent "
+            "from an invoking service cgroup"
+        ),
+    }
+
+
+def _supervisor_status() -> dict[str, object]:
+    path = systemd_unit_path()
+    if not path.is_file():
+        return {
+            "supervisor": "detached-or-crontab",
+            "supervisor_state": None,
+            "restart_policy": "reboot-only-or-none",
+            "unit": None,
+            "linger_enabled": None,
+        }
+    if not _systemd_user_available():
+        return {
+            "supervisor": "systemd-user",
+            "supervisor_state": "manager-unavailable",
+            "restart_policy": "always",
+            "unit": SYSTEMD_UNIT,
+            "linger_enabled": _linger_enabled(),
+        }
+    proc = _systemctl(
+        "show",
+        SYSTEMD_UNIT,
+        "--property=ActiveState,SubState,UnitFileState",
+    )
+    values: dict[str, str] = {}
+    if proc.returncode == 0:
+        for line in proc.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key] = value
+    state = "/".join(
+        value for value in (values.get("ActiveState"), values.get("SubState")) if value
+    ) or ("unknown" if proc.returncode == 0 else "query-failed")
+    return {
+        "supervisor": "systemd-user",
+        "supervisor_state": state,
+        "restart_policy": "always",
+        "unit": SYSTEMD_UNIT,
+        "unit_file_state": values.get("UnitFileState"),
+        "linger_enabled": _linger_enabled(),
+    }
+
+
+def heartbeat_health(cfg: HeadConfig, *, alive: bool) -> dict[str, object]:
+    try:
+        heartbeat_at = float(
+            _read_private_text(heartbeat_path(cfg), max_bytes=128).strip()
+        )
+        heartbeat_age_s = max(0.0, time.time() - heartbeat_at)
+    except (OSError, UnicodeError, ValueError):
+        heartbeat_at = None
+        heartbeat_age_s = None
+    # One tick may legitimately spend tens of seconds reconciling several
+    # slow SSH nodes.  A two-minute floor avoids declaring a healthy agent
+    # stale mid-probe while still detecting a wedged loop promptly.
+    heartbeat_stale_after_s = max(120.0, cfg.queue.poll_s * 2 + 5)
+    return {
+        "heartbeat_at": heartbeat_at,
+        "heartbeat_age_s": heartbeat_age_s,
+        "heartbeat_available": heartbeat_age_s is not None,
+        "heartbeat_stale_after_s": heartbeat_stale_after_s,
+        "heartbeat_stale": (
+            alive
+            and heartbeat_age_s is not None
+            and heartbeat_age_s > heartbeat_stale_after_s
+        ),
+    }
 
 
 def _adaptive_handoff_state(
@@ -749,10 +1271,23 @@ def status(cfg: HeadConfig) -> dict[str, object]:
         log_bytes = log_path(cfg).stat().st_size
     except OSError:
         log_bytes = 0
+    health = heartbeat_health(cfg, alive=pid is not None)
+    from .scheduler import scheduler_snapshot
+
+    scheduler = scheduler_snapshot(
+        cfg,
+        entries,
+        agent_alive=pid is not None,
+        agent_heartbeat_stale=bool(health["heartbeat_stale"]),
+        registry_damage=len(damage),
+    )
     return {
         "center": cfg.center,
         "alive": pid is not None,
         "pid": pid,
+        **_supervisor_status(),
+        **health,
+        "scheduler": scheduler,
         "queued": len(q),
         "queue_head": q[0].job_id if q else None,
         "running": running,

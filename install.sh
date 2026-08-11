@@ -6,7 +6,7 @@ usage() {
     cat <<'EOF'
 usage: ./install.sh [--python 3.10|3.11] [--dry-run]
 
-Build and install the clean, committed checkout as an isolated uv tool.
+Build and install the clean, committed checkout in a verified environment.
 Run this on the DT head (master); compute workers do not need DT installed.
 EOF
 }

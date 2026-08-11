@@ -9,6 +9,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .dispatch import RunSpec
+from .jobs import RESULT_STATES
 
 
 class SubmissionValidationError(ValueError):
@@ -71,6 +72,9 @@ def validate_resources(
 def validate_workflow(
     *,
     after_success: str | None,
+    after_complete: str | None,
+    after_result: str | None,
+    after_result_states: list[str],
     no_queue: bool,
     follow: bool,
     poll: float,
@@ -79,15 +83,43 @@ def validate_workflow(
     artifact_manifest: str | None,
     node: str | None,
 ) -> None:
-    if follow and (poll <= 0 or lines <= 0):
-        raise SubmissionValidationError("--poll and --lines must be positive")
+    if follow and (not math.isfinite(poll) or poll <= 0 or lines <= 0):
+        raise SubmissionValidationError(
+            "--poll must be finite and positive; --lines must be positive"
+        )
     if artifacts and artifact_manifest:
         raise SubmissionValidationError(
             "use either --artifact or --artifact-manifest, not both"
         )
-    if after_success and no_queue:
+    selected_dependencies = sum(
+        bool(value) for value in (after_success, after_complete, after_result)
+    )
+    if selected_dependencies > 1:
         raise SubmissionValidationError(
-            "--after-success requires queueing; remove --no-queue"
+            "use only one dependency policy: --after-success, "
+            "--after-complete, or --after-result"
+        )
+    if after_result and not after_result_states:
+        raise SubmissionValidationError(
+            "--after-result requires at least one --when-result"
+        )
+    if after_result_states and not after_result:
+        raise SubmissionValidationError("--when-result requires --after-result")
+    unknown_states = sorted(set(after_result_states) - RESULT_STATES)
+    if unknown_states:
+        raise SubmissionValidationError(
+            "unknown --when-result state(s): " + ", ".join(unknown_states)
+        )
+    if (after_success or after_complete or after_result) and no_queue:
+        option = (
+            "--after-success"
+            if after_success
+            else "--after-complete"
+            if after_complete
+            else "--after-result"
+        )
+        raise SubmissionValidationError(
+            f"{option} requires queueing; remove --no-queue"
         )
     if any(not path.strip() for path in artifacts):
         raise SubmissionValidationError("--artifact paths must be non-empty")
@@ -113,6 +145,10 @@ class SubmissionRequest:
     max_job_memory_mib: int | None = None
     artifact_manifest: str | None = None
     after_success: str | None = None
+    after_complete: str | None = None
+    after_result: str | None = None
+    after_result_states: tuple[str, ...] = ()
+    request_id: str | None = None
 
     def resolved(
         self,
@@ -121,6 +157,8 @@ class SubmissionRequest:
         project: str | None,
         artifact_manifest: str | None,
         after_success: str | None,
+        after_complete: str | None,
+        after_result: str | None,
     ) -> "SubmissionRequest":
         """Return a copy with head-side identities bound."""
         return replace(
@@ -129,6 +167,8 @@ class SubmissionRequest:
             project=project,
             artifact_manifest=artifact_manifest,
             after_success=after_success,
+            after_complete=after_complete,
+            after_result=after_result,
         )
 
     def to_run_spec(self) -> RunSpec:
@@ -146,4 +186,8 @@ class SubmissionRequest:
             max_job_memory_mib=self.max_job_memory_mib,
             artifact_manifest=self.artifact_manifest,
             after_success=self.after_success,
+            after_complete=self.after_complete,
+            after_result=self.after_result,
+            after_result_states=list(self.after_result_states),
+            request_id=self.request_id,
         )

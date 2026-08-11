@@ -15,15 +15,17 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from .config import HeadConfig, Node
-from .jobs import JobEntry, job_lock, list_all, load, save
+from .jobs import MAX_JOB_RECORD_BYTES, JobEntry, job_lock, list_all, load, save
 from .layout import LEGACY_LAYOUT, ROLE_LAYOUT, node_path_expression
 from .payload_hash import RUNTIME_PAYLOAD_NAMES
+from .private_state import PrivateStateError, read_bounded_regular
 from .snapshot_hash import tree_sha256
 from .snapshot_store import lock as snapshot_store_lock
 
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _TERMINAL_MIGRATABLE = frozenset({"finished", "killed"})
 _MARKER = "DT_MIGRATE_LAYOUT_V1"
+_SNAPSHOT_METADATA_MAX_BYTES = 64 * 1024
 
 
 class MigrationRunner(Protocol):
@@ -37,7 +39,31 @@ class MigrationRunner(Protocol):
     ) -> subprocess.CompletedProcess[str]: ...
 
 
-def _disk_bytes(path: Path) -> int:
+def _accounting(rows: list[dict[str, object]]) -> dict[str, object]:
+    """Summarize legacy-source bytes without pretending unknown sizes are zero."""
+    by_status: dict[str, int] = {}
+    unknown_rows: list[str] = []
+    known_bytes = 0
+    for row in rows:
+        value = row.get("bytes")
+        status = str(row.get("status"))
+        if isinstance(value, int) and not isinstance(value, bool):
+            known_bytes += max(0, value)
+            by_status[status] = by_status.get(status, 0) + max(0, value)
+        else:
+            identity = row.get("identity")
+            unknown_rows.append(
+                f"{row.get('scope')}:{row.get('kind')}:{identity or '-'}"
+            )
+    return {
+        "complete": not unknown_rows,
+        "known_bytes": known_bytes,
+        "bytes_by_status": dict(sorted(by_status.items())),
+        "unknown_rows": unknown_rows,
+    }
+
+
+def _disk_bytes(path: Path) -> int | None:
     try:
         proc = subprocess.run(
             ["du", "-s", "-B1", "--", str(path)],
@@ -50,13 +76,25 @@ def _disk_bytes(path: Path) -> int:
             return max(0, int(proc.stdout.split(maxsplit=1)[0]))
     except (OSError, subprocess.TimeoutExpired, ValueError, IndexError):
         pass
-    return 0
+    return None
 
 
 def _same_file(source: Path, destination: Path) -> bool:
     try:
-        return source.read_bytes() == destination.read_bytes()
-    except OSError:
+        source_result = read_bounded_regular(
+            source,
+            max_bytes=MAX_JOB_RECORD_BYTES,
+        )
+        destination_result = read_bounded_regular(
+            destination,
+            max_bytes=MAX_JOB_RECORD_BYTES,
+        )
+        return (
+            source_result is not None
+            and destination_result is not None
+            and source_result[0] == destination_result[0]
+        )
+    except PrivateStateError:
         return False
 
 
@@ -71,20 +109,34 @@ def _registry_rows(cfg: HeadConfig) -> list[dict[str, object]]:
         status = "movable"
         blocker = None
         job_id = source.stem
+        source_bytes: int | None = None
         try:
             if source.is_symlink() or not source.is_file():
                 raise ValueError("source is not a regular file")
-            raw = json.loads(source.read_text("utf-8"))
+            source_result = read_bounded_regular(
+                source,
+                max_bytes=MAX_JOB_RECORD_BYTES,
+            )
+            if source_result is None:
+                raise ValueError("source disappeared during inspection")
+            source_bytes = source_result[1].st_size
+            raw = json.loads(source_result[0])
             if not isinstance(raw, dict) or raw.get("job_id") != job_id:
                 raise ValueError("registry identity does not match filename")
-            if destination.exists():
+            if destination.exists() or destination.is_symlink():
                 if destination.is_symlink() or not destination.is_file():
                     raise ValueError("destination is not a regular file")
                 if _same_file(source, destination):
                     status = "duplicate_verified"
                 else:
                     raise ValueError("destination contains a different record")
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+            PrivateStateError,
+            json.JSONDecodeError,
+        ) as exc:
             status = "blocked"
             blocker = " ".join(str(exc).split()) or type(exc).__name__
         rows.append(
@@ -94,7 +146,7 @@ def _registry_rows(cfg: HeadConfig) -> list[dict[str, object]]:
                 "identity": job_id,
                 "source": str(source),
                 "destination": str(destination),
-                "bytes": source.stat().st_size if source.is_file() else None,
+                "bytes": source_bytes,
                 "status": status,
                 "blocker": blocker,
             }
@@ -113,7 +165,13 @@ def _snapshot_identity(root: Path, digest: str) -> None:
         or not meta.is_file()
     ):
         raise ValueError("snapshot contains an unsafe or missing identity path")
-    raw = json.loads(meta.read_text("utf-8"))
+    meta_result = read_bounded_regular(
+        meta,
+        max_bytes=_SNAPSHOT_METADATA_MAX_BYTES,
+    )
+    if meta_result is None:
+        raise ValueError("snapshot metadata disappeared during inspection")
+    raw = json.loads(meta_result[0])
     if not isinstance(raw, dict) or raw.get("snapshot_sha256") != digest:
         raise ValueError("snapshot metadata identity mismatch")
     observed = tree_sha256(code)
@@ -138,7 +196,13 @@ def _snapshot_rows(cfg: HeadConfig) -> list[dict[str, object]]:
             if destination.exists():
                 _snapshot_identity(destination, source.name)
                 status = "duplicate_verified"
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+            PrivateStateError,
+            json.JSONDecodeError,
+        ) as exc:
             status = "blocked"
             blocker = " ".join(str(exc).split()) or type(exc).__name__
         rows.append(
@@ -217,13 +281,17 @@ def _legacy_rows(cfg: HeadConfig) -> list[dict[str, object]]:
                 ),
             }
         )
-    for name in (
+    agent_names = {
         "agent.lock",
         "agent.log",
         "agent.pid",
         "agent.wake",
+        "agent.heartbeat",
+        "last_autoclean",
         "autoclean.last",
-    ):
+        *(path.name for path in cfg.root.glob("agent.log.*")),
+    }
+    for name in sorted(agent_names):
         source = cfg.root / name
         if not source.exists() and not source.is_symlink():
             continue
@@ -251,44 +319,37 @@ def _legacy_job_path(entry: JobEntry) -> bool:
     )
 
 
+def _bounded_json_check(expression: str, *, max_bytes: int) -> str:
+    """Build one bounded remote JSON identity check."""
+    return shlex.quote(
+        "import json,sys; "
+        f"b=open(sys.argv[1], 'rb').read({max_bytes + 1}); "
+        f"d=json.loads(b) if len(b) <= {max_bytes} else {{}}; "
+        f"raise SystemExit(0 if {expression} else 1)"
+    )
+
+
 def _worker_probe_command(entry: JobEntry, destination: str) -> str:
     source = node_path_expression(entry.job_dir)
     target = node_path_expression(destination)
     job_id = shlex.quote(entry.job_id)
-    meta_reader = shlex.quote(
-        "import json,sys; "
-        "d=json.load(open(sys.argv[1], encoding='utf-8')); "
-        "raise SystemExit(0 if d.get('job_id') == sys.argv[2] else 1)"
-    )
-    receipt_reader = shlex.quote(
-        "import json,sys; "
-        "d=json.load(open(sys.argv[1], encoding='utf-8')); "
-        "raise SystemExit(0 if "
-        "d.get('schema_version') == 'dt_layout_v1' "
-        "and d.get('job_id') == sys.argv[2] else 1)"
+    meta_reader = _bounded_json_check(
+        "d.get('job_id') == sys.argv[2]",
+        max_bytes=MAX_JOB_RECORD_BYTES,
     )
     return (
         f"src={source}; dst={target}; job_id={job_id}; "
         'if [ -L "$src" ] || [ ! -d "$src" ]; then '
-        f"printf '{_MARKER}\\tblocked\\t0\\tunsafe_or_missing_source\\n'; "
+        f"printf '{_MARKER}\\tblocked\\t-1\\tunsafe_or_missing_source\\n'; "
         'elif [ -L "$src/meta.json" ] || [ ! -f "$src/meta.json" ] '
         f'|| ! python3 -c {meta_reader} "$src/meta.json" "$job_id"; then '
-        f"printf '{_MARKER}\\tblocked\\t0\\tmetadata_identity_mismatch\\n'; "
-        'elif [ -d "$dst" ] && [ ! -L "$dst" ] && [ ! -L "$dst/.dt" ] '
-        '&& [ -f "$dst/.dt/meta.json" ] && [ ! -L "$dst/.dt/meta.json" ] '
-        '&& [ -f "$dst/.dt/layout.json" ] '
-        '&& [ ! -L "$dst/.dt/layout.json" ] '
-        f'&& python3 -c {meta_reader} "$dst/.dt/meta.json" "$job_id" '
-        f'&& python3 -c {receipt_reader} "$dst/.dt/layout.json" "$job_id"; then '
-        'b=$(timeout 60s du -s -B1 -- "$src" 2>/dev/null '
-        "| awk 'NR == 1 {print $1}'); "
-        f"printf '{_MARKER}\\tcopy_verified\\t%s\\t-\\n' \"${{b:-0}}\"; "
+        f"printf '{_MARKER}\\tblocked\\t-1\\tmetadata_identity_mismatch\\n'; "
         'elif [ -e "$dst" ] || [ -L "$dst" ]; then '
-        f"printf '{_MARKER}\\tblocked\\t0\\tdestination_conflict\\n'; "
+        f"printf '{_MARKER}\\tblocked\\t-1\\tdestination_requires_review\\n'; "
         "else "
         'b=$(timeout 60s du -s -B1 -- "$src" 2>/dev/null '
         "| awk 'NR == 1 {print $1}'); "
-        f"printf '{_MARKER}\\tmovable\\t%s\\t-\\n' \"${{b:-0}}\"; fi"
+        f"printf '{_MARKER}\\tmovable\\t%s\\t-\\n' \"${{b:--1}}\"; fi"
     )
 
 
@@ -343,7 +404,8 @@ def _worker_row(
     row["status"] = status
     row["blocker"] = None if blocker == "-" else blocker
     try:
-        row["bytes"] = max(0, int(bytes_text))
+        parsed_bytes = int(bytes_text)
+        row["bytes"] = parsed_bytes if parsed_bytes >= 0 else None
     except ValueError:
         row["bytes"] = None
     return row
@@ -380,6 +442,7 @@ def plan_layout(
     for row in rows:
         status = str(row["status"])
         counts[status] = counts.get(status, 0) + 1
+    accounting = _accounting(rows)
     return {
         "schema_version": "dt_layout_migration_v1",
         "center": cfg.center,
@@ -390,6 +453,7 @@ def plan_layout(
         "summary": {
             "total": len(rows),
             **dict(sorted(counts.items())),
+            "accounting": accounting,
         },
     }
 
@@ -401,8 +465,17 @@ def _copy_registry_row(row: dict[str, object]) -> None:
         raise OSError("registry source is no longer a regular file")
     if destination.is_symlink() or (destination.exists() and not destination.is_file()):
         raise OSError("registry destination is no longer a regular file")
+    source_result = read_bounded_regular(
+        source,
+        max_bytes=MAX_JOB_RECORD_BYTES,
+    )
+    if source_result is None:
+        raise OSError("registry source disappeared")
+    source_payload = source_result[0]
     destination.parent.mkdir(parents=True, exist_ok=True)
     if row["status"] == "duplicate_verified":
+        if not _same_file(source, destination):
+            raise OSError("registry duplicate changed after migration plan")
         source.unlink()
         return
     descriptor, temp_name = tempfile.mkstemp(
@@ -410,17 +483,58 @@ def _copy_registry_row(row: dict[str, object]) -> None:
         suffix=".tmp",
         dir=destination.parent,
     )
-    os.close(descriptor)
     temporary = Path(temp_name)
+    published = False
+    completed = False
     try:
-        shutil.copy2(source, temporary, follow_symlinks=False)
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(source_payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short registry migration write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
         if not _same_file(source, temporary):
             raise OSError("registry copy verification failed")
-        os.replace(temporary, destination)
+        try:
+            os.link(temporary, destination, follow_symlinks=False)
+        except FileExistsError:
+            raise OSError("registry destination appeared during migration") from None
+        published = True
         if not _same_file(source, destination):
             raise OSError("published registry verification failed")
+        directory = os.open(
+            destination.parent,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        )
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        if (
+            read_bounded_regular(source, max_bytes=MAX_JOB_RECORD_BYTES)
+            != source_result
+        ):
+            raise OSError("registry source changed during migration")
         source.unlink()
+        completed = True
     finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if published and not completed:
+            try:
+                temporary_info = temporary.lstat()
+                destination_info = destination.lstat()
+                if (
+                    temporary_info.st_dev,
+                    temporary_info.st_ino,
+                ) == (destination_info.st_dev, destination_info.st_ino):
+                    destination.unlink()
+            except FileNotFoundError:
+                pass
         temporary.unlink(missing_ok=True)
 
 
@@ -452,13 +566,12 @@ def _worker_copy_command(entry: JobEntry, destination: str) -> str:
     target = node_path_expression(destination)
     payload_names = " ".join(shlex.quote(name) for name in RUNTIME_PAYLOAD_NAMES)
     state_names = "pgid gpus started_at finished_at exit_code .dt-cancel"
-    verify = shlex.quote(
-        "import json,sys; "
-        "d=json.load(open(sys.argv[1], encoding='utf-8')); "
-        "raise SystemExit(0 if d.get('job_id') == sys.argv[2] else 1)"
+    verify = _bounded_json_check(
+        "d.get('job_id') == sys.argv[2]",
+        max_bytes=MAX_JOB_RECORD_BYTES,
     )
     script = (
-        'set -u; src="$DT_MSRC"; dst="$DT_MDST"; job_id="$DT_MJOB"; '
+        'set -u; umask 077; src="$DT_MSRC"; dst="$DT_MDST"; job_id="$DT_MJOB"; '
         'parent=${dst%/*}; tmp="$parent/.migrate-$job_id.tmp"; '
         'cleanup() { rc=$?; if [ "$rc" -ne 0 ]; then '
         'rm -rf -- "$tmp"; fi; exit "$rc"; }; trap cleanup EXIT; '
@@ -466,11 +579,14 @@ def _worker_copy_command(entry: JobEntry, destination: str) -> str:
         '[ ! -e "$dst" ] && [ ! -L "$dst" ] || exit 71; '
         '[ ! -e "$tmp" ] && [ ! -L "$tmp" ] || exit 72; '
         'mkdir -p "$parent" "$tmp" || exit 73; '
+        'chmod 700 "$parent" "$tmp" || exit 73; '
         'cp -a -- "$src/." "$tmp/" || { rm -rf -- "$tmp"; exit 74; }; '
+        'chmod 700 "$tmp" || exit 74; '
         "command -v diff >/dev/null 2>&1 || exit 82; "
         'diff -qr --no-dereference "$src" "$tmp" >/dev/null || exit 83; '
         '[ ! -e "$tmp/.dt" ] && [ ! -L "$tmp/.dt" ] || exit 84; '
         'mkdir -p "$tmp/.dt/payload" "$tmp/.dt/state" || exit 75; '
+        'chmod 700 "$tmp/.dt" "$tmp/.dt/payload" "$tmp/.dt/state" || exit 75; '
         "for name in " + payload_names + '; do [ ! -L "$tmp/$name" ] || exit 76; '
         '[ ! -e "$tmp/$name" ] || mv -- "$tmp/$name" "$tmp/.dt/payload/$name"; '
         "done; "
@@ -498,7 +614,7 @@ def _worker_copy_command(entry: JobEntry, destination: str) -> str:
         f'python3 -c {verify} "$tmp/.dt/meta.json" "$job_id" || exit 79; '
         'printf \'{"schema_version":"dt_layout_v1","job_id":"%s"}\\n\' '
         '"$job_id" >"$tmp/.dt/layout.json" || exit 80; '
-        'mv -- "$tmp" "$dst" || exit 81; '
+        'chmod 700 "$tmp" || exit 81; mv -- "$tmp" "$dst" || exit 81; '
         f"printf '{_MARKER}\\tcopied\\n'"
     )
     return (
@@ -526,15 +642,14 @@ def apply_layout(
     """Apply only rows proven movable by a fresh plan."""
     plan = plan_layout(cfg, runner=runner)
     rows = plan["rows"]
-    assert isinstance(rows, list)
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise RuntimeError("migration plan rows are malformed")
     applied: list[dict[str, object]] = []
     nodes = {node.name: node for node in cfg.nodes}
     for raw in rows:
-        assert isinstance(raw, dict)
         if raw.get("status") not in {
             "movable",
             "duplicate_verified",
-            "copy_verified",
         }:
             continue
         kind = raw.get("kind")
@@ -547,18 +662,24 @@ def apply_layout(
                     _copy_snapshot_row(raw)
             elif kind == "job":
                 job_id = str(raw["identity"])
-                entry = load(cfg, job_id)
-                if entry is None or entry.status not in _TERMINAL_MIGRATABLE:
-                    raise RuntimeError("job state changed after migration plan")
-                node = nodes.get(entry.node)
-                if node is None:
-                    raise RuntimeError("worker configuration changed after plan")
-                destination = str(raw["destination"])
-                if raw.get("status") != "copy_verified":
+                with job_lock(cfg, job_id):
+                    current = load(cfg, job_id)
+                    if (
+                        current is None
+                        or current.status not in _TERMINAL_MIGRATABLE
+                        or current.job_dir != raw.get("source")
+                        or current.storage_layout not in {None, LEGACY_LAYOUT}
+                    ):
+                        raise RuntimeError("job state changed after migration plan")
+                    node = nodes.get(current.node)
+                    if node is None:
+                        raise RuntimeError("worker configuration changed after plan")
+                    destination = str(raw["destination"])
+                    old_entry = JobEntry(**current.__dict__)
                     copied = runner(
                         node.name,
                         node.local,
-                        _worker_copy_command(entry, destination),
+                        _worker_copy_command(current, destination),
                         timeout=1800,
                     )
                     if copied.returncode != 0 or f"{_MARKER}\tcopied" not in (
@@ -566,31 +687,29 @@ def apply_layout(
                     ):
                         detail = copied.stderr or copied.stdout or "copy failed"
                         raise RuntimeError(" ".join(detail.split()))
-                old_entry = JobEntry(**entry.__dict__)
-                with job_lock(cfg, entry.job_id):
-                    current = load(cfg, entry.job_id)
-                    if (
-                        current is None
-                        or current.status not in _TERMINAL_MIGRATABLE
-                        or current.job_dir != old_entry.job_dir
-                    ):
-                        raise RuntimeError("job state changed during worker copy")
                     current.job_dir = destination
                     current.storage_layout = ROLE_LAYOUT
                     current.worker_root = cfg.worker_root_for(node)
                     current.job_relpath = f"jobs/{current.job_id}"
                     save(cfg, current)
-                deleted = runner(
-                    node.name,
-                    node.local,
-                    _worker_delete_source_command(old_entry),
-                    timeout=600,
-                )
-                if deleted.returncode != 0:
-                    log(
-                        f"{job_id}: new capsule is active; legacy duplicate "
-                        "was retained for manual review"
+                    deleted = runner(
+                        node.name,
+                        node.local,
+                        _worker_delete_source_command(old_entry),
+                        timeout=600,
                     )
+                    if deleted.returncode != 0:
+                        detail = " ".join(
+                            (
+                                deleted.stderr
+                                or deleted.stdout
+                                or f"delete exited {deleted.returncode}"
+                            ).split()
+                        )
+                        raise RuntimeError(
+                            "new capsule is active but the legacy duplicate was "
+                            f"retained for manual review: {detail}"
+                        )
             else:
                 continue
         except Exception as exc:
@@ -604,6 +723,27 @@ def apply_layout(
         else:
             applied.append({**raw, "status": "migrated", "blocker": None})
     failures = sum(row["status"] == "failed" for row in applied)
+    post_plan = plan_layout(cfg, runner=runner)
+    post_summary = post_plan["summary"]
+    pre_summary = plan["summary"]
+    if not isinstance(post_summary, dict) or not isinstance(pre_summary, dict):
+        raise RuntimeError("migration accounting summary is malformed")
+    pre_accounting = pre_summary["accounting"]
+    post_accounting = post_summary["accounting"]
+    if not isinstance(pre_accounting, dict) or not isinstance(post_accounting, dict):
+        raise RuntimeError("migration accounting details are malformed")
+    migrated_known_bytes = 0
+    for row in applied:
+        bytes_value = row.get("bytes")
+        if (
+            row["status"] == "migrated"
+            and isinstance(bytes_value, int)
+            and not isinstance(bytes_value, bool)
+        ):
+            migrated_known_bytes += bytes_value
+    expected_residual = int(pre_accounting["known_bytes"]) - migrated_known_bytes
+    observed_residual = int(post_accounting["known_bytes"])
+    accounting_delta = observed_residual - expected_residual
     return {
         **plan,
         "mode": "apply",
@@ -612,5 +752,20 @@ def apply_layout(
             "migrated": len(applied) - failures,
             "failed": failures,
             "finished_at": time.time(),
+        },
+        "verification": {
+            "complete": (
+                failures == 0
+                and bool(pre_accounting["complete"])
+                and bool(post_accounting["complete"])
+                and accounting_delta == 0
+            ),
+            "pre_legacy_known_bytes": int(pre_accounting["known_bytes"]),
+            "migrated_known_bytes": migrated_known_bytes,
+            "post_legacy_known_bytes": observed_residual,
+            "accounting_delta_bytes": accounting_delta,
+            "pre_unknown_rows": list(pre_accounting["unknown_rows"]),
+            "post_unknown_rows": list(post_accounting["unknown_rows"]),
+            "post_summary": post_summary,
         },
     }

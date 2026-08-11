@@ -1,14 +1,17 @@
+import json
 import os
 import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 
 import dt.probe as probe_mod
 from dt.config import HeadConfig, Node
 from dt.probe import (
     GPU_ERROR,
+    Gpu,
     NodeStatus,
     PROBE_CMD,
     SEP,
@@ -377,6 +380,50 @@ def test_bounded_probe_cleans_up_workers_and_temporary_directory(tmp_path):
         time.sleep(0.01)
 
 
+def test_bounded_probe_parent_retries_cleanup_after_child_cleanup_race(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    cleanup_calls = tmp_path / "rmdir-calls"
+    nvidia_smi = fake_bin / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  *query-compute-apps*) exit 0;;\n"
+        "  *) printf '%s\\n' '0, GPU-test, 0, 1000, 0, 30';;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    nvidia_smi.chmod(0o755)
+    rmdir = fake_bin / "rmdir"
+    rmdir.write_text(
+        "#!/bin/sh\n"
+        'count=$(cat "$DT_TEST_RMDIR_CALLS" 2>/dev/null || printf 0)\n'
+        "count=$((count + 1))\n"
+        'printf \'%s\\n\' "$count" > "$DT_TEST_RMDIR_CALLS"\n'
+        '[ "$count" -eq 1 ] && exit 1\n'
+        'exec /usr/bin/rmdir "$@"\n',
+        encoding="utf-8",
+    )
+    rmdir.chmod(0o755)
+
+    proc = subprocess.run(
+        ["bash", "-c", probe_mod.bounded_probe_command(2)],
+        env={
+            **os.environ,
+            "DT_TEST_RMDIR_CALLS": str(cleanup_calls),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "TMPDIR": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert int(cleanup_calls.read_text()) >= 2
+    assert not list(tmp_path.glob("dt-probe.*"))
+
+
 def test_probe_node_surfaces_query_failure_instead_of_zero_gpus(monkeypatch):
     output = (
         f"{GPU_ERROR}\ndriver unavailable sentinel\n"
@@ -441,8 +488,16 @@ def test_probe_node_types_ssh_255_as_unreachable(monkeypatch):
 def test_probe_node_types_remote_probe_timeout_as_reachable_error(monkeypatch):
     captured = {}
 
-    def timed_out(node_name, is_local, command, timeout, check=False):
+    def timed_out(
+        node_name,
+        is_local,
+        command,
+        timeout,
+        check=False,
+        retry_stale_mux=False,
+    ):
         captured.update(command=command, timeout=timeout)
+        assert retry_stale_mux is True
         return subprocess.CompletedProcess([], 124, "", "")
 
     monkeypatch.setattr(probe_mod, "run_on", timed_out)
@@ -456,15 +511,24 @@ def test_probe_node_types_remote_probe_timeout_as_reachable_error(monkeypatch):
     assert status.gpus == []
     assert status.unreachable is False
     assert status.error == "GPU probe timed out after 7s"
-    assert captured["command"].startswith("timeout ")
+    assert captured["command"].startswith("umask 077; dt_outer_tmp=")
+    assert "timeout --signal=TERM --kill-after=2s 7s" in captured["command"]
     assert captured["timeout"] > 7
 
 
 def test_probe_node_uses_node_specific_timeout_by_default(monkeypatch):
     captured = {}
 
-    def completed(node_name, is_local, command, timeout, check=False):
+    def completed(
+        node_name,
+        is_local,
+        command,
+        timeout,
+        check=False,
+        retry_stale_mux=False,
+    ):
         captured.update(command=command, timeout=timeout)
+        assert retry_stale_mux is True
         return subprocess.CompletedProcess(
             [],
             0,
@@ -631,6 +695,117 @@ def test_probe_results_survive_optional_cache_write_failure(tmp_path, monkeypatc
     statuses = probe_mod.probe_center(cfg, use_cache=False)
 
     assert [status.node for status in statuses] == ["n1"]
+
+
+def test_oversized_probe_cache_is_ignored_and_replaced_by_live_data(
+    tmp_path, monkeypatch
+):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    cache = cfg.cache_dir() / "probe.json"
+    cache.write_bytes(b"[]" + b"x" * 128)
+    monkeypatch.setattr(probe_mod, "PROBE_CACHE_MAX_BYTES", 120)
+    calls = []
+    monkeypatch.setattr(
+        probe_mod,
+        "probe_node",
+        lambda node, threshold: calls.append(node.name) or NodeStatus(node=node.name),
+    )
+
+    statuses = probe_mod.probe_center(cfg, use_cache=True)
+
+    assert calls == ["n1"]
+    assert [status.node for status in statuses] == ["n1"]
+    assert cache.stat().st_size <= 120
+
+
+def test_probe_cache_with_wrong_node_set_is_ignored(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    cache = cfg.cache_dir() / "probe.json"
+    cache.write_text(json.dumps([asdict(NodeStatus(node="removed-node"))]))
+    calls = []
+    monkeypatch.setattr(
+        probe_mod,
+        "probe_node",
+        lambda node, threshold: calls.append(node.name) or NodeStatus(node=node.name),
+    )
+
+    statuses = probe_mod.probe_center(cfg, use_cache=True)
+
+    assert calls == ["n1"]
+    assert [status.node for status in statuses] == ["n1"]
+
+
+def test_probe_cache_with_invalid_gpu_values_is_ignored(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    cache = cfg.cache_dir() / "probe.json"
+    unsafe = NodeStatus(
+        node="n1",
+        gpus=[Gpu(index=0, uuid="GPU-0", mem_used=-1, mem_total=0, util=-1)],
+    )
+    cache.write_text(json.dumps([asdict(unsafe)]))
+    calls = []
+    monkeypatch.setattr(
+        probe_mod,
+        "probe_node",
+        lambda node, threshold: calls.append(node.name) or NodeStatus(node=node.name),
+    )
+
+    statuses = probe_mod.probe_center(cfg, use_cache=True)
+
+    assert calls == ["n1"]
+    assert statuses[0].gpus == []
+
+
+def test_probe_cache_and_refresh_lock_do_not_follow_symlinks(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    cache_dir = cfg.cache_dir()
+    outside_cache = tmp_path / "outside-cache"
+    outside_lock = tmp_path / "outside-lock"
+    outside_cache.write_text("must survive\n")
+    outside_lock.write_text("must survive\n")
+    (cache_dir / "probe.json").symlink_to(outside_cache)
+    (cache_dir / "probe.lock").symlink_to(outside_lock)
+    monkeypatch.setattr(
+        probe_mod,
+        "probe_node",
+        lambda node, threshold: NodeStatus(node=node.name),
+    )
+
+    statuses = probe_mod.probe_center(cfg, use_cache=True)
+
+    assert [status.node for status in statuses] == ["n1"]
+    assert outside_cache.read_text() == "must survive\n"
+    assert outside_lock.read_text() == "must survive\n"
+    assert not (cache_dir / "probe.json").is_symlink()
+    assert (cache_dir / "probe.lock").is_symlink()
 
 
 def test_probe_cache_preserves_gpu_inventory_error(tmp_path, monkeypatch):

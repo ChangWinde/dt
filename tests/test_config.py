@@ -1,5 +1,8 @@
+import os
+
 import pytest
 
+import dt.config as config_module
 from dt.config import ConfigError, HeadConfig, LaptopConfig, load, parse
 
 
@@ -50,6 +53,189 @@ def test_node_probe_timeout_rejects_unbounded_values(value):
         )
 
 
+def test_explicit_site_topology_binds_nodes_and_lan_routes():
+    cfg = parse(
+        {
+            "center": "headstar",
+            "nodes": [
+                {"name": "star-0", "local": True},
+                {"name": "psibot-hm"},
+                {
+                    "name": "psibot-ds",
+                    "lan_address": "lyf@172.16.6.91",
+                    "lan_port": 2202,
+                    "transfer_cost": 0.1,
+                },
+            ],
+            "sites": {
+                "star": {
+                    "gateway": "star-0",
+                    "nodes": ["star-0"],
+                },
+                "psibot": {
+                    "gateway": "psibot-hm",
+                    "nodes": ["psibot-hm", "psibot-ds"],
+                    "artifact_policy": "site-cache-first",
+                    "cache_root": "~/dt-site-cache",
+                    "fallback_direct": True,
+                },
+            },
+        }
+    )
+
+    assert isinstance(cfg, HeadConfig)
+    assert cfg.sites["psibot"].cache_node == "psibot-hm"
+    assert cfg.sites["psibot"].artifact_policy == "site-cache-first"
+    assert cfg.sites["psibot"].cache_root == "~/dt-site-cache"
+    assert cfg.sites["psibot"].fallback_direct is True
+    assert cfg.sites["psibot"].route_circuit_failures == 2
+    assert cfg.sites["psibot"].route_circuit_cooldown_s == 60
+    assert cfg.sites["psibot"].route_circuit_max_cooldown_s == 900
+    assert cfg.nodes[2].site == "psibot"
+    assert cfg.nodes[2].lan_address == "lyf@172.16.6.91"
+    assert cfg.nodes[2].lan_port == 2202
+    assert cfg.nodes[2].transfer_cost == 0.1
+
+
+def test_topology_aware_site_can_discover_lan_endpoints_at_runtime():
+    cfg = parse(
+        {
+            "center": "headstar",
+            "nodes": ["psibot-hm", "psibot-ds"],
+            "sites": {
+                "psibot": {
+                    "gateway": "psibot-hm",
+                    "nodes": ["psibot-hm", "psibot-ds"],
+                    "artifact_policy": "topology-aware",
+                }
+            },
+        }
+    )
+
+    assert isinstance(cfg, HeadConfig)
+    assert cfg.sites["psibot"].artifact_policy == "topology-aware"
+    assert cfg.nodes[1].lan_address is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("route_circuit_failures", 0),
+        ("route_circuit_failures", 11),
+        ("route_circuit_failures", True),
+        ("route_circuit_cooldown_s", 0),
+        ("route_circuit_cooldown_s", float("inf")),
+        ("route_circuit_max_cooldown_s", 30),
+        ("route_circuit_max_cooldown_s", 86401),
+    ],
+)
+def test_route_circuit_policy_is_bounded(field, value):
+    site = {
+        "gateway": "psibot-hm",
+        "nodes": ["psibot-hm", "psibot-ds"],
+        "artifact_policy": "topology-aware",
+        field: value,
+    }
+    if field == "route_circuit_max_cooldown_s" and value == 30:
+        site["route_circuit_cooldown_s"] = 60
+
+    with pytest.raises(ConfigError, match=field):
+        parse(
+            {
+                "center": "headstar",
+                "nodes": ["psibot-hm", "psibot-ds"],
+                "sites": {"psibot": site},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("sites", "message"),
+    [
+        (
+            {
+                "psibot": {
+                    "gateway": "psibot-hm",
+                    "nodes": ["psibot-hm", "missing"],
+                }
+            },
+            "unknown node",
+        ),
+        (
+            {
+                "psibot": {
+                    "gateway": "psibot-hm",
+                    "nodes": ["psibot-hm", "psibot-ds"],
+                    "artifact_policy": "site-cache-first",
+                }
+            },
+            "lan_address",
+        ),
+        (
+            {
+                "psibot": {
+                    "gateway": "psibot-hm",
+                    "nodes": ["psibot-hm"],
+                }
+            },
+            "topology is incomplete",
+        ),
+    ],
+)
+def test_invalid_or_incomplete_topology_fails_closed(sites, message):
+    with pytest.raises(ConfigError, match=message):
+        parse(
+            {
+                "center": "headstar",
+                "nodes": ["psibot-hm", "psibot-ds"],
+                "sites": sites,
+            }
+        )
+
+
+def test_node_site_without_topology_is_rejected():
+    with pytest.raises(ConfigError, match="requires a top-level"):
+        parse(
+            {
+                "center": "headstar",
+                "nodes": [{"name": "psibot-hm", "site": "psibot"}],
+            }
+        )
+
+
+def test_site_name_rejects_path_or_shell_syntax():
+    with pytest.raises(ConfigError, match="site names"):
+        parse(
+            {
+                "center": "headstar",
+                "nodes": ["psibot-hm"],
+                "sites": {
+                    "../psibot": {
+                        "gateway": "psibot-hm",
+                        "nodes": ["psibot-hm"],
+                    }
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize("port", [0, 65536, True, "not-a-port"])
+def test_lan_port_is_bounded(port):
+    with pytest.raises(ConfigError, match="lan_port"):
+        parse(
+            {
+                "center": "headstar",
+                "nodes": [
+                    {
+                        "name": "psibot-hm",
+                        "lan_address": "psibot@172.16.17.100",
+                        "lan_port": port,
+                    }
+                ],
+            }
+        )
+
+
 def test_head_config_supports_dedicated_results_root(tmp_path):
     results = tmp_path / "experiment-results"
     cfg = parse(
@@ -89,6 +275,150 @@ def test_project_with_setup_hook():
         parse({"center": "c", "nodes": ["n1"], "projects": {"bad": {"setup": "x"}}})
 
 
+@pytest.mark.parametrize("extra", ["sim data", "--offline", "*", "x" * 65])
+def test_project_extras_are_safe_bounded_uv_identities(extra):
+    with pytest.raises(ConfigError, match=r"extras\[\]"):
+        parse(
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "projects": {"p": {"path": ".", "extras": [extra]}},
+            }
+        )
+
+
+def test_project_extras_are_deduplicated_without_reordering():
+    cfg = parse(
+        {
+            "center": "c",
+            "nodes": ["n1"],
+            "projects": {"p": {"path": ".", "extras": ["sim", "data", "sim"]}},
+        }
+    )
+
+    assert cfg.projects["p"].extras == ["sim", "data"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["foo/bar", "foo?bar", ".hidden", "p" * 65],
+)
+def test_project_names_are_safe_bounded_path_identities(name):
+    with pytest.raises(ConfigError, match="projects name"):
+        parse({"center": "c", "nodes": ["n1"], "projects": {name: "."}})
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"center": "bad center", "nodes": ["n1"]},
+        {"centers": {"../center": "head"}},
+    ],
+)
+def test_center_names_are_safe_bounded_identities(payload):
+    with pytest.raises(ConfigError, match="center"):
+        parse(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "limit_name", "payload"),
+    [
+        ("MAX_CENTERS", "centers", {"centers": {"a": "h1", "b": "h2"}}),
+        ("MAX_NODES", "nodes", {"center": "c", "nodes": ["n1", "n2"]}),
+        (
+            "MAX_PROJECTS",
+            "projects",
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "projects": {"a": ".", "b": "."},
+            },
+        ),
+        (
+            "MAX_SITES",
+            "sites",
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "sites": {
+                    "a": {"gateway": "n1", "nodes": ["n1"]},
+                    "b": {"gateway": "n1", "nodes": ["n1"]},
+                },
+            },
+        ),
+    ],
+)
+def test_config_collections_have_explicit_resource_bounds(
+    monkeypatch, field, limit_name, payload
+):
+    monkeypatch.setattr(config_module, field, 1)
+
+    with pytest.raises(ConfigError, match=rf"{limit_name}.*maximum is 1"):
+        parse(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "label", "payload"),
+    [
+        (
+            "MAX_PROJECT_EXTRAS",
+            "extras",
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "projects": {"p": {"path": ".", "extras": ["a", "b"]}},
+            },
+        ),
+        (
+            "MAX_SETUP_INPUTS",
+            "setup_inputs",
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "projects": {
+                    "p": {
+                        "path": ".",
+                        "setup": "true",
+                        "setup_inputs": ["a", "b"],
+                    }
+                },
+            },
+        ),
+        (
+            "MAX_SNAPSHOT_EXCLUDES",
+            "snapshot_excludes",
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "snapshot_excludes": ["a", "b"],
+            },
+        ),
+    ],
+)
+def test_config_nested_lists_have_explicit_resource_bounds(
+    monkeypatch, field, label, payload
+):
+    monkeypatch.setattr(config_module, field, 1)
+
+    with pytest.raises(ConfigError, match=rf"{label}.*maximum is 1"):
+        parse(payload)
+
+
+def test_site_member_list_has_the_global_node_bound(monkeypatch):
+    monkeypatch.setattr(config_module, "MAX_NODES", 1)
+
+    with pytest.raises(ConfigError, match=r"sites\.s\.nodes.*maximum is 1"):
+        parse(
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "sites": {
+                    "s": {"gateway": "n1", "nodes": ["n1", "n1"]},
+                },
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "project",
     [
@@ -116,6 +446,27 @@ def test_laptop_config():
     assert cfg.head("zgca") == "zgca-r0"
     with pytest.raises(ConfigError):
         cfg.head("nope")
+
+
+@pytest.mark.parametrize(
+    "destination",
+    [
+        "-oProxyCommand=sh",
+        "host name",
+        "host\nProxyCommand sh",
+        "host;touch-pwned",
+    ],
+)
+def test_ssh_destinations_reject_option_and_shell_syntax(destination):
+    with pytest.raises(ConfigError, match="safe SSH"):
+        parse({"center": "c", "nodes": [destination]})
+    with pytest.raises(ConfigError, match="safe SSH"):
+        parse({"centers": {"c": destination}})
+
+
+def test_ssh_destinations_reject_unusable_argument_length():
+    with pytest.raises(ConfigError, match="safe SSH"):
+        parse({"center": "c", "nodes": ["n" * 513]})
 
 
 def test_both_roles_rejected():
@@ -178,6 +529,15 @@ def test_head_config_rejects_wrong_nested_types(field):
 
 
 @pytest.mark.parametrize(
+    "webhook",
+    ["file:///tmp/event", "ftp://example.com/event", "https:///missing-host"],
+)
+def test_head_config_rejects_unsafe_webhook_protocols(webhook):
+    with pytest.raises(ConfigError, match=r"HTTP\(S\)"):
+        parse({"center": "c", "nodes": ["n1"], "webhook": webhook})
+
+
+@pytest.mark.parametrize(
     "payload",
     [
         {"center": "c", "nodes": ["n1"], "poll_seconds": 1},
@@ -217,3 +577,47 @@ def test_load_wraps_invalid_yaml_as_config_error(tmp_path, monkeypatch):
 
     with pytest.raises(ConfigError, match="cannot parse"):
         load()
+
+
+def test_load_refuses_fifo_and_oversized_config_files(tmp_path, monkeypatch):
+    fifo = tmp_path / "config.fifo"
+    os.mkfifo(fifo)
+    monkeypatch.setenv("DT_CONFIG", str(fifo))
+    with pytest.raises(ConfigError, match="not a regular file"):
+        load()
+
+    oversized = tmp_path / "oversized.yaml"
+    oversized.write_bytes(b"x" * 129)
+    monkeypatch.setattr(config_module, "MAX_CONFIG_BYTES", 128)
+    monkeypatch.setenv("DT_CONFIG", str(oversized))
+    with pytest.raises(ConfigError, match="exceeds"):
+        load()
+
+
+def test_load_reuses_unchanged_parse_and_invalidates_after_atomic_replace(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "config.yaml"
+    path.write_text("center: first\nnodes: [n1]\n")
+    monkeypatch.setenv("DT_CONFIG", str(path))
+    calls = 0
+    original = config_module.yaml.safe_load
+
+    def counted_load(stream):
+        nonlocal calls
+        calls += 1
+        return original(stream)
+
+    monkeypatch.setattr(config_module.yaml, "safe_load", counted_load)
+
+    first = load()
+    repeated = load()
+    replacement = tmp_path / "replacement.yaml"
+    replacement.write_text("center: second\nnodes: [n2]\n")
+    replacement.replace(path)
+    changed = load()
+
+    assert first is repeated
+    assert isinstance(changed, HeadConfig)
+    assert changed.center == "second"
+    assert calls == 2

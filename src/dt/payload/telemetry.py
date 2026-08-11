@@ -15,8 +15,10 @@ import os
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterable, Iterator
@@ -426,10 +428,23 @@ def _phase(path: Path | None) -> str | None:
     """Read the atomically published phase, rejecting untrusted text."""
     if path is None:
         return None
+    descriptor = -1
     try:
-        value = path.read_text().strip()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 256:
+            return None
+        value = os.read(descriptor, 257).decode("utf-8").strip()
     except OSError:
         return None
+    except UnicodeError:
+        return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     if (
         not value
         or len(value) > 64
@@ -491,9 +506,30 @@ def _job_memory_violation(
 
 def _write_json_atomic(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(value, separators=(",", ":")) + "\n")
-    os.replace(temporary, path)
+    parent_info = path.parent.lstat()
+    if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+        raise OSError("telemetry output directory is unsafe")
+    encoded = (json.dumps(value, separators=(",", ":")) + "\n").encode("utf-8")
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        descriptor = -1
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def _trip_resource_guard(
@@ -571,10 +607,32 @@ def _sample_stream(path: Path) -> Iterator[TextIO | None]:
     process -- and with it the guard -- down.
     """
     stream = None
+    descriptor = -1
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        stream = path.open("a", buffering=1)
-    except OSError as exc:
+        parent_info = path.parent.lstat()
+        if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+            raise OSError("telemetry history directory is unsafe")
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_APPEND
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            0o600,
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            descriptor = -1
+            raise OSError("telemetry history is not a regular file")
+        os.fchmod(descriptor, 0o600)
+        stream = os.fdopen(descriptor, "a", buffering=1)
+        descriptor = -1
+    except (OSError, ValueError) as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
         print(
             f"[telemetry] resource history unavailable ({exc}); guards stay armed",
             file=sys.stderr,

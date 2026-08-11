@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import replace
 
+import pytest
 from typer.testing import CliRunner
 
 from dt import cli, completion
@@ -16,6 +17,8 @@ from dt.probe import Gpu, NodeStatus, SystemStats
 
 
 def test_completion_signal_wakes_on_local_exit_marker(tmp_path):
+    job_dir = tmp_path / "jobs" / "signal"
+    job_dir.mkdir(parents=True)
     entry = JobEntry(
         job_id="signal",
         name="signal",
@@ -23,7 +26,7 @@ def test_completion_signal_wakes_on_local_exit_marker(tmp_path):
         project="p",
         node="local",
         node_local=True,
-        job_dir=str(tmp_path),
+        job_dir=str(job_dir),
         session="dt_signal",
         cmd="true",
         status="running",
@@ -33,7 +36,7 @@ def test_completion_signal_wakes_on_local_exit_marker(tmp_path):
     writer = threading.Thread(
         target=lambda: (
             time.sleep(0.05),
-            (tmp_path / "exit_code").write_text("7\n"),
+            (job_dir / "exit_code").write_text("7\n"),
         )
     )
     writer.start()
@@ -265,6 +268,12 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
     assert data["phase_summary"]["current_phase"] == "train"
     assert data["max_vram_mib"] == 20000
     assert data["max_job_memory_mib"] == 20000
+    assert data["gpu_isolation"] == {
+        "mode": "advisory",
+        "enforced": False,
+        "cuda_visibility": "restricted",
+        "graphics_device_access": "unrestricted",
+    }
     assert data["resource_guard"]["kind"] == "max_job_memory_mib"
     assert data["resource_guard"]["observed_mib"] == 20623
     assert data["resource_guard"]["phase"] == "train"
@@ -404,7 +413,7 @@ def test_info_default_prioritizes_state_and_moves_internals_to_verbose(
         git_sha="a" * 40,
         snapshot_sha256="0123456789abcdef" * 4,
         payload_sha256="fedcba9876543210" * 4,
-        env_hash="env123",
+        env_hash="abc123def456",
     )
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
@@ -431,7 +440,7 @@ def test_info_default_prioritizes_state_and_moves_internals_to_verbose(
     assert "payload" in verbose.output
     assert "job dir" in verbose.output
     assert "session" in verbose.output
-    assert "env123" in verbose.output
+    assert "abc123def456" in verbose.output
     lossless_verbose = "".join(verbose.output.split())
     assert entry.snapshot_sha256 in lossless_verbose
     assert entry.payload_sha256 in lossless_verbose
@@ -684,6 +693,15 @@ def test_full_job_id_detection_accepts_legacy_and_current_suffixes():
     assert remote_mod.FULL_JOB_ID_RE.fullmatch(
         "20260728-1200_same-job_a1b2c3d4e5f60718"
     )
+
+
+def test_laptop_center_fanout_has_a_fixed_worker_bound():
+    import dt.remote as remote_mod
+
+    assert remote_mod.center_worker_count(0) == 1
+    assert remote_mod.center_worker_count(1) == 1
+    assert remote_mod.center_worker_count(8) == 8
+    assert remote_mod.center_worker_count(10_000) == 32
 
 
 def test_laptop_lookup_hedges_when_default_center_is_slow(monkeypatch):
@@ -3204,7 +3222,8 @@ def test_wait_does_not_confirm_lost_from_unreachable_cached_state(
     assert result.output.count("n1 reachable again") == 1
 
 
-def test_wait_rejects_nonpositive_poll_before_monitoring(tmp_path, monkeypatch):
+@pytest.mark.parametrize("poll", ["0", "nan", "inf", "-inf"])
+def test_wait_rejects_invalid_poll_before_monitoring(tmp_path, monkeypatch, poll):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -3231,7 +3250,7 @@ def test_wait_rejects_nonpositive_poll_before_monitoring(tmp_path, monkeypatch):
 
     result = CliRunner().invoke(
         cli.app,
-        ["wait", "done", "--poll", "0", "--error-lines", "0"],
+        ["wait", "done", "--poll", poll, "--error-lines", "0"],
     )
 
     assert result.exit_code == 1
@@ -3314,11 +3333,18 @@ def test_wait_json_finished_contract_preserves_job_exit_code(tmp_path, monkeypat
         "project": "p",
         "node": "n1",
         "gpus": [0],
+        "gpu_isolation": {
+            "mode": "advisory",
+            "enforced": False,
+            "cuda_visibility": "restricted",
+            "graphics_device_access": "unrestricted",
+        },
         "session": "dt_json_finished",
         "job_dir": "dt/jobs/json-finished",
         "snapshot_sha256": "a" * 64,
         "payload_sha256": None,
         "reason": None,
+        "result_state": "execution_failure",
         "exit_code": 7,
     }
 
@@ -4266,6 +4292,12 @@ def test_watch_json_preflight_failures_are_machine_readable(tmp_path, monkeypatc
             "--poll and --lines must be positive",
         ),
         (
+            ["watch", "missing", "--poll", "nan", "--json"],
+            1,
+            "invalid_argument",
+            "--poll and --lines must be positive",
+        ),
+        (
             ["watch", "missing", "--json"],
             cli.EXIT_NOT_FOUND,
             "not_found",
@@ -4384,6 +4416,7 @@ def test_watch_group_payload_counts_terminal_issues():
         "killed": 0,
         "lost": 0,
         "failed": 0,
+        "skipped": 0,
         "terminal": 2,
         "issues": 1,
     }
@@ -5174,7 +5207,8 @@ def test_ps_watch_uses_poll_driven_redraws_and_stops_cleanly(tmp_path, monkeypat
     assert [row["laptop"] for row in seen["view_kwargs"]] == [False, False]
 
 
-def test_ps_watch_rejects_nonpositive_poll_before_gathering(tmp_path, monkeypatch):
+@pytest.mark.parametrize("poll", ["0", "nan", "inf", "-inf"])
+def test_ps_watch_rejects_invalid_poll_before_gathering(tmp_path, monkeypatch, poll):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -5191,13 +5225,13 @@ def test_ps_watch_rejects_nonpositive_poll_before_gathering(tmp_path, monkeypatc
         raising=False,
     )
 
-    result = CliRunner().invoke(cli.app, ["ps", "--watch", "--poll", "0"])
+    result = CliRunner().invoke(cli.app, ["ps", "--watch", "--poll", poll])
 
     assert result.exit_code == 1
     assert "--poll must be positive" in result.output
 
     json_result = CliRunner().invoke(
-        cli.app, ["ps", "--watch", "--poll", "0", "--json"]
+        cli.app, ["ps", "--watch", "--poll", poll, "--json"]
     )
 
     assert json_result.exit_code == 1
@@ -7136,7 +7170,7 @@ def test_logs_reads_env_log_for_placed_prestart_failure(tmp_path, monkeypatch):
         project="p",
         node="n1",
         node_local=False,
-        job_dir="dt/jobs/env-failed",
+        job_dir="~/dt/worker/jobs/env-failed",
         session="dt_env_failed",
         cmd="true",
         status="failed",
@@ -7152,7 +7186,7 @@ def test_logs_reads_env_log_for_placed_prestart_failure(tmp_path, monkeypatch):
             [],
             0,
             f"{cli.LOG_SOURCE_MARK}\n"
-            "dt/jobs/env-failed/logs/env.log\n"
+            "~/dt/worker/jobs/env-failed/logs/env.log\n"
             "ROOT_CAUSE invalid uv.lock\n",
             "",
         )
@@ -7168,6 +7202,7 @@ def test_logs_reads_env_log_for_placed_prestart_failure(tmp_path, monkeypatch):
     assert machine.exit_code == 0, machine.output
     payload = json.loads(machine.stdout)
     assert payload["source"] == "logs/env.log"
+    assert payload["path"] == "~/dt/worker/jobs/env-failed/logs/env.log"
     assert payload["text"] == "ROOT_CAUSE invalid uv.lock\n"
 
 

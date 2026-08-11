@@ -13,6 +13,17 @@ from pathlib import Path, PurePosixPath
 
 LEGACY_LAYOUT = "legacy-v0"
 ROLE_LAYOUT = "role-v1"
+MAX_NODE_PATH_BYTES = 4096
+MAX_NODE_PATH_COMPONENT_BYTES = 255
+
+
+def _validate_path_size(path: str, parts: tuple[str, ...]) -> None:
+    if len(os.fsencode(path)) > MAX_NODE_PATH_BYTES:
+        raise ValueError(f"root exceeds {MAX_NODE_PATH_BYTES} bytes")
+    if any(len(os.fsencode(part)) > MAX_NODE_PATH_COMPONENT_BYTES for part in parts):
+        raise ValueError(
+            f"root component exceeds {MAX_NODE_PATH_COMPONENT_BYTES} bytes"
+        )
 
 
 def normalize_node_root(value: str) -> str:
@@ -31,6 +42,7 @@ def normalize_node_root(value: str) -> str:
         raise ValueError("root must be absolute or start with ~/")
     if not parts or any(part in {"", ".", ".."} for part in parts):
         raise ValueError("root must not contain . or .. components")
+    _validate_path_size(root, parts)
     return root
 
 
@@ -45,7 +57,9 @@ def node_path(root: str, *parts: str) -> str:
         if any(part in {"", ".", ".."} for part in path.parts):
             raise ValueError(f"invalid node path component: {raw!r}")
         clean.extend(path.parts)
-    return f"{base}/{'/'.join(clean)}" if clean else base
+    joined = f"{base}/{'/'.join(clean)}" if clean else base
+    _validate_path_size(joined, tuple(PurePosixPath(joined).parts))
+    return joined
 
 
 def node_path_expression(path: str) -> str:

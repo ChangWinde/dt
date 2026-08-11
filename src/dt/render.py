@@ -25,6 +25,7 @@ STATUS_STYLE = {
     "killed": "yellow",
     "lost": "red",
     "failed": "bold red",
+    "skipped": "yellow",
 }
 JsonRow: TypeAlias = dict[str, Any]
 
@@ -632,7 +633,9 @@ def ps_table(
             if isinstance(samples, (int, float)) and not isinstance(samples, bool):
                 progress_parts.append(f"{float(samples):g}/s")
         reason_issue = (
-            r.get("reason") if status in ("queued", "failed", "lost") else None
+            r.get("reason")
+            if status in ("queued", "failed", "lost", "skipped")
+            else None
         )
         issue = r.get("progress_error") or reason_issue or r.get("status_probe_error")
         if not issue and status == "lost":

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -6,11 +7,20 @@ from unittest.mock import MagicMock
 import pytest
 
 import dt.dispatch as dispatch_mod
-from dt.agent import _restart_preflight, _rotate_agent_log, process_once
-from dt.config import HeadConfig, Node, QueueCfg, parse
+import dt.jobs as jobs_mod
+from dt.agent import (
+    AGENT_CONFIG_INVALID_ROLE_EXIT,
+    AGENT_CONFIG_RESTART_EXIT,
+    _restart_preflight,
+    _rotate_agent_log,
+    process_once,
+)
+from dt.config import ConfigError, HeadConfig, LaptopConfig, Node, QueueCfg, parse
 from dt.dispatch import RunSpec, dispatch_queued, pick_candidates
 from dt.jobs import (
     JobEntry,
+    RegistryError,
+    job_lock,
     list_all,
     load,
     queued_entries,
@@ -109,6 +119,48 @@ def test_agent_restart_preflight_checks_lazy_package_module_syntax(tmp_path):
     assert "SyntaxError" in detail
 
 
+def test_agent_exits_before_hot_reloading_a_different_state_root(
+    tmp_path, monkeypatch, capsys
+):
+    import dt.agent as agent
+    import dt.config as config
+
+    original = _cfg(tmp_path / "original")
+    replacement = _cfg(tmp_path / "replacement")
+    monkeypatch.setattr(config, "load", lambda: replacement)
+    monkeypatch.setattr(agent, "_code_fingerprint", lambda: 1)
+
+    assert agent.run_loop(original) == AGENT_CONFIG_RESTART_EXIT
+
+    output = capsys.readouterr().out
+    assert "agent runtime identity changed" in output
+    assert "agent down" in output
+    assert not agent._pid_path(original).exists()
+    assert not replacement.root.exists()
+
+
+def test_agent_exits_if_hot_reloaded_config_changes_to_laptop_role(
+    tmp_path, monkeypatch, capsys
+):
+    import dt.agent as agent
+    import dt.config as config
+
+    original = _cfg(tmp_path)
+    monkeypatch.setattr(
+        config,
+        "load",
+        lambda: LaptopConfig(centers={"head": "head"}),
+    )
+    monkeypatch.setattr(agent, "_code_fingerprint", lambda: 1)
+
+    assert agent.run_loop(original) == AGENT_CONFIG_INVALID_ROLE_EXIT
+
+    output = capsys.readouterr().out
+    assert "no longer has the head role" in output
+    assert "agent down" in output
+    assert not agent._pid_path(original).exists()
+
+
 def test_pick_candidates_enforces_known_disk_contract_but_allows_unknown_state():
     nodes = [Node(name="low"), Node(name="fit"), Node(name="unknown")]
     statuses = [
@@ -167,6 +219,55 @@ def test_queue_config_defaults():
     assert cfg.webhook is None
 
 
+@pytest.mark.parametrize(
+    ("queue", "message"),
+    [
+        ({"poll_s": 10**1000}, "between 1 and 86400"),
+        ({"poll_s": 86401}, "between 1 and 86400"),
+        ({"active_poll_s": 3601}, "no greater than 3600"),
+    ],
+)
+def test_queue_cadence_has_finite_operational_bounds(queue, message):
+    with pytest.raises(ConfigError, match=message):
+        parse({"center": "c", "nodes": ["n1"], "queue": queue})
+
+
+def test_webhook_failure_is_redacted_and_observable(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    cfg.webhook = "https://token.example.invalid/private/path"
+    messages = []
+    monkeypatch.setattr(
+        agent.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("secret detail")),
+    )
+
+    assert agent.notify(cfg, {"event": "finished"}, messages.append) is False
+    assert messages == ["webhook notification failed: TimeoutError"]
+    assert "token.example" not in messages[0]
+    assert "secret detail" not in messages[0]
+
+
+def test_programmatic_unsafe_webhook_is_refused(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    cfg.webhook = "file:///tmp/event"
+    messages = []
+    opened = []
+    monkeypatch.setattr(
+        agent.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: opened.append(args),
+    )
+
+    assert agent.notify(cfg, {"event": "finished"}, messages.append) is False
+    assert opened == []
+    assert messages == ["webhook notification refused: unsafe URL"]
+
+
 def test_agent_log_rotation_preserves_open_append_descriptor(tmp_path, monkeypatch):
     import dt.agent as agent
 
@@ -200,6 +301,81 @@ def test_agent_log_rotation_ignores_small_or_missing_logs(tmp_path, monkeypatch)
     assert _rotate_agent_log(cfg) is False
 
 
+def test_agent_log_rotation_refuses_symlink_without_truncating_target(
+    tmp_path, monkeypatch
+):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    cfg.root.mkdir(parents=True)
+    outside = tmp_path / "outside.log"
+    outside.write_text("must survive\n")
+    agent.log_path(cfg).symlink_to(outside)
+    monkeypatch.setattr(agent, "AGENT_LOG_MAX_BYTES", 1)
+
+    with pytest.raises(OSError):
+        _rotate_agent_log(cfg)
+
+    assert agent.log_path(cfg).is_symlink()
+    assert outside.read_text() == "must survive\n"
+
+
+def test_agent_heartbeat_atomically_replaces_symlink_without_following_it(tmp_path):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    cfg.root.mkdir(parents=True)
+    outside = tmp_path / "outside-heartbeat"
+    outside.write_text("must survive\n")
+    agent.heartbeat_path(cfg).symlink_to(outside)
+
+    agent._write_heartbeat(cfg)
+
+    assert not agent.heartbeat_path(cfg).is_symlink()
+    assert float(agent.heartbeat_path(cfg).read_text()) > 0
+    assert agent.heartbeat_path(cfg).stat().st_mode & 0o777 == 0o600
+    assert outside.read_text() == "must survive\n"
+
+
+def test_agent_autoclean_refuses_symlinked_retention_state(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path, auto_clean_days=7)
+    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-autoclean-state"
+    outside.write_text("must survive\n")
+    stamp = cfg.agent_dir() / "last_autoclean"
+    stamp.symlink_to(outside)
+    cleaned = []
+    messages = []
+    monkeypatch.setattr(
+        agent,
+        "clean_jobs",
+        lambda *_args, **_kwargs: cleaned.append(True),
+    )
+
+    agent._maybe_autoclean(cfg, messages.append)
+
+    assert cleaned == []
+    assert messages == [
+        "auto-clean skipped: unsafe retention state (PrivateStateError)"
+    ]
+    assert stamp.is_symlink()
+    assert outside.read_text() == "must survive\n"
+
+
+def test_agent_state_reader_rejects_fifo_without_blocking(tmp_path):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
+    fifo = cfg.agent_dir() / "agent.pid"
+    os.mkfifo(fifo)
+
+    with pytest.raises(OSError, match="not a regular file"):
+        agent._read_private_text(fifo, max_bytes=64)
+
+
 # -- registry back-compat + FIFO ----------------------------------------------
 
 
@@ -221,6 +397,7 @@ def test_old_registry_entries_still_load(tmp_path):
         "exit_code": 0,
         "git_sha": None,
         "git_dirty": False,
+        "env_hash": "",
         "max_hours": None,
         "created_at": 1.0,
         "finished_at": 2.0,
@@ -234,9 +411,39 @@ def test_old_registry_entries_still_load(tmp_path):
     entry = load(cfg, "20260101-0000_old_aaaa")
     assert entry is not None and entry.gpus_requested == 1 and entry.pin_node is None
     assert entry.snapshot_sha256 is None
+    assert entry.env_hash is None
     assert entry.boot_id is None
     assert entry.after_success is None
     assert not hasattr(entry, "future_agent_field")
+
+
+def test_registry_rejects_unimplemented_physical_gpu_isolation(tmp_path):
+    cfg = _cfg(tmp_path)
+    path = cfg.registry_dir() / "physical.json"
+    path.write_text(
+        json.dumps(
+            {
+                "job_id": "physical",
+                "name": "physical",
+                "center": cfg.center,
+                "project": "p",
+                "node": "n1",
+                "node_local": False,
+                "job_dir": "~/dt/jobs/physical",
+                "session": "dt_physical",
+                "cmd": "true",
+                "gpu_isolation": "physical",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unsupported physical GPU isolation"):
+        load(cfg, "physical")
+    damage = []
+    assert list_all(cfg, damage=damage) == []
+    assert len(damage) == 1
+    assert "unsupported physical GPU isolation" in damage[0].detail
 
 
 def test_fifo_order_and_running_count(tmp_path):
@@ -299,6 +506,7 @@ def test_direct_dependency_submission_queues_before_capacity_probe(
         dispatch_mod.tree_sha256(code),
         code,
     )
+    save(cfg, _entry("guard", "running", 1.0))
     spec = RunSpec(
         name="appended",
         gpus=1,
@@ -330,6 +538,38 @@ def test_direct_dependency_submission_queues_before_capacity_probe(
     assert entry.after_success == "guard"
     assert entry.reason == "waiting: dependency guard"
     assert dispatch_mod.stage_dir(cfg, entry.job_id).is_dir()
+
+
+def test_legacy_queue_stage_is_private_without_changing_snapshot_identity(tmp_path):
+    cfg = _cfg(tmp_path)
+    source = tmp_path / "source"
+    source.mkdir(mode=0o755)
+    executable = source / "train.py"
+    executable.write_text("print('frozen')\n")
+    executable.chmod(0o755)
+    digest = dispatch_mod.tree_sha256(source)
+    spec = RunSpec(
+        name="private-stage",
+        gpus=1,
+        cmd=["python", "train.py"],
+        project="p",
+    )
+
+    staging = dispatch_mod._stage(
+        cfg,
+        source,
+        "private-stage-id",
+        spec,
+        {"job_id": "private-stage-id"},
+        stored=dispatch_mod.StoredSnapshot(digest, source),
+    )
+
+    assert staging.stat().st_mode & 0o777 == 0o700
+    assert (staging / "logs").stat().st_mode & 0o777 == 0o700
+    assert (staging / "cmd.sh").stat().st_mode & 0o777 == 0o600
+    assert (staging / "meta.json").stat().st_mode & 0o777 == 0o600
+    assert (staging / "code" / "train.py").stat().st_mode & 0o777 == 0o755
+    assert dispatch_mod.tree_sha256(staging / "code") == digest
 
 
 def test_satisfied_pinned_dependency_places_without_queue_round_trip(
@@ -507,6 +747,249 @@ def test_successful_dependency_releases_normal_dispatch(tmp_path, monkeypatch):
     assert persisted.reason is None
 
 
+def test_scientific_rejection_does_not_satisfy_after_success(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(
+        "pred",
+        "finished",
+        created_at=1.0,
+        node="n1",
+        exit_code=0,
+        result_state="scientific_reject",
+    )
+    successor = _entry(
+        "next",
+        "queued",
+        created_at=2.0,
+        after_success="pred",
+    )
+    save(cfg, predecessor)
+    save(cfg, successor)
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_dispatch_queued_active",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("scientific rejection must not release after-success")
+        ),
+    )
+
+    outcome, detail = dispatch_queued(cfg, successor, lambda _message: None)
+
+    assert outcome == "skipped"
+    assert detail == (
+        "dependency pred did not succeed: finished, exit 0, result scientific_reject"
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "result_state"),
+    [
+        ("finished", "scientific_reject"),
+        ("failed", "infra_failure"),
+        ("killed", "cancelled"),
+        ("lost", "infra_failure"),
+    ],
+)
+def test_after_complete_releases_on_every_terminal_result(
+    tmp_path,
+    monkeypatch,
+    status,
+    result_state,
+):
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(
+        "pred",
+        status,
+        created_at=1.0,
+        node="n2",
+        exit_code=0 if status == "finished" else None,
+        result_state=result_state,
+    )
+    successor = _entry(
+        "finalizer",
+        "queued",
+        created_at=2.0,
+        pin_node="n1",
+        after_complete="pred",
+        reason="waiting: completion dependency pred",
+    )
+    save(cfg, predecessor)
+    save(cfg, successor)
+    seen = []
+
+    def active(_cfg, entry, _log):
+        seen.append((entry.pin_node, entry.reason))
+        return "started", "n1"
+
+    monkeypatch.setattr(dispatch_mod, "_dispatch_queued_active", active)
+
+    assert dispatch_queued(cfg, successor, lambda _message: None) == (
+        "started",
+        "n1",
+    )
+    assert seen == [("n1", None)]
+
+
+def test_after_result_releases_matching_scientific_branch_cross_node(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(
+        "pred",
+        "finished",
+        created_at=1.0,
+        node="n2",
+        exit_code=0,
+        result_state="scientific_reject",
+    )
+    successor = _entry(
+        "analyze-rejection",
+        "queued",
+        created_at=2.0,
+        pin_node="n1",
+        after_result="pred",
+        after_result_states=["scientific_reject"],
+        reason="waiting: result dependency pred",
+    )
+    save(cfg, predecessor)
+    save(cfg, successor)
+    seen = []
+
+    def active(_cfg, entry, _log):
+        seen.append((entry.job_id, entry.reason))
+        return "started", "n1"
+
+    monkeypatch.setattr(dispatch_mod, "_dispatch_queued_active", active)
+
+    assert dispatch_queued(cfg, successor, lambda _message: None) == (
+        "started",
+        "n1",
+    )
+    assert seen == [("analyze-rejection", None)]
+
+
+def test_after_result_false_branch_becomes_typed_skip(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(
+        "pred",
+        "finished",
+        created_at=1.0,
+        node="n2",
+        exit_code=0,
+        result_state="success",
+    )
+    successor = _entry(
+        "analyze-rejection",
+        "queued",
+        created_at=2.0,
+        after_result="pred",
+        after_result_states=["scientific_reject"],
+    )
+    save(cfg, predecessor)
+    save(cfg, successor)
+    staging = dispatch_mod.stage_dir(cfg, successor.job_id)
+    (staging / "code").mkdir(parents=True)
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_dispatch_queued_active",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("false result predicate must not reach placement")
+        ),
+    )
+
+    outcome, detail = dispatch_queued(cfg, successor, lambda _message: None)
+
+    assert outcome == "skipped"
+    assert detail == (
+        "result dependency pred completed as success; expected one of scientific_reject"
+    )
+    persisted = load(cfg, successor.job_id)
+    assert persisted is not None
+    assert persisted.status == "skipped"
+    assert persisted.result_state == "dependency_skipped"
+    assert not staging.exists()
+
+
+def test_submit_with_already_false_result_predicate_skips_without_snapshot(
+    tmp_path,
+):
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(
+        "pred",
+        "finished",
+        created_at=1.0,
+        node="n2",
+        exit_code=0,
+        result_state="success",
+    )
+    save(cfg, predecessor)
+    source_calls = 0
+
+    def forbidden_source():
+        nonlocal source_calls
+        source_calls += 1
+        raise AssertionError("false dependency must not capture source")
+
+    entry = dispatch_mod._submit_prepared_once(
+        cfg,
+        dispatch_mod.RunSpec(
+            name="rejection-analysis",
+            gpus=0,
+            cmd=["true"],
+            project="p",
+            node="n1",
+            after_result="pred",
+            after_result_states=["scientific_reject"],
+        ),
+        source_factory=forbidden_source,
+        git_sha="a" * 40,
+        git_dirty=False,
+        git_diff=None,
+        log=lambda _message: None,
+        no_queue=False,
+    )
+
+    assert source_calls == 0
+    assert entry.status == "skipped"
+    assert entry.result_state == "dependency_skipped"
+    assert entry.snapshot_sha256 is None
+    assert not dispatch_mod.stage_dir(cfg, entry.job_id).exists()
+
+
+def test_after_complete_waits_without_pinning_to_predecessor_node(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _cfg(tmp_path)
+    predecessor = _entry("pred", "running", created_at=1.0, node="n2")
+    successor = _entry(
+        "finalizer",
+        "queued",
+        created_at=2.0,
+        pin_node="n1",
+        after_complete="pred",
+    )
+    save(cfg, predecessor)
+    save(cfg, successor)
+    monkeypatch.setattr(
+        dispatch_mod,
+        "_dispatch_queued_active",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("pending completion must not place")
+        ),
+    )
+
+    assert dispatch_queued(cfg, successor, lambda _message: None) == (
+        "blocked",
+        "completion dependency pred is running",
+    )
+    persisted = load(cfg, "finalizer")
+    assert persisted is not None
+    assert persisted.pin_node == "n1"
+    assert persisted.reason == "waiting: completion dependency pred is running"
+
+
 @pytest.mark.parametrize(
     ("status", "exit_code"),
     [
@@ -550,12 +1033,13 @@ def test_unsuccessful_dependency_fails_before_gpu(
 
     outcome, detail = dispatch_queued(cfg, successor, lambda message: None)
 
-    assert outcome == "failed"
+    assert outcome == "skipped"
     assert detail is not None
     assert detail.startswith("dependency pred did not succeed:")
     persisted = load(cfg, "next")
     assert persisted is not None
-    assert persisted.status == "failed"
+    assert persisted.status == "skipped"
+    assert persisted.result_state == "dependency_skipped"
     assert persisted.finished_at is not None
     assert persisted.gpus == []
     assert not staging.exists()
@@ -616,15 +1100,15 @@ def test_failed_dependency_propagates_through_whole_chain_in_one_tick(tmp_path):
     )
 
     assert process_once(cfg, lambda message: None) == [
-        ("train", "failed"),
-        ("evaluate", "failed"),
+        ("train", "skipped"),
+        ("evaluate", "skipped"),
     ]
     train = load(cfg, "train")
     evaluate = load(cfg, "evaluate")
-    assert train is not None and train.status == "failed"
-    assert evaluate is not None and evaluate.status == "failed"
+    assert train is not None and train.status == "skipped"
+    assert evaluate is not None and evaluate.status == "skipped"
     assert "dependency guard did not succeed: finished, exit 9" == train.reason
-    assert "dependency train did not succeed: failed" == evaluate.reason
+    assert "dependency train did not succeed: skipped" == evaluate.reason
 
 
 def test_pending_dependency_does_not_starve_unrelated_queue_work(
@@ -829,6 +1313,312 @@ def test_agent_status_exposes_machine_readable_adaptive_handoff(
     assert st["registry_damage"] == 1
 
 
+def test_agent_systemd_unit_has_restart_and_cgroup_contract(tmp_path):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    unit = agent.render_systemd_unit(cfg, tmp_path / "bin" / "dt")
+
+    assert f'ExecStart="{tmp_path}/bin/dt" agent run' in unit
+    assert "Restart=always" in unit
+    assert "RestartSec=2s" in unit
+    assert f"RestartPreventExitStatus={AGENT_CONFIG_INVALID_ROLE_EXIT}" in unit
+    assert "KillMode=control-group" in unit
+    assert unit.count("append:") == 2
+    assert f"StandardOutput=append:{agent.log_path(cfg)}" in unit
+    assert f"StandardError=append:{agent.log_path(cfg)}" in unit
+    assert "WantedBy=default.target" in unit
+
+
+def test_agent_systemd_unit_escapes_specifiers_and_control_characters(
+    tmp_path,
+    monkeypatch,
+):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setenv("DT_CONFIG", "/tmp/config%name\nnext")
+
+    unit = agent.render_systemd_unit(cfg, tmp_path / "bin" / "dt")
+
+    assert 'Environment="DT_CONFIG=/tmp/config%%name\\nnext"' in unit
+    assert "\nnext\n" not in unit
+
+
+def test_agent_systemd_output_path_uses_systemd_escapes(tmp_path):
+    import dt.agent as agent
+
+    encoded = agent._systemd_output_spec(tmp_path / "space % log")
+
+    assert "\\x20" in encoded
+    assert "%%" in encoded
+    assert encoded.startswith("append:/")
+
+
+def test_agent_install_prefers_systemd_user_supervisor(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    unit_path = tmp_path / "systemd" / agent.SYSTEMD_UNIT
+    calls = []
+    monkeypatch.setattr(agent, "systemd_unit_path", lambda: unit_path)
+    monkeypatch.setattr(agent, "_systemd_user_available", lambda: True)
+    monkeypatch.setattr(agent, "remove_agent_crontab", lambda: True)
+
+    def systemctl(*args, timeout=10):
+        calls.append((args, timeout))
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(agent, "_systemctl", systemctl)
+
+    result = agent.install_supervisor(cfg)
+
+    assert result["supervisor"] == "systemd-user"
+    assert result["restart_policy"] == "always"
+    assert result["legacy_cron_removed"] is True
+    assert unit_path.is_file()
+    assert agent.log_path(cfg).stat().st_mode & 0o777 == 0o600
+    assert agent.log_path(cfg).parent.stat().st_mode & 0o777 == 0o700
+    assert [args for args, _timeout in calls] == [
+        ("daemon-reload",),
+        ("enable", agent.SYSTEMD_UNIT),
+    ]
+
+
+def test_agent_systemd_install_failure_removes_new_unit(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    unit_path = tmp_path / "systemd" / agent.SYSTEMD_UNIT
+    calls = []
+    monkeypatch.setattr(agent, "systemd_unit_path", lambda: unit_path)
+    monkeypatch.setattr(agent, "_systemd_user_available", lambda: True)
+
+    def systemctl(*args, timeout=10):
+        calls.append(args)
+        return subprocess.CompletedProcess(
+            [],
+            1 if len(calls) == 1 else 0,
+            "",
+            "reload refused" if len(calls) == 1 else "",
+        )
+
+    monkeypatch.setattr(agent, "_systemctl", systemctl)
+
+    with pytest.raises(RuntimeError, match="previous unit restored"):
+        agent.install_systemd_service(cfg)
+
+    assert not unit_path.exists()
+    assert calls == [
+        ("daemon-reload",),
+        ("disable", agent.SYSTEMD_UNIT),
+        ("daemon-reload",),
+    ]
+
+
+def test_agent_systemd_upgrade_failure_restores_existing_unit(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    unit_path = tmp_path / "systemd" / agent.SYSTEMD_UNIT
+    unit_path.parent.mkdir(parents=True)
+    unit_path.write_text("existing service\n")
+    unit_path.chmod(0o640)
+    calls = []
+    monkeypatch.setattr(agent, "systemd_unit_path", lambda: unit_path)
+    monkeypatch.setattr(agent, "_systemd_user_available", lambda: True)
+
+    def systemctl(*args, timeout=10):
+        calls.append(args)
+        failed = args == ("enable", agent.SYSTEMD_UNIT)
+        return subprocess.CompletedProcess(
+            [],
+            1 if failed else 0,
+            "",
+            "enable refused" if failed else "",
+        )
+
+    monkeypatch.setattr(agent, "_systemctl", systemctl)
+
+    with pytest.raises(RuntimeError, match="previous unit restored"):
+        agent.install_systemd_service(cfg)
+
+    assert unit_path.read_text() == "existing service\n"
+    assert unit_path.stat().st_mode & 0o777 == 0o640
+    assert calls == [
+        ("daemon-reload",),
+        ("enable", agent.SYSTEMD_UNIT),
+        ("daemon-reload",),
+    ]
+
+
+def test_agent_systemd_install_refuses_symlinked_unit(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    unit_path = tmp_path / "systemd" / agent.SYSTEMD_UNIT
+    unit_path.parent.mkdir(parents=True)
+    outside = tmp_path / "outside.service"
+    outside.write_text("do not replace\n")
+    unit_path.symlink_to(outside)
+    calls = []
+    monkeypatch.setattr(agent, "systemd_unit_path", lambda: unit_path)
+    monkeypatch.setattr(agent, "_systemd_user_available", lambda: True)
+    monkeypatch.setattr(agent, "_systemctl", lambda *args, **kwargs: calls.append(args))
+
+    with pytest.raises(RuntimeError, match="safely opened"):
+        agent.install_systemd_service(cfg)
+
+    assert outside.read_text() == "do not replace\n"
+    assert unit_path.is_symlink()
+    assert calls == []
+
+
+def test_agent_systemd_install_refuses_symlinked_log(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    unit_path = tmp_path / "systemd" / agent.SYSTEMD_UNIT
+    outside = tmp_path / "outside.log"
+    outside.write_text("do not append\n")
+    agent.log_path(cfg).symlink_to(outside)
+    calls = []
+    monkeypatch.setattr(agent, "systemd_unit_path", lambda: unit_path)
+    monkeypatch.setattr(agent, "_systemd_user_available", lambda: True)
+    monkeypatch.setattr(agent, "_systemctl", lambda *args, **kwargs: calls.append(args))
+
+    with pytest.raises(RuntimeError, match="private agent log"):
+        agent.install_systemd_service(cfg)
+
+    assert outside.read_text() == "do not append\n"
+    assert agent.log_path(cfg).is_symlink()
+    assert not unit_path.exists()
+    assert calls == []
+
+
+def test_agent_install_rolls_back_systemd_when_legacy_cron_cannot_be_removed(
+    tmp_path,
+    monkeypatch,
+):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    unit_path = tmp_path / "systemd" / agent.SYSTEMD_UNIT
+    calls = []
+    monkeypatch.setattr(agent, "systemd_unit_path", lambda: unit_path)
+    monkeypatch.setattr(agent, "_systemd_user_available", lambda: True)
+    monkeypatch.setattr(
+        agent,
+        "remove_agent_crontab",
+        lambda: (_ for _ in ()).throw(OSError("read-only crontab")),
+    )
+
+    def systemctl(*args, timeout=10):
+        calls.append(args)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(agent, "_systemctl", systemctl)
+
+    with pytest.raises(RuntimeError, match="rolled back"):
+        agent.install_supervisor(cfg)
+
+    assert not unit_path.exists()
+    assert ("disable", agent.SYSTEMD_UNIT) in calls
+    assert calls[-2:] == [
+        ("daemon-reload",),
+        ("disable", agent.SYSTEMD_UNIT),
+    ]
+
+
+def test_agent_cron_cleanup_failure_restores_prior_enabled_unit(
+    tmp_path,
+    monkeypatch,
+):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    unit_path = tmp_path / "systemd" / agent.SYSTEMD_UNIT
+    unit_path.parent.mkdir(parents=True)
+    unit_path.write_text("prior enabled unit\n")
+    unit_path.chmod(0o640)
+    calls = []
+    monkeypatch.setattr(agent, "systemd_unit_path", lambda: unit_path)
+    monkeypatch.setattr(agent, "_systemd_user_available", lambda: True)
+    monkeypatch.setattr(
+        agent,
+        "remove_agent_crontab",
+        lambda: (_ for _ in ()).throw(OSError("read-only crontab")),
+    )
+
+    def systemctl(*args, timeout=10):
+        calls.append(args)
+        return subprocess.CompletedProcess([], 0, "enabled\n", "")
+
+    monkeypatch.setattr(agent, "_systemctl", systemctl)
+
+    with pytest.raises(RuntimeError, match="rolled back"):
+        agent.install_supervisor(cfg)
+
+    assert unit_path.read_text() == "prior enabled unit\n"
+    assert unit_path.stat().st_mode & 0o777 == 0o640
+    assert calls == [
+        ("is-enabled", agent.SYSTEMD_UNIT),
+        ("daemon-reload",),
+        ("enable", agent.SYSTEMD_UNIT),
+        ("daemon-reload",),
+        ("enable", agent.SYSTEMD_UNIT),
+    ]
+
+
+def test_agent_install_reports_weaker_cron_fallback(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(agent, "_systemd_user_available", lambda: False)
+    monkeypatch.setattr(agent, "install_crontab", lambda _cfg: "@reboot dt agent run")
+
+    result = agent.install_supervisor(cfg)
+
+    assert result["supervisor"] == "crontab"
+    assert result["fallback"] is True
+    assert "cannot isolate" in result["warning"]
+
+
+def test_agent_status_reports_stale_heartbeat(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(agent, "alive_pid", lambda _cfg: 1234)
+    monkeypatch.setattr(
+        agent,
+        "_supervisor_status",
+        lambda: {
+            "supervisor": "systemd-user",
+            "supervisor_state": "active/running",
+            "restart_policy": "always",
+            "unit": agent.SYSTEMD_UNIT,
+        },
+    )
+    agent.heartbeat_path(cfg).write_text("1\n")
+
+    result = agent.status(cfg)
+
+    assert result["supervisor"] == "systemd-user"
+    assert result["heartbeat_stale"] is True
+    assert result["heartbeat_age_s"] > result["heartbeat_stale_after_s"]
+
+
+def test_missing_legacy_heartbeat_is_unknown_not_false_stale(tmp_path):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+
+    result = agent.heartbeat_health(cfg, alive=True)
+
+    assert result["heartbeat_available"] is False
+    assert result["heartbeat_stale"] is False
+
+
 def test_registry_damage_is_reported_instead_of_silently_dropped(tmp_path):
     cfg = _cfg(tmp_path)
     save(cfg, _entry("good", "queued", created_at=1.0))
@@ -840,6 +1630,135 @@ def test_registry_damage_is_reported_instead_of_silently_dropped(tmp_path):
     assert [entry.job_id for entry in entries] == ["good"]
     assert [item.path for item in damage] == ["broken.json"]
     assert damage[0].detail
+
+
+def test_registry_ref_rejects_path_traversal_before_filesystem_access(tmp_path):
+    cfg = _cfg(tmp_path)
+    outside = tmp_path / "outside.json"
+    outside.write_text(
+        json.dumps(
+            {
+                **_entry("safe", "queued", created_at=1.0).__dict__,
+                "job_id": "../../outside",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert load(cfg, "../../outside") is None
+    assert outside.exists()
+
+
+def test_registry_ref_rejects_oversized_filename_before_filesystem_access(tmp_path):
+    cfg = _cfg(tmp_path)
+
+    assert load(cfg, "x" * (jobs_mod.MAX_JOB_ID_LENGTH + 1)) is None
+
+
+def test_registry_record_symlink_is_never_followed(tmp_path):
+    cfg = _cfg(tmp_path)
+    outside = tmp_path / "outside-record.json"
+    outside.write_text(
+        json.dumps(_entry("linked", "running", created_at=1.0).__dict__),
+        encoding="utf-8",
+    )
+    (cfg.registry_dir() / "linked.json").symlink_to(outside)
+
+    with pytest.raises(RegistryError, match="safely open registry record"):
+        load(cfg, "linked")
+    damage = []
+    assert list_all(cfg, damage=damage) == []
+    assert [item.path for item in damage] == ["linked.json"]
+    assert outside.exists()
+
+
+def test_registry_lock_symlink_cannot_truncate_its_target(tmp_path):
+    cfg = _cfg(tmp_path)
+    outside = tmp_path / "outside-lock"
+    outside.write_text("must survive\n", encoding="utf-8")
+    (cfg.state_dir() / "job-safe.lock").symlink_to(outside)
+
+    with pytest.raises(RegistryError, match="safely open registry lock"):
+        with job_lock(cfg, "safe"):
+            pass
+
+    assert outside.read_text(encoding="utf-8") == "must survive\n"
+
+
+def test_registry_filename_must_match_embedded_job_identity(tmp_path):
+    cfg = _cfg(tmp_path)
+    (cfg.registry_dir() / "claimed.json").write_text(
+        json.dumps(_entry("different", "queued", created_at=1.0).__dict__),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="does not match its filename"):
+        load(cfg, "claimed")
+    damage = []
+    assert list_all(cfg, damage=damage) == []
+    assert [item.path for item in damage] == ["claimed.json"]
+
+
+def test_registry_writer_refuses_a_record_its_reader_cannot_bound(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(jobs_mod, "MAX_JOB_RECORD_BYTES", 128)
+
+    with pytest.raises(RegistryError, match="exceeds its size limit"):
+        save(cfg, _entry("bounded", "queued", created_at=1.0, cmd="x" * 512))
+
+    assert not (cfg.registry_dir() / "bounded.json").exists()
+
+
+def test_registry_writer_rejects_unsafe_historical_project_extra(tmp_path):
+    cfg = _cfg(tmp_path)
+    entry = _entry("unsafe-extra", "queued", created_at=1.0)
+    entry.extras = ["--no-project"]
+
+    with pytest.raises(ValueError, match="invalid project extras"):
+        save(cfg, entry)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("launch_phases_s", [], "launch phases"),
+        ("after_result_states", "success", "dependency result states"),
+        ("setup_inputs", "src", "setup inputs"),
+        ("env_mode", "ambient", "environment mode"),
+        ("cache_mode", "mutable", "cache mode"),
+        ("storage_layout", "future", "storage layout"),
+        ("snapshot_sha256", "not-a-digest", "SHA-256"),
+        ("snapshot_duration_s", float("nan"), "measurements"),
+        ("env_preexisting", 1, "boolean"),
+        ("worker_root", "relative/root", "worker root"),
+    ],
+)
+def test_registry_writer_rejects_malformed_optional_contracts(
+    tmp_path, field, value, message
+):
+    cfg = _cfg(tmp_path)
+    entry = _entry("invalid-contract", "queued", created_at=1.0)
+    setattr(entry, field, value)
+
+    with pytest.raises(ValueError, match=message):
+        save(cfg, entry)
+
+
+def test_agent_wake_marker_does_not_follow_a_symlink(tmp_path):
+    cfg = _cfg(tmp_path)
+    outside = tmp_path / "outside-wake"
+    outside.write_text("must survive\n", encoding="utf-8")
+    wake = jobs_mod.agent_wake_path(cfg)
+    wake.symlink_to(outside)
+    before = outside.stat().st_mtime_ns
+
+    jobs_mod.request_agent_wake(cfg)
+
+    assert wake.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "must survive\n"
+    assert outside.stat().st_mtime_ns == before
 
 
 def test_running_count_treats_unreadable_entries_as_running(tmp_path):
@@ -1023,22 +1942,24 @@ def test_completion_watch_command_is_bounded_to_job_identity():
         created_at=1.0,
         node="n1",
         pgid=123,
-        job_dir="dt/jobs/path with spaces",
+        job_dir="dt/path with spaces/jobs/running",
     )
 
     command = agent._completion_watch_command(entry)
 
-    assert "'dt/jobs/path with spaces'/exit_code" in command
-    assert "kill -0 123" in command
+    assert "'dt/path with spaces/jobs/running'/exit_code" in command
+    assert "DT_WPID=123" in command
+    assert "process_start_ticks" in command
+    assert "dt_process_owned" in command
     assert "sleep 0.1" in command
 
 
 def test_local_completion_watcher_exits_on_remote_marker(tmp_path):
     import dt.agent as agent
 
-    job_dir = tmp_path / "job with spaces"
-    job_dir.mkdir()
-    wrapper = subprocess.Popen(["sleep", "5"])
+    job_dir = tmp_path / "jobs" / "running"
+    job_dir.mkdir(parents=True)
+    wrapper = subprocess.Popen(["sleep", "5"], cwd=job_dir)
     entry = _entry(
         "running",
         "running",
@@ -1084,7 +2005,7 @@ def test_agent_logs_and_notifies_unverified_dispatch_cancellation(
     monkeypatch.setattr(
         agent,
         "notify",
-        lambda cfg_, payload: notifications.append(payload),
+        lambda cfg_, payload, log=None: notifications.append(payload),
     )
     logs = []
 

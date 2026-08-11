@@ -23,17 +23,24 @@ if [[ "${DT_RELEASE_ALLOW_DIRTY:-0}" != "1" ]] && \
 fi
 
 OUT_DIR="${1:-$REPO_DIR/dist}"
+if [[ -L "$OUT_DIR" ]]; then
+    echo "release-check: output directory must not be a symlink: $OUT_DIR" >&2
+    exit 1
+fi
 if [[ -d "$OUT_DIR" ]] && find "$OUT_DIR" -mindepth 1 -print -quit | grep -q .; then
     echo "release-check: output directory is not empty: $OUT_DIR" >&2
     exit 1
 fi
 mkdir -p "$OUT_DIR"
+[[ -d "$OUT_DIR" && ! -L "$OUT_DIR" ]] || {
+    echo "release-check: output path is not a safe directory: $OUT_DIR" >&2
+    exit 1
+}
 
 WORK_DIR="$(mktemp -d /tmp/disttrainer-release.XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 BUILD_A="$WORK_DIR/build-a"
 BUILD_B="$WORK_DIR/build-b"
-INSTALL_ENV="$WORK_DIR/install"
 mkdir -p "$BUILD_A" "$BUILD_B"
 
 UV_NETWORK=()
@@ -53,9 +60,10 @@ uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync mypy --strict --no-incremental \
     --cache-dir="$WORK_DIR/mypy" --follow-imports=skip \
-    src/dt
+    src/dt scripts/audit_release.py scripts/release_contract.py
 bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
-    install.sh scripts/release-check.sh
+    install.sh scripts/package-check.sh scripts/release-check.sh \
+    scripts/security-check.sh
 git diff --check
 
 SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
@@ -80,7 +88,8 @@ done
 uv export --format requirements.txt --no-dev --no-emit-project --locked \
     --no-annotate --no-header "${UV_NETWORK[@]}" \
     -o "$OUT_DIR/runtime-constraints.txt" >/dev/null
-uv export --format cyclonedx1.5 --no-dev --no-emit-project --locked \
+uv export --preview-features sbom-export \
+    --format cyclonedx1.5 --no-dev --no-emit-project --locked \
     "${UV_NETWORK[@]}" -o "$OUT_DIR/sbom.cdx.json" >/dev/null
 
 cp bootstrap.sh "$OUT_DIR/"
@@ -100,27 +109,45 @@ python3 scripts/audit_release.py \
         "sbom.cdx.json" "release-audit.json" "bootstrap.sh" > SHA256SUMS
 )
 
-uv venv --python "${DT_RELEASE_PYTHON:-3.11}" "$INSTALL_ENV" >/dev/null
-uv pip install "${UV_NETWORK[@]}" --python "$INSTALL_ENV/bin/python" \
-    --constraints "$OUT_DIR/runtime-constraints.txt" \
-    "$BUILD_A/$WHEEL_NAME" >/dev/null
-[[ "$("$INSTALL_ENV/bin/dt" --version)" == "dt $RELEASE_VERSION" ]]
-"$INSTALL_ENV/bin/dt" --help >/dev/null
-"$INSTALL_ENV/bin/dt" run --help >/dev/null
+for release_python in 3.10 3.11; do
+    INSTALL_ENV="$WORK_DIR/install-$release_python"
+    TOOL_BIN_DIR="$WORK_DIR/tool-bin-$release_python"
+    INSTALL_ROOT="$WORK_DIR/installations-$release_python"
+    CONFIG_PATH="$WORK_DIR/config-$release_python.yaml"
+    uv venv --python "$release_python" "$INSTALL_ENV" >/dev/null
+    uv --no-config pip install "${UV_NETWORK[@]}" \
+        --python "$INSTALL_ENV/bin/python" \
+        --require-hashes --only-binary :all: \
+        -r "$OUT_DIR/runtime-constraints.txt" >/dev/null
+    uv --no-config pip install "${UV_NETWORK[@]}" \
+        --python "$INSTALL_ENV/bin/python" \
+        --no-deps "$BUILD_A/$WHEEL_NAME" >/dev/null
+    uv --no-config pip check --python "$INSTALL_ENV/bin/python" >/dev/null
+    [[ "$("$INSTALL_ENV/bin/dt" --version)" == "dt $RELEASE_VERSION" ]]
+    "$INSTALL_ENV/bin/dt" --help >/dev/null
+    for command in init free run ps logs wait info request pull batch chain compare \
+        watch metrics rerun exec fork attach kill clean events storage compact sync \
+        seed topology doctor agent migrate; do
+        "$INSTALL_ENV/bin/dt" "$command" --help >/dev/null
+    done
+    "$INSTALL_ENV/bin/dt" agent install --help >/dev/null
+    "$INSTALL_ENV/bin/dt" migrate layout --help >/dev/null
 
-BOOTSTRAP_ENV=(
-    "UV_TOOL_BIN_DIR=$WORK_DIR/tool-bin"
-    "UV_TOOL_DIR=$WORK_DIR/tools"
-    "DT_CONFIG_PATH=$WORK_DIR/config.yaml"
-    "DT_PYTHON=${DT_RELEASE_PYTHON:-3.11}"
-)
-if [[ "${DT_RELEASE_OFFLINE:-0}" == "1" ]]; then
-    BOOTSTRAP_ENV+=("UV_OFFLINE=1")
-fi
-env "${BOOTSTRAP_ENV[@]}" bash "$OUT_DIR/bootstrap.sh" \
-    "$OUT_DIR/$WHEEL_NAME" "$OUT_DIR/runtime-constraints.txt" >/dev/null
-[[ "$("$WORK_DIR/tool-bin/dt" --version)" == "dt $RELEASE_VERSION" ]]
-[[ ! -e "$WORK_DIR/config.yaml" ]]
+    BOOTSTRAP_ENV=(
+        "UV_TOOL_BIN_DIR=$TOOL_BIN_DIR"
+        "DT_INSTALL_ROOT=$INSTALL_ROOT"
+        "DT_CONFIG=$CONFIG_PATH"
+        "DT_PYTHON=$release_python"
+    )
+    if [[ "${DT_RELEASE_OFFLINE:-0}" == "1" ]]; then
+        BOOTSTRAP_ENV+=("UV_OFFLINE=1")
+    fi
+    env "${BOOTSTRAP_ENV[@]}" bash "$OUT_DIR/bootstrap.sh" \
+        "$OUT_DIR/$WHEEL_NAME" "$OUT_DIR/runtime-constraints.txt" >/dev/null
+    [[ "$("$TOOL_BIN_DIR/dt" --version)" == "dt $RELEASE_VERSION" ]]
+    [[ ! -e "$CONFIG_PATH" ]]
+    echo "release-check: Python $release_python wheel/bootstrap PASS"
+done
 
 python3 - "$OUT_DIR" "$DISTRIBUTION" "$RELEASE_VERSION" <<'PY'
 import hashlib
@@ -136,10 +163,23 @@ artifacts = {}
 for path in sorted(out.iterdir()):
     if path.name == "release-manifest.json" or not path.is_file():
         continue
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
     artifacts[path.name] = {
         "bytes": path.stat().st_size,
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "sha256": digest.hexdigest(),
     }
+git_status = subprocess.check_output(
+    ["git", "status", "--porcelain"], text=True
+).strip()
+if git_status:
+    print(
+        "release-check: source worktree changed during qualification",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 manifest = {
     "schema_version": "disttrainer_release_manifest_v1",
     "distribution": distribution,
@@ -147,9 +187,7 @@ manifest = {
     "git_commit": subprocess.check_output(
         ["git", "rev-parse", "HEAD"], text=True
     ).strip(),
-    "git_dirty": bool(
-        subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
-    ),
+    "git_dirty": False,
     "artifacts": artifacts,
 }
 (out / "release-manifest.json").write_text(

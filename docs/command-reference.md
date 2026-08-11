@@ -23,24 +23,34 @@ This page helps operators choose a command and handle its result. Run
 | `dt chain` | Submit stages gated on predecessor success |
 | `dt fork` | Submit from an exact historical snapshot |
 | `dt rerun` | Submit the historical command with current project code |
+| `dt exec` | Diagnose an exact snapshot in its existing environment, without sync |
 | `dt compare` | Audit controls and compare selected numeric metrics |
 | `dt watch` | Follow multiple selected jobs until all are terminal |
 | `dt metrics` | Summarize persisted GPU, CPU, memory, and I/O telemetry |
+| `dt request` | Recover the durable receipt for a retry-safe submission intent |
 
 ## Operations commands
 
 | Command | Purpose |
 |---|---|
 | `dt doctor` | Verify SSH, tools, GPU runtime, transfer, and agent contracts |
+| `dt topology` | Probe and explain directed P2P data edges without transferring artifacts |
 | `dt agent` | Install, start, stop, inspect, or foreground the queue agent |
 | `dt attach` | Enter the job's managed tmux session |
 | `dt kill` | Terminate and verify a complete job process group |
+| `dt events` | Query the bounded, redacted operation journal on this host or a head |
 | `dt storage` | Inventory DistTrainer-managed storage |
 | `dt migrate layout` | Plan or apply identity-verified legacy runtime moves |
 | `dt compact` | Remove recoverable old code copies while retaining job evidence |
 | `dt clean` | Delete explicitly scoped old jobs, results, or environments |
 | `dt sync` | Incrementally stage project code or explicit large inputs |
 | `dt seed` | Seed approved caches and Python runtimes on slow-network nodes |
+
+`dt topology [--site SITE] --json` actively verifies configured directed data edges.
+Use `--source NODE` and/or `--destination NODE` to scope a large site. The
+default `--max-edges 256` prevents accidental quadratic probing; callers may
+raise it explicitly up to 4,096. This command discovers and measures routes but
+does not transfer an Artifact.
 
 ## Submission shape
 
@@ -52,6 +62,23 @@ Use `-n/--name` when a campaign requires a specific label; otherwise DT derives
 a searchable name from the script or module in the command. The `--` boundary
 separates DistTrainer options from the remote command. `-g 0` creates a
 CPU-only job. Use `--no-queue` only when capacity absence must fail immediately.
+Names normalize to filesystem-safe ASCII. A normalized value longer than 64
+characters keeps a readable prefix plus a stable digest, so registry and tmux
+identities remain below filesystem component limits without collapsing two
+distinct long names.
+
+For automated callers, add a stable `--request-id`. A retry with the same
+normalized intent returns the original job; a changed intent conflicts. If the
+client loses the response, query `dt request REQUEST_ID --json` instead of
+submitting a new job.
+
+The option is available on `run`, `task`, `rerun`, `fork`, `exec`, `batch`, and
+`chain`. On `batch`, `chain`, and `fork --repeat`, it identifies the complete
+group. DT durably records the confirmed prefix and uses a deterministic child
+request per item: retrying can resume a child that was never claimed, but an
+`uncertain` child fails closed and blocks later items. Group receipts add
+`request_id` and `idempotent_replay`; `dt request REQUEST_ID --json` returns
+the parent state, submitted jobs, next index, and first unresolved child.
 
 The non-follow human contract writes progress to stderr and the bare job ID as
 the last stdout line:
@@ -88,10 +115,36 @@ routable references; the complete submitted job ID remains the last stdout line.
 show the complete next-job ID and scheduler reason, or add `--json` for the
 structured explanation contract.
 
+`dt info REF --json` includes `result_state`, a versioned `paths` object, and a
+`gpu_isolation` contract. The path entries state ownership, mutability,
+lifetime, cleanup policy, and the actual environment interpreter; agents
+should consume those fields rather than infer paths from `job_dir`. Current
+bare-process jobs report advisory isolation, `enforced: false`, and unrestricted
+graphics-device access rather than implying that CUDA visibility is a physical
+device boundary.
+
 `dt ps --json` returns complete history by default for compatibility. Explicit
 filters such as `--limit`, `--issues`, or `-s` narrow it. Human `dt ps`
 defaults to active work, uses a plain sentence for empty filters, and compacts
 dependency references in issue rows.
+
+Routine Agent polling should use the opt-in bounded query contract:
+
+```bash
+dt ps --summary --json
+dt ps --compact --active --limit 50 --json
+dt ps --compact --issues --fields job_id,status,node,reason --limit 50 --json
+dt ps --compact --since 2026-08-10T08:00:00Z --json
+dt ps --compact --cursor "$NEXT_CURSOR" --json
+```
+
+These options activate `dt_ps_query_v1`, an object containing `query`,
+`summary`, `page`, projected `jobs`, `partial`, and per-center `errors`.
+`page.next_cursor` is opaque and bound to the filters and ordering of the
+original query. `--since` observes registry lifecycle updates, not only newly
+created jobs. A mixed-version head may serve compact non-incremental queries
+through a full-array compatibility fallback; `--since` fails closed until that
+head supports the incremental contract.
 
 Use command-specific detail views when diagnosing:
 
@@ -108,6 +161,21 @@ but retains phase rows when the application actually transitions between phases.
 Streaming JSON commands use one object or a documented JSONL stream. Progress
 and reconnect notices remain on stderr.
 
+Every installed CLI invocation writes private `start` and `finish` events.
+Laptop-to-head calls share a parent operation ID. Query local evidence with:
+
+```bash
+dt events --issues
+dt events --limit 50 --json
+dt events --operation-id OPERATION_ID --json
+dt events -c CENTER --issues --json  # laptop: query one head
+```
+
+`dt_operation_events_v1` is newest-first and says whether results were
+truncated or malformed records were skipped. Raw command arguments and
+exception messages are deliberately absent; use the correlated job, request,
+or agent evidence for authorized detail.
+
 ## Exit codes
 
 General command codes:
@@ -122,7 +190,7 @@ General command codes:
 | 5 | Required host or center unreachable |
 | 130 | Local interruption; registered remote jobs continue unless explicitly killed |
 
-`dt wait` reserves 65 through 68 for terminal job states, while 0 through 125
+`dt wait` reserves 65 through 69 for terminal job states, while 0 through 125
 otherwise carry the experiment result. See [Operations](operations.md) for the
 mapping.
 
@@ -136,3 +204,9 @@ explicit escalation.
 Do not use raw SSH process kills or ad hoc GPU allocation alongside
 DistTrainer. They bypass leases, registry state, process-tree verification, and
 recovery evidence.
+
+GPU leases and `CUDA_VISIBLE_DEVICES` are advisory allocation for bare
+processes. They constrain CUDA enumeration but do not physically deny Vulkan,
+EGL, OpenGL, or direct device-node access. Do not run a graphics workload as if
+it had strong GPU isolation; that future contract requires an explicit OCI/CDI
+isolation backend described by ADR 0014.

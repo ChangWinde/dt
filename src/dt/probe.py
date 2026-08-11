@@ -9,8 +9,11 @@ window before a training process creates a CUDA context.
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import shlex
+import stat
 import subprocess
 import tempfile
 import time
@@ -71,6 +74,8 @@ APP_Q = (
 )
 SEP = "---DT---"
 SYS_SEP = "---DT-SYS---"
+PROBE_CACHE_MAX_BYTES = 8 * 1024 * 1024
+PROBE_MAX_WORKERS = 32
 SYSTEM_Q = r"""
 cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 0)
 load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
@@ -94,8 +99,11 @@ printf '%s,%s,%s,%s,%s,%s,%s\n' \
   "${disk_total:-0}" "${disk_avail:-0}" "${io:--1}"
 """
 PROBE_CMD = (
-    'umask 077; dt_probe_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dt-probe.XXXXXX") '
+    'umask 077; if [ "${0:-}" = dt-bounded-probe ] && [ -n "${1:-}" ]; then '
+    "dt_probe_tmp=$1; else "
+    'dt_probe_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dt-probe.XXXXXX") '
     '|| { echo "dt: failed to create probe temporary directory" >&2; exit 70; }; '
+    "fi; "
     'dt_gpu_out="$dt_probe_tmp/gpu"; '
     'dt_app_out="$dt_probe_tmp/apps"; '
     'dt_system_out="$dt_probe_tmp/system"; '
@@ -136,6 +144,8 @@ CACHE_TTL_S = 3.0
 PROBE_TIMEOUT_EXIT = 124
 PROBE_TRANSPORT_GRACE_S = 5.0
 CacheSignature: TypeAlias = tuple[int, int, int, int]
+_LEASE_OWNER_RE = re.compile(r"[A-Za-z0-9_.:@+-]{1,128}")
+_PROCESS_USER_RE = re.compile(r"[A-Za-z0-9_.@+-]{1,128}")
 
 
 def probe_command(lease_root: str | None = None) -> str:
@@ -155,10 +165,21 @@ def bounded_probe_command(
     """Bound remote telemetry separately from the surrounding SSH channel."""
     duration = f"{timeout:g}s"
     command = probe_command(lease_root)
-    return (
+    outer = (
+        'umask 077; dt_outer_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dt-probe.XXXXXX") '
+        '|| { echo "dt: failed to create probe temporary directory" >&2; exit 70; }; '
+        "dt_outer_cleanup() { "
+        'rm -f -- "$dt_outer_tmp/gpu" "$dt_outer_tmp/apps" '
+        '"$dt_outer_tmp/system"; '
+        'rmdir -- "$dt_outer_tmp" 2>/dev/null || true; }; '
+        "trap dt_outer_cleanup 0 1 2 15; "
         "timeout --signal=TERM --kill-after=2s "
-        f"{shlex.quote(duration)} sh -c {shlex.quote(command)}"
+        f"{shlex.quote(duration)} sh -c {shlex.quote(command)} "
+        'dt-bounded-probe "$dt_outer_tmp"; '
+        "dt_outer_rc=$?; dt_outer_cleanup; trap - 0 1 2 15; "
+        'exit "$dt_outer_rc"'
     )
+    return outer
 
 
 @dataclass
@@ -240,15 +261,37 @@ def _parse_probe_inventory(
                     temperature = None
         try:
             index = int(idx)
+            mem_used = int(used)
+            mem_total = int(total)
+            utilization = int(util)
+            if (
+                index < 0
+                or mem_used < 0
+                or mem_total <= 0
+                or mem_used > mem_total
+                or not 0 <= utilization <= 100
+                or not uuid
+                or len(uuid) > 256
+            ):
+                raise ValueError("GPU values are outside their valid range")
             gpu = Gpu(
                 index=index,
                 uuid=uuid,
-                mem_used=int(used),
-                mem_total=int(total),
-                util=int(util),
+                mem_used=mem_used,
+                mem_total=mem_total,
+                util=utilization,
                 leased=leased,
-                lease_owner=lease_owner,
-                temperature=temperature,
+                lease_owner=(
+                    lease_owner
+                    if lease_owner is not None
+                    and _LEASE_OWNER_RE.fullmatch(lease_owner)
+                    else None
+                ),
+                temperature=(
+                    temperature
+                    if temperature is not None and -100 <= temperature <= 1000
+                    else None
+                ),
             )
         except ValueError:
             malformed_rows += 1
@@ -278,7 +321,12 @@ def _parse_probe_inventory(
             if pid:
                 processes.add(process)
             gpus[uuid].procs += 1
-            user = parts[2] if len(parts) > 2 and parts[2] else "?"
+            candidate_user = parts[2] if len(parts) > 2 and parts[2] else "?"
+            user = (
+                candidate_user
+                if candidate_user == "?" or _PROCESS_USER_RE.fullmatch(candidate_user)
+                else "?"
+            )
             if user not in gpus[uuid].users:
                 gpus[uuid].users.append(user)
     out = sorted(gpus.values(), key=lambda g: g.index)
@@ -323,6 +371,17 @@ def parse_system_output(text: str) -> SystemStats | None:
         io = float(parts[6])
     except ValueError:
         return None
+    if (
+        cores <= 0
+        or not math.isfinite(load1)
+        or load1 < 0
+        or mem_total_kib <= 0
+        or not 0 <= mem_avail_kib <= mem_total_kib
+        or disk_total_kib <= 0
+        or not 0 <= disk_avail_kib <= disk_total_kib
+        or not math.isfinite(io)
+    ):
+        return None
     return SystemStats(
         cpu_cores=cores,
         cpu_load1=load1,
@@ -362,6 +421,7 @@ def probe_node(
             node.local,
             bounded_probe_command(probe_timeout, lease_root),
             timeout=probe_timeout + PROBE_TRANSPORT_GRACE_S,
+            retry_stale_mux=True,
         )
     except Exception as e:  # RemoteError / TimeoutExpired
         return NodeStatus(
@@ -411,26 +471,56 @@ def _probe_configured_node(cfg: HeadConfig, node: Node) -> NodeStatus:
 
 def _probe_cache_signature(cache_file: Path) -> CacheSignature | None:
     try:
-        stat = cache_file.stat()
+        metadata = cache_file.lstat()
     except OSError:
         return None
-    return (stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        return None
+    return (
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def _read_probe_cache(
     cache_file: Path,
     *,
     max_age_s: float | None = None,
+    expected_nodes: tuple[str, ...] | None = None,
 ) -> list[NodeStatus] | None:
+    descriptor = -1
     try:
+        descriptor = os.open(
+            cache_file,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > PROBE_CACHE_MAX_BYTES
+        ):
+            return None
         if max_age_s is not None:
-            age = time.time() - cache_file.stat().st_mtime
+            age = time.time() - metadata.st_mtime
             if age >= max_age_s:
                 return None
-        raw = json.loads(cache_file.read_text())
+        payload = bytearray()
+        while len(payload) <= PROBE_CACHE_MAX_BYTES:
+            block = os.read(
+                descriptor,
+                min(64 * 1024, PROBE_CACHE_MAX_BYTES + 1 - len(payload)),
+            )
+            if not block:
+                break
+            payload.extend(block)
+        if len(payload) > PROBE_CACHE_MAX_BYTES:
+            return None
+        raw = json.loads(payload)
         if not isinstance(raw, list):
             return None
-        return [
+        statuses = [
             NodeStatus(
                 node=n["node"],
                 gpus=[Gpu(**g) for g in n["gpus"]],
@@ -441,8 +531,116 @@ def _read_probe_cache(
             )
             for n in raw
         ]
+        if not _valid_cached_statuses(statuses, expected_nodes):
+            return None
+        return statuses
     except (OSError, TypeError, ValueError, KeyError):
         return None
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _valid_cached_statuses(
+    statuses: list[NodeStatus],
+    expected_nodes: tuple[str, ...] | None,
+) -> bool:
+    """Reject stale-schema or unsafe cache values before scheduling sees them."""
+    if (
+        expected_nodes is not None
+        and tuple(row.node for row in statuses) != expected_nodes
+    ):
+        return False
+    for row in statuses:
+        if (
+            not isinstance(row.node, str)
+            or not isinstance(row.unreachable, bool)
+            or row.error is not None
+            and (not isinstance(row.error, str) or len(row.error) > 4096)
+            or row.gpu_inventory_error is not None
+            and (
+                not isinstance(row.gpu_inventory_error, str)
+                or len(row.gpu_inventory_error) > 4096
+            )
+        ):
+            return False
+        for gpu in row.gpus:
+            if (
+                isinstance(gpu.index, bool)
+                or not isinstance(gpu.index, int)
+                or gpu.index < 0
+                or not isinstance(gpu.uuid, str)
+                or not 0 < len(gpu.uuid) <= 256
+                or isinstance(gpu.mem_used, bool)
+                or not isinstance(gpu.mem_used, int)
+                or isinstance(gpu.mem_total, bool)
+                or not isinstance(gpu.mem_total, int)
+                or not 0 <= gpu.mem_used <= gpu.mem_total
+                or gpu.mem_total <= 0
+                or isinstance(gpu.util, bool)
+                or not isinstance(gpu.util, int)
+                or not 0 <= gpu.util <= 100
+                or isinstance(gpu.procs, bool)
+                or not isinstance(gpu.procs, int)
+                or gpu.procs < 0
+                or not isinstance(gpu.leased, bool)
+                or not isinstance(gpu.free, bool)
+                or gpu.lease_owner is not None
+                and (
+                    not isinstance(gpu.lease_owner, str)
+                    or _LEASE_OWNER_RE.fullmatch(gpu.lease_owner) is None
+                )
+                or not isinstance(gpu.users, list)
+                or any(
+                    not isinstance(user, str)
+                    or (
+                        user != "?"
+                        and user != "dt-lease"
+                        and _PROCESS_USER_RE.fullmatch(user) is None
+                    )
+                    for user in gpu.users
+                )
+                or gpu.temperature is not None
+                and (
+                    isinstance(gpu.temperature, bool)
+                    or not isinstance(gpu.temperature, int)
+                    or not -100 <= gpu.temperature <= 1000
+                )
+            ):
+                return False
+        system = row.system
+        if system is not None and (
+            isinstance(system.cpu_cores, bool)
+            or not isinstance(system.cpu_cores, int)
+            or system.cpu_cores <= 0
+            or not isinstance(system.cpu_load1, (int, float))
+            or isinstance(system.cpu_load1, bool)
+            or not math.isfinite(float(system.cpu_load1))
+            or system.cpu_load1 < 0
+            or isinstance(system.mem_used_mib, bool)
+            or not isinstance(system.mem_used_mib, int)
+            or isinstance(system.mem_total_mib, bool)
+            or not isinstance(system.mem_total_mib, int)
+            or not 0 <= system.mem_used_mib <= system.mem_total_mib
+            or system.mem_total_mib <= 0
+            or not isinstance(system.disk_free_gib, (int, float))
+            or isinstance(system.disk_free_gib, bool)
+            or not isinstance(system.disk_total_gib, (int, float))
+            or isinstance(system.disk_total_gib, bool)
+            or not math.isfinite(float(system.disk_free_gib))
+            or not math.isfinite(float(system.disk_total_gib))
+            or not 0 <= system.disk_free_gib <= system.disk_total_gib
+            or system.disk_total_gib <= 0
+            or system.io_pressure is not None
+            and (
+                not isinstance(system.io_pressure, (int, float))
+                or isinstance(system.io_pressure, bool)
+                or not math.isfinite(float(system.io_pressure))
+                or system.io_pressure < 0
+            )
+        ):
+            return False
+    return True
 
 
 @contextmanager
@@ -453,7 +651,17 @@ def _probe_refresh_lock(lock_file: Path) -> Iterator[bool]:
     file cannot be opened or locked, callers still perform a live probe.
     """
     try:
-        stream = lock_file.open("a")
+        descriptor = os.open(
+            lock_file,
+            os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            os.close(descriptor)
+            raise OSError("probe refresh lock is not a regular file")
+        os.fchmod(descriptor, 0o600)
+        stream = os.fdopen(descriptor, "a", encoding="utf-8")
     except OSError:
         yield False
         return
@@ -473,7 +681,9 @@ def _probe_refresh_lock(lock_file: Path) -> Iterator[bool]:
 
 
 def _collect_center(cfg: HeadConfig) -> list[NodeStatus]:
-    with ThreadPoolExecutor(max_workers=max(len(cfg.nodes), 1)) as pool:
+    with ThreadPoolExecutor(
+        max_workers=min(PROBE_MAX_WORKERS, max(len(cfg.nodes), 1))
+    ) as pool:
         return list(pool.map(lambda n: _probe_configured_node(cfg, n), cfg.nodes))
 
 
@@ -503,9 +713,14 @@ def _write_probe_cache(cache_file: Path, statuses: list[NodeStatus]) -> None:
 
 def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
     cache_file = cfg.cache_dir() / "probe.json"
+    expected_nodes = tuple(node.name for node in cfg.nodes)
     initial_signature = _probe_cache_signature(cache_file)
     if use_cache:
-        cached = _read_probe_cache(cache_file, max_age_s=CACHE_TTL_S)
+        cached = _read_probe_cache(
+            cache_file,
+            max_age_s=CACHE_TTL_S,
+            expected_nodes=expected_nodes,
+        )
         if cached is not None:
             return cached
 
@@ -514,13 +729,23 @@ def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
         # callers accept the refreshed TTL; --fresh callers accept it only if
         # the atomic cache generation changed after this invocation began.
         if use_cache:
-            cached = _read_probe_cache(cache_file, max_age_s=CACHE_TTL_S)
+            cached = _read_probe_cache(
+                cache_file,
+                max_age_s=CACHE_TTL_S,
+                expected_nodes=expected_nodes,
+            )
             if cached is not None:
                 return cached
         elif (
             coordinated
             and _probe_cache_signature(cache_file) != initial_signature
-            and (cached := _read_probe_cache(cache_file)) is not None
+            and (
+                cached := _read_probe_cache(
+                    cache_file,
+                    expected_nodes=expected_nodes,
+                )
+            )
+            is not None
         ):
             return cached
 

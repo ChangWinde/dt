@@ -87,8 +87,9 @@ $DT_PREDECESSOR_OUTPUTS
 $DT_PREDECESSOR_META_PATH
 ```
 
-Waiting stages do not probe or lease GPUs. A failed, killed, lost, missing, or
-nonzero predecessor marks all dependent stages failed before start.
+Waiting stages do not probe or lease GPUs. A failed, killed, lost, or nonzero
+predecessor makes dependent stages `skipped / dependency_skipped`; a missing
+dependency remains an infrastructure failure.
 
 Append a new current-code job to an existing predecessor:
 
@@ -97,6 +98,48 @@ dt run -n evaluation \
   --after-success TRAIN_JOB \
   -- python evaluate.py
 ```
+
+Run a finalizer on another node regardless of the result:
+
+```bash
+dt run --node analysis-node --after-complete TRAIN_JOB -- python finalize.py
+```
+
+Route by typed scientific result:
+
+```bash
+dt run --node analysis-node \
+  --after-result TRAIN_JOB \
+  --when-result scientific_reject \
+  -- python analyze_rejection.py
+```
+
+`--when-result` is repeatable. A nonmatching branch becomes a terminal
+`skipped` job; it does not wait forever or masquerade as infrastructure damage.
+Inside a running job, emit an application-owned result with the installed
+helper:
+
+```bash
+dt-result emit --state scientific_reject \
+  --reason "acceptance metric below frozen threshold" \
+  --metadata-json '{"score":0.41,"threshold":0.50}'
+```
+
+Applications may emit only `success` or `scientific_reject`; DT owns
+infrastructure, guard, cancellation, and dependency classifications.
+
+## Exact recovery execution
+
+When package indexes or mutable project state are unavailable, diagnose the
+environment that actually ran a job:
+
+```bash
+dt exec TRAIN_JOB -- python -c 'import torch; print(torch.__version__)'
+```
+
+This uses the exact recorded snapshot, node, and environment identity. It does
+not run project sync, `uv sync`, or setup. Missing or incomplete environments
+fail closed. Add `-g N` only when the diagnostic itself needs GPUs.
 
 ## Exact-snapshot fork
 

@@ -202,6 +202,7 @@ def test_seed_reports_component_retry_without_polluting_json(tmp_path, monkeypat
             "delay_s": 5,
             "returncode": 255,
             "message": "ssh: transient seed link",
+            "kind": "transport",
         }
     ]
     assert result.stdout.count("\n") == 1

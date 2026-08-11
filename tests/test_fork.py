@@ -3,12 +3,17 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 
 import pytest
 from typer.testing import CliRunner
 
 from dt import agent, cli
+from dt import jobs as jobs_mod
+from dt import submission_intent as intent_mod
 import dt.dispatch as dispatch
 from dt.config import HeadConfig, LaptopConfig, Node, Project
 from dt.jobs import JobEntry
@@ -350,6 +355,7 @@ def test_cache_reuse_contract_rejects_unsafe_path_and_environment(
 def test_submit_fork_cache_requires_successful_source(tmp_path):
     cfg = _cfg(tmp_path)
     source = _entry(status="running", exit_code=None)
+    jobs_mod.save(cfg, source)
     spec = dispatch.fork_spec_from_entry(
         source,
         reuse_cache="outputs/.cache/torchinductor",
@@ -364,6 +370,7 @@ def test_submit_fork_keeps_requested_parent_distinct_from_cache_source(
 ):
     cfg = _cfg(tmp_path)
     source = _entry()
+    jobs_mod.save(cfg, source)
     child = _entry(
         job_id="20260724-0410_cached-child_ef01",
         cache_source_job=source.job_id,
@@ -388,6 +395,19 @@ def test_submit_fork_keeps_requested_parent_distinct_from_cache_source(
     assert seen["spec"].cache_source_job == source.job_id
     assert entry.forked_from == child.job_id
     assert entry.cache_source_job == source.job_id
+
+
+def test_submit_fork_refuses_source_identity_changed_after_resolution(tmp_path):
+    cfg = _cfg(tmp_path)
+    source = _entry()
+    jobs_mod.save(cfg, source)
+    changed = JobEntry(**source.__dict__)
+    changed.snapshot_sha256 = "b" * 64
+    jobs_mod.save(cfg, changed)
+    spec = dispatch.fork_spec_from_entry(source)
+
+    with pytest.raises(dispatch.ConfigError, match="source identity changed"):
+        dispatch.submit_fork(cfg, source, spec, lambda _message: None)
 
 
 def test_fork_cli_overrides_command_and_reports_exact_snapshot(tmp_path, monkeypatch):
@@ -717,7 +737,7 @@ def test_cold_fork_wrapper_overrides_ambient_cache_and_preserves_arguments(tmp_p
             'exec "$@"'
         ),
         "dt-cold-fork",
-        "python",
+        sys.executable,
         "-c",
         (
             "import json,os,sys; "
@@ -1000,6 +1020,63 @@ def test_fork_repeat_inherits_one_verified_cache_and_force_queues_fifo(
     assert payload["cache_reuse"]["source_job_id"] == source.job_id
     assert all(row["forked_from"] == old.job_id for row in payload["jobs"])
     assert [row["repeat_index"] for row in payload["jobs"]] == [1, 2, 3]
+
+
+def test_fork_repeat_request_replays_without_new_forks(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    source = _entry()
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "_find_or_die", lambda _cfg, _ref: source)
+    monkeypatch.setattr(agent, "alive_pid", lambda _cfg: 123)
+    launches: list[str] = []
+
+    def fake_submit_fork(
+        _cfg,
+        _source,
+        spec,
+        _log,
+        no_queue=False,
+        force_queue=False,
+        force_queue_label="batch",
+    ):
+        child = intent_mod.load(cfg, spec.request_id)
+        if child is not None:
+            replay = jobs_mod.load(cfg, child.job_id)
+            assert replay is not None
+            setattr(replay, "_request_replayed", True)
+            return replay
+        launches.append(spec.request_id)
+        entry = _forked_entry(
+            spec,
+            index=len(launches),
+            status="running" if len(launches) == 1 else "queued",
+        )
+        entry.request_id = spec.request_id
+        jobs_mod.save(cfg, entry)
+        child = intent_mod.create(spec.request_id, "f" * 64, entry.job_id)
+        intent_mod.save(cfg, intent_mod.transition(child, "confirmed"))
+        return entry
+
+    monkeypatch.setattr(dispatch, "submit_fork", fake_submit_fork)
+    argv = [
+        "fork",
+        source.job_id,
+        "--repeat",
+        "2",
+        "--request-id",
+        "agent-fork-repeat-1",
+        "--json",
+    ]
+    runner = CliRunner()
+    first = runner.invoke(cli.app, argv)
+    second = runner.invoke(cli.app, argv)
+
+    assert first.exit_code == second.exit_code == 0
+    assert len(launches) == 2
+    replay = json.loads(second.stdout)
+    assert replay["request_id"] == "agent-fork-repeat-1"
+    assert replay["idempotent_replay"] is True
+    assert replay["submitted"] == replay["requested"] == 2
 
 
 def test_fork_repeat_explicit_cache_unwraps_dt_cold_source_for_every_item(
@@ -1523,3 +1600,189 @@ def test_clean_preserves_predecessor_for_active_chain_stage(tmp_path):
 
     assert dispatch.clean_jobs(cfg, 5.0, envs=False, log=lambda _: None).removed == 0
     assert (cfg.registry_dir() / "guard.json").is_file()
+
+
+def test_clean_rechecks_active_references_after_initial_selection(
+    tmp_path, monkeypatch
+):
+    from dt import maintenance
+
+    cfg = _cfg(tmp_path)
+    source = _entry(
+        job_id="source-race",
+        node="-",
+        created_at=1.0,
+        finished_at=1.0,
+        job_dir="dt/jobs/source-race",
+    )
+    consumer = _entry(
+        job_id="consumer-race",
+        node="-",
+        status="queued",
+        exit_code=None,
+        created_at=10.0,
+        job_dir="dt/jobs/consumer-race",
+        cache_source_job=source.job_id,
+        cache_source_job_dir=source.job_dir,
+        cache_source_path="outputs/.cache/torchinductor",
+        cache_env="TORCHINDUCTOR_CACHE_DIR",
+        cache_source_env_hash=source.env_hash,
+    )
+    jobs_mod.save(cfg, source)
+    real_selection = maintenance.clean_job_victims
+
+    def racing_selection(*args, **kwargs):
+        victims = real_selection(*args, **kwargs)
+        jobs_mod.save(cfg, consumer)
+        return victims
+
+    monkeypatch.setattr(maintenance, "clean_job_victims", racing_selection)
+
+    report = dispatch.clean_jobs(cfg, 5.0, envs=False, log=lambda _: None)
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["state_changed"]
+    assert jobs_mod.load(cfg, source.job_id) is not None
+
+
+def test_cleanup_winning_source_lock_makes_late_fork_fail_closed(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    source = _entry(
+        job_id="source-clean-first",
+        created_at=1.0,
+        finished_at=1.0,
+        job_dir="dt/jobs/source-clean-first",
+    )
+    jobs_mod.save(cfg, source)
+    remote_delete_started = Event()
+    permit_delete = Event()
+
+    def delete_runner(*args, **kwargs):
+        remote_delete_started.set()
+        assert permit_delete.wait(2)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(dispatch, "run_on", delete_runner)
+    spec = dispatch.fork_spec_from_entry(source)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        cleaning = pool.submit(
+            dispatch.clean_jobs,
+            cfg,
+            5.0,
+            False,
+            lambda _: None,
+        )
+        assert remote_delete_started.wait(2)
+        forking = pool.submit(
+            dispatch.submit_fork,
+            cfg,
+            source,
+            spec,
+            lambda _: None,
+        )
+        permit_delete.set()
+        report = cleaning.result(timeout=2)
+        with pytest.raises(dispatch.ConfigError, match="source job disappeared"):
+            forking.result(timeout=2)
+
+    assert report.removed == 1
+    assert jobs_mod.load(cfg, source.job_id) is None
+
+
+def test_cache_fork_winning_source_lock_prevents_concurrent_cleanup(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    source = _entry(
+        job_id="source-fork-first",
+        node="n1",
+        created_at=1.0,
+        finished_at=1.0,
+        job_dir="dt/jobs/source-fork-first",
+    )
+    jobs_mod.save(cfg, source)
+    spec = dispatch.fork_spec_from_entry(
+        source,
+        reuse_cache="outputs/.cache/torchinductor",
+    )
+    submit_started = Event()
+    permit_submit = Event()
+    consumer = _entry(
+        job_id="consumer-fork-first",
+        node="-",
+        status="queued",
+        exit_code=None,
+        created_at=10.0,
+        finished_at=None,
+        job_dir="dt/jobs/consumer-fork-first",
+        cache_source_job=source.job_id,
+        cache_source_job_dir=source.job_dir,
+        cache_source_path="outputs/.cache/torchinductor",
+        cache_env="TORCHINDUCTOR_CACHE_DIR",
+        cache_source_env_hash=source.env_hash,
+    )
+
+    def submit_prepared(*args, **kwargs):
+        submit_started.set()
+        assert permit_submit.wait(2)
+        jobs_mod.save(cfg, consumer)
+        return consumer
+
+    monkeypatch.setattr(dispatch, "_submit_prepared", submit_prepared)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        forking = pool.submit(
+            dispatch.submit_fork,
+            cfg,
+            source,
+            spec,
+            lambda _: None,
+        )
+        assert submit_started.wait(2)
+        cleaning = pool.submit(
+            dispatch.clean_jobs,
+            cfg,
+            5.0,
+            False,
+            lambda _: None,
+        )
+        permit_submit.set()
+        assert forking.result(timeout=2).job_id == consumer.job_id
+        report = cleaning.result(timeout=2)
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["state_changed"]
+    assert jobs_mod.load(cfg, source.job_id) is not None
+
+
+def test_cleanup_refuses_lost_job_whose_remote_process_is_alive(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    source = _entry(
+        job_id="lost-but-live",
+        status="lost",
+        exit_code=None,
+        pgid=os.getpid(),
+        created_at=1.0,
+        finished_at=1.0,
+        job_dir="dt/jobs/lost-but-live",
+    )
+    jobs_mod.save(cfg, source)
+
+    def local_runner(node, local, command, timeout=15, check=False):
+        del node, local, check
+        return subprocess.run(
+            ["bash", "-c", command],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    monkeypatch.setattr(dispatch, "run_on", local_runner)
+
+    report = dispatch.clean_jobs(cfg, 5.0, envs=False, log=lambda _: None)
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["state_changed"]
+    assert jobs_mod.load(cfg, source.job_id) is not None

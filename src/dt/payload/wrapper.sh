@@ -3,6 +3,7 @@
 # leader: $$ IS the process group id `dt kill` needs. Never setsid here --
 # that would move the training process out of this group and break kill.
 set -u
+umask 077
 
 # Existing tmux servers can retain environment from the client that created
 # them. The launcher supplies the one authoritative managed env below.
@@ -18,7 +19,7 @@ DT_COMMAND_PATH="${DT_COMMAND_PATH:-$DT_JOB_DIR/cmd.sh}"
 DT_BIN_DIR="${DT_BIN_DIR:-$DT_JOB_DIR/.dt-bin}"
 DT_CACHE_ROOT="${DT_CACHE_ROOT:-$HOME/dt}"
 DT_GPU_LEASE_ROOT="${DT_GPU_LEASE_ROOT:-$HOME/dt/gpu-leases}"
-mkdir -p "$DT_STATE_DIR" "$DT_OUTPUT_DIR" "$DT_GPU_LEASE_ROOT" \
+mkdir -p "$DT_STATE_DIR" "$DT_OUTPUT_DIR" "$DT_JOB_DIR/logs" "$DT_GPU_LEASE_ROOT" \
          "$DT_CONTROL_DIR/tmp" "$DT_CACHE_ROOT/tools/xdg" \
          "$DT_CACHE_ROOT/tools/uv" "$DT_CACHE_ROOT/tools/torch"
 export TMPDIR="${TMPDIR:-$DT_CONTROL_DIR/tmp}"
@@ -135,13 +136,41 @@ dt_reap_escapees() {
 dt_record_completion() {
     local dt_rc=$1
     [ -f "$DT_STATE_DIR/exit_code" ] && return
+    dt_record_result_state "$dt_rc"
     dt_timestamp > "$DT_STATE_DIR/finished_at"
     printf '%s\n' "$dt_rc" > "$DT_STATE_DIR/exit_code.tmp.$$"
     mv "$DT_STATE_DIR/exit_code.tmp.$$" "$DT_STATE_DIR/exit_code"
 }
+dt_result_override=""
+dt_record_result_state() {
+    local dt_rc=$1 dt_state="" dt_result="$DT_OUTPUT_DIR/dt/result.json"
+    [ -f "$DT_STATE_DIR/result_state" ] && return
+    if [ -s "$DT_OUTPUT_DIR/dt/resource-guard.json" ]; then
+        dt_state="guard_terminated"
+    elif [ -n "$dt_result_override" ]; then
+        dt_state="$dt_result_override"
+    elif [ "$dt_rc" -ne 0 ]; then
+        if [ -n "${DT_MAX_HOURS:-}" ] && [ "$dt_rc" -eq 124 ]; then
+            dt_state="guard_terminated"
+        else
+            dt_state="execution_failure"
+        fi
+    elif [ -f "$dt_result" ]; then
+        dt_state=$(python3 "$DT_PAYLOAD_DIR/result.py" \
+            --output "$dt_result" state 2>>"$DT_JOB_DIR/logs/env.log") || {
+            echo "[wrapper] invalid explicit result; classifying execution failure" >&2
+            dt_state="execution_failure"
+        }
+    else
+        dt_state="success"
+    fi
+    printf '%s\n' "$dt_state" >"$DT_STATE_DIR/result_state.tmp.$$"
+    mv "$DT_STATE_DIR/result_state.tmp.$$" "$DT_STATE_DIR/result_state"
+}
 dt_signal_exit() {
     local dt_signal=$1 dt_rc=$2
     trap - "$dt_signal"
+    dt_result_override="cancelled"
     if [ -s "${DT_JOB_DIR:-}/outputs/dt/resource-guard.json" ]; then
         echo "[wrapper] resource guard tripped; details:" >&2
         sed -n '1p' "$DT_JOB_DIR/outputs/dt/resource-guard.json" >&2 || true
@@ -159,6 +188,22 @@ trap 'dt_on_exit $?' EXIT
 trap 'dt_signal_exit HUP 129' HUP
 trap 'dt_signal_exit INT 130' INT
 trap 'dt_signal_exit TERM 143' TERM
+
+# Hold a shared lease on the exact uv environment for the complete task
+# lifetime. `dt clean --envs` takes the same lock exclusively before removal,
+# while the launcher takes it exclusively during sync/setup. This closes the
+# cleanup race without serializing jobs that merely read the same environment.
+dt_env_lease_fd=""
+if [ -n "${DT_UV_ENV:-}" ]; then
+    exec {dt_env_lease_fd}<>"$DT_UV_ENV.lock" || {
+        echo "[wrapper] cannot open environment lifetime lock" >&2
+        exit 76
+    }
+    if ! flock -s "$dt_env_lease_fd"; then
+        echo "[wrapper] cannot acquire environment lifetime lock" >&2
+        exit 76
+    fi
+fi
 
 # Claim the selected cards before publishing pgid. The launcher keeps its
 # node-wide selection lock until this point, so lease acquisition closes the
@@ -180,7 +225,28 @@ if [ -n "${DT_GPU_IDS:-}" ]; then
     done
 fi
 
-echo $$ > "$DT_STATE_DIR/pgid"
+# A PID alone is not a durable process identity: Linux may reuse it later in
+# the same boot. Publish the wrapper's procfs start time atomically before the
+# pgid marker, so every new launcher receipt can be checked fail-closed.
+dt_process_start_ticks=$(awk '{ line=$0; sub(/^.*\) /, "", line); split(line, f, " "); print f[20] }' "/proc/$$/stat" 2>/dev/null) || dt_process_start_ticks=""
+case "$dt_process_start_ticks" in
+    *[!0-9]*|"")
+        echo "[wrapper] cannot establish process identity" >&2
+        exit 76
+        ;;
+esac
+dt_process_identity_tmp="$DT_STATE_DIR/process_start_ticks.tmp.$$"
+if ! printf '%s\n' "$dt_process_start_ticks" >"$dt_process_identity_tmp"; then
+    echo "[wrapper] cannot write process identity" >&2
+    rm -f "$dt_process_identity_tmp"
+    exit 76
+fi
+if ! mv -f -- "$dt_process_identity_tmp" "$DT_STATE_DIR/process_start_ticks"; then
+    echo "[wrapper] cannot publish process identity" >&2
+    rm -f "$dt_process_identity_tmp"
+    exit 76
+fi
+printf '%s\n' "$$" > "$DT_STATE_DIR/pgid"
 dt_timestamp > "$DT_STATE_DIR/started_at"
 
 cd "$DT_JOB_DIR/code"
@@ -346,7 +412,15 @@ runner=(bash "$DT_COMMAND_PATH")
 if [ -n "${DT_UV_ENV:-}" ]; then
     export UV_PROJECT_ENVIRONMENT="$DT_UV_ENV"
     export UV_PYTHON_PREFERENCE=only-managed
-    runner=("$DT_UV" run --no-sync bash "$DT_COMMAND_PATH")
+    if [ "${DT_ENV_MODE:-sync}" = reuse ]; then
+        # Exact recovery must remain usable when uv or the package index is
+        # unavailable. The launcher already proved this environment's Python
+        # exists; activate it directly without project discovery or sync.
+        export VIRTUAL_ENV="$DT_UV_ENV"
+        export PATH="$DT_UV_ENV/bin:$PATH"
+    else
+        runner=("$DT_UV" run --no-sync bash "$DT_COMMAND_PATH")
+    fi
 fi
 if command -v stdbuf >/dev/null 2>&1; then
     runner=(stdbuf -oL -eL "${runner[@]}")

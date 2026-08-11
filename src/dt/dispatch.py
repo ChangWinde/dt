@@ -11,30 +11,33 @@ the agent (agent.py) re-plays dispatch_queued() until a node frees up.
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import math
 import os
 import posixpath
 import re
+import selectors
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
 import time
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
+from dataclasses import asdict, dataclass, field
 from pathlib import Path, PurePosixPath
 from threading import Event
 from typing import Callable, Mapping, cast
 
 from .config import ConfigError, HeadConfig, Node, Project
+from .artifact_distribution import DistributionError, TransferExecutor
 from .lifecycle import termination_probe, termination_verdict
 from .layout import (
+    LEGACY_LAYOUT,
     ROLE_LAYOUT,
     display_node_path,
     job_cancel_path,
@@ -56,7 +59,9 @@ from .maintenance import (
 from .jobs import (
     CANCEL_UNVERIFIED_PREFIX,
     UNCERTAIN_LAUNCH_PREFIX,
+    RESULT_STATES,
     JobEntry,
+    effective_result_state,
     job_lock,
     load,
     new_job_id,
@@ -74,6 +79,13 @@ from .payload_hash import (
     payload_sha256 as _payload_sha256,
 )
 from .probe import NodeStatus, probe_center, probe_node
+from .private_state import (
+    PrivateStateError,
+    atomic_write,
+    ensure_private_directory,
+    private_lock,
+    read_bounded,
+)
 from .snapshot_hash import tree_sha256
 from .snapshot_store import (
     code_path as _snapshot_path,
@@ -81,7 +93,9 @@ from .snapshot_store import (
     lock as _snapshot_store_lock,
     save_state as _save_snapshot_store_state,
 )
+from . import submission_intent as intent_mod
 from .sshio import (
+    BULK_TRANSFER_TIMEOUT_S,
     RSYNC_UNREACHABLE_EXIT_CODES,
     RemoteError,
     RsyncRetryEvent,
@@ -91,6 +105,10 @@ from .sshio import (
 
 PAYLOAD_DIR = Path(__file__).parent / "payload"
 GPU_PULSE_MEMORY_MIB = 512
+SNAPSHOT_METADATA_MAX_BYTES = 64 * 1024
+LINKDEST_STATE_MAX_BYTES = 4 * 1024 * 1024
+MAX_GIT_DIFF_BYTES = 4 * 1024 * 1024
+GIT_QUERY_TIMEOUT_S = 20.0
 # Root-anchored (leading /): project artifact dirs that may legitimately
 # collide with package subpaths deeper in the tree (omnistack/data is a
 # Python module; an unanchored "data/" would silently drop it from the
@@ -172,6 +190,45 @@ def _launch_phases_s(result: dict[str, object]) -> dict[str, float]:
     return phases
 
 
+def _verified_tree_transfer(
+    transfer: Callable[[bool], subprocess.CompletedProcess[str]],
+    verify: Callable[[], str],
+    *,
+    expected_sha256: str | None,
+    label: str,
+    log: Callable[[str], None],
+) -> tuple[subprocess.CompletedProcess[str], str | None]:
+    """Transfer once cheaply, using checksum only for unknown or corrupt trees."""
+    proc = transfer(expected_sha256 is None)
+    if proc.returncode != 0:
+        return proc, None
+    observed = verify()
+    if expected_sha256 is None or observed == expected_sha256:
+        return proc, observed
+
+    log(f"{label} integrity mismatch; retrying once with checksum repair")
+    repaired = transfer(True)
+    if repaired.returncode != 0:
+        return repaired, None
+    repaired_observed = verify()
+    if repaired_observed != expected_sha256:
+        raise DispatchError(
+            f"{label} remained corrupt after checksum repair: "
+            f"expected {expected_sha256}, observed {repaired_observed}"
+        )
+    stdout = "\n".join(
+        part.rstrip("\n") for part in (proc.stdout, repaired.stdout) if part
+    )
+    repaired = subprocess.CompletedProcess(
+        repaired.args,
+        repaired.returncode,
+        f"{stdout}\n" if stdout else "",
+        repaired.stderr,
+    )
+    log(f"{label} checksum repair verified")
+    return repaired, repaired_observed
+
+
 def _excludes(cfg: HeadConfig) -> list[str]:
     return SNAPSHOT_EXCLUDES + cfg.snapshot_excludes
 
@@ -232,7 +289,7 @@ def _retry_logger(
         log(
             f"{subject} · {phase} attempt "
             f"{event.failed_attempt}/{event.max_attempts} failed "
-            f"(exit {event.returncode}); retry "
+            f"({event.kind}, exit {event.returncode}); retry "
             f"{event.next_attempt}/{event.max_attempts} in "
             f"{event.delay_s}s {detail}"
         )
@@ -263,10 +320,32 @@ def artifact_root_rel(
 
 
 def _file_sha256(path: Path) -> str:
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise OSError(f"not a regular file: {path}")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        while chunk := stream.read(8 * 1024 * 1024):
-            digest.update(chunk)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_dev != metadata.st_dev
+            or opened.st_ino != metadata.st_ino
+            or opened.st_size != metadata.st_size
+        ):
+            raise OSError(f"file changed while hashing: {path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while chunk := stream.read(8 * 1024 * 1024):
+                digest.update(chunk)
+        finished = os.fstat(descriptor)
+        if (
+            finished.st_size != opened.st_size
+            or finished.st_mtime_ns != opened.st_mtime_ns
+            or finished.st_ctime_ns != opened.st_ctime_ns
+        ):
+            raise OSError(f"file changed while hashing: {path}")
+    finally:
+        os.close(descriptor)
     return digest.hexdigest()
 
 
@@ -469,17 +548,31 @@ def _artifact_remote_check(
     )
 
 
+def _private_remote_directories(*paths: str) -> str:
+    """Create DT-owned node directories without accepting a leaf symlink."""
+    if not paths:
+        raise ValueError("at least one remote directory is required")
+    commands = ["set -eu", "umask 077"]
+    for path in paths:
+        rendered = node_path_expression(path)
+        commands.append(
+            f"if test -e {rendered} || test -L {rendered}; then "
+            f"test -d {rendered} && test ! -L {rendered}; "
+            f"else mkdir -p {rendered}; fi"
+        )
+        commands.append(f"chmod 700 {rendered}")
+    return "; ".join(commands)
+
+
 @contextmanager
 def _seed_cache_lock(cfg: HeadConfig, node: Node) -> Iterator[None]:
     """Serialize writers to one node's shared uv/HF cache trees."""
     identity = hashlib.sha256(node.name.encode()).hexdigest()[:20]
     path = cfg.state_dir() / f"seed-cache-{identity}.lock"
-    with path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    with private_lock(path) as acquired:
+        if not acquired:
+            raise DispatchError("seed cache lock was not acquired")
+        yield
 
 
 @contextmanager
@@ -498,19 +591,12 @@ def _sync_cache_lock(
     """
     identity = hashlib.sha256(f"{project_name}\0{node.name}".encode()).hexdigest()[:20]
     path = cfg.state_dir() / f"sync-cache-{identity}.lock"
-    with path.open("a+") as lock:
-        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
-        if not blocking:
-            operation |= fcntl.LOCK_NB
-        try:
-            fcntl.flock(lock, operation)
-        except BlockingIOError:
-            yield False
-            return
-        try:
-            yield True
-        finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+    with private_lock(
+        path,
+        exclusive=exclusive,
+        blocking=blocking,
+    ) as acquired:
+        yield acquired
 
 
 def sync_project(
@@ -605,7 +691,7 @@ def _sync_project_locked(
         prepared = run_on(
             node.name,
             node.local,
-            f"mkdir -p {node_path_expression(rel)}",
+            _private_remote_directories(rel),
             timeout=15,
         )
         if prepared.returncode != 0:
@@ -628,7 +714,7 @@ def _sync_project_locked(
         excludes=_excludes(cfg),
         delete=True,
         delete_excluded=True,
-        timeout=600,
+        timeout=BULK_TRANSFER_TIMEOUT_S,
         retries=retries,
         on_retry=on_retry,
         stats=True,
@@ -780,7 +866,7 @@ def sync_artifacts(
                 source_arg,
                 destination,
                 delete=is_dir,
-                timeout=600,
+                timeout=BULK_TRANSFER_TIMEOUT_S,
                 retries=retries,
                 on_retry=on_retry,
                 stats=True,
@@ -967,10 +1053,64 @@ class NoReachableNode(NoCapacity):
     """Every attempted candidate failed at the remote transport boundary."""
 
 
+class RequestConflict(DispatchError):
+    """One request id was reused for a different normalized intent."""
+
+
+class RequestOutcomeUnknown(DispatchError):
+    """A prior request may have crossed the launch boundary."""
+
+    def __init__(self, request_id: str, job_id: str, detail: str):
+        self.request_id = request_id
+        self.job_id = job_id
+        super().__init__(detail)
+
+
+class RequestRejected(DispatchError):
+    """A request reached a known rejection before any remote launch."""
+
+
+def reconcile_submission_request(
+    cfg: HeadConfig,
+    record: intent_mod.RequestRecord,
+) -> tuple[intent_mod.RequestRecord, JobEntry | None]:
+    """Repair an interrupted preparing receipt from its authoritative job row."""
+    existing = load(cfg, record.job_id)
+    if record.state != "preparing" or existing is None:
+        return record, existing
+    if (existing.reason or "").startswith(UNCERTAIN_LAUNCH_PREFIX):
+        updated = intent_mod.transition(
+            record,
+            "uncertain",
+            error_kind="launch_outcome_unknown",
+            error_message=existing.reason,
+        )
+    elif existing.status == "failed":
+        updated = intent_mod.transition(
+            record,
+            "confirmed",
+            error_kind="failed_before_start",
+            error_message=existing.reason,
+        )
+    else:
+        updated = intent_mod.transition(record, "confirmed")
+    intent_mod.save(cfg, updated)
+    return updated, existing
+
+
 # Launcher-reported reasons that are about *this job* rather than about GPU
 # capacity. A queued job stuck on these must not block the jobs behind it
 # (strict FIFO only protects capacity waits from starvation).
 _JOB_SPECIFIC = ("path-missing", "disk-full", "node-unfit", "cache-missing")
+_TERMINAL_JOB_STATUSES = frozenset({"finished", "killed", "lost", "failed", "skipped"})
+
+
+def _job_succeeded(entry: JobEntry) -> bool:
+    return (
+        entry.status == "finished"
+        and entry.exit_code == 0
+        and effective_result_state(entry) == "success"
+    )
 
 
 def blocked_not_busy(tried_reasons: dict[str, str]) -> bool:
@@ -1006,6 +1146,7 @@ class RunSpec:
     name: str
     gpus: int
     cmd: list[str]
+    gpu_isolation: str = "advisory"
     project: str | None = None
     node: str | None = None
     require_path: str | None = None
@@ -1016,8 +1157,15 @@ class RunSpec:
     setup: str | None = None  # project post-sync hook, runs inside the job env
     setup_inputs: list[str] | None = None  # snapshot paths that affect setup
     extras: list[str] | None = None  # uv sync --extra groups
+    env_mode: str = "sync"  # sync or reuse an explicitly inherited environment
+    env_hash_override: str | None = None
+    env_source_job: str | None = None
     forked_from: str | None = None  # exact-snapshot lineage
     after_success: str | None = None  # queued dependency; predecessor must exit 0
+    after_complete: str | None = None  # queued dependency; any terminal result
+    after_result: str | None = None  # queued typed-result predicate
+    after_result_states: list[str] = field(default_factory=list)
+    request_id: str | None = None  # optional retry-safe caller intent
     rerun_of: str | None = None  # current-code retry lineage
     rerun_source_snapshot_sha256: str | None = None
     artifact_manifest: str | None = None  # shared-input manifest SHA-256
@@ -1038,6 +1186,11 @@ def _validate_run_spec(spec: RunSpec) -> None:
         raise ConfigError("command must not be empty")
     if spec.gpus < 0:
         raise ConfigError("gpus must be non-negative")
+    if spec.gpu_isolation != "advisory":
+        raise ConfigError(
+            "gpu_isolation must be advisory; this DT build has no physical "
+            "GPU device-isolation backend"
+        )
     if spec.require_disk_gib is not None and (
         isinstance(spec.require_disk_gib, bool)
         or not isinstance(spec.require_disk_gib, int)
@@ -1091,6 +1244,49 @@ def _validate_run_spec(spec: RunSpec) -> None:
         or re.fullmatch(r"[A-Za-z0-9_-]+", spec.after_success) is None
     ):
         raise ConfigError("after_success must be a safe job identity")
+    if spec.after_complete is not None and (
+        not isinstance(spec.after_complete, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", spec.after_complete) is None
+    ):
+        raise ConfigError("after_complete must be a safe job identity")
+    if spec.after_result is not None and (
+        not isinstance(spec.after_result, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", spec.after_result) is None
+    ):
+        raise ConfigError("after_result must be a safe job identity")
+    selected_dependencies = sum(
+        value is not None
+        for value in (spec.after_success, spec.after_complete, spec.after_result)
+    )
+    if selected_dependencies > 1:
+        raise ConfigError("dependency policies are mutually exclusive")
+    if spec.after_result is not None:
+        if not spec.after_result_states:
+            raise ConfigError("after_result requires at least one result state")
+        unknown_states = sorted(set(spec.after_result_states) - RESULT_STATES)
+        if unknown_states:
+            raise ConfigError(
+                "unknown dependency result state(s): " + ", ".join(unknown_states)
+            )
+        spec.after_result_states = sorted(set(spec.after_result_states))
+    elif spec.after_result_states:
+        raise ConfigError("result states require after_result")
+    if spec.request_id is not None:
+        try:
+            intent_mod.validate_request_id(spec.request_id)
+        except intent_mod.InvalidRequestId as exc:
+            raise ConfigError(str(exc)) from exc
+    if spec.env_mode not in {"sync", "reuse"}:
+        raise ConfigError("environment mode must be sync or reuse")
+    if spec.env_mode == "reuse":
+        if re.fullmatch(r"[0-9a-f]{12}", spec.env_hash_override or "") is None:
+            raise ConfigError("environment reuse requires a valid 12-hex identity")
+        if re.fullmatch(r"[A-Za-z0-9_-]+", spec.env_source_job or "") is None:
+            raise ConfigError("environment reuse requires a safe source job identity")
+        if spec.node is None:
+            raise ConfigError("environment reuse requires an explicit source node")
+    elif spec.env_hash_override is not None or spec.env_source_job is not None:
+        raise ConfigError("environment override requires reuse mode")
     if spec.rerun_source_snapshot_sha256 is not None:
         if spec.rerun_of is None:
             raise ConfigError("rerun source snapshot requires rerun_of lineage")
@@ -1212,6 +1408,9 @@ def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
         extras=list(entry.extras) if entry.extras else None,
         forked_from=entry.forked_from,
         after_success=entry.after_success,
+        after_complete=entry.after_complete,
+        after_result=entry.after_result,
+        after_result_states=list(entry.after_result_states),
         rerun_of=entry.job_id,
         rerun_source_snapshot_sha256=entry.snapshot_sha256,
         artifact_manifest=entry.artifact_manifest,
@@ -1301,6 +1500,36 @@ def fork_spec_from_entry(
     )
 
 
+def environment_reuse_spec_from_entry(
+    entry: JobEntry,
+    *,
+    cmd: list[str],
+    name: str | None = None,
+    gpus: int = 0,
+    request_id: str | None = None,
+) -> RunSpec:
+    """Build a diagnostic job using an existing exact snapshot and venv.
+
+    The launcher validates that the recorded venv still exists and never runs
+    ``uv sync`` or the project setup hook.  Reuse is pinned to the source
+    node because environment identities name node-local directories.
+    """
+    if entry.node == "-" or entry.status == "queued":
+        raise ConfigError("environment source job has not started on a node")
+    if re.fullmatch(r"[0-9a-f]{12}", entry.env_hash or "") is None:
+        raise ConfigError("environment source job has no reproducible environment")
+    if not entry.snapshot_sha256:
+        raise ConfigError("environment source job has no exact snapshot identity")
+    spec = fork_spec_from_entry(entry, name=name or f"{entry.name}-exec", cmd=cmd)
+    spec.gpus = gpus
+    spec.max_vram_mib = None if gpus == 0 else spec.max_vram_mib
+    spec.env_mode = "reuse"
+    spec.env_hash_override = entry.env_hash
+    spec.env_source_job = entry.job_id
+    spec.request_id = request_id
+    return spec
+
+
 def inherited_cache_fork_spec_from_entry(
     entry: JobEntry,
     cache_source: JobEntry,
@@ -1377,24 +1606,135 @@ def resolve_project(
     )
 
 
+def _stop_git_process(process: subprocess.Popen[bytes]) -> bool:
+    """Reap git and any configured filter process without leaking children."""
+    interrupted = False
+    if process.poll() is not None:
+        return interrupted
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        while True:
+            try:
+                process.wait()
+                return interrupted
+            except KeyboardInterrupt:
+                interrupted = True
+    try:
+        process.wait(timeout=0.5)
+        return interrupted
+    except KeyboardInterrupt:
+        interrupted = True
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    while True:
+        try:
+            process.wait()
+            return interrupted
+        except KeyboardInterrupt:
+            interrupted = True
+            continue
+
+
+def _git_capture_bounded(
+    project_dir: Path,
+    args: tuple[str, ...],
+    *,
+    max_bytes: int,
+    timeout: float = GIT_QUERY_TIMEOUT_S,
+) -> tuple[int, str, bool]:
+    """Capture at most ``max_bytes`` from one read-only git query."""
+    process = subprocess.Popen(
+        ["git", "-C", str(project_dir), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    payload = bytearray()
+    deadline = time.monotonic() + timeout
+    exceeded = False
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            block = os.read(
+                process.stdout.fileno(),
+                min(64 * 1024, max_bytes + 1 - len(payload)),
+            )
+            if not block:
+                selector.unregister(process.stdout)
+                break
+            payload.extend(block)
+            if len(payload) > max_bytes:
+                exceeded = True
+                del payload[max_bytes:]
+                if _stop_git_process(process):
+                    raise KeyboardInterrupt
+                break
+        if not exceeded:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            process.wait(timeout=remaining)
+    except BaseException as exc:
+        interrupted = _stop_git_process(process)
+        if interrupted and not isinstance(exc, KeyboardInterrupt):
+            raise KeyboardInterrupt from exc
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+    return process.returncode or 0, payload.decode("utf-8", errors="replace"), exceeded
+
+
 def git_info(project_dir: Path) -> tuple[str | None, bool, str | None]:
-    """(sha, dirty, diff) - all None/False when not a git repo."""
-
-    def _git(*args: str) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(project_dir), *args],
-            capture_output=True,
-            text=True,
-            timeout=20,
+    """Return bounded Git provenance; the snapshot remains authoritative."""
+    try:
+        sha_rc, sha_text, sha_exceeded = _git_capture_bounded(
+            project_dir,
+            ("rev-parse", "HEAD"),
+            max_bytes=256,
         )
-
-    sha_p = _git("rev-parse", "HEAD")
-    if sha_p.returncode != 0:
+    except (OSError, subprocess.TimeoutExpired):
         return None, False, None
-    sha = sha_p.stdout.strip()
-    dirty = bool(_git("status", "--porcelain").stdout.strip())
-    diff = _git("diff", "HEAD").stdout if dirty else None
-    return sha, dirty, diff
+    sha = sha_text.strip()
+    if sha_rc != 0 or sha_exceeded or re.fullmatch(r"[0-9a-fA-F]{7,64}", sha) is None:
+        return None, False, None
+    try:
+        status_rc, status_text, status_exceeded = _git_capture_bounded(
+            project_dir,
+            ("status", "--porcelain", "--untracked-files=normal"),
+            max_bytes=0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # Once HEAD is known, inability to prove cleanliness must not be
+        # reported as a clean tree.
+        return sha, True, None
+    if status_rc != 0 and not status_exceeded:
+        return sha, True, None
+    dirty = status_exceeded or bool(status_text)
+    if not dirty:
+        return sha, False, None
+    try:
+        diff_rc, diff, diff_exceeded = _git_capture_bounded(
+            project_dir,
+            ("diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"),
+            max_bytes=MAX_GIT_DIFF_BYTES,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return sha, True, None
+    return sha, True, diff if diff_rc == 0 and not diff_exceeded else None
 
 
 def pin_is_busy(statuses: list[NodeStatus], spec: RunSpec) -> bool:
@@ -1533,8 +1873,11 @@ def _validate_stored_snapshot(cfg: HeadConfig, digest: str) -> StoredSnapshot:
     ):
         raise DispatchError(f"exact snapshot {digest} is not archived on this head")
     try:
-        identity = json.loads(meta.read_text("utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        meta_result = read_bounded(meta, max_bytes=SNAPSHOT_METADATA_MAX_BYTES)
+        if meta_result is None:
+            raise PrivateStateError("snapshot metadata disappeared")
+        identity = json.loads(meta_result[0])
+    except (PrivateStateError, UnicodeError, json.JSONDecodeError) as exc:
         raise DispatchError(
             f"exact snapshot {digest} metadata cannot be read: {exc}"
         ) from exc
@@ -1573,8 +1916,14 @@ def _repair_queued_snapshot(
         if source_ref.is_symlink() or not source_ref.is_file():
             raise DispatchError("queued source reference is unsafe or missing")
         try:
-            reference = json.loads(source_ref.read_text("utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            source_result = read_bounded(
+                source_ref,
+                max_bytes=SNAPSHOT_METADATA_MAX_BYTES,
+            )
+            if source_result is None:
+                raise PrivateStateError("queued source reference disappeared")
+            reference = json.loads(source_result[0])
+        except (PrivateStateError, UnicodeError, json.JSONDecodeError) as exc:
             raise DispatchError(
                 f"queued source reference cannot be read: {exc}"
             ) from exc
@@ -1604,7 +1953,7 @@ def _repair_queued_snapshot(
         f"{stored.code_dir}/",
         f"{staged_code}/",
         delete=True,
-        timeout=600,
+        timeout=BULK_TRANSFER_TIMEOUT_S,
         retries=2,
         on_retry=_retry_logger(log, "head", "queued snapshot recovery"),
         checksum=True,
@@ -1693,7 +2042,7 @@ def capture_snapshot(
                 f"{code}/",
                 excludes=_excludes(cfg),
                 link_dest=str(baseline) if baseline else None,
-                timeout=600,
+                timeout=BULK_TRANSFER_TIMEOUT_S,
                 retries=2,
                 on_retry=_retry_logger(log, "head", "snapshot capture"),
                 stats=True,
@@ -1762,7 +2111,7 @@ def resolve_snapshot(
             _code_src(node, entry.job_dir),
             f"{temp_code}/",
             excludes=_excludes(cfg),
-            timeout=600,
+            timeout=BULK_TRANSFER_TIMEOUT_S,
             retries=2,
             on_retry=_retry_logger(log, entry.node, "snapshot backfill"),
             stats=True,
@@ -1799,25 +2148,24 @@ def _linkdest_state(cfg: HeadConfig) -> Path:
 def _linkdest_lock(cfg: HeadConfig) -> Iterator[None]:
     """Concurrent submits share this state file; lock the read-modify-write."""
     lock = cfg.state_dir() / "linkdest.lock"
-    fd = None
-    try:
-        fd = open(lock, "w")
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    with private_lock(lock) as acquired:
+        if not acquired:
+            raise DispatchError("link-dest state lock was not acquired")
         yield
-    finally:
-        if fd is not None:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            fd.close()
 
 
 def _load_linkdest(cfg: HeadConfig) -> dict[str, str]:
     state: dict[str, str] = {}
     paths = [cfg.root / "state" / "linkdest.json", _linkdest_state(cfg)]
     for path in dict.fromkeys(paths):
-        if not path.exists():
+        try:
+            result = read_bounded(path, max_bytes=LINKDEST_STATE_MAX_BYTES)
+        except PrivateStateError:
+            continue
+        if result is None:
             continue
         try:
-            raw: object = json.loads(path.read_text())
+            raw: object = json.loads(result[0])
             if isinstance(raw, dict):
                 state.update(
                     {
@@ -1826,16 +2174,20 @@ def _load_linkdest(cfg: HeadConfig) -> dict[str, str]:
                         if isinstance(value, str)
                     }
                 )
-        except (OSError, UnicodeError, json.JSONDecodeError):
+        except (UnicodeError, json.JSONDecodeError):
             continue
     return state
 
 
 def _save_linkdest(cfg: HeadConfig, state: dict[str, str]) -> None:
     path = _linkdest_state(cfg)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=1))
-    tmp.replace(path)
+    encoded = (json.dumps(state, indent=1) + "\n").encode("utf-8")
+    if len(encoded) > LINKDEST_STATE_MAX_BYTES:
+        raise DispatchError("link-dest state exceeds its size limit")
+    try:
+        atomic_write(path, encoded)
+    except PrivateStateError as exc:
+        raise DispatchError("link-dest state cannot be published safely") from exc
 
 
 def _prev_job_id(cfg: HeadConfig, project_name: str, node: Node) -> str | None:
@@ -1843,7 +2195,8 @@ def _prev_job_id(cfg: HeadConfig, project_name: str, node: Node) -> str | None:
     if not val:
         return None
     # legacy format stored "dt/jobs/<id>/code"; new format stores the bare id
-    return Path(val).parent.name if "/" in val else val
+    job_id = Path(val).parent.name if "/" in val else val
+    return job_id if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", job_id) else None
 
 
 def _snapshot_baselines(
@@ -2020,8 +2373,9 @@ def _stored_payload_dir(
         return root
 
     lock_path = cfg.state_dir() / "payload-store.lock"
-    with lock_path.open("w", encoding="utf-8") as descriptor:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    with private_lock(lock_path) as acquired:
+        if not acquired:
+            raise DispatchError("runtime payload store lock was not acquired")
         if root.exists():
             return validate()
         if runtime_files is None:
@@ -2076,8 +2430,7 @@ def _support_files(
 def _write_support_files(base: Path, files: Mapping[str, str]) -> None:
     for name, content in files.items():
         path = base / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        atomic_write(path, content.encode("utf-8"))
 
 
 def environment_key(
@@ -2100,7 +2453,7 @@ def environment_key(
     lock = code_dir / "uv.lock"
     if not lock.is_file():
         return None
-    lock_sha256 = hashlib.sha256(lock.read_bytes()).hexdigest()
+    lock_sha256 = _file_sha256(lock)
     normalized_extras = sorted(set(extras or []))
     if not normalized_extras and not setup:
         return lock_sha256[:12]
@@ -2163,11 +2516,7 @@ def _setup_input_identities(
             digest = tree_sha256(candidate)
         elif stat.S_ISREG(metadata.st_mode):
             kind = "file"
-            hasher = hashlib.sha256()
-            with candidate.open("rb") as stream:
-                while chunk := stream.read(1024 * 1024):
-                    hasher.update(chunk)
-            digest = hasher.hexdigest()
+            digest = _file_sha256(candidate)
         elif stat.S_ISLNK(metadata.st_mode):
             kind = "symlink"
             digest = hashlib.sha256(os.fsencode(os.readlink(candidate))).hexdigest()
@@ -2233,7 +2582,7 @@ def snapshot(
     run_on(
         node.name,
         node.local,
-        f"mkdir -p {node_path_expression(f'{job_dir}/logs')}",
+        _private_remote_directories(job_dir, f"{job_dir}/logs"),
         timeout=15,
         check=True,
     )
@@ -2257,27 +2606,76 @@ def snapshot(
                 f"sync cache busy on {node.name}; "
                 "snapshot continuing without cache baseline"
             )
-        proc = rsync(
-            f"{project_dir}/",
-            _code_dst(node, job_dir),
-            excludes=None if pre_filtered else _excludes(cfg),
-            # relative to the dest dir (dt/jobs/<id>/code), so it resolves on
-            # the node regardless of where its home is
-            link_dest=link_dest,
-            copy_dest=stable_copy_dest,
-            timeout=600,
-            retries=2,  # NAT link: stall timeout + partial resume
-            on_retry=_retry_logger(log, node.name, "snapshot code"),
-            stats=True,
-            checksum=True,
+        site = cfg.sites.get(node.site or "")
+        topology_delivery = (
+            expected_sha256 is not None
+            and pre_filtered
+            and site is not None
+            and site.artifact_policy in {"site-cache-first", "topology-aware"}
         )
-    if proc.returncode != 0:
-        raise DispatchError(
-            f"code snapshot to {node.name} failed: {proc.stderr.strip()}"
-        )
-    _warn_snapshot_size(cfg, proc.stdout, log)
+        snapshot_sha256: str
+        if topology_delivery:
+            if expected_sha256 is None or site is None:
+                raise DispatchError("invalid topology snapshot transfer state")
+            if link_dest is not None:
+                raise DispatchError(
+                    "site-cache transfer cannot use a hard-link baseline"
+                )
+            try:
+                distributed = TransferExecutor(cfg).ensure(
+                    project_dir,
+                    expected_sha256,
+                    node,
+                    f"{job_dir}/code",
+                    copy_dest=stable_copy_dest,
+                    on_retry=_retry_logger(log, site.cache_node, "site cache upload"),
+                    log=log,
+                )
+            except (DistributionError, ConfigError, OSError) as exc:
+                raise DispatchError(str(exc)) from exc
+            transferred = distributed.cross_site_bytes + distributed.site_bytes
+            if transferred > cfg.snapshot_warn_gib * 2**30:
+                log(
+                    f"warning: snapshot transferred {transferred / 2**30:.1f} GiB "
+                    f"(> {cfg.snapshot_warn_gib:g} GiB) across its planned route"
+                )
+            snapshot_sha256 = expected_sha256
+        else:
 
-    snapshot_sha256 = _remote_tree_sha256(node, f"{job_dir}/code")
+            def transfer_code(checksum: bool) -> subprocess.CompletedProcess[str]:
+                return rsync(
+                    f"{project_dir}/",
+                    _code_dst(node, job_dir),
+                    excludes=None if pre_filtered else _excludes(cfg),
+                    # Relative to the destination code dir, so this resolves on
+                    # the node regardless of where its home is.
+                    link_dest=link_dest,
+                    copy_dest=stable_copy_dest,
+                    timeout=BULK_TRANSFER_TIMEOUT_S,
+                    retries=2,  # NAT link: stall timeout + partial resume
+                    on_retry=_retry_logger(log, node.name, "snapshot code"),
+                    stats=True,
+                    checksum=checksum,
+                )
+
+            proc, observed = _verified_tree_transfer(
+                transfer_code,
+                lambda: _remote_tree_sha256(node, f"{job_dir}/code"),
+                expected_sha256=expected_sha256,
+                label=f"snapshot to {node.name}",
+                log=log,
+            )
+            if proc.returncode != 0:
+                raise DispatchError(
+                    f"code snapshot to {node.name} failed: {proc.stderr.strip()}"
+                )
+            _warn_snapshot_size(cfg, proc.stdout, log)
+            if observed is None:
+                raise DispatchError(
+                    f"code snapshot to {node.name} returned no content identity"
+                )
+            snapshot_sha256 = observed
+
     if expected_sha256 and snapshot_sha256 != expected_sha256:
         raise DispatchError(
             f"code snapshot changed in transit to {node.name}: "
@@ -2288,7 +2686,7 @@ def snapshot(
         spec,
         snapshot_sha256,
     )
-    env_key = environment_key(
+    env_key = spec.env_hash_override or environment_key(
         project_dir,
         spec.extras,
         spec.setup,
@@ -2315,6 +2713,7 @@ def snapshot(
             timeout=60,
             retries=2,
             on_retry=_retry_logger(log, node.name, "snapshot support"),
+            private_destination=True,
         )
         if proc.returncode != 0:
             raise DispatchError(
@@ -2360,8 +2759,8 @@ def _stage(
     self-contained staged worktree for compatibility.
     """
     staging = stage_dir(cfg, job_id)
-    staging.mkdir(parents=True, exist_ok=True)
-    (staging / "logs").mkdir(exist_ok=True)
+    ensure_private_directory(staging)
+    ensure_private_directory(staging / "logs")
 
     if cfg.layout == ROLE_LAYOUT:
         if stored is None:
@@ -2369,16 +2768,16 @@ def _stage(
         source = _validate_stored_snapshot(cfg, stored.sha256).code_dir
         snapshot_sha256 = stored.sha256
     elif stored is None:
-        (staging / "code").mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(staging / "code")
         cache = cfg.cache_dir() / "stage" / (spec.project or "_default")
-        cache.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(cache)
         proc = rsync(
             f"{project_dir}/",
             f"{cache}/",
             excludes=_excludes(cfg),
             delete=True,
             delete_excluded=True,
-            timeout=600,
+            timeout=BULK_TRANSFER_TIMEOUT_S,
             stats=True,
             checksum=True,
         )
@@ -2388,7 +2787,7 @@ def _stage(
         _warn_snapshot_size(cfg, proc.stdout, log)
         source = cache
     else:
-        (staging / "code").mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(staging / "code")
         source = stored.code_dir
 
     if cfg.layout != ROLE_LAYOUT:
@@ -2398,7 +2797,7 @@ def _stage(
             f"{source}/",
             f"{staging}/code/",
             copy_dest=str(source),
-            timeout=600,
+            timeout=BULK_TRANSFER_TIMEOUT_S,
             checksum=True,
         )
         if proc.returncode != 0:
@@ -2416,7 +2815,7 @@ def _stage(
             f"staging snapshot changed during copy: expected {stored.sha256}, "
             f"observed {meta['snapshot_sha256']}"
         )
-    env_key = environment_key(
+    env_key = spec.env_hash_override or environment_key(
         source if cfg.layout == ROLE_LAYOUT else staging / "code",
         spec.extras,
         spec.setup,
@@ -2480,6 +2879,7 @@ def launch(
         "DT_RUNTIME_ROOT": cfg.runtime_root_for(node),
         "DT_GPU_LEASE_ROOT": cfg.lease_root_for(node),
         "DT_GPUS": str(spec.gpus),
+        "DT_GPU_ISOLATION": spec.gpu_isolation,
         "DT_SESSION": session,
         "DT_ENVS_DIR": cfg.envs_for(node),
         "DT_MEM_MIB": str(cfg.mem_threshold_mib),
@@ -2489,6 +2889,7 @@ def launch(
         "DT_JOB_NAME": spec.name,
         "DT_CENTER": cfg.center,
         "DT_NODE": node.name,
+        "DT_ENV_MODE": spec.env_mode,
     }
     if spec.project:
         envs["DT_ARTIFACT_ROOT"] = artifact_root_rel(spec.project, cfg, node)
@@ -2596,14 +2997,17 @@ def _cancel_orphan(
     launcher got, and it may still start the tmux session later (it outlives
     its ssh session). Return ``None`` only after the cancel sentinel is
     confirmed on-node; otherwise return why duplicate-safe failover is unsafe."""
-    probe = termination_probe(
-        job_dir,
-        None,
-        "TERM",
-        session=session,
-        cancel_sentinel=True,
-        layout=layout,
-    )
+    try:
+        probe = termination_probe(
+            job_dir,
+            None,
+            "TERM",
+            session=session,
+            cancel_sentinel=True,
+            layout=layout,
+        )
+    except ValueError as exc:
+        return str(exc)
     try:
         proc = run_on(node.name, node.local, probe, timeout=20)
     except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
@@ -2626,14 +3030,19 @@ def _cancel_placed_launch(entry: JobEntry) -> str | None:
     ``None`` means every process is confirmed dead; a string means cancellation
     could not be proven and the caller must restore the visible running entry.
     """
-    probe = termination_probe(
-        entry.job_dir,
-        entry.pgid,
-        "TERM",
-        session=entry.session,
-        cancel_sentinel=True,
-        layout=entry.storage_layout,
-    )
+    try:
+        probe = termination_probe(
+            entry.job_dir,
+            entry.pgid,
+            "TERM",
+            boot_id=entry.boot_id,
+            job_id=entry.job_id,
+            session=entry.session,
+            cancel_sentinel=True,
+            layout=entry.storage_layout,
+        )
+    except ValueError as exc:
+        return str(exc)
     try:
         proc = run_on(entry.node, entry.node_local, probe, timeout=20)
     except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
@@ -2805,6 +3214,7 @@ def _try_nodes(
                 gpus=[int(g) for g in gpu_values if isinstance(g, (str, int))],
                 pgid=int(pgid_value),
                 gpus_requested=spec.gpus,
+                gpu_isolation=spec.gpu_isolation,
                 require_path=spec.require_path,
                 require_disk_gib=spec.require_disk_gib,
                 pin_node=spec.node,
@@ -2819,6 +3229,8 @@ def _try_nodes(
                     env_preexisting if isinstance(env_preexisting, bool) else None
                 ),
                 setup_ran=(setup_ran if isinstance(setup_ran, bool) else None),
+                env_mode=spec.env_mode,
+                env_source_job=spec.env_source_job,
                 boot_id=boot_id_value if isinstance(boot_id_value, str) else None,
                 snapshot_sha256=snapshot_sha256,
                 payload_sha256=payload_sha256,
@@ -2833,6 +3245,10 @@ def _try_nodes(
                 extras=list(spec.extras or []),
                 forked_from=spec.forked_from,
                 after_success=spec.after_success,
+                after_complete=spec.after_complete,
+                after_result=spec.after_result,
+                after_result_states=list(spec.after_result_states),
+                request_id=spec.request_id,
                 rerun_of=spec.rerun_of,
                 rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
                 rerun_snapshot_changed=_rerun_snapshot_changed(
@@ -2907,7 +3323,109 @@ def submit_fork(
     force_queue: bool = False,
     force_queue_label: str = "batch",
 ) -> JobEntry:
+    """Submit from a source whose cleanup/migration identity stays locked."""
+    _validate_run_spec(spec)
+    spec.forked_from = spec.forked_from or source.job_id
+    with _job_reference_locks(cfg, spec, extra=(source.job_id,)):
+        current = load(cfg, source.job_id)
+        if current is None:
+            raise ConfigError("fork source job disappeared; resolve it and retry")
+        if _fork_source_identity(current) != _fork_source_identity(source):
+            raise ConfigError("fork source identity changed; resolve it and retry")
+        return _submit_fork_locked(
+            cfg,
+            current,
+            spec,
+            log,
+            no_queue=no_queue,
+            force_queue=force_queue,
+            force_queue_label=force_queue_label,
+            references_locked=True,
+        )
+
+
+def _fork_source_identity(entry: JobEntry) -> tuple[object, ...]:
+    """Return persisted fields whose change would alter exact fork behavior."""
+    return (
+        entry.project,
+        entry.snapshot_sha256,
+        entry.payload_sha256,
+        entry.env_hash,
+        entry.job_dir,
+        # Old legacy rows are decoded as legacy-v0 even when their in-memory
+        # object was constructed with the historical ``None`` spelling.
+        entry.storage_layout or LEGACY_LAYOUT,
+    )
+
+
+def _reference_job_ids(spec: RunSpec, *, extra: tuple[str, ...] = ()) -> list[str]:
+    """Return source identities whose lifetime a submission depends on."""
+    return sorted(
+        {
+            value
+            for value in (
+                *extra,
+                spec.forked_from,
+                spec.cache_source_job,
+                spec.env_source_job,
+                spec.after_success,
+                spec.after_complete,
+                spec.after_result,
+            )
+            if value is not None
+        }
+    )
+
+
+@contextmanager
+def _job_reference_locks(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    *,
+    extra: tuple[str, ...] = (),
+) -> Iterator[None]:
+    """Serialize source-dependent submission with destructive maintenance."""
+    with ExitStack() as stack:
+        for job_id in _reference_job_ids(spec, extra=extra):
+            stack.enter_context(job_lock(cfg, job_id))
+        yield
+
+
+def _require_submission_references(cfg: HeadConfig, spec: RunSpec) -> None:
+    """Fail closed when a source disappeared before its lock was acquired."""
+    labels = (
+        ("fork source", spec.forked_from),
+        ("cache source", spec.cache_source_job),
+        ("environment source", spec.env_source_job),
+        ("success dependency", spec.after_success),
+        ("completion dependency", spec.after_complete),
+        ("result dependency", spec.after_result),
+    )
+    for label, job_id in labels:
+        if job_id is not None and load(cfg, job_id) is None:
+            raise ConfigError(f"{label} job {job_id!r} disappeared; resolve and retry")
+
+
+def _submit_fork_locked(
+    cfg: HeadConfig,
+    source: JobEntry,
+    spec: RunSpec,
+    log: Callable[[str], None],
+    no_queue: bool = False,
+    force_queue: bool = False,
+    force_queue_label: str = "batch",
+    references_locked: bool = False,
+) -> JobEntry:
     """Submit from ``source``'s verified dispatch-time code snapshot."""
+    if spec.env_mode == "reuse":
+        if source.node == "-" or source.status == "queued":
+            raise ConfigError("environment source job has not started on a node")
+        if spec.node != source.node:
+            raise ConfigError("environment reuse must stay on the source job's node")
+        if spec.env_source_job != source.job_id:
+            raise ConfigError("environment reuse source does not match fork source")
+        if spec.env_hash_override != source.env_hash:
+            raise ConfigError("recorded environment identity changed on source job")
     if spec.cache_source_job is not None:
         if spec.cache_source_job != source.job_id:
             raise ConfigError("cache source must be the exact fork source job")
@@ -2933,7 +3451,6 @@ def submit_fork(
         )
     if spec.extras is None:
         spec.extras = list(source.extras)
-    spec.forked_from = spec.forked_from or source.job_id
     return _submit_prepared(
         cfg,
         spec,
@@ -2945,6 +3462,7 @@ def submit_fork(
         no_queue=no_queue,
         force_queue=force_queue,
         force_queue_label=force_queue_label,
+        references_locked=references_locked,
     )
 
 
@@ -2960,15 +3478,259 @@ def _submit_prepared(
     no_queue: bool,
     force_queue: bool = False,
     force_queue_label: str = "batch",
+    references_locked: bool = False,
 ) -> JobEntry:
-    """Shared placement path for current-code submits and exact forks."""
+    """Submit once, or replay one durable request without launching twice."""
+    # Validate before deriving lock paths from externally influenced IDs.
     _validate_run_spec(spec)
+    if not references_locked:
+        with _job_reference_locks(cfg, spec):
+            return _submit_prepared(
+                cfg,
+                spec,
+                source_factory=source_factory,
+                git_sha=git_sha,
+                git_dirty=git_dirty,
+                git_diff=git_diff,
+                log=log,
+                no_queue=no_queue,
+                force_queue=force_queue,
+                force_queue_label=force_queue_label,
+                references_locked=True,
+            )
+    if no_queue:
+        dependency = next(
+            (
+                label
+                for label, job_id in (
+                    ("after_success", spec.after_success),
+                    ("after_complete", spec.after_complete),
+                    ("after_result", spec.after_result),
+                )
+                if job_id is not None
+            ),
+            None,
+        )
+        if dependency is not None:
+            raise ConfigError(f"{dependency} requires queueing")
+    _require_submission_references(cfg, spec)
     # Freeze the effective floor into the job contract. This keeps queued,
     # rerun, and exact-fork behavior stable even if center config changes.
     spec.require_disk_gib = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
-    submitted_at = time.time()
     spec.name = sanitize_name(spec.name)
-    job_id = new_job_id(spec.name)
+    if spec.request_id is None:
+        return _submit_prepared_once(
+            cfg,
+            spec,
+            source_factory=source_factory,
+            git_sha=git_sha,
+            git_dirty=git_dirty,
+            git_diff=git_diff,
+            log=log,
+            no_queue=no_queue,
+            force_queue=force_queue,
+            force_queue_label=force_queue_label,
+        )
+
+    # The exact source and node payload are identities, not mutable work.  They
+    # are resolved before the durable claim so changing either between retries
+    # is a conflict.  No compute-side launch can occur before the claim exists.
+    source = source_factory()
+    runtime_sha256 = payload_sha256(_runtime_payload_files())
+    intent_payload = asdict(spec)
+    intent_payload.pop("request_id", None)
+    intent_payload.update(
+        {
+            "source_snapshot_sha256": source.sha256,
+            "runtime_payload_sha256": runtime_sha256,
+            "git_sha": git_sha,
+            "git_dirty": git_dirty,
+            "git_diff_sha256": (
+                hashlib.sha256(git_diff.encode("utf-8")).hexdigest()
+                if git_diff is not None
+                else None
+            ),
+            "no_queue": no_queue,
+            "force_queue": force_queue,
+            "force_queue_label": force_queue_label,
+        }
+    )
+    intent_sha256 = intent_mod.canonical_intent(intent_payload)
+    request_id = spec.request_id
+
+    try:
+        lock_context = intent_mod.lock(cfg, request_id)
+        lock_context.__enter__()
+    except intent_mod.RequestLockError as exc:
+        raise RequestRejected(
+            f"request {request_id!r} was not launched because its durable "
+            f"lock could not be acquired: {exc}"
+        ) from exc
+    try:
+        try:
+            # Single- and multi-job requests share one public identity
+            # namespace and the same lock.  A key claimed by a parent group
+            # must never be silently reused for an unrelated single launch.
+            from . import submission_group as group_mod
+
+            group_record = group_mod.load(cfg, request_id)
+            record = intent_mod.load(cfg, request_id)
+        except (intent_mod.RequestRecordError, group_mod.GroupRequestError) as exc:
+            raise RequestOutcomeUnknown(
+                request_id,
+                "-",
+                f"request {request_id!r} has unreadable durable state; "
+                "refusing a duplicate submission",
+            ) from exc
+        if group_record is not None:
+            raise RequestConflict(
+                f"request {request_id!r} already belongs to a multi-job intent"
+            )
+        if record is not None and record.intent_sha256 != intent_sha256:
+            raise RequestConflict(
+                f"request {request_id!r} already belongs to a different intent"
+            )
+        if record is not None:
+            try:
+                record, existing = reconcile_submission_request(cfg, record)
+            except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+                raise RequestOutcomeUnknown(
+                    request_id,
+                    record.job_id,
+                    f"request {request_id!r} has a job record but its "
+                    "durable receipt could not be reconciled; inspect "
+                    f"`dt request {request_id} --json` before retrying",
+                ) from exc
+            if record.state == "confirmed" and existing is not None:
+                if record.error_kind == "failed_before_start":
+                    raise FailedBeforeStart(existing)
+                setattr(existing, "_request_replayed", True)
+                return existing
+            if record.state == "rejected":
+                detail = record.error_message or "submission was rejected"
+                raise RequestRejected(
+                    f"request {request_id!r} was already rejected: {detail}"
+                )
+            raise RequestOutcomeUnknown(
+                request_id,
+                record.job_id,
+                f"request {request_id!r} may have been submitted as "
+                f"{record.job_id}; inspect `dt request {request_id} --json` "
+                "before retrying",
+            )
+
+        job_id = new_job_id(spec.name)
+        record = intent_mod.create(request_id, intent_sha256, job_id)
+        try:
+            intent_mod.save(cfg, record)
+        except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+            # The launch boundary has not been crossed. Report a known safe
+            # rejection instead of leaking an OSError/traceback or inviting a
+            # retry whose durable identity was never proven.
+            raise RequestRejected(
+                f"request {request_id!r} was not launched because its durable "
+                f"claim could not be persisted: {exc}"
+            ) from exc
+        try:
+            entry = _submit_prepared_once(
+                cfg,
+                spec,
+                source_factory=lambda: source,
+                git_sha=git_sha,
+                git_dirty=git_dirty,
+                git_diff=git_diff,
+                log=log,
+                no_queue=no_queue,
+                force_queue=force_queue,
+                force_queue_label=force_queue_label,
+                allocated_job_id=job_id,
+                submitted_at=record.created_at,
+            )
+        except BaseException as exc:
+            existing = load(cfg, job_id)
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                state = "uncertain"
+                error_kind = "interrupted"
+            elif existing is not None and (existing.reason or "").startswith(
+                UNCERTAIN_LAUNCH_PREFIX
+            ):
+                state = "uncertain"
+                error_kind = "launch_outcome_unknown"
+            elif isinstance(exc, FailedBeforeStart) and existing is not None:
+                state = "confirmed"
+                error_kind = "failed_before_start"
+            elif isinstance(
+                exc,
+                (ConfigError, DispatchError, NoCapacity, NoReachableNode),
+            ):
+                state = "rejected"
+                error_kind = type(exc).__name__
+            else:
+                # Unexpected local I/O or serialization errors can happen
+                # after the remote launcher accepted the job but before its
+                # registry row became visible.  Fail closed so retrying this
+                # request id can never launch a second long-running task.
+                state = "uncertain"
+                error_kind = type(exc).__name__
+            try:
+                intent_mod.save(
+                    cfg,
+                    intent_mod.transition(
+                        record,
+                        state,
+                        error_kind=error_kind,
+                        error_message=str(exc),
+                    ),
+                )
+            except (
+                OSError,
+                intent_mod.RequestRecordError,
+                ValueError,
+            ) as persistence_exc:
+                raise RequestOutcomeUnknown(
+                    request_id,
+                    job_id,
+                    f"request {request_id!r} did not return a durable final "
+                    f"receipt; inspect `dt request {request_id} --json` "
+                    "before retrying",
+                ) from persistence_exc
+            raise
+        try:
+            intent_mod.save(cfg, intent_mod.transition(record, "confirmed"))
+        except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+            raise RequestOutcomeUnknown(
+                request_id,
+                job_id,
+                f"request {request_id!r} created job {job_id}, but its durable "
+                "confirmation could not be persisted; inspect "
+                f"`dt request {request_id} --json` before retrying",
+            ) from exc
+        return entry
+    finally:
+        lock_context.__exit__(None, None, None)
+
+
+def _submit_prepared_once(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    *,
+    source_factory: Callable[[], StoredSnapshot],
+    git_sha: str | None,
+    git_dirty: bool,
+    git_diff: str | None,
+    log: Callable[[str], None],
+    no_queue: bool,
+    force_queue: bool = False,
+    force_queue_label: str = "batch",
+    allocated_job_id: str | None = None,
+    submitted_at: float | None = None,
+) -> JobEntry:
+    """Shared placement path after any durable request claim is established."""
+    _validate_run_spec(spec)
+    spec.require_disk_gib = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    spec.name = sanitize_name(spec.name)
+    submitted_at = time.time() if submitted_at is None else submitted_at
+    job_id = allocated_job_id or new_job_id(spec.name)
     session = f"dt_{job_id}"
     # Persist the logical path; home expansion occurs only on the selected
     # worker. Unpinned queued jobs use the default root until placement stores
@@ -3001,6 +3763,7 @@ def _submit_prepared(
         "project": project_name,
         "cmd": shlex.join(spec.cmd),
         "gpus_requested": spec.gpus,
+        "gpu_isolation": spec.gpu_isolation,
         "require_disk_gib": spec.require_disk_gib,
         "git_sha": git_sha,
         "git_dirty": git_dirty,
@@ -3011,6 +3774,15 @@ def _submit_prepared(
         "artifact_manifest": spec.artifact_manifest,
         "forked_from": spec.forked_from,
         "after_success": spec.after_success,
+        "after_complete": spec.after_complete,
+        "after_result": spec.after_result,
+        "after_result_states": list(spec.after_result_states),
+        "request_id": spec.request_id,
+        "environment": {
+            "mode": spec.env_mode,
+            "identity": spec.env_hash_override,
+            "source_job_id": spec.env_source_job,
+        },
         "rerun_of": spec.rerun_of,
         "rerun_source_snapshot_sha256": spec.rerun_source_snapshot_sha256,
         "cache_reuse": (
@@ -3074,6 +3846,7 @@ def _submit_prepared(
             payload_sha256=runtime_sha256,
             artifact_manifest=spec.artifact_manifest,
             gpus_requested=spec.gpus,
+            gpu_isolation=spec.gpu_isolation,
             require_path=spec.require_path,
             require_disk_gib=spec.require_disk_gib,
             pin_node=spec.node,
@@ -3084,8 +3857,15 @@ def _submit_prepared(
                 list(spec.setup_inputs) if spec.setup_inputs is not None else None
             ),
             extras=list(spec.extras or []),
+            env_hash=spec.env_hash_override,
+            env_mode=spec.env_mode,
+            env_source_job=spec.env_source_job,
             forked_from=spec.forked_from,
             after_success=spec.after_success,
+            after_complete=spec.after_complete,
+            after_result=spec.after_result,
+            after_result_states=list(spec.after_result_states),
+            request_id=spec.request_id,
             rerun_of=spec.rerun_of,
             rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
             rerun_snapshot_changed=_rerun_snapshot_changed(
@@ -3107,6 +3887,66 @@ def _submit_prepared(
         request_agent_wake(cfg)
         return entry
 
+    def skip_dependency(reason: str) -> JobEntry:
+        """Record a false dependency predicate without staging runnable code."""
+        finished_at = time.time()
+        entry = JobEntry(
+            job_id=job_id,
+            name=spec.name,
+            center=cfg.center,
+            project=project_name,
+            node="-",
+            node_local=False,
+            job_dir=job_dir,
+            session=session,
+            cmd=shlex.join(spec.cmd),
+            status="skipped",
+            result_state="dependency_skipped",
+            git_sha=git_sha,
+            git_dirty=git_dirty,
+            payload_sha256=runtime_sha256,
+            artifact_manifest=spec.artifact_manifest,
+            max_hours=spec.max_hours,
+            max_vram_mib=spec.max_vram_mib,
+            max_job_memory_mib=spec.max_job_memory_mib,
+            created_at=submitted_at,
+            finished_at=finished_at,
+            gpus_requested=spec.gpus,
+            gpu_isolation=spec.gpu_isolation,
+            require_path=spec.require_path,
+            require_disk_gib=spec.require_disk_gib,
+            pin_node=spec.node,
+            reason=reason,
+            setup=spec.setup,
+            setup_inputs=(
+                list(spec.setup_inputs) if spec.setup_inputs is not None else None
+            ),
+            extras=list(spec.extras or []),
+            env_hash=spec.env_hash_override,
+            env_mode=spec.env_mode,
+            env_source_job=spec.env_source_job,
+            forked_from=spec.forked_from,
+            after_success=spec.after_success,
+            after_complete=spec.after_complete,
+            after_result=spec.after_result,
+            after_result_states=list(spec.after_result_states),
+            request_id=spec.request_id,
+            rerun_of=spec.rerun_of,
+            rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
+            cache_source_job=spec.cache_source_job,
+            cache_source_job_dir=spec.cache_source_job_dir,
+            cache_source_path=spec.cache_source_path,
+            cache_env=spec.cache_env,
+            cache_source_env_hash=spec.cache_source_env_hash,
+            cache_mode=spec.cache_mode,
+            storage_layout=cfg.layout,
+            worker_root=submit_worker_root,
+            worker_roots=dict(submit_worker_roots),
+            job_relpath=job_relpath,
+        )
+        save(cfg, entry)
+        return entry
+
     if force_queue:
         return enqueue(
             f"{force_queue_label} item",
@@ -3118,11 +3958,20 @@ def _submit_prepared(
         predecessor = load(cfg, spec.after_success)
         dependency_ready_on_pin = (
             predecessor is not None
-            and predecessor.status == "finished"
-            and predecessor.exit_code == 0
+            and _job_succeeded(predecessor)
             and predecessor.node != "-"
             and predecessor.node == spec.node
         )
+        if (
+            predecessor is not None
+            and predecessor.status in _TERMINAL_JOB_STATUSES
+            and not _job_succeeded(predecessor)
+        ):
+            result = effective_result_state(predecessor) or predecessor.status
+            return skip_dependency(
+                f"dependency {spec.after_success} completed as {result}; "
+                "required success"
+            )
         if dependency_ready_on_pin:
             assert predecessor is not None
             log(
@@ -3133,6 +3982,45 @@ def _submit_prepared(
             return enqueue(
                 f"dependency {spec.after_success}",
                 reason=f"waiting: dependency {spec.after_success}",
+            )
+    if spec.after_complete:
+        if no_queue:
+            raise ConfigError("after_complete requires queueing")
+        predecessor = load(cfg, spec.after_complete)
+        if predecessor is not None and predecessor.status in _TERMINAL_JOB_STATUSES:
+            log(
+                f"dependency {spec.after_complete} already completed as "
+                f"{effective_result_state(predecessor) or predecessor.status}; "
+                "placing independently"
+            )
+        else:
+            return enqueue(
+                f"completion dependency {spec.after_complete}",
+                reason=f"waiting: completion dependency {spec.after_complete}",
+            )
+    if spec.after_result:
+        if no_queue:
+            raise ConfigError("after_result requires queueing")
+        predecessor = load(cfg, spec.after_result)
+        if predecessor is not None and predecessor.status in _TERMINAL_JOB_STATUSES:
+            result = effective_result_state(predecessor) or predecessor.status
+            if result not in spec.after_result_states:
+                expected = ",".join(spec.after_result_states)
+                return skip_dependency(
+                    f"dependency {spec.after_result} completed as {result}; "
+                    f"expected one of {expected}"
+                )
+            log(
+                f"dependency {spec.after_result} already completed as {result}; "
+                "result predicate matched"
+            )
+        else:
+            expected = ",".join(spec.after_result_states)
+            return enqueue(
+                f"result dependency {spec.after_result}",
+                reason=(
+                    f"waiting: result dependency {spec.after_result} in [{expected}]"
+                ),
             )
 
     cap = cfg.queue.max_my_jobs
@@ -3269,6 +4157,7 @@ def _submit_prepared(
                 created_at=submitted_at,
                 finished_at=failed_at,
                 gpus_requested=spec.gpus,
+                gpu_isolation=spec.gpu_isolation,
                 require_path=spec.require_path,
                 require_disk_gib=spec.require_disk_gib,
                 pin_node=spec.node,
@@ -3278,8 +4167,15 @@ def _submit_prepared(
                     list(spec.setup_inputs) if spec.setup_inputs is not None else None
                 ),
                 extras=list(spec.extras or []),
+                env_hash=spec.env_hash_override,
+                env_mode=spec.env_mode,
+                env_source_job=spec.env_source_job,
                 forked_from=spec.forked_from,
                 after_success=spec.after_success,
+                after_complete=spec.after_complete,
+                after_result=spec.after_result,
+                after_result_states=list(spec.after_result_states),
+                request_id=spec.request_id,
                 rerun_of=spec.rerun_of,
                 rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
                 rerun_snapshot_changed=_rerun_snapshot_changed(
@@ -3328,6 +4224,7 @@ def _submit_prepared(
             created_at=submitted_at,
             finished_at=failed_at,
             gpus_requested=spec.gpus,
+            gpu_isolation=spec.gpu_isolation,
             require_path=spec.require_path,
             require_disk_gib=spec.require_disk_gib,
             pin_node=spec.node,
@@ -3337,8 +4234,15 @@ def _submit_prepared(
                 list(spec.setup_inputs) if spec.setup_inputs is not None else None
             ),
             extras=list(spec.extras or []),
+            env_hash=spec.env_hash_override,
+            env_mode=spec.env_mode,
+            env_source_job=spec.env_source_job,
             forked_from=spec.forked_from,
             after_success=spec.after_success,
+            after_complete=spec.after_complete,
+            after_result=spec.after_result,
+            after_result_states=list(spec.after_result_states),
+            request_id=spec.request_id,
             rerun_of=spec.rerun_of,
             rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
             rerun_snapshot_changed=_rerun_snapshot_changed(
@@ -3391,6 +4295,7 @@ def dispatch_queued(
             if dependency == current.job_id:
                 detail = f"dependency {dependency} points to the same job"
                 current.status = "failed"
+                current.result_state = "infra_failure"
                 current.reason = detail
                 current.finished_at = time.time()
                 save(cfg, current)
@@ -3401,6 +4306,7 @@ def dispatch_queued(
             if predecessor is None:
                 detail = f"dependency {dependency} was not found"
                 current.status = "failed"
+                current.result_state = "infra_failure"
                 current.reason = detail
                 current.finished_at = time.time()
                 save(cfg, current)
@@ -3415,23 +4321,118 @@ def dispatch_queued(
                     save(cfg, current)
                 entry.__dict__.update(current.__dict__)
                 return "blocked", detail
-            if predecessor.status != "finished" or predecessor.exit_code != 0:
+            if not _job_succeeded(predecessor):
                 exit_note = (
                     f", exit {predecessor.exit_code}"
                     if predecessor.exit_code is not None
                     else ""
                 )
+                result_note = (
+                    predecessor.result_state
+                    if predecessor.result_state == "scientific_reject"
+                    else None
+                )
                 detail = (
                     f"dependency {dependency} did not succeed: "
                     f"{predecessor.status}{exit_note}"
+                    f"{f', result {result_note}' if result_note else ''}"
                 )
+                current.status = "skipped"
+                current.result_state = "dependency_skipped"
+                current.reason = detail
+                current.finished_at = time.time()
+                save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                remove_staging(cfg, current.job_id)
+                return "skipped", detail
+            if current.reason is not None:
+                current.reason = None
+                save(cfg, current)
+        completion_dependency = current.after_complete
+        if completion_dependency is not None:
+            if completion_dependency == current.job_id:
+                detail = f"completion dependency {completion_dependency} points to the same job"
                 current.status = "failed"
+                current.result_state = "infra_failure"
                 current.reason = detail
                 current.finished_at = time.time()
                 save(cfg, current)
                 entry.__dict__.update(current.__dict__)
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
+            predecessor = load(cfg, completion_dependency)
+            if predecessor is None:
+                detail = f"completion dependency {completion_dependency} was not found"
+                current.status = "failed"
+                current.result_state = "infra_failure"
+                current.reason = detail
+                current.finished_at = time.time()
+                save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                remove_staging(cfg, current.job_id)
+                return "failed", detail
+            if predecessor.status not in _TERMINAL_JOB_STATUSES:
+                detail = (
+                    f"completion dependency {completion_dependency} is "
+                    f"{predecessor.status}"
+                )
+                reason = f"waiting: {detail}"
+                if current.reason != reason:
+                    current.reason = reason
+                    save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                return "blocked", detail
+            if current.reason is not None:
+                current.reason = None
+                save(cfg, current)
+        result_dependency = current.after_result
+        if result_dependency is not None:
+            if result_dependency == current.job_id:
+                detail = f"result dependency {result_dependency} points to the same job"
+                current.status = "failed"
+                current.result_state = "infra_failure"
+                current.reason = detail
+                current.finished_at = time.time()
+                save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                remove_staging(cfg, current.job_id)
+                return "failed", detail
+            predecessor = load(cfg, result_dependency)
+            if predecessor is None:
+                detail = f"result dependency {result_dependency} was not found"
+                current.status = "failed"
+                current.result_state = "infra_failure"
+                current.reason = detail
+                current.finished_at = time.time()
+                save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                remove_staging(cfg, current.job_id)
+                return "failed", detail
+            if predecessor.status not in _TERMINAL_JOB_STATUSES:
+                detail = (
+                    f"result dependency {result_dependency} is {predecessor.status}"
+                )
+                reason = f"waiting: {detail}"
+                if current.reason != reason:
+                    current.reason = reason
+                    save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                return "blocked", detail
+            observed = effective_result_state(predecessor) or predecessor.status
+            if observed not in current.after_result_states:
+                expected = ",".join(current.after_result_states)
+                detail = (
+                    f"result dependency {result_dependency} completed as {observed}; "
+                    f"expected one of {expected}"
+                )
+                current.status = "skipped"
+                current.result_state = "dependency_skipped"
+                current.reason = detail
+                current.finished_at = time.time()
+                save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                remove_staging(cfg, current.job_id)
+                return "skipped", detail
             if current.reason is not None:
                 current.reason = None
                 save(cfg, current)
@@ -3446,6 +4447,8 @@ def _existing_dispatch_outcome(entry: JobEntry) -> tuple[str, str | None]:
         return "started", entry.node
     if entry.status == "failed":
         return "failed", entry.reason or "dispatch failed"
+    if entry.status == "skipped":
+        return "skipped", entry.reason or "dependency predicate was false"
     return "failed", f"job is already {entry.status}"
 
 
@@ -3478,6 +4481,12 @@ def _queued_node(cfg: HeadConfig, entry: JobEntry, node: Node) -> Node:
         name=node.name,
         local=node.local,
         root=persisted or cfg.worker_root_for(node),
+        probe_timeout_s=node.probe_timeout_s,
+        site=node.site,
+        lan_address=node.lan_address,
+        lan_port=node.lan_port,
+        artifact_seed=node.artifact_seed,
+        transfer_cost=node.transfer_cost,
     )
 
 
@@ -3590,8 +4599,14 @@ def _dispatch_queued_active(
             list(entry.setup_inputs) if entry.setup_inputs is not None else None
         ),
         extras=list(entry.extras) if entry.extras else None,
+        env_mode=entry.env_mode or "sync",
+        env_hash_override=(entry.env_hash if entry.env_mode == "reuse" else None),
+        env_source_job=entry.env_source_job,
         forked_from=entry.forked_from,
         after_success=entry.after_success,
+        after_complete=entry.after_complete,
+        after_result=entry.after_result,
+        after_result_states=list(entry.after_result_states),
         rerun_of=entry.rerun_of,
         rerun_source_snapshot_sha256=entry.rerun_source_snapshot_sha256,
         artifact_manifest=entry.artifact_manifest,
@@ -3697,11 +4712,15 @@ def _dispatch_queued_active(
         run_on(
             node.name,
             node.local,
-            f"mkdir -p {node_path_expression(f'{node_job_dir}/logs')}",
+            _private_remote_directories(
+                node_job_dir,
+                f"{node_job_dir}/logs",
+            ),
             timeout=15,
             check=True,
         )
         role_layout = entry.storage_layout == ROLE_LAYOUT
+        verified_observed: str | None = None
         link_dest, copy_dest = _snapshot_baselines(
             cfg,
             entry.project,
@@ -3722,21 +4741,73 @@ def _dispatch_queued_active(
                     f"sync cache busy on {node.name}; queued snapshot "
                     "continuing without cache baseline"
                 )
-            proc = rsync(
-                (f"{staged_code}/" if role_layout else f"{staging}/"),
-                (
-                    _code_dst(node, node_job_dir)
-                    if role_layout
-                    else _job_dst(node, node_job_dir)
-                ),
-                link_dest=link_dest,
-                copy_dest=stable_copy_dest,
-                timeout=600,
-                retries=2,
-                on_retry=_retry_logger(log, node.name, "queued snapshot"),
-                checksum=True,
-                delete=role_layout,
+            site = cfg.sites.get(node.site or "")
+            topology_delivery = (
+                role_layout
+                and entry.snapshot_sha256 is not None
+                and site is not None
+                and site.artifact_policy in {"site-cache-first", "topology-aware"}
             )
+            if topology_delivery:
+                if entry.snapshot_sha256 is None or site is None:
+                    raise DispatchError("invalid queued topology transfer state")
+                if link_dest is not None:
+                    raise DispatchError(
+                        "site-cache transfer cannot use a hard-link baseline"
+                    )
+                try:
+                    TransferExecutor(cfg).ensure(
+                        staged_code,
+                        entry.snapshot_sha256,
+                        node,
+                        f"{node_job_dir}/code",
+                        copy_dest=stable_copy_dest,
+                        on_retry=_retry_logger(
+                            log,
+                            site.cache_node,
+                            "queued site cache upload",
+                        ),
+                        log=log,
+                    )
+                except (DistributionError, ConfigError, OSError) as exc:
+                    raise DispatchError(str(exc)) from exc
+                proc = subprocess.CompletedProcess([], 0, "", "")
+                verified_observed = entry.snapshot_sha256
+            elif role_layout:
+
+                def transfer_queued_code(
+                    checksum: bool,
+                ) -> subprocess.CompletedProcess[str]:
+                    return rsync(
+                        f"{staged_code}/",
+                        _code_dst(node, node_job_dir),
+                        link_dest=link_dest,
+                        copy_dest=stable_copy_dest,
+                        timeout=BULK_TRANSFER_TIMEOUT_S,
+                        retries=2,
+                        on_retry=_retry_logger(log, node.name, "queued snapshot"),
+                        checksum=checksum,
+                        delete=True,
+                    )
+
+                proc, verified_observed = _verified_tree_transfer(
+                    transfer_queued_code,
+                    lambda: _remote_tree_sha256(node, f"{node_job_dir}/code"),
+                    expected_sha256=entry.snapshot_sha256,
+                    label=f"queued snapshot to {node.name}",
+                    log=log,
+                )
+            else:
+                proc = rsync(
+                    f"{staging}/",
+                    _job_dst(node, node_job_dir),
+                    link_dest=link_dest,
+                    copy_dest=stable_copy_dest,
+                    timeout=BULK_TRANSFER_TIMEOUT_S,
+                    retries=2,
+                    on_retry=_retry_logger(log, node.name, "queued snapshot"),
+                    checksum=True,
+                )
         if proc.returncode != 0:
             raise DispatchError(
                 f"snapshot to {node.name} failed: {proc.stderr.strip()}"
@@ -3748,6 +4819,7 @@ def _dispatch_queued_active(
                 timeout=60,
                 retries=2,
                 on_retry=_retry_logger(log, node.name, "queued support"),
+                private_destination=True,
             )
             if proc.returncode == 0:
                 proc = rsync(
@@ -3761,6 +4833,7 @@ def _dispatch_queued_active(
                     timeout=60,
                     retries=2,
                     on_retry=_retry_logger(log, node.name, "queued payload"),
+                    private_destination=True,
                 )
         else:
             # A previous transfer attempt (or accidental inspection of the
@@ -3769,7 +4842,7 @@ def _dispatch_queued_active(
                 f"{staging}/code/",
                 _code_dst(node, node_job_dir),
                 delete=True,
-                timeout=600,
+                timeout=BULK_TRANSFER_TIMEOUT_S,
                 retries=2,
                 on_retry=_retry_logger(log, node.name, "queued code convergence"),
                 checksum=True,
@@ -3778,7 +4851,15 @@ def _dispatch_queued_active(
             raise DispatchError(
                 f"code convergence on {node.name} failed: {proc.stderr.strip()}"
             )
-        observed = _remote_tree_sha256(node, f"{node_job_dir}/code")
+        observed = (
+            verified_observed
+            if role_layout
+            else _remote_tree_sha256(node, f"{node_job_dir}/code")
+        )
+        if observed is None:
+            raise DispatchError(
+                f"queued snapshot to {node.name} has no verified content identity"
+            )
         if entry.snapshot_sha256 and observed != entry.snapshot_sha256:
             raise DispatchError(
                 f"queued snapshot changed in transit to {node.name}: "

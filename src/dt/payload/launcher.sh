@@ -5,6 +5,8 @@
 #                     [DT_MAX_VRAM_MIB] [DT_MAX_JOB_MEMORY_MIB]
 #                     [DT_WEBHOOK DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME]
 #                     [DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST]
+#                     [DT_ENV_MODE=sync|reuse]
+#                     [DT_GPU_ISOLATION=advisory]
 #                     [DT_PAYLOAD_ATTEST_MS]
 #                     [DT_PREDECESSOR_JOB_ID DT_PREDECESSOR_JOB_DIR]
 #                     [DT_CACHE_SOURCE_JOB_ID DT_CACHE_SOURCE_JOB_DIR
@@ -17,6 +19,7 @@
 # On success prints one JSON line with placement, environment cache state,
 # setup execution, and node boot identity.
 set -u
+umask 077
 
 # A local-node launch inherits the dt client's shell. Never let its active
 # project environment influence this job's managed uv sync/setup.
@@ -34,6 +37,16 @@ esac
 DT_MEM_MIB="${DT_MEM_MIB:-500}"
 DT_DISK_GIB="${DT_DISK_GIB:-10}"
 DT_RESERVE="${DT_RESERVE:-0}"
+DT_ENV_MODE="${DT_ENV_MODE:-sync}"
+DT_GPU_ISOLATION="${DT_GPU_ISOLATION:-advisory}"
+case "$DT_ENV_MODE" in
+    sync|reuse) : ;;
+    *) log "invalid environment mode: $DT_ENV_MODE"; exit 13 ;;
+esac
+case "$DT_GPU_ISOLATION" in
+    advisory) : ;;
+    *) log "unsupported GPU isolation mode: $DT_GPU_ISOLATION"; exit 15 ;;
+esac
 
 # Values arrive shell-quoted, so `~` never expanded; job_dir may be
 # home-relative. Absolutize everything here, on the node they refer to.
@@ -111,7 +124,7 @@ mkdir -p "$DT_JOB_DIR/logs" "$DT_OUTPUT_DIR" "$DT_CONTROL_DIR" \
 export DT_ROOT DT_WORKER_ROOT DT_JOB_DIR DT_CONTROL_DIR DT_PAYLOAD_DIR \
        DT_STATE_DIR DT_OUTPUT_DIR \
        DT_META_PATH DT_COMMAND_PATH DT_CANCEL_PATH DT_BIN_DIR DT_ENVS_DIR DT_CACHE_ROOT DT_RUNTIME_ROOT \
-       DT_GPU_LEASE_ROOT
+       DT_GPU_LEASE_ROOT DT_GPU_ISOLATION
 export TMPDIR="$DT_CONTROL_DIR/tmp"
 export XDG_CACHE_HOME="$DT_CACHE_ROOT/tools/xdg"
 export UV_CACHE_DIR="$DT_CACHE_ROOT/tools/uv"
@@ -188,6 +201,16 @@ for tool in tmux flock; do
         exit 15
     fi
 done
+if command -v python3 >/dev/null 2>&1 \
+   && [ -f "$DT_PAYLOAD_DIR/result.py" ]; then
+    mkdir -p "$DT_BIN_DIR"
+    cat >"$DT_BIN_DIR/dt-result" <<'DT_RESULT_HELPER'
+#!/usr/bin/env bash
+exec python3 "$DT_PAYLOAD_DIR/result.py" \
+    --output "$DT_OUTPUT_DIR/dt/result.json" "$@"
+DT_RESULT_HELPER
+    chmod 700 "$DT_BIN_DIR/dt-result"
+fi
 if [ "$DT_GPUS" -gt 0 ] && ! command -v nvidia-smi >/dev/null 2>&1; then
     log "node-unfit: nvidia-smi not found but $DT_GPUS GPUs requested"
     exit 15
@@ -423,10 +446,6 @@ SETUP_RAN=false
 SETUP_RAN_MARK="$DT_JOB_DIR/logs/.setup-ran"
 rm -f "$SETUP_RAN_MARK"
 if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
-    if [ -z "$UV_BIN" ]; then
-        log "project has uv.lock but uv is not installed on this node"
-        exit 13
-    fi
     if [ -f "$DT_CONTROL_DIR/env-key" ]; then
         lockhash=$(tr -d '[:space:]' < "$DT_CONTROL_DIR/env-key")
         case "$lockhash" in
@@ -440,30 +459,50 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
             exit 13
         fi
     else
+        if [ "$DT_ENV_MODE" = reuse ]; then
+            log "exact environment reuse requires a recorded environment identity"
+            exit 13
+        fi
         # Compatibility for job bundles produced by older head nodes.
         lockhash=$(sha256sum "$DT_JOB_DIR/code/uv.lock" | cut -c1-12)
     fi
     UV_ENV="$DT_ENVS_DIR/$lockhash"
-    if [ -d "$UV_ENV" ]; then
+    if [ "$DT_ENV_MODE" = reuse ]; then
+        if [ ! -d "$UV_ENV" ] || [ ! -x "$UV_ENV/bin/python" ]; then
+            log "inherited environment $lockhash is unavailable or incomplete"
+            exit 13
+        fi
         ENV_PREEXISTING=true
-    fi
-    mkdir -p "$DT_ENVS_DIR"
-    log "syncing env $lockhash"
-    # only-managed: system interpreters lack dev headers (Python.h), which
-    # breaks sdist builds; uv-managed toolchains ship them (design doc 6).
-    # setup.sh (optional project hook, e.g. install local libs/ packages that
-    # uv.lock cannot describe) runs under the same env lock, once per env per
-    # setup content (marker), never editable - the job dir is disposable.
-    if ! flock "$DT_ENVS_DIR/$lockhash.lock" \
+        log "reusing exact environment $lockhash without sync or setup"
+    else
+        if [ -z "$UV_BIN" ]; then
+            log "project has uv.lock but uv is not installed on this node"
+            exit 13
+        fi
+        if [ -d "$UV_ENV" ]; then
+            ENV_PREEXISTING=true
+        fi
+        mkdir -p "$DT_ENVS_DIR"
+        log "syncing env $lockhash"
+        # only-managed: system interpreters lack dev headers (Python.h), which
+        # breaks sdist builds; uv-managed toolchains ship them (design doc 6).
+        # setup.sh (optional project hook, e.g. install local libs/ packages that
+        # uv.lock cannot describe) runs under the same env lock, once per env per
+        # setup content (marker), never editable - the job dir is disposable.
+        if ! flock "$DT_ENVS_DIR/$lockhash.lock" \
         env UV_PROJECT_ENVIRONMENT="$UV_ENV" UV_SYSTEM_CERTS=1 \
             UV_PYTHON_PREFERENCE=only-managed DT_JOB_DIR="$DT_JOB_DIR" UV_BIN="$UV_BIN" \
             DT_EXTRAS="${DT_EXTRAS:-}" \
         bash -c '
             cd "$DT_JOB_DIR/code" || exit 1
-            eflags=""
-            for e in $DT_EXTRAS; do eflags="$eflags --extra $e"; done
+            extra_names=()
+            extra_flags=()
+            IFS=" " read -r -a extra_names <<< "$DT_EXTRAS"
+            for e in "${extra_names[@]}"; do
+                extra_flags+=(--extra "$e")
+            done
             sync_once() {
-                "$UV_BIN" sync --frozen --inexact $eflags
+                "$UV_BIN" sync --frozen --inexact "${extra_flags[@]}"
             }
             is_pypi_network_failure() {
                 grep -Fq "https://pypi.org/" "$1" \
@@ -581,17 +620,22 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
                 # packages a concurrent job with more extras relies on
                 sync_with_cache_repair || exit 1
             fi' \
-        >>"$DT_JOB_DIR/logs/env.log" 2>&1; then
-        log "uv sync / setup failed, see logs/env.log"
-        exit 13
-    fi
-    if [ -f "$SETUP_RAN_MARK" ]; then
-        SETUP_RAN=true
-        rm -f "$SETUP_RAN_MARK"
+            >>"$DT_JOB_DIR/logs/env.log" 2>&1; then
+            log "uv sync / setup failed, see logs/env.log"
+            exit 13
+        fi
+        if [ -f "$SETUP_RAN_MARK" ]; then
+            SETUP_RAN=true
+            rm -f "$SETUP_RAN_MARK"
+        fi
     fi
     # last-used stamp: `dt clean --envs` reaps envs whose mtime went stale
     touch "$UV_ENV" 2>/dev/null || true
 else
+    if [ "$DT_ENV_MODE" = reuse ]; then
+        log "exact environment reuse requires a uv.lock snapshot"
+        exit 13
+    fi
     log "no uv.lock in snapshot; running with system python"
     # Minimal/non-uv projects commonly invoke `python`, while Debian/Ubuntu
     # nodes expose only `python3` to non-interactive shells. Keep the alias
@@ -674,6 +718,42 @@ probe_ok() {
     return "$rc"
 }
 
+run_tmux_new_session() {
+    # setsid/nohup/tmux detach terminals, but they do not escape the cgroup of
+    # an invoking systemd service.  A transient user scope gives the dedicated
+    # tmux server an independent lifetime.  Hosts without a usable user manager
+    # retain the portable direct-tmux behavior.
+    local unit_hash
+    if command -v systemd-run >/dev/null 2>&1 \
+       && command -v systemctl >/dev/null 2>&1 \
+       && timeout 3s systemctl --user show-environment >/dev/null 2>&1; then
+        unit_hash=$(printf '%s' "${DT_JOB_ID:-$DT_SESSION}" \
+            | sha256sum | cut -c1-16)
+        systemd-run --user --scope --quiet \
+            --unit="dt-runtime-${unit_hash}-$$" -- tmux "$@"
+        return $?
+    fi
+    tmux "$@"
+}
+
+dt_shell_quote() {
+    # Render exactly one shell word. Paths, URLs and task metadata are all
+    # untrusted at this boundary and must never be interpolated into tmux's
+    # shell-command string.
+    local value=${1-}
+    value=${value//\'/\'\"\'\"\'}
+    printf -v DT_SHELL_QUOTED "'%s'" "$value"
+}
+
+dt_append_session_env() {
+    local name=$1 value=""
+    if [[ -v "$name" ]]; then
+        value=${!name}
+    fi
+    dt_shell_quote "$value"
+    DT_SESSION_COMMAND+=" $name=$DT_SHELL_QUOTED"
+}
+
 start_session() {
     local ids=$1
     # -L dt: dedicated socket = dedicated tmux server. Never join the user's
@@ -689,8 +769,39 @@ start_session() {
     # the GPU idle between otherwise back-to-back experiments. Runtime env is
     # still passed explicitly below, and fd 9 is closed before the server can
     # inherit the node launch lock.
-    tmux -L dt new-session -d -s "$DT_SESSION" \
-        "cd '$DT_JOB_DIR' && env DT_ROOT='${DT_ROOT:-}' DT_WORKER_ROOT='${DT_WORKER_ROOT:-}' DT_JOB_DIR='$DT_JOB_DIR' DT_OUTPUT_DIR='$DT_OUTPUT_DIR' DT_CONTROL_DIR='$DT_CONTROL_DIR' DT_PAYLOAD_DIR='$DT_PAYLOAD_DIR' DT_STATE_DIR='$DT_STATE_DIR' DT_META_PATH='$DT_META_PATH' DT_COMMAND_PATH='$DT_COMMAND_PATH' DT_CANCEL_PATH='$DT_CANCEL_PATH' DT_BIN_DIR='$DT_BIN_DIR' DT_CACHE_ROOT='$DT_CACHE_ROOT' DT_RUNTIME_ROOT='$DT_RUNTIME_ROOT' DT_GPU_LEASE_ROOT='$DT_GPU_LEASE_ROOT' DT_ARTIFACT_ROOT='${DT_ARTIFACT_ROOT:-}' DT_ARTIFACT_MANIFEST='${DT_ARTIFACT_MANIFEST:-}' DT_PREDECESSOR_JOB_ID='$DT_PREDECESSOR_JOB_ID' DT_PREDECESSOR_JOB_DIR='$DT_PREDECESSOR_JOB_DIR' DT_PREDECESSOR_OUTPUTS='$DT_PREDECESSOR_OUTPUTS' DT_PREDECESSOR_META_PATH='$DT_PREDECESSOR_META_PATH' DT_REUSE_CACHE_PATH='$DT_REUSE_CACHE_PATH' DT_REUSE_CACHE_ENV='$DT_CACHE_ENV' DT_CACHE_SOURCE_PATH='$DT_CACHE_SOURCE_PATH' DT_CACHE_SOURCE_JOB_ID='$DT_CACHE_SOURCE_JOB_ID' DT_CACHE_SOURCE_RELPATH='$DT_CACHE_SOURCE_RELPATH' DT_CACHE_SOURCE_ENV='$DT_CACHE_SOURCE_ENV' DT_CACHE_SOURCE_SNAPSHOT='$DT_CACHE_SOURCE_SNAPSHOT' DT_CACHE_MODE='$DT_CACHE_MODE' DT_CACHE_RUNTIME_RELPATH='$DT_CACHE_RUNTIME_RELPATH' DT_CACHE_SOURCE_MANIFEST_SHA256='$DT_CACHE_SOURCE_MANIFEST_SHA256' DT_CACHE_CLONE_FILES='$DT_CACHE_CLONE_FILES' DT_CACHE_CLONE_BYTES='$DT_CACHE_CLONE_BYTES' DT_CACHE_CLONE_DURATION_MS='$DT_CACHE_CLONE_DURATION_MS' CUDA_VISIBLE_DEVICES='$ids' DT_GPU_IDS='$ids' DT_MAX_HOURS='${DT_MAX_HOURS:-}' DT_MAX_VRAM_MIB='${DT_MAX_VRAM_MIB:-}' DT_MAX_JOB_MEMORY_MIB='${DT_MAX_JOB_MEMORY_MIB:-}' DT_UV='$UV_BIN' DT_UV_ENV='$UV_ENV' DT_WEBHOOK='${DT_WEBHOOK:-}' DT_CENTER='${DT_CENTER:-}' DT_NODE='${DT_NODE:-}' DT_JOB_ID='${DT_JOB_ID:-}' DT_JOB_NAME='${DT_JOB_NAME:-}' DT_PROXY='${DT_PROXY:-}' bash '$DT_PAYLOAD_DIR/wrapper.sh' >> logs/stdout.log 2>&1" \
+    CUDA_VISIBLE_DEVICES=$ids
+    DT_GPU_IDS=$ids
+    DT_REUSE_CACHE_ENV=$DT_CACHE_ENV
+    DT_UV=$UV_BIN
+    DT_UV_ENV=$UV_ENV
+    DT_SHELL_QUOTED=""
+    dt_shell_quote "$DT_JOB_DIR"
+    DT_SESSION_COMMAND="cd $DT_SHELL_QUOTED && env"
+    local name
+    local -a session_env_names=(
+        DT_ROOT DT_WORKER_ROOT DT_JOB_DIR DT_OUTPUT_DIR DT_CONTROL_DIR \
+        DT_PAYLOAD_DIR DT_STATE_DIR DT_META_PATH DT_COMMAND_PATH \
+        DT_CANCEL_PATH DT_BIN_DIR DT_CACHE_ROOT DT_RUNTIME_ROOT \
+        DT_GPU_LEASE_ROOT DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST \
+        DT_PREDECESSOR_JOB_ID DT_PREDECESSOR_JOB_DIR \
+        DT_PREDECESSOR_OUTPUTS DT_PREDECESSOR_META_PATH \
+        DT_REUSE_CACHE_PATH DT_REUSE_CACHE_ENV DT_CACHE_SOURCE_PATH \
+        DT_CACHE_SOURCE_JOB_ID DT_CACHE_SOURCE_RELPATH DT_CACHE_SOURCE_ENV \
+        DT_CACHE_SOURCE_SNAPSHOT DT_CACHE_MODE DT_CACHE_RUNTIME_RELPATH \
+        DT_CACHE_SOURCE_MANIFEST_SHA256 DT_CACHE_CLONE_FILES \
+        DT_CACHE_CLONE_BYTES DT_CACHE_CLONE_DURATION_MS \
+        CUDA_VISIBLE_DEVICES DT_GPU_IDS DT_GPU_ISOLATION DT_MAX_HOURS \
+        DT_MAX_VRAM_MIB DT_MAX_JOB_MEMORY_MIB DT_ENV_MODE DT_UV DT_UV_ENV \
+        DT_WEBHOOK DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME DT_PROXY
+    )
+    for name in "${session_env_names[@]}"; do
+        dt_append_session_env "$name"
+    done
+    dt_shell_quote "$DT_PAYLOAD_DIR/wrapper.sh"
+    DT_SESSION_COMMAND+=" bash $DT_SHELL_QUOTED"
+    DT_SESSION_COMMAND+=" >> logs/stdout.log 2>&1"
+    run_tmux_new_session -L dt new-session -d -s "$DT_SESSION" \
+        "$DT_SESSION_COMMAND" \
         \; set-option -g exit-empty off \
         9>&-
 }
@@ -751,8 +862,10 @@ launch_locked() {
         return 14
     fi
     rm -f "$DT_STATE_DIR/pgid" "$DT_STATE_DIR/gpus" \
+          "$DT_STATE_DIR/process_start_ticks" \
           "$DT_STATE_DIR/started_at" "$DT_STATE_DIR/finished_at" \
-          "$DT_STATE_DIR/exit_code" "$DT_STATE_DIR"/exit_code.tmp.*
+          "$DT_STATE_DIR/exit_code" "$DT_STATE_DIR"/exit_code.tmp.* \
+          "$DT_STATE_DIR"/process_start_ticks.tmp.*
     session_start_started_ms=$(now_ms)
     start_session "$ids" || return 14
     # Close the check→start race: cancellation may land after the pre-start
