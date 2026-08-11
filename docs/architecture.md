@@ -111,7 +111,7 @@ payload verifies that manifest before setup or application execution.
 Each job owns:
 
 ```text
-code/                   immutable dispatched source copy
+code/                   writable working copy of the immutable source snapshot
 logs/                   setup and application logs
 outputs/                recoverable application and DistTrainer evidence
 .dt/meta.json           dispatch contract

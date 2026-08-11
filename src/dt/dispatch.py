@@ -2574,9 +2574,7 @@ def snapshot(
                         f"code snapshot to {node.name} failed: {detail}",
                         proc.returncode,
                     )
-                raise DispatchError(
-                    f"code snapshot to {node.name} failed: {detail}"
-                )
+                raise DispatchError(f"code snapshot to {node.name} failed: {detail}")
             _warn_snapshot_size(cfg, proc.stdout, log)
             if observed is None:
                 raise DispatchError(
@@ -2631,9 +2629,7 @@ def snapshot(
                     f"support sync to {node.name} failed: {detail}",
                     proc.returncode,
                 )
-            raise DispatchError(
-                f"support sync to {node.name} failed: {detail}"
-            )
+            raise DispatchError(f"support sync to {node.name} failed: {detail}")
 
     _remember_snapshot(cfg, project_name, node, job_id)
     return snapshot_sha256
