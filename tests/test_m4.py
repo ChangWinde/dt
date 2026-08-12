@@ -1092,6 +1092,108 @@ def test_clean_retains_registry_when_related_local_cleanup_fails(tmp_path):
     assert load(cfg, entry.job_id) is not None
 
 
+def _deployment_home(tmp_path):
+    """Build one node home with a deploy tree and a tool-installation root."""
+    home = tmp_path / "node-home"
+    base = home / ".local" / "share" / "disttrainer"
+    releases = base / "releases"
+    incoming = base / "incoming"
+    installs = base / "installations"
+    for version in ("1.0.0", "2.0.0", "3.0.0"):
+        (releases / version).mkdir(parents=True)
+        (releases / version / "wheel.whl").write_text(version)
+    (base / "current").symlink_to("releases/2.0.0")
+    (incoming / "stale-stage").mkdir(parents=True)
+    (incoming / "fresh-stage").mkdir(parents=True)
+    (base / ".removing.junk.123").mkdir()
+    for install in ("py3.11-aaa-bbb", "py3.11-ccc-ddd", "py3.11-eee-fff"):
+        (installs / install / "bin").mkdir(parents=True)
+        (installs / install / "bin" / "dt").write_text("#!/bin/sh\n")
+    (installs / ".incoming.xyz").mkdir()
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "dt").symlink_to(installs / "py3.11-aaa-bbb" / "bin" / "dt")
+    old = (1.0, 1.0)
+    for stale in (
+        releases / "1.0.0",
+        releases / "2.0.0",
+        incoming / "stale-stage",
+        installs / "py3.11-aaa-bbb",
+        installs / "py3.11-ccc-ddd",
+    ):
+        os.utime(stale, old)
+    return home, base, installs
+
+
+def _run_deployment_clean(home, tmp_path):
+    from dt.maintenance import clean_deployments_command
+
+    command = clean_deployments_command(datetime.now() - timedelta(days=1))
+    env = {**os.environ, "HOME": str(home)}
+    env.pop("XDG_DATA_HOME", None)
+    env.pop("DT_INSTALL_ROOT", None)
+    return subprocess.run(
+        command,
+        shell=True,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def test_deployment_cleanup_keeps_current_live_and_fresh_trees(tmp_path):
+    # A29-9: releases/ and installations/ accumulate one tree per deploy
+    # forever. The sweep removes only provably old entries and never the
+    # release `current` points at, the installation the dt command resolves
+    # into, or anything fresh; leftover quarantines are finished.
+    home, base, installs = _deployment_home(tmp_path)
+
+    result = _run_deployment_clean(home, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    removed = set(result.stdout.splitlines())
+    assert removed == {
+        "release 1.0.0",
+        "staging stale-stage",
+        "installation py3.11-ccc-ddd",
+    }
+    releases = base / "releases"
+    assert not (releases / "1.0.0").exists()
+    assert (releases / "2.0.0").is_dir()  # current target, old but kept
+    assert (releases / "3.0.0").is_dir()  # fresh
+    assert not (base / "incoming" / "stale-stage").exists()
+    assert (base / "incoming" / "fresh-stage").is_dir()
+    assert not (base / ".removing.junk.123").exists()
+    assert (installs / "py3.11-aaa-bbb").is_dir()  # live, old but kept
+    assert not (installs / "py3.11-ccc-ddd").exists()
+    assert (installs / "py3.11-eee-fff").is_dir()  # fresh
+    assert (installs / ".incoming.xyz").is_dir()  # bootstrap's domain
+    assert not list(base.glob(".removing.*"))
+    assert not list(installs.glob(".removing.*"))
+
+
+def test_deployment_cleanup_fails_closed_on_unsafe_markers(tmp_path):
+    # An unsafe `current` marker skips the whole release sweep and an
+    # unresolvable dt symlink skips every installation; staging cleanup
+    # still proceeds, and the refusals are visible on stderr.
+    home, base, installs = _deployment_home(tmp_path)
+    (base / "current").unlink()
+    (base / "current").write_text("not a symlink\n")
+    (home / ".local" / "bin" / "dt").unlink()
+
+    result = _run_deployment_clean(home, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    removed = set(result.stdout.splitlines())
+    assert removed == {"staging stale-stage"}
+    assert (base / "releases" / "1.0.0").is_dir()
+    assert (installs / "py3.11-ccc-ddd").is_dir()
+    assert "unsafe current marker" in result.stderr
+    assert "dt command symlink is not resolvable" in result.stderr
+
+
 def test_environment_cleanup_quotes_operator_configured_path(tmp_path):
     from dt.maintenance import clean_envs_command
 

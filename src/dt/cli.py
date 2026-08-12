@@ -13019,6 +13019,15 @@ def clean(
     envs: bool = typer.Option(
         False, "--envs", help="also remove shared venvs unused since that date"
     ),
+    deployments: bool = typer.Option(
+        False,
+        "--deployments",
+        help=(
+            "also remove dt release trees, deploy staging, and tool "
+            "installations older than that date; the active release and the "
+            "installation the dt command resolves into are never touched"
+        ),
+    ),
     results: bool = typer.Option(
         False,
         "--results",
@@ -13045,6 +13054,7 @@ def clean(
                 for item in ("--project", project_name)
             ]
             + (["--envs"] if envs else [])
+            + (["--deployments"] if deployments else [])
             + (["--results"] if results else [])
             + (["--plan"] if plan else [])
             + (["-y"] if yes else [])
@@ -13091,6 +13101,7 @@ def clean(
             f"plan: {n_victims} ended job dirs"
             f" + {len(managed_results)} identity-verified managed results"
             + (" + stale shared venvs" if envs else "")
+            + (" + old release trees and installations" if deployments else "")
             + (
                 f" · projects {escape(', '.join(sorted(projects)))}"
                 if projects is not None
@@ -13112,7 +13123,7 @@ def clean(
                 f"[dim]... {len(managed_results) - preview_limit} more results[/dim]"
             )
         return
-    if not n_victims and not envs and not managed_results:
+    if not n_victims and not envs and not deployments and not managed_results:
         err.print("nothing to clean")
         return
     if not yes:
@@ -13124,6 +13135,8 @@ def clean(
             what += f" + {len(managed_results)} verified managed results"
         if envs:
             what += " + stale shared venvs"
+        if deployments:
+            what += " + old release trees and installations"
         typer.confirm(f"{what}?", abort=True)
     removed_results = 0
     managed_results_by_job: dict[str, list[_ManagedResult]] = {}
@@ -13157,7 +13170,19 @@ def clean(
         projects=projects,
         before_registry_remove=remove_managed_results if results else None,
     )
+    removed_deployments = 0
+    if deployments:
+        from .maintenance import clean_deployments
+
+        removed_deployments = clean_deployments(
+            cfg,
+            cutoff,
+            lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
+            runner=run_on,
+        )
     suffix = f" + {removed_results} managed results" if results else ""
+    if deployments:
+        suffix += f" + {removed_deployments} deployment trees"
     err.print(f"cleaned {report.removed}/{report.eligible} jobs{suffix}")
     if report.failures:
         err.print(

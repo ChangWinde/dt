@@ -288,10 +288,20 @@ Cleanup removes old terminal jobs and optional managed data:
 dt clean --before 2026-07-01 --plan
 dt clean --before 2026-07-01 -p smoke --plan
 dt clean --before 2026-07-01 --results --envs --plan
+dt clean --before 2026-07-01 --deployments -y
 ```
 
 Review the exact plan before adding `-y`. Project filters are repeatable.
 Active dependency chains protect predecessor outputs from premature cleanup.
+
+`--deployments` sweeps `releases/`, deploy staging, and tool installations
+older than the cutoff on every configured node. The release `current` points
+at and the installation the `dt` command resolves into are never candidates
+regardless of age; keep the cutoff older than your rollback horizon, because
+a release removed by the sweep is no longer available to `--rollback`. The
+sweep holds the same locks as `deploy.sh` and `bootstrap.sh`, and an unsafe
+`current` marker or unresolvable `dt` command skips that whole tree with a
+visible diagnostic.
 
 ## Operational checks after changes
 
