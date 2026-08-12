@@ -142,9 +142,12 @@ These options activate `dt_ps_query_v1`, an object containing `query`,
 `summary`, `page`, projected `jobs`, `partial`, and per-center `errors`.
 `page.next_cursor` is opaque and bound to the filters and ordering of the
 original query. `--since` observes registry lifecycle updates, not only newly
-created jobs. A mixed-version head may serve compact non-incremental queries
-through a full-array compatibility fallback; `--since` fails closed until that
-head supports the incremental contract.
+created jobs. Pagination anchors on the immutable creation keyset, so
+following the cursor chain returns every row that matched when the
+enumeration started; rows that change mid-enumeration surface in the next
+`--since` window. A mixed-version head may serve compact non-incremental
+queries through a full-array compatibility fallback; `--since` fails closed
+until that head supports the incremental contract.
 
 Use command-specific detail views when diagnosing:
 

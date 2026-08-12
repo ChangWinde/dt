@@ -22,6 +22,17 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   bounded agent query can no longer fail for omitting a redundant flag.
   Explicit `--json` invocations are unchanged.
 
+### Fixed
+
+- `dt ps --since` cursor pagination anchored on mutable `updated_at`: a job
+  whose state changed between page fetches moved above the cursor and
+  silently vanished from the enumeration, so an agent following the cursor
+  chain could permanently miss a terminal transition. Pagination now anchors
+  on the immutable creation keyset for every query; `--since` selection still
+  observes lifecycle updates. A cursor minted by an older head for an
+  incremental query is rejected with an invalid-argument error instead of
+  resuming with different semantics.
+
 ## 0.8.0 — 2026-08-11
 
 ### Added

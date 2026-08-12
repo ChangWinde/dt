@@ -5050,7 +5050,7 @@ def _gather_laptop_ps_query(
         issues_only=issues_only,
         since=since,
     )
-    order = ps_query_mod.order_field(since)
+    order = ps_query_mod.ORDER_FIELD
     global_page = ps_query_mod.paginate(
         candidates,
         limit=limit,
@@ -5383,7 +5383,7 @@ def ps(
                 limit=query_limit,
                 cursor=cursor,
                 digest=digest,
-                order=ps_query_mod.order_field(parsed_since),
+                order=ps_query_mod.ORDER_FIELD,
             )
     except ps_query_mod.QueryError as exc:
         _fail_submission(
