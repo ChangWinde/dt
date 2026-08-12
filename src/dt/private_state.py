@@ -5,7 +5,7 @@ from __future__ import annotations
 import fcntl
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -29,10 +29,11 @@ def ensure_private_directory(path: Path, *, create: bool = True) -> bool:
         raise PrivateStateError(f"cannot inspect private directory: {path}") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise PrivateStateError(f"private directory is unsafe: {path}")
-    try:
-        path.chmod(0o700)
-    except OSError as exc:
-        raise PrivateStateError(f"cannot secure private directory: {path}") from exc
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        try:
+            path.chmod(0o700)
+        except OSError as exc:
+            raise PrivateStateError(f"cannot secure private directory: {path}") from exc
     return True
 
 
@@ -54,7 +55,8 @@ def open_private_regular(
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             raise PrivateStateError(f"private state is not a regular file: {path}")
-        os.fchmod(descriptor, mode)
+        if stat.S_IMODE(info.st_mode) != mode:
+            os.fchmod(descriptor, mode)
     except Exception:
         os.close(descriptor)
         raise
@@ -141,6 +143,65 @@ def read_bounded_regular(
         if descriptor >= 0:
             os.close(descriptor)
         os.close(directory)
+
+
+@contextmanager
+def bounded_directory_reader(
+    directory: Path,
+    *,
+    max_bytes: int,
+    mode: int = 0o600,
+) -> Iterator[Callable[[str], tuple[bytes, os.stat_result] | None] | None]:
+    """Read many bounded private files under one validated directory.
+
+    Yields ``None`` when the directory does not exist, otherwise a reader
+    that resolves names against the pinned directory descriptor.  Per-file
+    semantics match ``read_bounded``: symlinks and special files are refused,
+    the size bound and the stable before/after signature are enforced, and a
+    stray file mode is repaired -- but the directory is opened and validated
+    once for the whole batch instead of once per record.
+    """
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        handle = os.open(directory, directory_flags)
+    except FileNotFoundError:
+        yield None
+        return
+    except OSError as exc:
+        raise PrivateStateError(f"cannot safely open directory: {directory}") from exc
+
+    def read_name(name: str) -> tuple[bytes, os.stat_result] | None:
+        if not name or "/" in name or name in {".", ".."}:
+            raise PrivateStateError(f"unsafe private state name: {name!r}")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        try:
+            descriptor = os.open(name, flags, dir_fd=handle)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise PrivateStateError(
+                f"cannot safely open private file: {directory / name}"
+            ) from exc
+        try:
+            info = os.fstat(descriptor)
+            if stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) != mode:
+                os.fchmod(descriptor, mode)
+            return _read_descriptor_bounded(
+                descriptor,
+                path=directory / name,
+                max_bytes=max_bytes,
+            )
+        finally:
+            os.close(descriptor)
+
+    try:
+        yield read_name
+    finally:
+        os.close(handle)
 
 
 def _read_descriptor_bounded(

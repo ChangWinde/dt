@@ -47,6 +47,7 @@ from .lifecycle import process_identity_shell, validate_job_capsule
 from .private_state import (
     PrivateStateError,
     atomic_write,
+    bounded_directory_reader,
     ensure_private_directory,
     fsync_dir,
     open_private_regular,
@@ -584,6 +585,28 @@ def _decode_entry(
     return entry
 
 
+def _decode_entry_result(
+    result: tuple[bytes, os.stat_result] | None,
+    *,
+    name: str,
+    layout: str | None,
+    expected_job_id: str,
+) -> JobEntry:
+    if result is None:
+        raise RegistryError(f"registry record disappeared: {name}")
+    payload, info = result
+    try:
+        raw = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RegistryError(f"registry record is malformed: {name}") from exc
+    return _decode_entry(
+        raw,
+        layout=layout,
+        registry_updated_at=info.st_mtime,
+        expected_job_id=expected_job_id,
+    )
+
+
 def _read_entry_path(
     path: Path,
     *,
@@ -594,17 +617,10 @@ def _read_entry_path(
         result = read_bounded(path, max_bytes=MAX_JOB_RECORD_BYTES)
     except PrivateStateError as exc:
         raise RegistryError(f"cannot safely open registry record: {path.name}") from exc
-    if result is None:
-        raise RegistryError(f"registry record disappeared: {path.name}")
-    payload, info = result
-    try:
-        raw = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RegistryError(f"registry record is malformed: {path.name}") from exc
-    return _decode_entry(
-        raw,
+    return _decode_entry_result(
+        result,
+        name=path.name,
         layout=layout,
-        registry_updated_at=info.st_mtime,
         expected_job_id=expected_job_id,
     )
 
@@ -763,19 +779,44 @@ def list_all(
             continue
         if not exists:
             continue
-        for f in sorted(directory.glob("*.json")):
-            try:
-                entry = _read_entry_path(
-                    f,
-                    layout=layout,
-                    expected_job_id=f.stem,
-                )
-                entries[entry.job_id] = entry
-            except Exception as exc:
-                if damage is not None:
-                    detail = " ".join(str(exc).split()) or type(exc).__name__
-                    damage.append(RegistryDamage(path=f.name, detail=detail))
+        try:
+            names = sorted(
+                name
+                for name in os.listdir(directory)
+                if name.endswith(".json") and not name.startswith(".")
+            )
+        except OSError as exc:
+            if damage is not None:
+                damage.append(RegistryDamage(path=str(directory), detail=str(exc)))
+            continue
+        # One pinned, validated directory descriptor serves the whole scan
+        # instead of re-validating the directory for every record.
+        with bounded_directory_reader(
+            directory,
+            max_bytes=MAX_JOB_RECORD_BYTES,
+        ) as read_name:
+            if read_name is None:
                 continue
+            for name in names:
+                try:
+                    try:
+                        result = read_name(name)
+                    except PrivateStateError as exc:
+                        raise RegistryError(
+                            f"cannot safely open registry record: {name}"
+                        ) from exc
+                    entry = _decode_entry_result(
+                        result,
+                        name=name,
+                        layout=layout,
+                        expected_job_id=name[: -len(".json")],
+                    )
+                    entries[entry.job_id] = entry
+                except Exception as exc:
+                    if damage is not None:
+                        detail = " ".join(str(exc).split()) or type(exc).__name__
+                        damage.append(RegistryDamage(path=name, detail=detail))
+                    continue
     return [entries[job_id] for job_id in sorted(entries)]
 
 
