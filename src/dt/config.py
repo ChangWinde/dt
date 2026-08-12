@@ -40,6 +40,11 @@ MAX_QUEUE_POLL_S = 24 * 3600
 MAX_QUEUE_ACTIVE_POLL_S = 3600.0
 SITE_ARTIFACT_POLICIES = frozenset({"direct", "site-cache-first", "topology-aware"})
 _SSH_DESTINATION_RE = re.compile(r"^[A-Za-z0-9_.@:%+\[\]-]+$")
+# lan_address is spliced into `address:path` rsync/ssh targets, so unlike a
+# general SSH destination it can never carry `:` (host:port, bare IPv6) or
+# brackets: the first colon would be read as the path separator and the port
+# silently dropped in favour of lan_port.
+_LAN_ADDRESS_RE = re.compile(r"^[A-Za-z0-9_.@%+-]+$")
 _CONFIG_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _LOAD_CACHE_LOCK = Lock()
 _LOAD_CACHE: (
@@ -410,6 +415,22 @@ def _ssh_destination(value: object, label: str) -> str:
     return destination
 
 
+def _lan_address(value: object, label: str) -> str:
+    address = _nonempty_string(value, label)
+    if (
+        len(address) > MAX_SSH_DESTINATION_LENGTH
+        or address.startswith("-")
+        or _LAN_ADDRESS_RE.fullmatch(address) is None
+    ):
+        raise ConfigError(
+            f"`{label}` must be a bare host, IPv4 address, or user@host; "
+            "`host:port`, brackets, and bare IPv6 are rejected because the "
+            "address is spliced into `address:path` transfer targets "
+            "(set `lan_port` for a non-default port)"
+        )
+    return address
+
+
 def _integer(value: object, label: str) -> int:
     if isinstance(value, bool):
         raise ConfigError(f"`{label}` must be an integer")
@@ -492,7 +513,7 @@ def _parse_nodes(raw: object) -> list[Node]:
             )
             raw_lan_address = item.get("lan_address")
             lan_address = (
-                _ssh_destination(raw_lan_address, "nodes[].lan_address")
+                _lan_address(raw_lan_address, "nodes[].lan_address")
                 if raw_lan_address is not None
                 else None
             )
@@ -1006,10 +1027,17 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         if raw_proxy is None:
             proxy = None
         else:
+            # The value is exported verbatim as HTTP_PROXY/HTTPS_PROXY for
+            # every job and environment build, so it must be a real HTTP(S)
+            # proxy URL, mirroring the webhook validation.
             proxy = _nonempty_string(raw_proxy, "proxy")
-            if "://" not in proxy:
+            parsed_proxy = urlsplit(proxy)
+            if parsed_proxy.scheme not in {"http", "https"} or (
+                parsed_proxy.hostname is None
+            ):
                 raise ConfigError(
-                    "`proxy` must include a scheme, for example http://host:3128"
+                    "`proxy` must be an HTTP(S) proxy URL with a hostname, "
+                    "for example http://host:3128"
                 )
         nodes = _parse_nodes(data.get("nodes") or [])
         sites = _parse_sites(data.get("sites"), nodes)
@@ -1036,6 +1064,49 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         )
 
     raise ConfigError("config must contain `centers` (laptop) or `center` (head)")
+
+
+class _UniqueKeyLoader(yaml.SafeLoader):  # type: ignore[misc]  # yaml is untyped
+    """safe_load that rejects duplicate mapping keys instead of last-wins.
+
+    YAML keeps only the final occurrence of a repeated key, so a stricter
+    guard placed earlier in the file (a lower `disk_min_gib`, a tighter
+    `max_hours`) can be silently overridden by a later typo. Legitimate
+    ``<<`` merge-key overrides keep their standard meaning.
+    """
+
+    def construct_mapping(
+        self, node: yaml.MappingNode, deep: bool = False
+    ) -> dict[object, object]:
+        seen: set[object] = set()
+        for key_node, _value_node in node.value:
+            if key_node.tag == "tag:yaml.org,2002:merge":
+                continue
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in seen
+            except TypeError:
+                # An unhashable key cannot collide here; the schema layer
+                # rejects it with its own diagnostic.
+                continue
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            seen.add(key)
+        mapping: dict[object, object] = super().construct_mapping(node, deep=deep)
+        return mapping
+
+
+def _parse_yaml_strict(payload: str) -> object:
+    loader = _UniqueKeyLoader(payload)
+    try:
+        return loader.get_single_data()
+    finally:
+        loader.dispose()
 
 
 def load() -> HeadConfig | LaptopConfig:
@@ -1093,7 +1164,7 @@ def load() -> HeadConfig | LaptopConfig:
         if opened_signature != _config_file_signature(path, finished):
             raise ConfigError(f"config changed while being read: {path}")
         try:
-            data = yaml.safe_load(payload)
+            data = _parse_yaml_strict(payload)
         except yaml.YAMLError as exc:
             raise ConfigError(f"cannot parse config {path}: {exc}") from None
         except RecursionError:

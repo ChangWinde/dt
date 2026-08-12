@@ -606,6 +606,59 @@ def test_proxy_requires_a_scheme():
     assert ok.proxy == "http://host:3128"
 
 
+def test_proxy_requires_an_http_scheme_and_hostname():
+    # The value is exported verbatim as HTTP_PROXY/HTTPS_PROXY into every
+    # job; a non-HTTP scheme or a hostless URL breaks all egress silently.
+    for bad in ("ftp://mirror", "socks5://host:1080", "http://"):
+        with pytest.raises(ConfigError, match=r"HTTP\(S\) proxy"):
+            parse({"center": "c", "nodes": ["n1"], "proxy": bad})
+    ok = parse({"center": "c", "nodes": ["n1"], "proxy": "https://host:3128"})
+    assert ok.proxy == "https://host:3128"
+
+
+def test_lan_address_rejects_ports_brackets_and_bare_ipv6():
+    # lan_address is spliced into `address:path` rsync/ssh targets: the
+    # first colon reads as the path separator, so `host:port` silently
+    # dropped its port (lan_port stayed 22) and bare IPv6 broke the target.
+    for bad in ("node1:2222", "2001:db8::1", "[2001:db8::1]:22"):
+        with pytest.raises(ConfigError, match="lan_port"):
+            parse(
+                {
+                    "center": "c",
+                    "nodes": [{"name": "n1", "lan_address": bad}],
+                }
+            )
+    ok = parse(
+        {
+            "center": "c",
+            "nodes": [{"name": "n1", "lan_address": "lyf@172.16.6.91"}],
+        }
+    )
+    assert ok.nodes[0].lan_address == "lyf@172.16.6.91"
+
+
+def test_load_rejects_duplicate_yaml_keys(tmp_path, monkeypatch):
+    # safe_load keeps only the final occurrence, so a stricter guard placed
+    # earlier in the file would be silently overridden by a later typo.
+    path = tmp_path / "config.yaml"
+    path.write_text("center: c\nnodes: [n1]\ndisk_min_gib: 99\ndisk_min_gib: 0\n")
+    monkeypatch.setenv("DT_CONFIG", str(path))
+
+    with pytest.raises(ConfigError, match="duplicate key 'disk_min_gib'"):
+        load()
+
+
+def test_load_rejects_duplicate_keys_in_nested_mappings(tmp_path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "center: c\nnodes:\n  - name: n1\n    gpus: 1\n    gpus: 8\n",
+    )
+    monkeypatch.setenv("DT_CONFIG", str(path))
+
+    with pytest.raises(ConfigError, match="duplicate key 'gpus'"):
+        load()
+
+
 def test_load_wraps_deeply_nested_yaml_as_config_error(tmp_path, monkeypatch):
     path = tmp_path / "config.yaml"
     path.write_text("center: test\n")
@@ -614,7 +667,7 @@ def test_load_wraps_deeply_nested_yaml_as_config_error(tmp_path, monkeypatch):
     def deep(_payload):
         raise RecursionError("maximum recursion depth exceeded")
 
-    monkeypatch.setattr(config_module.yaml, "safe_load", deep)
+    monkeypatch.setattr(config_module, "_parse_yaml_strict", deep)
 
     with pytest.raises(ConfigError, match="too deep"):
         load()
@@ -642,14 +695,14 @@ def test_load_reuses_unchanged_parse_and_invalidates_after_atomic_replace(
     path.write_text("center: first\nnodes: [n1]\n")
     monkeypatch.setenv("DT_CONFIG", str(path))
     calls = 0
-    original = config_module.yaml.safe_load
+    original = config_module._parse_yaml_strict
 
     def counted_load(stream):
         nonlocal calls
         calls += 1
         return original(stream)
 
-    monkeypatch.setattr(config_module.yaml, "safe_load", counted_load)
+    monkeypatch.setattr(config_module, "_parse_yaml_strict", counted_load)
 
     first = load()
     repeated = load()
