@@ -225,9 +225,6 @@ class JobEntry:
     job_relpath: str | None = None
     recovered_at: float | None = None
 
-    def created_str(self) -> str:
-        return datetime.fromtimestamp(self.created_at).strftime("%m-%d %H:%M")
-
 
 def effective_result_state(entry: JobEntry) -> str | None:
     """Return an explicit result or a backward-compatible lifecycle default."""

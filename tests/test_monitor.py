@@ -2267,7 +2267,9 @@ def test_smart_log_tail_keeps_home_relative_display_separate_from_read_path(tmp_
         text=True,
         env={**os.environ, "HOME": str(tmp_path)},
     )
-    selected, display, tail = cli._parse_job_log_tail(entry, proc.stdout)
+    selected, display, tail, _updated_at, _resource = cli._parse_job_log_tail_response(
+        entry, proc.stdout
+    )
 
     assert proc.returncode == 0, proc.stderr
     assert selected == "~/dt/worker/jobs/nested/outputs/registry/train.log"
@@ -2388,7 +2390,7 @@ def test_smart_log_tail_rejects_source_outside_job():
         cmd="true",
     )
 
-    selected, display, tail = cli._parse_job_log_tail(
+    selected, display, tail, _updated_at, _resource = cli._parse_job_log_tail_response(
         entry,
         f"{cli.LOG_SOURCE_MARK}\n/etc/shadow\nnot safe\n",
     )

@@ -5977,14 +5977,6 @@ def _parse_job_log_tail_response(
     return path, display, tail, updated_at, resource_sample
 
 
-def _parse_job_log_tail(entry: jobs_mod.JobEntry, text: str) -> tuple[str, str, str]:
-    """Parse a smart-tail response; accept old raw-tail fixtures as stdout."""
-    path, display, tail, _updated_at, _resource = _parse_job_log_tail_response(
-        entry, text
-    )
-    return path, display, tail
-
-
 def _parse_log_progress(text: str) -> JsonDict | None:
     """Extract only explicit, broadly recognizable progress facts from logs."""
     clean = _ANSI_ESCAPE_RE.sub("", text or "")

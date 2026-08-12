@@ -1971,7 +1971,8 @@ def capture_snapshot(
             shutil.rmtree(temp_root, ignore_errors=True)
 
 
-def _code_src(node: Node, job_dir: str) -> str:
+def _code_endpoint(node: Node, job_dir: str) -> str:
+    """One rsync endpoint for a job's code tree, source or destination."""
     return rsync_destination(
         node.name,
         node.local,
@@ -2014,7 +2015,7 @@ def resolve_snapshot(
     try:
         log(f"backfilling exact snapshot {digest[:12]} from {entry.node}")
         proc = rsync(
-            _code_src(node, entry.job_dir),
+            _code_endpoint(node, entry.job_dir),
             f"{temp_code}/",
             excludes=_excludes(cfg),
             timeout=BULK_TRANSFER_TIMEOUT_S,
@@ -2439,15 +2440,6 @@ def _setup_input_identities(
     return identities
 
 
-def _code_dst(node: Node, job_dir: str) -> str:
-    return rsync_destination(
-        node.name,
-        node.local,
-        f"{job_dir}/code",
-        directory=True,
-    )
-
-
 def _job_dst(node: Node, job_dir: str) -> str:
     return rsync_destination(
         node.name,
@@ -2551,7 +2543,7 @@ def snapshot(
             def transfer_code(checksum: bool) -> subprocess.CompletedProcess[str]:
                 return rsync(
                     f"{project_dir}/",
-                    _code_dst(node, job_dir),
+                    _code_endpoint(node, job_dir),
                     excludes=None if pre_filtered else _excludes(cfg),
                     # Relative to the destination code dir, so this resolves on
                     # the node regardless of where its home is.
@@ -4724,7 +4716,7 @@ def _dispatch_queued_active(
                 ) -> subprocess.CompletedProcess[str]:
                     return rsync(
                         f"{staged_code}/",
-                        _code_dst(node, node_job_dir),
+                        _code_endpoint(node, node_job_dir),
                         link_dest=link_dest,
                         copy_dest=stable_copy_dest,
                         timeout=BULK_TRANSFER_TIMEOUT_S,
@@ -4784,7 +4776,7 @@ def _dispatch_queued_active(
             # remote worktree) may have left generated files under code/.
             proc = rsync(
                 f"{staging}/code/",
-                _code_dst(node, node_job_dir),
+                _code_endpoint(node, node_job_dir),
                 delete=True,
                 timeout=BULK_TRANSFER_TIMEOUT_S,
                 retries=2,
