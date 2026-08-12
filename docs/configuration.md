@@ -217,6 +217,14 @@ SSH multiplexing is separated end to end:
 - gateway-executed LAN fan-out uses `~/.ssh/dt/artifact-relay/%C` with a
   30-second persist window.
 
+Unix sockets cap the whole path at ~104 bytes, so when the state directory is
+too deep for that budget (long home paths, containerized state roots) DT
+relocates the sockets to a short per-user runtime directory
+(`$XDG_RUNTIME_DIR/dt-m-<hash>/…`, falling back to the system temp dir) and
+keeps multiplexing; the hash pins the sockets to their state root. If nothing
+fits, the overlay disables multiplexing explicitly rather than letting every
+mux attempt fail.
+
 DT supplies a generated `-F` overlay to OpenSSH, so implicit ProxyJump
 subprocesses inherit the selected pool. A final-target `ControlPath` override
 alone is insufficient and is not used as the isolation boundary.
