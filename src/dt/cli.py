@@ -5746,7 +5746,14 @@ _LOG_NUL_RUN_RE = re.compile(r"\x00+")
 
 def _stable_remote_exit(returncode: int) -> int:
     """Hide SSH's process-specific 255 behind dt's stable unreachable code."""
-    return EXIT_UNREACHABLE if returncode == 255 else returncode
+    if returncode == 255:
+        return EXIT_UNREACHABLE
+    if returncode < 0:
+        # A negative code is death by signal (-N). Map it to the POSIX 128+N so
+        # the process exit code does not wrap around (SIGPIPE -13 -> 141, not
+        # 243 when `dt logs -f | head` closes the pipe early).
+        return 128 + (-returncode)
+    return returncode
 
 
 def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:

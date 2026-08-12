@@ -2414,6 +2414,15 @@ def test_log_progress_parses_live_eta_and_latest_step():
     }
 
 
+def test_stable_remote_exit_normalizes_signal_codes():
+    assert cli._stable_remote_exit(0) == 0
+    assert cli._stable_remote_exit(1) == 1
+    assert cli._stable_remote_exit(255) == cli.EXIT_UNREACHABLE
+    # A negative code is death by signal; 128+N avoids exit-code wraparound.
+    assert cli._stable_remote_exit(-13) == 141
+    assert cli._stable_remote_exit(-9) == 137
+
+
 def test_log_progress_drops_job_injected_nonfinite_and_oversized():
     # Job stdout is fully job-controlled; these must never reach the JSON.
     inf_throughput = cli._parse_log_progress("Throughput: " + "9" * 400 + " samples/s")
