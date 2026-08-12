@@ -264,14 +264,20 @@ def inventory(
     disk_bytes: Callable[[Path], int | None],
 ) -> dict[str, object]:
     """Collect one stable inventory payload for all DT-managed paths."""
-    results_root = cfg.results_dir()
+    # Inventory is read-only by contract: never call the *_dir() accessors,
+    # which materialize their directory. Diagnosing a full or read-only disk
+    # is exactly when mkdir would crash this command; a missing path simply
+    # reports zero bytes.
+    results_root = (
+        cfg.results_root if cfg.results_root is not None else cfg.head_root / "results"
+    )
     if cfg.layout == ROLE_LAYOUT:
         head_paths = {
             "state": cfg.head_root / "state",
             "snapshots": cfg.head_root / "snapshots",
             "results": results_root,
-            "quarantine": cfg.quarantine_dir(),
-            "cache": cfg.cache_dir(),
+            "quarantine": cfg.head_root / "quarantine",
+            "cache": cfg.head_root / "cache",
         }
         legacy_paths = {
             "legacy_registry": cfg.legacy_registry_dir(),
