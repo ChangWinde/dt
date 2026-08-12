@@ -5434,7 +5434,15 @@ def ps(
 
     def gather(include_progress: bool) -> tuple[list[JsonDict], dict[str, str]]:
         window_kwargs: JsonDict = {"remote_window": True} if remote_window else {}
-        if limit is not None and not legacy_issue_window and not query_mode:
+        if (
+            limit is not None
+            and not legacy_issue_window
+            and not query_mode
+            and not issues
+        ):
+            # With --issues the limit must apply after issue filtering (below),
+            # or the newest N rows are taken before the older failures are even
+            # considered and the panel reads all-green.
             window_kwargs["limit"] = limit
         if issues:
             window_kwargs["issues_only"] = True
@@ -5454,7 +5462,13 @@ def ps(
                 **window_kwargs,
             )
         if issues and not legacy_issue_window:
-            rows = _limit_ps_rows(_ps_issue_rows(rows), limit)
+            # Filter the whole set to issue rows first; apply the human --limit
+            # only outside query mode. In query mode every issue row is handed
+            # to build_payload so the envelope's eligible/next_cursor count the
+            # full issue set instead of a pre-truncated slice.
+            rows = _ps_issue_rows(rows)
+            if not query_mode:
+                rows = _limit_ps_rows(rows, limit)
         return rows, errors
 
     if query_mode:

@@ -49,6 +49,47 @@ def test_ps_surfaces_damaged_registry_rows(tmp_path):
     assert "unreadable" in errors["local registry"]
 
 
+def test_ps_issues_filters_before_the_human_limit(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    for i in range(3):
+        cli.jobs_mod.save(
+            cfg, _entry(f"fail-{i}", created_at=float(i), status="failed")
+        )
+    for i in range(5):
+        cli.jobs_mod.save(cfg, _entry(f"ok-{i}", created_at=float(10 + i)))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, ["ps", "--issues", "--limit", "2", "--json"])
+
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.stdout)
+    ids = {row["job_id"] for row in rows}
+    # The older failures must survive the limit, not be truncated away first.
+    assert len(rows) == 2
+    assert ids <= {"fail-0", "fail-1", "fail-2"}
+
+
+def test_ps_issues_query_envelope_counts_all_issues(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    for i in range(3):
+        cli.jobs_mod.save(
+            cfg, _entry(f"fail-{i}", created_at=float(i), status="failed")
+        )
+    for i in range(5):
+        cli.jobs_mod.save(cfg, _entry(f"ok-{i}", created_at=float(10 + i)))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(
+        cli.app, ["ps", "--compact", "--issues", "--limit", "2", "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    # eligible/total must reflect every issue, not a pre-truncated slice.
+    assert payload["summary"]["total"] == 3
+    assert payload["page"]["returned"] == 2
+
+
 def test_ps_compact_is_bounded_and_legacy_json_stays_an_array(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     for index in range(3):
