@@ -336,6 +336,42 @@ def clean_jobs(
                 )
                 continue
             if entry.node != "-":
+                # compact's preflight gates, mirrored: a stale row pointing at
+                # an unconfigured node or the wrong locality would rm -rf a
+                # nonexistent per-job slot on the wrong executor, return 0,
+                # and delete the only record still naming the real workdir.
+                node = next(
+                    (item for item in cfg.nodes if item.name == entry.node),
+                    None,
+                )
+                if node is None:
+                    message = f"node {entry.node!r} is not in the configuration"
+                    log(f"{entry.job_id}: {message}; registry retained")
+                    failures.append(
+                        CleanFailure(
+                            job_id=entry.job_id,
+                            node=entry.node,
+                            kind="node_not_configured",
+                            message=message,
+                        )
+                    )
+                    continue
+                if node.local != entry.node_local:
+                    message = (
+                        f"registry row says node_local={entry.node_local} but "
+                        f"the configured node is "
+                        f"{'local' if node.local else 'remote'}"
+                    )
+                    log(f"{entry.job_id}: {message}; registry retained")
+                    failures.append(
+                        CleanFailure(
+                            job_id=entry.job_id,
+                            node=entry.node,
+                            kind="node_identity_mismatch",
+                            message=message,
+                        )
+                    )
+                    continue
                 live_guard = ""
                 if entry.status == "lost" and entry.pgid is not None:
                     live_guard = (

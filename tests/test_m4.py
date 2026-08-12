@@ -768,6 +768,26 @@ def test_clean_jobs_selection_and_staging(tmp_path):
     assert {e.job_id for e in list_all(cfg)} == {"old-queued", "new-done"}
 
 
+def test_clean_refuses_misdirected_node_identity(tmp_path):
+    # A stale row naming an unconfigured node or the wrong locality must fail
+    # visibly: rm -rf against the wrong executor hits a nonexistent per-job
+    # slot, returns 0, and would delete the only record still pointing at the
+    # real workdir.
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("ghost-node", "finished", created_at=1.0, node="ghost"))
+    save(cfg, _entry("flipped", "finished", created_at=1.0, node="n1"))
+
+    report = clean_jobs(cfg, cutoff_ts=100.0, envs=False, log=lambda m: None)
+
+    assert report.removed == 0
+    assert {failure.kind for failure in report.failures} == {
+        "node_not_configured",
+        "node_identity_mismatch",
+    }
+    assert load(cfg, "ghost-node") is not None
+    assert load(cfg, "flipped") is not None
+
+
 def test_dependency_settled_treats_recoverable_lost_as_pending():
     from dt.dispatch import LOST_RECOVERY_WINDOW_S, _dependency_settled
 
@@ -873,6 +893,9 @@ def test_clean_rejects_job_dir_outside_exact_managed_slot(tmp_path, monkeypatch)
 
 def test_clean_retains_registry_when_remote_delete_fails(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
+    # The row must pass the node-identity gate to reach the remote delete, so
+    # the configured node's locality has to match the registry row (remote).
+    cfg.nodes = [Node(name="n1")]
     entry = _entry(
         "remote-failure",
         "finished",
