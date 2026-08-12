@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
@@ -140,12 +141,27 @@ def parse_resource_jsonl(text: str) -> tuple[list[JsonDict], int]:
     return rows, invalid
 
 
+# Telemetry rows are job-writable. A hostile or corrupt field can be a
+# non-finite float or a 400-digit int; the latter overflows float() during
+# aggregation (and math.isfinite itself). Bound every number well above any
+# real metric (timestamps ~1e9, MiB ~1e6, percent 0-100) so summaries stay
+# finite and JSON-valid.
+_MAX_METRIC_MAGNITUDE = 10**15
+
+
+def _safe_number(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+    elif abs(value) > _MAX_METRIC_MAGNITUDE:
+        return None
+    return value
+
+
 def _numbers(values: list[object]) -> list[int | float]:
-    return [
-        value
-        for value in values
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
-    ]
+    return [n for value in values if (n := _safe_number(value)) is not None]
 
 
 def summarize_resources(
@@ -175,13 +191,11 @@ def summarize_resources(
         util = _numbers([sample.get("utilization_pct") for sample in samples])
         busy_util = [value for value in util if value > 0]
         busy_timestamps = [
-            float(timestamp)
+            float(safe_ts)
             for timestamp, value in gpu_activity_samples[index]
-            if isinstance(timestamp, (int, float))
-            and not isinstance(timestamp, bool)
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and value > 0
+            if (safe_ts := _safe_number(timestamp)) is not None
+            and (safe_val := _safe_number(value)) is not None
+            and safe_val > 0
         ]
         mem = _numbers([sample.get("mem_used_mib") for sample in samples])
         total = _numbers([sample.get("mem_total_mib") for sample in samples])

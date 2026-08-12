@@ -1480,6 +1480,27 @@ def test_gpu_activity_summary_tolerates_missing_utilization_and_timestamps():
     assert gpu["last_busy_before_end_s"] is None
 
 
+def test_resource_summary_bounds_hostile_job_written_numbers():
+    # timestamp is a 400-digit int and utilization is inf: job stdout is fully
+    # job-controlled, so aggregation must not raise OverflowError and the
+    # summary must remain valid JSON.
+    rows = [
+        {
+            "timestamp": int("9" * 400),
+            "gpus": [{"index": 0, "utilization_pct": float("inf"), "mem_used_mib": 10}],
+            "host": {"cpu_load1": float("nan")},
+        },
+        {
+            "timestamp": 1000.0,
+            "gpus": [{"index": 0, "utilization_pct": 50, "mem_used_mib": 20}],
+            "host": {"cpu_load1": 1.5},
+        },
+    ]
+    summary = _summarize_resources(rows)
+    json.dumps(summary, allow_nan=False)  # must not raise
+    assert summary["gpus"]["0"]["util_busy_mean_pct"] == 50.0
+
+
 def test_resource_summary_and_ui_surface_job_attributed_usage():
     rows = [
         {
