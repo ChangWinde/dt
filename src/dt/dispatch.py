@@ -1077,26 +1077,55 @@ def reconcile_submission_request(
     cfg: HeadConfig,
     record: intent_mod.RequestRecord,
 ) -> tuple[intent_mod.RequestRecord, JobEntry | None]:
-    """Repair an interrupted preparing receipt from its authoritative job row."""
+    """Repair an interrupted receipt from its authoritative job row.
+
+    ``preparing`` is an interrupted submission; ``uncertain`` is a launch
+    whose outcome was unknown when the receipt was written.  Both heal from
+    the job row: a verified `dt kill` cleanup (row killed, or finished when
+    the exit marker surfaced) settles an uncertain launch, so the receipt
+    must follow it.  Leaving the receipt uncertain forever made the same
+    request id answer RequestOutcomeUnknown for good and pushed callers to
+    abandon the id and resubmit blind.
+    """
     existing = load(cfg, record.job_id)
-    if record.state != "preparing" or existing is None:
+    if existing is None:
         return record, existing
-    if (existing.reason or "").startswith(UNCERTAIN_LAUNCH_PREFIX):
-        updated = intent_mod.transition(
-            record,
-            "uncertain",
-            error_kind="launch_outcome_unknown",
-            error_message=existing.reason,
-        )
-    elif existing.status == "failed":
-        updated = intent_mod.transition(
-            record,
-            "confirmed",
-            error_kind="failed_before_start",
-            error_message=existing.reason,
-        )
+    if record.state == "preparing":
+        if (existing.reason or "").startswith(UNCERTAIN_LAUNCH_PREFIX):
+            updated = intent_mod.transition(
+                record,
+                "uncertain",
+                error_kind="launch_outcome_unknown",
+                error_message=existing.reason,
+            )
+        elif existing.status == "failed":
+            updated = intent_mod.transition(
+                record,
+                "confirmed",
+                error_kind="failed_before_start",
+                error_message=existing.reason,
+            )
+        else:
+            updated = intent_mod.transition(record, "confirmed")
+    elif record.state == "uncertain":
+        if is_uncertain_launch(existing) or existing.status == "lost":
+            # Still unresolved (or inside the lost recovery window): the
+            # receipt keeps refusing duplicate submissions.
+            return record, existing
+        if existing.status in {"killed", "failed", "skipped"}:
+            updated = intent_mod.transition(
+                record,
+                "confirmed",
+                error_kind="failed_before_start",
+                error_message=existing.reason,
+            )
+        else:
+            # The launch demonstrably happened (running, or finished once
+            # its exit marker was recovered): the receipt becomes a normal
+            # idempotent replay pointing at the real job.
+            updated = intent_mod.transition(record, "confirmed")
     else:
-        updated = intent_mod.transition(record, "confirmed")
+        return record, existing
     intent_mod.save(cfg, updated)
     return updated, existing
 
@@ -4250,8 +4279,10 @@ def dispatch_queued(
     log: Callable[[str], None],
 ) -> tuple[str, str | None]:
     """Try to place a queued job now. Returns (outcome, detail) with outcome in:
-    started | busy | blocked | failed | killed | cancel-failed.
-    Called by the agent (and tests)."""
+    started | busy | waiting | blocked | failed | killed | cancel-failed.
+    ``waiting`` is a cheap local dependency wait; ``blocked`` is a
+    job-specific placement blocker whose retry re-probes nodes, so the agent
+    may back it off. Called by the agent (and tests)."""
     with job_lock(cfg, entry.job_id):
         current = load(cfg, entry.job_id) or entry
         if current.status != "queued":
@@ -4276,7 +4307,7 @@ def dispatch_queued(
                     current.reason = reason
                     save(cfg, current)
                 entry.__dict__.update(current.__dict__)
-                return "blocked", unreadable
+                return "waiting", unreadable
             if predecessor is None:
                 detail = f"dependency {dependency} was not found"
                 current.status = "failed"
@@ -4294,7 +4325,7 @@ def dispatch_queued(
                     current.reason = reason
                     save(cfg, current)
                 entry.__dict__.update(current.__dict__)
-                return "blocked", detail
+                return "waiting", detail
             if not _job_succeeded(predecessor):
                 exit_note = (
                     f", exit {predecessor.exit_code}"
@@ -4341,7 +4372,7 @@ def dispatch_queued(
                     current.reason = reason
                     save(cfg, current)
                 entry.__dict__.update(current.__dict__)
-                return "blocked", unreadable
+                return "waiting", unreadable
             if predecessor is None:
                 detail = f"completion dependency {completion_dependency} was not found"
                 current.status = "failed"
@@ -4362,7 +4393,7 @@ def dispatch_queued(
                     current.reason = reason
                     save(cfg, current)
                 entry.__dict__.update(current.__dict__)
-                return "blocked", detail
+                return "waiting", detail
             if current.reason is not None:
                 current.reason = None
                 save(cfg, current)
@@ -4385,7 +4416,7 @@ def dispatch_queued(
                     current.reason = reason
                     save(cfg, current)
                 entry.__dict__.update(current.__dict__)
-                return "blocked", unreadable
+                return "waiting", unreadable
             if predecessor is None:
                 detail = f"result dependency {result_dependency} was not found"
                 current.status = "failed"
@@ -4405,7 +4436,7 @@ def dispatch_queued(
                     current.reason = reason
                     save(cfg, current)
                 entry.__dict__.update(current.__dict__)
-                return "blocked", detail
+                return "waiting", detail
             observed = effective_result_state(predecessor) or predecessor.status
             if observed not in current.after_result_states:
                 expected = ",".join(current.after_result_states)

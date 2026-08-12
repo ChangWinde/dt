@@ -5170,7 +5170,7 @@ def test_dispatch_queued_blocks_on_unreadable_dependency(tmp_path):
 
     outcome, detail = dispatch.dispatch_queued(cfg, dep, lambda _m: None)
 
-    assert outcome == "blocked"
+    assert outcome == "waiting"
     assert "unreadable" in (detail or "")
     stored = jobs.load(cfg, dep.job_id)
     assert stored is not None
@@ -5216,7 +5216,7 @@ def test_uncertain_launch_predecessor_is_not_settled(tmp_path):
 
     # A failed-but-unproven launch may still be running; the dependent must
     # wait for a verified kill, not be released or skipped.
-    assert outcome == "blocked"
+    assert outcome == "waiting"
     assert jobs.load(cfg, dep.job_id).status == "queued"
 
 

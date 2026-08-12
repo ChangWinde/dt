@@ -791,7 +791,7 @@ def test_dependency_waits_before_capacity_or_staging_probe(tmp_path, monkeypatch
     )
 
     assert dispatch_queued(cfg, successor, lambda message: None) == (
-        "blocked",
+        "waiting",
         "dependency pred is running",
     )
     persisted = load(cfg, "next")
@@ -1070,7 +1070,7 @@ def test_after_complete_waits_without_pinning_to_predecessor_node(
     )
 
     assert dispatch_queued(cfg, successor, lambda _message: None) == (
-        "blocked",
+        "waiting",
         "completion dependency pred is running",
     )
     persisted = load(cfg, "finalizer")
@@ -1241,9 +1241,91 @@ def test_pending_dependency_does_not_starve_unrelated_queue_work(
     )
 
     assert process_once(cfg, lambda message: None) == [
-        ("dependent", "blocked"),
+        ("dependent", "waiting"),
         ("independent", "started"),
     ]
+
+
+def test_blocked_placement_backs_off_while_dependency_waits_stay_hot(
+    tmp_path,
+    monkeypatch,
+):
+    # A02-6: a permanently blocked entry used to re-probe every node and
+    # restage at the full 2s cadence forever. Placement blockers now retry
+    # on a capped exponential backoff, while cheap dependency waits keep
+    # their every-tick reactivity and later runnable work is untouched.
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("stuck", "queued", created_at=1.0))
+    save(cfg, _entry("chained", "queued", created_at=2.0))
+    dispatched: dict[str, int] = {}
+
+    def fake_dispatch(cfg_, entry_, log_):
+        dispatched[entry_.job_id] = dispatched.get(entry_.job_id, 0) + 1
+        if entry_.job_id == "stuck":
+            return "blocked", "n1: path-missing: /data/x"
+        return "waiting", "dependency guard is running"
+
+    monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
+    monkeypatch.setattr(
+        agent,
+        "_reconcile_jobs",
+        lambda cfg_, log_, entries=None: entries or [],
+    )
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(agent.time, "monotonic", lambda: clock["now"])
+    backoff: dict[str, tuple[int, float]] = {}
+
+    outcomes, _ = agent._process_once_with_snapshot(
+        cfg, lambda _m: None, blocked_backoff=backoff
+    )
+    assert outcomes == [("stuck", "blocked"), ("chained", "waiting")]
+    assert dispatched == {"stuck": 1, "chained": 1}
+
+    clock["now"] = 1002.0  # inside the 5s backoff window
+    outcomes, _ = agent._process_once_with_snapshot(
+        cfg, lambda _m: None, blocked_backoff=backoff
+    )
+    assert outcomes == [("stuck", "blocked"), ("chained", "waiting")]
+    assert dispatched == {"stuck": 1, "chained": 2}
+
+    clock["now"] = 1006.0  # past the first deadline: one full retry
+    agent._process_once_with_snapshot(cfg, lambda _m: None, blocked_backoff=backoff)
+    assert dispatched == {"stuck": 2, "chained": 3}
+
+    clock["now"] = 1012.0  # second delay doubled to 10s; still waiting
+    agent._process_once_with_snapshot(cfg, lambda _m: None, blocked_backoff=backoff)
+    assert dispatched == {"stuck": 2, "chained": 4}
+
+
+def test_blocked_backoff_clears_once_the_job_dispatches(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("flaky", "queued", created_at=1.0))
+    outcome = {"value": ("blocked", "n1: path-missing: /data/x")}
+    monkeypatch.setattr(
+        agent,
+        "dispatch_queued",
+        lambda cfg_, entry_, log_: outcome["value"],
+    )
+    monkeypatch.setattr(
+        agent,
+        "_reconcile_jobs",
+        lambda cfg_, log_, entries=None: entries or [],
+    )
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(agent.time, "monotonic", lambda: clock["now"])
+    backoff: dict[str, tuple[int, float]] = {}
+
+    agent._process_once_with_snapshot(cfg, lambda _m: None, blocked_backoff=backoff)
+    assert "flaky" in backoff
+
+    clock["now"] = 1006.0
+    outcome["value"] = ("started", "n1")
+    agent._process_once_with_snapshot(cfg, lambda _m: None, blocked_backoff=backoff)
+    assert backoff == {}
 
 
 def test_agent_deduplicates_unchanged_blocked_diagnostics_across_ticks(
@@ -1283,9 +1365,9 @@ def test_agent_deduplicates_unchanged_blocked_diagnostics_across_ticks(
             messages.append,
             blocked_log_state=blocked_log_state,
         )
-        assert outcomes == [("dependent", "blocked")]
+        assert outcomes == [("dependent", "waiting")]
 
-    assert sum("dependent blocked" in message for message in messages) == 1
+    assert sum("dependent waiting" in message for message in messages) == 1
 
     save(
         cfg,
@@ -1306,8 +1388,8 @@ def test_agent_deduplicates_unchanged_blocked_diagnostics_across_ticks(
         blocked_log_state=blocked_log_state,
     )
 
-    assert outcomes == [("dependent", "blocked")]
-    assert sum("dependent blocked" in message for message in messages) == 2
+    assert outcomes == [("dependent", "waiting")]
+    assert sum("dependent waiting" in message for message in messages) == 2
     assert "dependency guard2 is running" in messages[-1]
 
 

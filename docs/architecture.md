@@ -83,7 +83,10 @@ invoking service does not inherit ownership of active jobs.
 The agent resolves dependencies before probing GPU capacity. Dependencies can
 require success, any terminal completion, or selected typed result states. A
 false predicate becomes `skipped / dependency_skipped`. A pending dependency
-is a job-specific blocker, so unrelated runnable work can pass it. A failed or
+is a cheap local wait, re-checked every tick, and unrelated runnable work can
+pass it. A job-specific placement blocker (missing path, unfit or full node)
+also lets later work pass, but its own retries re-probe nodes, so they run on
+a capped exponential backoff instead of at full poll cadence. A failed or
 false dependency never consumes a GPU lease.
 
 Capacity waits retain FIFO fairness among jobs that can use the same capacity.

@@ -540,17 +540,46 @@ def _reconcile_jobs(
     return entries
 
 
+BLOCKED_BACKOFF_BASE_S = 5.0
+BLOCKED_BACKOFF_CAP_S = 300.0
+
+
+def _bump_blocked_backoff(
+    blocked_backoff: dict[str, tuple[int, float]] | None,
+    job_id: str,
+) -> None:
+    """Schedule the next full retry of a job-specific placement blocker.
+
+    A permanently blocked entry used to re-probe every node and restage its
+    payload at the full active-poll cadence (2s by default) forever - tens of
+    thousands of remote operations a day for one bad dataset path. Doubling
+    from 5s up to a 300s ceiling keeps transient blockers snappy while
+    capping the steady-state cost; the in-memory state simply resets on
+    agent restart, which grants one immediate retry.
+    """
+    if blocked_backoff is None:
+        return
+    retries = blocked_backoff.get(job_id, (0, 0.0))[0]
+    delay = min(BLOCKED_BACKOFF_CAP_S, BLOCKED_BACKOFF_BASE_S * (2.0**retries))
+    blocked_backoff[job_id] = (retries + 1, time.monotonic() + delay)
+
+
 def _process_once_with_snapshot(
     cfg: HeadConfig,
     log: Callable[[str], None],
     *,
     blocked_log_state: dict[str, str] | None = None,
+    blocked_backoff: dict[str, tuple[int, float]] | None = None,
 ) -> tuple[list[tuple[str, str]], list[JobEntry]]:
     """One poll tick: reconcile active jobs, then walk the queue FIFO.
 
     - started / failed / skipped / killed / cancel-failed: move on to the next job
+    - waiting (dependency not settled): skip it; the check is one local
+      registry read, so it is retried every tick for a fast chain reaction
     - blocked (job-specific: missing dataset path, unfit nodes): skip it so
-      it cannot starve the jobs behind it; retried next tick
+      it cannot starve the jobs behind it; each retry re-probes every node
+      and restages, so persistently blocked entries retry on a capped
+      exponential backoff instead of at full cost every tick
     - busy (GPU capacity): preserve FIFO for every job that could use the same
       capacity; a pinned wait may be skipped only for later work pinned to a
       different node
@@ -591,6 +620,15 @@ def _process_once_with_snapshot(
                 # whose pins are disjoint.
                 results.append((entry.job_id, "busy"))
                 continue
+        if blocked_backoff is not None:
+            deadline = blocked_backoff.get(entry.job_id)
+            if deadline is not None and time.monotonic() < deadline[1]:
+                # A persistently blocked entry keeps its diagnosis and its
+                # FIFO-skip behavior, but a full retry (every node probed,
+                # staging rebuilt) waits for its backoff deadline instead of
+                # burning the fleet every tick.
+                results.append((entry.job_id, "blocked"))
+                continue
         try:
             outcome, detail = dispatch_queued(cfg, entry, log)
         except Exception as exc:
@@ -605,10 +643,13 @@ def _process_once_with_snapshot(
             results.append((entry.job_id, "blocked"))
             if blocked_log_state is not None:
                 blocked_log_state[entry.job_id] = detail
+            _bump_blocked_backoff(blocked_backoff, entry.job_id)
             continue
         results.append((entry.job_id, outcome))
-        if blocked_log_state is not None and outcome != "blocked":
+        if blocked_log_state is not None and outcome not in ("blocked", "waiting"):
             blocked_log_state.pop(entry.job_id, None)
+        if blocked_backoff is not None and outcome != "blocked":
+            blocked_backoff.pop(entry.job_id, None)
         if outcome == "started":
             running += 1
             log(f"{entry.job_id} -> {detail}")
@@ -691,15 +732,27 @@ def _process_once_with_snapshot(
                 log(f"{entry.job_id} blocked ({blocked_detail}); trying jobs behind it")
             if blocked_log_state is not None:
                 blocked_log_state[entry.job_id] = blocked_detail
+            _bump_blocked_backoff(blocked_backoff, entry.job_id)
+        elif outcome == "waiting":
+            waiting_detail = detail or "reason unavailable"
+            if (
+                blocked_log_state is None
+                or blocked_log_state.get(entry.job_id) != waiting_detail
+            ):
+                log(f"{entry.job_id} waiting ({waiting_detail}); trying jobs behind it")
+            if blocked_log_state is not None:
+                blocked_log_state[entry.job_id] = waiting_detail
         elif outcome == "busy":
             if entry.pin_node is None:
                 break
             busy_pins.add(entry.pin_node)
-    if blocked_log_state is not None:
-        queued_ids = {entry.job_id for entry in queue}
-        for job_id in list(blocked_log_state):
+    queued_ids = {entry.job_id for entry in queue}
+    for state in (blocked_log_state, blocked_backoff):
+        if state is None:
+            continue
+        for job_id in list(state):
             if job_id not in queued_ids:
-                blocked_log_state.pop(job_id, None)
+                state.pop(job_id, None)
     return results, entries
 
 
@@ -1000,6 +1053,7 @@ def run_loop(cfg: HeadConfig) -> int:
     rejected_restart: tuple[int, float] | None = None
     completion_watchers: dict[str, subprocess.Popen[bytes]] = {}
     blocked_log_state: dict[str, str] = {}
+    blocked_backoff: dict[str, tuple[int, float]] = {}
     fd_released = False
     try:
         while not stop["flag"]:
@@ -1029,6 +1083,7 @@ def run_loop(cfg: HeadConfig) -> int:
                     cfg,
                     log,
                     blocked_log_state=blocked_log_state,
+                    blocked_backoff=blocked_backoff,
                 )
                 _sync_completion_watchers(
                     cfg,
