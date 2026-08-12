@@ -4,10 +4,9 @@ every declared node plus the tool prerequisites on it. Covers the M0 list.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import subprocess
-import ipaddress
-
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -145,19 +144,6 @@ def relay_agent_status(
     return failure
 
 
-def _parse_ip_literal(
-    value: str,
-) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
-    """Parse one IP literal, tolerating surrounding whitespace and brackets."""
-    candidate = value.strip().strip("[]")
-    if not candidate:
-        return None
-    try:
-        return ipaddress.ip_address(candidate)
-    except ValueError:
-        return None
-
-
 def annotate_lan_addresses(cfg: HeadConfig, rows: list[dict[str, Any]]) -> None:
     """Flag nodes whose pinned ``lan_address`` is no longer on the node.
 
@@ -176,26 +162,36 @@ def annotate_lan_addresses(cfg: HeadConfig, rows: list[dict[str, Any]]) -> None:
         if lan_address is None:
             continue
         checks = row["checks"]
-        pinned_ip = _parse_ip_literal(lan_address)
-        if pinned_ip is None:
-            # Hostnames and other non-literal pins cannot be checked against
-            # the advertised IP list; report unknown instead of failing a
-            # healthy cluster on a representation mismatch.
-            checks["lan"] = "unknown"
-            continue
         raw_addresses = str(checks.get("addrs", "missing"))
         if raw_addresses in ("missing", ""):
             checks["lan"] = "unknown"
             continue
-        advertised = {
-            parsed
-            for part in raw_addresses.split(",")
-            if (parsed := _parse_ip_literal(part)) is not None
-        }
-        if pinned_ip in advertised:
+        # ``lan_address`` may be an alias, host, or ``user@host``. Only its host
+        # part can be checked against the reported IPs; the username is stripped
+        # (also keeping it out of the diagnostic) and IPv6 brackets are removed.
+        host = lan_address.rsplit("@", 1)[-1].strip()
+        if host.startswith("[") and "]" in host:
+            host = host[1 : host.index("]")]
+        try:
+            pinned_ip = ipaddress.ip_address(host)
+        except ValueError:
+            # A hostname or alias cannot be confirmed against a reported IP
+            # list, so report it unverified instead of a false "stale".
+            checks["lan"] = "unknown"
+            continue
+        reported: set[ipaddress._BaseAddress] = set()
+        for part in raw_addresses.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                reported.add(ipaddress.ip_address(part))
+            except ValueError:
+                continue
+        if pinned_ip in reported:
             checks["lan"] = "ok"
         else:
-            checks["lan"] = f"stale: {lan_address} not on node"
+            checks["lan"] = f"stale: {host} not on node"
 
 
 def doctor_center(cfg: HeadConfig) -> list[dict[str, Any]]:

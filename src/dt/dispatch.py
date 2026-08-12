@@ -82,6 +82,8 @@ from .private_state import (
     PrivateStateError,
     atomic_write,
     ensure_private_directory,
+    fsync_dir,
+    fsync_tree,
     private_lock,
     read_bounded,
 )
@@ -1103,6 +1105,29 @@ def reconcile_submission_request(
 # (strict FIFO only protects capacity waits from starvation).
 _JOB_SPECIFIC = ("path-missing", "disk-full", "node-unfit", "cache-missing")
 _TERMINAL_JOB_STATUSES = frozenset({"finished", "killed", "lost", "failed", "skipped"})
+# A job seen "lost" can still recover to running/finished within the shared
+# rescue window when a late exit marker appears. The constant lives in jobs.py
+# so the agent recheck, this settled gate, and the scheduler explanation can
+# never drift apart.
+LOST_RECOVERY_WINDOW_S = LOST_RECHECK_S
+
+
+def _dependency_settled(entry: JobEntry, now: float | None = None) -> bool:
+    """Whether a predecessor's terminal state is safe to act on irreversibly.
+
+    A ``lost`` predecessor inside its recovery window is not yet settled: it can
+    recover to a success. Acting on it early would permanently skip an
+    after_success/after_result dependent or release an after_complete dependent
+    against an outcome that then changes. Treat it as pending until the window
+    closes, matching the agent's own recheck window.
+    """
+    if entry.status not in _TERMINAL_JOB_STATUSES:
+        return False
+    if entry.status == "lost" and entry.finished_at is not None:
+        elapsed = (time.time() if now is None else now) - entry.finished_at
+        if elapsed <= LOST_RECOVERY_WINDOW_S:
+            return False
+    return True
 
 
 def _job_succeeded(entry: JobEntry) -> bool:
@@ -1883,6 +1908,12 @@ def _commit_snapshot_dir(
             )
         )
         os.replace(temp_root, final_root)
+        # Make the "immutable" snapshot durable before any job record can
+        # reference it: sync the published tree contents and the rename itself
+        # so a crash cannot leave a registry row pointing at a missing or
+        # partially written source.
+        fsync_tree(final_root)
+        fsync_dir(cfg.snapshots_dir())
         stored = StoredSnapshot(digest, final_code)
 
     state = _load_snapshot_store_state(cfg)
@@ -2545,9 +2576,16 @@ def snapshot(
                 log=log,
             )
             if proc.returncode != 0:
-                raise DispatchError(
-                    f"code snapshot to {node.name} failed: {proc.stderr.strip()}"
-                )
+                detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
+                if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
+                    # A transport-level failure is node-unreachable, not a
+                    # capacity/dispatch error; let _try_nodes fail over.
+                    raise RemoteError(
+                        node.name,
+                        f"code snapshot to {node.name} failed: {detail}",
+                        proc.returncode,
+                    )
+                raise DispatchError(f"code snapshot to {node.name} failed: {detail}")
             _warn_snapshot_size(cfg, proc.stdout, log)
             if observed is None:
                 raise DispatchError(
@@ -2595,9 +2633,14 @@ def snapshot(
             private_destination=True,
         )
         if proc.returncode != 0:
-            raise DispatchError(
-                f"support sync to {node.name} failed: {proc.stderr.strip()}"
-            )
+            detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
+            if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
+                raise RemoteError(
+                    node.name,
+                    f"support sync to {node.name} failed: {detail}",
+                    proc.returncode,
+                )
+            raise DispatchError(f"support sync to {node.name} failed: {detail}")
 
     _remember_snapshot(cfg, project_name, node, job_id)
     return snapshot_sha256
@@ -3873,7 +3916,7 @@ def _submit_prepared_once(
         )
         if (
             predecessor is not None
-            and predecessor.status in _TERMINAL_JOB_STATUSES
+            and _dependency_settled(predecessor)
             and not _job_succeeded(predecessor)
         ):
             result = effective_result_state(predecessor) or predecessor.status
@@ -3896,7 +3939,7 @@ def _submit_prepared_once(
         if no_queue:
             raise ConfigError("after_complete requires queueing")
         predecessor = load(cfg, spec.after_complete)
-        if predecessor is not None and predecessor.status in _TERMINAL_JOB_STATUSES:
+        if predecessor is not None and _dependency_settled(predecessor):
             log(
                 f"dependency {spec.after_complete} already completed as "
                 f"{effective_result_state(predecessor) or predecessor.status}; "
@@ -3911,7 +3954,7 @@ def _submit_prepared_once(
         if no_queue:
             raise ConfigError("after_result requires queueing")
         predecessor = load(cfg, spec.after_result)
-        if predecessor is not None and predecessor.status in _TERMINAL_JOB_STATUSES:
+        if predecessor is not None and _dependency_settled(predecessor):
             result = effective_result_state(predecessor) or predecessor.status
             if result not in spec.after_result_states:
                 expected = ",".join(spec.after_result_states)
@@ -4222,23 +4265,16 @@ def dispatch_queued(
                 entry.__dict__.update(current.__dict__)
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
-            if predecessor.status in {"queued", "running"}:
-                detail = f"dependency {dependency} is {predecessor.status}"
-                reason = f"waiting: {detail}"
-                if current.reason != reason:
-                    current.reason = reason
-                    save(cfg, current)
-                entry.__dict__.update(current.__dict__)
-                return "blocked", detail
-            if (
-                predecessor.status == "lost"
-                and predecessor.finished_at is not None
-                and time.time() - predecessor.finished_at <= LOST_RECHECK_S
-            ):
-                # The agent still rechecks freshly lost jobs (a late exit
-                # marker rescues them); skipping dependents now would turn a
-                # transient network blip into a permanently dead chain.
-                detail = f"dependency {dependency} is lost but inside the rescue window"
+            if not _dependency_settled(predecessor):
+                if predecessor.status == "lost":
+                    # The agent still rechecks freshly lost jobs (a late exit
+                    # marker rescues them); skipping dependents now would turn
+                    # a transient network blip into a permanently dead chain.
+                    detail = (
+                        f"dependency {dependency} is lost but inside the rescue window"
+                    )
+                else:
+                    detail = f"dependency {dependency} is {predecessor.status}"
                 reason = f"waiting: {detail}"
                 if current.reason != reason:
                     current.reason = reason
@@ -4295,7 +4331,7 @@ def dispatch_queued(
                 entry.__dict__.update(current.__dict__)
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
-            if predecessor.status not in _TERMINAL_JOB_STATUSES:
+            if not _dependency_settled(predecessor):
                 detail = (
                     f"completion dependency {completion_dependency} is "
                     f"{predecessor.status}"
@@ -4332,7 +4368,7 @@ def dispatch_queued(
                 entry.__dict__.update(current.__dict__)
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
-            if predecessor.status not in _TERMINAL_JOB_STATUSES:
+            if not _dependency_settled(predecessor):
                 detail = (
                     f"result dependency {result_dependency} is {predecessor.status}"
                 )

@@ -57,7 +57,10 @@ def test_control_and_artifact_pools_are_private_and_disjoint(tmp_path, monkeypat
     assert stat.S_IMODE((state / "artifact").stat().st_mode) == 0o700
     assert "ForwardAgent yes" not in control.read_text()
     assert "ForwardAgent yes" not in artifact.read_text()
+    assert "ForwardAgent no" in control.read_text()
+    assert "ForwardAgent no" in artifact.read_text()
     assert "ForwardAgent yes" in relay.read_text()
+    assert "ForwardAgent no" not in relay.read_text()
     assert "ConnectTimeout 10" in control.read_text()
     assert "ConnectTimeout 10" in artifact.read_text()
     assert "ConnectTimeout 10" in relay.read_text()
@@ -68,6 +71,32 @@ def test_control_and_artifact_pools_are_private_and_disjoint(tmp_path, monkeypat
     assert "ControlMaster no" in fresh.read_text()
     assert "ControlPath none" in fresh.read_text()
     assert "ControlPersist" not in fresh.read_text()
+
+
+def test_included_forward_agent_cannot_leak_to_control_or_artifact(
+    tmp_path, monkeypatch
+):
+    _state, user_config, _system_config = _transport_home(tmp_path, monkeypatch)
+    # A user who enables agent forwarding globally must not have it applied to
+    # dt's control or bulk-data connections; only the trusted relay forwards.
+    user_config.write_text("Host *\n    ForwardAgent yes\n")
+
+    def effective_forward_agent(workload):
+        config = sshio.ssh_pool_config(workload)
+        expanded = subprocess.run(
+            ["ssh", "-F", str(config), "-G", "worker"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for line in expanded.splitlines():
+            if line.startswith("forwardagent "):
+                return line.split()[1]
+        return None
+
+    assert effective_forward_agent(sshio.SSHWorkload.CONTROL) == "no"
+    assert effective_forward_agent(sshio.SSHWorkload.ARTIFACT) == "no"
+    assert effective_forward_agent(sshio.SSHWorkload.ARTIFACT_RELAY) == "yes"
 
 
 def test_proxyjump_inherits_artifact_overlay_instead_of_global_socket(
@@ -132,12 +161,17 @@ def test_rsync_uses_artifact_pool_while_remote_commands_use_control_pool(
     sshio.rsync("source/", "worker:target/")
     remote_shell = shlex.split(seen["cmd"][seen["cmd"].index("-e") + 1])
     assert remote_shell == ["ssh", "-F", str(state / "artifact.conf")]
+    # Option parsing must end before the transfer operands so a path beginning
+    # with "-" can never be read as an rsync option.
+    assert seen["cmd"][-3:] == ["--", "source/", "worker:target/"]
 
     assert sshio.ssh_cmd("worker", "true")[:3] == [
         "ssh",
         "-F",
         str(state / "control.conf"),
     ]
+    # The destination is guarded from option interpretation by a "--" marker.
+    assert sshio.ssh_cmd("worker", "true")[-3:] == ["--", "worker", "true"]
 
 
 def test_rsync_private_destination_strips_group_and_other_permissions(

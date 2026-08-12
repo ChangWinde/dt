@@ -85,7 +85,6 @@ from .private_state import (
 )
 from .probe import NodeStatus, probe_center, probe_node, status_as_dict
 from .remote import (
-    FULL_JOB_ID_RE,
     center_worker_count,
     fan_json,
     fan_json_by_center,
@@ -1480,9 +1479,11 @@ def free(
 # dt options before that boundary fail locally instead of becoming the remote
 # executable.
 RUN_CTX = {"allow_extra_args": True}
-# Job ids moved from token_hex(2) to token_hex(8); reuse the shared
-# pattern so the laptop line filter can never drift from head again.
-_JOB_ID_LINE_RE = FULL_JOB_ID_RE
+# Recognize a submission id echoed on the final human-mode line. Four hex
+# characters cover historical ids; current ids use a longer token_hex suffix,
+# so this must stay aligned with remote.FULL_JOB_ID_RE or plain laptop
+# submissions parse their own valid job id as a protocol error.
+_JOB_ID_LINE_RE = re.compile(r"^\d{8}-\d{4}_[A-Za-z0-9_-]+_[0-9a-f]{4,}$")
 
 
 def _fail_submission(
@@ -2309,6 +2310,21 @@ def run(
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         if center == "auto":
+            if request_id:
+                # Retry-safe submission stores its receipt on one chosen head.
+                # `-c auto` re-runs center selection on every attempt, so a
+                # retry can land on a different center and start a second job.
+                # Refuse the combination until a global routing receipt exists.
+                _fail_submission(
+                    kind="invalid_request",
+                    message=(
+                        "-c auto cannot be combined with --request-id: a retry "
+                        "may select a different center and duplicate the job; "
+                        "pick an explicit center for idempotent submission"
+                    ),
+                    exit_code=2,
+                    json_=json_,
+                )
             if require_path:
                 err.print(
                     "[red]-c auto cannot honor --require-path: data lives in one "
@@ -4855,6 +4871,9 @@ def _ps_issue_rows(rows: list[JsonDict]) -> list[JsonDict]:
             return True
         if status == "finished":
             exit_code = row.get("exit_code")
+            if exit_code is None:
+                # A finished record without an exit code is an infra failure.
+                return True
             return (
                 isinstance(exit_code, int)
                 and not isinstance(exit_code, bool)
@@ -6168,9 +6187,7 @@ def _read_job_log_tail(
 
 def _is_uncertain_launch(entry: jobs_mod.JobEntry) -> bool:
     """Whether a failed launch may still have remote processes/evidence."""
-    return entry.status == "failed" and (entry.reason or "").startswith(
-        jobs_mod.UNCERTAIN_LAUNCH_PREFIX
-    )
+    return jobs_mod.is_uncertain_launch(entry)
 
 
 def _refuse_unplaced(
@@ -6245,7 +6262,9 @@ def _print_log_follow_stopped(ref: str) -> None:
 def _log_terminal_exit_code(entry: jobs_mod.JobEntry) -> int | None:
     """Map a verified terminal job to the same stable code as ``dt wait``."""
     if entry.status == "finished":
-        return min(entry.exit_code if entry.exit_code is not None else 0, 125)
+        if entry.exit_code is None:
+            return 68
+        return min(entry.exit_code, 125)
     if entry.status == "failed" and not _is_uncertain_launch(entry):
         return 68
     if entry.status == "killed":
@@ -6265,9 +6284,12 @@ def _print_log_stream_complete(
     from rich.markup import escape
 
     if entry.status == "finished":
-        actual = entry.exit_code if entry.exit_code is not None else 0
-        summary = f"finished · exit {actual}"
-        color = "green" if actual == 0 else "red"
+        if entry.exit_code is None:
+            summary = "finished · result unavailable (no exit code)"
+            color = "red"
+        else:
+            summary = f"finished · exit {entry.exit_code}"
+            color = "green" if entry.exit_code == 0 else "red"
     else:
         summary = entry.status
         color = "yellow" if entry.status in {"killed", "lost"} else "red"
@@ -6982,16 +7004,23 @@ def _wait_terminal_result(
     if entry.status == "finished":
         from rich.markup import escape
 
-        code = entry.exit_code if entry.exit_code is not None else 0
+        if entry.exit_code is None:
+            # A finished record with no exit code is an infrastructure anomaly;
+            # effective_result_state classifies it infra_failure, so wait must
+            # not report success or a zero process code.
+            code = 68
+            summary = "finished · result unavailable (no exit code)"
+        else:
+            code = entry.exit_code
+            summary = f"finished · exit {code}"
         color = "green" if code == 0 else "red"
-        summary = f"finished · exit {code}"
         reference = escape(display_ref or entry.job_id)
         identity = f"{escape(entry.name)} · ref {reference}"
         if len(summary) + len(entry.name) + len(display_ref or entry.job_id) + 12 <= 72:
             emit(f"[{color}]{summary}[/{color}] · {identity}")
         else:
             emit(f"[{color}]{summary}[/{color}]\n[dim]{identity}[/dim]")
-        extra: JsonDict = {"exit_code": code}
+        extra: JsonDict = {"exit_code": entry.exit_code}
         if code != 0 and error_lines:
             finished_failure_log = _read_finished_failure_log(
                 entry,
@@ -8104,7 +8133,7 @@ def _watch_group_view(payload: JsonDict) -> Any:
         )
 
         has_issue = status in {"killed", "lost", "failed", "skipped"} or (
-            status == "finished" and exit_code not in (None, 0)
+            status == "finished" and exit_code != 0
         )
         if status == "running" or has_issue:
             raw_log = str(snapshot.get("log_tail") or "").rstrip()
