@@ -112,14 +112,61 @@ def git_capture_bounded(
     return process.returncode or 0, payload.decode("utf-8", errors="replace"), exceeded
 
 
-def git_info(
+# One merged status capture serves HEAD and cleanliness together; headers
+# are a few short lines, so a capped capture that still lacks them is
+# unusable rather than clean.
+MERGED_STATUS_MAX_BYTES = 64 * 1024
+
+
+def _parse_status_v2(text: str, *, exceeded: bool) -> tuple[str | None, bool] | None:
+    """Extract ``(sha, dirty)`` from one porcelain-v2 ``--branch`` capture.
+
+    Returns ``None`` when the capture proves nothing, so the caller falls
+    back to the historical two-step query.  An unborn branch yields
+    ``(None, False)``: there is no commit to reference, matching the
+    historical ``rev-parse HEAD`` failure.
+    """
+    sha: str | None = None
+    unborn = False
+    dirty = exceeded
+    for line in text.splitlines():
+        if line.startswith("# branch.oid "):
+            candidate = line[len("# branch.oid ") :]
+            if candidate == "(initial)":
+                unborn = True
+            elif re.fullmatch(r"[0-9a-fA-F]{7,64}", candidate):
+                sha = candidate
+            else:
+                return None
+        elif line.startswith("#"):
+            continue
+        elif line:
+            dirty = True
+    if unborn:
+        return None, False
+    if sha is None:
+        return None
+    return sha, dirty
+
+
+def _bounded_head_diff(project_dir: Path, max_diff_bytes: int) -> str | None:
+    try:
+        diff_rc, diff, diff_exceeded = git_capture_bounded(
+            project_dir,
+            ("diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"),
+            max_bytes=max_diff_bytes,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return diff if diff_rc == 0 and not diff_exceeded else None
+
+
+def _git_info_two_step(
     project_dir: Path,
     *,
-    max_diff_bytes: int | None = None,
+    max_diff_bytes: int,
 ) -> tuple[str | None, bool, str | None]:
-    """Return bounded Git provenance; the snapshot remains authoritative."""
-    if max_diff_bytes is None:
-        max_diff_bytes = MAX_GIT_DIFF_BYTES
+    """Historical rev-parse + status sequence, kept as the fallback path."""
     try:
         sha_rc, sha_text, sha_exceeded = git_capture_bounded(
             project_dir,
@@ -146,12 +193,43 @@ def git_info(
     dirty = status_exceeded or bool(status_text)
     if not dirty:
         return sha, False, None
+    return sha, True, _bounded_head_diff(project_dir, max_diff_bytes)
+
+
+def git_info(
+    project_dir: Path,
+    *,
+    max_diff_bytes: int | None = None,
+) -> tuple[str | None, bool, str | None]:
+    """Return bounded Git provenance; the snapshot remains authoritative.
+
+    One ``status --porcelain=v2 --branch`` capture provides HEAD and
+    cleanliness together, so a clean submission costs one git process and a
+    dirty one costs two.  Anything the merged capture cannot prove falls back
+    to the historical two-step query instead of being guessed.
+    """
+    if max_diff_bytes is None:
+        max_diff_bytes = MAX_GIT_DIFF_BYTES
+    parsed: tuple[str | None, bool] | None
     try:
-        diff_rc, diff, diff_exceeded = git_capture_bounded(
+        status_rc, status_text, status_exceeded = git_capture_bounded(
             project_dir,
-            ("diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"),
-            max_bytes=max_diff_bytes,
+            ("status", "--porcelain=v2", "--branch", "--untracked-files=normal"),
+            max_bytes=MERGED_STATUS_MAX_BYTES,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return sha, True, None
-    return sha, True, diff if diff_rc == 0 and not diff_exceeded else None
+        parsed = None
+    else:
+        parsed = (
+            _parse_status_v2(status_text, exceeded=status_exceeded)
+            if status_rc == 0 or status_exceeded
+            else None
+        )
+    if parsed is None:
+        return _git_info_two_step(project_dir, max_diff_bytes=max_diff_bytes)
+    sha, dirty = parsed
+    if sha is None:
+        return None, False, None
+    if not dirty:
+        return sha, False, None
+    return sha, True, _bounded_head_diff(project_dir, max_diff_bytes)

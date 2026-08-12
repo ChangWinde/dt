@@ -95,6 +95,74 @@ def test_git_provenance_is_bounded_without_claiming_dirty_tree_clean(
     assert diff is None
 
 
+def test_git_provenance_costs_one_process_clean_and_two_dirty(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "dt-test@example.invalid")
+    git("config", "user.name", "DT Test")
+    source = repo / "train.py"
+    source.write_text("print('clean')\n")
+    git("add", "train.py")
+    git("commit", "-qm", "initial")
+    expected_sha = git("rev-parse", "HEAD").stdout.strip()
+
+    unborn = tmp_path / "unborn"
+    unborn.mkdir()
+    subprocess.run(["git", "-C", str(unborn), "init", "-q"], check=True)
+
+    launches: list[tuple[str, ...]] = []
+    real_popen = subprocess.Popen
+
+    class CountingPopen(real_popen):
+        def __init__(self, args, **kwargs):
+            launches.append(tuple(args))
+            super().__init__(args, **kwargs)
+
+    monkeypatch.setattr(git_provenance.subprocess, "Popen", CountingPopen)
+
+    assert git_provenance.git_info(repo) == (expected_sha, False, None)
+    assert len(launches) == 1
+
+    source.write_text("print('changed')\n")
+    launches.clear()
+    sha, dirty, diff = git_provenance.git_info(repo)
+    assert (sha, dirty) == (expected_sha, True)
+    assert diff is not None and "+print('changed')" in diff
+    assert len(launches) == 2
+
+    # An unborn branch has no commit to reference; that is absent provenance,
+    # never a clean claim about an unprovable tree.
+    assert git_provenance.git_info(unborn) == (None, False, None)
+
+
+def test_status_v2_parser_never_reports_the_unprovable_as_clean():
+    parse = git_provenance._parse_status_v2
+    sha = "a" * 40
+    clean = f"# branch.oid {sha}\n# branch.head main\n"
+
+    assert parse(clean, exceeded=False) == (sha, False)
+    entry = "1 .M N... 100644 100644 100644 0000 0000 train.py\n"
+    assert parse(clean + entry, exceeded=False) == (sha, True)
+    assert parse(clean + "? new.py\n", exceeded=False) == (sha, True)
+    # A truncated capture can hide entries, so it is never clean.
+    assert parse(clean, exceeded=True) == (sha, True)
+    assert parse("# branch.oid (initial)\n? new.py\n", exceeded=False) == (None, False)
+    # Nothing proven: force the caller onto the two-step fallback.
+    assert parse("", exceeded=False) is None
+    assert parse("# branch.oid not-hex\n", exceeded=False) is None
+    assert parse("garbage without headers\n", exceeded=False) is None
+
+
 def test_git_cleanup_reaps_before_restoring_repeated_interrupt(monkeypatch):
     signals = []
 
