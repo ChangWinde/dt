@@ -194,7 +194,12 @@ def _capacity_state(
             "an eligible node must become reachable",
         )
     wanted = max(0, entry.gpus_requested)
-    reserve = max(0, cfg.queue.reserve_free_per_node)
+    # dispatch._reserve_for keeps no reserve for pinned jobs: pinning is an
+    # explicit operator decision about that node, so the anti-starvation
+    # reserve only shields unpinned placement.
+    reserve = (
+        0 if entry.pin_node is not None else max(0, cfg.queue.reserve_free_per_node)
+    )
     # The launcher refuses a job whose node lacks the effective disk floor
     # (max of the center floor and the per-job request). Apply the same gate
     # here so the explanation cannot promise a run the launcher will reject.
@@ -274,12 +279,18 @@ def scheduler_snapshot(
             state, reason, condition = _capacity_state(cfg, entry, capacity)
 
         fifo_owner: str | None = None
-        if state == "runnable" and entry.gpus_requested > 0:
+        if state == "runnable":
             if unpinned_capacity_wait is not None:
+                # The agent stops the whole pass at an unpinned capacity
+                # waiter, so even 0-GPU work behind it is not attempted.
                 fifo_owner = unpinned_capacity_wait
-            elif entry.pin_node is None and busy_pins:
+            elif entry.gpus_requested > 0 and entry.pin_node is None and busy_pins:
                 fifo_owner = next(iter(busy_pins.values()))
-            elif entry.pin_node is not None and entry.pin_node in busy_pins:
+            elif (
+                entry.gpus_requested > 0
+                and entry.pin_node is not None
+                and entry.pin_node in busy_pins
+            ):
                 fifo_owner = busy_pins[entry.pin_node]
         if fifo_owner is not None:
             state = "waiting_fifo"

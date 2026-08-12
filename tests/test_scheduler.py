@@ -178,6 +178,62 @@ def test_scheduler_snapshot_explains_false_typed_result_predicate(tmp_path):
     assert snapshot["queue"][0]["reason"] == ("result dependency completed as success")
 
 
+def test_pinned_job_is_exempt_from_the_unpinned_reserve(tmp_path):
+    """dispatch._reserve_for keeps no reserve for pinned jobs; the snapshot
+    must not report them as waiting for capacity they can already use."""
+    from dt.config import QueueCfg
+
+    cfg = _cfg(tmp_path)
+    cfg = HeadConfig(
+        center=cfg.center,
+        nodes=cfg.nodes,
+        projects=cfg.projects,
+        default_project=cfg.default_project,
+        root=cfg.root,
+        envs=cfg.envs,
+        queue=QueueCfg(reserve_free_per_node=1),
+    )
+    resources = [{"node": "n1", "gpus": [{"free": True}], "error": None}]
+    pinned = _entry("pinned", 1, gpus_requested=1, pin_node="n1")
+    unpinned = _entry("unpinned", 2, gpus_requested=1)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [pinned, unpinned],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    by_id = {row["job_id"]: row for row in snapshot["queue"]}
+    # The pinned job can use the single free GPU (no reserve applies to it).
+    assert by_id["pinned"]["state"] == "runnable"
+    # The unpinned job still honours the reserve.
+    assert by_id["unpinned"]["state"] in {"waiting_capacity", "waiting_fifo"}
+
+
+def test_unpinned_capacity_wait_also_holds_zero_gpu_work(tmp_path):
+    """The agent breaks the whole pass at an unpinned capacity waiter, so a
+    0-GPU job behind it must not be explained as runnable (audit F3)."""
+    cfg = _cfg(tmp_path)
+    resources = [
+        {"node": "n1", "gpus": [{"free": False}, {"free": False}], "error": None},
+    ]
+    waiter = _entry("gpu-waiter", 1, gpus_requested=1)
+    cpu_job = _entry("cpu-job", 2, gpus_requested=0)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [waiter, cpu_job],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    by_id = {row["job_id"]: row for row in snapshot["queue"]}
+    assert by_id["gpu-waiter"]["state"] == "waiting_capacity"
+    assert by_id["cpu-job"]["state"] == "waiting_fifo"
+    assert "gpu-waiter" in by_id["cpu-job"]["reason"]
+
+
 def test_unpinned_capacity_wait_preserves_overlapping_fifo(tmp_path):
     cfg = _cfg(tmp_path)
     resources = [
