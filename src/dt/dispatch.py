@@ -1918,6 +1918,35 @@ def _commit_snapshot_dir(
     return stored
 
 
+def _source_matches_baseline(
+    cfg: HeadConfig,
+    project_dir: Path,
+    baseline: Path,
+) -> bool:
+    """True only when a checksum dry-run proves the source tree unchanged.
+
+    The comparison mirrors the capture exactly: the same excludes, archive
+    metadata, and checksum content comparison, plus ``--delete`` so a file
+    removed from the source counts as a change.  Any itemized line, any
+    unexpected output, or a nonzero exit declines the fast path; only a
+    completely quiet dry-run may skip the rebuild, and the reused store is
+    still re-hashed by ``_validate_stored_snapshot`` before it is returned.
+    The trust in rsync's checksum comparison is not new: the full capture
+    already relies on it to decide which baseline files to hard-link.
+    """
+    proc = rsync(
+        f"{project_dir}/",
+        f"{baseline}/",
+        excludes=_excludes(cfg),
+        delete=True,
+        timeout=BULK_TRANSFER_TIMEOUT_S,
+        checksum=True,
+        dry_run=True,
+        itemize=True,
+    )
+    return proc.returncode == 0 and not proc.stdout.strip()
+
+
 def capture_snapshot(
     cfg: HeadConfig,
     project_name: str,
@@ -1928,7 +1957,9 @@ def capture_snapshot(
 
     Consecutive snapshots hard-link unchanged files to the previous immutable
     store, so a one-line experiment edit consumes roughly one file of extra
-    disk.  Job workdirs never hard-link back to this store.
+    disk.  Job workdirs never hard-link back to this store.  A source tree
+    proven unchanged by a checksum dry-run reuses the re-verified baseline
+    store without rebuilding and re-hashing a capture tree.
     """
     stores = cfg.snapshots_dir()
     with _snapshot_store_lock(cfg):
@@ -1939,6 +1970,19 @@ def capture_snapshot(
             if baseline_digest and _snapshot_path(cfg, baseline_digest).is_dir()
             else None
         )
+        if (
+            baseline is not None
+            and baseline_digest is not None
+            and _source_matches_baseline(cfg, project_dir, baseline)
+        ):
+            stored = _validate_stored_snapshot(cfg, baseline_digest)
+            # Same in-flight protection and bookkeeping as a rebuilt capture
+            # that resolves to an already-archived digest.
+            os.utime(stored.code_dir.parent)
+            state[project_name] = baseline_digest
+            _save_snapshot_store_state(cfg, state)
+            log(f"source unchanged; reusing verified snapshot {baseline_digest[:12]}")
+            return stored
         temp_root = Path(tempfile.mkdtemp(prefix=".capture-", dir=stores))
         code = temp_root / "code"
         code.mkdir()

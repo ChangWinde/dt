@@ -879,6 +879,7 @@ def rsync(
     stats: bool = False,
     checksum: bool = False,
     dry_run: bool = False,
+    itemize: bool = False,
     private_destination: bool = False,
     cancel_event: Event | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
@@ -905,6 +906,8 @@ def rsync(
         cmd.append("--checksum")
     if dry_run:
         cmd.append("--dry-run")
+    if itemize:
+        cmd.append("--itemize-changes")
     if private_destination:
         # DT-internal snapshots, control files, and caches belong to the
         # authenticated Unix identity.  Preserve the owner's executable bit,
