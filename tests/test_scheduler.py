@@ -413,3 +413,37 @@ def test_scheduler_does_not_treat_truthy_non_boolean_gpu_state_as_free(tmp_path)
     )
 
     assert snapshot["queue"][0]["state"] == "waiting_capacity"
+
+
+def test_pinned_job_ignores_the_free_reserve_in_the_explanation(tmp_path):
+    from dt.config import QueueCfg
+
+    root = tmp_path / "dt"
+    root.mkdir()
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=root,
+        envs="~/dt/envs",
+        queue=QueueCfg(reserve_free_per_node=1),
+    )
+    resources = [{"node": "n1", "gpus": [{"free": True}], "error": None}]
+
+    pinned = scheduler_snapshot(
+        cfg,
+        [_entry("pinned", 1, pin_node="n1", gpus_requested=1)],
+        resources=resources,
+        agent_alive=True,
+    )
+    assert pinned["queue"][0]["state"] == "runnable"
+
+    # The reserve still applies to an unpinned job on the same one free GPU.
+    unpinned = scheduler_snapshot(
+        cfg,
+        [_entry("unpinned", 1, gpus_requested=1)],
+        resources=resources,
+        agent_alive=True,
+    )
+    assert unpinned["queue"][0]["state"] == "waiting_capacity"
