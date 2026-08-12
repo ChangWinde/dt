@@ -109,6 +109,59 @@ def process_identity_shell() -> str:
     )
 
 
+def liveness_shell() -> str:
+    """Signal-free census answering whether any process still belongs to a job.
+
+    Defines ``dt_job_live_state JOB_DIR PGID BOOT_ID IDENTITY_FILE``, which
+    prints ``LIVE``, ``DEAD``, or ``UNPROVEN``.  Destructive maintenance uses
+    it as the gate before ``rm -rf``: it must stay in lockstep with
+    ``termination_probe``'s survivor census.  Shared discipline: a proven
+    reboot is the one safe DEAD shortcut, an unreadable boot_id or broken
+    enumerator is UNPROVEN rather than DEAD, zombies are not survivors, and a
+    live-but-unproven leader reads LIVE so nothing is ever deleted under a
+    process that may still be ours.  Unlike the kill probe it needs no
+    identity proof to inspect a zombie-anchored group: a foreign zombie can
+    only cause an over-refusal here, never a wrong-target signal.
+    """
+    return (
+        process_identity_shell() + "dt_job_live_state() { "
+        "dt_jl_jd=$1; dt_jl_pg=$2; dt_jl_boot=$3; dt_jl_ident=$4; "
+        'case "$dt_jl_jd" in /*) :;; *) dt_jl_jd="$PWD/$dt_jl_jd";; esac; '
+        'case "$dt_jl_pg" in *[!0-9]*|"") dt_jl_pg=0;; esac; '
+        'if [ -n "$dt_jl_boot" ]; then '
+        "dt_jl_cur=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) "
+        "|| { echo UNPROVEN; return 0; }; "
+        '[ "$dt_jl_cur" = "$dt_jl_boot" ] || { echo DEAD; return 0; }; fi; '
+        'dt_process_owned "$dt_jl_pg" "$dt_jl_ident" "$dt_jl_jd" ""; dt_jl_rc=$?; '
+        'if [ "$dt_jl_rc" -eq 0 ] || [ "$dt_jl_rc" -eq 2 ]; then '
+        "echo LIVE; return 0; fi; "
+        "dt_jl_deg=0; dt_jl_open=0; "
+        'if [ "$dt_jl_pg" -gt 0 ]; then '
+        'if [ ! -e "/proc/$dt_jl_pg" ]; then dt_jl_open=1; '
+        'elif dt_pid_zombie "$dt_jl_pg"; then '
+        'dt_jl_zpg=$(dt_pid_group "$dt_jl_pg") '
+        '&& [ "$dt_jl_zpg" = "$dt_jl_pg" ] && dt_jl_open=1; fi; fi; '
+        'if [ "$dt_jl_open" -eq 1 ]; then '
+        'dt_jl_gp=$(pgrep -g "$dt_jl_pg" 2>/dev/null); dt_jl_grc=$?; '
+        '[ "$dt_jl_grc" -gt 1 ] && dt_jl_deg=1; '
+        "for dt_jl_x in $dt_jl_gp; do "
+        'if dt_pid_zombie "$dt_jl_x"; then continue; fi; '
+        '[ -e "/proc/$dt_jl_x" ] || continue; '
+        "echo LIVE; return 0; done; fi; "
+        "if command -v find >/dev/null 2>&1; then "
+        "dt_jl_cwd=$(find /proc -mindepth 2 -maxdepth 2 -type l -name cwd "
+        '\\( -lname "$dt_jl_jd" -o -lname "$dt_jl_jd/*" \\) '
+        "-printf '%h\\n' 2>/dev/null); dt_jl_frc=$?; "
+        '[ "$dt_jl_frc" -gt 1 ] && dt_jl_deg=1; '
+        '[ -n "$dt_jl_cwd" ] && { echo LIVE; return 0; }; '
+        "else for dt_jl_p in /proc/[0-9]*; do "
+        'case "$(readlink "$dt_jl_p/cwd" 2>/dev/null)" in "$dt_jl_jd"|"$dt_jl_jd"/*) '
+        "echo LIVE; return 0;; esac; done; fi; "
+        '[ "$dt_jl_deg" -eq 1 ] && { echo UNPROVEN; return 0; }; '
+        "echo DEAD; }; "
+    )
+
+
 def termination_probe(
     job_dir: str,
     pgid: int | None,

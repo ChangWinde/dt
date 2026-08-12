@@ -844,6 +844,104 @@ def test_clean_refuses_misdirected_node_identity(tmp_path):
     assert load(cfg, "flipped") is not None
 
 
+def test_clean_guard_census_covers_all_terminal_victims(tmp_path):
+    # A22-7/A12-2: the live guard is a full identity census on every victim,
+    # not a bare kill -0 on lost rows only. A LIVE state refuses deletion and
+    # keeps the registry row pointing at the surviving workdir.
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry("guarded", "finished", created_at=1.0, node="n1", node_local=True),
+    )
+    commands = []
+
+    def runner(node, local, command, timeout, check):
+        commands.append(command)
+        return subprocess.CompletedProcess([], 75, "", "DT_CLEAN_LIVE LIVE")
+
+    report = maintenance.clean_jobs(
+        cfg, cutoff_ts=100.0, envs=False, log=lambda _: None, runner=runner
+    )
+
+    assert len(commands) == 1
+    assert "dt_job_live_state" in commands[0]
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["state_changed"]
+    assert load(cfg, "guarded") is not None
+
+
+def test_clean_treats_unprovable_liveness_as_refusal(tmp_path):
+    # A census that cannot prove death (masked /proc, broken enumerators)
+    # must refuse deletion instead of reading blindness as emptiness.
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry("blind", "killed", created_at=1.0, node="n1", node_local=True),
+    )
+
+    def runner(node, local, command, timeout, check):
+        return subprocess.CompletedProcess([], 75, "", "DT_CLEAN_LIVE UNPROVEN")
+
+    report = maintenance.clean_jobs(
+        cfg, cutoff_ts=100.0, envs=False, log=lambda _: None, runner=runner
+    )
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["liveness_unproven"]
+    assert load(cfg, "blind") is not None
+
+
+def test_clean_census_refuses_live_capsule_orphan_and_allows_quiet_one(tmp_path):
+    # Real census: a live process whose cwd is inside the capsule blocks the
+    # rm -rf even though the row is terminal and records no pgid; once the
+    # capsule is quiet the same sweep removes it.
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    node_home = tmp_path / "node-home"
+    workdir = node_home / "dt" / "jobs" / "orphaned"
+    workdir.mkdir(parents=True)
+    save(
+        cfg,
+        _entry("orphaned", "finished", created_at=1.0, node="n1", node_local=True),
+    )
+
+    def runner(node, local, command, timeout, check):
+        return subprocess.run(
+            ["bash", "-c", command],
+            cwd=node_home,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    orphan = subprocess.Popen(["sleep", "30"], cwd=workdir, start_new_session=True)
+    try:
+        refused = maintenance.clean_jobs(
+            cfg, cutoff_ts=100.0, envs=False, log=lambda _: None, runner=runner
+        )
+    finally:
+        orphan.terminate()
+        orphan.wait(timeout=2)
+
+    assert refused.removed == 0
+    assert [failure.kind for failure in refused.failures] == ["state_changed"]
+    assert workdir.is_dir()
+    assert load(cfg, "orphaned") is not None
+
+    removed = maintenance.clean_jobs(
+        cfg, cutoff_ts=100.0, envs=False, log=lambda _: None, runner=runner
+    )
+
+    assert removed.removed == 1
+    assert not workdir.exists()
+    assert load(cfg, "orphaned") is None
+
+
 def test_dependency_settled_treats_recoverable_lost_as_pending():
     from dt.dispatch import LOST_RECOVERY_WINDOW_S, _dependency_settled
 

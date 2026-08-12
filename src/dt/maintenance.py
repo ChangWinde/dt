@@ -25,10 +25,12 @@ from .jobs import (
 from .layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
+    job_state_dir,
     node_path,
     node_path_expression,
     normalize_node_root,
 )
+from .lifecycle import liveness_shell
 from .snapshot_store import load_state, lock, save_state
 from .sshio import diagnostic_excerpt
 
@@ -405,12 +407,29 @@ def clean_jobs(
                         )
                     )
                     continue
-                live_guard = ""
-                if entry.status == "lost" and entry.pgid is not None:
-                    live_guard = (
-                        f"if kill -0 {entry.pgid} 2>/dev/null; then "
-                        "echo DT_CLEAN_LIVE >&2; exit 75; fi; "
-                    )
+                # Every victim gets the full identity census, not a bare
+                # kill -0 on the recorded leader for lost rows only: a dead
+                # leader with live in-capsule orphans, a false-terminal row
+                # from an earlier bad postmortem, or an unprovable probe must
+                # all refuse deletion instead of pulling the directory out
+                # from under running processes and unregistering them.
+                identity_file = node_path_expression(
+                    job_state_dir(managed_dir, entry.storage_layout)
+                    + "/process_start_ticks"
+                )
+                pgid = (
+                    int(entry.pgid)
+                    if isinstance(entry.pgid, int) and entry.pgid > 0
+                    else 0
+                )
+                live_guard = (
+                    liveness_shell()
+                    + "dt_jl_state=$(dt_job_live_state "
+                    + f"{node_path_expression(managed_dir)} {pgid} "
+                    + f"{shlex.quote(entry.boot_id or '')} {identity_file}); "
+                    + '[ "$dt_jl_state" = DEAD ] || '
+                    + '{ echo "DT_CLEAN_LIVE $dt_jl_state" >&2; exit 75; }; '
+                )
                 try:
                     proc = runner(
                         entry.node,
@@ -434,13 +453,20 @@ def clean_jobs(
                 if proc.returncode != 0:
                     detail = diagnostic_excerpt(proc.stderr, proc.stdout)
                     if proc.returncode == 75 and "DT_CLEAN_LIVE" in detail:
-                        message = "lost job process is running; cleanup refused"
+                        unproven = "UNPROVEN" in detail
+                        message = (
+                            "job liveness could not be proven; cleanup refused"
+                            if unproven
+                            else "job processes are still running; cleanup refused"
+                        )
                         log(f"{entry.job_id}: {message}; registry retained")
                         failures.append(
                             CleanFailure(
                                 job_id=entry.job_id,
                                 node=entry.node,
-                                kind="state_changed",
+                                kind=(
+                                    "liveness_unproven" if unproven else "state_changed"
+                                ),
                                 message=message,
                             )
                         )
