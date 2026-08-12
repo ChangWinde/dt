@@ -138,7 +138,7 @@ def test_lan_annotation_flags_drifted_pinned_address(tmp_path):
     doctor.annotate_lan_addresses(cfg, rows)
 
     assert rows[0]["checks"]["lan"] == "ok"
-    assert rows[1]["checks"]["lan"] == "stale: 10.0.0.9 not on node"
+    assert rows[1]["checks"]["lan"] == "stale: pinned address not on node"
     assert rows[2]["checks"]["lan"] == "unknown"
     assert "lan" not in rows[3]["checks"]
     # A user@ip endpoint compares by its host part and never leaks the user.
@@ -161,6 +161,63 @@ def test_check_node_parses_advertised_addresses(monkeypatch):
     row = doctor.check_node(Node(name="n1"))
 
     assert row["checks"]["addrs"] == "10.0.0.5,172.17.0.1"
+
+
+def test_check_node_redacts_remote_ssh_failure_detail(monkeypatch):
+    # A31-3: raw remote stderr (hostnames, addresses) must not ride into
+    # doctor rows, which travel verbatim into `dt doctor --json`.
+    def failing_run_on(name, local, snippet, timeout):
+        return subprocess.CompletedProcess(
+            ["ssh"],
+            255,
+            stdout="",
+            stderr=(
+                "ssh: connect to host gpu-node-7.dc2.internal port 22222: "
+                "No route to host\n"
+            ),
+        )
+
+    monkeypatch.setattr(doctor, "run_on", failing_run_on)
+
+    row = doctor.check_node(Node(name="n1"))
+
+    assert row["unreachable"] is True
+    assert (
+        row["checks"]["ssh"]
+        == "ssh: connect to host <host> port 22222: No route to host"
+    )
+
+
+def test_doctor_center_reduces_addresses_to_a_count(tmp_path, monkeypatch):
+    # A31-2: the raw interface inventory exists only to compute the lan
+    # verdict; the JSON view gets a count, not the internal address list.
+    cfg = _cfg(
+        tmp_path,
+        nodes=[
+            Node(name="pinned", lan_address="10.0.0.5"),
+            Node(name="silent"),
+        ],
+    )
+
+    def fake_run_on(name, local, snippet, timeout):
+        if name == "pinned":
+            return subprocess.CompletedProcess(
+                ["ssh"],
+                0,
+                stdout="DT_SSH=ok\nDT_ADDRS=10.0.0.5,172.17.0.1\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            ["ssh"], 0, stdout="DT_SSH=ok\nDT_ADDRS=\n", stderr=""
+        )
+
+    monkeypatch.setattr(doctor, "run_on", fake_run_on)
+
+    rows = {row["node"]: row for row in doctor.doctor_center(cfg)}
+
+    assert rows["pinned"]["checks"]["lan"] == "ok"
+    assert rows["pinned"]["checks"]["addrs"] == "2 addresses (redacted)"
+    assert rows["silent"]["checks"]["addrs"] == "missing"
 
 
 def test_doctor_reports_relay_failure_and_exits_nonzero(tmp_path, monkeypatch):

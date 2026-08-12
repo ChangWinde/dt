@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .config import HeadConfig, Node
+from .redaction import redact_remote_detail
 from .sshio import RemoteError, run_on
 
 # Site policies whose transfers authenticate through a forwarded head agent.
@@ -80,16 +81,18 @@ def check_node(node: Node) -> dict[str, Any]:
     try:
         proc = run_on(node.name, node.local, CHECK_SNIPPET, timeout=20)
     except Exception as e:
+        # Remote stderr crosses a trust boundary and doctor rows travel in
+        # shareable JSON: keep the failure vocabulary, drop endpoint names.
         return {
             "node": node.name,
-            "checks": {"ssh": f"fail: {e}"},
+            "checks": {"ssh": f"fail: {redact_remote_detail(str(e))}"},
             "unreachable": isinstance(e, (RemoteError, OSError)),
         }
     if proc.returncode != 0 and "DT_SSH=ok" not in proc.stdout:
         msg = (proc.stderr or "").strip().splitlines()
         return {
             "node": node.name,
-            "checks": {"ssh": msg[-1] if msg else "fail"},
+            "checks": {"ssh": redact_remote_detail(msg[-1]) if msg else "fail"},
             "unreachable": proc.returncode == 255,
         }
     for line in proc.stdout.splitlines():
@@ -203,7 +206,10 @@ def annotate_lan_addresses(cfg: HeadConfig, rows: list[dict[str, Any]]) -> None:
         if pinned_ip in reported:
             checks["lan"] = "ok"
         else:
-            checks["lan"] = f"stale: {host} not on node"
+            # The verdict is enough to act on; the pinned address itself is
+            # the operator's own config value and must not ride along into
+            # shareable doctor output.
+            checks["lan"] = "stale: pinned address not on node"
 
 
 def doctor_center(cfg: HeadConfig) -> list[dict[str, Any]]:
@@ -214,4 +220,15 @@ def doctor_center(cfg: HeadConfig) -> list[dict[str, Any]]:
     for r in rows:
         r["center"] = cfg.center
     annotate_lan_addresses(cfg, rows)
+    # The raw interface list exists only to drive the lan verdict above.
+    # `dt doctor --json` output lands in CI logs and tickets, so the
+    # per-node internal address inventory is reduced to a count once the
+    # verdict is computed.
+    for r in rows:
+        checks = r.get("checks", {})
+        raw_addresses = str(checks.get("addrs", ""))
+        if raw_addresses and raw_addresses != "missing":
+            count = len([part for part in raw_addresses.split(",") if part.strip()])
+            plural = "es" if count != 1 else ""
+            checks["addrs"] = f"{count} address{plural} (redacted)"
     return rows
