@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.9.0 — 2026-08-12
+
 ### Added
 
 - `dt info --json` returns typed recovery `actions`: `kind`, a ready-to-run
@@ -29,6 +31,19 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   bounded agent query can no longer fail for omitting a redundant flag.
   Explicit `--json` invocations are unchanged.
 
+- Death by signal now exits with the shell convention `128 + N` (capped at
+  255) instead of wrapping through negative return codes, so
+  `dt logs -f | head` reports 141 rather than 243.
+- `dt --version` resolves its source commit only inside the dt checkout
+  (src layout with `pyproject.toml` and `.git`), never from an unrelated
+  ancestor repository such as a git-managed `$HOME`, and tolerates a missing
+  git binary.
+- Head-side observation hot paths are near-linear (compact reference
+  generation, visible-slice diagnostics, one registry decode per
+  multi-reference command, batched record reads); telemetry summaries stream
+  with about 79% less peak memory, and resubmitting unchanged source reuses
+  the re-verified snapshot store instead of rebuilding it.
+
 ### Fixed
 
 - `dt ps --since` cursor pagination anchored on mutable `updated_at`: a job
@@ -39,6 +54,31 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   observes lifecycle updates. A cursor minted by an older head for an
   incremental query is rejected with an invalid-argument error instead of
   resuming with different semantics.
+
+- One unreadable registry row no longer starves the whole queue: dependency
+  resolution failures hold only the affected job as blocked-visible, and the
+  agent tick isolates per-entry decode failures instead of crashing.
+- The resource guard stays armed when writing its evidence fails (full disk,
+  broken stderr) instead of silently disarming while the job keeps running.
+- The operation journal degrades to a private per-user temp root when HOME
+  and the passwd database are unavailable instead of crashing every command.
+- Artifact route health: a healthy transfer-edge probe releases its half-open
+  reservation, cache permission failures fail closed instead of re-crossing
+  the WAN, a local head OSError is not counted as a route failure, and the
+  breaker ladder holds at its cooldown plateau instead of resetting.
+- Scheduler explanations match dispatch: the launcher disk floor, the
+  lost-predecessor rescue window, and reserve/FIFO handling are reported the
+  way the agent actually dispatches.
+- Job-log-derived progress numbers are bounded and finite before they reach
+  `ps`/`watch`/query JSON, so a misbehaving training log cannot inject
+  `Infinity` or oversized integers into strict agent parsers.
+- Registry rows present in both the legacy and current layouts surface as
+  split-brain damage with a `dt migrate` hint instead of being silently
+  shadowed.
+- `fork --repeat` pads member indices to the widest width; a home root that
+  escapes `$HOME` via `~//` is rejected; a self-locking
+  `mem_threshold_mib: 0` and pathologically nested YAML are rejected as
+  configuration errors.
 
 ## 0.8.0 — 2026-08-11
 
