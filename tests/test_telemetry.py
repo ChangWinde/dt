@@ -1797,3 +1797,299 @@ def test_resource_jsonl_parser_tolerates_interrupted_final_line():
 
     assert rows == [{"timestamp": 1, "gpus": [], "host": {}}]
     assert invalid == 1
+
+
+def _oracle_numbers(values):
+    import math
+
+    return [
+        value
+        for value in values
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and (not isinstance(value, float) or math.isfinite(value))
+    ]
+
+
+def _oracle_summarize(rows, *, include_phases=True):
+    """Historical whole-list aggregation kept verbatim as the oracle."""
+    timestamps = sorted(_oracle_numbers([row.get("timestamp") for row in rows]))
+    sample_intervals = [
+        later - earlier
+        for earlier, later in zip(timestamps, timestamps[1:])
+        if later > earlier
+    ]
+    gpu_samples = {}
+    gpu_activity_samples = {}
+    for row in rows:
+        for gpu in row.get("gpus") or []:
+            if (
+                isinstance(gpu, dict)
+                and isinstance(gpu.get("index"), int)
+                and not isinstance(gpu.get("index"), bool)
+            ):
+                index = str(gpu["index"])
+                gpu_samples.setdefault(index, []).append(gpu)
+                gpu_activity_samples.setdefault(index, []).append(
+                    (row.get("timestamp"), gpu.get("utilization_pct"))
+                )
+    gpu_summary = {}
+    for index, samples in sorted(gpu_samples.items(), key=lambda item: int(item[0])):
+        util = _oracle_numbers([sample.get("utilization_pct") for sample in samples])
+        busy_util = [value for value in util if value > 0]
+        busy_timestamps = [
+            float(timestamp)
+            for timestamp, value in gpu_activity_samples[index]
+            if isinstance(timestamp, (int, float))
+            and not isinstance(timestamp, bool)
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value > 0
+        ]
+        mem = _oracle_numbers([sample.get("mem_used_mib") for sample in samples])
+        total = _oracle_numbers([sample.get("mem_total_mib") for sample in samples])
+        temp = _oracle_numbers([sample.get("temperature_c") for sample in samples])
+        power = _oracle_numbers([sample.get("power_w") for sample in samples])
+        gpu_summary[index] = {
+            "samples": len(samples),
+            "util_samples": len(util),
+            "util_mean_pct": sum(util) / len(util) if util else None,
+            "util_peak_pct": max(util) if util else None,
+            "util_busy_mean_pct": (
+                sum(busy_util) / len(busy_util) if busy_util else None
+            ),
+            "util_busy_samples": len(busy_util),
+            "busy_fraction_pct": (100.0 * len(busy_util) / len(util) if util else None),
+            "first_busy_after_s": (
+                max(0.0, min(busy_timestamps) - min(timestamps))
+                if busy_timestamps and timestamps
+                else None
+            ),
+            "last_busy_before_end_s": (
+                max(0.0, max(timestamps) - max(busy_timestamps))
+                if busy_timestamps and timestamps
+                else None
+            ),
+            "mem_mean_mib": sum(mem) / len(mem) if mem else None,
+            "mem_peak_mib": max(mem) if mem else None,
+            "mem_total_mib": max(total) if total else None,
+            "temperature_peak_c": max(temp) if temp else None,
+            "power_mean_w": sum(power) / len(power) if power else None,
+            "power_peak_w": max(power) if power else None,
+        }
+    hosts = [row["host"] for row in rows if isinstance(row.get("host"), dict)]
+    cpu = _oracle_numbers([host.get("cpu_load1") for host in hosts])
+    mem = _oracle_numbers([host.get("mem_used_mib") for host in hosts])
+    total = _oracle_numbers([host.get("mem_total_mib") for host in hosts])
+    io = _oracle_numbers([host.get("io_pressure") for host in hosts])
+    gpu_errors = [
+        str(row["gpu_error"]) for row in rows if row.get("gpu_error") not in (None, "")
+    ]
+    jobs = [row["job"] for row in rows if isinstance(row.get("job"), dict)]
+    job_cpu = _oracle_numbers([job.get("cpu_pct") for job in jobs])
+    job_rss = _oracle_numbers([job.get("rss_mib") for job in jobs])
+    job_pss = _oracle_numbers([job.get("pss_mib") for job in jobs])
+    job_pss_anon = _oracle_numbers([job.get("pss_anon_mib") for job in jobs])
+    job_processes = _oracle_numbers([job.get("processes") for job in jobs])
+    job_threads = _oracle_numbers([job.get("threads") for job in jobs])
+    job_reads = _oracle_numbers([job.get("read_mib_s") for job in jobs])
+    job_writes = _oracle_numbers([job.get("write_mib_s") for job in jobs])
+    job_summary = (
+        {
+            "samples": len(jobs),
+            "cpu_mean_pct": (sum(job_cpu) / len(job_cpu) if job_cpu else None),
+            "cpu_peak_pct": max(job_cpu) if job_cpu else None,
+            "rss_mean_mib": (sum(job_rss) / len(job_rss) if job_rss else None),
+            "rss_peak_mib": max(job_rss) if job_rss else None,
+            "pss_samples": len(job_pss),
+            "pss_mean_mib": (sum(job_pss) / len(job_pss) if job_pss else None),
+            "pss_peak_mib": max(job_pss) if job_pss else None,
+            "pss_anon_samples": len(job_pss_anon),
+            "pss_anon_mean_mib": (
+                sum(job_pss_anon) / len(job_pss_anon) if job_pss_anon else None
+            ),
+            "pss_anon_peak_mib": max(job_pss_anon) if job_pss_anon else None,
+            "process_peak": max(job_processes) if job_processes else None,
+            "thread_peak": max(job_threads) if job_threads else None,
+            "read_mean_mib_s": (sum(job_reads) / len(job_reads) if job_reads else None),
+            "read_peak_mib_s": max(job_reads) if job_reads else None,
+            "write_mean_mib_s": (
+                sum(job_writes) / len(job_writes) if job_writes else None
+            ),
+            "write_peak_mib_s": max(job_writes) if job_writes else None,
+        }
+        if jobs
+        else None
+    )
+    summary = {
+        "schema_version": "dt_resource_summary_v1",
+        "samples": len(rows),
+        "started_at": min(timestamps) if timestamps else None,
+        "finished_at": max(timestamps) if timestamps else None,
+        "duration_s": (
+            max(timestamps) - min(timestamps) if len(timestamps) >= 2 else 0.0
+        ),
+        "sample_interval_s": (
+            sum(sample_intervals) / len(sample_intervals) if sample_intervals else None
+        ),
+        "gpus": gpu_summary,
+        "gpu_error_samples": len(gpu_errors),
+        "gpu_error_last": gpu_errors[-1] if gpu_errors else None,
+        "job": job_summary,
+        "host": {
+            "cpu_load1_mean": sum(cpu) / len(cpu) if cpu else None,
+            "cpu_load1_peak": max(cpu) if cpu else None,
+            "mem_used_mean_mib": sum(mem) / len(mem) if mem else None,
+            "mem_used_peak_mib": max(mem) if mem else None,
+            "mem_total_mib": max(total) if total else None,
+            "io_pressure_mean": sum(io) / len(io) if io else None,
+            "io_pressure_peak": max(io) if io else None,
+        },
+    }
+    if include_phases:
+        summary["phases"] = _oracle_phase_spans(rows)
+    return summary
+
+
+def _oracle_phase_spans(rows):
+    from dt.monitoring import safe_phase_name
+
+    grouped = []
+    current_phase = None
+    current_rows = []
+    for row in rows:
+        phase = row.get("phase")
+        if not safe_phase_name(phase):
+            if current_phase is not None:
+                grouped.append((current_phase, current_rows))
+            current_phase = None
+            current_rows = []
+            continue
+        if phase != current_phase:
+            if current_phase is not None:
+                grouped.append((current_phase, current_rows))
+            current_phase = str(phase)
+            current_rows = []
+        current_rows.append(row)
+    if current_phase is not None:
+        grouped.append((current_phase, current_rows))
+    spans = []
+    for phase, phase_rows in grouped:
+        sampled = _oracle_summarize(phase_rows, include_phases=False)
+        spans.append(
+            {
+                "phase": phase,
+                "samples": sampled["samples"],
+                "sampled_started_at": sampled["started_at"],
+                "sampled_finished_at": sampled["finished_at"],
+                "sampled_duration_s": sampled["duration_s"],
+                "gpus": sampled["gpus"],
+                "job": sampled["job"],
+            }
+        )
+    return spans
+
+
+def _random_telemetry_lines(rng, count):
+    lines = []
+    phases = ["wrapper", "setup", "train", "eval", "bad phase!", None]
+    for _ in range(count):
+        kind = rng.random()
+        if kind < 0.06:
+            lines.append(rng.choice(['{"timestamp":', "[]", '"quoted"', "42", ""]))
+            continue
+        row = {}
+        stamp_kind = rng.random()
+        if stamp_kind < 0.75:
+            base = 100 + rng.randrange(200)
+            row["timestamp"] = base + rng.choice([0, 0.25, 0.5])
+        elif stamp_kind < 0.85:
+            row["timestamp"] = rng.choice(["soon", None, [1]])
+        if rng.random() < 0.85:
+            gpus = []
+            for index in range(rng.randrange(3)):
+                gpu = {"index": index}
+                if rng.random() < 0.9:
+                    gpu["utilization_pct"] = rng.choice([0, 0.0, 17, 99.5, "hot"])
+                if rng.random() < 0.8:
+                    gpu["mem_used_mib"] = rng.choice([256, 1024.5])
+                if rng.random() < 0.6:
+                    gpu["mem_total_mib"] = 24564
+                if rng.random() < 0.5:
+                    gpu["temperature_c"] = rng.randrange(30, 90)
+                if rng.random() < 0.5:
+                    gpu["power_w"] = rng.choice([75, 300.25])
+                gpus.append(gpu)
+            if rng.random() < 0.1:
+                gpus.append("not-a-gpu")
+            row["gpus"] = gpus
+        if rng.random() < 0.7:
+            row["host"] = {
+                "cpu_load1": rng.choice([0.5, 2.0, "busy"]),
+                "mem_used_mib": rng.randrange(1024, 65536),
+                "mem_total_mib": 65536,
+                "io_pressure": rng.choice([0.0, 0.5]),
+            }
+        if rng.random() < 0.5:
+            row["job"] = {
+                "cpu_pct": rng.choice([12.5, 800]),
+                "rss_mib": rng.randrange(100, 30000),
+                "pss_mib": rng.choice([None, 128.5]),
+                "pss_anon_mib": rng.choice([None, 96.25]),
+                "processes": rng.randrange(1, 64),
+                "threads": rng.randrange(1, 512),
+                "read_mib_s": rng.choice([0.0, 12.75]),
+                "write_mib_s": rng.choice([0.0, 3.5]),
+            }
+        if rng.random() < 0.15:
+            row["gpu_error"] = rng.choice(["nvml lost", "", None, 17])
+        phase = rng.choice(phases)
+        if phase is not None:
+            row["phase"] = phase
+        lines.append(json.dumps(row))
+    return lines
+
+
+def test_streaming_summary_matches_the_whole_list_oracle():
+    import random
+
+    from dt.monitoring import (
+        parse_resource_jsonl,
+        phase_resource_spans,
+        summarize_resource_text,
+        summarize_resources,
+    )
+
+    rng = random.Random(20260812)
+    for trial in range(25):
+        text = "\n".join(_random_telemetry_lines(rng, rng.randrange(0, 120)))
+        rows, invalid = parse_resource_jsonl(text)
+
+        streamed_summary, streamed_invalid = summarize_resource_text(text)
+        assert streamed_invalid == invalid, trial
+        if not rows:
+            assert streamed_summary is None, trial
+            continue
+        expected = _oracle_summarize(rows)
+        assert streamed_summary == expected, trial
+        assert summarize_resources(rows) == expected, trial
+        assert phase_resource_spans(rows) == _oracle_phase_spans(rows), trial
+
+
+def test_summary_skips_a_boolean_gpu_index_instead_of_crashing():
+    from dt.monitoring import summarize_resources
+
+    rows = [
+        {
+            "timestamp": 100,
+            "gpus": [
+                {"index": True, "utilization_pct": 50},
+                {"index": 0, "utilization_pct": 25},
+            ],
+        }
+    ]
+
+    summary = summarize_resources(rows)
+
+    assert list(summary["gpus"].keys()) == ["0"]
+    assert summary["gpus"]["0"]["util_peak_pct"] == 25
