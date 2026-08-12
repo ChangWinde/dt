@@ -12533,6 +12533,7 @@ def _kill_one(
     yes: bool,
     force: bool,
     result: JsonDict | None = None,
+    sweep: bool = False,
 ) -> str:
     """Returns 'ok' | 'notfound' | 'alive' | 'unverified'."""
 
@@ -12596,7 +12597,7 @@ def _kill_one(
     # "lost" still gets the kill: the group leader may be dead while children
     # live on (e.g. a child that ignores TERM) - exactly what needs cleanup
     uncertain_launch = _is_uncertain_launch(entry)
-    if entry.status not in ("running", "lost") and not uncertain_launch:
+    if entry.status not in ("running", "lost") and not uncertain_launch and not sweep:
         message = f"{entry.job_id} is already {entry.status}"
         err.print(message)
         return finish("ok", "already_terminal", entry, message)
@@ -12604,11 +12605,12 @@ def _kill_one(
         if not sys.stdin.isatty():
             err.print("[red]non-interactive kill needs -y[/red]")
             raise typer.Exit(1)
-        target = (
-            f"any process from uncertain launch {entry.job_id} on {entry.node}"
-            if uncertain_launch
-            else f"{entry.job_id} (pgid {entry.pgid} on {entry.node})"
-        )
+        if uncertain_launch:
+            target = f"any process from uncertain launch {entry.job_id} on {entry.node}"
+        elif entry.status not in ("running", "lost"):
+            target = f"leftover processes of {entry.job_id} on {entry.node}"
+        else:
+            target = f"{entry.job_id} (pgid {entry.pgid} on {entry.node})"
         typer.confirm(f"kill {target}?", abort=True)
     sig = "KILL" if force else "TERM"
     with jobs_mod.job_lock(cfg, entry.job_id):
@@ -12618,7 +12620,18 @@ def _kill_one(
         if current is not None:
             entry = current
         uncertain_launch = _is_uncertain_launch(entry)
-        if entry.status not in ("running", "lost") and not uncertain_launch:
+        # A22-6: --sweep gives already-terminal jobs their only orphan
+        # cleanup entry.  The probe still signals and takes a census, but the
+        # terminal record itself is never rewritten, and the EXITED shortcut
+        # is disabled so a recorded completion cannot shield the leftovers.
+        terminal_sweep = (
+            sweep and not uncertain_launch and entry.status not in ("running", "lost")
+        )
+        if (
+            entry.status not in ("running", "lost")
+            and not uncertain_launch
+            and not terminal_sweep
+        ):
             message = f"{entry.job_id} is already {entry.status}"
             err.print(message)
             return finish("ok", "already_terminal", entry, message)
@@ -12627,11 +12640,12 @@ def _kill_one(
         # escaped it with setpgrp, then require a positive death verdict.  An
         # uncertain launch has no known PGID, so also leave the launch sentinel
         # and close its tmux session while the procfs cwd scan finds survivors.
-        target = (
-            f"uncertain launch {entry.job_id}"
-            if uncertain_launch
-            else f"group {entry.pgid}"
-        )
+        if uncertain_launch:
+            target = f"uncertain launch {entry.job_id}"
+        elif terminal_sweep:
+            target = f"leftover processes of {entry.job_id}"
+        else:
+            target = f"group {entry.pgid}"
         try:
             probe = termination_probe(
                 entry.job_dir,
@@ -12642,6 +12656,7 @@ def _kill_one(
                 session=entry.session if uncertain_launch else None,
                 cancel_sentinel=uncertain_launch,
                 layout=entry.storage_layout,
+                ignore_exit_marker=terminal_sweep,
             )
         except ValueError as exc:
             message = f"could not verify death of {target} on {entry.node}: {exc}"
@@ -12673,14 +12688,45 @@ def _kill_one(
                 message,
             )
         if verdict == "ALIVE":
-            retained = "failed" if uncertain_launch else "running"
+            if terminal_sweep:
+                retained = entry.status
+                force_hint = "dt kill " + entry.job_id + " -y --force --sweep"
+            else:
+                retained = "failed" if uncertain_launch else "running"
+                force_hint = "dt kill " + entry.job_id + " -y --force"
             message = f"{target} on {entry.node} survived {sig}"
             err.print(
                 f"[red]{escape(message)}[/red] "
                 f"(job stays '{escape(retained)}'; try: "
-                f"dt kill {escape(entry.job_id)} -y --force)"
+                f"{escape(force_hint)})"
             )
             return finish("alive", "survived", entry, message)
+        if verdict == "EXITED":
+            # The exit marker predates our signal: completion won the race
+            # (the interactive confirmation window alone can hide seconds).
+            # Rewriting a finished job into killed/cancelled would erase its
+            # real result and mis-skip every dependent gated on it.  Prefer
+            # the full remote completion record; fall back to the probe's
+            # sanitized exit code when that read is unavailable (also the
+            # only completion path for an uncertain launch, whose failed
+            # status the refresh probe deliberately leaves alone).
+            entry = jobs_mod._refresh_status_locked(cfg, entry)
+            if entry.status != "finished":
+                entry.status = "finished"
+                entry.exit_code = int(detail) if detail is not None else None
+                entry.finished_at = entry.finished_at or time.time()
+                entry.result_state = None
+                entry.reason = "completed before kill; recorded from exit marker"
+                jobs_mod.save(cfg, entry)
+            message = f"{entry.job_id} completed before {sig} was sent"
+            err.print(f"[yellow]{escape(message)}; result preserved[/yellow]")
+            return finish("ok", "completed", entry, message)
+        if terminal_sweep:
+            # Confirmed DEAD: the sweep found or produced a quiet capsule.
+            # The terminal record already tells the truth; leave it alone.
+            message = f"sent {sig} to {target} on {entry.node}; no owned survivors"
+            err.print(f"[yellow]{escape(message)}[/yellow]")
+            return finish("ok", "swept", entry, message)
         previous_reason = entry.reason
         entry.status = "killed"
         entry.result_state = "cancelled"
@@ -12703,6 +12749,14 @@ def kill(
     yes: bool = typer.Option(False, "-y", "--yes"),
     force: bool = typer.Option(
         False, "--force", help="SIGKILL (for jobs that swallow TERM)"
+    ),
+    sweep: bool = typer.Option(
+        False,
+        "--sweep",
+        help=(
+            "also signal leftover processes of an already-terminal job; "
+            "its recorded result is never rewritten"
+        ),
     ),
     json_: bool = typer.Option(
         False,
@@ -12730,7 +12784,12 @@ def kill(
         if json_:
             rows: list[JsonDict] = []
             outcomes: list[str] = []
-            argv_tail = ["-y"] + (["--force"] if force else []) + ["--json"]
+            argv_tail = (
+                ["-y"]
+                + (["--force"] if force else [])
+                + (["--sweep"] if sweep else [])
+                + ["--json"]
+            )
             for ref in refs:
                 lookup_errors: dict[str, str] = {}
                 unreachable: set[str] = set()
@@ -12824,7 +12883,11 @@ def kill(
                 raise typer.Exit(EXIT_UNREACHABLE)
             raise typer.Exit(1)
         rc = 0
-        argv_tail = (["-y"] if yes else []) + (["--force"] if force else [])
+        argv_tail = (
+            (["-y"] if yes else [])
+            + (["--force"] if force else [])
+            + (["--sweep"] if sweep else [])
+        )
         for ref in refs:
             _, head = _locate(cfg, ref)
             rc |= forward_call(head, ["kill", ref, *argv_tail], tty=not yes)
@@ -12839,6 +12902,7 @@ def kill(
             yes,
             force,
             rows[index] if json_ else None,
+            sweep=sweep,
         )
         for index, ref in enumerate(refs)
     ]

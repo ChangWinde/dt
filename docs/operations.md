@@ -187,6 +187,10 @@ boot before treating the process group as task-owned. Jobs started by an older
 DT build have no identity marker and are accepted only while their wrapper cwd
 is still inside the job capsule. An identity mismatch is reported as `lost`;
 DT fails closed instead of signaling a possibly reused process or tmux session.
+A job whose exit marker predates the signal is reported as completed and keeps
+its recorded result: `dt kill` never rewrites a real completion into a kill.
+Use `--sweep` to signal leftover processes of an already-terminal job; the
+sweep reports what it found and leaves the terminal record untouched.
 
 Then choose one action:
 
@@ -196,6 +200,7 @@ Then choose one action:
 | Exact-code repeat required | `dt fork JOB -n NEW_NAME` |
 | Queued job no longer needed | `dt kill JOB -y` |
 | Running job must stop | `dt kill JOB -y`; add `--force` only after TERM failure is confirmed |
+| Terminal job left processes behind | `dt kill JOB -y --sweep`; signals leftovers, never rewrites the recorded result |
 | Transfer interrupted | Rerun the same `dt pull` command |
 | SSH disconnected | Reconnect with `dt watch`, `dt logs -f`, or `dt wait`; do not resubmit blindly |
 | Launch outcome uncertain | Inspect, then use verified `dt kill JOB -y` cleanup before retrying |

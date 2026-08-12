@@ -2964,6 +2964,10 @@ def _cancel_orphan(
         return None
     if verdict == "ALIVE":
         return "processes survived TERM"
+    if verdict == "EXITED":
+        # The orphan is not merely dead: it ran to completion and recorded a
+        # result.  Failing over would run the same work twice.
+        return "launch already ran to completion on the node"
     return detail or "orphan cancellation could not be verified"
 
 
@@ -2999,6 +3003,10 @@ def _cancel_placed_launch(entry: JobEntry) -> str | None:
         return None
     if verdict == "ALIVE":
         return "processes survived TERM"
+    if verdict == "EXITED":
+        # Completion beat the cancellation: keep the record alive so the next
+        # status refresh finalizes the real result instead of erasing it.
+        return "job already ran to completion before cancellation"
     return detail or "cancellation could not be verified"
 
 

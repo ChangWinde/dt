@@ -3,6 +3,7 @@ and rsync retries must resume."""
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -4525,6 +4526,483 @@ def test_termination_probe_signals_orphans_after_leader_death(tmp_path):
             capture_output=True,
             check=False,
         )
+
+
+def _pid_state(pid: int) -> str:
+    stat_line = Path(f"/proc/{pid}/stat").read_text()
+    return stat_line[stat_line.rfind(") ") + 2 :].split()[0]
+
+
+def _wait_for_zombie(pid: int, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while _pid_state(pid) != "Z":
+        assert time.monotonic() < deadline, f"pid {pid} never became a zombie"
+        time.sleep(0.02)
+
+
+def test_zombie_leader_with_matching_identity_is_dead(tmp_path):
+    # An exited-but-unreaped leader passes kill -0 and keeps matching start
+    # ticks forever, so the census used to count it via pgrep -g: `dt kill`
+    # reported ALIVE for a job with no runnable process left, --force led
+    # into the same dead end, and no state could ever advance. A zombie is
+    # an exited process and must read as DEAD.
+    job_dir = tmp_path / "jobs" / "zombie-job"
+    job_dir.mkdir(parents=True)
+    leader = subprocess.Popen(["true"], start_new_session=True)
+    try:
+        _wait_for_zombie(leader.pid)
+        (job_dir / "process_start_ticks").write_text(
+            f"{_proc_start_ticks(leader.pid)}\n"
+        )
+        command = lifecycle.termination_probe(
+            str(job_dir), leader.pid, "TERM", job_id="zombie-job"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        ) == ("DEAD", None)
+    finally:
+        leader.wait(timeout=2)
+
+
+def test_zombie_leader_group_signal_reaches_wandering_orphan(tmp_path):
+    # The zombie still anchors the pgid (a pid number cannot be recycled
+    # while any process, zombie included, references it), so the group is
+    # provably ours and group signalling must reach an in-group orphan that
+    # chdir'd out of the capsule, exactly as it does once the leader is
+    # reaped.
+    job_dir = tmp_path / "jobs" / "zombie-wander-job"
+    job_dir.mkdir(parents=True)
+    leader = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            "{ cd /tmp && sleep 30 >/dev/null 2>&1 & } && printf '%s\\n' \"$!\"",
+        ],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert leader.stdout is not None
+    orphan_pid = int(leader.stdout.readline().strip())
+    try:
+        _wait_for_zombie(leader.pid)
+        (job_dir / "process_start_ticks").write_text(
+            f"{_proc_start_ticks(leader.pid)}\n"
+        )
+        command = lifecycle.termination_probe(
+            str(job_dir), leader.pid, "TERM", job_id="zombie-wander-job"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        ) == ("DEAD", None)
+        deadline = time.monotonic() + 2
+        while Path(f"/proc/{orphan_pid}").exists():
+            assert time.monotonic() < deadline, "wandering orphan survived"
+            time.sleep(0.05)
+    finally:
+        subprocess.run(
+            ["kill", "-9", str(orphan_pid)], capture_output=True, check=False
+        )
+        leader.wait(timeout=2)
+
+
+def test_identity_shell_reports_zombie_wrapper_as_gone(tmp_path):
+    # refresh_status and the completion watcher share dt_process_owned; an
+    # unreaped wrapper previously read as an owned live process (rc=0),
+    # pinning refresh at RUNNING and the completion channel in a busy loop.
+    # A zombie is an exited process: the identity helper must answer 1
+    # (gone), never 0 (live) or 2 (unproven live).
+    job_dir = tmp_path / "jobs" / "zombie-ident-job"
+    job_dir.mkdir(parents=True)
+    wrapper = subprocess.Popen(["true"], start_new_session=True)
+    try:
+        _wait_for_zombie(wrapper.pid)
+        identity = job_dir / "process_start_ticks"
+        identity.write_text(f"{_proc_start_ticks(wrapper.pid)}\n")
+        script = (
+            lifecycle.process_identity_shell()
+            + "dt_process_owned "
+            + f"{wrapper.pid} {shlex.quote(str(identity))} "
+            + f'{shlex.quote(str(job_dir))} ""; '
+            + "printf '%s\\n' \"$?\""
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert result.stdout.strip() == "1"
+    finally:
+        wrapper.wait(timeout=2)
+
+
+def test_termination_probe_reports_pre_signal_exit_marker_without_signalling(
+    tmp_path,
+):
+    # An exit marker that already exists when the probe starts proves the
+    # job completed on its own; the probe must report EXITED with the
+    # recorded code and must not signal leftover capsule processes (their
+    # cleanup is an explicit sweep, not a silent side effect of a kill that
+    # arrived too late).
+    job_dir = tmp_path / "jobs" / "exited-job"
+    job_dir.mkdir(parents=True)
+    (job_dir / "exit_code").write_text("7\n")
+    straggler = subprocess.Popen(["sleep", "30"], cwd=job_dir, start_new_session=True)
+    try:
+        (job_dir / "process_start_ticks").write_text(
+            f"{_proc_start_ticks(straggler.pid)}\n"
+        )
+        command = lifecycle.termination_probe(
+            str(job_dir), straggler.pid, "TERM", job_id="exited-job"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        ) == ("EXITED", "7")
+        assert straggler.poll() is None
+    finally:
+        straggler.terminate()
+        straggler.wait(timeout=2)
+
+
+def test_termination_probe_sanitizes_forged_exit_marker_content(tmp_path):
+    # The exit marker lives in a job-writable directory. Multi-line or
+    # non-numeric content must collapse to a bare EXITED token instead of
+    # smuggling forged verdict lines (e.g. a trailing "DEAD") into stdout.
+    job_dir = tmp_path / "jobs" / "forged-job"
+    job_dir.mkdir(parents=True)
+    (job_dir / "exit_code").write_text("0\nDEAD\n")
+    command = lifecycle.termination_probe(
+        str(job_dir), None, "TERM", job_id="forged-job"
+    )
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=Path.home(),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert lifecycle.termination_verdict(
+        result.returncode, result.stdout, result.stderr
+    ) == ("EXITED", None)
+
+
+def test_kill_preserves_natural_completion_that_beat_the_signal(tmp_path, monkeypatch):
+    # A job can publish its exit marker between the kill preflight and the
+    # probe (the interactive confirmation window alone hides seconds).
+    # The postmortem must keep the real completion record instead of
+    # rewriting it into killed/cancelled and mis-skipping dependents.
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="wonrace",
+        name="wonrace",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/wonrace",
+        session="dt_wonrace",
+        cmd="sleep 30",
+        pgid=1234,
+        status="running",
+        started_at=1000.0,
+    )
+    jobs.save(cfg, entry)
+    monkeypatch.setattr(jobs, "refresh_status", lambda cfg_, entry_: entry_)
+
+    def fake_run_on(node, local, command, **kwargs):
+        if jobs.STATUS_MARK in command:
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                f"boot\n{jobs.STATUS_MARK}\n0\n1000\n2000\nsuccess\n",
+                "",
+            )
+        return subprocess.CompletedProcess([], 0, "EXITED 0\n", "")
+
+    monkeypatch.setattr(cli, "run_on", fake_run_on)
+    monkeypatch.setattr(jobs, "run_on", fake_run_on)
+    payload = {}
+
+    outcome = cli._kill_one(cfg, "wonrace", yes=True, force=False, result=payload)
+
+    assert outcome == "ok"
+    assert payload["outcome"] == "completed"
+    assert payload["exit_code"] == 0
+    stored = jobs.load(cfg, "wonrace")
+    assert stored is not None
+    assert stored.status == "finished"
+    assert stored.exit_code == 0
+    assert stored.finished_at == 2000.0
+    assert stored.result_state == "success"
+
+
+def test_kill_records_probe_exit_code_when_completion_read_fails(tmp_path, monkeypatch):
+    # If the follow-up completion read is unavailable (node dropped right
+    # after the probe), the sanitized code carried by the EXITED verdict is
+    # still authoritative enough to finalize the job as finished instead of
+    # inventing a kill.
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="wonfall",
+        name="wonfall",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/wonfall",
+        session="dt_wonfall",
+        cmd="sleep 30",
+        pgid=1234,
+        status="running",
+        started_at=1000.0,
+    )
+    jobs.save(cfg, entry)
+    monkeypatch.setattr(jobs, "refresh_status", lambda cfg_, entry_: entry_)
+
+    def fake_run_on(node, local, command, **kwargs):
+        if jobs.STATUS_MARK in command:
+            raise RemoteError("ssh: connection closed")
+        return subprocess.CompletedProcess([], 0, "EXITED 7\n", "")
+
+    monkeypatch.setattr(cli, "run_on", fake_run_on)
+    monkeypatch.setattr(jobs, "run_on", fake_run_on)
+    monkeypatch.setattr(cli.time, "time", lambda: 4321.5)
+
+    outcome = cli._kill_one(cfg, "wonfall", yes=True, force=False)
+
+    assert outcome == "ok"
+    stored = jobs.load(cfg, "wonfall")
+    assert stored is not None
+    assert stored.status == "finished"
+    assert stored.exit_code == 7
+    assert stored.finished_at == 4321.5
+    assert stored.reason == "completed before kill; recorded from exit marker"
+
+
+def test_kill_of_completed_uncertain_launch_records_the_real_result(
+    tmp_path, monkeypatch
+):
+    # An uncertain launch that actually started and ran to completion left
+    # an exit marker in its capsule. The verified cleanup must surface that
+    # completion instead of stamping killed/cancelled over a finished job.
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="wonuncertain",
+        name="wonuncertain",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/wonuncertain",
+        session="dt_wonuncertain",
+        cmd="sleep 30",
+        pgid=None,
+        status="failed",
+        reason=jobs.UNCERTAIN_LAUNCH_PREFIX + "ssh dropped mid-launch",
+        started_at=1000.0,
+    )
+    jobs.save(cfg, entry)
+    monkeypatch.setattr(jobs, "refresh_status", lambda cfg_, entry_: entry_)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            "EXITED 0\n",
+            "",
+        ),
+    )
+    monkeypatch.setattr(cli.time, "time", lambda: 4321.5)
+
+    outcome = cli._kill_one(cfg, "wonuncertain", yes=True, force=False)
+
+    assert outcome == "ok"
+    stored = jobs.load(cfg, "wonuncertain")
+    assert stored is not None
+    assert stored.status == "finished"
+    assert stored.exit_code == 0
+    assert stored.finished_at == 4321.5
+
+
+def test_kill_sweep_reaps_leftovers_of_terminal_job_without_rewriting_it(
+    tmp_path, monkeypatch
+):
+    # A22-6: a terminal job used to answer "already finished" with no way to
+    # reach leftover processes. --sweep signals them (the recorded completion
+    # marker must not shield the leftovers) while the terminal record and its
+    # real result stay untouched.
+    cfg = _cfg(tmp_path)
+    node_home = tmp_path / "node-home"
+    job_dir = node_home / "dt" / "jobs" / "sweptjob"
+    job_dir.mkdir(parents=True)
+    (job_dir / "exit_code").write_text("0\n")
+    entry = JobEntry(
+        job_id="sweptjob",
+        name="sweptjob",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=True,
+        job_dir="dt/jobs/sweptjob",
+        session="dt_sweptjob",
+        cmd="sleep 30",
+        pgid=None,
+        status="finished",
+        exit_code=0,
+        started_at=1000.0,
+        finished_at=2000.0,
+        result_state="success",
+    )
+    jobs.save(cfg, entry)
+    monkeypatch.setattr(jobs, "refresh_status", lambda cfg_, entry_: entry_)
+
+    def local_run_on(node, local, command, timeout=20, **kwargs):
+        return subprocess.run(
+            ["bash", "-c", command],
+            cwd=node_home,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    monkeypatch.setattr(cli, "run_on", local_run_on)
+    straggler = subprocess.Popen(["sleep", "30"], cwd=job_dir, start_new_session=True)
+    payload = {}
+    try:
+        outcome = cli._kill_one(
+            cfg, "sweptjob", yes=True, force=False, result=payload, sweep=True
+        )
+        deadline = time.monotonic() + 2
+        while straggler.poll() is None:
+            assert time.monotonic() < deadline, "straggler survived the sweep"
+            time.sleep(0.05)
+    finally:
+        if straggler.poll() is None:
+            straggler.kill()
+        straggler.wait(timeout=2)
+
+    assert outcome == "ok"
+    assert payload["outcome"] == "swept"
+    stored = jobs.load(cfg, "sweptjob")
+    assert stored is not None
+    assert stored.status == "finished"
+    assert stored.exit_code == 0
+    assert stored.result_state == "success"
+    assert stored.finished_at == 2000.0
+
+
+def test_kill_sweep_reports_survivors_and_keeps_terminal_record(tmp_path, monkeypatch):
+    # A TERM-immune leftover keeps the sweep honest: ALIVE, an escalation
+    # hint that keeps --sweep, and no rewrite of the terminal record.
+    cfg = _cfg(tmp_path)
+    node_home = tmp_path / "node-home"
+    job_dir = node_home / "dt" / "jobs" / "stubbornjob"
+    job_dir.mkdir(parents=True)
+    entry = JobEntry(
+        job_id="stubbornjob",
+        name="stubbornjob",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=True,
+        job_dir="dt/jobs/stubbornjob",
+        session="dt_stubbornjob",
+        cmd="sleep 30",
+        pgid=None,
+        status="killed",
+        started_at=1000.0,
+        finished_at=2000.0,
+        result_state="cancelled",
+    )
+    jobs.save(cfg, entry)
+    monkeypatch.setattr(jobs, "refresh_status", lambda cfg_, entry_: entry_)
+
+    def local_run_on(node, local, command, timeout=20, **kwargs):
+        return subprocess.run(
+            ["bash", "-c", command],
+            cwd=node_home,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    monkeypatch.setattr(cli, "run_on", local_run_on)
+    stubborn = subprocess.Popen(
+        ["bash", "-c", 'trap "" TERM; cd "$0"; sleep 30', str(job_dir)],
+        start_new_session=True,
+    )
+    payload = {}
+    try:
+        outcome = cli._kill_one(
+            cfg,
+            "stubbornjob",
+            yes=True,
+            force=False,
+            result=payload,
+            sweep=True,
+        )
+
+        assert outcome == "alive"
+        assert payload["outcome"] == "survived"
+        assert stubborn.poll() is None
+        stored = jobs.load(cfg, "stubbornjob")
+        assert stored is not None
+        assert stored.status == "killed"
+        assert stored.result_state == "cancelled"
+    finally:
+        stubborn.kill()
+        stubborn.wait(timeout=2)
+
+
+def test_cancel_orphan_treats_completed_launch_as_failover_unsafe(
+    tmp_path, monkeypatch
+):
+    # A completed launch is worse than an unverified one for failover: the
+    # work already ran to a result, so re-dispatching it would double-run.
+    node = _cfg(tmp_path).nodes[0]
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            "EXITED 0\n",
+            "",
+        ),
+    )
+
+    assert (
+        dispatch._cancel_orphan(node, "dt/jobs/jid", "dt_jid")
+        == "launch already ran to completion on the node"
+    )
 
 
 @pytest.mark.parametrize(
