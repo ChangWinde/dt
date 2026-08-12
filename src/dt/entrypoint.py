@@ -55,7 +55,10 @@ def _version_main(argv: list[str]) -> None:
 
 def main() -> None:
     argv = sys.argv[1:]
-    if argv == ["--version"]:
+    # The journal classifies both spellings as "version"; -V must therefore
+    # actually behave as one instead of reaching the full CLI as a usage
+    # error that the journal then misreports as a failed identity probe.
+    if argv in (["--version"], ["-V"]):
         _version_main(argv)
         return
     _cli_main()

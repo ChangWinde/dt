@@ -35,6 +35,28 @@ def test_exact_version_uses_fast_path_and_records_operation(
     assert events[-1]["exit_code"] == 0
 
 
+def test_short_version_alias_matches_journal_classification(
+    tmp_path, monkeypatch, capsys
+):
+    # The journal records -V as command "version"; it must actually behave as
+    # one instead of reaching the full CLI as a usage error that the journal
+    # then misreports as a failed identity probe.
+    state = tmp_path / "state"
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    monkeypatch.setenv("DT_CONFIG", str(tmp_path / "missing-config.yaml"))
+    monkeypatch.setattr(sys, "argv", ["dt", "-V"])
+    monkeypatch.setattr(
+        entrypoint,
+        "_cli_main",
+        lambda: (_ for _ in ()).throw(AssertionError("full CLI was imported")),
+    )
+
+    entrypoint.main()
+
+    output = capsys.readouterr()
+    assert output.out.startswith(f"dt {__version__}")
+
+
 def test_non_exact_version_arguments_delegate_to_full_cli(monkeypatch):
     calls = []
     monkeypatch.setattr(sys, "argv", ["dt", "--version", "unexpected"])

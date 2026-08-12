@@ -216,6 +216,7 @@ def _root(
     version: bool = typer.Option(
         False,
         "--version",
+        "-V",
         callback=_version_cb,
         is_eager=True,
         help="show version (+ git sha when running from a repo)",
