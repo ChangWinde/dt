@@ -2,6 +2,7 @@
 and rsync retries must resume."""
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -4279,10 +4280,15 @@ def test_kill_uses_single_procfs_scan_instead_of_one_readlink_per_pid():
     assert "find /proc -mindepth 2 -maxdepth 2" in source
 
 
-def test_termination_probe_does_not_signal_reused_process_group(tmp_path):
+def test_corrupt_identity_with_capsule_cwd_is_alive_not_dead(tmp_path):
+    # A live process whose cwd is inside our private capsule but whose
+    # identity file is corrupt (rc=2, unproven leader) is indistinguishable
+    # from a reused group; foreign reuse cannot land its cwd in the capsule,
+    # so fail closed: report ALIVE and never signal the possibly-foreign
+    # group. (Was falsely DEAD before the H1 postmortem fix.)
     job_dir = tmp_path / "jobs" / "stale-job"
     job_dir.mkdir(parents=True)
-    (job_dir / "process_start_ticks").write_text("1\n")
+    (job_dir / "process_start_ticks").write_text("1\n")  # wrong ticks -> rc=2
     unrelated = subprocess.Popen(["sleep", "30"], cwd=job_dir, start_new_session=True)
     try:
         command = lifecycle.termination_probe(
@@ -4293,7 +4299,36 @@ def test_termination_probe_does_not_signal_reused_process_group(tmp_path):
             cwd=Path.home(),
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=10,
+        )
+
+        assert lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        ) == ("ALIVE", None)
+        assert unrelated.poll() is None
+    finally:
+        unrelated.terminate()
+        unrelated.wait(timeout=2)
+
+
+def test_foreign_group_reuse_outside_capsule_is_dead(tmp_path):
+    # Genuine reuse: an unrelated process holding the recorded PGID whose cwd
+    # is *outside* the capsule and whose identity ticks do not match must stay
+    # DEAD and never be signalled.
+    job_dir = tmp_path / "jobs" / "reused-job"
+    job_dir.mkdir(parents=True)
+    (job_dir / "process_start_ticks").write_text("1\n")  # wrong ticks -> rc=2
+    unrelated = subprocess.Popen(["sleep", "30"], cwd="/tmp", start_new_session=True)
+    try:
+        command = lifecycle.termination_probe(
+            str(job_dir), unrelated.pid, "TERM", job_id="reused-job"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
 
         assert lifecycle.termination_verdict(
@@ -4303,6 +4338,144 @@ def test_termination_probe_does_not_signal_reused_process_group(tmp_path):
     finally:
         unrelated.terminate()
         unrelated.wait(timeout=2)
+
+
+def test_termination_probe_unverified_when_boot_id_unreadable(tmp_path):
+    # Failing to read boot_id (masked /proc, fork exhaustion) is not evidence
+    # of a reboot; the probe must report UNVERIFIED and signal nothing rather
+    # than fire a single shot and declare DEAD.
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "cat").write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do case "$a" in */boot_id) exit 1;; esac; done\n'
+        'exec /bin/cat "$@"\n'
+    )
+    (stub / "cat").chmod(0o755)
+    job_dir = tmp_path / "jobs" / "boot-unknown-job"
+    job_dir.mkdir(parents=True)
+    alive = subprocess.Popen(["sleep", "30"], cwd=job_dir, start_new_session=True)
+    try:
+        (job_dir / "process_start_ticks").write_text(
+            f"{_proc_start_ticks(alive.pid)}\n"
+        )
+        command = lifecycle.termination_probe(
+            str(job_dir),
+            alive.pid,
+            "TERM",
+            boot_id="some-recorded-boot-id",
+            job_id="boot-unknown-job",
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"},
+        )
+
+        verdict, _ = lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        )
+        assert verdict == "UNVERIFIED"
+        assert alive.poll() is None
+    finally:
+        alive.terminate()
+        alive.wait(timeout=2)
+
+
+def test_termination_probe_unverified_when_enumeration_tools_fail(tmp_path):
+    # pgrep/find failing (missing on a minimal node, fork exhaustion) yields
+    # the same empty output as "no processes"; an empty census under a broken
+    # enumerator must report UNVERIFIED, not a false DEAD.
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "pgrep").write_text("#!/bin/sh\nexit 127\n")
+    (stub / "find").write_text("#!/bin/sh\nexit 2\n")
+    for tool in ("pgrep", "find"):
+        (stub / tool).chmod(0o755)
+    job_dir = tmp_path / "jobs" / "degraded-job"
+    job_dir.mkdir(parents=True)
+    trapped = subprocess.Popen(
+        ["bash", "-c", 'trap "" TERM; cd "$0"; sleep 30', str(job_dir)],
+        start_new_session=True,
+    )
+    try:
+        (job_dir / "process_start_ticks").write_text(
+            f"{_proc_start_ticks(trapped.pid)}\n"
+        )
+        command = lifecycle.termination_probe(
+            str(job_dir), trapped.pid, "TERM", job_id="degraded-job"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"},
+        )
+
+        verdict, _ = lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        )
+        assert verdict == "UNVERIFIED"
+        assert trapped.poll() is None
+    finally:
+        # bash tail-call-exec's sleep and SIG_IGN for TERM survives the exec,
+        # so the process genuinely ignores SIGTERM; only SIGKILL clears it.
+        trapped.kill()
+        trapped.wait(timeout=2)
+
+
+def test_dead_leader_signals_in_group_orphan_that_left_the_capsule(tmp_path):
+    # A dead leader's PGID cannot be reused as a group, so an in-group orphan
+    # that chdir'd out of the capsule (dataloader/user os.chdir) is still ours
+    # and must be signalled via the group even though the cwd scan misses it.
+    job_dir = tmp_path / "jobs" / "wander-job"
+    job_dir.mkdir(parents=True)
+    (job_dir / "process_start_ticks").write_text("1\n")
+    leader = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            "{ cd /tmp && sleep 30 >/dev/null 2>&1 & } && printf '%s\\n' \"$!\"",
+        ],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert leader.stdout is not None
+    orphan_pid = int(leader.stdout.readline().strip())
+    leader_pid = leader.pid
+    assert leader.wait(timeout=5) == 0
+    assert Path(f"/proc/{orphan_pid}").exists()
+    assert not Path(f"/proc/{leader_pid}").exists()
+
+    try:
+        command = lifecycle.termination_probe(
+            str(job_dir), leader_pid, "TERM", job_id="wander-job"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        ) == ("DEAD", None)
+        deadline = time.monotonic() + 2
+        while Path(f"/proc/{orphan_pid}").exists():
+            assert time.monotonic() < deadline, "in-group orphan survived the probe"
+            time.sleep(0.05)
+    finally:
+        subprocess.run(
+            ["kill", "-9", str(orphan_pid)], capture_output=True, check=False
+        )
 
 
 def test_termination_probe_signals_orphans_after_leader_death(tmp_path):

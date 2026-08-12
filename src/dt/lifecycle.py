@@ -121,7 +121,6 @@ def termination_probe(
         else ""
     )
     close_session = (
-        '[ "$DT_KBOOT_MATCH" -eq 1 ] && '
         'tmux -L dt kill-session -t "$DT_KSESSION" 2>/dev/null; '
         if session is not None
         else ""
@@ -129,44 +128,90 @@ def termination_probe(
     script = (
         process_identity_shell() + "owned_group() { "
         'dt_process_owned "$DT_KPG" "$DT_KIDENT" "$DT_KJD" "$DT_KBOOT"; }; '
-        # A live-but-unproven leader (rc=2) means the PGID may belong to a
-        # reused, unrelated process group: never signal its members. A dead
-        # leader (rc=1) cannot have been reused as a group, so in-group
-        # orphans whose cwd stayed inside the capsule are ours to signal.
-         + "emit_cwd_pid() { dt_ec_pid=$1; "
-        'if [ "$DT_KGROUP_OWNED" -eq 0 ] && [ "$DT_KLEADER_GONE" -eq 0 ] '
-        '&& [ "$DT_KPG" -gt 0 ]; then '
-        'dt_ec_group=$(dt_pid_group "$dt_ec_pid") || return 0; '
-        '[ "$dt_ec_group" = "$DT_KPG" ] && return 0; fi; '
-        "printf '%s\\n' \"$dt_ec_pid\"; }; "
+        # The signal targets and the survivor census are deliberately
+        # different sets. A live-but-unproven leader (rc=2) means the PGID may
+        # belong to a reused, unrelated group, so its in-group members must
+        # never be *signalled*; but a process whose cwd is inside our private
+        # capsule is almost certainly ours (foreign reuse cannot land there),
+        # so it must still *count as alive*. Splitting the two stops a
+        # corrupt-but-present identity file from being reported falsely dead.
+         + "sig_scan() { "
+        "if command -v find >/dev/null 2>&1; then "
+        "dt_sig_raw=$(find /proc -mindepth 2 -maxdepth 2 -type l -name cwd "
+        '\\( -lname "$DT_KJD" -o -lname "$DT_KJD/*" \\) '
+        "-printf '%h\\n' 2>/dev/null); "
+        "for dt_sig_h in $dt_sig_raw; do printf '%s\\n' \"${dt_sig_h##*/}\"; done; "
+        "else for dt_sig_p in /proc/[0-9]*; do "
+        'case "$(readlink "$dt_sig_p/cwd" 2>/dev/null)" in "$DT_KJD"|"$DT_KJD"/*) '
+        "printf '%s\\n' \"${dt_sig_p#/proc/}\";; esac; done; fi; }; "
+        # survivors() prints OK|DEGRADED on the first line, then every PID that
+        # proves the job is still alive. DEGRADED marks an enumeration failure
+        # (missing/br0ken pgrep or find, fork exhaustion) so an empty census
+        # under a broken probe reports UNVERIFIED, never a false DEAD.
+         + "survivors() { dt_su_deg=0; dt_su_pids=''; dt_su_grun=0; "
+        'if [ "$DT_KGROUP_OWNED" -eq 1 ]; then dt_su_grun=1; '
+        'elif [ "$DT_KLEADER_GONE" -eq 1 ] && [ "$DT_KPG" -gt 0 ] '
+        '&& [ ! -e "/proc/$DT_KPG" ]; then dt_su_grun=1; fi; '
+        'if [ "$dt_su_grun" -eq 1 ]; then '
+        'dt_su_gp=$(pgrep -g "$DT_KPG" 2>/dev/null); dt_su_grc=$?; '
+        '[ "$dt_su_grc" -gt 1 ] && dt_su_deg=1; '
+        'for dt_su_x in $dt_su_gp; do dt_su_pids="$dt_su_pids $dt_su_x"; done; fi; '
+        "if command -v find >/dev/null 2>&1; then "
+        "dt_su_cwd=$(find /proc -mindepth 2 -maxdepth 2 -type l -name cwd "
+        '\\( -lname "$DT_KJD" -o -lname "$DT_KJD/*" \\) '
+        "-printf '%h\\n' 2>/dev/null); dt_su_frc=$?; "
+        # find exits 1 merely because it could not stat other users' /proc
+        # entries; only >=2 (missing/incompatible find, fork failure) is a
+        # real enumeration failure worth flagging degraded.
+        '[ "$dt_su_frc" -gt 1 ] && dt_su_deg=1; '
+        'for dt_su_h in $dt_su_cwd; do dt_su_pids="$dt_su_pids ${dt_su_h##*/}"; done; '
+        "else for dt_su_p in /proc/[0-9]*; do "
+        'case "$(readlink "$dt_su_p/cwd" 2>/dev/null)" in "$DT_KJD"|"$DT_KJD"/*) '
+        'dt_su_pids="$dt_su_pids ${dt_su_p#/proc/}";; esac; done; fi; '
+        '[ "$dt_su_deg" -eq 1 ] && echo DEGRADED || echo OK; '
+        "for dt_su_x in $dt_su_pids; do printf '%s\\n' \"$dt_su_x\"; done; }; "
         + 'case "$DT_KJD" in /*) :;; *) DT_KJD="$PWD/$DT_KJD";; esac; '
-        + 'DT_KBOOT_MATCH=1; if [ -n "$DT_KBOOT" ]; then '
+        # Distinguish a read failure (probe infrastructure down: masked
+        # /proc, fork exhaustion) from a genuine mismatch (node rebooted).
+        + 'DT_KBOOT_MATCH=1; DT_KBOOT_UNKNOWN=0; if [ -n "$DT_KBOOT" ]; then '
         + "dt_k_current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) "
-        + '|| DT_KBOOT_MATCH=0; [ "$dt_k_current_boot" = "$DT_KBOOT" ] '
-        + "|| DT_KBOOT_MATCH=0; fi; "
+        + "|| DT_KBOOT_UNKNOWN=1; "
+        '[ "$DT_KBOOT_UNKNOWN" -eq 0 ] && [ "$dt_k_current_boot" != "$DT_KBOOT" ] '
+        + "&& DT_KBOOT_MATCH=0; fi; "
         + prefix
+        # A proven boot mismatch is the one safe DEAD shortcut: the node
+        # rebooted, so nothing from the recorded boot can still be running.
+        + '[ "$DT_KBOOT_UNKNOWN" -eq 0 ] && [ "$DT_KBOOT_MATCH" -eq 0 ] '
+        "&& { echo DEAD; exit 0; }; "
+        '[ "$DT_KBOOT_UNKNOWN" -eq 1 ] && { echo UNPROVEN; exit 3; }; '
         + "owned_group; dt_k_owned_rc=$?; "
         "DT_KGROUP_OWNED=0; DT_KLEADER_GONE=0; "
         '[ "$dt_k_owned_rc" -eq 0 ] && DT_KGROUP_OWNED=1; '
         '[ "$dt_k_owned_rc" -eq 1 ] && DT_KLEADER_GONE=1; '
-        + 'list() { [ "$DT_KBOOT_MATCH" -eq 1 ] || return 0; '
-        '[ "$DT_KGROUP_OWNED" -eq 1 ] && '
-        'pgrep -g "$DT_KPG" 2>/dev/null; '
-        "if command -v find >/dev/null 2>&1; then "
-        "find /proc -mindepth 2 -maxdepth 2 -type l -name cwd "
-        '\\( -lname "$DT_KJD" -o -lname "$DT_KJD/*" \\) '
-        "-printf '%h\\n' 2>/dev/null | sed 's#.*/##' | "
-        'while IFS= read -r pid; do emit_cwd_pid "$pid"; done; '
-        "else for p in /proc/[0-9]*; do "
-        'case "$(readlink "$p/cwd" 2>/dev/null)" in "$DT_KJD"|"$DT_KJD"/*) '
-        'emit_cwd_pid "${p#/proc/}";; esac; done; fi; }; '
-        '[ "$DT_KGROUP_OWNED" -eq 1 ] && '
-        'kill -"$DT_KSIG" -- -"$DT_KPG" 2>/dev/null; '
-        "for pid in $(list | sort -u); do "
+        # A dead leader (rc=1) cannot have had its PGID reused as a group, so
+        # signalling the whole group reaches in-group orphans that chdir'd
+        # out of the capsule; the /proc check separates a freed PID (ours)
+        # from one reused by another user.
+         + "dt_k_grun=0; "
+        '[ "$DT_KGROUP_OWNED" -eq 1 ] && dt_k_grun=1; '
+        '[ "$DT_KLEADER_GONE" -eq 1 ] && [ "$DT_KPG" -gt 0 ] '
+        '&& [ ! -e "/proc/$DT_KPG" ] && dt_k_grun=1; '
+        '[ "$dt_k_grun" -eq 1 ] && kill -"$DT_KSIG" -- -"$DT_KPG" 2>/dev/null; '
+        "for pid in $(sig_scan | sort -u); do "
+        # rc=2 (unproven live leader): never signal a PID that shares the
+        # possibly-reused group; a capsule PID outside that group is ours.
+        'if [ "$DT_KGROUP_OWNED" -eq 0 ] && [ "$DT_KLEADER_GONE" -eq 0 ] '
+        '&& [ "$DT_KPG" -gt 0 ]; then '
+        'dt_k_spg=$(dt_pid_group "$pid") && [ "$dt_k_spg" = "$DT_KPG" ] '
+        "&& continue; fi; "
         'kill -"$DT_KSIG" "$pid" 2>/dev/null; done; '
         + close_session
         + "for i in 1 2 3 4 5 6; do sleep 0.5; "
-        '[ -z "$(list)" ] && { echo DEAD; exit 0; }; done; '
+        "dt_k_out=$(survivors); "
+        'case "$dt_k_out" in '
+        "OK) echo DEAD; exit 0;; "
+        "DEGRADED) echo UNPROVEN; exit 3;; "
+        "esac; done; "
         "echo ALIVE"
     )
     envs = [
