@@ -1966,6 +1966,7 @@ def _submission_payload(
     **extra: object,
 ) -> JsonDict:
     payload: JsonDict = {
+        "schema_version": "dt_submission_v1",
         "job_id": entry.job_id,
         "status": entry.status,
         "project": entry.project,

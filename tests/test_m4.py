@@ -535,6 +535,7 @@ def test_rerun_cli_uses_standard_submission_payload_and_reason(tmp_path, monkeyp
     assert json_result.exit_code == 0
     payload = json.loads(json_result.stdout)
     assert payload == {
+        "schema_version": "dt_submission_v1",
         "job_id": "new",
         "status": "queued",
         "project": "p",
