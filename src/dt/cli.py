@@ -7366,16 +7366,17 @@ def wait(
         raise typer.Exit(rc)
 
     entries: list[jobs_mod.JobEntry] = []
-    for ref in refs:
-        entry = jobs_mod.find(cfg, ref)
-        if entry is None:
-            _fail_submission(
-                kind="not_found",
-                message=f"no job matching {ref!r}",
-                exit_code=65,
-                json_=json_,
-            )
-        entries.append(entry)
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        for ref in refs:
+            entry = jobs_mod.find(cfg, ref)
+            if entry is None:
+                _fail_submission(
+                    kind="not_found",
+                    message=f"no job matching {ref!r}",
+                    exit_code=65,
+                    json_=json_,
+                )
+            entries.append(entry)
     if len({entry.job_id for entry in entries}) != len(entries):
         _fail_submission(
             kind="invalid_argument",
@@ -10144,16 +10145,17 @@ def compare(
                 )
     else:
         entries = []
-        for ref in refs:
-            entry = jobs_mod.find(cfg, ref)
-            if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=EXIT_NOT_FOUND,
-                    json_=json_,
-                )
-            entries.append(entry)
+        with jobs_mod.shared_resolution_snapshot(cfg):
+            for ref in refs:
+                entry = jobs_mod.find(cfg, ref)
+                if entry is None:
+                    _fail_submission(
+                        kind="not_found",
+                        message=f"no job matching {ref!r}",
+                        exit_code=EXIT_NOT_FOUND,
+                        json_=json_,
+                    )
+                entries.append(entry)
 
     if len({entry.job_id for entry in entries}) != len(entries):
         _fail_submission(
@@ -10345,19 +10347,20 @@ def watch(
         return True
 
     entries = []
-    for ref in refs:
-        if json_:
-            entry = jobs_mod.find(cfg, ref)
-            if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=EXIT_NOT_FOUND,
-                    json_=True,
-                )
-        else:
-            entry = _find_or_die(cfg, ref)
-        entries.append(entry)
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        for ref in refs:
+            if json_:
+                entry = jobs_mod.find(cfg, ref)
+                if entry is None:
+                    _fail_submission(
+                        kind="not_found",
+                        message=f"no job matching {ref!r}",
+                        exit_code=EXIT_NOT_FOUND,
+                        json_=True,
+                    )
+            else:
+                entry = _find_or_die(cfg, ref)
+            entries.append(entry)
     job_ids = [entry.job_id for entry in entries]
     if len(set(job_ids)) != len(job_ids):
         _fail_submission(
@@ -12302,7 +12305,8 @@ def pull(
             )
         raise typer.Exit(rc)
 
-    entries = [jobs_mod.find(cfg, ref) for ref in refs]
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        entries = [jobs_mod.find(cfg, ref) for ref in refs]
     if len(entries) == 1 and entries[0] is None:
         _pull_unlocked(
             refs[0],

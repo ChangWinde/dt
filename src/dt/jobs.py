@@ -24,6 +24,7 @@ import stat
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
@@ -820,25 +821,25 @@ def queue_contexts(entries: list[JobEntry]) -> dict[str, dict[str, object]]:
     }
 
 
-def resolve_ref(
-    cfg: HeadConfig,
-    ref: str,
-) -> tuple[JobEntry | None, list[JobEntry]]:
-    """Return one resolved job or the ambiguous partial-id candidates."""
+def _scope_ref(cfg: HeadConfig, ref: str) -> str | None:
+    """Strip this center's scope prefix; None when out of scope or empty."""
     ref = ref.strip()
     if not ref:
-        return None, []
+        return None
     scoped_prefix = f"{cfg.center}:"
     if ref.startswith(scoped_prefix):
         ref = ref[len(scoped_prefix) :]
-        if not ref:
-            return None, []
-    elif ":" in ref:
-        return None, []
-    exact = load(cfg, ref)
-    if exact:
-        return exact, []
-    entries = list_all(cfg)
+        return ref or None
+    if ":" in ref:
+        return None
+    return ref
+
+
+def _resolve_ref_against(
+    entries: list[JobEntry],
+    ref: str,
+) -> tuple[JobEntry | None, list[JobEntry]]:
+    """Match one already-scoped ref by exact name, then unique partial id."""
     exact_names = [entry for entry in entries if entry.name == ref]
     if exact_names:
         # Reusing a meaningful experiment name intentionally addresses its
@@ -848,6 +849,53 @@ def resolve_ref(
     if len(matches) != 1:
         return None, sorted(matches, key=lambda entry: entry.created_at, reverse=True)
     return matches[0], []
+
+
+_resolution_snapshot: ContextVar[dict[str, list[JobEntry]] | None] = ContextVar(
+    "dt_registry_resolution_snapshot",
+    default=None,
+)
+
+
+@contextmanager
+def shared_resolution_snapshot(cfg: HeadConfig) -> Iterator[None]:
+    """Serve partial-ref resolution in this scope from one registry decode.
+
+    Multi-reference commands resolve every argument up front; without a
+    shared snapshot each non-exact reference re-reads and re-decodes the full
+    registry.  Exact job ids still read their row directly, so they observe
+    rows saved after the scope opened.  Entries resolved inside one scope may
+    alias each other, so callers must treat them as read-only or replace().
+    """
+    token = _resolution_snapshot.set({})
+    try:
+        yield
+    finally:
+        _resolution_snapshot.reset(token)
+
+
+def _resolution_entries(cfg: HeadConfig) -> list[JobEntry]:
+    scope = _resolution_snapshot.get()
+    if scope is None:
+        return list_all(cfg)
+    key = str(cfg.registry_dir())
+    if key not in scope:
+        scope[key] = list_all(cfg)
+    return scope[key]
+
+
+def resolve_ref(
+    cfg: HeadConfig,
+    ref: str,
+) -> tuple[JobEntry | None, list[JobEntry]]:
+    """Return one resolved job or the ambiguous partial-id candidates."""
+    scoped = _scope_ref(cfg, ref)
+    if scoped is None:
+        return None, []
+    exact = load(cfg, scoped)
+    if exact:
+        return exact, []
+    return _resolve_ref_against(_resolution_entries(cfg), scoped)
 
 
 def find(cfg: HeadConfig, ref: str) -> JobEntry | None:

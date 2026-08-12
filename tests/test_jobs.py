@@ -1,6 +1,7 @@
 import random
 import re
 
+from dt import jobs
 from dt.config import HeadConfig
 from dt.jobs import (
     JobEntry,
@@ -154,6 +155,79 @@ def test_compact_job_refs_expand_collisions_and_resolver_fails_closed(tmp_path):
     assert (
         find(cfg, f"region:west:{refs[entries[0].job_id]}").job_id == entries[0].job_id
     )
+
+
+def test_shared_resolution_snapshot_decodes_the_registry_once(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="center-a",
+        nodes=[],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+
+    def entry(job_id: str, name: str, created_at: float) -> JobEntry:
+        return JobEntry(
+            job_id=job_id,
+            name=name,
+            center="center-a",
+            project="p",
+            node="n",
+            node_local=False,
+            job_dir=f"jobs/{job_id}",
+            session=job_id,
+            cmd="true",
+            created_at=created_at,
+        )
+
+    first = entry("20260812-0100_alpha_00000000000000aa", "alpha", 1.0)
+    second = entry("20260812-0200_beta_00000000000000bb", "beta", 2.0)
+    third = entry("20260812-0300_beta_00000000000000cc", "beta", 3.0)
+    for item in (first, second, third):
+        save(cfg, item)
+
+    refs = [
+        first.job_id,  # exact id resolves without touching the snapshot
+        "beta",  # exact name addresses its newest run
+        "00aa",  # unique compact suffix
+        "20260812-0",  # ambiguous prefix returns candidates
+        f"center-a:{second.job_id}",  # this center's scope prefix
+        "center-b:" + first.job_id,  # foreign scope never resolves here
+        "  ",  # blank never resolves
+        first.job_id,  # duplicates resolve once
+    ]
+
+    expected = {ref: resolve_ref(cfg, ref) for ref in set(refs)}
+
+    calls = 0
+    real_list_all = jobs.list_all
+
+    def counting_list_all(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_list_all(*args, **kwargs)
+
+    monkeypatch.setattr(jobs, "list_all", counting_list_all)
+    with jobs.shared_resolution_snapshot(cfg):
+        resolved = {ref: resolve_ref(cfg, ref) for ref in refs}
+        # An exact id saved after the scope opened still resolves, because
+        # exact lookups read their row directly instead of the snapshot.
+        late = entry("20260812-0400_late_00000000000000dd", "late", 4.0)
+        save(cfg, late)
+        assert find(cfg, late.job_id).job_id == late.job_id
+    assert calls == 1
+
+    for ref in set(refs):
+        assert resolved[ref] == expected[ref], ref
+    assert resolved["beta"][0] is not None
+    assert resolved["beta"][0].job_id == third.job_id
+    assert resolved["20260812-0"][0] is None
+    assert {item.job_id for item in resolved["20260812-0"][1]} == {
+        first.job_id,
+        second.job_id,
+        third.job_id,
+    }
 
 
 def _reference_compact_refs(
