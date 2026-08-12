@@ -1763,6 +1763,23 @@ def test_registry_filename_must_match_embedded_job_identity(tmp_path):
     assert [item.path for item in damage] == ["claimed.json"]
 
 
+def test_registry_null_created_at_surfaces_as_damage(tmp_path):
+    # An explicit created_at:null must not decode into a "healthy" row: every
+    # consumer sorts on created_at, so one poisoned line would TypeError
+    # compact plans and queue ordering wholesale.
+    cfg = _cfg(tmp_path)
+    record = _entry("poison", "queued", created_at=1.0).__dict__ | {"created_at": None}
+    (cfg.registry_dir() / "poison.json").write_text(
+        json.dumps(record), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="invalid lifecycle timestamps"):
+        load(cfg, "poison")
+    damage = []
+    assert list_all(cfg, damage=damage) == []
+    assert [item.path for item in damage] == ["poison.json"]
+
+
 def test_registry_writer_refuses_a_record_its_reader_cannot_bound(
     tmp_path, monkeypatch
 ):

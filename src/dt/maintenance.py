@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import shutil
@@ -227,6 +228,7 @@ def _remove_unreferenced_snapshots(
     cfg: HeadConfig,
     removed_entries: list[JobEntry],
     cutoff_ts: float,
+    log: Log,
 ) -> None:
     victim_digests = {
         entry.snapshot_sha256
@@ -253,9 +255,29 @@ def _remove_unreferenced_snapshots(
                     old_enough = path.stat().st_mtime < cutoff_ts
                 except FileNotFoundError:
                     continue
+                except OSError as exc:
+                    log(f"snapshot {digest[:12]} left in place: {exc}")
+                    continue
                 if path.is_dir() and not path.is_symlink() and old_enough:
-                    shutil.rmtree(path)
+                    # Quarantine-rename before deleting: a failed rmtree must
+                    # not leave a half-deleted tree at the digest path, where
+                    # the next same-content submission would reuse it as a
+                    # complete snapshot. One broken digest must also not
+                    # abort cleanup of the remaining ones.
+                    doomed = root / f".removing-{digest}"
+                    try:
+                        os.replace(path, doomed)
+                    except OSError as exc:
+                        log(f"snapshot {digest[:12]} left in place: {exc}")
+                        continue
                     removed_any = True
+                    try:
+                        shutil.rmtree(doomed)
+                    except OSError as exc:
+                        log(
+                            f"snapshot {digest[:12]} quarantined as "
+                            f"{doomed.name} but not fully removed: {exc}"
+                        )
             if removed_any:
                 removed_digests.add(digest)
         state = {
@@ -387,7 +409,13 @@ def clean_jobs(
                 continue
             removed_entries.append(entry)
 
-    _remove_unreferenced_snapshots(cfg, removed_entries, cutoff_ts)
+    try:
+        _remove_unreferenced_snapshots(cfg, removed_entries, cutoff_ts, log)
+    except Exception as exc:
+        # Registry records are already removed; losing the whole report (and
+        # skipping env cleanup) over a snapshot-store hiccup would hide what
+        # was actually done.
+        log(f"snapshot cleanup incomplete: {exc}")
     if envs:
         clean_envs(cfg, cutoff_ts, log, runner=runner)
     return CleanReport(
