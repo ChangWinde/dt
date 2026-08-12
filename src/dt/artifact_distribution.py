@@ -1000,6 +1000,38 @@ class TransferExecutor:
         log: Callable[[str], None],
         started: float,
     ) -> DistributionResult:
+        try:
+            return self._topology_aware_transfer(
+                source,
+                digest,
+                site,
+                destination,
+                destination_code,
+                copy_dest,
+                on_retry,
+                log,
+                started,
+            )
+        finally:
+            # Routes that were probed healthy but never ran their transfer
+            # (discarded by verification, or ranked behind the selected one)
+            # still hold decision()'s half-open claim; leaking it blocks a
+            # healthy edge for a full cooldown.
+            for issue in self.discovery.release_carried_reservations():
+                log(f"warning: route circuit reservation cleanup failed: {issue}")
+
+    def _topology_aware_transfer(
+        self,
+        source: Path,
+        digest: str,
+        site: Site,
+        destination: Node,
+        destination_code: str,
+        copy_dest: str | None,
+        on_retry: Callable[[RsyncRetryEvent], None] | None,
+        log: Callable[[str], None],
+        started: float,
+    ) -> DistributionResult:
         cache_node = self.topology.cache_node(site)
         discovery_started = time.monotonic()
         routes, present_replicas = self._discover_routes(

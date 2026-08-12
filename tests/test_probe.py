@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -250,6 +251,51 @@ def test_concurrent_probe_readers_do_not_create_false_gpu_leases(tmp_path):
     assert not real_wrapper.free
     assert real_wrapper.leased
     assert real_wrapper.lease_owner == "stale-finished-owner"
+
+
+def test_lease_file_without_checkable_lock_reads_busy(tmp_path):
+    # flock vanishing (PATH regression, rebuilt container) while a wrapper
+    # holds its lease must not silently free a busy GPU; an uncheckable
+    # lease file reads busy until doctor's DT_FLOCK check is fixed.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "nvidia-smi").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *--query-gpu=*) echo "0, GPU-test, 0, 81920, 0, 30" ;;\n'
+        "  *--query-compute-apps=*) : ;;\n"
+        "  *) exit 9 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "nvidia-smi").chmod(0o755)
+    for tool in ("tr", "head", "awk", "ps", "mktemp", "rm", "rmdir", "cat", "df"):
+        source = shutil.which(tool)
+        assert source is not None
+        (fake_bin / tool).symlink_to(source)
+    bash = shutil.which("bash")
+    assert bash is not None
+    leases = tmp_path / "leases"
+    leases.mkdir()
+    (leases / "gpu-0.lock").write_text("job-on-flockless-node\n", encoding="utf-8")
+
+    proc = subprocess.run(
+        [bash, "-c", PROBE_CMD],
+        env={
+            "PATH": str(fake_bin),
+            "HOME": str(tmp_path),
+            "TMPDIR": str(tmp_path),
+            "DT_GPU_LEASE_ROOT": str(leases),
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    gpu = parse_probe_output(proc.stdout, 500)[0]
+    assert gpu.leased is True
+    assert gpu.lease_owner == "job-on-flockless-node"
+    assert gpu.free is False
 
 
 def test_parse_live_gpu_temperature_with_lease():

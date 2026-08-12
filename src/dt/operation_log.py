@@ -300,6 +300,14 @@ def _checked_regular(path: Path) -> bool:
     return True
 
 
+def _fsync_directory(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _rotate(target: JournalTarget) -> None:
     current = target.current
     keep_files = target.settings.keep_files
@@ -307,6 +315,7 @@ def _rotate(target: JournalTarget) -> None:
         return
     if keep_files == 1:
         current.unlink()
+        _fsync_directory(current.parent)
         return
     oldest = current.with_name(f"{JOURNAL_NAME}.{keep_files - 1}")
     if _checked_regular(oldest):
@@ -320,6 +329,10 @@ def _rotate(target: JournalTarget) -> None:
             destination.unlink()
         os.replace(source, destination)
     os.replace(current, current.with_name(f"{JOURNAL_NAME}.1"))
+    # The rename chain is atomic per file but not durable until the directory
+    # itself is synced; a power loss here could otherwise drop whole
+    # generations that were already acknowledged.
+    _fsync_directory(current.parent)
 
 
 def append_event(target: JournalTarget, event: dict[str, Any]) -> None:
@@ -350,6 +363,10 @@ def append_event(target: JournalTarget, event: dict[str, Any]) -> None:
                     if written <= 0:
                         raise OperationJournalError("short operation journal write")
                     view = view[written:]
+                # Journal facts are the only postmortem trail for a crashed
+                # command; an unsynced append is exactly the record that a
+                # power loss erases.
+                os.fsync(data_fd)
             finally:
                 os.close(data_fd)
         finally:

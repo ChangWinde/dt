@@ -1604,6 +1604,54 @@ def test_clean_removes_only_unreferenced_snapshot_store(tmp_path, monkeypatch):
     assert not (cfg.snapshots_dir() / gone).exists()
 
 
+def test_clean_snapshot_gc_isolates_per_digest_failures(tmp_path, monkeypatch):
+    # One undeletable snapshot must not abort GC of the others or swallow the
+    # CleanReport, and its digest path must not keep a half-deleted tree that
+    # a same-content resubmission would reuse.
+    cfg = _cfg(tmp_path)
+    sticky = "c" * 64
+    smooth = "d" * 64
+    for digest in (sticky, smooth):
+        code = cfg.snapshots_dir() / digest / "code"
+        code.mkdir(parents=True)
+        (code / "x").write_text(digest)
+        os.utime(code.parent, (1.0, 1.0))
+    from dt.jobs import save
+
+    for job_id, digest in (("j1", sticky), ("j2", smooth)):
+        save(
+            cfg,
+            _entry(
+                job_id=job_id,
+                created_at=1.0,
+                finished_at=1.0,
+                job_dir=f"dt/jobs/{job_id}",
+                snapshot_sha256=digest,
+                node="-",
+                status="finished",
+            ),
+        )
+    import dt.maintenance as maintenance
+
+    real_rmtree = shutil.rmtree
+
+    def flaky(path, *args, **kwargs):
+        if sticky in str(path):
+            raise OSError(13, "denied")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(maintenance.shutil, "rmtree", flaky)
+    logs: list[str] = []
+
+    report = dispatch.clean_jobs(cfg, 1.5, envs=False, log=logs.append)
+
+    assert report.removed == 2
+    assert not (cfg.snapshots_dir() / smooth).exists()
+    assert not (cfg.snapshots_dir() / sticky).exists()
+    assert (cfg.snapshots_dir() / f".removing-{sticky}").is_dir()
+    assert any("not fully removed" in line for line in logs)
+
+
 def test_clean_preserves_cache_source_for_active_consumer(tmp_path):
     cfg = _cfg(tmp_path)
     source = _entry(

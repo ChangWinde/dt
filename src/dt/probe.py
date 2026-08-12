@@ -41,8 +41,12 @@ GPU_Q = (
     'idx=$(printf %s "$idx" | tr -d " "); '
     'lease="${DT_GPU_LEASE_ROOT:-$HOME/dt/gpu-leases}/gpu-$idx.lock"; '
     "leased=0; lease_owner=; "
-    'if [ -e "$lease" ] && command -v flock >/dev/null 2>&1 '
-    '&& ! flock -n -s "$lease" -c true; then '
+    # A lease file whose lock cannot be checked must read busy, not free:
+    # flock vanishing (PATH regression, rebuilt container) while a wrapper
+    # holds the lease would otherwise double-allocate a busy GPU. Stale-file
+    # false-busy is visible and fixable (doctor reports DT_FLOCK=missing).
+    'if [ -e "$lease" ] && { ! command -v flock >/dev/null 2>&1 '
+    '|| ! flock -n -s "$lease" -c true; }; then '
     'leased=1; lease_owner=$(head -n 1 "$lease" 2>/dev/null); fi; '
     'echo "$idx,$uuid,$used,$total,$util,$temp,$leased,$lease_owner"; done; fi'
 )

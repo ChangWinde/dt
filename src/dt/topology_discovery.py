@@ -395,6 +395,11 @@ class TopologyDiscovery:
             tuple[str, str],
             Future[tuple[DirectEndpoint, bool, float, str]],
         ] = {}
+        # Half-open circuit claims taken by decision() that a healthy probe
+        # deliberately left for the bulk transfer that normally follows.
+        # Scopes that never run that transfer must release them via
+        # release_carried_reservations().
+        self._carried_reservations: dict[tuple[str, str, str], Site] = {}
 
     def advertise(self, node: Node) -> NodeAdvertisement:
         with self._advertisement_lock:
@@ -767,17 +772,16 @@ class TopologyDiscovery:
                             destination.name,
                         )
                     elif prior.failures > 0:
-                        # A lightweight probe deliberately does not erase a
-                        # prior bulk-transfer failure, but the half-open
-                        # reservation this decision() claimed must be released
-                        # so the healthy edge is not left looking circuit-open
-                        # for the whole trial window (60-900s) after a probe
-                        # that nobody follows with a transfer.
-                        self.route_health.release_reservation(
-                            site,
-                            source.name,
-                            destination.name,
-                        )
+                        # A healthy probe does not erase a prior bulk-transfer
+                        # failure, so decision()'s half-open claim stays held
+                        # for the transfer expected to follow. Remember it:
+                        # if this scope never runs that transfer, the claim
+                        # must be released, or a read-only probe leaves a
+                        # healthy edge circuit-open for a full cooldown.
+                        with self._route_lock:
+                            self._carried_reservations[
+                                (site.name, source.name, destination.name)
+                            ] = site
                 elif kind in ROUTE_TRANSPORT_FAILURE_KINDS:
                     self.route_health.record_failure(
                         site,
@@ -808,6 +812,30 @@ class TopologyDiscovery:
         pending.set_result(result)
         return result
 
+    def _discard_carried(self, site: Site, source: str, destination: str) -> None:
+        with self._route_lock:
+            self._carried_reservations.pop((site.name, source, destination), None)
+
+    def release_carried_reservations(self) -> list[str]:
+        """Release half-open claims whose bulk transfer never ran.
+
+        Probe-only scopes (``dt topology``) and routes that were verified but
+        never selected would otherwise leave a healthy edge circuit-open for
+        up to ``route_circuit_max_cooldown_s``. Cleanup is best-effort so a
+        scope-end ``finally`` never masks the primary outcome: failures are
+        returned as descriptions instead of raised.
+        """
+        with self._route_lock:
+            carried = dict(self._carried_reservations)
+            self._carried_reservations.clear()
+        failures: list[str] = []
+        for (_, source, destination), site in carried.items():
+            try:
+                self.route_health.release_reservation(site, source, destination)
+            except RouteHealthError as exc:
+                failures.append(f"{source} -> {destination}: {exc}")
+        return failures
+
     def record_transfer_failure(
         self,
         route: DiscoveredRoute,
@@ -828,6 +856,7 @@ class TopologyDiscovery:
             )
         except RouteHealthError as exc:
             raise TopologyDiscoveryError("route circuit failure update failed") from exc
+        self._discard_carried(site, route.replica.node.name, destination.name)
 
     def record_transfer_success(
         self,
@@ -847,6 +876,7 @@ class TopologyDiscovery:
             )
         except RouteHealthError as exc:
             raise TopologyDiscoveryError("route circuit success update failed") from exc
+        self._discard_carried(site, route.replica.node.name, destination.name)
 
     def release_transfer_reservation(
         self,
@@ -869,6 +899,7 @@ class TopologyDiscovery:
             raise TopologyDiscoveryError(
                 "route circuit reservation update failed"
             ) from exc
+        self._discard_carried(site, route.replica.node.name, destination.name)
 
     def route(
         self,
@@ -996,5 +1027,11 @@ class TopologyDiscovery:
 
         if not pairs:
             return []
-        with ThreadPoolExecutor(max_workers=min(8, len(pairs))) as pool:
-            return list(pool.map(probe, pairs))
+        try:
+            with ThreadPoolExecutor(max_workers=min(8, len(pairs))) as pool:
+                return list(pool.map(probe, pairs))
+        finally:
+            # A probe-only scope never runs the bulk transfers that would
+            # resolve carried half-open claims; without this, observing the
+            # topology blocks healthy recovering edges for a full cooldown.
+            self.release_carried_reservations()
