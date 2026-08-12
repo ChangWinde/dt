@@ -768,6 +768,62 @@ def test_clean_jobs_selection_and_staging(tmp_path):
     assert {e.job_id for e in list_all(cfg)} == {"old-queued", "new-done"}
 
 
+def test_envs_in_use_protects_queued_rows_on_their_placement_targets(tmp_path):
+    # Queued rows still carry node "-", so grouping by entry.node parked the
+    # promised protection under a key no configured node ever reads; a
+    # retention sweep could then delete the exact env a pending job needs.
+    from dt.maintenance import envs_in_use
+
+    cfg = _cfg(tmp_path)
+    cfg.nodes = [Node(name="n1", local=True), Node(name="n2")]
+    save(
+        cfg,
+        _entry("pinned", "queued", created_at=1.0, env_hash="a" * 12, pin_node="n1"),
+    )
+    save(
+        cfg,
+        _entry(
+            "floating",
+            "queued",
+            created_at=2.0,
+            env_hash="b" * 12,
+            cache_source_env_hash="c" * 12,
+        ),
+    )
+    save(cfg, _entry("placed", "running", created_at=3.0, env_hash="d" * 12, node="n2"))
+
+    used = envs_in_use(cfg)
+
+    assert used["n1"] == {"a" * 12, "b" * 12, "c" * 12}
+    assert used["n2"] == {"b" * 12, "c" * 12, "d" * 12}
+    assert "-" not in used
+
+
+def test_clean_reports_unreadable_victim_rows_and_keeps_sweeping(tmp_path, monkeypatch):
+    # A row that turns unreadable between the cleanup plan and its locked
+    # re-read must surface as a failure, not abort the sweep and lose the
+    # whole report.
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("poisoned", "finished", created_at=1.0))
+    save(cfg, _entry("healthy", "finished", created_at=1.0))
+    real_load = maintenance.load
+
+    def flaky_load(cfg_arg, job_id):
+        if job_id == "poisoned":
+            raise maintenance.RegistryError("registry row damaged mid-sweep")
+        return real_load(cfg_arg, job_id)
+
+    monkeypatch.setattr(maintenance, "load", flaky_load)
+
+    report = clean_jobs(cfg, cutoff_ts=100.0, envs=False, log=lambda _: None)
+
+    assert report.removed == 1
+    assert [failure.kind for failure in report.failures] == ["registry_row_unreadable"]
+    assert load(cfg, "healthy") is None
+
+
 def test_clean_refuses_misdirected_node_identity(tmp_path):
     # A stale row naming an unconfigured node or the wrong locality must fail
     # visibly: rm -rf against the wrong executor hits a nonexistent per-job

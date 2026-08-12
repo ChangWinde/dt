@@ -15,6 +15,7 @@ from pathlib import PurePosixPath
 from .config import HeadConfig
 from .jobs import (
     JobEntry,
+    RegistryError,
     is_uncertain_launch,
     job_lock,
     list_all,
@@ -55,14 +56,31 @@ class CleanReport:
 
 
 def envs_in_use(cfg: HeadConfig) -> dict[str, set[str]]:
-    """Return environment identities referenced by live jobs, grouped by node."""
+    """Return environment identities referenced by live jobs, grouped by node.
+
+    Exact-environment jobs already carry their identity while queued, but a
+    queued row's node is still "-" (placement assigns the real one later), so
+    grouping by ``entry.node`` alone would park the whole protection under a
+    key no configured node ever reads. Queued identities go to the pin when
+    present and to every configured node otherwise, and the cache-fork source
+    environment is equally live: deleting it makes the pending fork's exact
+    reuse unreconstructible.
+    """
     used: dict[str, set[str]] = {}
+    node_names = [node.name for node in cfg.nodes]
+
+    def protect(placed: str | None, identity: str | None) -> None:
+        if not identity:
+            return
+        for name in [placed] if placed and placed != "-" else node_names:
+            used.setdefault(name, set()).add(identity)
+
     for entry in list_all(cfg):
-        # Exact-environment jobs already carry their identity while queued.
-        # Protect them as well as running jobs so a retention sweep cannot
-        # invalidate a future `dt exec` before the agent places it.
-        if entry.status in {"queued", "running"} and entry.env_hash:
-            used.setdefault(entry.node, set()).add(entry.env_hash)
+        if entry.status not in {"queued", "running"}:
+            continue
+        placed = entry.node if entry.node != "-" else entry.pin_node
+        protect(placed, entry.env_hash)
+        protect(placed, entry.cache_source_env_hash)
     return used
 
 
@@ -304,7 +322,22 @@ def clean_jobs(
     failures: list[CleanFailure] = []
     for selected in victims:
         with job_lock(cfg, selected.job_id):
-            entry = load(cfg, selected.job_id)
+            try:
+                entry = load(cfg, selected.job_id)
+            except (RegistryError, ValueError) as exc:
+                # A row that turned unreadable after the cleanup plan must
+                # not abort the whole sweep; report it and keep going.
+                message = f"registry row became unreadable: {exc}"
+                log(f"{selected.job_id}: {message}; registry retained")
+                failures.append(
+                    CleanFailure(
+                        job_id=selected.job_id,
+                        node=selected.node,
+                        kind="registry_row_unreadable",
+                        message=message,
+                    )
+                )
+                continue
             if entry is None or not _still_cleanable(
                 cfg,
                 entry,
