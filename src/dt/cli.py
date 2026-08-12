@@ -182,6 +182,10 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
     rich_markup_mode="rich",
     epilog=ROOT_EPILOG,
+    # An uncaught exception must not dump frame locals: they routinely hold
+    # webhook tokens, proxy URLs, and whole config mappings, and crash output
+    # is exactly what operators paste into shared channels.
+    pretty_exceptions_show_locals=False,
 )
 
 CliFunction = TypeVar("CliFunction", bound=Callable[..., Any])

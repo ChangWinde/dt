@@ -1,6 +1,13 @@
 """Redaction helpers must strip operator-private detail and never raise."""
 
+from dt import cli
 from dt.redaction import redact_home_path
+
+
+def test_uncaught_exceptions_never_render_frame_locals():
+    # Frame locals routinely hold webhook tokens and whole config mappings;
+    # crash output is exactly what operators paste into shared channels.
+    assert cli.app.pretty_exceptions_show_locals is False
 
 
 def test_home_prefix_is_rewritten_to_tilde(monkeypatch):
