@@ -1626,3 +1626,73 @@ def test_verified_transfer_does_not_resend_on_verifier_transport_failure(tmp_pat
         )
 
     assert modes == [False]
+
+
+def _receiver_shell_words(command: str) -> list[str]:
+    """Split the rsync remote path the way the receiving shell would."""
+    import shlex as _shlex
+
+    tail = command.rsplit(" -- ", 1)[1]
+    source_and_target = _shlex.split(tail)
+    assert len(source_and_target) == 2
+    target = source_and_target[1]
+    _address, _, remote_path = target.partition(":")
+    return _shlex.split(remote_path)
+
+
+def test_fanout_destination_with_spaces_survives_the_receiver_shell(
+    tmp_path, monkeypatch
+):
+    import dt.artifact_distribution as module
+
+    cfg = _cfg(tmp_path)
+    executor = TransferExecutor(cfg)
+    commands = []
+
+    def fake_run_on(node, local, command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess([], 0, _stats(23, 2), "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
+
+    executor._fanout(
+        cfg.sites["psibot"],
+        cfg.nodes[1],
+        cfg.nodes[2],
+        "a" * 64,
+        "~/dt/worker/my jobs/new/code",
+        None,
+    )
+
+    lan_command = next(c for c in commands if "lyf@172.16.6.91" in c)
+    assert _receiver_shell_words(lan_command) == ["dt/worker/my jobs/new/code/"]
+
+
+def test_p2p_destination_with_spaces_survives_the_receiver_shell(tmp_path, monkeypatch):
+    import dt.artifact_distribution as module
+
+    cfg = _topology_cfg(tmp_path)
+    executor = TransferExecutor(cfg)
+    replica = ArtifactReplica(
+        kind="peer",
+        node=cfg.nodes[1],
+        code_dir="~/dt/worker/jobs/prior/code",
+        recorded_at=10.0,
+    )
+    route = _direct_route(replica, cfg.nodes[2])
+    commands = []
+
+    def fake_run_on(node, local, command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess([], 0, _stats(987, 4), "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
+
+    executor._p2p_transfer(
+        route,
+        cfg.nodes[2],
+        "~/dt/worker/my jobs/new/code",
+        None,
+    )
+
+    assert _receiver_shell_words(commands[0]) == ["dt/worker/my jobs/new/code/"]
