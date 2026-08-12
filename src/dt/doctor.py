@@ -46,15 +46,27 @@ doctor_net() {
 # short line, so the parser does not depend on output order.
 doctor_net &
 dt_net_pid=$!
-v=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
-echo DT_GPU=${v:-missing}
+if command -v nvidia-smi >/dev/null 2>&1; then
+    # nvidia-smi prints classic failures (NVML mismatch, lost devices) on
+    # stdout; only a plain version number may count as healthy. A present
+    # but broken driver is "error", distinct from a CPU-only "missing".
+    v=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)
+    case "$v" in
+        ""|*[!0-9.]*) echo "DT_GPU=error: ${v:-no driver output}" ;;
+        *) echo "DT_GPU=$v" ;;
+    esac
+else
+    echo DT_GPU=missing
+fi
 if [ -x "$HOME/.local/bin/uv" ] || command -v uv >/dev/null 2>&1; then echo DT_UV=ok; else echo DT_UV=missing; fi
 if command -v tmux >/dev/null 2>&1; then echo DT_TMUX=ok; else echo DT_TMUX=missing; fi
 if command -v rsync >/dev/null 2>&1; then echo DT_RSYNC=ok; else echo DT_RSYNC=missing; fi
 if command -v flock >/dev/null 2>&1; then echo DT_FLOCK=ok; else echo DT_FLOCK=missing; fi
 if command -v python3 >/dev/null 2>&1; then echo DT_PYTHON3=ok; else echo DT_PYTHON3=missing; fi
 if command -v timeout >/dev/null 2>&1; then echo DT_TIMEOUT=ok; else echo DT_TIMEOUT=missing; fi
-dt_addrs=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | paste -sd, -)
+# Both families: an IPv6-pinned lan_address would otherwise always read
+# "stale" because the reported set only ever contained IPv4 addresses.
+dt_addrs=$({ ip -4 -o addr show scope global 2>/dev/null; ip -6 -o addr show scope global 2>/dev/null; } | awk '{print $4}' | cut -d/ -f1 | paste -sd, -)
 # Minimal containers may lack `ip`; hostname -I matches topology discovery.
 [ -n "$dt_addrs" ] || dt_addrs=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^$' | paste -sd, -)
 echo "DT_ADDRS=$dt_addrs"

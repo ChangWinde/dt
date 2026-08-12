@@ -1,4 +1,5 @@
 import json
+import os
 import socket as socket_mod
 import subprocess
 
@@ -194,6 +195,84 @@ def test_doctor_reports_relay_failure_and_exits_nonzero(tmp_path, monkeypatch):
     payload = json.loads(result.stdout)
     head_row = next(row for row in payload if row["node"] == "head")
     assert head_row["checks"]["relay"] == "fail: no agent socket"
+
+
+def test_check_snippet_reports_gpu_error_and_both_address_families(tmp_path):
+    # nvidia-smi prints its classic failures (NVML mismatch, lost devices) on
+    # stdout: only a plain version may read healthy, and a present-but-broken
+    # driver must be distinct from a CPU-only "missing". The address list must
+    # carry both families or an IPv6 pin always reads "stale".
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "nvidia-smi").write_text(
+        "#!/bin/sh\n"
+        "echo 'Failed to initialize NVML: Driver/library version mismatch'\n"
+        "exit 15\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "ip").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        "  -4*) echo '1: eth0    inet 10.0.0.5/24 brd 10.0.0.255' ;;\n"
+        "  -6*) echo '1: eth0    inet6 fd00::5/64 scope global' ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    (fake_bin / "curl").write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+    for tool in ("nvidia-smi", "ip", "curl"):
+        (fake_bin / tool).chmod(0o755)
+
+    proc = subprocess.run(
+        ["bash", "-c", doctor.CHECK_SNIPPET],
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    checks = {}
+    for line in proc.stdout.splitlines():
+        if line.startswith("DT_") and "=" in line:
+            key, _, value = line.partition("=")
+            checks[key] = value
+    assert checks["DT_GPU"].startswith("error:")
+    assert "NVML" in checks["DT_GPU"]
+    assert "10.0.0.5" in checks["DT_ADDRS"]
+    assert "fd00::5" in checks["DT_ADDRS"]
+
+
+def test_doctor_fails_on_gpu_driver_error_text(tmp_path, monkeypatch):
+    # The failure text must fail the health check instead of rendering a
+    # green table with exit 0 while the node cannot run any GPU job.
+    cfg = _cfg(tmp_path, nodes=[Node(name="head", local=True)])
+    rows = [
+        {
+            "node": "head",
+            "checks": {
+                "ssh": "ok",
+                "gpu": "error: Failed to initialize NVML: mismatch",
+            },
+            "unreachable": False,
+        },
+    ]
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "doctor_center", lambda cfg_arg: rows)
+    monkeypatch.setattr(cli, "relay_agent_status", lambda cfg_arg: None)
+    monkeypatch.setattr(agent_mod, "alive_pid", lambda cfg_arg: 1234)
+    monkeypatch.setattr(cli.jobs_mod, "queued_entries", lambda cfg_arg: [])
+
+    result = CliRunner().invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 1, result.output
+
+
+def test_alive_pid_probe_is_readonly_on_fresh_root(tmp_path):
+    # doctor runs this probe; a fresh or read-only root must yield "not
+    # running" without materializing state directories or an agent.lock.
+    cfg = _cfg(tmp_path)
+
+    assert agent_mod.alive_pid(cfg) is None
+    assert not (tmp_path / "dt").exists()
 
 
 def test_doctor_flags_stale_lan_address_and_exits_nonzero(tmp_path, monkeypatch):

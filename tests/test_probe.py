@@ -253,6 +253,19 @@ def test_concurrent_probe_readers_do_not_create_false_gpu_leases(tmp_path):
     assert real_wrapper.lease_owner == "stale-finished-owner"
 
 
+def test_lease_owner_with_commas_does_not_drop_the_card():
+    # A comma inside the owner text must collapse into the owner field (and
+    # fail its identity regex) instead of inflating the field count and
+    # removing the whole GPU from the inventory.
+    text = f"0, GPU-x, 0, 81920, 0, 42, 1, run,with,commas\n{SEP}\n"
+
+    gpu = parse_probe_output(text, 500)[0]
+
+    assert gpu.leased
+    assert gpu.lease_owner is None
+    assert not gpu.free
+
+
 def test_lease_file_without_checkable_lock_reads_busy(tmp_path):
     # flock vanishing (PATH regression, rebuilt container) while a wrapper
     # holds its lease must not silently free a busy GPU; an uncheckable

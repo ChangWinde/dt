@@ -15100,6 +15100,11 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
             "timeout",
             "dt",
         )
+    ) or any(
+        # A present-but-broken driver reports "error: ..."; it must fail the
+        # health check just like a missing dependency.
+        str(row["checks"].get("gpu", "")).startswith("error")
+        for row in rows
     )
     unreachable_failure = any(row.get("unreachable", True) for row in ssh_failures)
     nontransport_ssh_failure = any(

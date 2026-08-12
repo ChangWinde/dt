@@ -84,6 +84,13 @@ def _runtime_identity(cfg: HeadConfig) -> tuple[str, str, str]:
     return cfg.center, cfg.layout, root
 
 
+def _agent_state_dir(cfg: HeadConfig) -> Path:
+    """agent_dir() without its mkdir side effect, for read-only probes."""
+    from .layout import ROLE_LAYOUT
+
+    return cfg.head_root / "state" / "agent" if cfg.layout == ROLE_LAYOUT else cfg.root
+
+
 def _lock_path(cfg: HeadConfig) -> Path:
     return cfg.agent_dir() / "agent.lock"
 
@@ -100,9 +107,20 @@ def heartbeat_path(cfg: HeadConfig) -> Path:
     return cfg.agent_dir() / "agent.heartbeat"
 
 
-def _open_private_regular(path: Path, flags: int, *, mode: int = 0o600) -> int:
+def _open_private_regular(
+    path: Path,
+    flags: int,
+    *,
+    mode: int = 0o600,
+    create_parent: bool = True,
+) -> int:
     try:
-        return open_private_regular(path, flags, mode=mode)
+        return open_private_regular(
+            path,
+            flags,
+            mode=mode,
+            create_parent=create_parent,
+        )
     except PrivateStateError as exc:
         if isinstance(exc.__cause__, FileNotFoundError):
             raise FileNotFoundError(path) from exc
@@ -386,18 +404,33 @@ def _write_heartbeat(cfg: HeadConfig) -> None:
 
 
 def alive_pid(cfg: HeadConfig) -> int | None:
-    """The running agent's pid, or None. Truth is the flock, not the pid file."""
-    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
+    """The running agent's pid, or None. Truth is the flock, not the pid file.
+
+    Strictly read-only: doctor and status probes run this against possibly
+    unwritable or read-only state roots, so it must neither create state (a
+    fresh root simply has no lock file: no agent ever ran) nor crash on a
+    root it cannot open. The shared-lock probe also avoids contending the
+    exclusive lock a concurrently starting agent needs.
+    """
     try:
-        fd = _open_private_regular(_lock_path(cfg), os.O_RDWR | os.O_CREAT)
+        fd = _open_private_regular(
+            _agent_state_dir(cfg) / "agent.lock",
+            os.O_RDWR,
+            create_parent=False,
+        )
     except OSError:
         return None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
     except OSError:
         os.close(fd)
         try:
-            return int(_read_private_text(_pid_path(cfg), max_bytes=64).strip())
+            return int(
+                _read_private_text(
+                    _agent_state_dir(cfg) / "agent.pid",
+                    max_bytes=64,
+                ).strip()
+            )
         except Exception:
             return -1  # locked but pid unknown
     fcntl.flock(fd, fcntl.LOCK_UN)
@@ -930,6 +963,11 @@ def run_loop(cfg: HeadConfig) -> int:
 
     signal.signal(signal.SIGTERM, _term)
     signal.signal(signal.SIGINT, _term)
+    # A foreground agent whose terminal goes away would otherwise die on
+    # SIGHUP without the shutdown path, orphaning completion watchers and
+    # leaving the stale pid file behind. Respect an inherited SIG_IGN (nohup).
+    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, _term)
 
     def log(msg: str) -> None:
         stamp = datetime.now().strftime("%m-%d %H:%M:%S")

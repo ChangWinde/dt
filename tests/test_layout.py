@@ -368,6 +368,27 @@ def test_role_storage_inventory_counts_dedicated_site_artifact_cache(tmp_path):
     assert payload["total_bytes"] == 145
 
 
+def test_storage_inventory_is_readonly(tmp_path):
+    # dt storage is what operators run to diagnose a full or read-only disk;
+    # materializing head directories on the way would both mutate state and
+    # crash at exactly that moment.
+    cfg = parse(
+        {
+            "center": "c",
+            "nodes": ["n1"],
+            "paths": {"root": str(tmp_path / "dt")},
+        }
+    )
+    assert isinstance(cfg, HeadConfig)
+
+    def runner(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], 0, "jobs\t0\t0\n", "")
+
+    inventory(cfg, runner=runner, disk_bytes=lambda _path: 0)
+
+    assert not (tmp_path / "dt").exists()
+
+
 def test_head_scan_failure_keeps_storage_accounting_incomplete(tmp_path):
     cfg = parse(
         {
@@ -377,7 +398,9 @@ def test_head_scan_failure_keeps_storage_accounting_incomplete(tmp_path):
         }
     )
     assert isinstance(cfg, HeadConfig)
-    cfg.root.joinpath("results").mkdir(parents=True)
+    # inventory is read-only and no longer materializes head directories, so
+    # the unknown-size section must exist on disk beforehand.
+    cfg.head_root.joinpath("results").mkdir(parents=True)
 
     def runner(*_args, **_kwargs):
         return subprocess.CompletedProcess([], 0, "jobs\t0\t0\nenvs\t0\t0\n", "")
