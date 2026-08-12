@@ -21,6 +21,7 @@ from uuid import uuid4
 from . import snapshot_hash as snapshot_hash_mod
 from .config import HeadConfig, Node, Site
 from .layout import node_path, node_path_expression, rsync_destination
+from .private_state import openat_create_retry
 from .sshio import (
     BULK_TRANSFER_TIMEOUT_S,
     ROUTE_TRANSPORT_FAILURE_KINDS,
@@ -274,7 +275,7 @@ def _artifact_transfer_lock(
             lock_flags |= os.O_NOFOLLOW
         try:
             scope_id = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
-            lock_descriptor = os.open(
+            lock_descriptor = openat_create_retry(
                 f"{site.name}-{digest}-{scope_id}.lock",
                 lock_flags,
                 0o600,
