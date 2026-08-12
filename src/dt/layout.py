@@ -35,6 +35,11 @@ def normalize_node_root(value: str) -> str:
         raise ValueError("root must name a dedicated directory")
     if root.startswith("~/"):
         remainder = root[2:]
+        if remainder.startswith("/"):
+            # "~//..." makes the remainder absolute: Path.home() / "/x" == "/x"
+            # escapes $HOME on the local node while the remote shell keeps it
+            # under $HOME -- a three-way path split. Reject it outright.
+            raise ValueError("root must not contain empty or absolute components")
         parts = PurePosixPath(remainder).parts
     elif root.startswith("/"):
         parts = PurePosixPath(root).parts[1:]

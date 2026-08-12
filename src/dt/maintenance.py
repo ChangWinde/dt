@@ -240,19 +240,17 @@ def _remove_unreferenced_snapshots(
     removed_digests: set[str] = set()
     with lock(cfg):
         damage: list[RegistryDamage] = []
-        live_entries = list_all(cfg, damage=damage)
-        if damage:
-            # An unreadable registry row may still reference a victim digest.
-            # With an incomplete `referenced` set we cannot prove a snapshot is
-            # unreferenced, so fail closed: keep every snapshot this cycle rather
-            # than delete a live job's only recovery source.
-            return
         referenced = {
             entry.snapshot_sha256
-            for entry in live_entries
+            for entry in list_all(cfg, damage=damage)
             if entry.snapshot_sha256
             and re.fullmatch(r"[0-9a-f]{64}", entry.snapshot_sha256)
         }
+        if damage:
+            # An unreadable registry row may still reference a snapshot, so
+            # "unreferenced" cannot be proven. Skip snapshot GC entirely
+            # rather than risk deleting a damaged job's recovery snapshot.
+            return
         for digest in victim_digests - referenced:
             roots = {cfg.snapshots_dir(), cfg.legacy_snapshots_dir()}
             removed_any = False

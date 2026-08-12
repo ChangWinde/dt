@@ -71,6 +71,46 @@ def test_route_circuit_persists_opens_backs_off_and_resets(tmp_path):
     assert closed.last_kind == "success"
 
 
+def test_breaker_ladder_holds_at_cooldown_plateau(tmp_path):
+    """Half-open failures at the plateau must not reset the ladder (audit N1)."""
+    cfg, site = _cfg(
+        tmp_path,
+        route_circuit_failures=2,
+        route_circuit_cooldown_s=10,
+        route_circuit_max_cooldown_s=40,
+    )
+    now = [100.0]
+    health = PersistentRouteHealth(cfg, clock=lambda: now[0])
+
+    health.record_failure(site, "s", "d", "transfer.timeout")
+    decision = health.record_failure(site, "s", "d", "transfer.timeout")
+    assert decision.failures == 2
+
+    # Climb the ladder through the plateau by honouring each cooldown, then
+    # letting the half-open trial fail. The backoff must never fall back to
+    # the base cooldown once it has reached the maximum.
+    last_retry = decision.retry_after_s
+    peak_reached = False
+    for _ in range(8):
+        now[0] += last_retry + 1
+        trial = health.decision(site, "s", "d")
+        assert trial.is_open is False  # cooldown elapsed: a trial is allowed
+        failed = health.record_failure(site, "s", "d", "transfer.timeout")
+        assert failed.failures >= decision.failures  # never resets to 1
+        decision = failed
+        last_retry = failed.retry_after_s
+        if last_retry == site.route_circuit_max_cooldown_s:
+            peak_reached = True
+        elif peak_reached:
+            raise AssertionError(
+                "cooldown fell back below the plateau after reaching it"
+            )
+
+    assert peak_reached
+    assert decision.retry_after_s == site.route_circuit_max_cooldown_s
+    assert decision.failures >= 5
+
+
 def test_neutral_half_open_outcome_releases_only_trial_reservation(tmp_path):
     cfg, site = _cfg(
         tmp_path,

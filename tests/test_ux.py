@@ -31,6 +31,37 @@ def _max_terminal_width(output: str) -> int:
 # -- root onboarding -----------------------------------------------------------
 
 
+def test_repository_sha_is_bounded_to_the_package_repo(monkeypatch, tmp_path):
+    """dt --version must not read a commit from a repo that merely contains HOME."""
+    import subprocess as subprocess_mod
+
+    from dt import version
+
+    monkeypatch.setattr(version, "SOURCE_COMMIT", None)
+
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess_mod.CompletedProcess(argv, 0, "deadbee\n", "")
+
+    monkeypatch.setattr(version.subprocess, "run", fake_run)
+
+    fake_pkg_file = tmp_path / "checkout" / "src" / "dt" / "version.py"
+    fake_pkg_file.parent.mkdir(parents=True)
+    monkeypatch.setattr(version, "__file__", str(fake_pkg_file))
+
+    # No .git and no pyproject near the package: never walk to $HOME's repo.
+    assert version.repository_sha() is None
+    assert calls == []
+
+    # The dt checkout itself (src layout, pyproject, .git) is honored.
+    (tmp_path / "checkout" / "pyproject.toml").write_text("[project]" + chr(10))
+    (tmp_path / "checkout" / ".git").mkdir()
+    assert version.repository_sha() == "deadbee"
+    assert len(calls) == 1
+
+
 def test_version_prefers_installed_source_commit(monkeypatch):
     from typer.testing import CliRunner
 
@@ -45,6 +76,35 @@ def test_version_prefers_installed_source_commit(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert result.output == f"dt {__version__} (aaaaaaaaaaaa)\n"
+
+
+def test_repository_sha_ignores_ancestor_git_when_installed(monkeypatch, tmp_path):
+    from dt import version
+
+    installed = tmp_path / "site-packages" / "dt" / "version.py"
+    installed.parent.mkdir(parents=True)
+    (tmp_path / ".git").mkdir()  # unrelated ancestor repository
+
+    monkeypatch.setattr(version, "__file__", str(installed))
+    assert version.repository_sha() is None
+
+
+def test_repository_sha_survives_missing_git_binary(monkeypatch, tmp_path):
+    from dt import version
+
+    checkout = tmp_path / "checkout"
+    (checkout / "src" / "dt").mkdir(parents=True)
+    (checkout / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    (checkout / ".git").mkdir()
+    module_file = checkout / "src" / "dt" / "version.py"
+    module_file.write_text("", encoding="utf-8")
+
+    def no_git(*_args, **_kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(version, "__file__", str(module_file))
+    monkeypatch.setattr(version.subprocess, "run", no_git)
+    assert version.repository_sha() is None
 
 
 def test_root_help_has_a_compact_end_to_end_quick_start():

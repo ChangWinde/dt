@@ -788,6 +788,7 @@ start_session() {
     DT_SESSION_COMMAND="cd $DT_SHELL_QUOTED && env"
     local name
     local -a session_env_names=(
+        TMPDIR \
         DT_ROOT DT_WORKER_ROOT DT_JOB_DIR DT_OUTPUT_DIR DT_CONTROL_DIR \
         DT_PAYLOAD_DIR DT_STATE_DIR DT_META_PATH DT_COMMAND_PATH \
         DT_CANCEL_PATH DT_BIN_DIR DT_CACHE_ROOT DT_RUNTIME_ROOT \
@@ -874,6 +875,7 @@ launch_locked() {
           "$DT_STATE_DIR/process_start_ticks" \
           "$DT_STATE_DIR/started_at" "$DT_STATE_DIR/finished_at" \
           "$DT_STATE_DIR/exit_code" "$DT_STATE_DIR"/exit_code.tmp.* \
+          "$DT_STATE_DIR/result_state" "$DT_STATE_DIR"/result_state.tmp.* \
           "$DT_STATE_DIR"/process_start_ticks.tmp.*
     session_start_started_ms=$(now_ms)
     start_session "$ids" || return 14

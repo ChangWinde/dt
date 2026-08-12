@@ -532,6 +532,18 @@ def _write_json_atomic(path: Path, value: dict[str, object]) -> None:
             pass
 
 
+def _guard_warn(message: str) -> None:
+    """Emit a guard diagnostic without ever aborting termination.
+
+    stderr can itself be a file on the disk that just filled up; a failed
+    write must never stand between a detected violation and the kill.
+    """
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except OSError:
+        pass
+
+
 def _trip_resource_guard(
     *,
     root_pid: int,
@@ -562,36 +574,28 @@ def _trip_resource_guard(
     try:
         _write_json_atomic(output, record)
     except OSError as exc:
-        print(
-            f"[telemetry] resource guard could not persist evidence: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
+        _guard_warn(f"[telemetry] resource guard could not persist evidence: {exc}")
     if kind == "max_vram_mib":
         subject = f"GPU {violation.get('gpu_index')} memory"
     else:
         subject = f"job host memory ({violation.get('observed_metric')})"
-    print(
+    _guard_warn(
         f"[telemetry] {subject} {observed} MiB exceeded {limit} MiB; "
-        f"terminating job process group {root_pid}",
-        file=sys.stderr,
-        flush=True,
+        f"terminating job process group {root_pid}"
     )
     for pid in descendants:
+        # PID reuse can point this at another user's process; a failed
+        # per-descendant signal must not abort the authoritative group kill.
         try:
             os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
+        except OSError:
             pass
     try:
         os.killpg(root_pid, signal.SIGTERM)
     except ProcessLookupError:
         return True
     except OSError as exc:
-        print(
-            f"[telemetry] resource guard could not signal process group: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
+        _guard_warn(f"[telemetry] resource guard could not signal process group: {exc}")
         return False
     deadline = time.monotonic() + 2.0
     remaining: set[int] = set()
@@ -603,7 +607,7 @@ def _trip_resource_guard(
     for pid in remaining:
         try:
             os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except OSError:
             pass
     return True
 

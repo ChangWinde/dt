@@ -22,7 +22,9 @@ DT_GPU_LEASE_ROOT="${DT_GPU_LEASE_ROOT:-$HOME/dt/gpu-leases}"
 mkdir -p "$DT_STATE_DIR" "$DT_OUTPUT_DIR" "$DT_JOB_DIR/logs" "$DT_GPU_LEASE_ROOT" \
          "$DT_CONTROL_DIR/tmp" "$DT_CACHE_ROOT/tools/xdg" \
          "$DT_CACHE_ROOT/tools/uv" "$DT_CACHE_ROOT/tools/torch"
-export TMPDIR="${TMPDIR:-$DT_CONTROL_DIR/tmp}"
+# TMPDIR is job-owned: the dt tmux server is long-lived and would leak a
+# previous job's TMPDIR into this one, so never inherit it here.
+export TMPDIR="$DT_CONTROL_DIR/tmp"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$DT_CACHE_ROOT/tools/xdg}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-$DT_CACHE_ROOT/tools/uv}"
 export TORCH_HOME="${TORCH_HOME:-$DT_CACHE_ROOT/tools/torch}"

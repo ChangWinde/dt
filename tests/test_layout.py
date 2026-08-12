@@ -135,6 +135,17 @@ def test_derived_node_path_rejects_oversized_component():
         node_path("~/dt", "x" * 256)
 
 
+def test_normalize_node_root_rejects_home_absolute_escape():
+    from dt.layout import normalize_node_root
+
+    # "~//x" leaves an absolute remainder: Path.home() / "/x" == "/x" escapes
+    # $HOME on the local node while the remote shell keeps it under $HOME.
+    with pytest.raises(ValueError, match="absolute"):
+        normalize_node_root("~//scratch/dt")
+    assert normalize_node_root("~/scratch/dt") == "~/scratch/dt"
+    assert normalize_node_root("/scratch/dt") == "/scratch/dt"
+
+
 def test_node_paths_have_shell_and_rsync_safe_renderings(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
 

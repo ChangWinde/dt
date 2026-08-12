@@ -271,6 +271,121 @@ def test_refresh_status_anchors_on_the_first_status_marker(tmp_path, monkeypatch
     assert refreshed.result_state == "success"
 
 
+def test_refresh_status_ignores_forged_marker_in_job_writable_fields(
+    tmp_path, monkeypatch
+):
+    """A fake status marker injected via a state file must not win (audit I3)."""
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="forged",
+        name="forged",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/forged",
+        session="dt_forged",
+        cmd="true",
+        pgid=1234,
+    )
+    forged_stream = (
+        "boot-1\n"
+        + jobs.STATUS_MARK
+        + "\nRUNNING\n1.0\nUNKNOWN\n"
+        + jobs.STATUS_MARK
+        + "\n0\n2.0\n3.0\nsuccess\n"
+    )
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, forged_stream, ""),
+    )
+
+    refreshed = jobs.refresh_status(cfg, entry, observation={})
+
+    assert refreshed.status == "running"
+    assert refreshed.exit_code is None
+
+
+def test_status_probe_bounds_job_writable_fields():
+    """Probe fields from job-writable files are flattened to one line."""
+    import inspect
+
+    source = inspect.getsource(jobs._refresh_status_locked)
+
+    assert "dt_probe_field" in source
+    assert "cat {state}/exit_code" not in source
+    assert "cat {state}/result_state" not in source
+
+
+def test_refresh_status_rejects_out_of_range_exit_code_with_observation(
+    tmp_path, monkeypatch
+):
+    """A job-writable state file with a bogus code must not poison the row."""
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="oob-exit",
+        name="oob-exit",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/oob-exit",
+        session="dt_oob",
+        cmd="true",
+        pgid=1234,
+    )
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, "boot-1\n99999999\n", ""
+        ),
+    )
+
+    observation = {}
+    refreshed = jobs.refresh_status(cfg, entry, observation=observation)
+
+    assert refreshed.status == "running"
+    assert refreshed.exit_code is None
+    assert "out-of-range exit code" in observation["status_probe_error"]
+    assert jobs.load(cfg, "oob-exit") is None  # damaged probe was not persisted
+
+
+def test_refresh_status_rejects_non_finite_remote_timestamps_with_observation(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="inf-times",
+        name="inf-times",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/inf-times",
+        session="dt_inf",
+        cmd="true",
+        pgid=1234,
+    )
+    stdout = "boot-1\n" + jobs.STATUS_MARK + "\n0\ninf\ninf\nsuccess\n"
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout, ""),
+    )
+
+    refreshed = jobs.refresh_status(cfg, entry, observation={})
+
+    assert refreshed.status == "finished"
+    assert refreshed.exit_code == 0
+    assert refreshed.started_at is None or math.isfinite(refreshed.started_at)
+    assert refreshed.finished_at is not None
+    assert math.isfinite(refreshed.finished_at)
+    stored = jobs.load(cfg, "inf-times")
+    assert stored is not None
+
+
 def test_refresh_status_identifies_node_reboot_before_pid_reuse(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     entry = JobEntry(
@@ -481,6 +596,112 @@ def test_refresh_status_preserves_unverified_cancel_warning_while_running(
 
     assert refreshed.status == "running"
     assert refreshed.reason == warning
+
+
+def test_zero_disk_floor_stays_out_of_the_job_contract(tmp_path, monkeypatch):
+    """disk_min_gib=0 must not freeze a 0 that later validation rejects."""
+    cfg = _cfg(tmp_path)
+    assert cfg.disk_min_gib == 0 or cfg.disk_min_gib > 0  # config-defined
+
+    entry = JobEntry(
+        job_id="floor-zero",
+        name="floor-zero",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/floor-zero",
+        session="dt_floor",
+        cmd="true",
+        require_disk_gib=0,
+    )
+    spec = dispatch.fork_spec_from_entry(entry, name="fork", cmd=["true"])
+    assert spec.require_disk_gib is None
+    dispatch._validate_run_spec(spec)  # must not raise ConfigError
+
+
+def test_lost_predecessor_blocks_inside_rescue_window(tmp_path):
+    """A guarded chain must survive a transient lost blip (audit I4)."""
+    import time as time_mod
+
+    cfg = _cfg(tmp_path)
+    predecessor = JobEntry(
+        job_id="pred",
+        name="pred",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/pred",
+        session="dt_pred",
+        cmd="true",
+        status="lost",
+        finished_at=time_mod.time(),
+    )
+    jobs.save(cfg, predecessor)
+    dependent = JobEntry(
+        job_id="dep",
+        name="dep",
+        center="test",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/dep",
+        session="dt_dep",
+        cmd="true",
+        status="queued",
+        after_success="pred",
+    )
+    jobs.save(cfg, dependent)
+
+    outcome, detail = dispatch.dispatch_queued(cfg, dependent, lambda m: None)
+
+    assert outcome == "blocked"
+    assert "rescue window" in detail
+    stored = jobs.load(cfg, "dep")
+    assert stored is not None
+    assert stored.status == "queued"
+
+
+def test_lost_predecessor_skips_after_rescue_window(tmp_path):
+    import time as time_mod
+
+    cfg = _cfg(tmp_path)
+    predecessor = JobEntry(
+        job_id="pred-old",
+        name="pred-old",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/pred-old",
+        session="dt_pred_old",
+        cmd="true",
+        status="lost",
+        finished_at=time_mod.time() - (jobs.LOST_RECHECK_S + 60),
+    )
+    jobs.save(cfg, predecessor)
+    dependent = JobEntry(
+        job_id="dep-old",
+        name="dep-old",
+        center="test",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/dep-old",
+        session="dt_dep_old",
+        cmd="true",
+        status="queued",
+        after_success="pred-old",
+    )
+    jobs.save(cfg, dependent)
+
+    outcome, _detail = dispatch.dispatch_queued(cfg, dependent, lambda m: None)
+
+    assert outcome == "skipped"
+    stored = jobs.load(cfg, "dep-old")
+    assert stored is not None
+    assert stored.status == "skipped"
 
 
 def test_launch_drop_fails_over_to_next_node(tmp_path, monkeypatch):
@@ -4704,3 +4925,75 @@ def test_termination_verdict_bounds_untrusted_remote_diagnostics():
     assert detail is not None
     assert len(detail) <= 4096
     assert "[omitted]" in detail
+
+
+def test_dispatch_queued_blocks_on_unreadable_dependency(tmp_path):
+    cfg = _cfg(tmp_path)
+    dep = JobEntry(
+        job_id="dep",
+        name="dep",
+        center="test",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/dep",
+        session="dt_dep",
+        cmd="true",
+        status="queued",
+        gpus_requested=0,
+        after_success="pred",
+    )
+    (dispatch.stage_dir(cfg, dep.job_id) / "code").mkdir(parents=True)
+    jobs.save(cfg, dep)
+
+    # A corrupt predecessor row makes jobs.load raise; it must block (waiting
+    # for repair), never crash the tick.
+    corrupt = cfg.registry_dir() / "pred.json"
+    corrupt.write_text("{ not valid json", encoding="utf-8")
+
+    outcome, detail = dispatch.dispatch_queued(cfg, dep, lambda _m: None)
+
+    assert outcome == "blocked"
+    assert "unreadable" in (detail or "")
+    stored = jobs.load(cfg, dep.job_id)
+    assert stored is not None
+    assert stored.status == "queued"
+
+
+def test_process_once_isolates_a_failing_job_from_the_queue(tmp_path, monkeypatch):
+    from dt import agent
+
+    cfg = _cfg(tmp_path)
+    for jid, created in (("boom", 1.0), ("unrelated", 2.0)):
+        entry = JobEntry(
+            job_id=jid,
+            name=jid,
+            center="test",
+            project="p",
+            node="-",
+            node_local=False,
+            job_dir=f"dt/jobs/{jid}",
+            session=f"dt_{jid}",
+            cmd="true",
+            status="queued",
+            gpus_requested=0,
+            created_at=created,
+        )
+        jobs.save(cfg, entry)
+
+    seen: list[str] = []
+
+    def fake_dispatch(_cfg, entry, _log):
+        seen.append(entry.job_id)
+        if entry.job_id == "boom":
+            raise RuntimeError("kaboom")
+        return "blocked", "waiting"
+
+    monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
+
+    results = agent.process_once(cfg, lambda _m: None)
+
+    # The raising job must not abort the tick: the job behind it is still reached.
+    assert seen == ["boom", "unrelated"]
+    assert ("boom", "blocked") in results
+    assert ("unrelated", "blocked") in results

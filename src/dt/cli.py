@@ -25,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from threading import Event
 from typing import (
     Any,
@@ -4651,7 +4651,8 @@ def _gather_ps_rows(
             _scope_laptop_ps_refs(cfg, rows)
         return _limit_ps_rows(rows, limit), errors
 
-    entries = jobs_mod.list_all(cfg)
+    registry_damage: list[jobs_mod.RegistryDamage] = []
+    entries = jobs_mod.list_all(cfg, damage=registry_damage)
     display_refs = jobs_mod.compact_job_refs(entries)
     refresh_statuses = {"running", "lost"}
     if active_only:
@@ -4814,7 +4815,18 @@ def _gather_ps_rows(
             row.setdefault("log_source", None)
             row.setdefault("progress_error", None)
             row.setdefault("resources", None)
-    return _limit_ps_rows(rows, limit), {}
+    if issues_only:
+        # Filter before the newest-N window: otherwise the oldest failing
+        # jobs silently vanish from --issues and the bounded-query envelope
+        # reports an eligible count that cursors can never enumerate.
+        rows = list(_ps_issue_rows(rows))
+    damage_errors = {
+        f"registry:{PurePath(item.path).name}": (
+            f"unreadable registry entry: {item.detail}"
+        )
+        for item in registry_damage
+    }
+    return _limit_ps_rows(rows, limit), damage_errors
 
 
 def _select_ps_rows(
@@ -5462,7 +5474,10 @@ def ps(
         window_kwargs: JsonDict = {"remote_window": True} if remote_window else {}
         if limit is not None and not legacy_issue_window and not query_mode:
             window_kwargs["limit"] = limit
-        if issues:
+        if issues and not legacy_issue_window:
+            # The legacy v1 window contract ships the full superset and lets
+            # the old laptop client filter; every other path filters on the
+            # head before the newest-N window (audit A4).
             window_kwargs["issues_only"] = True
         if active_only:
             rows, errors = _gather_ps_rows(
@@ -5784,7 +5799,14 @@ _LOG_NUL_RUN_RE = re.compile(r"\x00+")
 
 def _stable_remote_exit(returncode: int) -> int:
     """Hide SSH's process-specific 255 behind dt's stable unreachable code."""
-    return EXIT_UNREACHABLE if returncode == 255 else returncode
+    if returncode == 255:
+        return EXIT_UNREACHABLE
+    if returncode < 0:
+        # subprocess reports signal death as a negative number; without
+        # normalizing it, `dt logs -f | head` (SIGPIPE, -13) surfaces as a
+        # wrapped 243. Use the shell-standard 128+signal convention.
+        return 128 + min(-returncode, 127)
+    return returncode
 
 
 def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
@@ -5977,6 +5999,37 @@ def _parse_job_log_tail_response(
     return path, display, tail, updated_at, resource_sample
 
 
+# Job stdout is fully job-controlled. A line like "Throughput: 9...9" parses to
+# inf, and "step: 9...9" to a 400-digit int; either would serialize as an
+# RFC-invalid token (Infinity) or overflow fixed-width consumers, crashing
+# strict agent JSON parsers. Every numeric progress field is bounded on exit.
+_PROGRESS_NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
+    "step": (0, 10**12),
+    "total_steps": (0, 10**12),
+    "percent": (0, 100),
+    "step_time_s": (0, 1e9),
+    "samples_per_sec": (0, 1e9),
+}
+
+
+def _sanitized_progress(progress: JsonDict) -> JsonDict | None:
+    """Drop job-log-derived numbers that are non-finite or out of range."""
+    clean: JsonDict = {}
+    for key, value in progress.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            clean[key] = value
+            continue
+        # math.isfinite would itself raise OverflowError on a huge int; ints are
+        # always finite, and the bounds check below rejects out-of-range ones.
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        bounds = _PROGRESS_NUMERIC_BOUNDS.get(key)
+        if bounds is not None and not (bounds[0] <= value <= bounds[1]):
+            continue
+        clean[key] = value
+    return clean or None
+
+
 def _parse_log_progress(text: str) -> JsonDict | None:
     """Extract only explicit, broadly recognizable progress facts from logs."""
     clean = _ANSI_ESCAPE_RE.sub("", text or "")
@@ -6117,7 +6170,7 @@ def _parse_log_progress(text: str) -> JsonDict | None:
         progress.pop("eta", None)
         progress.pop("elapsed", None)
         progress.pop("step_time_s", None)
-    return progress or None
+    return _sanitized_progress(progress)
 
 
 def _format_eta_duration(seconds: int) -> str:

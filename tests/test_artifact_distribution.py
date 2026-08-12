@@ -104,10 +104,10 @@ def test_cache_miss_uploads_once_then_fans_out_over_lan(tmp_path, monkeypatch):
 
     def fake_run_on(node, local, command, **kwargs):
         calls.append((node, command, kwargs))
-        # marker probe is absent; prepare and atomic publish succeed; the
+        # marker probe reports absent; prepare and atomic publish succeed; the
         # outer cache->LAN rsync returns its own stats.
-        if command.startswith("test -d"):
-            return subprocess.CompletedProcess([], 1, "", "")
+        if "DT_CACHE" in command:
+            return subprocess.CompletedProcess([], 0, "DT_CACHE=absent\n", "")
         return subprocess.CompletedProcess([], 0, _stats(23, 2), "")
 
     rsync_calls = []
@@ -166,6 +166,8 @@ def test_cache_hit_skips_cross_site_rsync(tmp_path, monkeypatch):
 
     def fake_run_on(node, local, command, **kwargs):
         calls.append((node, command, kwargs))
+        if "DT_CACHE" in command:
+            return subprocess.CompletedProcess([], 0, "DT_CACHE=present\n", "")
         return subprocess.CompletedProcess([], 0, _stats(7, 1), "")
 
     rsync_calls = []
@@ -222,6 +224,68 @@ def test_cache_transport_failure_is_not_reclassified_as_cache_miss(
     assert uploads == []
 
 
+def _completed(stdout, returncode=0):
+    import subprocess as _sp
+
+    return _sp.CompletedProcess([], returncode, stdout, "")
+
+
+def test_cache_probe_unreadable_marker_fails_closed(tmp_path, monkeypatch):
+    """A permission fault on the marker must not be reclassified as a miss."""
+    import dt.artifact_distribution as module
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(
+        module,
+        "run_on",
+        lambda *args, **kwargs: _completed("DT_CACHE=unreadable\n"),
+    )
+    uploads = []
+    monkeypatch.setattr(
+        module.TransferExecutor,
+        "_populate_cache",
+        lambda *args, **kwargs: uploads.append(True),
+    )
+
+    with pytest.raises(DistributionError, match="could not read the completion marker"):
+        TransferExecutor(cfg).ensure(
+            tmp_path / "snapshot",
+            "b" * 64,
+            cfg.nodes[2],
+            "~/dt/worker/jobs/job/code",
+        )
+    assert uploads == []
+
+
+def test_cache_probe_absent_is_a_miss(tmp_path, monkeypatch):
+    import dt.artifact_distribution as module
+
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    executor = TransferExecutor(cfg)
+    monkeypatch.setattr(
+        module,
+        "run_on",
+        lambda *args, **kwargs: _completed("DT_CACHE=absent\n"),
+    )
+    assert executor._cache_available(site, cfg.nodes[1], "b" * 64) is False
+
+
+def test_cache_probe_present_verifies_and_hits(tmp_path, monkeypatch):
+    import dt.artifact_distribution as module
+
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    executor = TransferExecutor(cfg)
+    monkeypatch.setattr(
+        module,
+        "run_on",
+        lambda *args, **kwargs: _completed("DT_CACHE=present\n"),
+    )
+    monkeypatch.setattr(executor.verifier, "require", lambda *args, **kwargs: None)
+    assert executor._cache_available(site, cfg.nodes[1], "b" * 64) is True
+
+
 def test_cache_probe_exception_is_fail_closed_and_never_uploads(tmp_path, monkeypatch):
     import dt.artifact_distribution as module
 
@@ -255,11 +319,13 @@ def test_transfer_event_exposes_route_and_byte_accounting(tmp_path, monkeypatch)
     import dt.artifact_distribution as module
 
     cfg = _cfg(tmp_path)
-    monkeypatch.setattr(
-        module,
-        "run_on",
-        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, _stats(5, 1), ""),
-    )
+
+    def fake_run_on(node, local, command, **kwargs):
+        if "DT_CACHE" in command:
+            return subprocess.CompletedProcess([], 0, "DT_CACHE=present\n", "")
+        return subprocess.CompletedProcess([], 0, _stats(5, 1), "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
     monkeypatch.setattr(
         module,
         "rsync",
@@ -1225,6 +1291,37 @@ def test_p2p_transport_exception_becomes_route_failure(tmp_path, monkeypatch):
             None,
         )
     assert caught.value.failure_kind == "timeout"
+
+
+def test_p2p_local_oserror_does_not_become_route_failure(tmp_path, monkeypatch):
+    """A head-local spawn failure must not poison the edge circuit (audit N3)."""
+    import dt.artifact_distribution as module
+
+    cfg = _topology_cfg(tmp_path)
+    executor = TransferExecutor(cfg)
+    replica = ArtifactReplica(
+        kind="peer",
+        node=cfg.nodes[1],
+        code_dir="~/dt/worker/jobs/prior/code",
+        recorded_at=10.0,
+    )
+    route = _direct_route(replica, cfg.nodes[2])
+    monkeypatch.setattr(
+        module,
+        "run_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("[Errno 12] Cannot allocate memory")
+        ),
+    )
+
+    with pytest.raises(DistributionError) as caught:
+        executor._p2p_transfer(
+            route,
+            cfg.nodes[2],
+            "~/dt/worker/jobs/new/code",
+            None,
+        )
+    assert not isinstance(caught.value, ArtifactRouteError)
 
 
 def test_p2p_data_failure_does_not_become_route_failure(tmp_path, monkeypatch):

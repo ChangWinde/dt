@@ -42,6 +42,7 @@ from . import completion as completion_mod
 from .config import HeadConfig
 from .dispatch import clean_jobs, dispatch_queued
 from .jobs import (
+    LOST_RECHECK_S as jobs_lost_recheck_s,
     JobEntry,
     RegistryDamage,
     agent_wake_path,
@@ -65,7 +66,7 @@ _stop_completion_watcher = completion_mod.stop_completion_watcher
 CRON_MARK = "# dt-agent"
 SYSTEMD_UNIT = "disttrainer-agent.service"
 AUTOCLEAN_EVERY_S = 24 * 3600
-LOST_RECHECK_S = 5 * 60
+LOST_RECHECK_S = jobs_lost_recheck_s
 AGENT_LOG_MAX_BYTES = 10 * 1024 * 1024
 AGENT_LOG_BACKUPS = 2
 SYSTEMD_UNIT_MAX_BYTES = 64 * 1024
@@ -554,7 +555,21 @@ def _process_once_with_snapshot(
                 # whose pins are disjoint.
                 results.append((entry.job_id, "busy"))
                 continue
-        outcome, detail = dispatch_queued(cfg, entry, log)
+        try:
+            outcome, detail = dispatch_queued(cfg, entry, log)
+        except Exception as exc:
+            # One job's unexpected failure must never abort the tick and starve
+            # every queued job behind it. Treat it as a transient block, log it
+            # visibly, and move on; the next tick retries.
+            detail = " ".join(str(exc).split()) or type(exc).__name__
+            log(
+                f"{entry.job_id} dispatch raised ({detail}); "
+                "treating as blocked and trying jobs behind it"
+            )
+            results.append((entry.job_id, "blocked"))
+            if blocked_log_state is not None:
+                blocked_log_state[entry.job_id] = detail
+            continue
         results.append((entry.job_id, outcome))
         if blocked_log_state is not None and outcome != "blocked":
             blocked_log_state.pop(entry.job_id, None)
@@ -665,10 +680,15 @@ def _code_fingerprint() -> int:
     change files in place; the agent restarts itself to pick them up."""
     pkg = Path(__file__).parent
     files = list(pkg.glob("*.py")) + list((pkg / "payload").glob("*.sh"))
-    try:
-        return max(p.stat().st_mtime_ns for p in files)
-    except ValueError:
-        return 0
+    newest = 0
+    for candidate in files:
+        try:
+            newest = max(newest, candidate.stat().st_mtime_ns)
+        except OSError:
+            # A deploy may delete a globbed file before we stat it; the
+            # surviving files still change the fingerprint on real upgrades.
+            continue
+    return newest
 
 
 def _restart_preflight(
@@ -951,16 +971,27 @@ def run_loop(cfg: HeadConfig) -> int:
                 rotate_log()
             except Exception as e:  # keep the loop alive, always
                 log(f"poll error: {e}")
-            dt_bin = Path.home() / ".local/bin/dt"
-            current_fingerprint = _code_fingerprint()
-            if (
-                current_fingerprint != born_with
-                and current_fingerprint != rejected_restart_fingerprint
-                and dt_bin.exists()
-            ):
+            try:
+                dt_bin = Path.home() / ".local/bin/dt"
+                current_fingerprint = _code_fingerprint()
+                restart_wanted = (
+                    current_fingerprint != born_with
+                    and current_fingerprint != rejected_restart_fingerprint
+                    and dt_bin.exists()
+                )
+            except Exception as exc:  # keep the loop alive, always
+                # The upgrade probe races the deploy that triggers it; a
+                # transient error must not kill the agent and orphan the
+                # queue until reboot.
+                log(f"upgrade check error: {exc}")
+                restart_wanted = False
+            if restart_wanted:
                 # deploy/git pull happened: exec ourselves to run the new
                 # code (the exec drops our lock fd, the fresh image retakes it)
-                ready, detail = _restart_preflight(dt_bin)
+                try:
+                    ready, detail = _restart_preflight(dt_bin)
+                except Exception as exc:  # keep the loop alive, always
+                    ready, detail = False, f"preflight crashed: {exc}"
                 if not ready:
                     rejected_restart_fingerprint = current_fingerprint
                     log(
@@ -974,7 +1005,14 @@ def run_loop(cfg: HeadConfig) -> int:
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 os.close(fd)
                 sys.stdout.flush()
-                os.execvp(str(dt_bin), [str(dt_bin), "agent", "run"])
+                try:
+                    os.execvp(str(dt_bin), [str(dt_bin), "agent", "run"])
+                except OSError as exc:
+                    # Lock and pidfile are already released: running on would
+                    # allow a second agent. Exit and let the supervisor
+                    # restart a clean instance.
+                    log(f"agent restart exec failed: {exc}; exiting")
+                    return 1
             _sleep_until_next_poll(
                 cfg,
                 stop,

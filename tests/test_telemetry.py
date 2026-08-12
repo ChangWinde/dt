@@ -76,6 +76,68 @@ def test_resource_telemetry_query_owns_path_tail_and_identity_contract():
     assert summary["invalid_lines"] == 1
 
 
+def test_guard_still_terminates_when_evidence_write_fails(tmp_path, monkeypatch):
+    """ENOSPC on the evidence file must not disarm the guard (audit I2)."""
+    from dt.payload import telemetry
+
+    signals = []
+    monkeypatch.setattr(
+        telemetry,
+        "_write_json_atomic",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError(28, "No space left on device")
+        ),
+    )
+    monkeypatch.setattr(telemetry, "_job_process_pids", lambda root: {4321, 4322})
+    monkeypatch.setattr(
+        telemetry.os,
+        "kill",
+        lambda pid, sig: signals.append(("kill", pid, sig)),
+    )
+
+    def fake_killpg(pgid, sig):
+        signals.append(("killpg", pgid, sig))
+        raise ProcessLookupError
+
+    monkeypatch.setattr(telemetry.os, "killpg", fake_killpg)
+
+    tripped = telemetry._trip_resource_guard(
+        root_pid=4321,
+        output=tmp_path / "resource-guard.json",
+        kind="max_vram_mib",
+        violation={
+            "observed_mib": 100,
+            "limit_mib": 10,
+            "gpu_index": 0,
+        },
+        sampled_at=1.0,
+        phase=None,
+    )
+
+    assert tripped is True
+    assert ("kill", 4322, telemetry.signal.SIGTERM) in signals
+    assert ("killpg", 4321, telemetry.signal.SIGTERM) in signals
+
+
+def test_parse_resource_jsonl_rejects_non_finite_rows():
+    """Job-writable telemetry with Infinity/NaN must not reach consumers."""
+    from dt.monitoring import parse_resource_jsonl, summarize_resources
+
+    text = "\n".join(
+        [
+            '{"timestamp": 1.0, "cpu": 0.5}',
+            '{"timestamp": Infinity, "cpu": NaN}',
+            '{"timestamp": 2.0, "cpu": -Infinity}',
+        ]
+    )
+    rows, invalid = parse_resource_jsonl(text)
+
+    assert len(rows) == 1
+    assert invalid == 2
+    summary = summarize_resources(rows)
+    assert "inf" not in repr(summary).lower()
+
+
 def test_telemetry_payload_emits_one_host_sample(tmp_path):
     output = tmp_path / "resources.jsonl"
     script = PAYLOAD_DIR / "telemetry.py"
@@ -1056,6 +1118,42 @@ def test_resource_guard_terminates_even_when_evidence_write_fails(
     )
 
     # A failed evidence write must not disarm the guard.
+    assert result is True
+    assert (4321, signal.SIGTERM) in signalled
+
+
+def test_resource_guard_terminates_even_when_stderr_write_fails(tmp_path, monkeypatch):
+    telemetry = _load_telemetry_payload()
+
+    class FullDiskStderr:
+        def write(self, *_args, **_kwargs):
+            raise OSError("stderr disk full")
+
+        def flush(self, *_args, **_kwargs):
+            raise OSError("stderr disk full")
+
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(telemetry, "_write_json_atomic", lambda *_a, **_k: None)
+    monkeypatch.setattr(telemetry, "_job_process_pids", lambda _root: set())
+    monkeypatch.setattr(
+        telemetry.os, "killpg", lambda pid, sig: signalled.append((pid, sig))
+    )
+    monkeypatch.setattr(telemetry.sys, "stderr", FullDiskStderr())
+
+    result = telemetry._trip_resource_guard(
+        root_pid=4321,
+        output=tmp_path / "resources.jsonl",
+        kind="max_job_memory_mib",
+        violation={
+            "observed_mib": 100,
+            "limit_mib": 50,
+            "observed_metric": "pss_anon_mib",
+        },
+        sampled_at=1.0,
+        phase=None,
+    )
+
+    # A full disk on stderr must not stand between detection and the kill.
     assert result is True
     assert (4321, signal.SIGTERM) in signalled
 

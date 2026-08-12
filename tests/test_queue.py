@@ -2639,3 +2639,21 @@ def test_cmd_round_trips_through_registry():
     cmd = ["python", "train.py", "--lr", "3e-4", "--tag", "a b'c"]
     joined = shlex.join(cmd)
     assert shlex.split(joined) == cmd
+
+
+def test_code_fingerprint_tolerates_vanishing_files(monkeypatch, tmp_path):
+    """A deploy deleting files between glob and stat must not crash the
+    upgrade probe and take the agent loop down (audit A1)."""
+    from dt import agent
+
+    pkg = tmp_path / "pkg"
+    (pkg / "payload").mkdir(parents=True)
+    real = pkg / "real.py"
+    real.write_text("x = 1\n")
+    # A broken symlink behaves exactly like a file deleted after glob:
+    # it is listed, and stat() raises FileNotFoundError.
+    (pkg / "ghost.py").symlink_to(pkg / "deleted-by-deploy.py")
+
+    monkeypatch.setattr(agent, "__file__", str(pkg / "agent.py"))
+
+    assert agent._code_fingerprint() == real.stat().st_mtime_ns

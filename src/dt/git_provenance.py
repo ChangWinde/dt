@@ -62,11 +62,18 @@ def git_capture_bounded(
     timeout: float = GIT_QUERY_TIMEOUT_S,
 ) -> tuple[int, str, bool]:
     """Capture at most ``max_bytes`` from one read-only git query."""
+    # Isolate the query: inherited GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE (set by
+    # a surrounding git hook) would otherwise resolve provenance against the
+    # wrong repository, and GIT_OPTIONAL_LOCKS=0 keeps a read-only query from
+    # rewriting the user's index stat cache under a lock.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     process = subprocess.Popen(
         ["git", "-C", str(project_dir), *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        env=env,
     )
     assert process.stdout is not None
     selector = selectors.DefaultSelector()

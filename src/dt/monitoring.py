@@ -132,7 +132,13 @@ def _reject_non_finite(constant: str) -> float:
 
 
 def parse_resource_jsonl(text: str) -> tuple[list[JsonDict], int]:
-    """Parse telemetry JSONL while tolerating an interrupted final write."""
+    """Parse telemetry JSONL while tolerating an interrupted final write.
+
+    The telemetry file is job-writable: a row carrying ``Infinity``/``NaN``
+    (accepted by Python's json module but invalid JSON) would round-trip into
+    ``dt metrics --json`` output and break standard parsers downstream, so
+    such rows count as invalid instead.
+    """
     rows: list[JsonDict] = []
     invalid = 0
     for line in text.splitlines():
