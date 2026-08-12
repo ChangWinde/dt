@@ -184,9 +184,11 @@ def _fallback_state_root() -> Path:
             return candidate
     try:
         return Path.home() / ".local" / "state"
-    except RuntimeError:
-        # No HOME and no passwd entry (minimal containers/cron): the journal
-        # is fail-open evidence and must never take a dt command down.
+    except (RuntimeError, OSError):
+        # HOME is unset and the uid is absent from the passwd database
+        # (bare containers, some CI). The journal is fail-open evidence,
+        # so degrade to a per-user temp root rather than crashing every
+        # dt command or colliding with another user in /tmp.
         return Path(tempfile.gettempdir()) / f"dt-operation-log-{os.getuid()}"
 
 
@@ -198,9 +200,10 @@ def resolve_target(
     if cfg is None:
         try:
             cfg = load()
-        except (ConfigError, RuntimeError):
-            # RuntimeError: config paths expand "~" and a HOME-less
-            # environment must degrade to the fallback journal target.
+        except (ConfigError, OSError, RuntimeError):
+            # RuntimeError/OSError here is HOME/path resolution failing while
+            # expanding the config path; the journal degrades to the fallback
+            # root instead of propagating and crashing the command.
             cfg = None
     if isinstance(cfg, HeadConfig):
         role = "head"
@@ -379,7 +382,17 @@ def _base_event(session: OperationSession, phase: str) -> dict[str, Any]:
 
 def begin(argv: list[str]) -> OperationSession:
     global _CURRENT
-    target = resolve_target()
+    try:
+        target = resolve_target()
+    except Exception:
+        # The journal must never stop a command from running. If target
+        # resolution fails for any reason, degrade to a best-effort temp
+        # target; append_event already tolerates an unwritable directory.
+        target = JournalTarget(
+            directory=Path(tempfile.gettempdir()) / "dt-state" / "dt" / "operations",
+            role="unknown",
+            settings=OperationsCfg(),
+        )
     session = OperationSession(
         operation_id=uuid.uuid4().hex,
         parent_operation_id=_safe_parent_id(),

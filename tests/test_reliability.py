@@ -4925,3 +4925,75 @@ def test_termination_verdict_bounds_untrusted_remote_diagnostics():
     assert detail is not None
     assert len(detail) <= 4096
     assert "[omitted]" in detail
+
+
+def test_dispatch_queued_blocks_on_unreadable_dependency(tmp_path):
+    cfg = _cfg(tmp_path)
+    dep = JobEntry(
+        job_id="dep",
+        name="dep",
+        center="test",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/dep",
+        session="dt_dep",
+        cmd="true",
+        status="queued",
+        gpus_requested=0,
+        after_success="pred",
+    )
+    (dispatch.stage_dir(cfg, dep.job_id) / "code").mkdir(parents=True)
+    jobs.save(cfg, dep)
+
+    # A corrupt predecessor row makes jobs.load raise; it must block (waiting
+    # for repair), never crash the tick.
+    corrupt = cfg.registry_dir() / "pred.json"
+    corrupt.write_text("{ not valid json", encoding="utf-8")
+
+    outcome, detail = dispatch.dispatch_queued(cfg, dep, lambda _m: None)
+
+    assert outcome == "blocked"
+    assert "unreadable" in (detail or "")
+    stored = jobs.load(cfg, dep.job_id)
+    assert stored is not None
+    assert stored.status == "queued"
+
+
+def test_process_once_isolates_a_failing_job_from_the_queue(tmp_path, monkeypatch):
+    from dt import agent
+
+    cfg = _cfg(tmp_path)
+    for jid, created in (("boom", 1.0), ("unrelated", 2.0)):
+        entry = JobEntry(
+            job_id=jid,
+            name=jid,
+            center="test",
+            project="p",
+            node="-",
+            node_local=False,
+            job_dir=f"dt/jobs/{jid}",
+            session=f"dt_{jid}",
+            cmd="true",
+            status="queued",
+            gpus_requested=0,
+            created_at=created,
+        )
+        jobs.save(cfg, entry)
+
+    seen: list[str] = []
+
+    def fake_dispatch(_cfg, entry, _log):
+        seen.append(entry.job_id)
+        if entry.job_id == "boom":
+            raise RuntimeError("kaboom")
+        return "blocked", "waiting"
+
+    monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
+
+    results = agent.process_once(cfg, lambda _m: None)
+
+    # The raising job must not abort the tick: the job behind it is still reached.
+    assert seen == ["boom", "unrelated"]
+    assert ("boom", "blocked") in results
+    assert ("unrelated", "blocked") in results

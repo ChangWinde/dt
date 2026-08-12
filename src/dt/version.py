@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -10,25 +11,34 @@ from ._provenance import SOURCE_COMMIT
 
 
 def repository_sha() -> str | None:
-    """Return the source checkout's short commit when running from a worktree.
+    """Return the short commit only when running from the dt source checkout.
 
-    The search is bounded to the package's own repository. Walking every
-    ancestor made ``dt --version`` report the commit of whatever repository
-    happened to contain ``$HOME``, which flipped the string and broke the
-    deploy assertion of an exact ``dt <version>``.
+    The scan is bounded to the ``<checkout>/src/dt`` layout on purpose. Walking
+    arbitrary ancestor directories for a ``.git`` leaks an unrelated
+    repository's commit when, for example, ``$HOME`` is itself a git repo, and
+    every installed wheel would run that scan. Installed builds carry
+    ``SOURCE_COMMIT`` instead.
     """
-    package_root = Path(__file__).resolve().parent.parent
-    for candidate in (package_root, package_root.parent):
-        if not (candidate / ".git").exists():
-            continue
+    module_dir = Path(__file__).resolve().parent
+    if module_dir.parent.name != "src":
+        return None
+    checkout = module_dir.parent.parent
+    if not (checkout / "pyproject.toml").is_file() or not (checkout / ".git").exists():
+        return None
+    # Strip inherited GIT_* so an ambient GIT_DIR cannot rewrite the identity,
+    # and tolerate a node without a git binary instead of crashing --version.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
         proc = subprocess.run(
-            ["git", "-C", str(candidate), "rev-parse", "--short", "HEAD"],
+            ["git", "-C", str(checkout), "rev-parse", "--short", "HEAD"],
             capture_output=True,
             text=True,
             check=False,
+            env=env,
         )
-        return proc.stdout.strip() or None
-    return None
+    except OSError:
+        return None
+    return proc.stdout.strip() or None
 
 
 def version_text() -> str:

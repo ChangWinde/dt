@@ -1846,3 +1846,15 @@ def test_cleanup_refuses_lost_job_whose_remote_process_is_alive(tmp_path, monkey
     assert report.removed == 0
     assert [failure.kind for failure in report.failures] == ["state_changed"]
     assert jobs_mod.load(cfg, source.job_id) is not None
+
+
+def test_fork_repeat_member_name_pads_to_max_index_width():
+    from dt import fork_repeat
+
+    # repeat <= 999 keeps the historical :03d width byte-for-byte.
+    assert fork_repeat._member_name("exp", 2, 5) == "exp-002"
+    assert fork_repeat._member_name("exp", 42, 999) == "exp-042"
+    # Larger repeats widen so names sort in numeric order.
+    names = [fork_repeat._member_name("exp", i, 1000) for i in (2, 999, 1000)]
+    assert names == ["exp-0002", "exp-0999", "exp-1000"]
+    assert sorted(names) == names

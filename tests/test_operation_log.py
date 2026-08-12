@@ -393,8 +393,6 @@ def test_main_records_remote_failures(tmp_path, monkeypatch):
 
 def test_begin_survives_home_less_environment(tmp_path, monkeypatch):
     """No HOME and no passwd entry must never take a dt command down."""
-    from pathlib import Path as PathType
-
     from dt import operation_log
 
     monkeypatch.delenv("HOME", raising=False)
@@ -404,8 +402,40 @@ def test_begin_survives_home_less_environment(tmp_path, monkeypatch):
     def no_home():
         raise RuntimeError("Could not determine home directory")
 
-    monkeypatch.setattr(PathType, "home", staticmethod(no_home))
+    monkeypatch.setattr(operation_log.Path, "home", staticmethod(no_home))
 
     session = operation_log.begin(["dt", "--version"])
     assert session.operation_id
     operation_log.finish(session, status="ok", exit_code=0)
+
+
+def test_fallback_state_root_degrades_when_home_unresolvable(monkeypatch):
+    import tempfile
+
+    from dt import operation_log
+
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+
+    def no_home():
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(operation_log.Path, "home", staticmethod(no_home))
+
+    root = operation_log._fallback_state_root()
+    assert str(root).startswith(tempfile.gettempdir())
+
+
+def test_begin_is_fail_open_without_home(monkeypatch):
+    from dt import operation_log
+
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+
+    def boom():
+        raise RuntimeError("Could not determine home directory")
+
+    monkeypatch.setattr(operation_log, "load", boom)
+    monkeypatch.setattr(operation_log.Path, "home", staticmethod(boom))
+
+    # HOME unset and uid absent from passwd must not crash any command.
+    session = operation_log.begin(["--version"])
+    assert session.command == "version"

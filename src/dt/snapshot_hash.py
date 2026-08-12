@@ -28,9 +28,22 @@ def tree_sha256(root: Path) -> str:
     if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
         raise NotADirectoryError(root)
 
+    def _abort(error: OSError) -> None:
+        # An unreadable directory must fail the hash outright. Silently
+        # omitting its contents (pathlib.rglob's behaviour) lets two distinct
+        # trees collide on one digest, which would let a node run the wrong code.
+        raise error
+
     digest = hashlib.sha256(_SCHEMA)
+    discovered: list[Path] = []
+    for parent, dirnames, filenames in os.walk(root, onerror=_abort, followlinks=False):
+        parent_path = Path(parent)
+        for name in dirnames:
+            discovered.append(parent_path / name)
+        for name in filenames:
+            discovered.append(parent_path / name)
     entries = sorted(
-        root.rglob("*"),
+        discovered,
         key=lambda path: os.fsencode(path.relative_to(root).as_posix()),
     )
     for path in entries:

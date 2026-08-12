@@ -34,6 +34,17 @@ JsonDict: TypeAlias = dict[str, Any]
 SCHEMA = "dt_fork_repeat_v1"
 
 
+def _member_name(prefix: str, index: int, repeat: int) -> str:
+    """Zero-pad a member index to the width of the largest index.
+
+    max(3, ...) keeps names byte-identical for the common repeat<=999 case (so
+    resumes are unaffected) while wider repeats still sort in dt ps: a fixed
+    :03d put "1000" before "999" lexicographically.
+    """
+    width = max(3, len(str(repeat)))
+    return f"{prefix}-{index:0{width}d}"
+
+
 @dataclass(frozen=True)
 class Host:
     """CLI-owned helpers required by fork-repeat orchestration."""
@@ -450,7 +461,9 @@ def run(
     for index in range(len(entries) + 1, repeat + 1):
         if failure is not None or group_terminal_replay:
             break
-        item_spec = spec if index == 1 else build_spec(f"{prefix}-{index:03d}")
+        item_spec = (
+            spec if index == 1 else build_spec(_member_name(prefix, index, repeat))
+        )
         item_spec.request_id = (
             group_mod.item_request_id(request_id, index)
             if request_id is not None

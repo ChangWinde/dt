@@ -1122,6 +1122,42 @@ def test_resource_guard_terminates_even_when_evidence_write_fails(
     assert (4321, signal.SIGTERM) in signalled
 
 
+def test_resource_guard_terminates_even_when_stderr_write_fails(tmp_path, monkeypatch):
+    telemetry = _load_telemetry_payload()
+
+    class FullDiskStderr:
+        def write(self, *_args, **_kwargs):
+            raise OSError("stderr disk full")
+
+        def flush(self, *_args, **_kwargs):
+            raise OSError("stderr disk full")
+
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(telemetry, "_write_json_atomic", lambda *_a, **_k: None)
+    monkeypatch.setattr(telemetry, "_job_process_pids", lambda _root: set())
+    monkeypatch.setattr(
+        telemetry.os, "killpg", lambda pid, sig: signalled.append((pid, sig))
+    )
+    monkeypatch.setattr(telemetry.sys, "stderr", FullDiskStderr())
+
+    result = telemetry._trip_resource_guard(
+        root_pid=4321,
+        output=tmp_path / "resources.jsonl",
+        kind="max_job_memory_mib",
+        violation={
+            "observed_mib": 100,
+            "limit_mib": 50,
+            "observed_metric": "pss_anon_mib",
+        },
+        sampled_at=1.0,
+        phase=None,
+    )
+
+    # A full disk on stderr must not stand between detection and the kill.
+    assert result is True
+    assert (4321, signal.SIGTERM) in signalled
+
+
 def test_telemetry_job_memory_guard_persists_evidence_and_terminates_group(
     tmp_path,
 ):
