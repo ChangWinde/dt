@@ -66,6 +66,66 @@ def test_compress_indices():
     assert compress_indices([1, 2]) == "1-2"
 
 
+def test_absent_storage_layout_infers_legacy_not_registry_directory():
+    """A migrated implicit-legacy record must not be flipped to role-v1
+    just because its file now lives in the role registry (audit R5)."""
+    from dataclasses import asdict
+
+    from dt.jobs import _decode_entry
+    from dt.layout import LEGACY_LAYOUT, ROLE_LAYOUT
+
+    legacy_record = JobEntry(
+        job_id="20260726-0900_legacy_ab12",
+        name="legacy",
+        center="c",
+        project="p",
+        node="n",
+        node_local=False,
+        job_dir="jobs/legacy",
+        session="legacy",
+        cmd="true",
+    )
+    raw = asdict(legacy_record)
+    raw.pop("storage_layout", None)  # historical row: no explicit field
+
+    decoded = _decode_entry(
+        raw,
+        layout=ROLE_LAYOUT,  # read from the role registry after migration
+        expected_job_id=legacy_record.job_id,
+    )
+
+    assert decoded.storage_layout == LEGACY_LAYOUT
+
+
+def test_explicit_role_storage_layout_is_preserved():
+    from dataclasses import asdict
+
+    from dt.jobs import _decode_entry
+    from dt.layout import ROLE_LAYOUT
+
+    role_record = JobEntry(
+        job_id="20260726-0900_role_cd34",
+        name="role",
+        center="c",
+        project="p",
+        node="n",
+        node_local=False,
+        job_dir="jobs/role",
+        session="role",
+        cmd="true",
+        storage_layout=ROLE_LAYOUT,
+    )
+    raw = asdict(role_record)
+
+    decoded = _decode_entry(
+        raw,
+        layout=None,
+        expected_job_id=role_record.job_id,
+    )
+
+    assert decoded.storage_layout == ROLE_LAYOUT
+
+
 def test_remove_record_fsyncs_registry_directory(tmp_path, monkeypatch):
     import dt.jobs as jobs_mod
 
