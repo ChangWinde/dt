@@ -11943,6 +11943,7 @@ def _pull_unlocked(
                 excludes=output_excludes,
                 timeout=4 * 3600,
                 retries=retries,
+                safe_links=True,
                 on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
                 **cancel_kwargs,
             )
@@ -11954,6 +11955,7 @@ def _pull_unlocked(
                     excludes=output_excludes,
                     timeout=4 * 3600,
                     retries=retries,
+                    safe_links=True,
                     on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
                     **cancel_kwargs,
                 )
@@ -12009,6 +12011,7 @@ def _pull_unlocked(
             excludes=PULL_LOG_RESERVED_EXCLUDES,
             timeout=4 * 3600,
             retries=retries,
+            safe_links=True,
             on_retry=_rsync_retry_observer(ref, "run_logs", retry_events),
             **cancel_kwargs,
         )
@@ -12020,6 +12023,7 @@ def _pull_unlocked(
                 excludes=PULL_LOG_RESERVED_EXCLUDES,
                 timeout=4 * 3600,
                 retries=retries,
+                safe_links=True,
                 on_retry=_rsync_retry_observer(ref, "run_logs", retry_events),
                 **cancel_kwargs,
             )

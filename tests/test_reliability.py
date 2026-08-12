@@ -990,6 +990,9 @@ def test_rsync_rejects_unbounded_retry_policies(retries):
         ("Permission denied (publickey,password).", "authentication"),
         ("Host key verification failed.", "host_key"),
         ("rsync: write failed: No space left on device", "space"),
+        # Emitted by the --rsync-path prepare chain: a deterministic
+        # destination problem, not a network-edge failure worth retrying.
+        ("dt: destination prepare failed", "destination"),
     ],
 )
 def test_rsync_does_not_retry_permanent_transport_failures(monkeypatch, message, kind):
@@ -1011,6 +1014,22 @@ def test_rsync_does_not_retry_permanent_transport_failures(monkeypatch, message,
     assert sshio.classify_rsync_failure(255, "", message) == kind
     assert calls == 1
     assert sleeps == []
+
+
+def test_rsync_safe_links_is_opt_in_for_zero_trust_pulls(monkeypatch):
+    commands = []
+
+    def fake_run(cmd, timeout, cancel_event):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", fake_run)
+
+    sshio.rsync("a/", "b/", safe_links=True)
+    sshio.rsync("a/", "b/")
+
+    assert "--safe-links" in commands[0]
+    assert "--safe-links" not in commands[1]
 
 
 def test_rsync_retry_preserves_all_attempt_stats_for_command_accounting(monkeypatch):
@@ -2304,6 +2323,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
                 ],
                 "timeout": 4 * 3600,
                 "retries": 2,
+                "safe_links": True,
             },
         ),
         (
@@ -2313,6 +2333,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
                 "excludes": ["job.json", "resources.jsonl"],
                 "timeout": 4 * 3600,
                 "retries": 2,
+                "safe_links": True,
             },
         ),
     ]
@@ -2397,6 +2418,7 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
                 "excludes": ["job.json", "resources.jsonl"],
                 "timeout": 4 * 3600,
                 "retries": 2,
+                "safe_links": True,
             },
         )
     ]
