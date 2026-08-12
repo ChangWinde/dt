@@ -17,10 +17,16 @@ class PrivateStateError(RuntimeError):
 def ensure_private_directory(path: Path, *, create: bool = True) -> bool:
     """Create/validate a private regular directory without accepting a symlink."""
     if create:
+        newly_created = not path.exists()
         try:
             path.mkdir(mode=0o700, parents=True, exist_ok=True)
         except OSError as exc:
             raise PrivateStateError(f"cannot create private directory: {path}") from exc
+        if newly_created:
+            # Make the new directory entry durable so a crash between creation
+            # and the first atomic_write cannot orphan a file under a lost dir.
+            # Only on creation, to keep the common already-exists path cheap.
+            fsync_dir(path.parent)
     try:
         info = path.lstat()
     except FileNotFoundError:

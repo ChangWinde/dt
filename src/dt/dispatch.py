@@ -2300,6 +2300,12 @@ def _stored_payload_dir(
         try:
             _write_support_files(temp, runtime_files)
             os.replace(temp, root)
+            # Make the published payload durable before any job record can
+            # reference it, matching the snapshot store: sync the tree contents
+            # and the rename so a crash cannot leave the dequeue path unable to
+            # find the payload and terminate every queued job that needs it.
+            fsync_tree(root)
+            fsync_dir(cfg.payloads_dir())
         finally:
             shutil.rmtree(temp, ignore_errors=True)
         return validate()
