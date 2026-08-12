@@ -453,6 +453,32 @@ def test_phase_helper_records_safe_marker_and_rejects_unsafe_names(tmp_path):
     assert current.read_text().strip() == "dataset.load"
 
 
+def test_parse_resource_jsonl_rejects_non_finite_values():
+    text = "\n".join(
+        [
+            json.dumps({"timestamp": 1.0, "cpu_pct": 10.0}),
+            '{"timestamp": Infinity, "cpu_pct": 5.0}',
+            '{"timestamp": 2.0, "cpu_pct": NaN}',
+            json.dumps({"timestamp": 3.0, "cpu_pct": 20.0}),
+        ]
+    )
+    rows, invalid = _parse_resource_jsonl(text)
+    assert invalid == 2
+    assert [row["timestamp"] for row in rows] == [1.0, 3.0]
+
+
+def test_summary_drops_non_finite_and_stays_valid_json():
+    # A worker-written inf/nan must never reach the summary, so metrics/info
+    # --json can always serialize with allow_nan=False.
+    rows = [
+        {"timestamp": 1.0, "cpu_pct": float("inf")},
+        {"timestamp": 2.0, "cpu_pct": 20.0},
+    ]
+    summary = _summarize_resources(rows)
+    json.dumps(summary, allow_nan=False)  # raises if any residual inf/nan
+    assert summary["duration_s"] == 1.0
+
+
 def test_phase_summary_preserves_order_and_terminal_durations():
     entry = JobEntry(
         job_id="phase-summary",
@@ -999,6 +1025,39 @@ def test_guard_evidence_atomically_replaces_a_symlink(tmp_path):
     assert json.loads(guard.read_text(encoding="utf-8")) == {"kind": "proof"}
     assert outside.read_text(encoding="utf-8") == "must survive\n"
     assert not list(tmp_path.glob(".resource-guard.json.*.tmp"))
+
+
+def test_resource_guard_terminates_even_when_evidence_write_fails(
+    tmp_path, monkeypatch
+):
+    telemetry = _load_telemetry_payload()
+
+    def boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    signalled: list[tuple[int, int]] = []
+    monkeypatch.setattr(telemetry, "_write_json_atomic", boom)
+    monkeypatch.setattr(telemetry, "_job_process_pids", lambda _root: set())
+    monkeypatch.setattr(
+        telemetry.os, "killpg", lambda pid, sig: signalled.append((pid, sig))
+    )
+
+    result = telemetry._trip_resource_guard(
+        root_pid=4321,
+        output=tmp_path / "resources.jsonl",
+        kind="max_job_memory_mib",
+        violation={
+            "observed_mib": 100,
+            "limit_mib": 50,
+            "observed_metric": "pss_anon_mib",
+        },
+        sampled_at=1.0,
+        phase=None,
+    )
+
+    # A failed evidence write must not disarm the guard.
+    assert result is True
+    assert (4321, signal.SIGTERM) in signalled
 
 
 def test_telemetry_job_memory_guard_persists_evidence_and_terminates_group(

@@ -233,8 +233,15 @@ def ssh_pool_config(
             # Because ProxyJump receives the same -F file, both the final
             # target and every implicit bastion bypass the damaged pool.
             lines.extend(["    ControlMaster no", "    ControlPath none"])
+        # Only the trusted artifact relay may forward the agent. OpenSSH keeps
+        # the first value obtained for a keyword, so pinning ForwardAgent here
+        # -- above the user/system Include below -- prevents an included
+        # ``ForwardAgent yes`` from leaking the agent to ordinary control or
+        # bulk-data workers.
         if workload is SSHWorkload.ARTIFACT_RELAY:
             lines.append("    ForwardAgent yes")
+        else:
+            lines.append("    ForwardAgent no")
         # OpenSSH treats an Include with no matching file as empty. Always
         # include the configured paths so a long-lived dt process immediately
         # observes later edits or creation without regenerating this overlay.
@@ -401,7 +408,10 @@ def ssh_cmd(
     base = ssh_base(workload, multiplex=multiplex)
     if tty:
         base += ["-t"]
-    return [*base, host, remote]
+    # ``--`` ends option parsing so a destination that begins with ``-`` (for
+    # example from a corrupt registry) can never be read as an ssh option such
+    # as ``-oProxyCommand=...`` and trigger local execution.
+    return [*base, "--", host, remote]
 
 
 def run_remote(
@@ -913,7 +923,10 @@ def rsync(
         cmd += [f"--link-dest={link_dest}"]
     if copy_dest:
         cmd += [f"--copy-dest={copy_dest}"]
-    cmd += [src, dst]
+    # ``--`` ends option parsing so a src/dst that begins with ``-`` cannot be
+    # read as an rsync option such as ``--rsync-path=...`` and run an arbitrary
+    # local or remote command.
+    cmd += ["--", src, dst]
     attempt = 0
     attempt_stdout = _BoundedTextCapture(MAX_CAPTURE_CHARS)
     captured_attempts = 0

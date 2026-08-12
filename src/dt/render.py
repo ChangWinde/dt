@@ -743,7 +743,7 @@ def doctor_table(rows: list[JsonRow]) -> Table:
 
     def control(checks: JsonRow) -> str:
         values = []
-        for name in ("agent", "dt"):
+        for name in ("agent", "relay", "dt"):
             value = str(checks.get(name, "-"))
             if value != "-":
                 values.append(f"{name}:{paint(value)}")

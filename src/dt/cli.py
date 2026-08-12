@@ -42,6 +42,7 @@ from typing import (
 import typer
 from rich.markup import escape
 
+from . import fork_repeat as fork_repeat_mod
 from . import jobs as jobs_mod
 from . import ps_query as ps_query_mod
 from . import submission_group as group_mod
@@ -59,7 +60,7 @@ from .dispatch import (
     reconcile_submission_request,
     submit,
 )
-from .doctor import doctor_center
+from .doctor import doctor_center, relay_agent_status
 from .forwarding import HeadCommand
 from .lifecycle import termination_probe, termination_verdict
 from .layout import (
@@ -1478,7 +1479,11 @@ def free(
 # dt options before that boundary fail locally instead of becoming the remote
 # executable.
 RUN_CTX = {"allow_extra_args": True}
-_JOB_ID_LINE_RE = re.compile(r"^\d{8}-\d{4}_[A-Za-z0-9_-]+_[0-9a-f]{4}$")
+# Recognize a submission id echoed on the final human-mode line. Four hex
+# characters cover historical ids; current ids use a longer token_hex suffix,
+# so this must stay aligned with remote.FULL_JOB_ID_RE or plain laptop
+# submissions parse their own valid job id as a protocol error.
+_JOB_ID_LINE_RE = re.compile(r"^\d{8}-\d{4}_[A-Za-z0-9_-]+_[0-9a-f]{4,}$")
 
 
 def _fail_submission(
@@ -1741,6 +1746,10 @@ def _failed_start_has_env_log(entry: jobs_mod.JobEntry) -> bool:
 
 def _failed_start_kind(entry: jobs_mod.JobEntry) -> str:
     reason = entry.reason or ""
+    if _is_uncertain_launch(entry):
+        # The node may still be running this item; the caller must treat the
+        # whole submission as unresolved, never as a confirmed terminal state.
+        return "uncertain_launch"
     if "payload-integrity:" in reason:
         return "payload_integrity"
     if _failed_start_has_env_log(entry):
@@ -2301,6 +2310,21 @@ def run(
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         if center == "auto":
+            if request_id:
+                # Retry-safe submission stores its receipt on one chosen head.
+                # `-c auto` re-runs center selection on every attempt, so a
+                # retry can land on a different center and start a second job.
+                # Refuse the combination until a global routing receipt exists.
+                _fail_submission(
+                    kind="invalid_request",
+                    message=(
+                        "-c auto cannot be combined with --request-id: a retry "
+                        "may select a different center and duplicate the job; "
+                        "pick an explicit center for idempotent submission"
+                    ),
+                    exit_code=2,
+                    json_=json_,
+                )
             if require_path:
                 err.print(
                     "[red]-c auto cannot honor --require-path: data lives in one "
@@ -3921,29 +3945,35 @@ def _inventory_command(
                     item_label=f"{policy.command} item",
                 )
                 if failed_entry is not None:
-                    try:
-                        persist_group_entry(index, failed_entry)
-                    except (
-                        OSError,
-                        ValueError,
-                        intent_mod.RequestRecordError,
-                        group_mod.GroupRequestError,
-                    ) as persistence_exc:
-                        failure = {
-                            "kind": "submission_unknown",
-                            "message": (
-                                f"job {failed_entry.job_id} was registered but "
-                                f"request {request_id!r} progress could not be "
-                                "persisted"
-                            ),
-                            "reasons": {
-                                "request_id": request_id,
-                                "job_id": failed_entry.job_id,
-                                "detail": str(persistence_exc),
-                            },
-                            "exit_code": EXIT_UNREACHABLE,
-                        }
-                        failure_code = EXIT_UNREACHABLE
+                    # An uncertain launch may still be running on the node, so
+                    # it is not part of the durably confirmed prefix; trying to
+                    # record it would fail on the non-confirmed receipt and
+                    # bury the accurate uncertain_launch classification under
+                    # submission_unknown.
+                    if failure.get("kind") != "uncertain_launch":
+                        try:
+                            persist_group_entry(index, failed_entry)
+                        except (
+                            OSError,
+                            ValueError,
+                            intent_mod.RequestRecordError,
+                            group_mod.GroupRequestError,
+                        ) as persistence_exc:
+                            failure = {
+                                "kind": "submission_unknown",
+                                "message": (
+                                    f"job {failed_entry.job_id} was registered "
+                                    f"but request {request_id!r} progress could "
+                                    "not be persisted"
+                                ),
+                                "reasons": {
+                                    "request_id": request_id,
+                                    "job_id": failed_entry.job_id,
+                                    "detail": str(persistence_exc),
+                                },
+                                "exit_code": EXIT_UNREACHABLE,
+                            }
+                            failure_code = EXIT_UNREACHABLE
                     entries.append(failed_entry)
                     ensure_agent(failed_entry)
                     if not json_:
@@ -3986,6 +4016,10 @@ def _inventory_command(
                 f"{policy.command}_submission_interrupted",
                 "submission_unknown",
                 "idempotency_conflict",
+                # An unverified orphan cancel means the item may be running;
+                # confirming the group would invite a duplicate under a new
+                # request id (audit H4).
+                "uncertain_launch",
             }
         )
         try:
@@ -4825,6 +4859,9 @@ def _ps_issue_rows(rows: list[JsonDict]) -> list[JsonDict]:
             return True
         if status == "finished":
             exit_code = row.get("exit_code")
+            if exit_code is None:
+                # A finished record without an exit code is an infra failure.
+                return True
             return (
                 isinstance(exit_code, int)
                 and not isinstance(exit_code, bool)
@@ -5192,31 +5229,34 @@ def ps(
     compact: bool = typer.Option(
         False,
         "--compact",
-        help="emit a bounded, versioned agent query instead of the legacy array",
+        help="emit a bounded, versioned agent query (implies --json)",
         rich_help_panel="Agent query",
     ),
     fields_: Optional[str] = typer.Option(
         None,
         "--fields",
-        help="comma-separated job fields for the bounded query",
+        help="comma-separated job fields for the bounded query (implies --json)",
         rich_help_panel="Agent query",
     ),
     summary: bool = typer.Option(
         False,
         "--summary",
-        help="emit aggregate counts without job rows",
+        help="emit aggregate counts without job rows (implies --json)",
         rich_help_panel="Agent query",
     ),
     since: Optional[str] = typer.Option(
         None,
         "--since",
-        help="only registry changes since Unix seconds or timezone-qualified ISO time",
+        help=(
+            "only registry changes since Unix seconds or timezone-qualified "
+            "ISO time (implies --json)"
+        ),
         rich_help_panel="Agent query",
     ),
     cursor: Optional[str] = typer.Option(
         None,
         "--cursor",
-        help="continue a bounded query from an opaque next_cursor",
+        help="continue a bounded query from an opaque next_cursor (implies --json)",
         rich_help_panel="Agent query",
     ),
     wide: bool = typer.Option(
@@ -5270,6 +5310,10 @@ def ps(
         or since is not None
         or (cursor is not None)
     )
+    if query_mode:
+        # Agent-query flags exist only to shape the bounded JSON envelope, so
+        # they imply --json instead of rejecting the invocation.
+        json_ = True
     if active and status is not None:
         _fail_submission(
             kind="invalid_argument",
@@ -5300,13 +5344,6 @@ def ps(
             message="--limit must be positive",
             exit_code=1,
             json_=json_,
-        )
-    if query_mode and not json_:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--compact/--fields/--summary/--since/--cursor require --json",
-            exit_code=1,
-            json_=False,
         )
     if query_mode and (watch_ or recent or window):
         _fail_submission(
@@ -6128,9 +6165,7 @@ def _read_job_log_tail(
 
 def _is_uncertain_launch(entry: jobs_mod.JobEntry) -> bool:
     """Whether a failed launch may still have remote processes/evidence."""
-    return entry.status == "failed" and (entry.reason or "").startswith(
-        jobs_mod.UNCERTAIN_LAUNCH_PREFIX
-    )
+    return jobs_mod.is_uncertain_launch(entry)
 
 
 def _refuse_unplaced(
@@ -6205,7 +6240,9 @@ def _print_log_follow_stopped(ref: str) -> None:
 def _log_terminal_exit_code(entry: jobs_mod.JobEntry) -> int | None:
     """Map a verified terminal job to the same stable code as ``dt wait``."""
     if entry.status == "finished":
-        return min(entry.exit_code if entry.exit_code is not None else 0, 125)
+        if entry.exit_code is None:
+            return 68
+        return min(entry.exit_code, 125)
     if entry.status == "failed" and not _is_uncertain_launch(entry):
         return 68
     if entry.status == "killed":
@@ -6225,9 +6262,12 @@ def _print_log_stream_complete(
     from rich.markup import escape
 
     if entry.status == "finished":
-        actual = entry.exit_code if entry.exit_code is not None else 0
-        summary = f"finished · exit {actual}"
-        color = "green" if actual == 0 else "red"
+        if entry.exit_code is None:
+            summary = "finished · result unavailable (no exit code)"
+            color = "red"
+        else:
+            summary = f"finished · exit {entry.exit_code}"
+            color = "green" if entry.exit_code == 0 else "red"
     else:
         summary = entry.status
         color = "yellow" if entry.status in {"killed", "lost"} else "red"
@@ -6942,16 +6982,23 @@ def _wait_terminal_result(
     if entry.status == "finished":
         from rich.markup import escape
 
-        code = entry.exit_code if entry.exit_code is not None else 0
+        if entry.exit_code is None:
+            # A finished record with no exit code is an infrastructure anomaly;
+            # effective_result_state classifies it infra_failure, so wait must
+            # not report success or a zero process code.
+            code = 68
+            summary = "finished · result unavailable (no exit code)"
+        else:
+            code = entry.exit_code
+            summary = f"finished · exit {code}"
         color = "green" if code == 0 else "red"
-        summary = f"finished · exit {code}"
         reference = escape(display_ref or entry.job_id)
         identity = f"{escape(entry.name)} · ref {reference}"
         if len(summary) + len(entry.name) + len(display_ref or entry.job_id) + 12 <= 72:
             emit(f"[{color}]{summary}[/{color}] · {identity}")
         else:
             emit(f"[{color}]{summary}[/{color}]\n[dim]{identity}[/dim]")
-        extra: JsonDict = {"exit_code": code}
+        extra: JsonDict = {"exit_code": entry.exit_code}
         if code != 0 and error_lines:
             finished_failure_log = _read_finished_failure_log(
                 entry,
@@ -8064,7 +8111,7 @@ def _watch_group_view(payload: JsonDict) -> Any:
         )
 
         has_issue = status in {"killed", "lost", "failed", "skipped"} or (
-            status == "finished" and exit_code not in (None, 0)
+            status == "finished" and exit_code != 0
         )
         if status == "running" or has_issue:
             raw_log = str(snapshot.get("log_tail") or "").rstrip()
@@ -10856,606 +10903,19 @@ def exec_job(
 # --------------------------------------------------------------------------
 
 
-FORK_REPEAT_SCHEMA = "dt_fork_repeat_v1"
-
-
-def _fork_repeat_receipt(
-    *,
-    old: jobs_mod.JobEntry,
-    source: jobs_mod.JobEntry,
-    name_prefix: str,
-    requested: int,
-    entries: list[jobs_mod.JobEntry],
-    display_refs: dict[str, str],
-    cache_mode: str,
-    cold_cache_env: str | None,
-    agent_started: bool | None,
-    error: JsonDict | None,
-    exit_code: int,
-    request_id: str | None = None,
-    idempotent_replay: bool = False,
-) -> JsonDict:
-    interrupted = (
-        isinstance(error, dict)
-        and error.get("kind") == "fork_repeat_submission_interrupted"
+def _fork_repeat_host() -> fork_repeat_mod.Host:
+    """Bind fork-repeat orchestration to CLI presentation and exit contracts."""
+    return fork_repeat_mod.Host(
+        fail_submission=_fail_submission,
+        batch_error=_batch_error,
+        submission_payload=_submission_payload,
+        display_refs_for_entries=_display_refs_for_entries,
+        group_failure=_group_failure,
+        emit_batch_next_commands=_emit_batch_next_commands,
+        forward_capture_stdout=forward_capture_stdout,
+        err=err,
+        escape=escape,
     )
-    rows = [
-        _submission_payload(
-            entry,
-            name=entry.name,
-            repeat_index=index,
-            repeat_size=requested,
-            command=entry.cmd,
-            forked_from=entry.forked_from,
-            max_hours=entry.max_hours,
-            exact_snapshot=bool(
-                old.snapshot_sha256 and entry.snapshot_sha256 == old.snapshot_sha256
-            ),
-        )
-        for index, entry in enumerate(entries, start=1)
-    ]
-    for row, entry in zip(rows, entries, strict=True):
-        row["display_ref"] = display_refs.get(entry.job_id, entry.job_id)
-    receipt: JsonDict = {
-        "schema_version": FORK_REPEAT_SCHEMA,
-        "status": (
-            "submitted"
-            if error is None
-            else "partial"
-            if entries
-            else "unknown"
-            if interrupted
-            else "failed"
-        ),
-        "repeat_ref_job_id": old.job_id,
-        "source_job_id": source.job_id,
-        "project": entries[0].project if entries else old.project,
-        "node": source.node,
-        "name_prefix": name_prefix,
-        "requested": requested,
-        "submitted": len(entries),
-        "running": sum(entry.status == "running" for entry in entries),
-        "queued": sum(entry.status == "queued" for entry in entries),
-        "snapshot_sha256": old.snapshot_sha256,
-        "exact_snapshot": bool(
-            entries
-            and old.snapshot_sha256
-            and all(entry.snapshot_sha256 == old.snapshot_sha256 for entry in entries)
-        ),
-        "cache_mode": cache_mode,
-        "runtime_failure_policy": "continue",
-        "jobs": rows,
-        "exit_code": exit_code,
-    }
-    if request_id is not None:
-        receipt["request_id"] = request_id
-        receipt["idempotent_replay"] = idempotent_replay
-    if cold_cache_env:
-        receipt["cold_cache"] = {
-            "env_var": cold_cache_env,
-            "path": "$DT_JOB_DIR/outputs/.cache/dt-cold",
-        }
-    if entries and entries[0].max_hours is not None:
-        receipt["max_hours"] = entries[0].max_hours
-    if entries and entries[0].max_vram_mib is not None:
-        receipt["max_vram_mib"] = entries[0].max_vram_mib
-    if entries and entries[0].max_job_memory_mib is not None:
-        receipt["max_job_memory_mib"] = entries[0].max_job_memory_mib
-    if entries and entries[0].cache_source_job:
-        receipt["cache_reuse"] = {
-            "source_job_id": entries[0].cache_source_job,
-            "source_path": entries[0].cache_source_path,
-            "env_var": entries[0].cache_env,
-            "source_env_hash": entries[0].cache_source_env_hash,
-            "mode": entries[0].cache_mode or "shared",
-        }
-        if entries[0].cache_mode == "clone":
-            receipt["cache_reuse"]["runtime_path"] = "outputs/.cache/dt-clone"
-    job_ids = [str(row["job_id"]) for row in rows]
-    if job_ids:
-        next_commands: dict[str, list[str]] = {
-            "watch": ["dt", "watch", *job_ids],
-            "wait": ["dt", "wait", *job_ids],
-            "pull": ["dt", "pull", *job_ids],
-            "kill": ["dt", "kill", *job_ids],
-        }
-        if len(job_ids) >= 2:
-            next_commands["compare"] = ["dt", "compare", *job_ids]
-        receipt["next_commands"] = next_commands
-    if agent_started is not None:
-        receipt["agent_started"] = agent_started
-    if error is not None:
-        receipt["error"] = error
-    return receipt
-
-
-def _emit_fork_repeat_human(
-    receipt: JsonDict,
-    *,
-    emit_job_ids: bool = True,
-) -> None:
-    from rich.markup import escape
-
-    jobs = receipt.get("jobs")
-    if emit_job_ids and isinstance(jobs, list):
-        for row in jobs:
-            if isinstance(row, dict) and isinstance(row.get("job_id"), str):
-                print(row["job_id"])
-    error = receipt.get("error")
-    if isinstance(error, dict):
-        err.print(
-            f"[red]fork repeat {escape(str(receipt['status']))}[/red]  "
-            f"{receipt['submitted']}/{receipt['requested']} registered · "
-            f"{escape(str(error.get('message', 'submission failed')))}"
-        )
-        _emit_batch_next_commands(receipt)
-        return
-    err.print(
-        f"[green]fork repeat submitted[/green]  {receipt['submitted']} jobs · "
-        f"{receipt['running']} running · {receipt['queued']} queued · "
-        f"cache {escape(str(receipt['cache_mode']))}"
-    )
-    err.print("[dim]policy: FIFO · runtime failures continue[/dim]")
-    _emit_batch_next_commands(receipt)
-
-
-def _forward_laptop_fork_repeat(
-    head: str,
-    argv: list[str],
-    *,
-    ref: str,
-    name_prefix: str,
-    json_: bool,
-    request_id: str | None = None,
-) -> int:
-    recovery = (
-        f"Retry the exact command with --request-id {request_id!r}, or query "
-        f"`dt request {request_id} --json`."
-        if request_id is not None
-        else (
-            "Do not resubmit blindly; inspect `dt ps -w` for prefix "
-            f"{name_prefix!r} or source ref {ref!r}."
-        )
-    )
-    try:
-        rc, captured = forward_capture_stdout(
-            head,
-            argv,
-            tty=False,
-            emit_stdout=False,
-        )
-    except KeyboardInterrupt:
-        _fail_submission(
-            kind="fork_repeat_submission_unknown",
-            message=(
-                f"fork repeat submission interrupted; outcome unknown. {recovery}"
-            ),
-            exit_code=130,
-            json_=json_,
-        )
-
-    try:
-        payload = json.loads(captured)
-    except json.JSONDecodeError:
-        payload = None
-    if (
-        isinstance(payload, dict)
-        and payload.get("schema_version") == FORK_REPEAT_SCHEMA
-        and isinstance(payload.get("exit_code"), int)
-    ):
-        if json_:
-            print(json.dumps(payload))
-        else:
-            _emit_fork_repeat_human(payload)
-        return int(payload["exit_code"])
-
-    if rc in (255, -signal.SIGINT, 128 + signal.SIGINT):
-        _fail_submission(
-            kind="fork_repeat_submission_unknown",
-            message=(
-                "link ended before a complete fork-repeat receipt arrived; "
-                f"outcome unknown. {recovery}"
-            ),
-            exit_code=EXIT_UNREACHABLE if rc == 255 else 130,
-            json_=json_,
-        )
-    _fail_submission(
-        kind="submission_protocol",
-        message=(
-            f"head returned no complete {FORK_REPEAT_SCHEMA} receipt (exit {rc}); "
-            f"inspect `dt ps -w` for prefix {name_prefix!r}"
-        ),
-        exit_code=1,
-        json_=json_,
-    )
-
-
-def _run_fork_repeat(
-    *,
-    cfg: HeadConfig,
-    old: jobs_mod.JobEntry,
-    source: jobs_mod.JobEntry,
-    spec: RunSpec,
-    build_spec: Callable[[str | None], RunSpec],
-    log: Callable[[str], None],
-    prefix: str,
-    repeat: int,
-    request_id: str | None,
-    command: list[str],
-    reuse_cache: str | None,
-    clone_cache: str | None,
-    cache_env: str,
-    inherit_cache: bool,
-    artifact_manifest: str | None,
-    max_hours: float | None,
-    max_vram_mib: int | None,
-    max_job_memory_mib: int | None,
-    cold_cache_env: str | None,
-    json_: bool,
-) -> None:
-    """Submit or reconcile a durable same-node fork group."""
-    from . import dispatch as dispatch_mod
-
-    entries: list[jobs_mod.JobEntry] = []
-    failure: JsonDict | None = None
-    failure_code = 0
-    group_record: group_mod.GroupRequestRecord | None = None
-    group_terminal_replay = False
-    group_intent_sha256: str | None = None
-    if request_id is not None:
-        group_intent_sha256 = intent_mod.canonical_intent(
-            {
-                "schema": group_mod.GROUP_REQUEST_SCHEMA,
-                "operation": "fork_repeat",
-                "center": cfg.center,
-                "repeat_ref_job_id": old.job_id,
-                "source_job_id": source.job_id,
-                "source_snapshot_sha256": source.snapshot_sha256,
-                "command": command,
-                "name_prefix": prefix,
-                "repeat": repeat,
-                "reuse_cache": reuse_cache,
-                "clone_cache": clone_cache,
-                "cache_env": cache_env,
-                "inherit_cache": inherit_cache,
-                "artifact_manifest": artifact_manifest,
-                "max_hours": max_hours,
-                "max_vram_mib": max_vram_mib,
-                "max_job_memory_mib": max_job_memory_mib,
-            }
-        )
-        try:
-            group_record = group_mod.locked_claim(
-                cfg,
-                request_id,
-                group_intent_sha256,
-                operation="fork_repeat",
-                requested=repeat,
-            )
-            entries = group_mod.load_entries_or_fail(cfg, group_record)
-            if group_record.state == "confirmed":
-                group_terminal_replay = True
-                failure = _group_failure(group_record)
-                failure_code = group_record.exit_code or 0
-        except group_mod.GroupRequestConflict as exc:
-            failure = {
-                "kind": "idempotency_conflict",
-                "message": str(exc),
-                "reasons": {"request_id": request_id},
-                "exit_code": 1,
-            }
-            failure_code = 1
-        except intent_mod.RequestLockError as exc:
-            failure = {
-                "kind": "submission_rejected",
-                "message": (
-                    f"request {request_id!r} was not advanced because its "
-                    f"durable lock could not be acquired: {exc}"
-                ),
-                "reasons": {"request_id": request_id},
-                "exit_code": EXIT_ENV,
-            }
-            failure_code = EXIT_ENV
-        except (
-            OSError,
-            ValueError,
-            intent_mod.RequestRecordError,
-            group_mod.GroupRequestError,
-        ) as exc:
-            failure = {
-                "kind": "submission_unknown",
-                "message": (
-                    f"request {request_id!r} has unreadable durable group "
-                    "state; refusing to submit any additional jobs"
-                ),
-                "reasons": {"request_id": request_id, "detail": str(exc)},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
-    agent_started: bool | None = None
-    agent_checked = False
-
-    def ensure_agent(repeat_entry: jobs_mod.JobEntry) -> None:
-        nonlocal agent_checked, agent_started
-        if repeat_entry.status != "queued" or agent_checked:
-            return
-        from . import agent as agent_mod
-
-        agent_checked = True
-        if agent_mod.alive_pid(cfg) is None:
-            agent_started = agent_mod.start_detached(cfg)
-
-    for existing_entry in entries:
-        ensure_agent(existing_entry)
-        if not json_:
-            print(existing_entry.job_id, flush=True)
-
-    if group_terminal_replay and entries:
-        if request_id is None:
-            _fail_submission(
-                kind="submission_unknown",
-                message="terminal fork receipt has no durable request identity",
-                exit_code=EXIT_UNREACHABLE,
-                json_=json_,
-            )
-        try:
-            replay_spec = build_spec(f"{prefix}-001")
-            replay_spec.request_id = group_mod.item_request_id(request_id, 1)
-            verified_entry = dispatch_mod.submit_fork(
-                cfg,
-                source,
-                replay_spec,
-                log,
-                force_queue=False,
-                force_queue_label="fork repeat",
-            )
-            if verified_entry.job_id != entries[0].job_id:
-                raise group_mod.GroupRequestError(
-                    "terminal group replay resolved to a different first job"
-                )
-        except FailedBeforeStart as exc:
-            if exc.entry.job_id != entries[0].job_id:
-                failure = {
-                    "kind": "submission_unknown",
-                    "message": (
-                        f"request {request_id!r} terminal receipt resolved "
-                        "to a different failed first job"
-                    ),
-                    "reasons": {"request_id": request_id},
-                    "exit_code": EXIT_UNREACHABLE,
-                }
-                failure_code = EXIT_UNREACHABLE
-                group_terminal_replay = False
-        except (
-            NoReachableNode,
-            NoCapacity,
-            DispatchError,
-            ConfigError,
-        ) as exc:
-            failure, failure_code, _failed_entry = _batch_error(
-                exc,
-                item_label="fork repeat replay",
-            )
-            group_terminal_replay = False
-        except (
-            OSError,
-            ValueError,
-            intent_mod.RequestRecordError,
-            group_mod.GroupRequestError,
-        ) as exc:
-            failure = {
-                "kind": "submission_unknown",
-                "message": (
-                    f"request {request_id!r} terminal receipt could not be "
-                    "verified without risking a duplicate"
-                ),
-                "reasons": {"request_id": request_id, "detail": str(exc)},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
-            group_terminal_replay = False
-
-    for index in range(len(entries) + 1, repeat + 1):
-        if failure is not None or group_terminal_replay:
-            break
-        item_spec = spec if index == 1 else build_spec(f"{prefix}-{index:03d}")
-        item_spec.request_id = (
-            group_mod.item_request_id(request_id, index)
-            if request_id is not None
-            else None
-        )
-
-        def item_log(message: str, *, item: int = index) -> None:
-            err.print(f"[dim]fork repeat {item}/{repeat}: {escape(message)}[/dim]")
-
-        try:
-            entry = dispatch_mod.submit_fork(
-                cfg,
-                source,
-                item_spec,
-                item_log,
-                force_queue=index > 1,
-                force_queue_label="fork repeat",
-            )
-            if request_id is not None and group_intent_sha256 is not None:
-                group_record = group_mod.locked_record_job(
-                    cfg,
-                    request_id,
-                    intent_sha256=group_intent_sha256,
-                    index=index,
-                    job_id=entry.job_id,
-                )
-        except KeyboardInterrupt:
-            confirmed = len(entries)
-            noun = "registration" if confirmed == 1 else "registrations"
-            failure = {
-                "kind": "fork_repeat_submission_interrupted",
-                "message": (
-                    "fork repeat submission interrupted after "
-                    f"{confirmed} confirmed {noun}; item {index} outcome "
-                    "unknown. Confirmed jobs were not cancelled. "
-                    + (
-                        f"Retry the same command with --request-id "
-                        f"{request_id!r} to reconcile this exact item."
-                        if request_id is not None
-                        else "Do not resubmit blindly; inspect `dt ps -w` "
-                        f"for prefix {prefix!r}."
-                    )
-                ),
-                "reasons": {},
-                "exit_code": 130,
-                "confirmed_submitted": confirmed,
-                "uncertain_repeat_index": index,
-            }
-            failure_code = 130
-            break
-        except (
-            FailedBeforeStart,
-            NoReachableNode,
-            NoCapacity,
-            DispatchError,
-            ConfigError,
-        ) as exc:
-            failure, failure_code, failed_entry = _batch_error(
-                exc,
-                item_label="fork repeat item",
-            )
-            if failed_entry is not None:
-                if request_id is not None and group_intent_sha256 is not None:
-                    try:
-                        group_record = group_mod.locked_record_job(
-                            cfg,
-                            request_id,
-                            intent_sha256=group_intent_sha256,
-                            index=index,
-                            job_id=failed_entry.job_id,
-                        )
-                    except (
-                        OSError,
-                        ValueError,
-                        intent_mod.RequestRecordError,
-                        group_mod.GroupRequestError,
-                    ) as persistence_exc:
-                        failure = {
-                            "kind": "submission_unknown",
-                            "message": (
-                                f"job {failed_entry.job_id} was registered "
-                                f"but request {request_id!r} progress could "
-                                "not be persisted"
-                            ),
-                            "reasons": {
-                                "request_id": request_id,
-                                "job_id": failed_entry.job_id,
-                                "detail": str(persistence_exc),
-                            },
-                            "exit_code": EXIT_UNREACHABLE,
-                        }
-                        failure_code = EXIT_UNREACHABLE
-                entries.append(failed_entry)
-                ensure_agent(failed_entry)
-                if not json_:
-                    print(failed_entry.job_id, flush=True)
-            break
-        except (
-            OSError,
-            ValueError,
-            intent_mod.RequestRecordError,
-            group_mod.GroupRequestError,
-        ) as exc:
-            failure = {
-                "kind": "submission_unknown",
-                "message": (
-                    f"fork repeat item {index} did not produce a complete "
-                    "durable group receipt; retry only with the same "
-                    "request id"
-                ),
-                "reasons": {"request_id": request_id, "detail": str(exc)},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
-            break
-        entries.append(entry)
-        ensure_agent(entry)
-        if not json_:
-            print(entry.job_id, flush=True)
-
-    if (
-        request_id is not None
-        and group_record is not None
-        and group_intent_sha256 is not None
-        and not group_terminal_replay
-    ):
-        uncertain = bool(
-            failure
-            and failure.get("kind")
-            in {
-                "fork_repeat_submission_interrupted",
-                "submission_unknown",
-                "idempotency_conflict",
-            }
-        )
-        try:
-            group_record = group_mod.locked_transition(
-                cfg,
-                request_id,
-                intent_sha256=group_intent_sha256,
-                state="uncertain" if uncertain else "confirmed",
-                exit_code=None if uncertain else failure_code,
-                error_kind=(str(failure["kind"]) if failure is not None else None),
-                error_message=(
-                    str(failure.get("message")) if failure is not None else None
-                ),
-            )
-        except (
-            OSError,
-            ValueError,
-            intent_mod.RequestRecordError,
-            group_mod.GroupRequestError,
-        ) as exc:
-            failure = {
-                "kind": "submission_unknown",
-                "message": (
-                    f"request {request_id!r} did not produce a durable final "
-                    "group receipt; retry only with the same request id"
-                ),
-                "reasons": {"request_id": request_id, "detail": str(exc)},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
-
-    cache_mode = (
-        "inherited"
-        if inherit_cache
-        else "isolated_clone"
-        if clone_cache
-        else "explicit"
-        if reuse_cache
-        else "job_local_cold"
-        if cold_cache_env
-        else "none"
-    )
-    receipt = _fork_repeat_receipt(
-        old=old,
-        source=source,
-        name_prefix=prefix,
-        requested=repeat,
-        entries=entries,
-        display_refs=_display_refs_for_entries(cfg, entries),
-        cache_mode=cache_mode,
-        cold_cache_env=cold_cache_env,
-        agent_started=agent_started,
-        error=failure,
-        exit_code=failure_code,
-        request_id=request_id,
-        idempotent_replay=group_terminal_replay,
-    )
-    if json_:
-        print(json.dumps(receipt))
-    else:
-        _emit_fork_repeat_human(receipt, emit_job_ids=False)
-    if failure_code:
-        raise typer.Exit(failure_code)
-    return
 
 
 def fork(
@@ -11626,7 +11086,8 @@ def fork(
         if repeat > 1:
             prefix = jobs_mod.sanitize_name((name or f"{ref}-fork").strip())
             raise typer.Exit(
-                _forward_laptop_fork_repeat(
+                fork_repeat_mod.forward_laptop(
+                    _fork_repeat_host(),
                     route.head,
                     argv,
                     ref=ref,
@@ -11768,7 +11229,8 @@ def fork(
         err.print(f"[dim]{escape(msg)}[/dim]")
 
     if repeat > 1:
-        _run_fork_repeat(
+        fork_repeat_mod.run(
+            _fork_repeat_host(),
             cfg=cfg,
             old=old,
             source=source,
@@ -15364,6 +14826,7 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
 
         n_queued = len(jobs_mod.queued_entries(cfg))
         agent_ok = agent_mod.alive_pid(cfg) is not None
+        relay_status = relay_agent_status(cfg)
         for r in rows:  # agent runs on the head itself -> its local node row
             if r["node"] in {n.name for n in cfg.nodes if n.local}:
                 r["checks"]["agent"] = (
@@ -15371,6 +14834,8 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
                     if agent_ok
                     else (f"off ({n_queued} queued!)" if n_queued else "off")
                 )
+                if relay_status is not None:
+                    r["checks"]["relay"] = relay_status
     else:
 
         def check_head(item: tuple[str, str]) -> JsonDict:
@@ -15461,7 +14926,20 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
     nontransport_ssh_failure = any(
         row.get("unreachable") is False for row in ssh_failures
     )
-    hard_fail = bool(ssh_failures) or dependency_failure
+    relay_failure = any(
+        str(row["checks"].get("relay", "")).startswith("fail") for row in rows
+    )
+    lan_stale_nodes = [
+        str(row["node"])
+        for row in rows
+        if str(row["checks"].get("lan", "")).startswith("stale")
+    ]
+    hard_fail = (
+        bool(ssh_failures)
+        or dependency_failure
+        or relay_failure
+        or bool(lan_stale_nodes)
+    )
     if json_:
         print(json.dumps(rows))
     else:
@@ -15484,6 +14962,29 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
                 for index, node_name in enumerate(slow_nodes):
                     label = "next:" if index == 0 else "     "
                     err.print(f"[dim]{label} dt seed {escape(node_name)} --plan[/dim]")
+            if relay_failure:
+                relay_detail = next(
+                    str(row["checks"]["relay"])
+                    for row in rows
+                    if str(row["checks"].get("relay", "")).startswith("fail")
+                )
+                err.print(f"[red]relay agent {escape(relay_detail)}[/red]")
+                err.print(
+                    "[dim]next: start a persistent ssh-agent holding the site "
+                    "node keys (docs/configuration.md, relay authentication)"
+                    "[/dim]"
+                )
+            if lan_stale_nodes:
+                noun = "node" if len(lan_stale_nodes) == 1 else "nodes"
+                err.print(
+                    f"[red]stale lan_address on {len(lan_stale_nodes)} {noun}[/red]"
+                )
+                for index, node_name in enumerate(lan_stale_nodes):
+                    label = "next:" if index == 0 else "     "
+                    err.print(
+                        f"[dim]{label} update nodes[].lan_address for "
+                        f"{escape(node_name)} in the head configuration[/dim]"
+                    )
     if not hard_fail:
         raise typer.Exit(0)
     if unreachable_failure and not dependency_failure and not nontransport_ssh_failure:

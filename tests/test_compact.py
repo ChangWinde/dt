@@ -135,6 +135,38 @@ def test_compact_plan_selects_only_exact_old_terminal_jobs(tmp_path, monkeypatch
     assert (root / "outputs" / "model.pt").read_bytes() == b"checkpoint"
 
 
+def test_compact_skips_uncertain_launch(tmp_path, monkeypatch):
+    from dt.jobs import UNCERTAIN_LAUNCH_PREFIX
+
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    # A failed record whose remote launch was never proven dead may still own
+    # its code tree; compaction must skip it instead of deleting the code.
+    uncertain = _entry(
+        digest,
+        job_id="20260720-1204_uncertain_abcd",
+        status="failed",
+        exit_code=None,
+        reason=f"{UNCERTAIN_LAUNCH_PREFIX}ssh dropped after session start",
+    )
+    save(cfg, uncertain)
+    node_home = tmp_path / "node-home"
+    root = _workdir(node_home, uncertain)
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg,
+        cutoff_ts=100.0,
+        before="1970-01-01",
+        apply=True,
+    )
+
+    assert report.exit_code == 0
+    assert report.payload["eligible_jobs"] == 0
+    assert report.payload["skipped"]["uncertain_launch"] == 1
+    assert (root / "code").is_dir()
+
+
 def test_compact_apply_removes_only_code_and_writes_recovery_receipt(
     tmp_path, monkeypatch
 ):

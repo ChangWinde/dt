@@ -158,9 +158,18 @@ if [ -n "${DT_PROXY:-}" ]; then
            NO_PROXY="localhost,127.0.0.1" no_proxy="localhost,127.0.0.1"
 fi
 
-# A fresh launcher run supersedes any stale cancel sentinel (a previous
-# dispatch attempt whose ssh dropped may have left one behind).
-rm -f "$DT_CANCEL_PATH"
+# A fresh launcher run supersedes a cancel sentinel left by an earlier
+# dispatch attempt (same-request replays reuse this job dir). Only remove a
+# sentinel strictly older than this launch: one racing in now targets this
+# very run and must survive to the next cancelled() checkpoint, otherwise
+# the dispatcher believes the node is clean and fails over to a duplicate.
+DT_CANCEL_STAMP="${DT_CANCEL_PATH}.launch"
+mkdir -p -- "$(dirname -- "$DT_CANCEL_PATH")" 2>/dev/null || true
+: > "$DT_CANCEL_STAMP"
+if [ -e "$DT_CANCEL_PATH" ] && [ "$DT_CANCEL_PATH" -ot "$DT_CANCEL_STAMP" ]; then
+    rm -f "$DT_CANCEL_PATH"
+fi
+rm -f "$DT_CANCEL_STAMP"
 
 cancelled() { [ -e "$DT_CANCEL_PATH" ]; }
 

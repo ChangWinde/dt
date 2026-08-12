@@ -340,8 +340,33 @@ def test_probe_command_preserves_compute_app_failure_and_fails_closed(monkeypatc
         "GPU process query failed: compute process sentinel"
     )
     status = probe_mod.probe_node(Node(name="n1"), mem_threshold_mib=500)
-    assert status.gpus == []
-    assert status.error == "GPU process query failed: compute process sentinel"
+    # A compute-app query failure fails closed: the card exists but its
+    # occupancy is unknown, so it is never advertised as free (no GPU job can
+    # land), while the node stays reachable for CPU-only work.
+    assert status.free_gpus == []
+    assert status.error is None
+    assert status.gpu_inventory_error == (
+        "GPU process query failed: compute process sentinel"
+    )
+
+
+def test_gpu_inventory_failure_still_schedules_cpu_only_jobs():
+    from dt.dispatch import RunSpec, pick_candidates
+
+    node = Node(name="n1")
+    broken = probe_mod.NodeStatus(
+        node="n1",
+        gpus=[],
+        system=None,
+        gpu_inventory_error="GPU query failed: nvidia-smi not found",
+    )
+
+    # A GPU job cannot land on a node with no schedulable cards ...
+    assert pick_candidates([broken], [node], RunSpec(name="j", cmd=["x"], gpus=1)) == []
+    # ... but a CPU-only job can, instead of starving forever.
+    assert pick_candidates([broken], [node], RunSpec(name="j", cmd=["x"], gpus=0)) == [
+        node
+    ]
 
 
 def test_bounded_probe_cleans_up_workers_and_temporary_directory(tmp_path):
@@ -439,8 +464,12 @@ def test_probe_node_surfaces_query_failure_instead_of_zero_gpus(monkeypatch):
 
     status = probe_mod.probe_node(Node(name="n1"), mem_threshold_mib=500)
 
+    # A GPU query failure surfaces as a soft inventory error while the node
+    # stays reachable with parsed system telemetry, so CPU work can still run.
     assert status.gpus == []
-    assert status.error == "GPU query failed: driver unavailable sentinel"
+    assert status.error is None
+    assert status.gpu_inventory_error == "GPU query failed: driver unavailable sentinel"
+    assert status.system is not None
     assert status.unreachable is False
 
 
@@ -483,6 +512,25 @@ def test_probe_node_types_ssh_255_as_unreachable(monkeypatch):
     assert status.gpus == []
     assert status.unreachable is True
     assert status.error == "ssh: connect to host n1: No route to host"
+
+
+def test_local_probe_failure_is_reachable_not_unreachable(monkeypatch):
+    # A local target runs no SSH, so a timeout or a 255 exit is a reachable
+    # probe error and must never be reported as node-unreachable (exit 5).
+    def raise_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired([], 5)
+
+    monkeypatch.setattr(probe_mod, "run_on", raise_timeout)
+    status = probe_mod.probe_node(Node(name="local", local=True), mem_threshold_mib=500)
+    assert status.unreachable is False
+
+    monkeypatch.setattr(
+        probe_mod,
+        "run_on",
+        lambda *a, **k: subprocess.CompletedProcess([], 255, "", "boom"),
+    )
+    status = probe_mod.probe_node(Node(name="local", local=True), mem_threshold_mib=500)
+    assert status.unreachable is False
 
 
 def test_probe_node_types_remote_probe_timeout_as_reachable_error(monkeypatch):

@@ -5,7 +5,9 @@ from dt.jobs import (
     JobEntry,
     compact_job_refs,
     find,
+    load,
     new_job_id,
+    remove_record,
     resolve_ref,
     sanitize_name,
     save,
@@ -59,6 +61,42 @@ def test_compress_indices():
     assert compress_indices([0, 1, 2, 3, 5, 7]) == "0-3 5 7"
     assert compress_indices([4]) == "4"
     assert compress_indices([1, 2]) == "1-2"
+
+
+def test_remove_record_fsyncs_registry_directory(tmp_path, monkeypatch):
+    import dt.jobs as jobs_mod
+
+    cfg = HeadConfig(
+        center="center-a",
+        nodes=[],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entry = JobEntry(
+        job_id="20260726-0900_doomed_24a3",
+        name="doomed",
+        center="center-a",
+        project="p",
+        node="n",
+        node_local=False,
+        job_dir="jobs/doomed",
+        session="doomed",
+        cmd="true",
+    )
+    save(cfg, entry)
+    assert load(cfg, entry.job_id) is not None
+
+    synced: list[str] = []
+    monkeypatch.setattr(jobs_mod, "fsync_dir", lambda path: synced.append(str(path)))
+
+    remove_record(cfg, entry.job_id)
+
+    # The deletion must be made durable by syncing the registry directory so a
+    # crash cannot resurrect a row whose remote data is already gone.
+    assert load(cfg, entry.job_id) is None
+    assert str(cfg.registry_dir()) in synced
 
 
 def test_compact_job_refs_expand_collisions_and_resolver_fails_closed(tmp_path):

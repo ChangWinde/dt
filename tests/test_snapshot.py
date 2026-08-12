@@ -4,6 +4,7 @@ import subprocess
 import pytest
 
 import dt.dispatch as dispatch
+import dt.git_provenance as git_provenance
 from dt.snapshot_hash import tree_sha256
 
 
@@ -114,13 +115,40 @@ def test_git_cleanup_reaps_before_restoring_repeated_interrupt(monkeypatch):
 
     process = Process()
     monkeypatch.setattr(
-        dispatch.os,
+        git_provenance.os,
         "killpg",
         lambda pid, sig: signals.append((pid, sig)),
     )
 
-    assert dispatch._stop_git_process(process) is True
+    assert git_provenance.stop_git_process(process) is True
     assert signals == [
-        (4321, dispatch.signal.SIGTERM),
-        (4321, dispatch.signal.SIGKILL),
+        (4321, git_provenance.signal.SIGTERM),
+        (4321, git_provenance.signal.SIGKILL),
     ]
+
+
+def test_stop_git_process_survives_eperm_on_zombie_group(monkeypatch):
+    """macOS raises EPERM for zombie process groups; reap instead of crashing."""
+
+    class Process:
+        pid = 4321
+
+        def __init__(self):
+            self.waited = False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            self.waited = True
+            return 0
+
+    process = Process()
+
+    def deny(pid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(git_provenance.os, "killpg", deny)
+
+    assert git_provenance.stop_git_process(process) is False
+    assert process.waited

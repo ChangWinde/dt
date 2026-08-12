@@ -147,16 +147,28 @@ def selection_digest(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _finite_number(value: object) -> bool:
+    """True only for a finite real number.
+
+    Rejects bool and, critically, an int so large that ``float(value)`` raises
+    ``OverflowError`` (a caller-supplied cursor or a malformed head row can carry
+    ``10**400``; the overflow must become an invalid-argument, not a 500).
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
 def _row_timestamp(row: JsonDict, field: str) -> float:
     candidate = row.get(field)
-    if not isinstance(candidate, (int, float)) or isinstance(candidate, bool):
+    if not _finite_number(candidate):
         candidate = row.get("created_at")
-    if (
-        not isinstance(candidate, (int, float))
-        or isinstance(candidate, bool)
-        or not math.isfinite(float(candidate))
-    ):
+    if not _finite_number(candidate):
         return 0.0
+    assert isinstance(candidate, (int, float))  # narrowed by _finite_number
     return float(candidate)
 
 
@@ -209,14 +221,13 @@ def _decode_cursor(
         or cursor_digest != digest
         or not isinstance(cursor_digest, str)
         or _DIGEST_RE.fullmatch(cursor_digest) is None
-        or not isinstance(timestamp, (int, float))
-        or isinstance(timestamp, bool)
-        or not math.isfinite(float(timestamp))
+        or not _finite_number(timestamp)
         or not isinstance(job_id, str)
         or not job_id
         or len(job_id) > 512
     ):
         raise QueryError("ps cursor does not match this query")
+    assert isinstance(timestamp, (int, float))  # narrowed by _finite_number
     return float(timestamp), job_id
 
 

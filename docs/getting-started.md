@@ -173,8 +173,10 @@ job_id=$(dt run -n first-run -- python train.py | tail -1)
 dt wait "$job_id"
 ```
 
-`dt wait` returns the experiment process exit code. It prints bounded failure
-evidence when the result is nonzero.
+`dt wait` returns the experiment process exit code, clamped to the 0-125 range
+so it never collides with the shell's signal or usage codes; the untruncated
+value is preserved in the `--json` result. It prints bounded failure evidence
+when the result is nonzero.
 
 ## Inspect and recover
 

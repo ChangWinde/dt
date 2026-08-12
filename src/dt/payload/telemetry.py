@@ -556,7 +556,17 @@ def _trip_resource_guard(
         "root_pid": root_pid,
         "term_descendants": len(descendants),
     }
-    _write_json_atomic(output, record)
+    # Evidence is best-effort: a full or unwritable disk must never disarm the
+    # guard. Persisting must not stand between a detected violation and the
+    # termination that actually enforces the limit.
+    try:
+        _write_json_atomic(output, record)
+    except OSError as exc:
+        print(
+            f"[telemetry] resource guard could not persist evidence: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
     if kind == "max_vram_mib":
         subject = f"GPU {violation.get('gpu_index')} memory"
     else:

@@ -19,7 +19,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import HeadConfig, Node
-from .jobs import JobEntry, RegistryDamage, job_lock, list_all, load
+from .jobs import (
+    JobEntry,
+    RegistryDamage,
+    is_uncertain_launch,
+    job_lock,
+    list_all,
+    load,
+)
 from .layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
@@ -134,6 +141,11 @@ def preflight(cfg: HeadConfig, cutoff_ts: float) -> CompactPreflight:
 
     for entry in sorted(entries, key=lambda item: (item.created_at, item.job_id)):
         if entry.created_at >= cutoff_ts or entry.status not in _TERMINAL_STATUSES:
+            continue
+        if is_uncertain_launch(entry):
+            # A record whose remote launch was never proven dead may still own
+            # the code tree; never prune it until a verified kill confirms death.
+            skipped["uncertain_launch"] += 1
             continue
         if _SAFE_JOB_ID.fullmatch(entry.job_id) is None:
             skipped["unsafe_job_id"] += 1
@@ -354,6 +366,7 @@ def _remote_rows(
                         apply
                         and (
                             current.status not in _TERMINAL_STATUSES
+                            or is_uncertain_launch(current)
                             or current.created_at >= cutoff_ts
                             or any(
                                 getattr(current, field)

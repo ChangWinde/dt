@@ -2,8 +2,10 @@
 and rsync retries must resume."""
 
 import json
+import math
 import shutil
 import subprocess
+import time
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -198,6 +200,75 @@ def test_refresh_status_preserves_typed_scientific_result(tmp_path, monkeypatch)
     assert refreshed.exit_code == 0
     assert refreshed.result_state == "scientific_reject"
     assert jobs.effective_result_state(refreshed) == "scientific_reject"
+
+
+def _refresh_with_probe_output(tmp_path, monkeypatch, stdout, **entry_kwargs):
+    cfg = _cfg(tmp_path)
+    fields = {
+        "job_id": "jid",
+        "name": "job",
+        "center": "test",
+        "project": "p",
+        "node": "n1",
+        "node_local": False,
+        "job_dir": "dt/jobs/jid",
+        "session": "dt_jid",
+        "cmd": "true",
+        "pgid": 1234,
+        "started_at": 90.0,
+    }
+    fields.update(entry_kwargs)
+    entry = JobEntry(**fields)
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout, ""),
+    )
+    return jobs.refresh_status(cfg, entry)
+
+
+def test_refresh_status_rejects_out_of_range_exit_code(tmp_path, monkeypatch):
+    # A managed exit_code file holds a byte in [0, 255]. An out-of-range value
+    # is corrupt evidence: refresh must not raise (it once let save() throw and
+    # took down every dt ps), must not fabricate a finished state.
+    for bad in ("999", "-3", "100000"):
+        refreshed = _refresh_with_probe_output(
+            tmp_path,
+            monkeypatch,
+            f"boot-a\n{jobs.STATUS_MARK}\n{bad}\n100.125\n112.875\n",
+        )
+        assert refreshed.status != "finished", bad
+        assert refreshed.exit_code != int(bad), bad
+
+
+def test_refresh_status_rejects_non_finite_remote_timestamps(tmp_path, monkeypatch):
+    # inf/nan satisfy ">0"/comparison traps; they must not reach save() as a
+    # lifecycle timestamp. A valid exit code still completes the job with a
+    # finite clock.
+    refreshed = _refresh_with_probe_output(
+        tmp_path,
+        monkeypatch,
+        f"boot-a\n{jobs.STATUS_MARK}\n0\ninf\nnan\n",
+    )
+    assert refreshed.status == "finished"
+    assert refreshed.exit_code == 0
+    assert refreshed.started_at == 90.0  # unchanged; the inf was rejected
+    assert refreshed.finished_at is not None and math.isfinite(refreshed.finished_at)
+
+
+def test_refresh_status_anchors_on_the_first_status_marker(tmp_path, monkeypatch):
+    # A job that writes a second marker plus fake fields into its own state file
+    # must not move the parse anchor. The real fields follow the FIRST marker
+    # (emitted right after the trusted /proc boot_id line).
+    injected = (
+        f"boot-a\n{jobs.STATUS_MARK}\n0\n100.125\n112.875\nsuccess\n"
+        f"{jobs.STATUS_MARK}\n7\n555.0\n666.0\nscientific_reject\n"
+    )
+    refreshed = _refresh_with_probe_output(tmp_path, monkeypatch, injected)
+    assert refreshed.exit_code == 0
+    assert refreshed.started_at == 100.125
+    assert refreshed.finished_at == 112.875
+    assert refreshed.result_state == "success"
 
 
 def test_refresh_status_identifies_node_reboot_before_pid_reuse(tmp_path, monkeypatch):
@@ -601,6 +672,171 @@ def test_launch_drop_stops_failover_when_orphan_cancel_is_unverified(
         "launch dropped ([n1] connection dropped); "
         "cancellation unverified: ssh: No route to host"
     )
+
+
+def test_unknown_launcher_exit_cancels_orphan_then_fails_over(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    cancelled: list[str] = []
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda node, job_dir, session: cancelled.append(node.name),
+    )
+
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+        if node.name == "n1":
+            return 255, "ssh: connection reset during launch"
+        return 0, {"gpus": [0], "pgid": 42}
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+
+    entry, reasons, fatal, _failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda message: None,
+    )
+
+    assert entry is not None and entry.node == "n2"
+    assert not fatal
+    assert cancelled == ["n1"]
+    assert "cancelled on node" in reasons["n1"]
+
+
+def test_unknown_launcher_exit_stops_failover_when_cancel_unverified(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    launched: list[str] = []
+
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+        launched.append(node.name)
+        return 255, "ssh: connection reset during launch"
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda node, job_dir, session: "ssh: No route to host",
+    )
+
+    entry, reasons, fatal, failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda message: None,
+    )
+
+    assert entry is None
+    assert fatal
+    assert launched == ["n1"]
+    assert "cancel-unverified" in failure_kinds
+    assert "cancellation unverified: ssh: No route to host" in reasons["n1"]
+
+
+def test_zero_exit_with_unparsable_output_cancels_before_failover(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    cancelled: list[str] = []
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda node, job_dir, session: cancelled.append(node.name),
+    )
+
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+        if node.name == "n1":
+            return 0, "launcher stdout was not json"
+        return 0, {"gpus": [0], "pgid": 42}
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+
+    entry, reasons, fatal, _failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda message: None,
+    )
+
+    assert entry is not None and entry.node == "n2"
+    assert cancelled == ["n1"]
+    assert "cancelled on node" in reasons["n1"]
+
+
+def test_invalid_pgid_cancels_running_session_before_abort(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    cancelled: list[str] = []
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda node, job_dir, session: cancelled.append(node.name),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "launch",
+        lambda *args, **kwargs: (0, {"gpus": [0], "pgid": None}),
+    )
+
+    entry, reasons, fatal, failure_kinds = _try_nodes(
+        cfg,
+        [cfg.nodes[0]],
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda message: None,
+    )
+
+    assert entry is None
+    assert fatal
+    assert cancelled == ["n1"]
+    assert "no valid pgid; cancelled on node" in reasons["n1"]
+
+
+def test_retryable_launcher_exit_fails_over_without_cancel(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda *args, **kwargs: pytest.fail(
+            "preflight refusals must not trigger orphan cancellation"
+        ),
+    )
+
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+        if node.name == "n1":
+            return 10, "busy"
+        return 0, {"gpus": [0], "pgid": 42}
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+
+    entry, reasons, _fatal, _failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda message: None,
+    )
+
+    assert entry is not None and entry.node == "n2"
+    assert reasons["n1"] == "busy: busy"
 
 
 def test_cancel_orphan_requires_verified_death_without_a_known_pgid(
@@ -4280,6 +4516,55 @@ def test_termination_probe_does_not_signal_reused_process_group(tmp_path):
     finally:
         unrelated.terminate()
         unrelated.wait(timeout=2)
+
+
+def test_termination_probe_signals_orphans_after_leader_death(tmp_path):
+    """A dead leader cannot be a reused group: cwd-owned orphans get killed."""
+    job_dir = tmp_path / "jobs" / "orphan-job"
+    job_dir.mkdir(parents=True)
+    (job_dir / "process_start_ticks").write_text("1\n")
+    leader = subprocess.Popen(
+        [
+            "bash",
+            "-c",
+            'cd "$0" && { sleep 30 >/dev/null 2>&1 & } && printf \'%s\\n\' "$!"',
+            str(job_dir),
+        ],
+        start_new_session=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert leader.stdout is not None
+    orphan_pid = int(leader.stdout.readline().strip())
+    leader_pid = leader.pid
+    assert leader.wait(timeout=5) == 0
+    assert Path(f"/proc/{orphan_pid}").exists()
+
+    try:
+        command = lifecycle.termination_probe(
+            str(job_dir), leader_pid, "TERM", job_id="orphan-job"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        ) == ("DEAD", None)
+        deadline = time.monotonic() + 2
+        while Path(f"/proc/{orphan_pid}").exists():
+            assert time.monotonic() < deadline, "orphan survived the probe"
+            time.sleep(0.05)
+    finally:
+        subprocess.run(
+            ["kill", "-9", str(orphan_pid)],
+            capture_output=True,
+            check=False,
+        )
 
 
 @pytest.mark.parametrize(

@@ -188,6 +188,49 @@ def _read_descriptor_bounded(
     return bytes(payload), after
 
 
+def fsync_dir(path: Path) -> None:
+    """Best-effort fsync of a directory so a rename/unlink survives a crash.
+
+    Durability of a directory entry (a published rename or a completed unlink)
+    requires syncing the directory itself, not just the file. Failures are
+    swallowed: a real EIO here means larger trouble, and this must never add a
+    new crash path to cleanup or publication.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def fsync_tree(root: Path) -> None:
+    """Best-effort recursive fsync of a just-published directory tree.
+
+    Renaming a freshly copied tree into place does not by itself make the file
+    contents durable; sync each regular file and directory so a content-
+    addressed snapshot cannot reference partially written bytes after a crash.
+    """
+    for current, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                descriptor = os.open(os.path.join(current, name), os.O_RDONLY)
+            except OSError:
+                continue
+            try:
+                os.fsync(descriptor)
+            except OSError:
+                pass
+            finally:
+                os.close(descriptor)
+        fsync_dir(Path(current))
+
+
 def atomic_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:
     """Durably replace one private file and fsync its containing directory."""
     ensure_private_directory(path.parent)

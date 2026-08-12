@@ -1,3 +1,4 @@
+import base64
 import json
 
 import pytest
@@ -125,6 +126,34 @@ def test_cursor_is_bound_to_filters_and_rejects_tampering():
             digest=digest,
             order="created_at",
         )
+
+
+def test_cursor_with_overflowing_timestamp_is_rejected_not_a_500():
+    # A well-formed cursor whose t is an int too large for float() must fail as
+    # an invalid argument (QueryError), never escape as OverflowError.
+    rows = [_row("job-a", created_at=1), _row("job-b", created_at=2)]
+    digest = ps_query.selection_digest(
+        status=None, active_only=False, issues_only=False, since=None
+    )
+    payload = json.dumps(
+        {"d": digest, "j": "job-a", "o": "created_at", "t": 10**400, "v": 1},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    hostile = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    with pytest.raises(ps_query.QueryError):
+        ps_query.paginate(
+            rows, limit=1, cursor=hostile, digest=digest, order="created_at"
+        )
+
+
+def test_row_timestamp_tolerates_overflowing_values():
+    # A malformed head row carrying an over-large timestamp must not crash
+    # keyset ordering or --since filtering with OverflowError.
+    rows = [_row("job-a", created_at=1), {"job_id": "huge", "created_at": 10**400}]
+    ordered = ps_query.filter_since(rows, since=0.5)
+    assert any(row.get("job_id") == "job-a" for row in ordered)
+    assert all(row.get("job_id") != "huge" for row in ordered)
 
 
 def test_incremental_query_orders_lifecycle_updates_not_creation():

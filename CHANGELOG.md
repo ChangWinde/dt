@@ -6,6 +6,22 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `dt doctor` now verifies the relay authentication contract for sites using
+  `site-cache-first` or `topology-aware` distribution: a reachable head
+  ssh-agent holding keys is reported as `relay` on the head row, and a
+  configured `nodes[].lan_address` that the node no longer reports fails the
+  check as `lan: stale` instead of surfacing later as a bare transfer
+  `authentication` error.
+
+### Changed
+
+- `dt ps` agent-query flags (`--compact`, `--fields`, `--summary`, `--since`,
+  `--cursor`) now imply `--json` instead of rejecting the invocation, so a
+  bounded agent query can no longer fail for omitting a redundant flag.
+  Explicit `--json` invocations are unchanged.
+
 ## 0.8.0 — 2026-08-11
 
 ### Added

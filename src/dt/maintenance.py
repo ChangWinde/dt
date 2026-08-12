@@ -12,7 +12,15 @@ from datetime import datetime
 from pathlib import PurePosixPath
 
 from .config import HeadConfig
-from .jobs import JobEntry, job_lock, list_all, load, remove_record
+from .jobs import (
+    JobEntry,
+    RegistryDamage,
+    is_uncertain_launch,
+    job_lock,
+    list_all,
+    load,
+    remove_record,
+)
 from .layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
@@ -146,6 +154,10 @@ def clean_job_victims(
         entry
         for entry in entries
         if entry.status in ("finished", "killed", "lost", "failed", "skipped")
+        # An uncertain launch has no proven-dead remote side and no pgid; never
+        # delete its capsule automatically or the only record of a live job is
+        # lost. It is cleaned only through an explicit, verified `dt kill`.
+        and not is_uncertain_launch(entry)
         and entry.finished_at is not None
         and entry.finished_at < cutoff_ts
         and (projects is None or entry.project in projects)
@@ -162,6 +174,7 @@ def _still_cleanable(
     """Revalidate one victim and every live reference while its lock is held."""
     if (
         entry.status not in {"finished", "killed", "lost", "failed", "skipped"}
+        or is_uncertain_launch(entry)
         or entry.finished_at is None
         or entry.finished_at >= cutoff_ts
         or (projects is not None and entry.project not in projects)
@@ -226,9 +239,17 @@ def _remove_unreferenced_snapshots(
         return
     removed_digests: set[str] = set()
     with lock(cfg):
+        damage: list[RegistryDamage] = []
+        live_entries = list_all(cfg, damage=damage)
+        if damage:
+            # An unreadable registry row may still reference a victim digest.
+            # With an incomplete `referenced` set we cannot prove a snapshot is
+            # unreferenced, so fail closed: keep every snapshot this cycle rather
+            # than delete a live job's only recovery source.
+            return
         referenced = {
             entry.snapshot_sha256
-            for entry in list_all(cfg)
+            for entry in live_entries
             if entry.snapshot_sha256
             and re.fullmatch(r"[0-9a-f]{64}", entry.snapshot_sha256)
         }

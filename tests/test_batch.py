@@ -466,6 +466,90 @@ def test_batch_partial_failure_keeps_registered_jobs_and_stops(
     assert payload["exit_code"] == cli.EXIT_ENV
 
 
+def test_batch_uncertain_launch_leaves_group_unresolved(tmp_path, monkeypatch):
+    """An unverified orphan cancel must not finalize the group as confirmed."""
+    from dt import jobs as jobs_mod
+    from dt import submission_group as group_mod
+    from dt import submission_intent as intent_mod
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    def confirm_item_intent(spec, entry):
+        # Real submissions persist a confirmed per-item receipt; group
+        # progress recording requires it.
+        record = intent_mod.load(cfg, spec.request_id)
+        if record is None:
+            canonical = intent_mod.canonical_intent({"cmd": spec.cmd})
+            record = intent_mod.create(
+                spec.request_id,
+                canonical,
+                entry.job_id,
+            )
+        record = intent_mod.transition(record, "confirmed")
+        intent_mod.save(cfg, record)
+
+    def fake_submit(cfg_, spec, cwd, log, no_queue=False):
+        entry = _entry(spec, index=1, status="running")
+        confirm_item_intent(spec, entry)
+        return entry
+
+    def uncertain_second(
+        cfg_,
+        source,
+        spec,
+        log,
+        no_queue=False,
+        force_queue=False,
+        force_queue_label=None,
+    ):
+        failed = _entry(spec, index=2, status="failed")
+        failed.reason = (
+            f"{jobs_mod.UNCERTAIN_LAUNCH_PREFIX}launch dropped; "
+            "cancellation unverified: ssh: No route to host"
+        )
+        # Real submissions persist the per-item receipt as "uncertain" on
+        # this path (see dispatch reconcile/finalization).
+        canonical = intent_mod.canonical_intent({"cmd": spec.cmd})
+        record = intent_mod.create(spec.request_id, canonical, failed.job_id)
+        record = intent_mod.transition(
+            record,
+            "uncertain",
+            error_kind="launch_outcome_unknown",
+            error_message=failed.reason,
+        )
+        intent_mod.save(cfg, record)
+        raise dispatch.FailedBeforeStart(failed)
+
+    monkeypatch.setattr(cli, "submit", fake_submit)
+    monkeypatch.setattr(dispatch, "submit_fork", uncertain_second)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "batch",
+            "n1",
+            "-p",
+            "p",
+            "--require-disk-gib",
+            "80",
+            "--request-id",
+            "req-uncertain-1",
+            "--json",
+            "python first.py",
+            "python second.py",
+            "python never.py",
+        ],
+    )
+
+    payload = json.loads(result.stdout)
+    assert payload["error"]["kind"] == "uncertain_launch"
+    assert [row["status"] for row in payload["jobs"]] == ["running", "failed"]
+    record = group_mod.load(cfg, "req-uncertain-1")
+    assert record is not None
+    assert record.state == "uncertain"
+
+
 def test_batch_artifact_failure_emits_batch_receipt_without_submitting(
     tmp_path,
     monkeypatch,

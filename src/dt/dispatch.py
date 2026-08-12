@@ -17,10 +17,8 @@ import math
 import os
 import posixpath
 import re
-import selectors
 import shlex
 import shutil
-import signal
 import stat
 import subprocess
 import tempfile
@@ -70,6 +68,7 @@ from .jobs import (
     sanitize_name,
     save,
 )
+from . import git_provenance as git_provenance_mod
 from . import payload_hash as payload_hash_mod
 from . import snapshot_hash as snapshot_hash_mod
 from .payload_hash import (
@@ -83,6 +82,8 @@ from .private_state import (
     PrivateStateError,
     atomic_write,
     ensure_private_directory,
+    fsync_dir,
+    fsync_tree,
     private_lock,
     read_bounded,
 )
@@ -108,7 +109,6 @@ GPU_PULSE_MEMORY_MIB = 512
 SNAPSHOT_METADATA_MAX_BYTES = 64 * 1024
 LINKDEST_STATE_MAX_BYTES = 4 * 1024 * 1024
 MAX_GIT_DIFF_BYTES = 4 * 1024 * 1024
-GIT_QUERY_TIMEOUT_S = 20.0
 # Root-anchored (leading /): project artifact dirs that may legitimately
 # collide with package subpaths deeper in the tree (omnistack/data is a
 # Python module; an unanchored "data/" would silently drop it from the
@@ -1103,6 +1103,27 @@ def reconcile_submission_request(
 # (strict FIFO only protects capacity waits from starvation).
 _JOB_SPECIFIC = ("path-missing", "disk-full", "node-unfit", "cache-missing")
 _TERMINAL_JOB_STATUSES = frozenset({"finished", "killed", "lost", "failed", "skipped"})
+# Mirror agent.LOST_RECHECK_S: a job seen "lost" can still recover to
+# running/finished within this window when a late exit marker appears.
+LOST_RECOVERY_WINDOW_S = 5 * 60
+
+
+def _dependency_settled(entry: JobEntry, now: float | None = None) -> bool:
+    """Whether a predecessor's terminal state is safe to act on irreversibly.
+
+    A ``lost`` predecessor inside its recovery window is not yet settled: it can
+    recover to a success. Acting on it early would permanently skip an
+    after_success/after_result dependent or release an after_complete dependent
+    against an outcome that then changes. Treat it as pending until the window
+    closes, matching the agent's own recheck window.
+    """
+    if entry.status not in _TERMINAL_JOB_STATUSES:
+        return False
+    if entry.status == "lost" and entry.finished_at is not None:
+        elapsed = (time.time() if now is None else now) - entry.finished_at
+        if elapsed <= LOST_RECOVERY_WINDOW_S:
+            return False
+    return True
 
 
 def _job_succeeded(entry: JobEntry) -> bool:
@@ -1606,135 +1627,14 @@ def resolve_project(
     )
 
 
-def _stop_git_process(process: subprocess.Popen[bytes]) -> bool:
-    """Reap git and any configured filter process without leaking children."""
-    interrupted = False
-    if process.poll() is not None:
-        return interrupted
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        while True:
-            try:
-                process.wait()
-                return interrupted
-            except KeyboardInterrupt:
-                interrupted = True
-    try:
-        process.wait(timeout=0.5)
-        return interrupted
-    except KeyboardInterrupt:
-        interrupted = True
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-    while True:
-        try:
-            process.wait()
-            return interrupted
-        except KeyboardInterrupt:
-            interrupted = True
-            continue
-
-
-def _git_capture_bounded(
-    project_dir: Path,
-    args: tuple[str, ...],
-    *,
-    max_bytes: int,
-    timeout: float = GIT_QUERY_TIMEOUT_S,
-) -> tuple[int, str, bool]:
-    """Capture at most ``max_bytes`` from one read-only git query."""
-    process = subprocess.Popen(
-        ["git", "-C", str(project_dir), *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    assert process.stdout is not None
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ)
-    payload = bytearray()
-    deadline = time.monotonic() + timeout
-    exceeded = False
-    try:
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(process.args, timeout)
-            events = selector.select(remaining)
-            if not events:
-                raise subprocess.TimeoutExpired(process.args, timeout)
-            block = os.read(
-                process.stdout.fileno(),
-                min(64 * 1024, max_bytes + 1 - len(payload)),
-            )
-            if not block:
-                selector.unregister(process.stdout)
-                break
-            payload.extend(block)
-            if len(payload) > max_bytes:
-                exceeded = True
-                del payload[max_bytes:]
-                if _stop_git_process(process):
-                    raise KeyboardInterrupt
-                break
-        if not exceeded:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(process.args, timeout)
-            process.wait(timeout=remaining)
-    except BaseException as exc:
-        interrupted = _stop_git_process(process)
-        if interrupted and not isinstance(exc, KeyboardInterrupt):
-            raise KeyboardInterrupt from exc
-        raise
-    finally:
-        selector.close()
-        process.stdout.close()
-    return process.returncode or 0, payload.decode("utf-8", errors="replace"), exceeded
-
-
 def git_info(project_dir: Path) -> tuple[str | None, bool, str | None]:
-    """Return bounded Git provenance; the snapshot remains authoritative."""
-    try:
-        sha_rc, sha_text, sha_exceeded = _git_capture_bounded(
-            project_dir,
-            ("rev-parse", "HEAD"),
-            max_bytes=256,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None, False, None
-    sha = sha_text.strip()
-    if sha_rc != 0 or sha_exceeded or re.fullmatch(r"[0-9a-fA-F]{7,64}", sha) is None:
-        return None, False, None
-    try:
-        status_rc, status_text, status_exceeded = _git_capture_bounded(
-            project_dir,
-            ("status", "--porcelain", "--untracked-files=normal"),
-            max_bytes=0,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        # Once HEAD is known, inability to prove cleanliness must not be
-        # reported as a clean tree.
-        return sha, True, None
-    if status_rc != 0 and not status_exceeded:
-        return sha, True, None
-    dirty = status_exceeded or bool(status_text)
-    if not dirty:
-        return sha, False, None
-    try:
-        diff_rc, diff, diff_exceeded = _git_capture_bounded(
-            project_dir,
-            ("diff", "--no-ext-diff", "--no-textconv", "HEAD", "--"),
-            max_bytes=MAX_GIT_DIFF_BYTES,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return sha, True, None
-    return sha, True, diff if diff_rc == 0 and not diff_exceeded else None
+    """Return bounded Git provenance; the snapshot remains authoritative.
+
+    Delegates to :mod:`dt.git_provenance` -- the extracted, interrupt- and
+    EPERM-safe implementation. ``MAX_GIT_DIFF_BYTES`` stays a dispatch-level
+    knob so submit-time policy (and its tests) keep one patch point.
+    """
+    return git_provenance_mod.git_info(project_dir, max_diff_bytes=MAX_GIT_DIFF_BYTES)
 
 
 def pin_is_busy(statuses: list[NodeStatus], spec: RunSpec) -> bool:
@@ -2004,6 +1904,12 @@ def _commit_snapshot_dir(
             )
         )
         os.replace(temp_root, final_root)
+        # Make the "immutable" snapshot durable before any job record can
+        # reference it: sync the published tree contents and the rename itself
+        # so a crash cannot leave a registry row pointing at a missing or
+        # partially written source.
+        fsync_tree(final_root)
+        fsync_dir(cfg.snapshots_dir())
         stored = StoredSnapshot(digest, final_code)
 
     state = _load_snapshot_store_state(cfg)
@@ -2666,9 +2572,16 @@ def snapshot(
                 log=log,
             )
             if proc.returncode != 0:
-                raise DispatchError(
-                    f"code snapshot to {node.name} failed: {proc.stderr.strip()}"
-                )
+                detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
+                if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
+                    # A transport-level failure is node-unreachable, not a
+                    # capacity/dispatch error; let _try_nodes fail over.
+                    raise RemoteError(
+                        node.name,
+                        f"code snapshot to {node.name} failed: {detail}",
+                        proc.returncode,
+                    )
+                raise DispatchError(f"code snapshot to {node.name} failed: {detail}")
             _warn_snapshot_size(cfg, proc.stdout, log)
             if observed is None:
                 raise DispatchError(
@@ -2716,9 +2629,14 @@ def snapshot(
             private_destination=True,
         )
         if proc.returncode != 0:
-            raise DispatchError(
-                f"support sync to {node.name} failed: {proc.stderr.strip()}"
-            )
+            detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
+            if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
+                raise RemoteError(
+                    node.name,
+                    f"support sync to {node.name} failed: {detail}",
+                    proc.returncode,
+                )
+            raise DispatchError(f"support sync to {node.name} failed: {detail}")
 
     _remember_snapshot(cfg, project_name, node, job_id)
     return snapshot_sha256
@@ -3134,6 +3052,12 @@ def _try_nodes(
     spec.payload_sha256 = payload_sha256
     reasons: dict[str, str] = {}
     failure_kinds: set[str] = set()
+
+    def cancel_launch_orphan(node: Node, node_job_dir: str) -> str | None:
+        if cfg.layout == ROLE_LAYOUT:
+            return _cancel_orphan(node, node_job_dir, session, layout=cfg.layout)
+        return _cancel_orphan(node, node_job_dir, session)
+
     for node in candidates:
         node_job_dir = job_dir(node) if callable(job_dir) else job_dir
         log(f"snapshot -> {node.name}")
@@ -3165,16 +3089,7 @@ def _try_nodes(
             )
         except RemoteError as e:
             failure_kinds.add("unreachable")
-            cancel_error = (
-                _cancel_orphan(
-                    node,
-                    node_job_dir,
-                    session,
-                    layout=cfg.layout,
-                )
-                if cfg.layout == ROLE_LAYOUT
-                else _cancel_orphan(node, node_job_dir, session)
-            )
+            cancel_error = cancel_launch_orphan(node, node_job_dir)
             if cancel_error is not None:
                 failure_kinds.add("cancel-unverified")
                 reasons[node.name] = (
@@ -3196,8 +3111,21 @@ def _try_nodes(
             gpu_values = raw_gpus if isinstance(raw_gpus, list) else []
             pgid_value = result.get("pgid")
             if not isinstance(pgid_value, (str, int)) or isinstance(pgid_value, bool):
+                # The launcher exited 0, so the tmux session is already
+                # running; abort without a verified cancel and a manual
+                # retry would run the same experiment twice.
                 failure_kinds.add("fatal")
-                reasons[node.name] = "internal: launcher returned no valid pgid"
+                cancel_error = cancel_launch_orphan(node, node_job_dir)
+                if cancel_error is not None:
+                    failure_kinds.add("cancel-unverified")
+                    reasons[node.name] = (
+                        "internal: launcher returned no valid pgid; "
+                        f"cancellation unverified: {cancel_error}"
+                    )
+                else:
+                    reasons[node.name] = (
+                        "internal: launcher returned no valid pgid; cancelled on node"
+                    )
                 return None, reasons, True, failure_kinds
             env_value = result.get("env")
             boot_id_value = result.get("boot_id")
@@ -3273,6 +3201,23 @@ def _try_nodes(
         if code in FATAL:
             failure_kinds.add("fatal")
             return None, reasons, True, failure_kinds
+        if code not in RETRYABLE:
+            # Retryable codes are pre-session preflight refusals. Anything
+            # else (an unknown exit, ssh dying with 255 mid-launch, or exit 0
+            # whose stdout did not parse) may have left the session running;
+            # failing over without a verified cancel starts a duplicate.
+            cancel_error = cancel_launch_orphan(node, node_job_dir)
+            if cancel_error is not None:
+                failure_kinds.add("cancel-unverified")
+                reasons[node.name] = (
+                    f"{reasons[node.name]}; cancellation unverified: {cancel_error}"
+                )
+                log(
+                    f"{node.name} launcher outcome unknown and cancellation "
+                    "is unverified; stopping failover"
+                )
+                return None, reasons, True, failure_kinds
+            reasons[node.name] = f"{reasons[node.name]}; cancelled on node"
         failure_kinds.add("retryable")
         log(f"{node.name} {reason}, trying next node")
     return None, reasons, False, failure_kinds
@@ -3541,15 +3486,14 @@ def _submit_prepared(
     intent_payload.pop("request_id", None)
     intent_payload.update(
         {
+            # The submitted source tree hash and runtime payload hash are the
+            # authoritative code identity. Git sha/dirty/diff are mutable
+            # bookkeeping that flips on a `git commit` even when the working
+            # tree is byte-identical, so they must NOT enter the intent digest
+            # (they would turn a safe retry into a spurious idempotency
+            # conflict). Provenance is still recorded on the job entry.
             "source_snapshot_sha256": source.sha256,
             "runtime_payload_sha256": runtime_sha256,
-            "git_sha": git_sha,
-            "git_dirty": git_dirty,
-            "git_diff_sha256": (
-                hashlib.sha256(git_diff.encode("utf-8")).hexdigest()
-                if git_diff is not None
-                else None
-            ),
             "no_queue": no_queue,
             "force_queue": force_queue,
             "force_queue_label": force_queue_label,
@@ -3964,7 +3908,7 @@ def _submit_prepared_once(
         )
         if (
             predecessor is not None
-            and predecessor.status in _TERMINAL_JOB_STATUSES
+            and _dependency_settled(predecessor)
             and not _job_succeeded(predecessor)
         ):
             result = effective_result_state(predecessor) or predecessor.status
@@ -3987,7 +3931,7 @@ def _submit_prepared_once(
         if no_queue:
             raise ConfigError("after_complete requires queueing")
         predecessor = load(cfg, spec.after_complete)
-        if predecessor is not None and predecessor.status in _TERMINAL_JOB_STATUSES:
+        if predecessor is not None and _dependency_settled(predecessor):
             log(
                 f"dependency {spec.after_complete} already completed as "
                 f"{effective_result_state(predecessor) or predecessor.status}; "
@@ -4002,7 +3946,7 @@ def _submit_prepared_once(
         if no_queue:
             raise ConfigError("after_result requires queueing")
         predecessor = load(cfg, spec.after_result)
-        if predecessor is not None and predecessor.status in _TERMINAL_JOB_STATUSES:
+        if predecessor is not None and _dependency_settled(predecessor):
             result = effective_result_state(predecessor) or predecessor.status
             if result not in spec.after_result_states:
                 expected = ",".join(spec.after_result_states)
@@ -4313,7 +4257,7 @@ def dispatch_queued(
                 entry.__dict__.update(current.__dict__)
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
-            if predecessor.status in {"queued", "running"}:
+            if not _dependency_settled(predecessor):
                 detail = f"dependency {dependency} is {predecessor.status}"
                 reason = f"waiting: {detail}"
                 if current.reason != reason:
@@ -4371,7 +4315,7 @@ def dispatch_queued(
                 entry.__dict__.update(current.__dict__)
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
-            if predecessor.status not in _TERMINAL_JOB_STATUSES:
+            if not _dependency_settled(predecessor):
                 detail = (
                     f"completion dependency {completion_dependency} is "
                     f"{predecessor.status}"
@@ -4408,7 +4352,7 @@ def dispatch_queued(
                 entry.__dict__.update(current.__dict__)
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
-            if predecessor.status not in _TERMINAL_JOB_STATUSES:
+            if not _dependency_settled(predecessor):
                 detail = (
                     f"result dependency {result_dependency} is {predecessor.status}"
                 )

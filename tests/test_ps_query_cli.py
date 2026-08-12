@@ -201,6 +201,25 @@ def test_laptop_query_merges_center_pages_and_scopes_refs(monkeypatch):
     ]
 
 
+def test_ps_agent_query_flags_imply_json(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    cli.jobs_mod.save(cfg, _entry("job-0", created_at=0.0))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    summary = CliRunner().invoke(cli.app, ["ps", "--summary"])
+    compact = CliRunner().invoke(cli.app, ["ps", "--compact", "--limit", "1"])
+
+    assert summary.exit_code == 0, summary.output
+    summary_payload = json.loads(summary.stdout)
+    assert summary_payload["schema_version"] == ps_query.SCHEMA_VERSION
+    assert summary_payload["jobs"] == []
+    assert summary_payload["summary"]["total"] == 1
+    assert compact.exit_code == 0, compact.output
+    compact_payload = json.loads(compact.stdout)
+    assert compact_payload["schema_version"] == ps_query.SCHEMA_VERSION
+    assert [row["job_id"] for row in compact_payload["jobs"]] == ["job-0"]
+
+
 def test_incremental_query_fails_closed_for_old_heads(monkeypatch):
     cfg = LaptopConfig(centers={"old": "head-old"})
     errors = FanErrors()
