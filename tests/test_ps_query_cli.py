@@ -36,6 +36,19 @@ def _entry(job_id: str, *, created_at: float, status: str = "finished") -> JobEn
     )
 
 
+def test_ps_surfaces_damaged_registry_rows(tmp_path):
+    cfg = _cfg(tmp_path)
+    cli.jobs_mod.save(cfg, _entry("good", created_at=1.0))
+    (cfg.registry_dir() / "bad.json").write_text("{ not json", encoding="utf-8")
+
+    rows, errors = cli._gather_ps_rows(cfg, None)
+
+    # The readable job still lists; the unreadable one is no longer silent.
+    assert [row["job_id"] for row in rows] == ["good"]
+    assert "local registry" in errors
+    assert "unreadable" in errors["local registry"]
+
+
 def test_ps_compact_is_bounded_and_legacy_json_stays_an_array(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     for index in range(3):

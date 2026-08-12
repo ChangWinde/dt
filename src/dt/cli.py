@@ -4620,7 +4620,17 @@ def _gather_ps_rows(
             _scope_laptop_ps_refs(cfg, rows)
         return _limit_ps_rows(rows, limit), errors
 
-    entries = jobs_mod.list_all(cfg)
+    damage: list[jobs_mod.RegistryDamage] = []
+    entries = jobs_mod.list_all(cfg, damage=damage)
+    # A corrupted row is counted as running for capacity but must not vanish
+    # silently from the operator's view (that is how a stuck job hides while it
+    # still holds GPUs). Surface it the same way an unreachable center is.
+    row_errors: dict[str, str] = {}
+    if damage:
+        row_errors["local registry"] = (
+            f"{len(damage)} record(s) unreadable and counted as running until "
+            "repaired; run dt doctor"
+        )
     display_refs = jobs_mod.compact_job_refs(entries)
     refresh_statuses = {"running", "lost"}
     if active_only:
@@ -4783,7 +4793,7 @@ def _gather_ps_rows(
             row.setdefault("log_source", None)
             row.setdefault("progress_error", None)
             row.setdefault("resources", None)
-    return _limit_ps_rows(rows, limit), {}
+    return _limit_ps_rows(rows, limit), row_errors
 
 
 def _select_ps_rows(
