@@ -4504,6 +4504,49 @@ def test_dispatch_queued_blocks_on_unreadable_dependency(tmp_path):
     assert stored.status == "queued"
 
 
+def test_uncertain_launch_predecessor_is_not_settled(tmp_path):
+    cfg = _cfg(tmp_path)
+    pred = JobEntry(
+        job_id="pred",
+        name="pred",
+        center="test",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/pred",
+        session="dt_pred",
+        cmd="true",
+        status="failed",
+        reason=jobs.UNCERTAIN_LAUNCH_PREFIX
+        + "ssh dropped after session may have started",
+        gpus_requested=0,
+    )
+    jobs.save(cfg, pred)
+    dep = JobEntry(
+        job_id="dep",
+        name="dep",
+        center="test",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/dep",
+        session="dt_dep",
+        cmd="true",
+        status="queued",
+        gpus_requested=0,
+        after_complete="pred",
+    )
+    (dispatch.stage_dir(cfg, dep.job_id) / "code").mkdir(parents=True)
+    jobs.save(cfg, dep)
+
+    outcome, _detail = dispatch.dispatch_queued(cfg, dep, lambda _m: None)
+
+    # A failed-but-unproven launch may still be running; the dependent must
+    # wait for a verified kill, not be released or skipped.
+    assert outcome == "blocked"
+    assert jobs.load(cfg, dep.job_id).status == "queued"
+
+
 def test_process_once_isolates_a_failing_job_from_the_queue(tmp_path, monkeypatch):
     from dt import agent
 

@@ -61,6 +61,7 @@ from .jobs import (
     JobEntry,
     RegistryError,
     effective_result_state,
+    is_uncertain_launch,
     job_lock,
     load,
     new_job_id,
@@ -1120,6 +1121,12 @@ def _dependency_settled(entry: JobEntry, now: float | None = None) -> bool:
     closes, matching the agent's own recheck window.
     """
     if entry.status not in _TERMINAL_JOB_STATUSES:
+        return False
+    if is_uncertain_launch(entry):
+        # A failed-but-unproven launch may still own live remote processes.
+        # Releasing an after_complete dependent or permanently skipping an
+        # after_success one before a verified `dt kill` resolves the outcome
+        # would violate fail-closed; treat it as pending until then.
         return False
     if entry.status == "lost" and entry.finished_at is not None:
         elapsed = (time.time() if now is None else now) - entry.finished_at
