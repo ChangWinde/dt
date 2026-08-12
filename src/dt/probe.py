@@ -237,7 +237,10 @@ def _parse_probe_inventory(
     processes: set[tuple[str, str]] = set()
     malformed_rows = 0
     for line in gpu_part.strip().splitlines():
-        parts = [p.strip() for p in line.split(",")]
+        # Cap the split so a lease owner containing commas collapses into
+        # field 8 (where the identity regex rejects it) instead of inflating
+        # the field count and dropping the whole card from the probe.
+        parts = [p.strip() for p in line.split(",", 7)]
         if len(parts) not in (5, 6, 7, 8):
             malformed_rows += 1
             continue
