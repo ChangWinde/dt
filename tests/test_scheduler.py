@@ -234,6 +234,30 @@ def test_unpinned_capacity_wait_also_holds_zero_gpu_work(tmp_path):
     assert "gpu-waiter" in by_id["cpu-job"]["reason"]
 
 
+def test_disjoint_pin_stays_runnable_behind_a_different_busy_pin(tmp_path):
+    """The agent tries a pin disjoint from an earlier busy pin (it continues
+    past it), so the explanation must not park it behind the FIFO (audit F4)."""
+    cfg = _cfg(tmp_path)
+    resources = [
+        {"node": "n1", "gpus": [{"free": False}], "error": None},
+        {"node": "n2", "gpus": [{"free": True}], "error": None},
+    ]
+    waiting_pin = _entry("pin-n1", 1, gpus_requested=1, pin_node="n1")
+    free_pin = _entry("pin-n2", 2, gpus_requested=1, pin_node="n2")
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [waiting_pin, free_pin],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    by_id = {row["job_id"]: row for row in snapshot["queue"]}
+    assert by_id["pin-n1"]["state"] == "waiting_capacity"
+    # The disjoint pin is not blocked by the earlier busy pin.
+    assert by_id["pin-n2"]["state"] == "runnable"
+
+
 def test_unpinned_capacity_wait_preserves_overlapping_fifo(tmp_path):
     cfg = _cfg(tmp_path)
     resources = [

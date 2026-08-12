@@ -830,20 +830,21 @@ class TransferExecutor:
                 )
             except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
                 detail = str(exc)
-                if isinstance(exc, OSError):
-                    # A local failure to even spawn the transfer on the head
-                    # (for example a missing rsync binary or ENOMEM) says
-                    # nothing about the remote network edge; never poison the
-                    # route circuit with it.
-                    kind = None
-                else:
-                    returncode = (
-                        exc.exit_code
-                        if isinstance(exc, RemoteError) and exc.exit_code is not None
-                        else 255
-                    )
-                    kind = _route_failure_kind(returncode, stderr=detail)
                 error_type = type(exc).__name__
+                if isinstance(exc, OSError) and not isinstance(exc, RemoteError):
+                    # A head-local spawn failure (EMFILE/ENOMEM/missing ssh) is
+                    # not evidence the remote edge is unhealthy; it must never
+                    # feed the route circuit and open it against a good edge.
+                    raise DistributionError(
+                        f"P2P transfer {source_node.name} -> {destination.name} "
+                        f"could not start locally ({error_type})"
+                    ) from exc
+                returncode = (
+                    exc.exit_code
+                    if isinstance(exc, RemoteError) and exc.exit_code is not None
+                    else 255
+                )
+                kind = _route_failure_kind(returncode, stderr=detail)
                 error = (
                     ArtifactRouteError(
                         f"P2P transfer {source_node.name} -> {destination.name} "

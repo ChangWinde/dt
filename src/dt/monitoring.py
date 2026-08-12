@@ -154,22 +154,31 @@ def parse_resource_jsonl(text: str) -> tuple[list[JsonDict], int]:
     return rows, invalid
 
 
+# Telemetry rows are job-writable. A hostile or corrupt field can be a
+# non-finite float or a 400-digit int; the latter overflows float() during
+# aggregation (and math.isfinite itself). Bound every number well above any
+# real metric (timestamps ~1e9, MiB ~1e6, percent 0-100) so summaries stay
+# finite and JSON-valid.
+_MAX_METRIC_MAGNITUDE = 10**15
+
+
+def _safe_number(value: object) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+    elif abs(value) > _MAX_METRIC_MAGNITUDE:
+        return None
+    return value
+
+
 def _numbers(values: list[object]) -> list[int | float]:
-    return [
-        value
-        for value in values
-        if isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and (not isinstance(value, float) or math.isfinite(value))
-    ]
+    return [n for value in values if (n := _safe_number(value)) is not None]
 
 
 def _valid_number(value: object) -> bool:
-    return (
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and (not isinstance(value, float) or math.isfinite(value))
-    )
+    return _safe_number(value) is not None
 
 
 class _SeriesStats:
@@ -248,16 +257,13 @@ class _GpuStats:
             assert isinstance(util_value, (int, float))
             if util_value > 0:
                 self.busy.add(util_value)
-        # Busy timestamps intentionally skip the finiteness filter, matching
-        # the historical activity-pair selection.
-        if (
-            isinstance(row_timestamp, (int, float))
-            and not isinstance(row_timestamp, bool)
-            and isinstance(util_value, (int, float))
-            and not isinstance(util_value, bool)
-            and util_value > 0
-        ):
-            self.busy_timestamps.add(float(row_timestamp))
+        # Busy activity pairs go through the same bounded predicate: an
+        # unbounded job-written timestamp or utilization must not reach the
+        # first/last-busy arithmetic.
+        safe_timestamp = _safe_number(row_timestamp)
+        safe_util = _safe_number(util_value)
+        if safe_timestamp is not None and safe_util is not None and safe_util > 0:
+            self.busy_timestamps.add(float(safe_timestamp))
         self.mem.add(gpu.get("mem_used_mib"))
         self.total.add(gpu.get("mem_total_mib"))
         self.temp.add(gpu.get("temperature_c"))

@@ -579,8 +579,16 @@ def _decode_entry(
             raise ValueError("job registry has an invalid relative job path")
     if entry.gpu_isolation != "advisory":
         raise ValueError("job registry requests unsupported physical GPU isolation")
-    if entry.storage_layout is None and layout is not None:
-        entry.storage_layout = layout
+    if entry.storage_layout is None:
+        # An absent storage_layout is a legacy-era sentinel: every role-v1
+        # record is stamped explicitly by save(). Inferring the layout from
+        # the registry directory instead let migration flip an implicit-legacy
+        # row to role-v1 when its file was relocated into the role registry,
+        # silently orphaning the legacy worktree (job_state_dir then resolves
+        # to the wrong place) and falsely reporting the migration complete on
+        # the next pass (audit R5 / DT-28). The `layout` argument is retained
+        # for provenance in the read plumbing but must not decide the sentinel.
+        entry.storage_layout = LEGACY_LAYOUT
     if entry.updated_at is None:
         entry.updated_at = registry_updated_at or entry.created_at
     return entry

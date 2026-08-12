@@ -26,6 +26,19 @@ def test_private_directory_refuses_a_symlink(tmp_path):
         ensure_private_directory(alias)
 
 
+def test_ensure_private_directory_fsyncs_only_on_creation(tmp_path, monkeypatch):
+    synced = []
+    monkeypatch.setattr(private_state_mod, "fsync_dir", lambda p: synced.append(p))
+
+    target = tmp_path / "a" / "b"
+    ensure_private_directory(target)
+    assert synced == [target.parent]
+
+    synced.clear()
+    ensure_private_directory(target)  # already exists -> no extra fsync
+    assert synced == []
+
+
 def test_bounded_reader_refuses_a_fifo_without_blocking(tmp_path):
     fifo = tmp_path / "state" / "record"
     fifo.parent.mkdir()

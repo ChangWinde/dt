@@ -361,6 +361,15 @@ def _nonempty_string(value: object, label: str) -> str:
     return value.strip()
 
 
+def _require_rooted_path(text: str, label: str) -> None:
+    if not text.startswith(("~", "/")):
+        raise ConfigError(
+            f"`{label}` must be absolute or start with ~/; a relative path "
+            "resolves against the working directory and can snapshot the "
+            "wrong tree"
+        )
+
+
 def _config_id(value: object, label: str) -> str:
     identity = _nonempty_string(value, label)
     if _CONFIG_ID_RE.fullmatch(identity) is None:
@@ -859,6 +868,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 if "path" not in p:
                     raise ConfigError(f"project {name!r} needs a `path`")
                 project_path = _nonempty_string(p["path"], f"projects.{name}.path")
+                _require_rooted_path(project_path, f"projects.{name}.path")
                 raw_setup = p.get("setup")
                 setup = (
                     _nonempty_string(raw_setup, f"projects.{name}.setup")
@@ -897,6 +907,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 )
             else:
                 project_path = _nonempty_string(p, f"projects.{name}")
+                _require_rooted_path(project_path, f"projects.{name}")
                 projects[name] = Project(path=Path(project_path).expanduser())
         qraw = _optional_mapping(data, "queue")
         _reject_unknown(
@@ -992,7 +1003,14 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         raw_webhook = data.get("webhook")
         webhook = _webhook_url(raw_webhook) if raw_webhook is not None else None
         raw_proxy = data.get("proxy")
-        proxy = _nonempty_string(raw_proxy, "proxy") if raw_proxy is not None else None
+        if raw_proxy is None:
+            proxy = None
+        else:
+            proxy = _nonempty_string(raw_proxy, "proxy")
+            if "://" not in proxy:
+                raise ConfigError(
+                    "`proxy` must include a scheme, for example http://host:3128"
+                )
         nodes = _parse_nodes(data.get("nodes") or [])
         sites = _parse_sites(data.get("sites"), nodes)
         return HeadConfig(

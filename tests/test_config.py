@@ -282,7 +282,7 @@ def test_project_extras_are_safe_bounded_uv_identities(extra):
             {
                 "center": "c",
                 "nodes": ["n1"],
-                "projects": {"p": {"path": ".", "extras": [extra]}},
+                "projects": {"p": {"path": "~/p", "extras": [extra]}},
             }
         )
 
@@ -292,7 +292,7 @@ def test_project_extras_are_deduplicated_without_reordering():
         {
             "center": "c",
             "nodes": ["n1"],
-            "projects": {"p": {"path": ".", "extras": ["sim", "data", "sim"]}},
+            "projects": {"p": {"path": "~/p", "extras": ["sim", "data", "sim"]}},
         }
     )
 
@@ -305,7 +305,7 @@ def test_project_extras_are_deduplicated_without_reordering():
 )
 def test_project_names_are_safe_bounded_path_identities(name):
     with pytest.raises(ConfigError, match="projects name"):
-        parse({"center": "c", "nodes": ["n1"], "projects": {name: "."}})
+        parse({"center": "c", "nodes": ["n1"], "projects": {name: "~/p"}})
 
 
 @pytest.mark.parametrize(
@@ -331,7 +331,7 @@ def test_center_names_are_safe_bounded_identities(payload):
             {
                 "center": "c",
                 "nodes": ["n1"],
-                "projects": {"a": ".", "b": "."},
+                "projects": {"a": "~/p", "b": "~/p"},
             },
         ),
         (
@@ -366,7 +366,7 @@ def test_config_collections_have_explicit_resource_bounds(
             {
                 "center": "c",
                 "nodes": ["n1"],
-                "projects": {"p": {"path": ".", "extras": ["a", "b"]}},
+                "projects": {"p": {"path": "~/p", "extras": ["a", "b"]}},
             },
         ),
         (
@@ -377,7 +377,7 @@ def test_config_collections_have_explicit_resource_bounds(
                 "nodes": ["n1"],
                 "projects": {
                     "p": {
-                        "path": ".",
+                        "path": "~/p",
                         "setup": "true",
                         "setup_inputs": ["a", "b"],
                     }
@@ -515,8 +515,8 @@ def test_malformed_config_shapes_raise_config_error(payload):
         {"paths": {"envs": ""}},
         {"paths": {"results": []}},
         {"projects": []},
-        {"projects": {"p": {"path": ".", "setup": 7}}},
-        {"projects": {"p": {"path": ".", "extras": "gpu"}}},
+        {"projects": {"p": {"path": "~/p", "setup": 7}}},
+        {"projects": {"p": {"path": "~/p", "extras": "gpu"}}},
         {"queue": []},
         {"webhook": []},
         {"proxy": {}},
@@ -547,7 +547,7 @@ def test_head_config_rejects_unsafe_webhook_protocols(webhook):
         {
             "center": "c",
             "nodes": ["n1"],
-            "projects": {"p": {"path": ".", "extra": ["gpu"]}},
+            "projects": {"p": {"path": "~/p", "extra": ["gpu"]}},
         },
         {"centers": {"c": {"head": "h", "host": "other"}}},
     ],
@@ -582,6 +582,28 @@ def test_load_wraps_invalid_yaml_as_config_error(tmp_path, monkeypatch):
 def test_mem_threshold_zero_is_rejected():
     with pytest.raises(ConfigError, match="mem_threshold_mib"):
         parse({"center": "headstar", "nodes": ["n1"], "mem_threshold_mib": 0})
+
+
+def test_project_path_must_be_absolute_or_home_rooted():
+    with pytest.raises(ConfigError, match=r"projects\.p\.path"):
+        parse(
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "projects": {"p": {"path": "rel/ative"}},
+            }
+        )
+    with pytest.raises(ConfigError, match=r"projects\.p"):
+        parse({"center": "c", "nodes": ["n1"], "projects": {"p": "rel/ative"}})
+    ok = parse({"center": "c", "nodes": ["n1"], "projects": {"p": {"path": "~/proj"}}})
+    assert "p" in ok.projects
+
+
+def test_proxy_requires_a_scheme():
+    with pytest.raises(ConfigError, match="proxy"):
+        parse({"center": "c", "nodes": ["n1"], "proxy": "host:3128"})
+    ok = parse({"center": "c", "nodes": ["n1"], "proxy": "http://host:3128"})
+    assert ok.proxy == "http://host:3128"
 
 
 def test_load_wraps_deeply_nested_yaml_as_config_error(tmp_path, monkeypatch):
