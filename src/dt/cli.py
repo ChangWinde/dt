@@ -14891,15 +14891,26 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
         n_queued = len(jobs_mod.queued_entries(cfg))
         agent_ok = agent_mod.alive_pid(cfg) is not None
         relay_status = relay_agent_status(cfg)
+        agent_label = (
+            "ok" if agent_ok else (f"off ({n_queued} queued!)" if n_queued else "off")
+        )
+        local_names = {n.name for n in cfg.nodes if n.local}
+        attached = False
         for r in rows:  # agent runs on the head itself -> its local node row
-            if r["node"] in {n.name for n in cfg.nodes if n.local}:
-                r["checks"]["agent"] = (
-                    "ok"
-                    if agent_ok
-                    else (f"off ({n_queued} queued!)" if n_queued else "off")
-                )
+            if r["node"] in local_names:
+                r["checks"]["agent"] = agent_label
                 if relay_status is not None:
                     r["checks"]["relay"] = relay_status
+                attached = True
+        if not attached:
+            # A pure-orchestrator head (zero local nodes is a legal config)
+            # still runs the agent and the relay; without a synthetic row a
+            # dead agent, a backlogged queue, and a broken relay would all
+            # be invisible and doctor would exit 0.
+            checks: dict[str, str] = {"ssh": "ok", "agent": agent_label}
+            if relay_status is not None:
+                checks["relay"] = relay_status
+            rows.append({"node": "(head)", "checks": checks, "unreachable": False})
     else:
 
         def check_head(item: tuple[str, str]) -> JsonDict:

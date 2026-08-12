@@ -266,6 +266,37 @@ def test_doctor_fails_on_gpu_driver_error_text(tmp_path, monkeypatch):
     assert result.exit_code == 1, result.output
 
 
+def test_orchestrator_head_without_local_node_still_reports_relay(
+    tmp_path, monkeypatch
+):
+    # Zero local nodes is a legal head shape (pure orchestrator); the agent
+    # and relay verdicts must not silently lose their carrier row.
+    cfg = _cfg(
+        tmp_path,
+        nodes=[Node(name="n1"), Node(name="n2")],
+        sites=_relay_site("n1", "n2"),
+    )
+    rows = [
+        {"node": "n1", "checks": {"ssh": "ok"}, "unreachable": False},
+        {"node": "n2", "checks": {"ssh": "ok"}, "unreachable": False},
+    ]
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "doctor_center", lambda cfg_arg: rows)
+    monkeypatch.setattr(
+        cli, "relay_agent_status", lambda cfg_arg: "fail: no agent socket"
+    )
+    monkeypatch.setattr(agent_mod, "alive_pid", lambda cfg_arg: None)
+    monkeypatch.setattr(cli.jobs_mod, "queued_entries", lambda cfg_arg: [])
+
+    result = CliRunner().invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    head_row = next(row for row in payload if row["node"] == "(head)")
+    assert head_row["checks"]["relay"] == "fail: no agent socket"
+    assert head_row["checks"]["agent"] == "off"
+
+
 def test_alive_pid_probe_is_readonly_on_fresh_root(tmp_path):
     # doctor runs this probe; a fresh or read-only root must yield "not
     # running" without materializing state directories or an agent.lock.

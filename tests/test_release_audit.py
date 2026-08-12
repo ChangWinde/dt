@@ -17,6 +17,21 @@ audit_release = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(audit_release)
 
 
+def test_required_payloads_cover_the_runtime_manifest():
+    # A packaging exclude that drops a runtime-required payload must fail this
+    # audit; the wheel canary and the runtime manifest may never drift apart.
+    from dt.payload_hash import RUNTIME_PAYLOAD_NAMES
+
+    runtime_payload_files = {
+        f"dt/payload/{name}"
+        for name in RUNTIME_PAYLOAD_NAMES
+        # snapshot_hash.py lives in dt/ and is injected at dispatch time.
+        if name != "snapshot_hash.py"
+    }
+
+    assert runtime_payload_files <= audit_release.REQUIRED_PAYLOADS
+
+
 def test_sdist_audit_rejects_oversized_member_before_content_scan(
     tmp_path, monkeypatch
 ):
