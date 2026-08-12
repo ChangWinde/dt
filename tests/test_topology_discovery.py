@@ -505,64 +505,6 @@ def test_concurrent_routes_from_one_seed_share_one_direct_edge_probe(
     assert routes[0].score < routes[1].score
 
 
-def test_healthy_probe_releases_half_open_reservation_after_transfer_failure(
-    tmp_path, monkeypatch
-):
-    """A transfer-opened circuit that a probe finds healthy must not be left
-    looking circuit-open for the trial window (audit N2)."""
-    cfg = _cfg(tmp_path)
-    discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
-
-    now = [1000.0]
-    health = PersistentRouteHealth(cfg, clock=lambda: now[0])
-    discovery.route_health = health
-
-    source = cfg.nodes[2]
-    destination = cfg.nodes[3]
-    site = discovery.topology.site_for(source)
-    assert site is not None
-
-    # A bulk transfer opened the edge circuit (last_kind is transfer-origin).
-    health.record_failure(site, source.name, destination.name, "transfer.timeout")
-    opened = health.record_failure(
-        site, source.name, destination.name, "transfer.timeout"
-    )
-    assert opened.failures == 2
-    assert opened.retry_after_s > 0
-
-    # Let the cooldown elapse so the next decision grants a half-open trial.
-    now[0] += opened.retry_after_s + 1
-
-    endpoint = DirectEndpoint(
-        destination="worker@172.16.6.111",
-        port=22,
-        host_key_alias="dt-node-proof",
-        host_keys=("ssh-ed25519 AAAA",),
-        origin="advertised-shared-subnet",
-        link_cost=0.0,
-    )
-    monkeypatch.setattr(discovery, "endpoint", lambda *args: endpoint)
-    monkeypatch.setattr(discovery, "probe_route", lambda *args: (True, 2.5, "ok"))
-
-    route = discovery.route(
-        ArtifactReplica(
-            kind="peer",
-            node=source,
-            code_dir="~/dt/worker/jobs/prior/code",
-            recorded_at=1.0,
-        ),
-        destination,
-    )
-    assert route.probe_latency_ms == 2.5
-
-    # The probe proved the edge is up: the reservation it claimed must be
-    # released, so the edge is immediately usable rather than fake-open.
-    follow_up = health.decision(site, source.name, destination.name)
-    assert follow_up.is_open is False
-    # The bulk-transfer failure history is preserved (a probe does not erase it).
-    assert follow_up.failures == 2
-
-
 def test_persistent_route_circuit_skips_known_bad_edge(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     endpoint = DirectEndpoint(
@@ -715,6 +657,127 @@ def test_deterministic_half_open_probe_releases_route_reservation(
     assert decision.failures == 2
     assert decision.is_open is False
     assert decision.last_kind == "probe.timeout"
+
+
+def _tripped_transfer_circuit(cfg, site, source, destination, now):
+    health = PersistentRouteHealth(cfg, clock=lambda: now[0])
+    health.record_failure(site, source.name, destination.name, "transfer.timeout")
+    opened = health.record_failure(
+        site,
+        source.name,
+        destination.name,
+        "transfer.timeout",
+    )
+    assert opened.is_open is True
+    now[0] += opened.retry_after_s + 1
+    return health
+
+
+def _healthy_probe_discovery(cfg, health, monkeypatch):
+    endpoint = DirectEndpoint(
+        destination="worker@172.16.6.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-shared-subnet",
+        link_cost=0.0,
+    )
+    discovery = TopologyDiscovery(
+        cfg,
+        TopologyRegistry(cfg),
+        route_health=health,
+    )
+    monkeypatch.setattr(discovery, "endpoint", lambda *args: endpoint)
+    monkeypatch.setattr(
+        discovery,
+        "probe_route",
+        lambda *args: (True, 5.0, "ok"),
+    )
+    return discovery
+
+
+def test_probe_only_discovery_releases_carried_reservation(tmp_path, monkeypatch):
+    # A healthy probe over a transfer-failure circuit deliberately keeps the
+    # half-open claim for the transfer that normally follows. dt topology
+    # never transfers, so without scope-end release the read-only command
+    # leaves the healthy edge circuit-open for a full cooldown.
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    now = [100.0]
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    health = _tripped_transfer_circuit(cfg, site, source, destination, now)
+    discovery = _healthy_probe_discovery(cfg, health, monkeypatch)
+
+    edges = discovery.discover_edges(
+        site,
+        source=source.name,
+        destination=destination.name,
+    )
+
+    assert [edge.status for edge in edges] == ["direct"]
+    decision = health.decision(site, source.name, destination.name)
+    assert decision.is_open is False
+    assert decision.failures == 2
+    assert decision.last_kind == "transfer.timeout"
+
+
+def test_unconsumed_route_reservation_is_released_at_scope_end(tmp_path, monkeypatch):
+    # A route probed healthy but never chosen for its transfer must give the
+    # half-open claim back when the distribution scope ends.
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    now = [100.0]
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    health = _tripped_transfer_circuit(cfg, site, source, destination, now)
+    discovery = _healthy_probe_discovery(cfg, health, monkeypatch)
+
+    discovery.route(
+        ArtifactReplica(
+            kind="peer",
+            node=source,
+            code_dir="~/dt/worker/jobs/prior/code",
+            recorded_at=1.0,
+        ),
+        destination,
+    )
+    claimed = health.decision(site, source.name, destination.name)
+    assert claimed.is_open is True
+
+    assert discovery.release_carried_reservations() == []
+
+    decision = health.decision(site, source.name, destination.name)
+    assert decision.is_open is False
+    assert decision.failures == 2
+
+
+def test_transfer_resolution_consumes_carried_reservation(tmp_path, monkeypatch):
+    # Once the transfer itself resolved the circuit, scope-end cleanup must
+    # not touch the freshly recorded outcome.
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    now = [100.0]
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    health = _tripped_transfer_circuit(cfg, site, source, destination, now)
+    discovery = _healthy_probe_discovery(cfg, health, monkeypatch)
+
+    route = discovery.route(
+        ArtifactReplica(
+            kind="peer",
+            node=source,
+            code_dir="~/dt/worker/jobs/prior/code",
+            recorded_at=1.0,
+        ),
+        destination,
+    )
+    discovery.record_transfer_success(route, destination)
+
+    assert discovery.release_carried_reservations() == []
+    decision = health.decision(site, source.name, destination.name)
+    assert decision.failures == 0
+    assert decision.last_kind == "success"
 
 
 def test_known_hosts_setup_refuses_symlink_target(tmp_path):

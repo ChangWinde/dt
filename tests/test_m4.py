@@ -535,6 +535,7 @@ def test_rerun_cli_uses_standard_submission_payload_and_reason(tmp_path, monkeyp
     assert json_result.exit_code == 0
     payload = json.loads(json_result.stdout)
     assert payload == {
+        "schema_version": "dt_submission_v1",
         "job_id": "new",
         "status": "queued",
         "project": "p",
@@ -789,6 +790,24 @@ def test_clean_keeps_shared_snapshot_when_a_live_row_is_unreadable(tmp_path):
     assert report.removed == 1  # old-done cleaned; live-run is not terminal
     assert snapshot.is_dir(), "shared snapshot of a live unreadable row was deleted"
     assert (snapshot / "code.txt").read_text() == "recoverable"
+def test_clean_refuses_misdirected_node_identity(tmp_path):
+    # A stale row naming an unconfigured node or the wrong locality must fail
+    # visibly: rm -rf against the wrong executor hits a nonexistent per-job
+    # slot, returns 0, and would delete the only record still pointing at the
+    # real workdir.
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("ghost-node", "finished", created_at=1.0, node="ghost"))
+    save(cfg, _entry("flipped", "finished", created_at=1.0, node="n1"))
+
+    report = clean_jobs(cfg, cutoff_ts=100.0, envs=False, log=lambda m: None)
+
+    assert report.removed == 0
+    assert {failure.kind for failure in report.failures} == {
+        "node_not_configured",
+        "node_identity_mismatch",
+    }
+    assert load(cfg, "ghost-node") is not None
+    assert load(cfg, "flipped") is not None
 
 
 def test_dependency_settled_treats_recoverable_lost_as_pending():
@@ -896,6 +915,9 @@ def test_clean_rejects_job_dir_outside_exact_managed_slot(tmp_path, monkeypatch)
 
 def test_clean_retains_registry_when_remote_delete_fails(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
+    # The row must pass the node-identity gate to reach the remote delete, so
+    # the configured node's locality has to match the registry row (remote).
+    cfg.nodes = [Node(name="n1")]
     entry = _entry(
         "remote-failure",
         "finished",

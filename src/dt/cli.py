@@ -84,6 +84,7 @@ from .private_state import (
     read_bounded_regular,
 )
 from .probe import NodeStatus, probe_center, probe_node, status_as_dict
+from .redaction import redact_home_path
 from .remote import (
     center_worker_count,
     fan_json,
@@ -181,6 +182,10 @@ app = typer.Typer(
     context_settings={"help_option_names": ["-h", "--help"]},
     rich_markup_mode="rich",
     epilog=ROOT_EPILOG,
+    # An uncaught exception must not dump frame locals: they routinely hold
+    # webhook tokens, proxy URLs, and whole config mappings, and crash output
+    # is exactly what operators paste into shared channels.
+    pretty_exceptions_show_locals=False,
 )
 
 CliFunction = TypeVar("CliFunction", bound=Callable[..., Any])
@@ -1970,6 +1975,7 @@ def _submission_payload(
     **extra: object,
 ) -> JsonDict:
     payload: JsonDict = {
+        "schema_version": "dt_submission_v1",
         "job_id": entry.job_id,
         "status": entry.status,
         "project": entry.project,
@@ -13293,7 +13299,7 @@ def events(
     payload = {
         "schema_version": operation_log_mod.QUERY_SCHEMA_VERSION,
         "role": cfg.role,
-        "journal": str(result.journal),
+        "journal": redact_home_path(str(result.journal)),
         "healthy": result.corrupt_records == 0,
         "count": len(result.events),
         "truncated": result.truncated,
@@ -13348,7 +13354,7 @@ def events(
         suffix = " · more available" if result.truncated else ""
         err.print(
             f"[dim]{len(result.events)} events{suffix} · "
-            f"journal {escape(str(result.journal))}[/dim]"
+            f"journal {escape(redact_home_path(str(result.journal)))}[/dim]"
         )
         if result.corrupt_records:
             err.print(

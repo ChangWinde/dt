@@ -397,13 +397,15 @@ def _decode_entry(
         or entry.result_state not in RESULT_STATES
     ):
         raise ValueError("job registry has an invalid typed result")
+    # created_at is never optional: every consumer sorts on it, so an explicit
+    # null must surface through the damage channel instead of decoding into a
+    # "healthy" row that TypeErrors compact and queue ordering wholesale.
     timestamps = (
-        entry.created_at,
         entry.started_at,
         entry.finished_at,
         entry.updated_at,
     )
-    if any(
+    if entry.created_at is None or any(
         value is not None
         and (
             isinstance(value, bool)
@@ -411,7 +413,7 @@ def _decode_entry(
             or not math.isfinite(float(value))
             or value < 0
         )
-        for value in timestamps
+        for value in (entry.created_at, *timestamps)
     ):
         raise ValueError("job registry has invalid lifecycle timestamps")
     if not isinstance(entry.placement_failures, dict) or any(

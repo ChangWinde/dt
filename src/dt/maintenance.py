@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import shutil
@@ -228,6 +229,7 @@ def _remove_unreferenced_snapshots(
     cfg: HeadConfig,
     removed_entries: list[JobEntry],
     cutoff_ts: float,
+    log: Log = lambda message: None,
 ) -> None:
     victim_digests = {
         entry.snapshot_sha256
@@ -240,17 +242,23 @@ def _remove_unreferenced_snapshots(
     removed_digests: set[str] = set()
     with lock(cfg):
         damage: list[RegistryDamage] = []
+        live_entries = list_all(cfg, damage=damage)
+        if damage:
+            # An unreadable registry row may still reference a victim digest.
+            # With an incomplete referenced set we cannot prove a snapshot is
+            # unreferenced, so fail closed: keep every snapshot this cycle
+            # rather than delete a live job's only recovery source.
+            log(
+                f"snapshot cleanup skipped: {len(damage)} unreadable registry "
+                "record(s); run dt doctor"
+            )
+            return
         referenced = {
             entry.snapshot_sha256
-            for entry in list_all(cfg, damage=damage)
+            for entry in live_entries
             if entry.snapshot_sha256
             and re.fullmatch(r"[0-9a-f]{64}", entry.snapshot_sha256)
         }
-        if damage:
-            # An unreadable registry row may still reference a snapshot, so
-            # "unreferenced" cannot be proven. Skip snapshot GC entirely
-            # rather than risk deleting a damaged job's recovery snapshot.
-            return
         for digest in victim_digests - referenced:
             roots = {cfg.snapshots_dir(), cfg.legacy_snapshots_dir()}
             removed_any = False
@@ -260,9 +268,29 @@ def _remove_unreferenced_snapshots(
                     old_enough = path.stat().st_mtime < cutoff_ts
                 except FileNotFoundError:
                     continue
+                except OSError as exc:
+                    log(f"snapshot {digest[:12]} left in place: {exc}")
+                    continue
                 if path.is_dir() and not path.is_symlink() and old_enough:
-                    shutil.rmtree(path)
+                    # Quarantine-rename before deleting: a failed rmtree must
+                    # not leave a half-deleted tree at the digest path, where
+                    # the next same-content submission would reuse it as a
+                    # complete snapshot. One broken digest must also not
+                    # abort cleanup of the remaining ones.
+                    doomed = root / f".removing-{digest}"
+                    try:
+                        os.replace(path, doomed)
+                    except OSError as exc:
+                        log(f"snapshot {digest[:12]} left in place: {exc}")
+                        continue
                     removed_any = True
+                    try:
+                        shutil.rmtree(doomed)
+                    except OSError as exc:
+                        log(
+                            f"snapshot {digest[:12]} quarantined as "
+                            f"{doomed.name} but not fully removed: {exc}"
+                        )
             if removed_any:
                 removed_digests.add(digest)
         state = {
@@ -321,6 +349,42 @@ def clean_jobs(
                 )
                 continue
             if entry.node != "-":
+                # compact's preflight gates, mirrored: a stale row pointing at
+                # an unconfigured node or the wrong locality would rm -rf a
+                # nonexistent per-job slot on the wrong executor, return 0,
+                # and delete the only record still naming the real workdir.
+                node = next(
+                    (item for item in cfg.nodes if item.name == entry.node),
+                    None,
+                )
+                if node is None:
+                    message = f"node {entry.node!r} is not in the configuration"
+                    log(f"{entry.job_id}: {message}; registry retained")
+                    failures.append(
+                        CleanFailure(
+                            job_id=entry.job_id,
+                            node=entry.node,
+                            kind="node_not_configured",
+                            message=message,
+                        )
+                    )
+                    continue
+                if node.local != entry.node_local:
+                    message = (
+                        f"registry row says node_local={entry.node_local} but "
+                        f"the configured node is "
+                        f"{'local' if node.local else 'remote'}"
+                    )
+                    log(f"{entry.job_id}: {message}; registry retained")
+                    failures.append(
+                        CleanFailure(
+                            job_id=entry.job_id,
+                            node=entry.node,
+                            kind="node_identity_mismatch",
+                            message=message,
+                        )
+                    )
+                    continue
                 live_guard = ""
                 if entry.status == "lost" and entry.pgid is not None:
                     live_guard = (
@@ -394,7 +458,13 @@ def clean_jobs(
                 continue
             removed_entries.append(entry)
 
-    _remove_unreferenced_snapshots(cfg, removed_entries, cutoff_ts)
+    try:
+        _remove_unreferenced_snapshots(cfg, removed_entries, cutoff_ts, log)
+    except Exception as exc:
+        # Registry records are already removed; losing the whole report (and
+        # skipping env cleanup) over a snapshot-store hiccup would hide what
+        # was actually done.
+        log(f"snapshot cleanup incomplete: {exc}")
     if envs:
         clean_envs(cfg, cutoff_ts, log, runner=runner)
     return CleanReport(

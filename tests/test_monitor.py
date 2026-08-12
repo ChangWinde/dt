@@ -3450,6 +3450,7 @@ def test_wait_json_finished_contract_preserves_job_exit_code(tmp_path, monkeypat
 
     assert result.exit_code == 7
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_submission_v1",
         "job_id": "json-finished",
         "status": "finished",
         "project": "p",

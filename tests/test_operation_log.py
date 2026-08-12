@@ -371,6 +371,53 @@ def test_events_cli_emits_bounded_machine_contract(tmp_path, monkeypatch):
     assert payload["events"][0]["operation_id"] == "3" * 32
 
 
+def test_append_event_is_durable_before_returning(tmp_path, monkeypatch):
+    # The journal is the only postmortem trail for a crashed command; an
+    # unsynced append is exactly the record a power loss erases.
+    cfg = _head_config(tmp_path)
+    assert isinstance(cfg, HeadConfig)
+    target = resolve_target(cfg)
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+
+    append_event(target, _finish_event("3" * 32))
+
+    assert synced, "append must fsync the journal before acknowledging"
+
+
+def test_events_journal_path_never_leaks_home(tmp_path, monkeypatch):
+    # The journal lives under the operator's home; echoing that absolute path
+    # in --json or the footer leaks the username across trust boundaries.
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    cfg = parse(
+        {
+            "center": "test",
+            "nodes": [{"name": "local", "local": True}],
+            "paths": {"root": str(home / "runtime")},
+        }
+    )
+    assert isinstance(cfg, HeadConfig)
+    target = resolve_target(cfg)
+    append_event(target, _finish_event("3" * 32))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, ["events", "--limit", "1", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert str(home) not in payload["journal"]
+    assert payload["journal"].startswith("~/")
+
+
 def test_main_records_remote_failures(tmp_path, monkeypatch):
     _write_head_config(tmp_path, monkeypatch)
     monkeypatch.setattr(cli.sys, "argv", ["dt", "free"])
