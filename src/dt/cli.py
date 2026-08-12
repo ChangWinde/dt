@@ -5947,6 +5947,37 @@ def _parse_job_log_tail(entry: jobs_mod.JobEntry, text: str) -> tuple[str, str, 
     return path, display, tail
 
 
+# Job stdout is fully job-controlled. A line like "Throughput: 9...9" parses to
+# inf, and "step: 9...9" to a 400-digit int; either would serialize as an
+# RFC-invalid token (Infinity) or overflow fixed-width consumers, crashing
+# strict agent JSON parsers. Every numeric progress field is bounded on exit.
+_PROGRESS_NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
+    "step": (0, 10**12),
+    "total_steps": (0, 10**12),
+    "percent": (0, 100),
+    "step_time_s": (0, 1e9),
+    "samples_per_sec": (0, 1e9),
+}
+
+
+def _sanitized_progress(progress: JsonDict) -> JsonDict | None:
+    """Drop job-log-derived numbers that are non-finite or out of range."""
+    clean: JsonDict = {}
+    for key, value in progress.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            clean[key] = value
+            continue
+        # math.isfinite would itself raise OverflowError on a huge int; ints are
+        # always finite, and the bounds check below rejects out-of-range ones.
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        bounds = _PROGRESS_NUMERIC_BOUNDS.get(key)
+        if bounds is not None and not (bounds[0] <= value <= bounds[1]):
+            continue
+        clean[key] = value
+    return clean or None
+
+
 def _parse_log_progress(text: str) -> JsonDict | None:
     """Extract only explicit, broadly recognizable progress facts from logs."""
     clean = _ANSI_ESCAPE_RE.sub("", text or "")
@@ -6087,7 +6118,7 @@ def _parse_log_progress(text: str) -> JsonDict | None:
         progress.pop("eta", None)
         progress.pop("elapsed", None)
         progress.pop("step_time_s", None)
-    return progress or None
+    return _sanitized_progress(progress)
 
 
 def _format_eta_duration(seconds: int) -> str:

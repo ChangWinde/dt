@@ -2414,6 +2414,25 @@ def test_log_progress_parses_live_eta_and_latest_step():
     }
 
 
+def test_log_progress_drops_job_injected_nonfinite_and_oversized():
+    # Job stdout is fully job-controlled; these must never reach the JSON.
+    inf_throughput = cli._parse_log_progress("Throughput: " + "9" * 400 + " samples/s")
+    assert inf_throughput is None or "samples_per_sec" not in inf_throughput
+
+    huge_step = cli._parse_log_progress("step: " + "9" * 400)
+    assert huge_step is None or "step" not in huge_step
+
+    # Whatever survives is always valid JSON (no Infinity / NaN token).
+    for payload in (inf_throughput, huge_step):
+        json.dumps(payload, allow_nan=False)
+
+    # A normal line is untouched.
+    ok = cli._parse_log_progress("step: 5 / 10")
+    assert ok is not None
+    assert ok["step"] == 5
+    assert ok["total_steps"] == 10
+
+
 def test_log_progress_drops_stale_zero_percent_eta_after_newer_step():
     progress = cli._parse_log_progress(
         "[5/5] Training ............... 1000 steps, bs=72, 1x cuda\n"
