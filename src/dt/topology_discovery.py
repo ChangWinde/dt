@@ -549,11 +549,20 @@ class TopologyDiscovery:
         source_ad = self.advertise(source)
         choices: list[tuple[float, str]] = []
         for source_address in source_ad.addresses:
+            # A per-host-identical bridge/virtual network (docker0 172.17.0.1/16)
+            # matches on every host and, worse, its presence would shadow the
+            # routable Pod /32 fallback below and select the source's own
+            # gateway as an unroutable dead route. Exclude bridges as candidate
+            # sources, not merely deprioritise them.
+            if _interface_penalty(source_address.interface) >= 100.0:
+                continue
             source_network = ipaddress.ip_network(
                 f"{source_address.address}/{source_address.prefixlen}",
                 strict=False,
             )
             for target_address in destination_ad.addresses:
+                if _interface_penalty(target_address.interface) >= 100.0:
+                    continue
                 target_ip = ipaddress.ip_address(target_address.address)
                 target_network = ipaddress.ip_network(
                     f"{target_address.address}/{target_address.prefixlen}",
@@ -578,6 +587,11 @@ class TopologyDiscovery:
             for target_address in destination_ad.addresses:
                 target_ip = ipaddress.ip_address(target_address.address)
                 if not _is_rfc1918(target_ip):
+                    continue
+                # docker0's 172.17.0.1 is itself RFC1918; excluding bridges here
+                # too means a node advertising only a bridge address has no
+                # direct endpoint (fail-closed) rather than a self-route.
+                if _interface_penalty(target_address.interface) >= 100.0:
                     continue
                 choices.append(
                     (

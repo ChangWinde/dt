@@ -154,6 +154,56 @@ def test_active_discovery_probes_exact_private_overlay_endpoint(tmp_path, monkey
     assert endpoint.link_cost >= 50
 
 
+def test_endpoint_excludes_bridge_gateway_and_selects_pod(tmp_path, monkeypatch):
+    import dt.topology_discovery as module
+
+    cfg = _cfg(tmp_path)
+
+    def _ad(user, addrs):
+        return json.dumps(
+            {
+                "schema_version": "dt_topology_advertisement_v1",
+                "user": user,
+                "ssh_port": 22,
+                "addresses": [
+                    {"address": a, "prefixlen": p, "interface": i} for a, p, i in addrs
+                ],
+                "host_keys": ["ssh-ed25519 AAAA"],
+            }
+        )
+
+    ads = {
+        "psibot-ys": _ad(
+            "worker", [("172.17.0.1", 16, "docker0"), ("10.244.1.5", 32, "eth0")]
+        ),
+        "psibot-ds": _ad(
+            "worker", [("172.17.0.1", 16, "docker0"), ("10.244.2.7", 32, "eth0")]
+        ),
+    }
+
+    def fake_run_on(node, local, command, **kwargs):
+        return subprocess.CompletedProcess([], 0, ads[node], "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
+
+    endpoint = TopologyDiscovery(cfg, TopologyRegistry(cfg)).endpoint(
+        cfg.nodes[2], cfg.nodes[3]
+    )
+    # The per-host-identical docker0 gateway is a self-route and must never be
+    # chosen; the routable destination Pod /32 is the correct endpoint.
+    assert endpoint.destination == "worker@10.244.2.7"
+    assert endpoint.origin != "advertised-shared-subnet"
+
+    # A node advertising only a bridge gateway has no direct endpoint.
+    ads["psibot-ds"] = _ad("worker", [("172.17.0.1", 16, "docker0")])
+    with pytest.raises(
+        TopologyDiscoveryError, match="no advertised private direct endpoint"
+    ):
+        TopologyDiscovery(cfg, TopologyRegistry(cfg)).endpoint(
+            cfg.nodes[2], cfg.nodes[3]
+        )
+
+
 def test_active_discovery_does_not_probe_unshared_public_endpoint(
     tmp_path, monkeypatch
 ):
