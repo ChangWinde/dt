@@ -371,6 +371,26 @@ def test_events_cli_emits_bounded_machine_contract(tmp_path, monkeypatch):
     assert payload["events"][0]["operation_id"] == "3" * 32
 
 
+def test_append_event_is_durable_before_returning(tmp_path, monkeypatch):
+    # The journal is the only postmortem trail for a crashed command; an
+    # unsynced append is exactly the record a power loss erases.
+    cfg = _head_config(tmp_path)
+    assert isinstance(cfg, HeadConfig)
+    target = resolve_target(cfg)
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+
+    append_event(target, _finish_event("3" * 32))
+
+    assert synced, "append must fsync the journal before acknowledging"
+
+
 def test_events_journal_path_never_leaks_home(tmp_path, monkeypatch):
     # The journal lives under the operator's home; echoing that absolute path
     # in --json or the footer leaks the username across trust boundaries.
