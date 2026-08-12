@@ -373,12 +373,15 @@ class PersistentRouteHealth:
         with self._locked(key) as (directory_fd, name):
             prior = self._read(directory_fd, name, key)
             failures = 1
-            if (
-                prior is not None
-                and prior.failures > 0
-                and now - prior.last_failure_at <= site.route_circuit_max_cooldown_s
-            ):
-                failures = min(prior.failures + 1, MAX_FAILURES)
+            if prior is not None and prior.failures > 0:
+                # Decay from the last time the circuit re-admitted traffic, not
+                # the last failure. At the plateau the enforced wait equals the
+                # max cooldown, so a post-window trial failure measured from
+                # last_failure_at always exceeds it and reset the whole ladder
+                # (N1): the circuit closed and the anti-herd guard vanished.
+                reference = max(prior.last_failure_at, prior.open_until)
+                if now - reference <= site.route_circuit_max_cooldown_s:
+                    failures = min(prior.failures + 1, MAX_FAILURES)
             open_for = 0.0
             if failures >= site.route_circuit_failures:
                 exponent = min(
