@@ -84,6 +84,7 @@ from .private_state import (
     read_bounded_regular,
 )
 from .probe import NodeStatus, probe_center, probe_node, status_as_dict
+from .redaction import redact_home_path
 from .remote import (
     center_worker_count,
     fan_json,
@@ -13174,7 +13175,7 @@ def events(
     payload = {
         "schema_version": operation_log_mod.QUERY_SCHEMA_VERSION,
         "role": cfg.role,
-        "journal": str(result.journal),
+        "journal": redact_home_path(str(result.journal)),
         "healthy": result.corrupt_records == 0,
         "count": len(result.events),
         "truncated": result.truncated,
@@ -13229,7 +13230,7 @@ def events(
         suffix = " · more available" if result.truncated else ""
         err.print(
             f"[dim]{len(result.events)} events{suffix} · "
-            f"journal {escape(str(result.journal))}[/dim]"
+            f"journal {escape(redact_home_path(str(result.journal)))}[/dim]"
         )
         if result.corrupt_records:
             err.print(
