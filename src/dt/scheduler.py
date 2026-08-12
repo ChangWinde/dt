@@ -2,22 +2,25 @@
 
 from __future__ import annotations
 
+import math
+import time
 from collections.abc import Mapping, Sequence
 
 from .config import HeadConfig
-from .jobs import JobEntry, effective_result_state
+from .jobs import JobEntry, LOST_RECHECK_S, effective_result_state
 
 SCHEDULER_SCHEMA = "dt_scheduler_state_v1"
 
 
 def _resource_capacity(
     resources: Sequence[Mapping[str, object]] | None,
-) -> tuple[dict[str, int], dict[str, int], set[str]] | None:
+) -> tuple[dict[str, int], dict[str, int], set[str], dict[str, float]] | None:
     if resources is None:
         return None
     free: dict[str, int] = {}
     total: dict[str, int] = {}
     unavailable: set[str] = set()
+    disk_free: dict[str, float] = {}
     for row in resources:
         node = row.get("node")
         if not isinstance(node, str) or not node:
@@ -31,7 +34,16 @@ def _resource_capacity(
         free[node] = sum(
             gpu.get("free") is True for gpu in gpus if isinstance(gpu, dict)
         )
-    return free, total, unavailable
+        system = row.get("system")
+        if isinstance(system, Mapping):
+            reported = system.get("disk_free_gib")
+            if (
+                isinstance(reported, (int, float))
+                and not isinstance(reported, bool)
+                and math.isfinite(float(reported))
+            ):
+                disk_free[node] = float(reported)
+    return free, total, unavailable, disk_free
 
 
 def _dependency_state(
@@ -107,6 +119,22 @@ def _dependency_state(
             f"dependency {dependency} must finish successfully",
         )
     if (
+        predecessor.status == "lost"
+        and predecessor.finished_at is not None
+        and time.time() - predecessor.finished_at <= LOST_RECHECK_S
+    ):
+        # dispatch_queued holds (does not skip) a dependent while a lost
+        # predecessor is still inside the agent's rescue window, because a
+        # late exit marker can flip it back to finished. Explain it the same
+        # way so `dt free --explain` does not claim a skip that will not
+        # happen yet.
+        return (
+            "waiting_dependency",
+            f"dependency {dependency} is lost but inside the rescue window",
+            f"dependency {dependency} must finish successfully or exhaust "
+            "its rescue window",
+        )
+    if (
         predecessor.status != "finished"
         or predecessor.exit_code != 0
         or effective_result_state(predecessor) != "success"
@@ -141,7 +169,7 @@ def _persisted_wait(
 def _capacity_state(
     cfg: HeadConfig,
     entry: JobEntry,
-    capacity: tuple[dict[str, int], dict[str, int], set[str]] | None,
+    capacity: tuple[dict[str, int], dict[str, int], set[str], dict[str, float]] | None,
 ) -> tuple[str, str, str]:
     if capacity is None:
         return (
@@ -149,7 +177,7 @@ def _capacity_state(
             entry.reason or "waiting for the next scheduler pass",
             "the agent must complete a fresh capacity probe",
         )
-    free, total, unavailable = capacity
+    free, total, unavailable, disk_free = capacity
     configured = {node.name for node in cfg.nodes}
     candidates = {entry.pin_node} if entry.pin_node is not None else configured
     if entry.pin_node is not None and entry.pin_node in unavailable:
@@ -166,15 +194,38 @@ def _capacity_state(
             "an eligible node must become reachable",
         )
     wanted = max(0, entry.gpus_requested)
-    reserve = max(0, cfg.queue.reserve_free_per_node)
-    fitting = [
+    # dispatch._reserve_for keeps no reserve for pinned jobs: pinning is an
+    # explicit operator decision about that node, so the anti-starvation
+    # reserve only shields unpinned placement.
+    reserve = (
+        0 if entry.pin_node is not None else max(0, cfg.queue.reserve_free_per_node)
+    )
+    # The launcher refuses a job whose node lacks the effective disk floor
+    # (max of the center floor and the per-job request). Apply the same gate
+    # here so the explanation cannot promise a run the launcher will reject.
+    required_disk = max(0, cfg.disk_min_gib, entry.require_disk_gib or 0)
+
+    def disk_ok(node: str) -> bool:
+        have = disk_free.get(node)
+        # Unknown disk is not gated: fall back to the prior GPU-only view.
+        return have is None or have >= required_disk
+
+    gpu_fitting = [
         node for node in reachable if max(0, free.get(node, 0) - reserve) >= wanted
     ]
+    fitting = [node for node in gpu_fitting if disk_ok(node)]
     if fitting:
         return (
             "runnable",
             f"{fitting[0]} currently satisfies the resource request",
             "the live agent can dispatch this job now",
+        )
+    if gpu_fitting and required_disk > 0:
+        return (
+            "waiting_disk",
+            entry.reason
+            or f"eligible nodes have GPUs free but under {required_disk} GiB disk",
+            f"one eligible node must free at least {required_disk} GiB of disk",
         )
     max_inventory = max((total.get(node, 0) for node in reachable), default=0)
     if wanted > max_inventory:
@@ -228,12 +279,18 @@ def scheduler_snapshot(
             state, reason, condition = _capacity_state(cfg, entry, capacity)
 
         fifo_owner: str | None = None
-        if state == "runnable" and entry.gpus_requested > 0:
+        if state == "runnable":
             if unpinned_capacity_wait is not None:
+                # The agent stops the whole pass at an unpinned capacity
+                # waiter, so even 0-GPU work behind it is not attempted.
                 fifo_owner = unpinned_capacity_wait
-            elif entry.pin_node is None and busy_pins:
+            elif entry.gpus_requested > 0 and entry.pin_node is None and busy_pins:
                 fifo_owner = next(iter(busy_pins.values()))
-            elif entry.pin_node is not None and entry.pin_node in busy_pins:
+            elif (
+                entry.gpus_requested > 0
+                and entry.pin_node is not None
+                and entry.pin_node in busy_pins
+            ):
                 fifo_owner = busy_pins[entry.pin_node]
         if fifo_owner is not None:
             state = "waiting_fifo"

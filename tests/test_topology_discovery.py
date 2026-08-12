@@ -455,6 +455,64 @@ def test_concurrent_routes_from_one_seed_share_one_direct_edge_probe(
     assert routes[0].score < routes[1].score
 
 
+def test_healthy_probe_releases_half_open_reservation_after_transfer_failure(
+    tmp_path, monkeypatch
+):
+    """A transfer-opened circuit that a probe finds healthy must not be left
+    looking circuit-open for the trial window (audit N2)."""
+    cfg = _cfg(tmp_path)
+    discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
+
+    now = [1000.0]
+    health = PersistentRouteHealth(cfg, clock=lambda: now[0])
+    discovery.route_health = health
+
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    site = discovery.topology.site_for(source)
+    assert site is not None
+
+    # A bulk transfer opened the edge circuit (last_kind is transfer-origin).
+    health.record_failure(site, source.name, destination.name, "transfer.timeout")
+    opened = health.record_failure(
+        site, source.name, destination.name, "transfer.timeout"
+    )
+    assert opened.failures == 2
+    assert opened.retry_after_s > 0
+
+    # Let the cooldown elapse so the next decision grants a half-open trial.
+    now[0] += opened.retry_after_s + 1
+
+    endpoint = DirectEndpoint(
+        destination="worker@172.16.6.111",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-shared-subnet",
+        link_cost=0.0,
+    )
+    monkeypatch.setattr(discovery, "endpoint", lambda *args: endpoint)
+    monkeypatch.setattr(discovery, "probe_route", lambda *args: (True, 2.5, "ok"))
+
+    route = discovery.route(
+        ArtifactReplica(
+            kind="peer",
+            node=source,
+            code_dir="~/dt/worker/jobs/prior/code",
+            recorded_at=1.0,
+        ),
+        destination,
+    )
+    assert route.probe_latency_ms == 2.5
+
+    # The probe proved the edge is up: the reservation it claimed must be
+    # released, so the edge is immediately usable rather than fake-open.
+    follow_up = health.decision(site, source.name, destination.name)
+    assert follow_up.is_open is False
+    # The bulk-transfer failure history is preserved (a probe does not erase it).
+    assert follow_up.failures == 2
+
+
 def test_persistent_route_circuit_skips_known_bad_edge(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     endpoint = DirectEndpoint(

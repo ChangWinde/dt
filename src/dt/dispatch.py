@@ -55,6 +55,7 @@ from .maintenance import (
     clean_jobs as _clean_jobs,
 )
 from .jobs import (
+    LOST_RECHECK_S,
     CANCEL_UNVERIFIED_PREFIX,
     UNCERTAIN_LAUNCH_PREFIX,
     RESULT_STATES,
@@ -1103,9 +1104,11 @@ def reconcile_submission_request(
 # (strict FIFO only protects capacity waits from starvation).
 _JOB_SPECIFIC = ("path-missing", "disk-full", "node-unfit", "cache-missing")
 _TERMINAL_JOB_STATUSES = frozenset({"finished", "killed", "lost", "failed", "skipped"})
-# Mirror agent.LOST_RECHECK_S: a job seen "lost" can still recover to
-# running/finished within this window when a late exit marker appears.
-LOST_RECOVERY_WINDOW_S = 5 * 60
+# A job seen "lost" can still recover to running/finished within the shared
+# rescue window when a late exit marker appears. The constant lives in jobs.py
+# so the agent recheck, this settled gate, and the scheduler explanation can
+# never drift apart.
+LOST_RECOVERY_WINDOW_S = LOST_RECHECK_S
 
 
 def _dependency_settled(entry: JobEntry, now: float | None = None) -> bool:
@@ -1418,7 +1421,7 @@ def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
         project=entry.project,
         node=entry.pin_node,
         require_path=entry.require_path,
-        require_disk_gib=entry.require_disk_gib,
+        require_disk_gib=entry.require_disk_gib or None,
         max_hours=entry.max_hours,
         max_vram_mib=entry.max_vram_mib,
         max_job_memory_mib=entry.max_job_memory_mib,
@@ -1496,7 +1499,7 @@ def fork_spec_from_entry(
         project=entry.project,
         node=actual_node,
         require_path=entry.require_path,
-        require_disk_gib=entry.require_disk_gib,
+        require_disk_gib=entry.require_disk_gib or None,
         max_hours=entry.max_hours,
         max_vram_mib=entry.max_vram_mib,
         max_job_memory_mib=entry.max_job_memory_mib,
@@ -3497,7 +3500,10 @@ def _submit_prepared(
     _require_submission_references(cfg, spec)
     # Freeze the effective floor into the job contract. This keeps queued,
     # rerun, and exact-fork behavior stable even if center config changes.
-    spec.require_disk_gib = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    # A floor of zero stays None: freezing a literal 0 would fail the
+    # positive-integer validation on every requeue/rerun of the entry.
+    _frozen_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    spec.require_disk_gib = _frozen_floor if _frozen_floor > 0 else None
     spec.name = sanitize_name(spec.name)
     if spec.request_id is None:
         return _submit_prepared_once(
@@ -4294,7 +4300,15 @@ def dispatch_queued(
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
             if not _dependency_settled(predecessor):
-                detail = f"dependency {dependency} is {predecessor.status}"
+                if predecessor.status == "lost":
+                    # The agent still rechecks freshly lost jobs (a late exit
+                    # marker rescues them); skipping dependents now would turn
+                    # a transient network blip into a permanently dead chain.
+                    detail = (
+                        f"dependency {dependency} is lost but inside the rescue window"
+                    )
+                else:
+                    detail = f"dependency {dependency} is {predecessor.status}"
                 reason = f"waiting: {detail}"
                 if current.reason != reason:
                     current.reason = reason
@@ -4570,7 +4584,7 @@ def _dispatch_queued_active(
         project=entry.project,
         node=entry.pin_node,
         require_path=entry.require_path,
-        require_disk_gib=entry.require_disk_gib,
+        require_disk_gib=entry.require_disk_gib or None,
         max_hours=entry.max_hours,
         max_vram_mib=entry.max_vram_mib,
         max_job_memory_mib=entry.max_job_memory_mib,

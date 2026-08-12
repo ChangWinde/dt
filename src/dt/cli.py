@@ -25,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from threading import Event
 from typing import (
     Any,
@@ -4651,7 +4651,8 @@ def _gather_ps_rows(
             _scope_laptop_ps_refs(cfg, rows)
         return _limit_ps_rows(rows, limit), errors
 
-    entries = jobs_mod.list_all(cfg)
+    registry_damage: list[jobs_mod.RegistryDamage] = []
+    entries = jobs_mod.list_all(cfg, damage=registry_damage)
     display_refs = jobs_mod.compact_job_refs(entries)
     refresh_statuses = {"running", "lost"}
     if active_only:
@@ -4814,7 +4815,18 @@ def _gather_ps_rows(
             row.setdefault("log_source", None)
             row.setdefault("progress_error", None)
             row.setdefault("resources", None)
-    return _limit_ps_rows(rows, limit), {}
+    if issues_only:
+        # Filter before the newest-N window: otherwise the oldest failing
+        # jobs silently vanish from --issues and the bounded-query envelope
+        # reports an eligible count that cursors can never enumerate.
+        rows = list(_ps_issue_rows(rows))
+    damage_errors = {
+        f"registry:{PurePath(item.path).name}": (
+            f"unreadable registry entry: {item.detail}"
+        )
+        for item in registry_damage
+    }
+    return _limit_ps_rows(rows, limit), damage_errors
 
 
 def _select_ps_rows(
@@ -5462,7 +5474,10 @@ def ps(
         window_kwargs: JsonDict = {"remote_window": True} if remote_window else {}
         if limit is not None and not legacy_issue_window and not query_mode:
             window_kwargs["limit"] = limit
-        if issues:
+        if issues and not legacy_issue_window:
+            # The legacy v1 window contract ships the full superset and lets
+            # the old laptop client filter; every other path filters on the
+            # head before the newest-N window (audit A4).
             window_kwargs["issues_only"] = True
         if active_only:
             rows, errors = _gather_ps_rows(
@@ -5784,7 +5799,14 @@ _LOG_NUL_RUN_RE = re.compile(r"\x00+")
 
 def _stable_remote_exit(returncode: int) -> int:
     """Hide SSH's process-specific 255 behind dt's stable unreachable code."""
-    return EXIT_UNREACHABLE if returncode == 255 else returncode
+    if returncode == 255:
+        return EXIT_UNREACHABLE
+    if returncode < 0:
+        # subprocess reports signal death as a negative number; without
+        # normalizing it, `dt logs -f | head` (SIGPIPE, -13) surfaces as a
+        # wrapped 243. Use the shell-standard 128+signal convention.
+        return 128 + min(-returncode, 127)
+    return returncode
 
 
 def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:

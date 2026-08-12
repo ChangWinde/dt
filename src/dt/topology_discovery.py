@@ -752,6 +752,18 @@ class TopologyDiscovery:
                             source.name,
                             destination.name,
                         )
+                    elif prior.failures > 0:
+                        # A lightweight probe deliberately does not erase a
+                        # prior bulk-transfer failure, but the half-open
+                        # reservation this decision() claimed must be released
+                        # so the healthy edge is not left looking circuit-open
+                        # for the whole trial window (60-900s) after a probe
+                        # that nobody follows with a transfer.
+                        self.route_health.release_reservation(
+                            site,
+                            source.name,
+                            destination.name,
+                        )
                 elif kind in ROUTE_TRANSPORT_FAILURE_KINDS:
                     self.route_health.record_failure(
                         site,

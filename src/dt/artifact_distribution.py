@@ -375,14 +375,23 @@ class TransferExecutor:
         root = _cache_object_root(self.cfg, site, cache_node, digest)
         marker = node_path(root, ".complete")
         code = node_path(root, "code")
+        # Emit a single classification token rather than chaining `test`.
+        # A chained test returns 1 for both a genuine absence and a
+        # permission-denied stat/read, so a restrictive-permission fault on
+        # the cache object was silently treated as a miss and triggered a
+        # redundant WAN refetch. Fail closed on unreadable instead.
         command = (
-            f"test -d {node_path_expression(root)} && "
-            f"test ! -L {node_path_expression(root)} && "
-            f"test -d {node_path_expression(code)} && "
-            f"test ! -L {node_path_expression(code)} && "
-            f"test -f {node_path_expression(marker)} && "
-            f"test ! -L {node_path_expression(marker)} && "
-            f'test "$(cat {node_path_expression(marker)})" = {shlex.quote(digest)}'
+            f"root={node_path_expression(root)}; "
+            f"code={node_path_expression(code)}; "
+            f"marker={node_path_expression(marker)}; "
+            'if ! { [ -e "$root" ] || [ -L "$root" ]; }; then echo DT_CACHE=absent; '
+            'elif [ -L "$root" ] || [ ! -d "$root" ] || [ -L "$code" ] '
+            '|| [ ! -d "$code" ] || [ -L "$marker" ] || [ ! -f "$marker" ]; then '
+            "echo DT_CACHE=unusable; "
+            'elif ! dt_marker=$(cat "$marker" 2>/dev/null); then '
+            "echo DT_CACHE=unreadable; "
+            f'elif [ "$dt_marker" = {shlex.quote(digest)} ]; then echo DT_CACHE=present; '
+            "else echo DT_CACHE=mismatch; fi"
         )
         try:
             present = run_on(
@@ -395,8 +404,6 @@ class TransferExecutor:
             raise DistributionError(
                 f"site cache probe failed on {cache_node.name}: {type(exc).__name__}"
             ) from exc
-        if present.returncode == 1:
-            return False
         if present.returncode != 0:
             detail = diagnostic_excerpt(
                 present.stderr,
@@ -410,6 +417,25 @@ class TransferExecutor:
             )
             raise DistributionError(
                 f"site cache probe failed on {cache_node.name} ({kind}): {detail}"
+            )
+        lines = [
+            line.strip() for line in (present.stdout or "").splitlines() if line.strip()
+        ]
+        token = lines[-1] if lines else ""
+        if token in ("DT_CACHE=absent", "DT_CACHE=unusable", "DT_CACHE=mismatch"):
+            return False
+        if token == "DT_CACHE=unreadable":
+            # The object exists but its completion marker could not be read:
+            # an operational permission fault, not a cache miss. Fail closed
+            # so we do not mask it with a WAN transfer (ADR-0017).
+            raise DistributionError(
+                f"site cache probe on {cache_node.name} could not read the "
+                "completion marker (permission?); refusing to treat it as a miss"
+            )
+        if token != "DT_CACHE=present":
+            raise DistributionError(
+                f"site cache probe on {cache_node.name} returned an "
+                f"unrecognized result: {token!r}"
             )
         try:
             self.verifier.require(cache_node, code, digest)
@@ -804,12 +830,19 @@ class TransferExecutor:
                 )
             except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
                 detail = str(exc)
-                returncode = (
-                    exc.exit_code
-                    if isinstance(exc, RemoteError) and exc.exit_code is not None
-                    else 255
-                )
-                kind = _route_failure_kind(returncode, stderr=detail)
+                if isinstance(exc, OSError):
+                    # A local failure to even spawn the transfer on the head
+                    # (for example a missing rsync binary or ENOMEM) says
+                    # nothing about the remote network edge; never poison the
+                    # route circuit with it.
+                    kind = None
+                else:
+                    returncode = (
+                        exc.exit_code
+                        if isinstance(exc, RemoteError) and exc.exit_code is not None
+                        else 255
+                    )
+                    kind = _route_failure_kind(returncode, stderr=detail)
                 error_type = type(exc).__name__
                 error = (
                     ArtifactRouteError(

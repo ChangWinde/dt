@@ -68,6 +68,25 @@ def test_launcher_does_not_leak_node_launch_lock_into_tmux():
     assert "9>&-" in LAUNCHER[start:end]
 
 
+def test_launcher_clears_result_state_on_reattempt():
+    """A same-dir reattempt must not inherit a prior cancelled/guard result."""
+    marker_clear = LAUNCHER.index('rm -f "$DT_STATE_DIR/pgid"')
+    session_start = LAUNCHER.index('start_session "$ids"')
+    cleared = LAUNCHER[marker_clear:session_start]
+    assert '"$DT_STATE_DIR/result_state"' in cleared
+
+
+def test_launcher_publishes_job_owned_tmpdir_into_session():
+    """TMPDIR must be exported into the job session, not inherited from tmux."""
+    names_block = LAUNCHER.split("local -a session_env_names=(", 1)[1].split(")", 1)[0]
+    assert "TMPDIR" in names_block.replace("\\", " ").split()
+
+
+def test_wrapper_sets_job_owned_tmpdir_unconditionally():
+    assert 'export TMPDIR="$DT_CONTROL_DIR/tmp"' in WRAPPER
+    assert 'export TMPDIR="${TMPDIR:-' not in WRAPPER
+
+
 def test_launcher_clears_stale_attempt_markers_before_new_session():
     session_check = LAUNCHER.index('tmux -L dt has-session -t "$DT_SESSION"')
     marker_clear = LAUNCHER.index('rm -f "$DT_STATE_DIR/pgid"')

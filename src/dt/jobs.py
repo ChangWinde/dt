@@ -59,6 +59,10 @@ NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
 MAX_SAFE_NAME_LENGTH = 64
 SAFE_NAME_DIGEST_LENGTH = 12
 STATUS_MARK = "@@DT_STATUS_V2@@"
+# How long a freshly lost job stays eligible for rescue: the agent
+# rechecks it (a late exit marker can flip it back) and dependency gates
+# must not permanently skip dependents inside this window.
+LOST_RECHECK_S = 5 * 60
 CANCEL_UNVERIFIED_PREFIX = "dequeue raced with dispatch; cancellation unverified: "
 UNCERTAIN_LAUNCH_PREFIX = "launch outcome uncertain: "
 RESULT_STATES = frozenset(
@@ -763,6 +767,7 @@ def list_all(
     show state to a human receive it through ``damage``.
     """
     entries: dict[str, JobEntry] = {}
+    origins: dict[str, str] = {}
     directories = [(cfg.legacy_registry_dir(), LEGACY_LAYOUT)]
     current = cfg.registry_dir()
     if current != cfg.legacy_registry_dir():
@@ -808,7 +813,24 @@ def list_all(
                         layout=layout,
                         expected_job_id=name[: -len(".json")],
                     )
+                    if entry.job_id in entries and damage is not None:
+                        # A crashed migration window can leave the same job in
+                        # both registries. save() routes by storage_layout, so
+                        # lifecycle writes may land in the copy this listing
+                        # does not prefer; surface the split instead of hiding
+                        # it.
+                        damage.append(
+                            RegistryDamage(
+                                path=name,
+                                detail=(
+                                    "split-brain registry row: exists in both "
+                                    f"{origins[entry.job_id]} and {directory}; "
+                                    "run dt migrate to reconcile"
+                                ),
+                            )
+                        )
                     entries[entry.job_id] = entry
+                    origins[entry.job_id] = str(directory)
                 except Exception as exc:
                     if damage is not None:
                         detail = " ".join(str(exc).split()) or type(exc).__name__
@@ -997,27 +1019,31 @@ def _refresh_status_locked(
     state_dir = job_state_dir(entry.job_dir, entry.storage_layout)
     state = node_path_expression(state_dir)
     wrapper_pid = int(entry.pgid) if entry.pgid is not None else 0
+    # Every field below comes from a job-writable file. dt_probe_field
+    # flattens it to one bounded line so an embedded newline (for example a
+    # forged status marker followed by a fake token stream) cannot change the
+    # probe's line protocol and rewrite a running job into a terminal state.
     probe = (
-        process_identity_shell()
+        process_identity_shell() + "dt_probe_field() { "
+        'if [ -f "$1" ]; then head -c 128 -- "$1" 2>/dev/null '
+        "| tr -d '\\r\\n'; echo; else echo UNKNOWN; fi; }; "
         + f"DT_WPID={wrapper_pid}; "
         + f"DT_WIDENT={state}/process_start_ticks; "
         + f"DT_WJOB={node_path_expression(entry.job_dir)}; "
         + f"DT_WBOOT={shlex.quote(entry.boot_id or '')}; "
         + "cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo UNKNOWN; "
         f"echo {STATUS_MARK}; "
-        f"if dt_rc=$(head -n 1 {state}/exit_code 2>/dev/null); then "
-        'printf "%s\\n" "$dt_rc"; '
-        f"head -n 1 {state}/started_at 2>/dev/null || echo UNKNOWN; "
-        f"head -n 1 {state}/finished_at 2>/dev/null || echo UNKNOWN; "
+        f"if [ -f {state}/exit_code ]; then "
+        f"dt_probe_field {state}/exit_code; "
+        f"dt_probe_field {state}/started_at; "
+        f"dt_probe_field {state}/finished_at; "
         'elif dt_process_owned "$DT_WPID" "$DT_WIDENT" "$DT_WJOB" '
         '"$DT_WBOOT"; then '
-        f"echo RUNNING; head -n 1 {state}/started_at 2>/dev/null "
-        "|| echo UNKNOWN; echo UNKNOWN; "
+        f"echo RUNNING; dt_probe_field {state}/started_at; echo UNKNOWN; "
         "else dt_identity_rc=$?; "
         f'[ "$dt_identity_rc" -eq 2 ] && echo STALE || echo LOST; '
-        f"head -n 1 {state}/started_at 2>/dev/null "
-        "|| echo UNKNOWN; echo UNKNOWN; fi; "
-        f"head -n 1 {state}/result_state 2>/dev/null || echo UNKNOWN"
+        f"dt_probe_field {state}/started_at; echo UNKNOWN; fi; "
+        f"dt_probe_field {state}/result_state"
     )
     try:
         proc = run_on(entry.node, entry.node_local, probe, timeout=timeout)
@@ -1079,9 +1105,12 @@ def _refresh_status_locked(
             timestamp = float(value)
         except (TypeError, ValueError):
             return None
-        if not math.isfinite(timestamp) or timestamp <= 0:
+        if not math.isfinite(timestamp):
+            # inf/nan from a job-writable state file must never reach the
+            # registry: json round-trips reject it and every later consumer
+            # of this row would crash.
             return None
-        return timestamp
+        return timestamp if timestamp > 0 else None
 
     remote_started_at = positive_timestamp(started_token)
     remote_finished_at = positive_timestamp(finished_token)
@@ -1091,12 +1120,15 @@ def _refresh_status_locked(
         except ValueError:
             return entry
         if not 0 <= exit_code <= 255:
-            # A managed exit_code file is always a byte in [0, 255]. Treat an
-            # out-of-range value as corrupt evidence: never fabricate a
-            # "finished" state from it, and never let it reach save() and crash
-            # every dt ps / kill / wait that reads this registry row.
+            # The state file is job-writable; an out-of-range code is damage,
+            # not a result. Keep the last known state and surface the problem
+            # instead of persisting a row every consumer would choke on.
             if observation is not None:
-                observation.update(status_probe_error=f"invalid exit_code {token!r}")
+                observation.update(
+                    status_probe_error=(
+                        f"out-of-range exit code {exit_code} in state probe"
+                    ),
+                )
             return entry
         entry.exit_code = exit_code
         entry.status = "finished"

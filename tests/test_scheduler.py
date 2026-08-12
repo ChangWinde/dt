@@ -101,6 +101,53 @@ def test_scheduler_snapshot_exposes_dependency_and_agent_stall(tmp_path):
     )
 
 
+def test_lost_predecessor_in_rescue_window_is_waiting_not_skipped(tmp_path):
+    """A lost predecessor inside the rescue window must explain as waiting,
+    matching dispatch_queued which blocks rather than skips (audit I4/scheduler)."""
+    import time
+
+    cfg = _cfg(tmp_path)
+    predecessor = _entry("parent", 1, status="lost", node="n1", finished_at=time.time())
+    dependent = _entry("child", 2, after_success="parent")
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [predecessor, dependent],
+        resources=_resources(),
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    child = next(row for row in snapshot["queue"] if row["job_id"] == "child")
+    assert child["state"] == "waiting_dependency"
+    assert "rescue window" in child["reason"]
+
+
+def test_lost_predecessor_past_rescue_window_is_blocked_skipped(tmp_path):
+    import time
+
+    from dt.jobs import LOST_RECHECK_S
+
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(
+        "parent",
+        1,
+        status="lost",
+        node="n1",
+        finished_at=time.time() - (LOST_RECHECK_S + 60),
+    )
+    dependent = _entry("child", 2, after_success="parent")
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [predecessor, dependent],
+        resources=_resources(),
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    child = next(row for row in snapshot["queue"] if row["job_id"] == "child")
+    assert child["state"] == "blocked_dependency_false"
+
+
 def test_scheduler_snapshot_explains_false_typed_result_predicate(tmp_path):
     cfg = _cfg(tmp_path)
     predecessor = _entry(
@@ -129,6 +176,62 @@ def test_scheduler_snapshot_explains_false_typed_result_predicate(tmp_path):
     assert snapshot["blocked_queued"] == 1
     assert snapshot["queue"][0]["state"] == "blocked_predicate_false"
     assert snapshot["queue"][0]["reason"] == ("result dependency completed as success")
+
+
+def test_pinned_job_is_exempt_from_the_unpinned_reserve(tmp_path):
+    """dispatch._reserve_for keeps no reserve for pinned jobs; the snapshot
+    must not report them as waiting for capacity they can already use."""
+    from dt.config import QueueCfg
+
+    cfg = _cfg(tmp_path)
+    cfg = HeadConfig(
+        center=cfg.center,
+        nodes=cfg.nodes,
+        projects=cfg.projects,
+        default_project=cfg.default_project,
+        root=cfg.root,
+        envs=cfg.envs,
+        queue=QueueCfg(reserve_free_per_node=1),
+    )
+    resources = [{"node": "n1", "gpus": [{"free": True}], "error": None}]
+    pinned = _entry("pinned", 1, gpus_requested=1, pin_node="n1")
+    unpinned = _entry("unpinned", 2, gpus_requested=1)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [pinned, unpinned],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    by_id = {row["job_id"]: row for row in snapshot["queue"]}
+    # The pinned job can use the single free GPU (no reserve applies to it).
+    assert by_id["pinned"]["state"] == "runnable"
+    # The unpinned job still honours the reserve.
+    assert by_id["unpinned"]["state"] in {"waiting_capacity", "waiting_fifo"}
+
+
+def test_unpinned_capacity_wait_also_holds_zero_gpu_work(tmp_path):
+    """The agent breaks the whole pass at an unpinned capacity waiter, so a
+    0-GPU job behind it must not be explained as runnable (audit F3)."""
+    cfg = _cfg(tmp_path)
+    resources = [
+        {"node": "n1", "gpus": [{"free": False}, {"free": False}], "error": None},
+    ]
+    waiter = _entry("gpu-waiter", 1, gpus_requested=1)
+    cpu_job = _entry("cpu-job", 2, gpus_requested=0)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [waiter, cpu_job],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    by_id = {row["job_id"]: row for row in snapshot["queue"]}
+    assert by_id["gpu-waiter"]["state"] == "waiting_capacity"
+    assert by_id["cpu-job"]["state"] == "waiting_fifo"
+    assert "gpu-waiter" in by_id["cpu-job"]["reason"]
 
 
 def test_unpinned_capacity_wait_preserves_overlapping_fifo(tmp_path):
@@ -165,6 +268,69 @@ def test_unpinned_capacity_wait_preserves_overlapping_fifo(tmp_path):
     assert snapshot["queue"][1]["next_condition"] == (
         "earlier overlapping job large must dispatch or unblock"
     )
+
+
+def test_disk_floor_blocks_runnable_when_node_lacks_disk(tmp_path):
+    """A node with free GPUs but insufficient disk must not read as runnable."""
+    cfg = _cfg(tmp_path)
+    resources = [
+        {
+            "node": "n1",
+            "gpus": [{"free": True}, {"free": True}],
+            "error": None,
+            "system": {"disk_free_gib": 3.0, "disk_total_gib": 100.0},
+        },
+    ]
+    job = _entry("needs-disk", 1, gpus_requested=1, require_disk_gib=50)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [job],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    row = snapshot["queue"][0]
+    assert row["state"] == "waiting_disk"
+    assert snapshot["runnable_queued"] == 0
+
+
+def test_disk_floor_allows_runnable_when_disk_is_sufficient(tmp_path):
+    cfg = _cfg(tmp_path)
+    resources = [
+        {
+            "node": "n1",
+            "gpus": [{"free": True}],
+            "error": None,
+            "system": {"disk_free_gib": 500.0, "disk_total_gib": 1000.0},
+        },
+    ]
+    job = _entry("needs-disk", 1, gpus_requested=1, require_disk_gib=50)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [job],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    assert snapshot["queue"][0]["state"] == "runnable"
+
+
+def test_unknown_disk_is_not_gated(tmp_path):
+    """Rows without a system probe keep the prior GPU-only runnable view."""
+    cfg = _cfg(tmp_path)
+    resources = [{"node": "n1", "gpus": [{"free": True}], "error": None}]
+    job = _entry("needs-disk", 1, gpus_requested=1, require_disk_gib=50)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [job],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    assert snapshot["queue"][0]["state"] == "runnable"
 
 
 def test_fresh_resources_supersede_stale_unreachable_reason(tmp_path):
