@@ -679,10 +679,16 @@ def _code_fingerprint() -> int:
     change files in place; the agent restarts itself to pick them up."""
     pkg = Path(__file__).parent
     files = list(pkg.glob("*.py")) + list((pkg / "payload").glob("*.sh"))
-    try:
-        return max(p.stat().st_mtime_ns for p in files)
-    except ValueError:
-        return 0
+    mtimes: list[int] = []
+    for path in files:
+        try:
+            mtimes.append(path.stat().st_mtime_ns)
+        except OSError:
+            # A deploy in progress can remove a file between the glob and the
+            # stat. A transient scan error must not kill the agent (this runs
+            # outside the poll keep-alive); ignore it and use what is readable.
+            continue
+    return max(mtimes, default=0)
 
 
 def _restart_preflight(
@@ -901,7 +907,13 @@ def run_loop(cfg: HeadConfig) -> int:
 
     def log(msg: str) -> None:
         stamp = datetime.now().strftime("%m-%d %H:%M:%S")
-        print(f"[{stamp}] {msg}", flush=True)
+        try:
+            print(f"[{stamp}] {msg}", flush=True)
+        except OSError:
+            # A full disk must not take the agent down: that would also stop
+            # autoclean, the one thing that can free space again. Logging is
+            # best-effort; the poll loop keeps running.
+            pass
 
     def rotate_log() -> None:
         try:

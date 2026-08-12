@@ -2639,3 +2639,20 @@ def test_cmd_round_trips_through_registry():
     cmd = ["python", "train.py", "--lr", "3e-4", "--tag", "a b'c"]
     joined = shlex.join(cmd)
     assert shlex.split(joined) == cmd
+
+
+def test_code_fingerprint_tolerates_a_file_that_vanishes_mid_scan(
+    tmp_path, monkeypatch
+):
+    from dt import agent
+
+    pkg = tmp_path / "pkg"
+    (pkg / "payload").mkdir(parents=True)
+    good = pkg / "a.py"
+    good.write_text("x", encoding="utf-8")
+    # A broken symlink is globbed but stat() raises FileNotFoundError, standing
+    # in for a file a concurrent deploy removed between the glob and the stat.
+    (pkg / "b.py").symlink_to(pkg / "does-not-exist")
+    monkeypatch.setattr(agent, "__file__", str(pkg / "agent.py"))
+
+    assert agent._code_fingerprint() == good.stat().st_mtime_ns
