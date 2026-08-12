@@ -669,7 +669,13 @@ class TransferExecutor:
                 if destination_code.startswith("~/")
                 else destination_code
             )
-            target = f"{destination.lan_address}:{target_path.rstrip('/')}/"
+            # The path after ``host:`` is parsed again by the receiver's
+            # shell, so quote it once for that layer (the whole target is then
+            # quoted once more for the sending shell below).
+            target = (
+                f"{destination.lan_address}:"
+                f"{shlex.quote(target_path.rstrip('/') + '/')}"
+            )
             source = f"{node_path_expression(cache_code)}/"
             command = (
                 'mkdir -p "$HOME/.ssh/dt/artifact"; '
@@ -813,7 +819,11 @@ class TransferExecutor:
                 if destination_code.startswith("~/")
                 else destination_code
             )
-            target = f"{endpoint.destination}:{target_path.rstrip('/')}/"
+            # Same two-layer quoting as the fan-out path: the receiver's
+            # shell re-parses everything after ``host:``.
+            target = (
+                f"{endpoint.destination}:{shlex.quote(target_path.rstrip('/') + '/')}"
+            )
             source = f"{node_path_expression(source_code)}/"
             command = f"{setup}{shlex.join(argv)} -- {source} {shlex.quote(target)}"
             workload = SSHWorkload.ARTIFACT_RELAY
