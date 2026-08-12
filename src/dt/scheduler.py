@@ -166,7 +166,12 @@ def _capacity_state(
             "an eligible node must become reachable",
         )
     wanted = max(0, entry.gpus_requested)
-    reserve = max(0, cfg.queue.reserve_free_per_node)
+    # A pinned job bypasses the free-GPU reserve at dispatch (_reserve_for
+    # returns 0 for a pin), so the explanation must not subtract it either --
+    # otherwise a pinned job that could dispatch now is reported waiting_capacity.
+    reserve = (
+        0 if entry.pin_node is not None else max(0, cfg.queue.reserve_free_per_node)
+    )
     fitting = [
         node for node in reachable if max(0, free.get(node, 0) - reserve) >= wanted
     ]
