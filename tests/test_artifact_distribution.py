@@ -106,7 +106,7 @@ def test_cache_miss_uploads_once_then_fans_out_over_lan(tmp_path, monkeypatch):
         calls.append((node, command, kwargs))
         # marker probe is absent; prepare and atomic publish succeed; the
         # outer cache->LAN rsync returns its own stats.
-        if command.startswith("test -d"):
+        if command.startswith("if test ! -d"):
             return subprocess.CompletedProcess([], 1, "", "")
         return subprocess.CompletedProcess([], 0, _stats(23, 2), "")
 
@@ -1286,6 +1286,43 @@ def test_p2p_local_spawn_failure_does_not_poison_the_circuit(tmp_path, monkeypat
         )
     # A head-local error must not be a route failure that opens the circuit.
     assert not isinstance(caught.value, ArtifactRouteError)
+
+
+def test_cache_probe_command_distinguishes_miss_error_and_hit(tmp_path):
+    from dt.artifact_distribution import _cache_probe_command
+
+    digest = "a" * 64
+
+    def probe(root):
+        cmd = _cache_probe_command(
+            str(root), str(root / "code"), str(root / ".complete"), digest
+        )
+        return subprocess.run(["bash", "-c", cmd]).returncode
+
+    # Absent root -> MISS.
+    assert probe(tmp_path / "absent") == 1
+
+    # Complete cache -> HIT.
+    hit = tmp_path / "hit"
+    (hit / "code").mkdir(parents=True)
+    (hit / ".complete").write_text(digest)
+    assert probe(hit) == 0
+
+    # Present but incomplete (accessible) -> MISS.
+    incomplete = tmp_path / "incomplete"
+    incomplete.mkdir()
+    assert probe(incomplete) == 1
+
+    # Present but unreadable -> ERROR (3), never a spurious MISS.
+    if os.geteuid() != 0:
+        blocked = tmp_path / "blocked"
+        (blocked / "code").mkdir(parents=True)
+        (blocked / ".complete").write_text(digest)
+        blocked.chmod(0o000)
+        try:
+            assert probe(blocked) == 3
+        finally:
+            blocked.chmod(0o755)
 
 
 def test_topology_aware_tries_next_verified_replica_after_peer_failure(

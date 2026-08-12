@@ -207,6 +207,27 @@ def _cache_object_root(
     return node_path(_cache_root(cfg, site, cache_node), digest)
 
 
+def _cache_probe_command(root: str, code: str, marker: str, digest: str) -> str:
+    """Shell distinguishing cache HIT (0), MISS (1), and inaccessible (3).
+
+    An unreadable object root must not read as a miss: the old `test` chain
+    returned 1 for both absence and EACCES, so a permission blip triggered a
+    needless WAN re-upload and let the caller quarantine a cache that is merely
+    inaccessible right now (N3). Exit 3 routes it to fail-closed handling.
+    """
+    root_x = node_path_expression(root)
+    code_x = node_path_expression(code)
+    marker_x = node_path_expression(marker)
+    return (
+        f"if test ! -d {root_x} || test -L {root_x}; then exit 1; fi; "
+        f"if test ! -r {root_x} || test ! -x {root_x}; then exit 3; fi; "
+        f"if test -d {code_x} && test ! -L {code_x} "
+        f"&& test -f {marker_x} && test ! -L {marker_x} "
+        f'&& test "$(cat {marker_x})" = {shlex.quote(digest)}; then exit 0; fi; '
+        "exit 1"
+    )
+
+
 @contextmanager
 def _artifact_transfer_lock(
     cfg: HeadConfig,
@@ -375,15 +396,7 @@ class TransferExecutor:
         root = _cache_object_root(self.cfg, site, cache_node, digest)
         marker = node_path(root, ".complete")
         code = node_path(root, "code")
-        command = (
-            f"test -d {node_path_expression(root)} && "
-            f"test ! -L {node_path_expression(root)} && "
-            f"test -d {node_path_expression(code)} && "
-            f"test ! -L {node_path_expression(code)} && "
-            f"test -f {node_path_expression(marker)} && "
-            f"test ! -L {node_path_expression(marker)} && "
-            f'test "$(cat {node_path_expression(marker)})" = {shlex.quote(digest)}'
-        )
+        command = _cache_probe_command(root, code, marker, digest)
         try:
             present = run_on(
                 cache_node.name,
