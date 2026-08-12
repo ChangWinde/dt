@@ -122,7 +122,11 @@ def parse_since(value: str | None) -> float | None:
 
 
 def order_field(since: float | None) -> str:
-    return "updated_at" if since is not None else "created_at"
+    # Pagination must key on an immutable field. --since filters by the mutable
+    # updated_at (see filter_since); ordering and the cursor always use the
+    # immutable created_at, so a concurrent update cannot move a row across the
+    # cursor and silently drop or duplicate it between pages.
+    return "created_at"
 
 
 def selection_digest(

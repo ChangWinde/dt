@@ -150,6 +150,51 @@ def test_incremental_query_orders_lifecycle_updates_not_creation():
     assert [row["job_id"] for row in page.rows] == ["old-changed"]
 
 
+def test_since_pagination_is_stable_when_updated_at_changes_between_pages():
+    since = 50
+    digest = ps_query.selection_digest(
+        status=None, active_only=False, issues_only=False, since=since
+    )
+    order = ps_query.order_field(since)
+    assert order == "created_at"
+
+    rows = [
+        _row("job-a", created_at=1, updated_at=100),
+        _row("job-b", created_at=2, updated_at=100),
+        _row("job-c", created_at=3, updated_at=100),
+    ]
+    first = ps_query.paginate(
+        ps_query.filter_since(rows, since),
+        limit=1,
+        cursor=None,
+        digest=digest,
+        order=order,
+    )
+    # A concurrent update bumps an already-returned row's updated_at. Keying on
+    # the mutable field would move it across the cursor and drop another row.
+    bumped = [
+        _row("job-a", created_at=1, updated_at=999),
+        _row("job-b", created_at=2, updated_at=100),
+        _row("job-c", created_at=3, updated_at=100),
+    ]
+    second = ps_query.paginate(
+        ps_query.filter_since(bumped, since),
+        limit=1,
+        cursor=first.next_cursor,
+        digest=digest,
+        order=order,
+    )
+    third = ps_query.paginate(
+        ps_query.filter_since(bumped, since),
+        limit=1,
+        cursor=second.next_cursor,
+        digest=digest,
+        order=order,
+    )
+    seen = [row["job_id"] for row in first.rows + second.rows + third.rows]
+    assert seen == ["job-c", "job-b", "job-a"]
+
+
 def test_summary_and_projection_are_bounded():
     rows = [
         _row("job-a", created_at=1, status="running", center="a"),
