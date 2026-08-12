@@ -1354,6 +1354,37 @@ def test_p2p_data_failure_does_not_become_route_failure(tmp_path, monkeypatch):
     assert not isinstance(caught.value, ArtifactRouteError)
 
 
+def test_p2p_local_spawn_failure_does_not_poison_the_circuit(tmp_path, monkeypatch):
+    import dt.artifact_distribution as module
+
+    cfg = _topology_cfg(tmp_path)
+    executor = TransferExecutor(cfg)
+    replica = ArtifactReplica(
+        kind="peer",
+        node=cfg.nodes[1],
+        code_dir="~/dt/worker/jobs/prior/code",
+        recorded_at=10.0,
+    )
+    route = _direct_route(replica, cfg.nodes[2])
+    monkeypatch.setattr(
+        module,
+        "run_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError(24, "Too many open files")
+        ),
+    )
+
+    with pytest.raises(DistributionError, match=r"could not start locally") as caught:
+        executor._p2p_transfer(
+            route,
+            cfg.nodes[2],
+            "~/dt/worker/jobs/new/code",
+            None,
+        )
+    # A head-local error must not be a route failure that opens the circuit.
+    assert not isinstance(caught.value, ArtifactRouteError)
+
+
 def test_topology_aware_tries_next_verified_replica_after_peer_failure(
     tmp_path, monkeypatch
 ):

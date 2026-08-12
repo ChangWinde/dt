@@ -907,7 +907,13 @@ def run_loop(cfg: HeadConfig) -> int:
 
     def log(msg: str) -> None:
         stamp = datetime.now().strftime("%m-%d %H:%M:%S")
-        print(f"[{stamp}] {msg}", flush=True)
+        try:
+            print(f"[{stamp}] {msg}", flush=True)
+        except OSError:
+            # A full disk must not take the agent down: that would also stop
+            # autoclean, the one thing that can free space again. Logging is
+            # best-effort; the poll loop keeps running.
+            pass
 
     def rotate_log() -> None:
         try:

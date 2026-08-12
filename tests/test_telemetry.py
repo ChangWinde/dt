@@ -1568,6 +1568,27 @@ def test_gpu_activity_summary_tolerates_missing_utilization_and_timestamps():
     assert gpu["last_busy_before_end_s"] is None
 
 
+def test_resource_summary_bounds_hostile_job_written_numbers():
+    # timestamp is a 400-digit int and utilization is inf: job stdout is fully
+    # job-controlled, so aggregation must not raise OverflowError and the
+    # summary must remain valid JSON.
+    rows = [
+        {
+            "timestamp": int("9" * 400),
+            "gpus": [{"index": 0, "utilization_pct": float("inf"), "mem_used_mib": 10}],
+            "host": {"cpu_load1": float("nan")},
+        },
+        {
+            "timestamp": 1000.0,
+            "gpus": [{"index": 0, "utilization_pct": 50, "mem_used_mib": 20}],
+            "host": {"cpu_load1": 1.5},
+        },
+    ]
+    summary = _summarize_resources(rows)
+    json.dumps(summary, allow_nan=False)  # must not raise
+    assert summary["gpus"]["0"]["util_busy_mean_pct"] == 50.0
+
+
 def test_resource_summary_and_ui_surface_job_attributed_usage():
     rows = [
         {
@@ -1898,15 +1919,9 @@ def test_resource_jsonl_parser_tolerates_interrupted_final_line():
 
 
 def _oracle_numbers(values):
-    import math
+    from dt.monitoring import _safe_number
 
-    return [
-        value
-        for value in values
-        if isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and (not isinstance(value, float) or math.isfinite(value))
-    ]
+    return [n for value in values if (n := _safe_number(value)) is not None]
 
 
 def _oracle_summarize(rows, *, include_phases=True):
@@ -1935,14 +1950,14 @@ def _oracle_summarize(rows, *, include_phases=True):
     for index, samples in sorted(gpu_samples.items(), key=lambda item: int(item[0])):
         util = _oracle_numbers([sample.get("utilization_pct") for sample in samples])
         busy_util = [value for value in util if value > 0]
+        from dt.monitoring import _safe_number as _oracle_safe
+
         busy_timestamps = [
-            float(timestamp)
+            float(safe_ts)
             for timestamp, value in gpu_activity_samples[index]
-            if isinstance(timestamp, (int, float))
-            and not isinstance(timestamp, bool)
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and value > 0
+            if (safe_ts := _oracle_safe(timestamp)) is not None
+            and (safe_val := _oracle_safe(value)) is not None
+            and safe_val > 0
         ]
         mem = _oracle_numbers([sample.get("mem_used_mib") for sample in samples])
         total = _oracle_numbers([sample.get("mem_total_mib") for sample in samples])

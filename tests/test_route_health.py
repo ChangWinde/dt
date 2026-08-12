@@ -34,6 +34,39 @@ def _cfg(tmp_path, **site_overrides):
     )
 
 
+def test_route_circuit_plateau_does_not_reset_the_ladder(tmp_path):
+    cfg, site = _cfg(
+        tmp_path,
+        route_circuit_failures=2,
+        route_circuit_cooldown_s=10,
+        route_circuit_max_cooldown_s=20,
+    )
+    now = [1000.0]
+    rh = PersistentRouteHealth(cfg, clock=lambda: now[0])
+
+    rh.record_failure(site, "source", "destination", "transfer.timeout")
+    rh.record_failure(site, "source", "destination", "transfer.timeout")
+    now[0] += 10.0
+    rh.decision(site, "source", "destination")
+    third = rh.record_failure(site, "source", "destination", "transfer.timeout")
+    assert third.failures == 3 and third.retry_after_s == 20  # at the plateau
+
+    seen = []
+    for _ in range(3):
+        now[0] += 25.0  # full window (20) plus probe time
+        grant = rh.decision(site, "source", "destination")
+        assert grant.is_open is False  # half-open trial granted
+        outcome = rh.record_failure(site, "source", "destination", "transfer.timeout")
+        seen.append(outcome.failures)
+        # The ladder must keep climbing and the circuit must re-open, not
+        # collapse to failures=1 with an open circuit every window.
+        assert outcome.retry_after_s == 20
+    assert seen == sorted(seen) and seen[0] >= 4
+
+    rh.record_success(site, "source", "destination")
+    assert rh.decision(site, "source", "destination").failures == 0
+
+
 def test_route_circuit_persists_opens_backs_off_and_resets(tmp_path):
     cfg, site = _cfg(
         tmp_path,

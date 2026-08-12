@@ -7552,7 +7552,12 @@ def _fmt_memory_mib(value: object, *, compact: bool = False) -> str:
 def _fmt_ts(ts: float | None) -> str:
     if not ts:
         return "-"
-    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M:%S")
+    try:
+        return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M:%S")
+    except (ValueError, OverflowError, OSError):
+        # started_at/finished_at can carry an out-of-range value from a late
+        # remote refresh; render it instead of crashing dt info on every read.
+        return "invalid"
 
 
 def _job_resources(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> JsonDict | None:

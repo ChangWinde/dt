@@ -2502,6 +2502,12 @@ def test_log_progress_parses_live_eta_and_latest_step():
     }
 
 
+def test_fmt_ts_survives_out_of_range_timestamp():
+    assert cli._fmt_ts(None) == "-"
+    assert cli._fmt_ts(1e19) == "invalid"
+    assert cli._fmt_ts(1000.0) != "invalid"
+
+
 def test_stable_remote_exit_normalizes_signal_codes():
     assert cli._stable_remote_exit(0) == 0
     assert cli._stable_remote_exit(1) == 1
