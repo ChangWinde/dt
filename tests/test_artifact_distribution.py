@@ -1,3 +1,4 @@
+import shlex
 import subprocess
 import threading
 import json
@@ -10,6 +11,8 @@ from dt.artifact_distribution import (
     ArtifactRouteError,
     DistributionError,
     TransferExecutor,
+    _destination_prepare_rsync_path,
+    _route_failure_kind,
 )
 from dt.config import HeadConfig, Node, Site
 from dt.sshio import SSHWorkload
@@ -1566,3 +1569,51 @@ def test_verified_transfer_does_not_resend_on_verifier_transport_failure(tmp_pat
         )
 
     assert modes == [False]
+
+
+def test_destination_prepare_failure_identifies_itself(tmp_path):
+    # A symlinked destination kills the remote end before rsync starts; the
+    # local side then reads EOF/exit 12. Without the stderr marker that would
+    # classify as "transport" and poison the circuit for a healthy edge.
+    target = tmp_path / "dest"
+    (tmp_path / "real").mkdir()
+    target.symlink_to(tmp_path / "real")
+    command = _destination_prepare_rsync_path(shlex.quote(str(target))).removeprefix(
+        "--rsync-path="
+    )
+
+    # rsync appends its server argv after the --rsync-path string, like ssh.
+    proc = subprocess.run(
+        ["sh", "-c", f"{command} --server"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 1
+    assert "dt: destination prepare failed" in proc.stderr
+    assert _route_failure_kind(12, stderr=proc.stderr) is None
+
+
+def test_destination_prepare_success_execs_rsync_with_private_slot(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "rsync").write_text(
+        '#!/bin/sh\necho "FAKE_RSYNC_RAN $@"\n', encoding="utf-8"
+    )
+    (fake_bin / "rsync").chmod(0o755)
+    destination = tmp_path / "slot"
+    command = _destination_prepare_rsync_path(
+        shlex.quote(str(destination))
+    ).removeprefix("--rsync-path=")
+
+    proc = subprocess.run(
+        ["sh", "-c", f"{command} --server"],
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "FAKE_RSYNC_RAN --server" in proc.stdout
+    assert destination.is_dir()
+    assert (destination.stat().st_mode & 0o777) == 0o700

@@ -296,7 +296,7 @@ RSYNC_UNREACHABLE_EXIT_CODES = frozenset({10, 12, 30, 35, 255})
 # immediately instead of adding 5s/10s backoff to an actionable error.
 RSYNC_RETRYABLE_EXIT_CODES = RSYNC_UNREACHABLE_EXIT_CODES | {24}
 _RSYNC_NONRETRYABLE_FAILURES = frozenset(
-    {"authentication", "deadline", "host_key", "permission", "space"}
+    {"authentication", "deadline", "destination", "host_key", "permission", "space"}
 )
 # Only these failures are evidence that a selected network edge is unhealthy.
 # Authentication, trust, permissions, capacity, and artifact-data failures are
@@ -326,6 +326,12 @@ def classify_rsync_failure(returncode: int, stdout: str, stderr: str) -> str:
     # progress amplifies congestion instead of repairing a transient link.
     if "rsync timed out after " in detail:
         return "deadline"
+    # Emitted by the --rsync-path destination-prepare chain. Without it, a
+    # deterministic destination problem (dest is a symlink, mkdir refused)
+    # kills the remote end before rsync starts, the local side reads EOF as
+    # exit 12, and a healthy network edge would be blamed as "transport".
+    if "dt: destination prepare failed" in detail:
+        return "destination"
     if (
         "host key verification failed" in detail
         or "remote host identification" in detail
@@ -880,6 +886,7 @@ def rsync(
     checksum: bool = False,
     dry_run: bool = False,
     private_destination: bool = False,
+    safe_links: bool = False,
     cancel_event: Event | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -911,6 +918,11 @@ def rsync(
         # make directories traversable by that owner, and strip every
         # group/other permission even when the source came from umask 022.
         cmd.append(f"--chmod={PRIVATE_RSYNC_CHMOD}")
+    if safe_links:
+        # Pull direction materializes trees written by a zero-trust remote;
+        # -a would otherwise recreate symlinks pointing outside the
+        # transferred tree on the operator's machine.
+        cmd.append("--safe-links")
     if delete:
         cmd.append("--delete")
     if delete_excluded:

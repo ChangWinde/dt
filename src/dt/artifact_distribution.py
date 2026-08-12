@@ -63,6 +63,24 @@ class ArtifactRouteError(DistributionError):
         self.failure_kind = failure_kind
 
 
+def _destination_prepare_rsync_path(destination_expression: str) -> str:
+    """--rsync-path snippet: prepare the destination slot, then exec rsync.
+
+    A prepare failure must identify itself on stderr: the remote end dying
+    before rsync starts reads locally as EOF/exit 12, which classification
+    would otherwise blame on the network edge ("transport") and poison the
+    route circuit for a perfectly healthy route.
+    """
+    return (
+        "--rsync-path={ umask 077 && "
+        f"mkdir -p {destination_expression} && "
+        f"test -d {destination_expression} && "
+        f"test ! -L {destination_expression} && "
+        f"chmod 700 {destination_expression}; }} || "
+        '{ echo "dt: destination prepare failed" >&2; exit 1; }; exec rsync'
+    )
+
+
 def _route_failure_kind(
     returncode: int, stdout: str = "", stderr: str = ""
 ) -> str | None:
@@ -645,11 +663,7 @@ class TransferExecutor:
             argv += [
                 "-e",
                 self._inner_ssh(destination.lan_port),
-                "--rsync-path=umask 077 && "
-                f"mkdir -p {destination_expression} && "
-                f"test -d {destination_expression} && "
-                f"test ! -L {destination_expression} && "
-                f"chmod 700 {destination_expression} && exec rsync",
+                _destination_prepare_rsync_path(destination_expression),
             ]
             target_path = (
                 destination_code[2:]
@@ -789,11 +803,7 @@ class TransferExecutor:
             argv += [
                 "-e",
                 inner,
-                "--rsync-path=umask 077 && "
-                f"mkdir -p {destination_expression} && "
-                f"test -d {destination_expression} && "
-                f"test ! -L {destination_expression} && "
-                f"chmod 700 {destination_expression} && exec rsync",
+                _destination_prepare_rsync_path(destination_expression),
             ]
             target_path = (
                 destination_code[2:]
