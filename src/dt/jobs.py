@@ -11,6 +11,7 @@ skipped  - a dependency predicate completed false; no user command ran
 
 from __future__ import annotations
 
+import bisect
 import fcntl
 import hashlib
 import json
@@ -23,6 +24,7 @@ import stat
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
@@ -45,6 +47,7 @@ from .lifecycle import process_identity_shell, validate_job_capsule
 from .private_state import (
     PrivateStateError,
     atomic_write,
+    bounded_directory_reader,
     ensure_private_directory,
     fsync_dir,
     open_private_regular,
@@ -222,9 +225,6 @@ class JobEntry:
     job_relpath: str | None = None
     recovered_at: float | None = None
 
-    def created_str(self) -> str:
-        return datetime.fromtimestamp(self.created_at).strftime("%m-%d %H:%M")
-
 
 def effective_result_state(entry: JobEntry) -> str | None:
     """Return an explicit result or a backward-compatible lifecycle default."""
@@ -260,36 +260,53 @@ def is_uncertain_launch(entry: JobEntry) -> bool:
 _JOB_ENTRY_FIELDS = frozenset(item.name for item in fields(JobEntry))
 
 
+def _count_starting_with(sorted_values: list[str], prefix: str) -> int:
+    """Count entries of ``sorted_values`` that start with ``prefix``.
+
+    Job ids are ASCII, so ``prefix + "\uffff"`` is a strict upper bound for
+    every value that begins with ``prefix``.
+    """
+    low = bisect.bisect_left(sorted_values, prefix)
+    high = bisect.bisect_right(sorted_values, prefix + "\uffff")
+    return high - low
+
+
 def compact_refs(records: list[tuple[str, str]], minimum: int = 4) -> dict[str, str]:
     """Return the shortest resolver-safe suffix for every job id.
 
     Four characters remain the normal display size.  Older registries can
     contain suffix collisions, so only the colliding references expand.
+
+    A suffix is safe when it is not an exact job name and no other record
+    matches it as a prefix or suffix.  Collisions are counted with binary
+    searches over the sorted ids and sorted reversed ids, so a full-registry
+    call costs O(N log N) instead of the historical O(N^2) scan while
+    producing byte-identical references.
     """
     if minimum < 1:
         raise ValueError("minimum compact ref length must be positive")
     job_ids = [job_id for job_id, _name in records]
     names = {name for _job_id, name in records}
-    unresolved = set(job_ids)
+    sorted_ids = sorted(job_ids)
+    sorted_reversed_ids = sorted(job_id[::-1] for job_id in job_ids)
     refs: dict[str, str] = {}
-    max_length = max((len(job_id) for job_id in job_ids), default=0)
-    for width in range(minimum, max_length + 1):
-        for job_id in tuple(unresolved):
+    for job_id in job_ids:
+        # Exact ids are resolved before names and partial matches.
+        assigned = job_id
+        for width in range(minimum, len(job_id) + 1):
             candidate = job_id[-width:]
             if candidate in names:
                 continue
-            matches = sum(
-                other.startswith(candidate) or other.endswith(candidate)
-                for other in job_ids
-            )
-            if matches == 1:
-                refs[job_id] = candidate
-                unresolved.remove(job_id)
-        if not unresolved:
+            # The id itself always ends with its own suffix; any second
+            # suffix match means another record collides.
+            if _count_starting_with(sorted_reversed_ids, candidate[::-1]) != 1:
+                continue
+            own_prefix_matches = 1 if job_id.startswith(candidate) else 0
+            if _count_starting_with(sorted_ids, candidate) != own_prefix_matches:
+                continue
+            assigned = candidate
             break
-    for job_id in unresolved:
-        # Exact ids are resolved before names and partial matches.
-        refs[job_id] = job_id
+        refs[job_id] = assigned
     return refs
 
 
@@ -565,6 +582,28 @@ def _decode_entry(
     return entry
 
 
+def _decode_entry_result(
+    result: tuple[bytes, os.stat_result] | None,
+    *,
+    name: str,
+    layout: str | None,
+    expected_job_id: str,
+) -> JobEntry:
+    if result is None:
+        raise RegistryError(f"registry record disappeared: {name}")
+    payload, info = result
+    try:
+        raw = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RegistryError(f"registry record is malformed: {name}") from exc
+    return _decode_entry(
+        raw,
+        layout=layout,
+        registry_updated_at=info.st_mtime,
+        expected_job_id=expected_job_id,
+    )
+
+
 def _read_entry_path(
     path: Path,
     *,
@@ -575,17 +614,10 @@ def _read_entry_path(
         result = read_bounded(path, max_bytes=MAX_JOB_RECORD_BYTES)
     except PrivateStateError as exc:
         raise RegistryError(f"cannot safely open registry record: {path.name}") from exc
-    if result is None:
-        raise RegistryError(f"registry record disappeared: {path.name}")
-    payload, info = result
-    try:
-        raw = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RegistryError(f"registry record is malformed: {path.name}") from exc
-    return _decode_entry(
-        raw,
+    return _decode_entry_result(
+        result,
+        name=path.name,
         layout=layout,
-        registry_updated_at=info.st_mtime,
         expected_job_id=expected_job_id,
     )
 
@@ -744,19 +776,44 @@ def list_all(
             continue
         if not exists:
             continue
-        for f in sorted(directory.glob("*.json")):
-            try:
-                entry = _read_entry_path(
-                    f,
-                    layout=layout,
-                    expected_job_id=f.stem,
-                )
-                entries[entry.job_id] = entry
-            except Exception as exc:
-                if damage is not None:
-                    detail = " ".join(str(exc).split()) or type(exc).__name__
-                    damage.append(RegistryDamage(path=f.name, detail=detail))
+        try:
+            names = sorted(
+                name
+                for name in os.listdir(directory)
+                if name.endswith(".json") and not name.startswith(".")
+            )
+        except OSError as exc:
+            if damage is not None:
+                damage.append(RegistryDamage(path=str(directory), detail=str(exc)))
+            continue
+        # One pinned, validated directory descriptor serves the whole scan
+        # instead of re-validating the directory for every record.
+        with bounded_directory_reader(
+            directory,
+            max_bytes=MAX_JOB_RECORD_BYTES,
+        ) as read_name:
+            if read_name is None:
                 continue
+            for name in names:
+                try:
+                    try:
+                        result = read_name(name)
+                    except PrivateStateError as exc:
+                        raise RegistryError(
+                            f"cannot safely open registry record: {name}"
+                        ) from exc
+                    entry = _decode_entry_result(
+                        result,
+                        name=name,
+                        layout=layout,
+                        expected_job_id=name[: -len(".json")],
+                    )
+                    entries[entry.job_id] = entry
+                except Exception as exc:
+                    if damage is not None:
+                        detail = " ".join(str(exc).split()) or type(exc).__name__
+                        damage.append(RegistryDamage(path=name, detail=detail))
+                    continue
     return [entries[job_id] for job_id in sorted(entries)]
 
 
@@ -802,25 +859,25 @@ def queue_contexts(entries: list[JobEntry]) -> dict[str, dict[str, object]]:
     }
 
 
-def resolve_ref(
-    cfg: HeadConfig,
-    ref: str,
-) -> tuple[JobEntry | None, list[JobEntry]]:
-    """Return one resolved job or the ambiguous partial-id candidates."""
+def _scope_ref(cfg: HeadConfig, ref: str) -> str | None:
+    """Strip this center's scope prefix; None when out of scope or empty."""
     ref = ref.strip()
     if not ref:
-        return None, []
+        return None
     scoped_prefix = f"{cfg.center}:"
     if ref.startswith(scoped_prefix):
         ref = ref[len(scoped_prefix) :]
-        if not ref:
-            return None, []
-    elif ":" in ref:
-        return None, []
-    exact = load(cfg, ref)
-    if exact:
-        return exact, []
-    entries = list_all(cfg)
+        return ref or None
+    if ":" in ref:
+        return None
+    return ref
+
+
+def _resolve_ref_against(
+    entries: list[JobEntry],
+    ref: str,
+) -> tuple[JobEntry | None, list[JobEntry]]:
+    """Match one already-scoped ref by exact name, then unique partial id."""
     exact_names = [entry for entry in entries if entry.name == ref]
     if exact_names:
         # Reusing a meaningful experiment name intentionally addresses its
@@ -830,6 +887,53 @@ def resolve_ref(
     if len(matches) != 1:
         return None, sorted(matches, key=lambda entry: entry.created_at, reverse=True)
     return matches[0], []
+
+
+_resolution_snapshot: ContextVar[dict[str, list[JobEntry]] | None] = ContextVar(
+    "dt_registry_resolution_snapshot",
+    default=None,
+)
+
+
+@contextmanager
+def shared_resolution_snapshot(cfg: HeadConfig) -> Iterator[None]:
+    """Serve partial-ref resolution in this scope from one registry decode.
+
+    Multi-reference commands resolve every argument up front; without a
+    shared snapshot each non-exact reference re-reads and re-decodes the full
+    registry.  Exact job ids still read their row directly, so they observe
+    rows saved after the scope opened.  Entries resolved inside one scope may
+    alias each other, so callers must treat them as read-only or replace().
+    """
+    token = _resolution_snapshot.set({})
+    try:
+        yield
+    finally:
+        _resolution_snapshot.reset(token)
+
+
+def _resolution_entries(cfg: HeadConfig) -> list[JobEntry]:
+    scope = _resolution_snapshot.get()
+    if scope is None:
+        return list_all(cfg)
+    key = str(cfg.registry_dir())
+    if key not in scope:
+        scope[key] = list_all(cfg)
+    return scope[key]
+
+
+def resolve_ref(
+    cfg: HeadConfig,
+    ref: str,
+) -> tuple[JobEntry | None, list[JobEntry]]:
+    """Return one resolved job or the ambiguous partial-id candidates."""
+    scoped = _scope_ref(cfg, ref)
+    if scoped is None:
+        return None, []
+    exact = load(cfg, scoped)
+    if exact:
+        return exact, []
+    return _resolve_ref_against(_resolution_entries(cfg), scoped)
 
 
 def find(cfg: HeadConfig, ref: str) -> JobEntry | None:

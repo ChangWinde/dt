@@ -94,10 +94,9 @@ class ResourceTelemetryQuery:
         *,
         include_identity: bool,
     ) -> dict[str, object] | None:
-        rows, invalid = parse_resource_jsonl(text)
-        if not rows:
+        summary, invalid = summarize_resource_text(text)
+        if summary is None:
             return None
-        summary = summarize_resources(rows)
         summary.update(
             {
                 "invalid_lines": invalid,
@@ -159,188 +158,383 @@ def _numbers(values: list[object]) -> list[int | float]:
     ]
 
 
+def _valid_number(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and (not isinstance(value, float) or math.isfinite(value))
+    )
+
+
+class _SeriesStats:
+    """Streaming count/sum/peak with the exact list-based semantics.
+
+    Values accumulate in input order starting from integer zero, so the sum
+    (and therefore the mean) is bit-identical to ``sum(list)`` over the same
+    values, and the peak keeps the first maximal element's type like
+    ``max(list)``.
+    """
+
+    __slots__ = ("count", "total", "peak")
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.total: int | float = 0
+        self.peak: int | float | None = None
+
+    def add(self, value: object) -> bool:
+        if not _valid_number(value):
+            return False
+        assert isinstance(value, (int, float))
+        self.count += 1
+        self.total = self.total + value
+        if self.peak is None or value > self.peak:
+            self.peak = value
+        return True
+
+    @property
+    def mean(self) -> int | float | None:
+        return self.total / self.count if self.count else None
+
+
+class _MinMax:
+    """Streaming min/max keeping first-tie semantics of min()/max()."""
+
+    __slots__ = ("minimum", "maximum")
+
+    def __init__(self) -> None:
+        self.minimum: float | None = None
+        self.maximum: float | None = None
+
+    def add(self, value: float) -> None:
+        if self.minimum is None or value < self.minimum:
+            self.minimum = value
+        if self.maximum is None or value > self.maximum:
+            self.maximum = value
+
+
+class _GpuStats:
+    __slots__ = (
+        "samples",
+        "util",
+        "busy",
+        "busy_timestamps",
+        "mem",
+        "total",
+        "temp",
+        "power",
+    )
+
+    def __init__(self) -> None:
+        self.samples = 0
+        self.util = _SeriesStats()
+        self.busy = _SeriesStats()
+        self.busy_timestamps = _MinMax()
+        self.mem = _SeriesStats()
+        self.total = _SeriesStats()
+        self.temp = _SeriesStats()
+        self.power = _SeriesStats()
+
+    def add(self, gpu: JsonDict, row_timestamp: object) -> None:
+        self.samples += 1
+        util_value = gpu.get("utilization_pct")
+        if self.util.add(util_value):
+            assert isinstance(util_value, (int, float))
+            if util_value > 0:
+                self.busy.add(util_value)
+        # Busy timestamps intentionally skip the finiteness filter, matching
+        # the historical activity-pair selection.
+        if (
+            isinstance(row_timestamp, (int, float))
+            and not isinstance(row_timestamp, bool)
+            and isinstance(util_value, (int, float))
+            and not isinstance(util_value, bool)
+            and util_value > 0
+        ):
+            self.busy_timestamps.add(float(row_timestamp))
+        self.mem.add(gpu.get("mem_used_mib"))
+        self.total.add(gpu.get("mem_total_mib"))
+        self.temp.add(gpu.get("temperature_c"))
+        self.power.add(gpu.get("power_w"))
+
+    def summary(self, timestamps: _MinMax) -> dict[str, object]:
+        busy_min = self.busy_timestamps.minimum
+        busy_max = self.busy_timestamps.maximum
+        return {
+            "samples": self.samples,
+            "util_samples": self.util.count,
+            "util_mean_pct": self.util.mean,
+            "util_peak_pct": self.util.peak,
+            "util_busy_mean_pct": self.busy.mean,
+            "util_busy_samples": self.busy.count,
+            "busy_fraction_pct": (
+                100.0 * self.busy.count / self.util.count if self.util.count else None
+            ),
+            "first_busy_after_s": (
+                max(0.0, busy_min - timestamps.minimum)
+                if busy_min is not None and timestamps.minimum is not None
+                else None
+            ),
+            "last_busy_before_end_s": (
+                max(0.0, timestamps.maximum - busy_max)
+                if busy_max is not None and timestamps.maximum is not None
+                else None
+            ),
+            "mem_mean_mib": self.mem.mean,
+            "mem_peak_mib": self.mem.peak,
+            "mem_total_mib": self.total.peak,
+            "temperature_peak_c": self.temp.peak,
+            "power_mean_w": self.power.mean,
+            "power_peak_w": self.power.peak,
+        }
+
+
+class _ResourceAccumulator:
+    """Aggregate dt_resource_v1 rows one at a time.
+
+    Produces the same summary as the historical whole-list aggregation
+    (bit-identical sums, means, peaks, and interval statistics) while
+    retaining only fixed-size statistics plus the set of distinct
+    timestamps, so an unbounded ``--tail 0`` read no longer materializes
+    every parsed row and per-metric list.
+    """
+
+    __slots__ = (
+        "samples",
+        "timestamps",
+        "timestamp_count",
+        "distinct_timestamps",
+        "gpus",
+        "host_cpu",
+        "host_mem",
+        "host_total",
+        "host_io",
+        "gpu_error_count",
+        "gpu_error_last",
+        "job_count",
+        "job_cpu",
+        "job_rss",
+        "job_pss",
+        "job_pss_anon",
+        "job_processes",
+        "job_threads",
+        "job_reads",
+        "job_writes",
+        "phase_spans_done",
+        "phase_current",
+        "phase_accumulator",
+    )
+
+    def __init__(self) -> None:
+        self.samples = 0
+        self.timestamps = _MinMax()
+        self.timestamp_count = 0
+        self.distinct_timestamps: set[int | float] = set()
+        self.gpus: dict[str, _GpuStats] = {}
+        self.host_cpu = _SeriesStats()
+        self.host_mem = _SeriesStats()
+        self.host_total = _SeriesStats()
+        self.host_io = _SeriesStats()
+        self.gpu_error_count = 0
+        self.gpu_error_last: str | None = None
+        self.job_count = 0
+        self.job_cpu = _SeriesStats()
+        self.job_rss = _SeriesStats()
+        self.job_pss = _SeriesStats()
+        self.job_pss_anon = _SeriesStats()
+        self.job_processes = _SeriesStats()
+        self.job_threads = _SeriesStats()
+        self.job_reads = _SeriesStats()
+        self.job_writes = _SeriesStats()
+        self.phase_spans_done: list[dict[str, object]] | None = None
+        self.phase_current: str | None = None
+        self.phase_accumulator: _ResourceAccumulator | None = None
+
+    def add(self, row: JsonDict, *, track_phases: bool = True) -> None:
+        self.samples += 1
+        timestamp = row.get("timestamp")
+        if _valid_number(timestamp):
+            assert isinstance(timestamp, (int, float))
+            self.timestamp_count += 1
+            self.timestamps.add(timestamp)
+            self.distinct_timestamps.add(timestamp)
+        for gpu in row.get("gpus") or []:
+            if (
+                isinstance(gpu, dict)
+                and isinstance(gpu.get("index"), int)
+                and not isinstance(gpu.get("index"), bool)
+            ):
+                gpu = cast(JsonDict, gpu)
+                stats = self.gpus.setdefault(str(gpu["index"]), _GpuStats())
+                stats.add(gpu, timestamp)
+        host = row.get("host")
+        if isinstance(host, dict):
+            self.host_cpu.add(host.get("cpu_load1"))
+            self.host_mem.add(host.get("mem_used_mib"))
+            self.host_total.add(host.get("mem_total_mib"))
+            self.host_io.add(host.get("io_pressure"))
+        if row.get("gpu_error") not in (None, ""):
+            self.gpu_error_count += 1
+            self.gpu_error_last = str(row["gpu_error"])
+        job = row.get("job")
+        if isinstance(job, dict):
+            self.job_count += 1
+            self.job_cpu.add(job.get("cpu_pct"))
+            self.job_rss.add(job.get("rss_mib"))
+            self.job_pss.add(job.get("pss_mib"))
+            self.job_pss_anon.add(job.get("pss_anon_mib"))
+            self.job_processes.add(job.get("processes"))
+            self.job_threads.add(job.get("threads"))
+            self.job_reads.add(job.get("read_mib_s"))
+            self.job_writes.add(job.get("write_mib_s"))
+        if track_phases:
+            self._track_phase(row)
+
+    def _track_phase(self, row: JsonDict) -> None:
+        if self.phase_spans_done is None:
+            self.phase_spans_done = []
+        phase = row.get("phase")
+        if not safe_phase_name(phase):
+            self._close_phase()
+            return
+        if phase != self.phase_current:
+            self._close_phase()
+            self.phase_current = str(phase)
+            self.phase_accumulator = _ResourceAccumulator()
+        assert self.phase_accumulator is not None
+        self.phase_accumulator.add(row, track_phases=False)
+
+    def _close_phase(self) -> None:
+        if self.phase_current is not None and self.phase_accumulator is not None:
+            assert self.phase_spans_done is not None
+            sampled = self.phase_accumulator.summary(include_phases=False)
+            self.phase_spans_done.append(
+                {
+                    "phase": self.phase_current,
+                    "samples": sampled["samples"],
+                    "sampled_started_at": sampled["started_at"],
+                    "sampled_finished_at": sampled["finished_at"],
+                    "sampled_duration_s": sampled["duration_s"],
+                    "gpus": sampled["gpus"],
+                    "job": sampled["job"],
+                }
+            )
+        self.phase_current = None
+        self.phase_accumulator = None
+
+    def _sample_interval(self) -> int | float | None:
+        # Positive gaps between consecutive sorted timestamps telescope over
+        # duplicates, so summing the gaps of the distinct sorted values in
+        # ascending order reproduces the historical result bit for bit.
+        if len(self.distinct_timestamps) < 2:
+            return None
+        ordered = sorted(self.distinct_timestamps)
+        intervals = [later - earlier for earlier, later in zip(ordered, ordered[1:])]
+        return sum(intervals) / len(intervals)
+
+    def summary(self, *, include_phases: bool = True) -> dict[str, object]:
+        gpu_summary = {
+            index: stats.summary(self.timestamps)
+            for index, stats in sorted(self.gpus.items(), key=lambda item: int(item[0]))
+        }
+        job_summary = (
+            {
+                "samples": self.job_count,
+                "cpu_mean_pct": self.job_cpu.mean,
+                "cpu_peak_pct": self.job_cpu.peak,
+                "rss_mean_mib": self.job_rss.mean,
+                "rss_peak_mib": self.job_rss.peak,
+                "pss_samples": self.job_pss.count,
+                "pss_mean_mib": self.job_pss.mean,
+                "pss_peak_mib": self.job_pss.peak,
+                "pss_anon_samples": self.job_pss_anon.count,
+                "pss_anon_mean_mib": self.job_pss_anon.mean,
+                "pss_anon_peak_mib": self.job_pss_anon.peak,
+                "process_peak": self.job_processes.peak,
+                "thread_peak": self.job_threads.peak,
+                "read_mean_mib_s": self.job_reads.mean,
+                "read_peak_mib_s": self.job_reads.peak,
+                "write_mean_mib_s": self.job_writes.mean,
+                "write_peak_mib_s": self.job_writes.peak,
+            }
+            if self.job_count
+            else None
+        )
+        summary: dict[str, object] = {
+            "schema_version": "dt_resource_summary_v1",
+            "samples": self.samples,
+            "started_at": self.timestamps.minimum,
+            "finished_at": self.timestamps.maximum,
+            "duration_s": (
+                self.timestamps.maximum - self.timestamps.minimum
+                if self.timestamp_count >= 2
+                and self.timestamps.maximum is not None
+                and self.timestamps.minimum is not None
+                else 0.0
+            ),
+            "sample_interval_s": self._sample_interval(),
+            "gpus": gpu_summary,
+            "gpu_error_samples": self.gpu_error_count,
+            "gpu_error_last": self.gpu_error_last,
+            "job": job_summary,
+            "host": {
+                "cpu_load1_mean": self.host_cpu.mean,
+                "cpu_load1_peak": self.host_cpu.peak,
+                "mem_used_mean_mib": self.host_mem.mean,
+                "mem_used_peak_mib": self.host_mem.peak,
+                "mem_total_mib": self.host_total.peak,
+                "io_pressure_mean": self.host_io.mean,
+                "io_pressure_peak": self.host_io.peak,
+            },
+        }
+        if include_phases:
+            summary["phases"] = self.phase_spans()
+        return summary
+
+    def phase_spans(self) -> list[dict[str, object]]:
+        self._close_phase()
+        return list(self.phase_spans_done or [])
+
+
 def summarize_resources(
     rows: list[JsonDict], *, include_phases: bool = True
 ) -> dict[str, object]:
     """Aggregate dt_resource_v1 JSONL into a compact stable summary."""
-    timestamps = sorted(_numbers([row.get("timestamp") for row in rows]))
-    sample_intervals = [
-        later - earlier
-        for earlier, later in zip(timestamps, timestamps[1:])
-        if later > earlier
-    ]
-    gpu_samples: dict[str, list[JsonDict]] = {}
-    gpu_activity_samples: dict[str, list[tuple[object, object]]] = {}
+    accumulator = _ResourceAccumulator()
     for row in rows:
-        for gpu in row.get("gpus") or []:
-            if isinstance(gpu, dict) and isinstance(gpu.get("index"), int):
-                gpu = cast(JsonDict, gpu)
-                index = str(gpu["index"])
-                gpu_samples.setdefault(index, []).append(gpu)
-                gpu_activity_samples.setdefault(index, []).append(
-                    (row.get("timestamp"), gpu.get("utilization_pct"))
-                )
+        accumulator.add(row, track_phases=include_phases)
+    return accumulator.summary(include_phases=include_phases)
 
-    gpu_summary: dict[str, dict[str, object]] = {}
-    for index, samples in sorted(gpu_samples.items(), key=lambda item: int(item[0])):
-        util = _numbers([sample.get("utilization_pct") for sample in samples])
-        busy_util = [value for value in util if value > 0]
-        busy_timestamps = [
-            float(timestamp)
-            for timestamp, value in gpu_activity_samples[index]
-            if isinstance(timestamp, (int, float))
-            and not isinstance(timestamp, bool)
-            and isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and value > 0
-        ]
-        mem = _numbers([sample.get("mem_used_mib") for sample in samples])
-        total = _numbers([sample.get("mem_total_mib") for sample in samples])
-        temp = _numbers([sample.get("temperature_c") for sample in samples])
-        power = _numbers([sample.get("power_w") for sample in samples])
-        gpu_summary[index] = {
-            "samples": len(samples),
-            "util_samples": len(util),
-            "util_mean_pct": sum(util) / len(util) if util else None,
-            "util_peak_pct": max(util) if util else None,
-            "util_busy_mean_pct": (
-                sum(busy_util) / len(busy_util) if busy_util else None
-            ),
-            "util_busy_samples": len(busy_util),
-            "busy_fraction_pct": (100.0 * len(busy_util) / len(util) if util else None),
-            "first_busy_after_s": (
-                max(0.0, min(busy_timestamps) - min(timestamps))
-                if busy_timestamps and timestamps
-                else None
-            ),
-            "last_busy_before_end_s": (
-                max(0.0, max(timestamps) - max(busy_timestamps))
-                if busy_timestamps and timestamps
-                else None
-            ),
-            "mem_mean_mib": sum(mem) / len(mem) if mem else None,
-            "mem_peak_mib": max(mem) if mem else None,
-            "mem_total_mib": max(total) if total else None,
-            "temperature_peak_c": max(temp) if temp else None,
-            "power_mean_w": sum(power) / len(power) if power else None,
-            "power_peak_w": max(power) if power else None,
-        }
 
-    hosts = [
-        cast(JsonDict, host)
-        for row in rows
-        if isinstance((host := row.get("host")), dict)
-    ]
-    cpu = _numbers([host.get("cpu_load1") for host in hosts])
-    mem = _numbers([host.get("mem_used_mib") for host in hosts])
-    total = _numbers([host.get("mem_total_mib") for host in hosts])
-    io = _numbers([host.get("io_pressure") for host in hosts])
-    gpu_errors = [
-        str(row["gpu_error"]) for row in rows if row.get("gpu_error") not in (None, "")
-    ]
-    jobs = [
-        cast(JsonDict, job) for row in rows if isinstance((job := row.get("job")), dict)
-    ]
-    job_cpu = _numbers([job.get("cpu_pct") for job in jobs])
-    job_rss = _numbers([job.get("rss_mib") for job in jobs])
-    job_pss = _numbers([job.get("pss_mib") for job in jobs])
-    job_pss_anon = _numbers([job.get("pss_anon_mib") for job in jobs])
-    job_processes = _numbers([job.get("processes") for job in jobs])
-    job_threads = _numbers([job.get("threads") for job in jobs])
-    job_reads = _numbers([job.get("read_mib_s") for job in jobs])
-    job_writes = _numbers([job.get("write_mib_s") for job in jobs])
-    job_summary = (
-        {
-            "samples": len(jobs),
-            "cpu_mean_pct": (sum(job_cpu) / len(job_cpu) if job_cpu else None),
-            "cpu_peak_pct": max(job_cpu) if job_cpu else None,
-            "rss_mean_mib": (sum(job_rss) / len(job_rss) if job_rss else None),
-            "rss_peak_mib": max(job_rss) if job_rss else None,
-            "pss_samples": len(job_pss),
-            "pss_mean_mib": (sum(job_pss) / len(job_pss) if job_pss else None),
-            "pss_peak_mib": max(job_pss) if job_pss else None,
-            "pss_anon_samples": len(job_pss_anon),
-            "pss_anon_mean_mib": (
-                sum(job_pss_anon) / len(job_pss_anon) if job_pss_anon else None
-            ),
-            "pss_anon_peak_mib": max(job_pss_anon) if job_pss_anon else None,
-            "process_peak": max(job_processes) if job_processes else None,
-            "thread_peak": max(job_threads) if job_threads else None,
-            "read_mean_mib_s": (sum(job_reads) / len(job_reads) if job_reads else None),
-            "read_peak_mib_s": max(job_reads) if job_reads else None,
-            "write_mean_mib_s": (
-                sum(job_writes) / len(job_writes) if job_writes else None
-            ),
-            "write_peak_mib_s": max(job_writes) if job_writes else None,
-        }
-        if jobs
-        else None
-    )
-    summary: dict[str, object] = {
-        "schema_version": "dt_resource_summary_v1",
-        "samples": len(rows),
-        "started_at": min(timestamps) if timestamps else None,
-        "finished_at": max(timestamps) if timestamps else None,
-        "duration_s": (
-            max(timestamps) - min(timestamps) if len(timestamps) >= 2 else 0.0
-        ),
-        "sample_interval_s": (
-            sum(sample_intervals) / len(sample_intervals) if sample_intervals else None
-        ),
-        "gpus": gpu_summary,
-        "gpu_error_samples": len(gpu_errors),
-        "gpu_error_last": gpu_errors[-1] if gpu_errors else None,
-        "job": job_summary,
-        "host": {
-            "cpu_load1_mean": sum(cpu) / len(cpu) if cpu else None,
-            "cpu_load1_peak": max(cpu) if cpu else None,
-            "mem_used_mean_mib": sum(mem) / len(mem) if mem else None,
-            "mem_used_peak_mib": max(mem) if mem else None,
-            "mem_total_mib": max(total) if total else None,
-            "io_pressure_mean": sum(io) / len(io) if io else None,
-            "io_pressure_peak": max(io) if io else None,
-        },
-    }
-    if include_phases:
-        summary["phases"] = phase_resource_spans(rows)
-    return summary
+def summarize_resource_text(text: str) -> tuple[dict[str, object] | None, int]:
+    """Parse and aggregate telemetry text without materializing every row.
+
+    Returns ``(summary, invalid_line_count)``; the summary is ``None`` when
+    no line decodes to a row, mirroring the historical parse-then-summarize
+    behavior for interrupted final writes.
+    """
+    accumulator = _ResourceAccumulator()
+    rows_seen = 0
+    invalid = 0
+    for line in text.splitlines():
+        try:
+            row = json.loads(line, parse_constant=_reject_non_finite)
+        except (json.JSONDecodeError, ValueError):
+            invalid += 1
+            continue
+        if isinstance(row, dict):
+            rows_seen += 1
+            accumulator.add(cast(JsonDict, row))
+        else:
+            invalid += 1
+    if not rows_seen:
+        return None, invalid
+    return accumulator.summary(), invalid
 
 
 def phase_resource_spans(rows: list[JsonDict]) -> list[dict[str, object]]:
     """Summarize ordered consecutive safe phases from the existing samples."""
-    grouped: list[tuple[str, list[JsonDict]]] = []
-    current_phase: str | None = None
-    current_rows: list[JsonDict] = []
-
+    accumulator = _ResourceAccumulator()
     for row in rows:
-        phase = row.get("phase")
-        if not safe_phase_name(phase):
-            if current_phase is not None:
-                grouped.append((current_phase, current_rows))
-            current_phase = None
-            current_rows = []
-            continue
-        if phase != current_phase:
-            if current_phase is not None:
-                grouped.append((current_phase, current_rows))
-            current_phase = str(phase)
-            current_rows = []
-        current_rows.append(row)
-    if current_phase is not None:
-        grouped.append((current_phase, current_rows))
-
-    spans = []
-    for phase, phase_rows in grouped:
-        sampled = summarize_resources(phase_rows, include_phases=False)
-        spans.append(
-            {
-                "phase": phase,
-                "samples": sampled["samples"],
-                "sampled_started_at": sampled["started_at"],
-                "sampled_finished_at": sampled["finished_at"],
-                "sampled_duration_s": sampled["duration_s"],
-                "gpus": sampled["gpus"],
-                "job": sampled["job"],
-            }
-        )
-    return spans
+        accumulator.add(row)
+    return accumulator.phase_spans()

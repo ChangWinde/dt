@@ -123,6 +123,17 @@ bare-process jobs report advisory isolation, `enforced: false`, and unrestricted
 graphics-device access rather than implying that CUDA visibility is a physical
 device boundary.
 
+`dt info REF --json` also returns typed recovery `actions`: each entry carries
+`kind`, a ready-to-run `argv` with the full job ID, an `effect` of `observe`,
+`submit`, or `destructive`, and `requires_confirmation`. The list mirrors the
+human `next` hints: queued jobs point at `wait`/`free`, running jobs at
+`logs -f`/`metrics`, successes at `pull --lite`, and failures at the failure
+log plus evidence recovery, with `rerun` offered only where resubmission is
+safe. An uncertain launch or a lost job gets a `verified_kill` destructive
+action instead of a resubmission, because resubmitting an unproven-dead job
+can double-run the experiment. Agents must never execute a `destructive`
+action without explicit operator confirmation.
+
 `dt ps --json` returns complete history by default for compatibility. Explicit
 filters such as `--limit`, `--issues`, or `-s` narrow it. Human `dt ps`
 defaults to active work, uses a plain sentence for empty filters, and compacts
@@ -142,9 +153,12 @@ These options activate `dt_ps_query_v1`, an object containing `query`,
 `summary`, `page`, projected `jobs`, `partial`, and per-center `errors`.
 `page.next_cursor` is opaque and bound to the filters and ordering of the
 original query. `--since` observes registry lifecycle updates, not only newly
-created jobs. A mixed-version head may serve compact non-incremental queries
-through a full-array compatibility fallback; `--since` fails closed until that
-head supports the incremental contract.
+created jobs. Pagination anchors on the immutable creation keyset, so
+following the cursor chain returns every row that matched when the
+enumeration started; rows that change mid-enumeration surface in the next
+`--since` window. A mixed-version head may serve compact non-incremental
+queries through a full-array compatibility fallback; `--since` fails closed
+until that head supports the incremental contract.
 
 Use command-specific detail views when diagnosing:
 

@@ -8,6 +8,7 @@ from dt.private_state import (
     PrivateStateError,
     atomic_write,
     atomic_write_regular,
+    bounded_directory_reader,
     ensure_private_directory,
     private_lock,
     read_bounded,
@@ -119,3 +120,47 @@ def test_private_lock_reports_a_nonblocking_contender(tmp_path):
         with private_lock(path, blocking=False) as contender:
             assert owner is True
             assert contender is False
+
+
+def test_directory_reader_matches_read_bounded_under_one_descriptor(tmp_path):
+    directory = tmp_path / "registry"
+    directory.mkdir(mode=0o700)
+    for index in range(3):
+        atomic_write(directory / f"job-{index}.json", f'{{"i": {index}}}'.encode())
+
+    with bounded_directory_reader(directory, max_bytes=64) as read_name:
+        assert read_name is not None
+        for index in range(3):
+            batch = read_name(f"job-{index}.json")
+            single = read_bounded(directory / f"job-{index}.json", max_bytes=64)
+            assert batch is not None and single is not None
+            assert batch[0] == single[0]
+        assert read_name("gone.json") is None
+        with pytest.raises(PrivateStateError, match="unsafe private state name"):
+            read_name("../escape.json")
+
+    with bounded_directory_reader(tmp_path / "absent", max_bytes=64) as read_name:
+        assert read_name is None
+
+
+def test_directory_reader_refuses_symlinks_and_repairs_stray_modes(tmp_path):
+    directory = tmp_path / "registry"
+    directory.mkdir(mode=0o700)
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(b"{}")
+    (directory / "alias.json").symlink_to(outside)
+    stray = directory / "stray.json"
+    stray.write_bytes(b"{}")
+    os.chmod(stray, 0o644)
+    oversized = directory / "big.json"
+    oversized.write_bytes(b"x" * 65)
+
+    with bounded_directory_reader(directory, max_bytes=64) as read_name:
+        assert read_name is not None
+        with pytest.raises(PrivateStateError):
+            read_name("alias.json")
+        result = read_name("stray.json")
+        assert result is not None and result[0] == b"{}"
+        assert os.stat(stray).st_mode & 0o777 == 0o600
+        with pytest.raises(PrivateStateError, match="size limit"):
+            read_name("big.json")

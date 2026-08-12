@@ -4314,9 +4314,9 @@ def _ps_rows_filters(rows: list[JsonDict]) -> frozenset[str]:
     return value if isinstance(value, frozenset) else frozenset(value)
 
 
-def _humanize_ps_references(rows: list[JsonDict]) -> _PsRows:
-    """Replace exact job ids in human diagnostics with their routable refs."""
-    replacements = sorted(
+def _ps_reference_replacements(rows: list[JsonDict]) -> list[tuple[str, str]]:
+    """Longest-first (job id, display ref) pairs for diagnostic rewriting."""
+    return sorted(
         (
             (str(row["job_id"]), str(row["display_ref"]))
             for row in rows
@@ -4326,6 +4326,23 @@ def _humanize_ps_references(rows: list[JsonDict]) -> _PsRows:
         ),
         key=lambda pair: len(pair[0]),
         reverse=True,
+    )
+
+
+def _humanize_ps_references(
+    rows: list[JsonDict],
+    *,
+    reference_rows: list[JsonDict] | None = None,
+) -> _PsRows:
+    """Replace exact job ids in human diagnostics with their routable refs.
+
+    ``reference_rows`` supplies the replacement table when only a visible
+    slice is rewritten: a visible diagnostic may name a job the view hides
+    (for example a failed predecessor), so the table must always come from
+    the full row set.
+    """
+    replacements = _ps_reference_replacements(
+        rows if reference_rows is None else reference_rows
     )
     rendered_rows: list[JsonDict] = []
     for row in rows:
@@ -5050,7 +5067,7 @@ def _gather_laptop_ps_query(
         issues_only=issues_only,
         since=since,
     )
-    order = ps_query_mod.order_field(since)
+    order = ps_query_mod.ORDER_FIELD
     global_page = ps_query_mod.paginate(
         candidates,
         limit=limit,
@@ -5163,11 +5180,16 @@ def _ps_view(
     title: str = "Active jobs",
     empty_text: str = "no active jobs",
 ) -> Any:
-    visible = _visible_ps_rows(
-        rows,
-        all_=all_,
-        limit=limit,
-        recent=recent,
+    # Rewrite diagnostics only for the rows the view will render; the
+    # replacement table still comes from the full row set.
+    visible = _humanize_ps_references(
+        _visible_ps_rows(
+            rows,
+            all_=all_,
+            limit=limit,
+            recent=recent,
+        ),
+        reference_rows=rows,
     )
     total = _ps_rows_total(rows)
     shown = f"{len(visible)}/{total} jobs" if len(visible) != total else f"{total} jobs"
@@ -5383,7 +5405,7 @@ def ps(
                 limit=query_limit,
                 cursor=cursor,
                 digest=digest,
-                order=ps_query_mod.order_field(parsed_since),
+                order=ps_query_mod.ORDER_FIELD,
             )
     except ps_query_mod.QueryError as exc:
         _fail_submission(
@@ -5524,7 +5546,6 @@ def ps(
 
                 refresh_started = time.monotonic()
                 rows, errors = gather(include_progress=True)
-                rows = _humanize_ps_references(rows)
                 with Live(
                     _ps_view(
                         rows,
@@ -5546,7 +5567,6 @@ def ps(
                         _sleep_for_poll_interval(refresh_started, poll)
                         refresh_started = time.monotonic()
                         rows, errors = gather(include_progress=True)
-                        rows = _humanize_ps_references(rows)
                         live.update(
                             _ps_view(
                                 rows,
@@ -5638,12 +5658,16 @@ def ps(
             )
         print(json.dumps(rows))  # stable default contract: json is never truncated
         return
-    rows = _humanize_ps_references(rows)
-    visible = _visible_ps_rows(
-        rows,
-        all_=all_,
-        limit=limit,
-        recent=recent_view,
+    # Rewrite diagnostics only for the visible slice; the replacement table
+    # still comes from the full row set so hidden predecessors stay routable.
+    visible = _humanize_ps_references(
+        _visible_ps_rows(
+            rows,
+            all_=all_,
+            limit=limit,
+            recent=recent_view,
+        ),
+        reference_rows=rows,
     )
     total = _ps_rows_total(rows)
     if limit is not None and len(visible) != total:
@@ -5951,14 +5975,6 @@ def _parse_job_log_tail_response(
                 resource_sample = _safe_job_resource_sample(candidate_sample)
     tail = _sanitize_log_text("".join(lines[tail_start:]))
     return path, display, tail, updated_at, resource_sample
-
-
-def _parse_job_log_tail(entry: jobs_mod.JobEntry, text: str) -> tuple[str, str, str]:
-    """Parse a smart-tail response; accept old raw-tail fixtures as stdout."""
-    path, display, tail, _updated_at, _resource = _parse_job_log_tail_response(
-        entry, text
-    )
-    return path, display, tail
 
 
 def _parse_log_progress(text: str) -> JsonDict | None:
@@ -7342,16 +7358,17 @@ def wait(
         raise typer.Exit(rc)
 
     entries: list[jobs_mod.JobEntry] = []
-    for ref in refs:
-        entry = jobs_mod.find(cfg, ref)
-        if entry is None:
-            _fail_submission(
-                kind="not_found",
-                message=f"no job matching {ref!r}",
-                exit_code=65,
-                json_=json_,
-            )
-        entries.append(entry)
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        for ref in refs:
+            entry = jobs_mod.find(cfg, ref)
+            if entry is None:
+                _fail_submission(
+                    kind="not_found",
+                    message=f"no job matching {ref!r}",
+                    exit_code=65,
+                    json_=json_,
+                )
+            entries.append(entry)
     if len({entry.job_id for entry in entries}) != len(entries):
         _fail_submission(
             kind="invalid_argument",
@@ -8732,6 +8749,86 @@ def _info_command_text(
     return result
 
 
+def _info_action(
+    kind: str,
+    argv: list[str],
+    *,
+    effect: str = "observe",
+    requires_confirmation: bool = False,
+) -> JsonDict:
+    return {
+        "kind": kind,
+        "argv": argv,
+        "effect": effect,
+        "requires_confirmation": requires_confirmation,
+    }
+
+
+def _info_actions(entry: jobs_mod.JobEntry) -> list[JsonDict]:
+    """Typed recovery actions for one job, mirroring the human hints.
+
+    ``argv`` always carries the full job id so an agent never re-resolves a
+    compact reference.  ``effect`` is ``observe``, ``submit``, or
+    ``destructive``; a destructive action requires explicit confirmation and
+    must never run unattended.  An uncertain launch and a lost job get a
+    verified kill instead of a resubmission, because resubmitting an
+    unproven-dead job can double-run the experiment.
+    """
+    job_id = entry.job_id
+    if entry.status == "queued":
+        return [
+            _info_action("wait_for_terminal_state", ["dt", "wait", job_id]),
+            _info_action("show_capacity", ["dt", "free"]),
+        ]
+    if entry.status == "running":
+        return [
+            _info_action("follow_log", ["dt", "logs", job_id, "-f"]),
+            _info_action("watch_resources", ["dt", "metrics", job_id]),
+        ]
+    if _is_uncertain_launch(entry) or entry.status == "lost":
+        return [
+            _info_action(
+                "inspect_launch_evidence", ["dt", "logs", job_id, "-n", "200"]
+            ),
+            _info_action(
+                "verified_kill",
+                ["dt", "kill", job_id],
+                effect="destructive",
+                requires_confirmation=True,
+            ),
+        ]
+    result_state = jobs_mod.effective_result_state(entry)
+    if result_state == "success":
+        return [
+            _info_action("recover_outputs", ["dt", "pull", job_id, "--lite"]),
+            _info_action("review_resources", ["dt", "metrics", job_id]),
+        ]
+    if result_state == "dependency_skipped":
+        predecessor = entry.after_success or entry.after_complete or entry.after_result
+        if predecessor:
+            return [_info_action("inspect_predecessor", ["dt", "info", predecessor])]
+        return []
+    if result_state in {"execution_failure", "infra_failure"}:
+        return [
+            _info_action("inspect_failure_log", ["dt", "logs", job_id, "-n", "200"]),
+            _info_action("recover_evidence", ["dt", "pull", job_id, "--lite"]),
+            _info_action(
+                "resubmit_current_code",
+                ["dt", "rerun", job_id],
+                effect="submit",
+            ),
+        ]
+    if result_state in {"scientific_reject", "cancelled", "guard_terminated"}:
+        # A scientific reject is an outcome, not an infrastructure fault, and
+        # a guard termination would trip again unchanged: recover evidence
+        # instead of suggesting an identical resubmission.
+        return [
+            _info_action("inspect_failure_log", ["dt", "logs", job_id, "-n", "200"]),
+            _info_action("recover_evidence", ["dt", "pull", job_id, "--lite"]),
+        ]
+    return []
+
+
 def info(
     ref: str = REF_ARG,
     json_: bool = typer.Option(False, "--json"),
@@ -8907,6 +9004,7 @@ def info(
         "after_result": entry.after_result,
         "after_result_states": list(entry.after_result_states),
         "result_state": jobs_mod.effective_result_state(entry),
+        "actions": _info_actions(entry),
         "rerun_of": entry.rerun_of,
         "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
         "rerun_snapshot_changed": entry.rerun_snapshot_changed,
@@ -10120,16 +10218,17 @@ def compare(
                 )
     else:
         entries = []
-        for ref in refs:
-            entry = jobs_mod.find(cfg, ref)
-            if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=EXIT_NOT_FOUND,
-                    json_=json_,
-                )
-            entries.append(entry)
+        with jobs_mod.shared_resolution_snapshot(cfg):
+            for ref in refs:
+                entry = jobs_mod.find(cfg, ref)
+                if entry is None:
+                    _fail_submission(
+                        kind="not_found",
+                        message=f"no job matching {ref!r}",
+                        exit_code=EXIT_NOT_FOUND,
+                        json_=json_,
+                    )
+                entries.append(entry)
 
     if len({entry.job_id for entry in entries}) != len(entries):
         _fail_submission(
@@ -10321,19 +10420,20 @@ def watch(
         return True
 
     entries = []
-    for ref in refs:
-        if json_:
-            entry = jobs_mod.find(cfg, ref)
-            if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=EXIT_NOT_FOUND,
-                    json_=True,
-                )
-        else:
-            entry = _find_or_die(cfg, ref)
-        entries.append(entry)
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        for ref in refs:
+            if json_:
+                entry = jobs_mod.find(cfg, ref)
+                if entry is None:
+                    _fail_submission(
+                        kind="not_found",
+                        message=f"no job matching {ref!r}",
+                        exit_code=EXIT_NOT_FOUND,
+                        json_=True,
+                    )
+            else:
+                entry = _find_or_die(cfg, ref)
+            entries.append(entry)
     job_ids = [entry.job_id for entry in entries]
     if len(set(job_ids)) != len(job_ids):
         _fail_submission(
@@ -12278,7 +12378,8 @@ def pull(
             )
         raise typer.Exit(rc)
 
-    entries = [jobs_mod.find(cfg, ref) for ref in refs]
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        entries = [jobs_mod.find(cfg, ref) for ref in refs]
     if len(entries) == 1 and entries[0] is None:
         _pull_unlocked(
             refs[0],

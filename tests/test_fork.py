@@ -117,6 +117,66 @@ def test_capture_snapshot_is_content_addressed_and_immutable(tmp_path):
     assert list(cfg.snapshots_dir().glob(".capture-*")) == []
 
 
+def test_unchanged_capture_skips_the_rebuild_but_declines_on_any_change(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    project = cfg.projects["p"].path
+    (project / "train.py").write_text("print('v1')\n")
+    package = project / "pkg"
+    package.mkdir()
+    util = package / "util.py"
+    util.write_text("x = 1\n")
+
+    first = dispatch.capture_snapshot(cfg, "p", project)
+
+    calls: list[dict] = []
+    real_rsync = dispatch.rsync
+
+    def recording_rsync(src, dst, **kwargs):
+        calls.append(kwargs)
+        return real_rsync(src, dst, **kwargs)
+
+    monkeypatch.setattr(dispatch, "rsync", recording_rsync)
+
+    unchanged = dispatch.capture_snapshot(cfg, "p", project)
+    assert unchanged.sha256 == first.sha256
+    # One quiet checksum dry-run replaced the rebuild entirely.
+    assert [call.get("dry_run", False) for call in calls] == [True]
+    assert list(cfg.snapshots_dir().glob(".capture-*")) == []
+
+    # A content edit inside a subdirectory declines the fast path.
+    calls.clear()
+    util.write_text("x = 2\n")
+    edited = dispatch.capture_snapshot(cfg, "p", project)
+    assert edited.sha256 != first.sha256
+    assert [call.get("dry_run", False) for call in calls] == [True, False]
+
+    # The tree digest covers permissions, so a mode-only flip must also
+    # decline the fast path and produce a new digest.
+    util.chmod(0o755)
+    mode_flipped = dispatch.capture_snapshot(cfg, "p", project)
+    assert mode_flipped.sha256 != edited.sha256
+
+    # A deletion must be seen through the --delete arm of the dry-run.
+    util.unlink()
+    deleted = dispatch.capture_snapshot(cfg, "p", project)
+    assert deleted.sha256 not in {first.sha256, edited.sha256, mode_flipped.sha256}
+
+
+def test_unchanged_capture_still_refuses_a_tampered_store(tmp_path):
+    cfg = _cfg(tmp_path)
+    project = cfg.projects["p"].path
+    (project / "train.py").write_text("print('v1')\n")
+
+    first = dispatch.capture_snapshot(cfg, "p", project)
+    meta = first.code_dir.parent / "meta.json"
+    meta.write_text(json.dumps({"snapshot_sha256": "0" * 64}))
+
+    with pytest.raises(dispatch.DispatchError, match="identity mismatched"):
+        dispatch.capture_snapshot(cfg, "p", project)
+
+
 def test_resolve_snapshot_backfill_requires_original_digest(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     remote_code = tmp_path / "executed-code"

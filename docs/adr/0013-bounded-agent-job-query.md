@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted; amended 2026-08-12 — pagination anchors on the immutable creation
+keyset for incremental queries too, because a mutable `updated_at` anchor let
+rows vanish from an enumeration (see Decision and Consequences).
 
 ## Context
 
@@ -62,10 +64,11 @@ and cursor pagination activate `dt_ps_query_v1`, which contains:
 - partial-center errors.
 
 The canonical boundary format remains JSON.  Rows are ordered newest first by
-`created_at`; incremental queries order by registry `updated_at`.  The cursor
-contains a validated keyset anchor and a digest of selection semantics.  It is
-opaque convenience state, not an authorization token.  Changing filters or
-the ordering contract invalidates it.
+the immutable `(created_at, job id)` keyset for every query, including
+incremental ones; `--since` selection still matches on registry `updated_at`.
+The cursor contains a validated keyset anchor and a digest of selection
+semantics.  It is opaque convenience state, not an authorization token.
+Changing filters or the ordering contract invalidates it.
 
 Every registry save records `updated_at`.  Legacy records use their atomic
 registry file modification time until first rewritten.  Field projection is
@@ -78,6 +81,13 @@ reports unreachable centers without claiming a complete result.
 Agents can poll summaries or small pages without loading commands, paths, and
 provenance.  Complete detail remains available through legacy `ps --json` and
 job-scoped `info --json`.  Keyset pagination avoids offset drift from newly
-submitted jobs, but it is a live view rather than snapshot isolation: a job
-whose state changes between pages may move in `updated_at` order.  Agents that
-need transitions should use `since` with overlap and deduplicate by job ID.
+submitted jobs.  Because the anchor is immutable, a row cannot move relative
+to the cursor: following the cursor chain returns every row that matched when
+the enumeration started, each exactly once, with the freshest state at read
+time.  A row that first becomes eligible while pages are being fetched
+surfaces in the next `since` window instead of silently disappearing, so
+agents should advance their watermark from the first page's `generated_at`
+and deduplicate by job ID across windows.  The original design anchored
+incremental queries on mutable `updated_at`; a job that changed between page
+fetches moved above the cursor and vanished from the enumeration entirely,
+which is why the anchor was amended.

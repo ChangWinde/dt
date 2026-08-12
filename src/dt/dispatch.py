@@ -1918,6 +1918,35 @@ def _commit_snapshot_dir(
     return stored
 
 
+def _source_matches_baseline(
+    cfg: HeadConfig,
+    project_dir: Path,
+    baseline: Path,
+) -> bool:
+    """True only when a checksum dry-run proves the source tree unchanged.
+
+    The comparison mirrors the capture exactly: the same excludes, archive
+    metadata, and checksum content comparison, plus ``--delete`` so a file
+    removed from the source counts as a change.  Any itemized line, any
+    unexpected output, or a nonzero exit declines the fast path; only a
+    completely quiet dry-run may skip the rebuild, and the reused store is
+    still re-hashed by ``_validate_stored_snapshot`` before it is returned.
+    The trust in rsync's checksum comparison is not new: the full capture
+    already relies on it to decide which baseline files to hard-link.
+    """
+    proc = rsync(
+        f"{project_dir}/",
+        f"{baseline}/",
+        excludes=_excludes(cfg),
+        delete=True,
+        timeout=BULK_TRANSFER_TIMEOUT_S,
+        checksum=True,
+        dry_run=True,
+        itemize=True,
+    )
+    return proc.returncode == 0 and not proc.stdout.strip()
+
+
 def capture_snapshot(
     cfg: HeadConfig,
     project_name: str,
@@ -1928,7 +1957,9 @@ def capture_snapshot(
 
     Consecutive snapshots hard-link unchanged files to the previous immutable
     store, so a one-line experiment edit consumes roughly one file of extra
-    disk.  Job workdirs never hard-link back to this store.
+    disk.  Job workdirs never hard-link back to this store.  A source tree
+    proven unchanged by a checksum dry-run reuses the re-verified baseline
+    store without rebuilding and re-hashing a capture tree.
     """
     stores = cfg.snapshots_dir()
     with _snapshot_store_lock(cfg):
@@ -1939,6 +1970,19 @@ def capture_snapshot(
             if baseline_digest and _snapshot_path(cfg, baseline_digest).is_dir()
             else None
         )
+        if (
+            baseline is not None
+            and baseline_digest is not None
+            and _source_matches_baseline(cfg, project_dir, baseline)
+        ):
+            stored = _validate_stored_snapshot(cfg, baseline_digest)
+            # Same in-flight protection and bookkeeping as a rebuilt capture
+            # that resolves to an already-archived digest.
+            os.utime(stored.code_dir.parent)
+            state[project_name] = baseline_digest
+            _save_snapshot_store_state(cfg, state)
+            log(f"source unchanged; reusing verified snapshot {baseline_digest[:12]}")
+            return stored
         temp_root = Path(tempfile.mkdtemp(prefix=".capture-", dir=stores))
         code = temp_root / "code"
         code.mkdir()
@@ -1971,7 +2015,8 @@ def capture_snapshot(
             shutil.rmtree(temp_root, ignore_errors=True)
 
 
-def _code_src(node: Node, job_dir: str) -> str:
+def _code_endpoint(node: Node, job_dir: str) -> str:
+    """One rsync endpoint for a job's code tree, source or destination."""
     return rsync_destination(
         node.name,
         node.local,
@@ -2014,7 +2059,7 @@ def resolve_snapshot(
     try:
         log(f"backfilling exact snapshot {digest[:12]} from {entry.node}")
         proc = rsync(
-            _code_src(node, entry.job_dir),
+            _code_endpoint(node, entry.job_dir),
             f"{temp_code}/",
             excludes=_excludes(cfg),
             timeout=BULK_TRANSFER_TIMEOUT_S,
@@ -2439,15 +2484,6 @@ def _setup_input_identities(
     return identities
 
 
-def _code_dst(node: Node, job_dir: str) -> str:
-    return rsync_destination(
-        node.name,
-        node.local,
-        f"{job_dir}/code",
-        directory=True,
-    )
-
-
 def _job_dst(node: Node, job_dir: str) -> str:
     return rsync_destination(
         node.name,
@@ -2551,7 +2587,7 @@ def snapshot(
             def transfer_code(checksum: bool) -> subprocess.CompletedProcess[str]:
                 return rsync(
                     f"{project_dir}/",
-                    _code_dst(node, job_dir),
+                    _code_endpoint(node, job_dir),
                     excludes=None if pre_filtered else _excludes(cfg),
                     # Relative to the destination code dir, so this resolves on
                     # the node regardless of where its home is.
@@ -4724,7 +4760,7 @@ def _dispatch_queued_active(
                 ) -> subprocess.CompletedProcess[str]:
                     return rsync(
                         f"{staged_code}/",
-                        _code_dst(node, node_job_dir),
+                        _code_endpoint(node, node_job_dir),
                         link_dest=link_dest,
                         copy_dest=stable_copy_dest,
                         timeout=BULK_TRANSFER_TIMEOUT_S,
@@ -4784,7 +4820,7 @@ def _dispatch_queued_active(
             # remote worktree) may have left generated files under code/.
             proc = rsync(
                 f"{staging}/code/",
-                _code_dst(node, node_job_dir),
+                _code_endpoint(node, node_job_dir),
                 delete=True,
                 timeout=BULK_TRANSFER_TIMEOUT_S,
                 retries=2,

@@ -121,8 +121,11 @@ def parse_since(value: str | None) -> float | None:
     return candidate
 
 
-def order_field(since: float | None) -> str:
-    return "updated_at" if since is not None else "created_at"
+# Pagination anchors on the immutable creation keyset for every query,
+# including incremental ones.  Anchoring on mutable ``updated_at`` let a row
+# that changed between page fetches move above the cursor and silently vanish
+# from the enumeration; ``--since`` selection still observes lifecycle updates.
+ORDER_FIELD = "created_at"
 
 
 def selection_digest(
@@ -137,7 +140,7 @@ def selection_digest(
         {
             "active_only": active_only,
             "issues_only": issues_only,
-            "order": order_field(since),
+            "order": ORDER_FIELD,
             "since": since,
             "status": status,
         },
@@ -365,7 +368,7 @@ def query_contract(
         "active_only": active_only,
         "issues_only": issues_only,
         "since": since,
-        "order": order_field(since),
+        "order": ORDER_FIELD,
         "fields": [] if summary_only else list(selected_fields),
         "limit": limit,
         "cursor_supplied": cursor is not None,
@@ -396,7 +399,7 @@ def build_payload(
         issues_only=issues_only,
         since=since,
     )
-    order = order_field(since)
+    order = ORDER_FIELD
     page = paginate(
         matching,
         limit=limit,

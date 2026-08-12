@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import json
 
 import pytest
@@ -173,10 +174,82 @@ def test_incremental_query_orders_lifecycle_updates_not_creation():
         limit=10,
         cursor=None,
         digest=digest,
-        order=ps_query.order_field(15),
+        order=ps_query.ORDER_FIELD,
     )
 
     assert [row["job_id"] for row in page.rows] == ["old-changed"]
+
+
+def test_since_pagination_does_not_lose_rows_that_update_between_pages():
+    newer = _row("job-new", created_at=30, updated_at=30)
+    older = _row("job-old", created_at=20, updated_at=25)
+    digest = ps_query.selection_digest(
+        status=None,
+        active_only=False,
+        issues_only=False,
+        since=10,
+    )
+
+    page_one = ps_query.paginate(
+        ps_query.filter_since([newer, older], 10),
+        limit=1,
+        cursor=None,
+        digest=digest,
+        order=ps_query.ORDER_FIELD,
+    )
+    assert [row["job_id"] for row in page_one.rows] == ["job-new"]
+    assert page_one.next_cursor is not None
+
+    # The unreturned row reaches a terminal state between the two page
+    # fetches.  With the historical mutable updated_at anchor its key moved
+    # above the cursor and the row silently vanished from the enumeration.
+    older_after_update = dict(older, status="finished", updated_at=40)
+    page_two = ps_query.paginate(
+        ps_query.filter_since([newer, older_after_update], 10),
+        limit=1,
+        cursor=page_one.next_cursor,
+        digest=digest,
+        order=ps_query.ORDER_FIELD,
+    )
+
+    assert [row["job_id"] for row in page_two.rows] == ["job-old"]
+    assert page_two.next_cursor is None
+
+
+def test_since_cursor_from_the_mutable_order_era_is_rejected():
+    legacy_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "active_only": False,
+                "issues_only": False,
+                "order": "updated_at",
+                "since": 10.0,
+                "status": None,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    legacy_cursor = ps_query.continuation_cursor(
+        _row("job-a", created_at=1, updated_at=12),
+        digest=legacy_digest,
+        order="updated_at",
+    )
+    digest = ps_query.selection_digest(
+        status=None,
+        active_only=False,
+        issues_only=False,
+        since=10.0,
+    )
+
+    with pytest.raises(ps_query.QueryError):
+        ps_query.paginate(
+            [_row("job-a", created_at=1, updated_at=12)],
+            limit=1,
+            cursor=legacy_cursor,
+            digest=digest,
+            order=ps_query.ORDER_FIELD,
+        )
 
 
 def test_summary_and_projection_are_bounded():
