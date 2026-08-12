@@ -161,6 +161,70 @@ def test_agent_exits_if_hot_reloaded_config_changes_to_laptop_role(
     assert not agent._pid_path(original).exists()
 
 
+def test_rejected_replacement_is_retried_after_its_deadline():
+    import dt.agent as agent
+
+    assert agent._latched((2, 100.0), 2, 50.0) is True
+    assert agent._latched((2, 100.0), 2, 100.0) is False
+    assert agent._latched((2, 100.0), 3, 50.0) is False
+    assert agent._latched(None, 2, 50.0) is False
+
+
+def _fake_dt_bin(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".local" / "bin").mkdir(parents=True)
+    (home / ".local" / "bin" / "dt").write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+
+def test_agent_stays_alive_when_replacement_preflight_fails(
+    tmp_path, monkeypatch, capsys
+):
+    import dt.agent as agent
+    import dt.config as config
+
+    original = _cfg(tmp_path / "original")
+    replacement = _cfg(tmp_path / "replacement")
+    loads = iter([original])
+    monkeypatch.setattr(config, "load", lambda: next(loads, replacement))
+    fingerprints = iter([1])
+    monkeypatch.setattr(agent, "_code_fingerprint", lambda: next(fingerprints, 2))
+    monkeypatch.setattr(
+        agent, "_restart_preflight", lambda _bin: (False, "broken import")
+    )
+    _fake_dt_bin(tmp_path, monkeypatch)
+
+    assert agent.run_loop(original) == AGENT_CONFIG_RESTART_EXIT
+
+    output = capsys.readouterr().out
+    assert "replacement preflight failed" in output
+    assert "retrying within" in output
+    assert "agent runtime identity changed" in output
+
+
+def test_agent_restart_exec_failure_exits_for_supervisor(tmp_path, monkeypatch, capsys):
+    import dt.agent as agent
+    import dt.config as config
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(config, "load", lambda: cfg)
+    fingerprints = iter([1])
+    monkeypatch.setattr(agent, "_code_fingerprint", lambda: next(fingerprints, 2))
+    monkeypatch.setattr(agent, "_restart_preflight", lambda _bin: (True, None))
+    _fake_dt_bin(tmp_path, monkeypatch)
+
+    def _refuse_exec(*_args):
+        raise OSError(8, "exec format error")
+
+    monkeypatch.setattr(agent.os, "execvp", _refuse_exec)
+
+    assert agent.run_loop(cfg) == AGENT_CONFIG_RESTART_EXIT
+
+    output = capsys.readouterr().out
+    assert "restart exec failed" in output
+    assert "agent down" in output
+
+
 def test_pick_candidates_enforces_known_disk_contract_but_allows_unknown_state():
     nodes = [Node(name="low"), Node(name="fit"), Node(name="unknown")]
     statuses = [
@@ -2656,3 +2720,18 @@ def test_code_fingerprint_tolerates_a_file_that_vanishes_mid_scan(
     monkeypatch.setattr(agent, "__file__", str(pkg / "agent.py"))
 
     assert agent._code_fingerprint() == good.stat().st_mtime_ns
+
+
+def test_code_fingerprint_pauses_when_package_dir_is_unreadable(tmp_path, monkeypatch):
+    from dt import agent
+
+    pkg = tmp_path / "pkg"
+    (pkg / "payload").mkdir(parents=True)
+    monkeypatch.setattr(agent, "__file__", str(pkg / "agent.py"))
+    pkg.chmod(0o000)
+    try:
+        # glob() swallows the permission error and yields nothing; an empty
+        # scan must read as "unknown", not as a changed fingerprint.
+        assert agent._code_fingerprint() is None
+    finally:
+        pkg.chmod(0o700)

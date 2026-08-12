@@ -71,6 +71,10 @@ AGENT_LOG_BACKUPS = 2
 SYSTEMD_UNIT_MAX_BYTES = 64 * 1024
 AGENT_CONFIG_RESTART_EXIT = 75
 AGENT_CONFIG_INVALID_ROLE_EXIT = 78
+# A replacement that failed its restart preflight is retried after this long,
+# so a transient failure (load, disk hiccup) cannot permanently pin an old
+# agent to stale code.
+PREFLIGHT_RETRY_S = 300.0
 
 
 def _runtime_identity(cfg: HeadConfig) -> tuple[str, str, str]:
@@ -674,11 +678,21 @@ def process_once(
     return _process_once_with_snapshot(cfg, log)[0]
 
 
-def _code_fingerprint() -> int:
+def _code_fingerprint() -> int | None:
     """Max mtime over the dt package sources. Editable installs (and deploys)
-    change files in place; the agent restarts itself to pick them up."""
+    change files in place; the agent restarts itself to pick them up.
+    Returns None when the package cannot be scanned at all, so a mid-deploy
+    unreadable directory pauses self-upgrade instead of killing the loop."""
     pkg = Path(__file__).parent
-    files = list(pkg.glob("*.py")) + list((pkg / "payload").glob("*.sh"))
+    try:
+        files = list(pkg.glob("*.py")) + list((pkg / "payload").glob("*.sh"))
+    except OSError:
+        return None
+    if not files:
+        # The package always ships *.py sources; an empty scan means the
+        # directory itself was unreadable (glob swallows the error) or is
+        # mid-replacement by a deploy.
+        return None
     mtimes: list[int] = []
     for path in files:
         try:
@@ -688,7 +702,18 @@ def _code_fingerprint() -> int:
             # stat. A transient scan error must not kill the agent (this runs
             # outside the poll keep-alive); ignore it and use what is readable.
             continue
-    return max(mtimes, default=0)
+    if not mtimes:
+        return None
+    return max(mtimes)
+
+
+def _latched(
+    rejected: tuple[int, float] | None,
+    fingerprint: int,
+    now: float,
+) -> bool:
+    """A rejected replacement fingerprint is retried after its deadline."""
+    return rejected is not None and rejected[0] == fingerprint and now < rejected[1]
 
 
 def _restart_preflight(
@@ -934,9 +959,10 @@ def run_loop(cfg: HeadConfig) -> int:
     )
     born_with = _code_fingerprint()
     born_identity = _runtime_identity(cfg)
-    rejected_restart_fingerprint: int | None = None
+    rejected_restart: tuple[int, float] | None = None
     completion_watchers: dict[str, subprocess.Popen[bytes]] = {}
     blocked_log_state: dict[str, str] = {}
+    fd_released = False
     try:
         while not stop["flag"]:
             queue_active: bool | None = None
@@ -977,30 +1003,65 @@ def run_loop(cfg: HeadConfig) -> int:
                 rotate_log()
             except Exception as e:  # keep the loop alive, always
                 log(f"poll error: {e}")
-            dt_bin = Path.home() / ".local/bin/dt"
+            dt_bin: Path | None
+            try:
+                dt_bin = Path.home() / ".local/bin/dt"
+            except (OSError, RuntimeError) as exc:
+                # A supervisor with a stripped environment (no resolvable
+                # home) must not kill the queue loop; self-upgrade simply
+                # stays off until the environment is coherent again.
+                log(f"self-upgrade check skipped: {exc}")
+                dt_bin = None
             current_fingerprint = _code_fingerprint()
+            now = time.monotonic()
             if (
-                current_fingerprint != born_with
-                and current_fingerprint != rejected_restart_fingerprint
+                dt_bin is not None
+                and current_fingerprint is not None
+                and current_fingerprint != born_with
+                and not _latched(rejected_restart, current_fingerprint, now)
                 and dt_bin.exists()
             ):
                 # deploy/git pull happened: exec ourselves to run the new
                 # code (the exec drops our lock fd, the fresh image retakes it)
                 ready, detail = _restart_preflight(dt_bin)
                 if not ready:
-                    rejected_restart_fingerprint = current_fingerprint
+                    rejected_restart = (
+                        current_fingerprint,
+                        now + PREFLIGHT_RETRY_S,
+                    )
                     log(
                         "dt code changed but replacement preflight failed; "
-                        f"keeping current agent alive ({detail})"
+                        "keeping current agent alive, retrying within "
+                        f"{PREFLIGHT_RETRY_S:g}s ({detail})"
                     )
                     continue
                 log("dt code changed on disk; restarting agent")
-                _stop_completion_watchers(completion_watchers)
-                _pid_path(cfg).unlink(missing_ok=True)
-                fcntl.flock(fd, fcntl.LOCK_UN)
-                os.close(fd)
-                sys.stdout.flush()
-                os.execvp(str(dt_bin), [str(dt_bin), "agent", "run"])
+                try:
+                    _stop_completion_watchers(completion_watchers)
+                    _pid_path(cfg).unlink(missing_ok=True)
+                except OSError as exc:
+                    log(f"agent restart deferred; teardown failed ({exc})")
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                    fd_released = True
+                    try:
+                        sys.stdout.flush()
+                    except OSError:
+                        pass
+                    try:
+                        os.execvp(str(dt_bin), [str(dt_bin), "agent", "run"])
+                    except OSError as exc:
+                        # The lock is already released and this image cannot
+                        # exec its replacement (deploy race, unexecutable
+                        # binary). Exit cleanly so the supervisor starts a
+                        # fresh agent instead of dying with a traceback and
+                        # leaving the queue driverless.
+                        log(
+                            f"agent restart exec failed ({exc}); exiting so "
+                            "the supervisor can start a fresh agent"
+                        )
+                        return AGENT_CONFIG_RESTART_EXIT
             _sleep_until_next_poll(
                 cfg,
                 stop,
@@ -1012,8 +1073,9 @@ def run_loop(cfg: HeadConfig) -> int:
         _stop_completion_watchers(completion_watchers)
         log("agent down")
         _pid_path(cfg).unlink(missing_ok=True)
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        if not fd_released:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
     return 0
 
 
