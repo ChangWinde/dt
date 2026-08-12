@@ -8749,6 +8749,86 @@ def _info_command_text(
     return result
 
 
+def _info_action(
+    kind: str,
+    argv: list[str],
+    *,
+    effect: str = "observe",
+    requires_confirmation: bool = False,
+) -> JsonDict:
+    return {
+        "kind": kind,
+        "argv": argv,
+        "effect": effect,
+        "requires_confirmation": requires_confirmation,
+    }
+
+
+def _info_actions(entry: jobs_mod.JobEntry) -> list[JsonDict]:
+    """Typed recovery actions for one job, mirroring the human hints.
+
+    ``argv`` always carries the full job id so an agent never re-resolves a
+    compact reference.  ``effect`` is ``observe``, ``submit``, or
+    ``destructive``; a destructive action requires explicit confirmation and
+    must never run unattended.  An uncertain launch and a lost job get a
+    verified kill instead of a resubmission, because resubmitting an
+    unproven-dead job can double-run the experiment.
+    """
+    job_id = entry.job_id
+    if entry.status == "queued":
+        return [
+            _info_action("wait_for_terminal_state", ["dt", "wait", job_id]),
+            _info_action("show_capacity", ["dt", "free"]),
+        ]
+    if entry.status == "running":
+        return [
+            _info_action("follow_log", ["dt", "logs", job_id, "-f"]),
+            _info_action("watch_resources", ["dt", "metrics", job_id]),
+        ]
+    if _is_uncertain_launch(entry) or entry.status == "lost":
+        return [
+            _info_action(
+                "inspect_launch_evidence", ["dt", "logs", job_id, "-n", "200"]
+            ),
+            _info_action(
+                "verified_kill",
+                ["dt", "kill", job_id],
+                effect="destructive",
+                requires_confirmation=True,
+            ),
+        ]
+    result_state = jobs_mod.effective_result_state(entry)
+    if result_state == "success":
+        return [
+            _info_action("recover_outputs", ["dt", "pull", job_id, "--lite"]),
+            _info_action("review_resources", ["dt", "metrics", job_id]),
+        ]
+    if result_state == "dependency_skipped":
+        predecessor = entry.after_success or entry.after_complete or entry.after_result
+        if predecessor:
+            return [_info_action("inspect_predecessor", ["dt", "info", predecessor])]
+        return []
+    if result_state in {"execution_failure", "infra_failure"}:
+        return [
+            _info_action("inspect_failure_log", ["dt", "logs", job_id, "-n", "200"]),
+            _info_action("recover_evidence", ["dt", "pull", job_id, "--lite"]),
+            _info_action(
+                "resubmit_current_code",
+                ["dt", "rerun", job_id],
+                effect="submit",
+            ),
+        ]
+    if result_state in {"scientific_reject", "cancelled", "guard_terminated"}:
+        # A scientific reject is an outcome, not an infrastructure fault, and
+        # a guard termination would trip again unchanged: recover evidence
+        # instead of suggesting an identical resubmission.
+        return [
+            _info_action("inspect_failure_log", ["dt", "logs", job_id, "-n", "200"]),
+            _info_action("recover_evidence", ["dt", "pull", job_id, "--lite"]),
+        ]
+    return []
+
+
 def info(
     ref: str = REF_ARG,
     json_: bool = typer.Option(False, "--json"),
@@ -8924,6 +9004,7 @@ def info(
         "after_result": entry.after_result,
         "after_result_states": list(entry.after_result_states),
         "result_state": jobs_mod.effective_result_state(entry),
+        "actions": _info_actions(entry),
         "rerun_of": entry.rerun_of,
         "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
         "rerun_snapshot_changed": entry.rerun_snapshot_changed,

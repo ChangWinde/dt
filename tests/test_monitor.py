@@ -302,6 +302,11 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
         "duration_s": "node",
     }
     assert data["cross_clock_intervals_approximate"] is True
+    assert [action["kind"] for action in data["actions"]] == [
+        "recover_outputs",
+        "review_resources",
+    ]
+    assert all(action["argv"][2] == "j" for action in data["actions"])
 
     human = CliRunner().invoke(cli.app, ["info", "j", "--verbose"])
     assert "payload" in human.output
@@ -323,6 +328,87 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
     assert "started (node)" in human.output
     assert "finished (node)" in human.output
     assert "cross-clock intervals are approximate" in human.output
+
+
+def test_info_actions_are_typed_and_never_suggest_double_runs():
+    def entry(status: str, **kwargs) -> JobEntry:
+        return JobEntry(
+            job_id="20260812-0900_job_" + "a" * 16,
+            name="job",
+            center="c",
+            project="p",
+            node="n1",
+            node_local=False,
+            job_dir="dt/jobs/j",
+            session="dt_j",
+            cmd="true",
+            status=status,
+            **kwargs,
+        )
+
+    queued = cli._info_actions(entry("queued"))
+    assert [action["kind"] for action in queued] == [
+        "wait_for_terminal_state",
+        "show_capacity",
+    ]
+    assert all(action["effect"] == "observe" for action in queued)
+
+    running = cli._info_actions(entry("running"))
+    assert [action["kind"] for action in running] == ["follow_log", "watch_resources"]
+
+    success = cli._info_actions(entry("finished", exit_code=0))
+    assert [action["kind"] for action in success] == [
+        "recover_outputs",
+        "review_resources",
+    ]
+
+    failure = cli._info_actions(entry("finished", exit_code=3))
+    assert [action["kind"] for action in failure] == [
+        "inspect_failure_log",
+        "recover_evidence",
+        "resubmit_current_code",
+    ]
+    assert failure[2]["effect"] == "submit"
+    assert failure[0]["argv"][2] == "20260812-0900_job_" + "a" * 16
+
+    # A lost or uncertain launch may still be running remotely: the only safe
+    # transition is a verified kill, never a resubmission that can double-run.
+    lost = cli._info_actions(entry("lost"))
+    assert [action["kind"] for action in lost] == [
+        "inspect_launch_evidence",
+        "verified_kill",
+    ]
+    assert lost[1]["effect"] == "destructive"
+    assert lost[1]["requires_confirmation"] is True
+
+    uncertain = cli._info_actions(
+        entry(
+            "failed",
+            reason=cli.jobs_mod.UNCERTAIN_LAUNCH_PREFIX + "ssh transport dropped",
+        )
+    )
+    assert [action["kind"] for action in uncertain] == [
+        "inspect_launch_evidence",
+        "verified_kill",
+    ]
+
+    reject = cli._info_actions(
+        entry("finished", exit_code=3, result_state="scientific_reject")
+    )
+    assert [action["kind"] for action in reject] == [
+        "inspect_failure_log",
+        "recover_evidence",
+    ]
+
+    skipped = cli._info_actions(entry("skipped", after_success="pred-id"))
+    assert skipped == [
+        {
+            "kind": "inspect_predecessor",
+            "argv": ["dt", "info", "pred-id"],
+            "effect": "observe",
+            "requires_confirmation": False,
+        }
+    ]
 
 
 def test_info_compacts_multiline_command_by_default_and_can_show_full(

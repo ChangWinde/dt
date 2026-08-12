@@ -8,6 +8,13 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Added
 
+- `dt info --json` returns typed recovery `actions`: `kind`, a ready-to-run
+  `argv` carrying the full job ID, an `effect` classification (`observe`,
+  `submit`, `destructive`), and `requires_confirmation`. Failures point at
+  the failure log and evidence recovery, resubmission is offered only where
+  it cannot double-run the experiment, and an uncertain launch or lost job
+  gets a verified-kill action instead.
+
 - `dt doctor` now verifies the relay authentication contract for sites using
   `site-cache-first` or `topology-aware` distribution: a reachable head
   ssh-agent holding keys is reported as `relay` on the head row, and a
