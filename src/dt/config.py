@@ -966,8 +966,11 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         snapshot_warn_gib = _finite_number(
             data.get("snapshot_warn_gib", 2.0), "snapshot_warn_gib"
         )
-        if mem_threshold_mib < 0:
-            raise ConfigError("`mem_threshold_mib` must be non-negative")
+        if mem_threshold_mib <= 0:
+            raise ConfigError(
+                "`mem_threshold_mib` must be positive; 0 marks every GPU busy "
+                "and stalls the whole center"
+            )
         if disk_min_gib < 0:
             raise ConfigError("`disk_min_gib` must be non-negative")
         if snapshot_warn_gib < 0:
@@ -1075,6 +1078,8 @@ def load() -> HeadConfig | LaptopConfig:
             data = yaml.safe_load(payload)
         except yaml.YAMLError as exc:
             raise ConfigError(f"cannot parse config {path}: {exc}") from None
+        except RecursionError:
+            raise ConfigError(f"config nesting is too deep to parse: {path}") from None
         parsed = parse(data)
         _LOAD_CACHE = (opened_signature, parsed)
         return parsed

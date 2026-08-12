@@ -579,6 +579,25 @@ def test_load_wraps_invalid_yaml_as_config_error(tmp_path, monkeypatch):
         load()
 
 
+def test_mem_threshold_zero_is_rejected():
+    with pytest.raises(ConfigError, match="mem_threshold_mib"):
+        parse({"center": "headstar", "nodes": ["n1"], "mem_threshold_mib": 0})
+
+
+def test_load_wraps_deeply_nested_yaml_as_config_error(tmp_path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    path.write_text("center: test\n")
+    monkeypatch.setenv("DT_CONFIG", str(path))
+
+    def deep(_payload):
+        raise RecursionError("maximum recursion depth exceeded")
+
+    monkeypatch.setattr(config_module.yaml, "safe_load", deep)
+
+    with pytest.raises(ConfigError, match="too deep"):
+        load()
+
+
 def test_load_refuses_fifo_and_oversized_config_files(tmp_path, monkeypatch):
     fifo = tmp_path / "config.fifo"
     os.mkfifo(fifo)
