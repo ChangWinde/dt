@@ -554,7 +554,21 @@ def _process_once_with_snapshot(
                 # whose pins are disjoint.
                 results.append((entry.job_id, "busy"))
                 continue
-        outcome, detail = dispatch_queued(cfg, entry, log)
+        try:
+            outcome, detail = dispatch_queued(cfg, entry, log)
+        except Exception as exc:
+            # One job's unexpected failure must never abort the tick and starve
+            # every queued job behind it. Treat it as a transient block, log it
+            # visibly, and move on; the next tick retries.
+            detail = " ".join(str(exc).split()) or type(exc).__name__
+            log(
+                f"{entry.job_id} dispatch raised ({detail}); "
+                "treating as blocked and trying jobs behind it"
+            )
+            results.append((entry.job_id, "blocked"))
+            if blocked_log_state is not None:
+                blocked_log_state[entry.job_id] = detail
+            continue
         results.append((entry.job_id, outcome))
         if blocked_log_state is not None and outcome != "blocked":
             blocked_log_state.pop(entry.job_id, None)

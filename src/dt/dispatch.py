@@ -59,6 +59,7 @@ from .jobs import (
     UNCERTAIN_LAUNCH_PREFIX,
     RESULT_STATES,
     JobEntry,
+    RegistryError,
     effective_result_state,
     job_lock,
     load,
@@ -4196,6 +4197,22 @@ def _submit_prepared_once(
     )
 
 
+def _load_predecessor(
+    cfg: HeadConfig, dependency: str
+) -> tuple[JobEntry | None, str | None]:
+    """Load a dependency row, mapping an unreadable row to a blocked wait.
+
+    A missing row (None) is a hard failure the caller reports. A corrupt row
+    must never crash the dispatch tick and starve every job behind it, so it
+    blocks (fail-closed) until the file is repaired -- the same conservative
+    posture list_all takes when it counts a damaged row as running.
+    """
+    try:
+        return load(cfg, dependency), None
+    except (RegistryError, ValueError):
+        return None, f"registry row for dependency {dependency} is unreadable"
+
+
 def dispatch_queued(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -4221,7 +4238,14 @@ def dispatch_queued(
                 entry.__dict__.update(current.__dict__)
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
-            predecessor = load(cfg, dependency)
+            predecessor, unreadable = _load_predecessor(cfg, dependency)
+            if unreadable is not None:
+                reason = f"waiting: {unreadable}"
+                if current.reason != reason:
+                    current.reason = reason
+                    save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                return "blocked", unreadable
             if predecessor is None:
                 detail = f"dependency {dependency} was not found"
                 current.status = "failed"
@@ -4279,7 +4303,14 @@ def dispatch_queued(
                 entry.__dict__.update(current.__dict__)
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
-            predecessor = load(cfg, completion_dependency)
+            predecessor, unreadable = _load_predecessor(cfg, completion_dependency)
+            if unreadable is not None:
+                reason = f"waiting: {unreadable}"
+                if current.reason != reason:
+                    current.reason = reason
+                    save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                return "blocked", unreadable
             if predecessor is None:
                 detail = f"completion dependency {completion_dependency} was not found"
                 current.status = "failed"
@@ -4316,7 +4347,14 @@ def dispatch_queued(
                 entry.__dict__.update(current.__dict__)
                 remove_staging(cfg, current.job_id)
                 return "failed", detail
-            predecessor = load(cfg, result_dependency)
+            predecessor, unreadable = _load_predecessor(cfg, result_dependency)
+            if unreadable is not None:
+                reason = f"waiting: {unreadable}"
+                if current.reason != reason:
+                    current.reason = reason
+                    save(cfg, current)
+                entry.__dict__.update(current.__dict__)
+                return "blocked", unreadable
             if predecessor is None:
                 detail = f"result dependency {result_dependency} was not found"
                 current.status = "failed"
