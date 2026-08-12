@@ -202,6 +202,31 @@ def test_agent_stays_alive_when_replacement_preflight_fails(
     assert "agent runtime identity changed" in output
 
 
+def test_agent_handles_sighup_but_respects_nohup(tmp_path, monkeypatch):
+    import signal as signal_mod
+
+    import dt.agent as agent
+    import dt.config as config
+
+    replacement = _cfg(tmp_path / "replacement")
+    monkeypatch.setattr(config, "load", lambda: replacement)
+    monkeypatch.setattr(agent, "_code_fingerprint", lambda: 1)
+    previous = signal_mod.getsignal(signal_mod.SIGHUP)
+    try:
+        # A terminal hangup must run the same graceful shutdown as SIGTERM.
+        signal_mod.signal(signal_mod.SIGHUP, signal_mod.SIG_DFL)
+        assert agent.run_loop(_cfg(tmp_path / "one")) == AGENT_CONFIG_RESTART_EXIT
+        installed = signal_mod.getsignal(signal_mod.SIGHUP)
+        assert installed not in (signal_mod.SIG_DFL, signal_mod.SIG_IGN)
+
+        # nohup's inherited SIG_IGN stays authoritative.
+        signal_mod.signal(signal_mod.SIGHUP, signal_mod.SIG_IGN)
+        assert agent.run_loop(_cfg(tmp_path / "two")) == AGENT_CONFIG_RESTART_EXIT
+        assert signal_mod.getsignal(signal_mod.SIGHUP) is signal_mod.SIG_IGN
+    finally:
+        signal_mod.signal(signal_mod.SIGHUP, previous)
+
+
 def test_agent_restart_exec_failure_exits_for_supervisor(tmp_path, monkeypatch, capsys):
     import dt.agent as agent
     import dt.config as config

@@ -929,6 +929,11 @@ def run_loop(cfg: HeadConfig) -> int:
 
     signal.signal(signal.SIGTERM, _term)
     signal.signal(signal.SIGINT, _term)
+    # A foreground agent whose terminal goes away would otherwise die on
+    # SIGHUP without the shutdown path, orphaning completion watchers and
+    # leaving the stale pid file behind. Respect an inherited SIG_IGN (nohup).
+    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, _term)
 
     def log(msg: str) -> None:
         stamp = datetime.now().strftime("%m-%d %H:%M:%S")
