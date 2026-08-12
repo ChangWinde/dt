@@ -2032,9 +2032,19 @@ def resolve_snapshot(
             stats=True,
         )
         if proc.returncode != 0:
+            detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
+            if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
+                # Transport-level failure means the source node is currently
+                # unreachable, exactly like the main snapshot path; a hard
+                # DispatchError here would mark the fork/rerun rejected
+                # instead of letting it retry or fail over.
+                raise RemoteError(
+                    entry.node,
+                    f"exact snapshot backfill failed: {detail}",
+                    proc.returncode,
+                )
             raise DispatchError(
-                f"exact snapshot backfill from {entry.node} failed: "
-                f"{proc.stderr.strip()}"
+                f"exact snapshot backfill from {entry.node} failed: {detail}"
             )
         _warn_snapshot_size(cfg, proc.stdout, log)
         observed = tree_sha256(temp_code)
