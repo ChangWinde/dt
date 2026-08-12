@@ -4314,9 +4314,9 @@ def _ps_rows_filters(rows: list[JsonDict]) -> frozenset[str]:
     return value if isinstance(value, frozenset) else frozenset(value)
 
 
-def _humanize_ps_references(rows: list[JsonDict]) -> _PsRows:
-    """Replace exact job ids in human diagnostics with their routable refs."""
-    replacements = sorted(
+def _ps_reference_replacements(rows: list[JsonDict]) -> list[tuple[str, str]]:
+    """Longest-first (job id, display ref) pairs for diagnostic rewriting."""
+    return sorted(
         (
             (str(row["job_id"]), str(row["display_ref"]))
             for row in rows
@@ -4326,6 +4326,23 @@ def _humanize_ps_references(rows: list[JsonDict]) -> _PsRows:
         ),
         key=lambda pair: len(pair[0]),
         reverse=True,
+    )
+
+
+def _humanize_ps_references(
+    rows: list[JsonDict],
+    *,
+    reference_rows: list[JsonDict] | None = None,
+) -> _PsRows:
+    """Replace exact job ids in human diagnostics with their routable refs.
+
+    ``reference_rows`` supplies the replacement table when only a visible
+    slice is rewritten: a visible diagnostic may name a job the view hides
+    (for example a failed predecessor), so the table must always come from
+    the full row set.
+    """
+    replacements = _ps_reference_replacements(
+        rows if reference_rows is None else reference_rows
     )
     rendered_rows: list[JsonDict] = []
     for row in rows:
@@ -5163,11 +5180,16 @@ def _ps_view(
     title: str = "Active jobs",
     empty_text: str = "no active jobs",
 ) -> Any:
-    visible = _visible_ps_rows(
-        rows,
-        all_=all_,
-        limit=limit,
-        recent=recent,
+    # Rewrite diagnostics only for the rows the view will render; the
+    # replacement table still comes from the full row set.
+    visible = _humanize_ps_references(
+        _visible_ps_rows(
+            rows,
+            all_=all_,
+            limit=limit,
+            recent=recent,
+        ),
+        reference_rows=rows,
     )
     total = _ps_rows_total(rows)
     shown = f"{len(visible)}/{total} jobs" if len(visible) != total else f"{total} jobs"
@@ -5524,7 +5546,6 @@ def ps(
 
                 refresh_started = time.monotonic()
                 rows, errors = gather(include_progress=True)
-                rows = _humanize_ps_references(rows)
                 with Live(
                     _ps_view(
                         rows,
@@ -5546,7 +5567,6 @@ def ps(
                         _sleep_for_poll_interval(refresh_started, poll)
                         refresh_started = time.monotonic()
                         rows, errors = gather(include_progress=True)
-                        rows = _humanize_ps_references(rows)
                         live.update(
                             _ps_view(
                                 rows,
@@ -5638,12 +5658,16 @@ def ps(
             )
         print(json.dumps(rows))  # stable default contract: json is never truncated
         return
-    rows = _humanize_ps_references(rows)
-    visible = _visible_ps_rows(
-        rows,
-        all_=all_,
-        limit=limit,
-        recent=recent_view,
+    # Rewrite diagnostics only for the visible slice; the replacement table
+    # still comes from the full row set so hidden predecessors stay routable.
+    visible = _humanize_ps_references(
+        _visible_ps_rows(
+            rows,
+            all_=all_,
+            limit=limit,
+            recent=recent_view,
+        ),
+        reference_rows=rows,
     )
     total = _ps_rows_total(rows)
     if limit is not None and len(visible) != total:
