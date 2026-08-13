@@ -135,6 +135,20 @@ def build_config(
     return payload
 
 
+# Appended to generated head configs as commentary only. Retention deletes
+# node workdirs (including never-pulled outputs), so dt never defaults it
+# on; the scaffold is where a new operator decides, eyes open.
+_HEAD_RETENTION_HINT = """
+# Optional: retire ended jobs older than N days. This deletes each ended
+# job's node workdir (including never-pulled outputs), its registry row,
+# and unused shared environments. dt never enables retention on its own;
+# without it, history grows until `dt clean` runs (dt doctor reports the
+# registry size). Uncomment to opt in:
+# queue:
+#   auto_clean_days: 30
+"""
+
+
 def render_config(payload: dict[str, object]) -> str:
     """Render stable, human-editable YAML after normal parser validation."""
     try:
@@ -152,6 +166,8 @@ def render_config(payload: dict[str, object]) -> str:
         raise InitError(f"cannot render configuration: {exc}") from exc
     if not isinstance(rendered, str):
         raise InitError("YAML renderer returned non-text output")
+    if "nodes" in payload and "queue" not in payload:
+        rendered += _HEAD_RETENTION_HINT
     return rendered
 
 
