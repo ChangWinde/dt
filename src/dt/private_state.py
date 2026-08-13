@@ -321,7 +321,7 @@ def _syncfs_tree(root: Path) -> bool:
     except OSError:
         return False
     try:
-        return syncfs(descriptor) == 0
+        return bool(syncfs(descriptor) == 0)
     except Exception:
         return False
     finally:
