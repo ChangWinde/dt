@@ -105,6 +105,7 @@ from .render import (
     ps_table,
 )
 from . import pull_relay
+from . import sync_relay
 from .sshio import (
     MAX_TRANSFER_RETRIES,
     RSYNC_RETRYABLE_EXIT_CODES,
@@ -14574,6 +14575,15 @@ def sync(
         "--retries",
         help="link retries after the first attempt (0 = fail fast)",
     ),
+    route: str = typer.Option(
+        "auto",
+        "--route",
+        help=(
+            "project transfer route: auto stages a persistent gateway mirror "
+            "when the head dials the node through a tunnel; direct/gateway "
+            "force"
+        ),
+    ),
 ) -> None:
     """Incrementally rsync project code or explicit reusable inputs to nodes.
 
@@ -14591,6 +14601,27 @@ def sync(
         operation="sync",
         json_=json_,
     )
+    route = route if isinstance(route, str) else "auto"
+    if route not in sync_relay.ROUTE_MODES:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"invalid --route {route!r}; "
+                f"choose one of {', '.join(sync_relay.ROUTE_MODES)}"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    if artifacts and route == "gateway":
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "--route gateway applies to project sync only; artifact "
+                "sync keeps the operator SSH route (ADR 0026)"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
     cfg = _cfg()
 
     def resume_argv() -> list[str]:
@@ -14605,6 +14636,8 @@ def sync(
             argv += ["--artifact", path]
         if retries != 2:
             argv += ["--retries", str(retries)]
+        if route != "auto":
+            argv += ["--route", route]
         if json_:
             argv.append("--json")
         return argv
@@ -14620,6 +14653,8 @@ def sync(
             argv += ["--artifact", path]
         if retries != 2:
             argv += ["--retries", str(retries)]
+        if route != "auto":
+            argv += ["--route", route]
         if json_:
             argv.append("--json")
 
@@ -14722,6 +14757,7 @@ def sync(
                     messages.append,
                     plan=True,
                     retries=retries,
+                    route=route,
                     on_retry=_rsync_retry_observer(
                         name,
                         "sync",
@@ -14737,6 +14773,7 @@ def sync(
                     node,
                     messages.append,
                     retries=retries,
+                    route=route,
                     on_retry=_rsync_retry_observer(
                         name,
                         "sync",

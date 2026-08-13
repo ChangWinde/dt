@@ -16,7 +16,7 @@ import shlex
 import subprocess
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .artifact_distribution import _TRANSFERRED_RE, _stat_total, inner_lan_ssh
 from .config import HeadConfig, Node, Site
@@ -44,14 +44,23 @@ class RelayError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class PullRoute:
-    """The routing decision for one pull, with its human-readable reason."""
+class RelayRoute:
+    """One relay routing decision, with its human-readable reason.
+
+    Shared by gateway-staged pull (ADR 0025) and gateway-staged sync
+    (ADR 0026): both stage bulk data through the site gateway on the same
+    topology and dial evidence.
+    """
 
     route: str  # "direct" | "gateway"
     gateway: Node | None
     node: Node | None
     site: Site | None
     reason: str
+
+
+# Historical name from the pull-only era.
+PullRoute = RelayRoute
 
 
 def dial_is_tunnel(options: dict[str, str]) -> bool:
@@ -73,8 +82,56 @@ def dial_is_tunnel(options: dict[str, str]) -> bool:
         return False
 
 
-def _direct(reason: str) -> PullRoute:
-    return PullRoute("direct", None, None, None, reason)
+def _direct(reason: str) -> RelayRoute:
+    return RelayRoute("direct", None, None, None, reason)
+
+
+def relay_topology(cfg: HeadConfig, node_name: str) -> RelayRoute:
+    """Whether the site topology allows staging through a gateway at all.
+
+    Pure configuration lookup, shared by the pull and sync deciders. A
+    "gateway" result only says the pieces exist; dial evidence still
+    decides whether staging is worth it in auto mode.
+    """
+    node = next((item for item in cfg.nodes if item.name == node_name), None)
+    if node is None:
+        return _direct("node is not in the current configuration")
+    if node.local:
+        return _direct("node is local")
+    site = next(
+        (item for item in cfg.sites.values() if node.name in item.nodes),
+        None,
+    )
+    if site is None:
+        return _direct("node belongs to no configured site")
+    if site.gateway == node.name:
+        return _direct("node is the site gateway")
+    gateway = next(
+        (item for item in cfg.nodes if item.name == site.gateway),
+        None,
+    )
+    if gateway is None or gateway.local:
+        return _direct("site gateway is not a usable remote node")
+    if node.lan_address is None:
+        return _direct("node advertises no LAN address")
+    return RelayRoute("gateway", gateway, node, site, "site topology allows staging")
+
+
+def _dials_favor_relay(
+    topology: RelayRoute,
+    resolver: Callable[[Node], dict[str, str]] | None,
+) -> RelayRoute | None:
+    """Direct-route verdict from dial evidence, or None when relay wins."""
+    if resolver is None:
+        from .topology_discovery import resolved_ssh_options
+
+        resolver = resolved_ssh_options
+    assert topology.node is not None and topology.gateway is not None
+    if not dial_is_tunnel(resolver(topology.node)):
+        return _direct("head dials the node directly")
+    if dial_is_tunnel(resolver(topology.gateway)):
+        return _direct("gateway dial is also a tunnel")
+    return None
 
 
 def decide_pull_route(
@@ -84,7 +141,7 @@ def decide_pull_route(
     outputs_bytes: int | None,
     mode: str,
     resolver: Callable[[Node], dict[str, str]] | None = None,
-) -> PullRoute:
+) -> RelayRoute:
     """Choose direct vs gateway staging from configuration and local evidence.
 
     Only local work happens here: two ``ssh -G`` subprocesses at most, no
@@ -95,47 +152,21 @@ def decide_pull_route(
         raise ValueError(f"unsupported pull route mode: {mode!r}")
     if mode == "direct":
         return _direct("forced by --route direct")
-    node = next((item for item in cfg.nodes if item.name == node_name), None)
-    if node is None:
-        return _direct("job node is not in the current configuration")
-    if node.local:
-        return _direct("job node is local")
-    site = next(
-        (item for item in cfg.sites.values() if node.name in item.nodes),
-        None,
-    )
-    if site is None:
-        return _direct("job node belongs to no configured site")
-    if site.gateway == node.name:
-        return _direct("job node is the site gateway")
-    gateway = next(
-        (item for item in cfg.nodes if item.name == site.gateway),
-        None,
-    )
-    if gateway is None or gateway.local:
-        return _direct("site gateway is not a usable remote node")
-    if node.lan_address is None:
-        return _direct("job node advertises no LAN address")
+    topology = relay_topology(cfg, node_name)
+    if topology.route != "gateway":
+        return topology
     if mode == "gateway":
-        return PullRoute("gateway", gateway, node, site, "forced by --route gateway")
-    if resolver is None:
-        from .topology_discovery import resolved_ssh_options
-
-        resolver = resolved_ssh_options
-    if not dial_is_tunnel(resolver(node)):
-        return _direct("head dials the job node directly")
-    if dial_is_tunnel(resolver(gateway)):
-        return _direct("gateway dial is also a tunnel")
+        return replace(topology, reason="forced by --route gateway")
+    verdict = _dials_favor_relay(topology, resolver)
+    if verdict is not None:
+        return verdict
     if outputs_bytes is None:
         return _direct("outputs size is unknown")
     if outputs_bytes < RELAY_MIN_BYTES:
         return _direct("outputs are below the relay threshold")
-    return PullRoute(
-        "gateway",
-        gateway,
-        node,
-        site,
-        "head dials the node through a tunnel; the gateway is direct",
+    return replace(
+        topology,
+        reason="head dials the node through a tunnel; the gateway is direct",
     )
 
 
