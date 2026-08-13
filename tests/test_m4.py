@@ -1572,11 +1572,17 @@ def test_agent_status_json_carries_schema_version(tmp_path, monkeypatch):
 
 
 def test_watch_documents_no_tails_and_keeps_compact_alias():
-    result = CliRunner().invoke(cli.app, ["watch", "--help"])
+    import re
+
+    result = CliRunner().invoke(cli.app, ["watch", "--help"], terminal_width=120)
 
     assert result.exit_code == 0
-    assert "--no-tails" in result.stdout
-    assert "--compact" in result.stdout
+    # rich embeds ANSI styling inside option tokens under some terminals;
+    # compare against the plain text like the other help assertions do.
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.output)
+    normalized = " ".join(output.split())
+    assert "--no-tails" in normalized
+    assert "--compact" in normalized
 
 
 def test_clean_results_failure_retains_retryable_registry_record(tmp_path, monkeypatch):
