@@ -171,6 +171,53 @@ def test_init_cli_dry_run_prints_yaml_without_writing(tmp_path):
     assert not config.exists()
 
 
+def test_init_head_scaffold_documents_retention_without_enabling_it(tmp_path):
+    """The scaffold names the retention lever and its blast radius as a
+    comment: parsing must yield no queue section, so behavior is unchanged
+    until the operator uncomments it deliberately."""
+    config = tmp_path / "config.yaml"
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "init",
+            "--role",
+            "head",
+            "--center",
+            "research",
+            "--config",
+            str(config),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    text = config.read_text("utf-8")
+    assert "# queue:" in text
+    assert "#   auto_clean_days: 30" in text
+    assert "never-pulled outputs" in text
+    parsed = yaml.safe_load(text)
+    assert "queue" not in parsed
+
+    laptop = CliRunner().invoke(
+        cli.app,
+        [
+            "init",
+            "--role",
+            "laptop",
+            "--center",
+            "research",
+            "--head",
+            "gpu-head",
+            "--config",
+            str(tmp_path / "laptop.yaml"),
+            "--dry-run",
+        ],
+    )
+    assert laptop.exit_code == 0, laptop.output
+    # Queue retention is head-only; the laptop scaffold stays clean.
+    assert "auto_clean_days" not in laptop.stdout
+
+
 def test_init_cli_refuses_to_replace_existing_config_without_force(tmp_path):
     config = tmp_path / "config.yaml"
     config.write_text("keep: true\n")
