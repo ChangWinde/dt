@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/ChangWinde/dt/actions/workflows/ci.yml/badge.svg)](https://github.com/ChangWinde/dt/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-3776AB.svg)](.github/SUPPORT.md)
-[![Release](https://img.shields.io/badge/release-0.8.0-0A7BBB.svg)](CHANGELOG.md)
+[![Release](https://img.shields.io/badge/release-0.9.0-0A7BBB.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-proprietary-lightgrey.svg)](LICENSE)
 
 `dt` is an AI-native remote execution tool for trusted, SSH-accessible Linux
@@ -46,9 +46,10 @@ for compatibility.
 AI-native describes the execution contract, not autonomous experiment design.
 The project still owns its command, data, scientific logic, and outputs.
 
-This README describes the 0.8.0 release candidate. Promotion still requires a
-verified release bundle, a live upgrade/rollback canary, and explicit release
-authority.
+This README describes the 0.9.0 line. Work merged since that tag is recorded
+under `Unreleased` in the [changelog](CHANGELOG.md). Promoting any release
+still requires a verified release bundle, a live upgrade/rollback canary, and
+explicit release authority.
 
 ## Quick start
 
