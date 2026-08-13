@@ -42,15 +42,18 @@ This page helps operators choose a command and handle its result. Run
 | `dt storage` | Inventory DistTrainer-managed storage |
 | `dt migrate layout` | Plan or apply identity-verified legacy runtime moves |
 | `dt compact` | Remove recoverable old code copies while retaining job evidence |
-| `dt clean` | Delete explicitly scoped old jobs, results, or environments |
+| `dt clean` | Delete explicitly scoped old jobs, results, environments, or deployment trees |
 | `dt sync` | Incrementally stage project code or explicit large inputs |
 | `dt seed` | Seed approved caches and Python runtimes on slow-network nodes |
 
 `dt topology [--site SITE] --json` actively verifies configured directed data edges.
 Use `--source NODE` and/or `--destination NODE` to scope a large site. The
 default `--max-edges 256` prevents accidental quadratic probing; callers may
-raise it explicitly up to 4,096. This command discovers and measures routes but
-does not transfer an Artifact.
+raise it explicitly up to 4,096. Every head-to-node control route is also
+classified (`relayed`/`proxied`/`direct`/`opaque`), and `--measure` streams a
+bounded payload over each healthy edge and control route to record real
+MiB/s for capacity-aware route ranking. Without `--measure` this command
+discovers and probes routes but does not transfer an Artifact.
 
 ## Submission shape
 
@@ -72,7 +75,7 @@ normalized intent returns the original job; a changed intent conflicts. If the
 client loses the response, query `dt request REQUEST_ID --json` instead of
 submitting a new job.
 
-The option is available on `run`, `task`, `rerun`, `fork`, `exec`, `batch`, and
+The option is available on `run`, `rerun`, `fork`, `exec`, `batch`, and
 `chain`. On `batch`, `chain`, and `fork --repeat`, it identifies the complete
 group. DT durably records the confirmed prefix and uses a deterministic child
 request per item: retrying can resume a child that was never claimed, but an
@@ -104,6 +107,14 @@ record the complete identity.
 
 Human tables are presentation surfaces and may compact columns for terminal
 width. JSON schemas and stable exit codes are automation surfaces.
+
+Note one short-flag split kept for compatibility: `-n` means `--name` on
+submission commands (`run`, `exec`, `rerun`, `fork`) and `--name-prefix` on
+`batch`/`chain`, but `--lines` on `logs` and `watch`. Scripts should prefer
+the long forms. Additional help-only flags (`seed --hf`, `info
+--full-command`, `info --metrics-tail`, `wait --error-lines`, `logs --json`,
+`watch --no-tails`) are documented in `--help` output; they follow the same
+JSON and exit-code contracts.
 
 Defaults are operator-first: state, anomaly, progress, and the next useful
 action come before provenance and implementation detail. Dense commands group
@@ -205,15 +216,18 @@ General command codes:
 | 130 | Local interruption; registered remote jobs continue unless explicitly killed |
 
 `dt wait` reserves 65 through 69 for terminal job states, while 0 through 125
-otherwise carry the experiment result. See [Operations](operations.md) for the
-mapping.
+otherwise carry the experiment result. The reservation is enforced: an
+experiment process that itself exits 65 through 69 is reported as 64 (just as
+codes above 125 clamp to 125), and `--json` always carries the untruncated
+`exit_code`. See [Operations](operations.md) for the mapping.
 
 ## Destructive commands
 
 `kill`, `clean`, and mutating `compact` require explicit confirmation for
 non-interactive use. Cleanup and compaction provide `--plan`. A TERM request
 that cannot verify process death returns failure; `--force` is a separate
-explicit escalation.
+explicit escalation. `kill --sweep` additionally signals leftover processes
+of an already-terminal job without rewriting its recorded result.
 
 Do not use raw SSH process kills or ad hoc GPU allocation alongside
 DistTrainer. They bypass leases, registry state, process-tree verification, and

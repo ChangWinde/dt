@@ -138,6 +138,7 @@ def test_init_cli_writes_config_and_reports_machine_readable_next_steps(tmp_path
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload == {
+        "schema_version": "dt_init_v1",
         "config": str(config),
         "next": ["dt doctor", "dt agent install", "dt agent start", "dt free"],
         "role": "head",

@@ -1379,6 +1379,93 @@ def test_clean_results_plan_then_removes_only_identity_verified_managed_pull(
     assert load(cfg, old.job_id) is None
 
 
+def test_clean_json_emits_versioned_plan_and_apply_envelopes(tmp_path, monkeypatch):
+    # QR-S1: the plan-first destructive flow agents are told to use finally
+    # has a machine-readable contract, mirroring dt_compact_v1.
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("old-done", "finished", created_at=1.0))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    plan = CliRunner().invoke(
+        cli.app, ["clean", "--before", "1970-01-02", "--plan", "--json"]
+    )
+    assert plan.exit_code == 0, plan.output
+    plan_payload = json.loads(plan.stdout)
+    assert plan_payload["schema_version"] == "dt_clean_v1"
+    assert plan_payload["mode"] == "plan"
+    assert plan_payload["eligible_jobs"] == 1
+    assert plan_payload["jobs"][0]["job_id"] == "old-done"
+    assert plan_payload["exit_code"] == 0
+    assert load(cfg, "old-done") is not None
+
+    refused = CliRunner().invoke(cli.app, ["clean", "--before", "1970-01-02", "--json"])
+    assert refused.exit_code == 1
+    refusal = json.loads(refused.stdout)
+    assert refusal["error"] == "confirmation_required"
+
+    applied = CliRunner().invoke(
+        cli.app, ["clean", "--before", "1970-01-02", "--json", "-y"]
+    )
+    assert applied.exit_code == 0, applied.output
+    apply_payload = json.loads(applied.stdout)
+    assert apply_payload["schema_version"] == "dt_clean_v1"
+    assert apply_payload["mode"] == "apply"
+    assert apply_payload["removed_jobs"] == 1
+    assert apply_payload["failures"] == []
+    assert load(cfg, "old-done") is None
+
+
+def test_ps_center_is_laptop_only_and_scopes_the_fan_out(tmp_path, monkeypatch):
+    # QR-S8: a multi-center laptop can scope queue observation to one center
+    # so an unreachable unrelated center cannot degrade the answer.
+    from dt.config import LaptopConfig
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    rejected = CliRunner().invoke(cli.app, ["ps", "--center", "x", "--json"])
+    assert rejected.exit_code == 1
+    assert "laptop-only" in rejected.stdout
+
+    laptop = LaptopConfig(centers={"a": "head-a", "b": "head-b"}, default_center="a")
+    seen: dict[str, dict[str, str]] = {}
+
+    def fake_gather(cfg_arg, status, **kwargs):
+        seen["centers"] = dict(cfg_arg.centers)
+        return [], {}
+
+    monkeypatch.setattr(cli, "_gather_ps_rows", fake_gather)
+    monkeypatch.setattr(cli, "_cfg", lambda: laptop)
+
+    result = CliRunner().invoke(cli.app, ["ps", "-c", "b", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["centers"] == {"b": "head-b"}
+
+
+def test_agent_status_json_carries_schema_version(tmp_path, monkeypatch):
+    import dt.agent as agent_mod
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(agent_mod, "status", lambda cfg_: {"alive": False})
+
+    result = CliRunner().invoke(cli.app, ["agent", "status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == "dt_agent_status_v1"
+    assert payload["alive"] is False
+
+
+def test_watch_documents_no_tails_and_keeps_compact_alias():
+    result = CliRunner().invoke(cli.app, ["watch", "--help"])
+
+    assert result.exit_code == 0
+    assert "--no-tails" in result.stdout
+    assert "--compact" in result.stdout
+
+
 def test_clean_results_failure_retains_retryable_registry_record(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     old = _entry("old-done", "finished", created_at=1.0)

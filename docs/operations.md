@@ -226,12 +226,16 @@ Stable `dt wait` terminal codes:
 
 | Code | Meaning |
 |---:|---|
-| 0 to 125 | Experiment process result |
+| 0 to 125 | Experiment process result (65-69 report as 64; >125 clamp to 125) |
 | 65 | Job not found |
 | 66 | Job killed |
 | 67 | Job lost |
 | 68 | Failed before start |
 | 69 | Dependency predicate skipped the job |
+
+The 65-69 band always means dt's own terminal semantics: an experiment
+that itself exits inside the band is reported as 64, and `dt wait --json`
+carries the untruncated `exit_code`.
 
 Submission uses exit 2 for `--no-queue` capacity failure, 3 for environment
 failure, 4 for local not-found paths, and 5 for unreachable infrastructure.

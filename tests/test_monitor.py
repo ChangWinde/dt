@@ -619,6 +619,57 @@ def test_info_queued_job_reports_fifo_context_in_json_and_human_output(
     assert "after success head" in normalized
 
 
+def test_info_decodes_the_registry_once_even_for_partial_queued_refs(
+    tmp_path, monkeypatch
+):
+    """A partial ref on a queued job used to trigger three full registry
+    scans (resolution, display refs, queue context); one snapshot must serve
+    all three (QR-P3)."""
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    for index, job_id in enumerate(("queue-head", "queue-middle", "queue-tail"), 1):
+        cli.jobs_mod.save(
+            cfg,
+            JobEntry(
+                job_id=job_id,
+                name=job_id,
+                center="c",
+                project="p",
+                node="-",
+                node_local=False,
+                job_dir=f"dt/jobs/{job_id}",
+                session=f"dt_{job_id}",
+                cmd="python train.py",
+                status="queued",
+                reason="waiting: no free GPU",
+                created_at=float(index),
+            ),
+        )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    scans = {"n": 0}
+    original_list_all = cli.jobs_mod.list_all
+
+    def counting_list_all(*args, **kwargs):
+        scans["n"] += 1
+        return original_list_all(*args, **kwargs)
+
+    monkeypatch.setattr(cli.jobs_mod, "list_all", counting_list_all)
+
+    result = CliRunner().invoke(cli.app, ["info", "queue-mi", "--json"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["job_id"] == "queue-middle"
+    assert data["queue_position"] == 2
+    assert scans["n"] == 1
+
+
 def test_info_json_missing_job_is_machine_readable(tmp_path, monkeypatch):
     cfg = HeadConfig(
         center="c",
@@ -7134,6 +7185,7 @@ def test_logs_json_success_contract(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_job_logs_v1",
         "job_id": "json-log",
         "name": "json-log",
         "status": "running",

@@ -16,7 +16,7 @@ If wait returns nonzero:
 
 ```bash
 dt info "$job_id"
-dt logs "$job_id" -n 200
+dt logs "$job_id" --lines 200
 # fix the project, then:
 dt rerun "$job_id"
 ```
@@ -113,6 +113,17 @@ into `info`, `logs`, and `agent status` for detailed evidence.
 Pull retries and resumes interrupted transfers. Use `--lite` or repeatable
 `--exclude` filters when large checkpoints are not needed.
 
+`dt topology --json` classifies every head-to-node control route: `relayed`
+means the SSH route enters a local tunnel (frp/autossh) whose low bandwidth
+bulk transfers would inherit — join the node to a site or pin `lan_address`
+before moving large data. `dt topology --measure` additionally streams a
+bounded payload to record real MiB/s; completed transfers keep those numbers
+fresh, and route ranking prefers measured-faster edges automatically.
+
+Run `dt doctor --json` after upgrades, host or driver changes, or repeated
+unexplained launch failures: it verifies SSH, GPU runtime, transfer tools,
+agent health, and the control-route link class per node.
+
 ## Resource safety
 
 Use guards for long or memory-sensitive jobs:
@@ -138,13 +149,19 @@ dt clean --before YYYY-MM-DD --plan
 ```
 
 Non-interactive mutation requires `-y`. `dt kill JOB -y` verifies process-group
-death; retry with `--force` only after TERM failure is reported.
+death; retry with `--force` only after TERM failure is reported. A kill that
+races a natural completion preserves the real result (`outcome: completed`).
+`dt kill JOB -y --sweep` signals leftover processes of an already-terminal
+job without rewriting its record. `dt clean --before DATE --deployments -y`
+also sweeps old release trees and tool installations; the active release and
+the installation the `dt` command resolves into are never touched.
 
 ## Stable exit codes
 
 General command codes:
 
 - 0: success;
+- 1: validation, health, comparison, or operation failure;
 - 2: no fitting capacity with `--no-queue`;
 - 3: environment/setup failure;
 - 4: not found;
@@ -152,7 +169,9 @@ General command codes:
 - 130: local interruption.
 
 `dt wait` returns the experiment code from 0 through 125, or 65 not found,
-66 killed, 67 lost, 68 failed before start, and 69 dependency-skipped.
+66 killed, 67 lost, 68 failed before start, and 69 dependency-skipped. The
+65-69 band is enforced: an experiment that itself exits 65-69 reports 64,
+and `--json` carries the untruncated `exit_code`.
 
 ## Development gate
 

@@ -102,7 +102,7 @@ dt free --explain
 job_id=$(dt run -n baseline -- python train.py | tail -1)
 dt wait "$job_id"
 dt info "$job_id"
-dt logs "$job_id" -n 200
+dt logs "$job_id" --lines 200
 dt pull "$job_id" --collection baseline
 ```
 

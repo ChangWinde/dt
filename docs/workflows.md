@@ -213,8 +213,16 @@ dt compare a1 b1 b2 a2 \
 ```
 
 Use `--lower-is-better` for latency or loss. Use `@job::duration_s` for the
-persisted job duration. Threshold failures return nonzero so a comparison can
-gate an automated decision.
+persisted job duration. `--max-regression` bounds how much the treatment may
+lose to the baseline (the mirror of `--min-improvement`), and `--max-spread`
+bounds within-group noise. Threshold failures return nonzero so a comparison
+can gate an automated decision.
+
+Forks can reuse a predecessor's large on-node data instead of re-downloading
+it: `dt fork REF --reuse-cache PATH` shares the directory read-only via
+`DT_REUSED_CACHE_DIR`, `--clone-cache PATH` gives the fork a private copy,
+and `--inherit-cache` repeats the parent's arrangement. `dt info --json`
+reports the resulting `cache_reuse` contract.
 
 ## Reproducibility checklist
 

@@ -2884,8 +2884,10 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
     ]
     assert all(callable(observer) for observer in retry_observers)
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_pull_v1",
         "job_id": entry.job_id,
         "status": "pulled",
+        "outcome": "pulled",
         "job_status": "failed",
         "node": "n1",
         "destination": str(destination),
@@ -2961,8 +2963,10 @@ def test_pull_json_success_contract(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_pull_v1",
         "job_id": "jid",
         "status": "pulled",
+        "outcome": "pulled",
         "job_status": "running",
         "node": "n1",
         "destination": str(destination),
