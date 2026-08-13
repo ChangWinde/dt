@@ -6,6 +6,115 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- Bulk data prefers real capacity instead of the operator's SSH route. The
+  head classifies every control route as `direct`, `relayed` (an frp/autossh
+  tunnel), `proxied` (a jump host), `local`, or `opaque`, learns per-edge
+  throughput passively from completed transfers, and ranks verified routes by
+  measured capacity. `dt topology --measure` adds a bounded active probe,
+  `dt topology` and `dt doctor` report the classification per node, and slow
+  evidence expires so one congested sample cannot permanently demote a fast
+  edge.
+
+- `dt pull --route auto|direct|gateway` recovers results through the site
+  gateway when the head dials the job node through a tunnel and the gateway
+  is directly reachable. Staging runs over the site LAN into a private
+  capsule on the gateway, applies pull filters before any WAN byte moves,
+  and is deleted on success. The decision uses only local `ssh -G` evidence
+  and a 64 MiB floor, so a direct pull costs nothing extra; any relay
+  failure falls back to the direct route. JSON reports `route`,
+  `route_gateway`, `route_reason`, and `relay_error` on fallback.
+
+- `dt sync --route auto|direct|gateway` applies the same routing to project
+  mirroring through a persistent gateway mirror, so every staged sync after
+  the first is delta-priced and one site's nodes cost a single WAN transfer
+  plus LAN replays. `--plan` and `--artifact` keep the operator route.
+
+- `dt clean --deployments` garbage-collects old release trees, staging
+  directories, and installations, never touching the live release or the
+  installation the `dt` command resolves into.
+
+- `dt clean --json` emits versioned `dt_clean_v1` plan and apply envelopes,
+  and `dt kill --sweep` signals leftover processes of an already-terminal
+  job without ever rewriting its recorded result.
+
+- `dt ps --center` scopes queue observation to one configured center from a
+  laptop, and `dt ps --active` is now a documented filter.
+
+### Changed
+
+- Every JSON payload carries `schema_version`: `dt init`, `dt logs`,
+  `dt info`, `dt pull`, `dt clean`, and `dt agent status` join the surfaces
+  that already declared one. `dt pull` additionally reports `outcome`
+  alongside the compatibility `status` key.
+
+- `dt wait` keeps its exit codes inside the documented reserved band: an
+  experiment exit in 65–69 is reported as 64 rather than colliding with dt's
+  own infrastructure codes.
+
+- `dt watch --compact` is now `--no-tails`, which describes what it does;
+  `--compact` remains as an alias.
+
+- The agent backs off exponentially on job-specific placement blockers
+  (bad dataset path, unfit node) instead of re-probing every node at the
+  active poll forever, while dependency waits stay hot and retry each tick.
+
+- Hot-path I/O measured and cut: snapshot publication flushes with one
+  `syncfs` instead of an fsync per file (seconds to milliseconds on large
+  trees), the resident agent reuses decoded registry rows keyed by file
+  revision, `dt info` decodes the registry once instead of up to three
+  times, and the agent heartbeat no longer forces two disk flushes per tick.
+
+- Configuration validation is stricter: `lan_address` rejects ports,
+  brackets, and bare IPv6; `proxy` requires a full HTTP(S) URL; duplicate
+  YAML keys are refused instead of silently overriding; relative project
+  paths are rejected.
+
+### Fixed
+
+- Destructive maintenance can no longer delete a running job's data. The
+  `clean`/`compact` liveness census is a full identity check on every
+  victim, refuses when it cannot prove death, runs under pinned bash (a zsh
+  login shell collapsed its multi-line census into a false DEAD), and no
+  longer glob-interprets configured job paths, which made a live process
+  under a path containing `[ ] * ?` read as dead.
+
+- The kill probe reports the truth in four previously false-DEAD cases:
+  zombie leaders, a completion that raced the signal (now `EXITED`, keeping
+  the natural result), wandering orphans reachable only through the process
+  group, and unprovable leaders. A job-writable exit marker containing a
+  Unicode digit no longer crashes `dt kill` or records a fabricated exit
+  code.
+
+- A job left blocked for about three and a half days no longer wedges the
+  agent: the placement backoff bounded its exponent, where the previous
+  computation raised `OverflowError` on every subsequent poll tick and
+  starved the queue behind it.
+
+- `dt clean --deployments` refuses the release sweep when the `current`
+  marker is missing instead of reaping every release including the
+  rollback target.
+
+- `dt doctor` redacts remote endpoint identity — addresses, hostnames, and
+  the user part of `user@host` — from shareable rows, and bounds hostile
+  remote stderr before scanning it.
+
+- Throughput memory degrades to "unmeasured" on a damaged state path
+  instead of raising out of a transfer that already succeeded.
+
+- Submission receipts recorded as uncertain now heal from authoritative job
+  status: a verified kill confirms them and a recovered completion replays
+  them, instead of staying closed against the real outcome.
+
+- `dt pull` materializes zero-trust remote trees with `--safe-links`, so a
+  symlink pointing outside the transferred tree is not recreated locally.
+
+- The operation journal makes appends and rotation durable, the agent
+  survives deploy file churn and a full disk, `dt storage` is strictly
+  read-only, a broken GPU driver fails the doctor check, and `-V` works as
+  an alias of `--version`.
+
 ## 0.9.0 — 2026-08-12
 
 ### Added
