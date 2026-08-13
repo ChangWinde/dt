@@ -88,6 +88,60 @@ def test_small_or_instantaneous_samples_are_rejected(tmp_path):
     assert store.sample("site:s", "n1", "n2") is None
 
 
+def test_smoothing_is_asymmetric_good_news_recovers_faster(tmp_path):
+    # One congested transfer must not sink a good edge (bad news weighted
+    # low); a recovered edge climbs back quickly (good news weighted high).
+    store = PersistentLinkMetrics(_cfg(tmp_path))
+    store.record("site:s", "n1", "n2", transferred_bytes=10 << 20, elapsed_seconds=1.0)
+
+    recovered = store.record(
+        "site:s", "n1", "n2", transferred_bytes=100 << 20, elapsed_seconds=1.0
+    )
+
+    assert recovered is not None
+    expected_up = 0.5 * (100 << 20) + 0.5 * (10 << 20)
+    assert recovered.smoothed_bps == pytest.approx(expected_up)
+
+
+def test_slow_evidence_expires_and_revives_the_edge(tmp_path):
+    # The self-locking trap: a slow-labelled edge ranks last, so it never
+    # gets used, so it never gets re-measured. Expired slow evidence must
+    # read as unmeasured again so the edge earns a retrial.
+    from dt.link_metrics import SLOW_EVIDENCE_TTL_S, effective_throughput_bps
+
+    clock = {"now": 1_000_000.0}
+    store = PersistentLinkMetrics(_cfg(tmp_path), clock=lambda: clock["now"])
+    slow = store.record(
+        "site:s",
+        "n1",
+        "n2",
+        transferred_bytes=2 << 20,  # ~2 MiB/s: below the optimistic rank
+        elapsed_seconds=1.0,
+    )
+    fast = store.record(
+        "site:s",
+        "n2",
+        "n1",
+        transferred_bytes=200 << 20,
+        elapsed_seconds=1.0,
+    )
+    assert slow is not None and fast is not None
+
+    # Fresh slow evidence counts.
+    assert effective_throughput_bps(slow, now=clock["now"]) == pytest.approx(
+        2 * (1 << 20)
+    )
+    # Expired slow evidence reads as unmeasured: the edge gets retried.
+    later = clock["now"] + SLOW_EVIDENCE_TTL_S + 1
+    assert effective_throughput_bps(slow, now=later) is None
+    # Fast evidence never expires here; every transfer it carries refreshes it.
+    much_later = clock["now"] + 30 * 24 * 3600
+    assert effective_throughput_bps(fast, now=much_later) == pytest.approx(
+        200 * (1 << 20)
+    )
+    assert effective_throughput_bps(None, now=later) is None
+
+
 def test_large_fast_transfers_record_a_floored_lower_bound(tmp_path):
     # A fast LAN moves 64 MiB in well under the minimum window; that is an
     # edge worth learning, recorded as "at least this fast".

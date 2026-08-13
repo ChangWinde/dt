@@ -185,7 +185,10 @@ When a relayed node needs bulk traffic, join it to a site or pin
 a bounded payload over every healthy site edge and control route and records
 MiB/s; completed transfers keep those numbers fresh automatically, and route
 ranking prefers measured-faster edges (half-decade buckets, unmeasured edges
-stay optimistic until first use).
+stay optimistic until first use). A slow measurement cannot pin a healthy
+edge permanently: below-optimistic evidence expires after 15 minutes, the
+edge ranks as unmeasured again and earns a retrial, and one congested
+transfer folds in at low weight while recovery folds in at high weight.
 
 Read-only topology and GPU telemetry probes may retry once through a fresh,
 non-multiplexed DT overlay when stderr proves a stale ControlMaster. The retry

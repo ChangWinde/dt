@@ -32,6 +32,7 @@ from .link_metrics import (
     LinkMetricsError,
     LinkSample,
     PersistentLinkMetrics,
+    effective_throughput_bps,
     site_link_scope,
 )
 from .route_health import (
@@ -1295,11 +1296,13 @@ class TopologyDiscovery:
         )
 
     def edge_throughput_bps(self, source: Node, destination: Node) -> float | None:
-        """Smoothed measured rate for one site edge, or None when unknown.
+        """Rate the ranking may act on for one site edge, or None when unknown.
 
         Throughput memory is an efficiency signal only: damaged or missing
         metrics degrade to "unmeasured" and must never fail a route that
-        host-key pinning and digest verification already protect.
+        host-key pinning and digest verification already protect. Expired
+        slow evidence also degrades to "unmeasured" so one congested moment
+        can never pin a healthy LAN edge behind worse routes forever.
         """
         site = self.topology.site_for(source)
         if site is None or self.topology.site_for(destination) != site:
@@ -1312,7 +1315,7 @@ class TopologyDiscovery:
             )
         except LinkMetricsError:
             return None
-        return None if sample is None else sample.smoothed_bps
+        return effective_throughput_bps(sample, now=self.link_metrics.clock())
 
     def discover_edges(
         self,

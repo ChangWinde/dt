@@ -38,7 +38,17 @@ MIN_SAMPLE_SECONDS = 0.25
 # silently never learning anything about fast LANs.
 FAST_SAMPLE_FLOOR_BYTES = 32 << 20
 # Exponential smoothing keeps one number per edge while riding out bursts.
-SMOOTHING = 0.3
+# Asymmetric on purpose: one congested transfer must not sink a good edge
+# (bad news needs corroboration), while a recovered edge should climb back
+# quickly (good news is believed faster).
+SMOOTHING_DOWN = 0.3
+SMOOTHING_UP = 0.5
+# Bad news also expires. A below-unmeasured (slower-than-optimistic) sample
+# only keeps an edge sunk while it is fresh; after this window the edge
+# ranks as unmeasured again, gets retried, and re-measures its true rate.
+# Fast samples never need expiry: a preferred edge is refreshed by every
+# transfer it carries, so stale good news self-corrects through use.
+SLOW_EVIDENCE_TTL_S = 900.0
 _ORIGINS = frozenset({"transfer", "probe"})
 _MAX_BPS = 1e12  # nothing DT talks to moves a terabyte per second
 
@@ -302,11 +312,13 @@ class PersistentLinkMetrics:
                 # write repairs it and the damage never silently poisons a
                 # routing decision (reads fail visibly elsewhere).
                 prior = None
-            smoothed = (
-                observed
-                if prior is None
-                else SMOOTHING * observed + (1.0 - SMOOTHING) * prior.smoothed_bps
-            )
+            if prior is None:
+                smoothed = observed
+            else:
+                weight = (
+                    SMOOTHING_UP if observed >= prior.smoothed_bps else SMOOTHING_DOWN
+                )
+                smoothed = weight * observed + (1.0 - weight) * prior.smoothed_bps
             sample = LinkSample(
                 schema_version=SCHEMA_VERSION,
                 key_digest=key,
@@ -320,6 +332,9 @@ class PersistentLinkMetrics:
             return sample
 
 
+UNMEASURED_BUCKET = 2
+
+
 def throughput_bucket(bps: float | None) -> int:
     """Half-decade buckets so near-equal edges do not flap the ranking.
 
@@ -328,7 +343,7 @@ def throughput_bucket(bps: float | None) -> int:
     edge already proven tunnel-grade (<1 MiB/s) sinks below them.
     """
     if bps is None or not math.isfinite(bps) or bps <= 0:
-        return 2
+        return UNMEASURED_BUCKET
     mib = bps / (1 << 20)
     if mib >= 100:
         return 0
@@ -341,3 +356,28 @@ def throughput_bucket(bps: float | None) -> int:
     if mib >= 1:
         return 4
     return 5
+
+
+def effective_throughput_bps(
+    sample: LinkSample | None,
+    *,
+    now: float | None = None,
+) -> float | None:
+    """The rate ranking may act on, with expired bad news removed.
+
+    A slow sample that would sink an edge below the optimistic unmeasured
+    rank only counts while fresh (SLOW_EVIDENCE_TTL_S). Once it expires the
+    edge is unmeasured again: it gets retried, and the retry re-measures the
+    truth. Without this, one congested moment would pin a healthy LAN edge
+    behind worse routes forever, exactly the failure this store exists to
+    prevent. Fast evidence never expires here because a preferred edge is
+    re-verified by every transfer it carries.
+    """
+    if sample is None:
+        return None
+    if (
+        throughput_bucket(sample.smoothed_bps) > UNMEASURED_BUCKET
+        and sample.age_s(now=now) > SLOW_EVIDENCE_TTL_S
+    ):
+        return None
+    return sample.smoothed_bps

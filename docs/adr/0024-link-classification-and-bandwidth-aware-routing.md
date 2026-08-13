@@ -100,6 +100,18 @@ optimistically (as if >=10 MiB/s): they get tried, therefore measured,
 therefore settle into their true bucket — while anything already proven
 tunnel-grade (<1 MiB/s) sinks below them.
 
+Two stabilizers keep the memory honest. Smoothing is asymmetric: a sample
+slower than the current estimate folds in at low weight (one congested
+transfer must not sink a good edge), while a faster sample folds in at high
+weight (a recovered edge climbs back quickly). And bad news expires: a
+sample that ranks an edge below the optimistic unmeasured level only counts
+for a bounded window (15 minutes); after that the edge reads as unmeasured
+again, gets retried, and re-measures its true rate. Without this expiry an
+edge labelled slow would rank last, never be selected, and therefore never
+be re-measured — one congested moment would permanently pin a healthy LAN
+edge behind worse routes. Fast evidence needs no expiry: a preferred edge is
+re-verified by every transfer it carries.
+
 ## Impact
 
 The first transfer over an unknown edge behaves exactly as today; every

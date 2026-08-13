@@ -1022,6 +1022,35 @@ def test_route_attaches_measured_throughput(tmp_path, monkeypatch):
     assert discovery.edge_throughput_bps(cfg.nodes[0], cfg.nodes[2]) is None
 
 
+def test_edge_throughput_revives_after_stale_slow_evidence(tmp_path):
+    # A LAN edge measured during one congested moment must not stay pinned
+    # behind worse routes: once the slow sample expires, the edge ranks as
+    # unmeasured, gets retried, and re-measures its true rate.
+    from dt.link_metrics import (
+        SLOW_EVIDENCE_TTL_S,
+        PersistentLinkMetrics,
+        site_link_scope,
+    )
+
+    cfg = _cfg(tmp_path)
+    clock = {"now": 1_000_000.0}
+    store = PersistentLinkMetrics(cfg, clock=lambda: clock["now"])
+    store.record(
+        site_link_scope(cfg.sites["psibot"]),
+        "psibot-ys",
+        "psibot-ds",
+        transferred_bytes=2 << 20,  # one congested moment: ~2 MiB/s
+        elapsed_seconds=1.0,
+    )
+    discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg), link_metrics=store)
+
+    fresh = discovery.edge_throughput_bps(cfg.nodes[2], cfg.nodes[3])
+    assert fresh == pytest.approx(2 * (1 << 20))
+
+    clock["now"] += SLOW_EVIDENCE_TTL_S + 1
+    assert discovery.edge_throughput_bps(cfg.nodes[2], cfg.nodes[3]) is None
+
+
 def test_measure_route_streams_and_records_a_probe_sample(tmp_path, monkeypatch):
     import dt.topology_discovery as module
 
