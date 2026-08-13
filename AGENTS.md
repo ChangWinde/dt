@@ -120,6 +120,11 @@ The JSON payload reports `route`, `route_gateway`, and `route_reason`;
 `relay_error` appears when staging failed and the pull recovered over the
 direct route. Force behavior with `--route direct` or `--route gateway`.
 
+`dt sync` applies the same routing to project mirroring (ADR 0026): a
+persistent filtered mirror on the gateway makes staged syncs delta-priced,
+and each sync row carries the same `route`/`route_gateway`/`route_reason`
+fields. `--plan` and `--artifact` always use the operator route.
+
 `dt topology --json` classifies every head-to-node control route: `relayed`
 means the SSH route enters a local tunnel (frp/autossh) whose low bandwidth
 bulk transfers would inherit — join the node to a site or pin `lan_address`

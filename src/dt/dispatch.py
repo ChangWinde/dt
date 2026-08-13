@@ -98,11 +98,13 @@ from .snapshot_store import (
     save_state as _save_snapshot_store_state,
 )
 from . import submission_intent as intent_mod
+from . import sync_relay
 from .sshio import (
     BULK_TRANSFER_TIMEOUT_S,
     RSYNC_UNREACHABLE_EXIT_CODES,
     RemoteError,
     RsyncRetryEvent,
+    diagnostic_excerpt,
     rsync,
     run_on,
 )
@@ -611,6 +613,7 @@ def sync_project(
     *,
     plan: bool = False,
     retries: int = 2,
+    route: str = "auto",
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
     cancel_event: Event | None = None,
 ) -> dict[str, object]:
@@ -633,6 +636,7 @@ def sync_project(
             log,
             plan=plan,
             retries=retries,
+            route=route,
             on_retry=on_retry,
             cancel_event=cancel_event,
         )
@@ -647,6 +651,7 @@ def _sync_project_locked(
     *,
     plan: bool,
     retries: int,
+    route: str = "auto",
     on_retry: Callable[[RsyncRetryEvent], None] | None,
     cancel_event: Event | None,
 ) -> dict[str, object]:
@@ -711,20 +716,86 @@ def _sync_project_locked(
                 )
             raise DispatchError(f"sync to {node.name} failed preparing cache: {detail}")
 
-    proc = rsync(
-        f"{project_dir}/",
-        rsync_dst,
-        excludes=_excludes(cfg),
-        delete=True,
-        delete_excluded=True,
-        timeout=BULK_TRANSFER_TIMEOUT_S,
-        retries=retries,
-        on_retry=on_retry,
-        stats=True,
-        checksum=True,
-        dry_run=plan,
-        cancel_event=cancel_event,
-    )
+    # Gateway staging (ADR 0026): keep a persistent filtered mirror on the
+    # site gateway and replay it over the LAN. Plan mode always dry-runs
+    # against the node's real cache, and every relay failure falls back to
+    # the unchanged direct sync below.
+    relay_route = None
+    relay_error: str | None = None
+    relayed_proc: subprocess.CompletedProcess[str] | None = None
+    if not plan:
+        relay_route = sync_relay.decide_sync_route(cfg, node.name, mode=route)
+    if (
+        relay_route is not None
+        and relay_route.route == "gateway"
+        and relay_route.gateway is not None
+    ):
+        gateway = relay_route.gateway
+        try:
+            with _sync_cache_lock(
+                cfg,
+                f"{project_name}\0gateway-stage",
+                gateway,
+                exclusive=True,
+            ):
+                sync_relay.prepare_mirror(relay_route, project_name)
+                leg_a = rsync(
+                    f"{project_dir}/",
+                    rsync_destination(
+                        gateway.name,
+                        gateway.local,
+                        sync_relay.mirror_relative(project_name),
+                        directory=True,
+                    ),
+                    excludes=_excludes(cfg),
+                    delete=True,
+                    delete_excluded=True,
+                    timeout=BULK_TRANSFER_TIMEOUT_S,
+                    retries=retries,
+                    on_retry=on_retry,
+                    stats=True,
+                    checksum=True,
+                    cancel_event=cancel_event,
+                )
+                if leg_a.returncode != 0:
+                    raise sync_relay.RelayError(
+                        "head -> gateway staging failed: "
+                        + diagnostic_excerpt(
+                            leg_a.stderr,
+                            None,
+                            fallback=f"rsync exited {leg_a.returncode}",
+                        )
+                    )
+            relayed_proc = sync_relay.push_mirror(
+                cfg,
+                relay_route,
+                project_name,
+                rel,
+            )
+        except sync_relay.RelayError as exc:
+            relay_error = str(exc)
+            log(
+                f"gateway relay via {gateway.name} failed: {relay_error}; "
+                "falling back to the direct route"
+            )
+
+    if relayed_proc is not None:
+        proc = relayed_proc
+    else:
+        proc = rsync(
+            f"{project_dir}/",
+            rsync_dst,
+            excludes=_excludes(cfg),
+            delete=True,
+            delete_excluded=True,
+            timeout=BULK_TRANSFER_TIMEOUT_S,
+            retries=retries,
+            on_retry=on_retry,
+            stats=True,
+            checksum=True,
+            dry_run=plan,
+            cancel_event=cancel_event,
+        )
     if proc.returncode != 0:
         detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
         if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
@@ -746,6 +817,20 @@ def _sync_project_locked(
             0 if plan and cache_present is False else deleted_files(proc.stdout)
         ),
     }
+    if relay_route is not None:
+        result["route"] = "gateway" if relayed_proc is not None else "direct"
+        result["route_gateway"] = (
+            relay_route.gateway.name
+            if relayed_proc is not None and relay_route.gateway is not None
+            else None
+        )
+        result["route_reason"] = (
+            relay_route.reason
+            if relay_error is None
+            else "gateway staging failed; synced over the direct route"
+        )
+        if relay_error is not None:
+            result["relay_error"] = relay_error
     file_count = transferred_files(proc.stdout)
     if file_count is not None:
         result["transferred_files"] = file_count

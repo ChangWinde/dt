@@ -340,6 +340,47 @@ def test_leg_b_recovers_the_staged_tree_bit_exact(tmp_path, loopback_node):
     assert (destination / "report.txt").read_text() == "final accuracy 0.97\n"
 
 
+def test_sync_push_replays_the_mirror_and_deletes_strays(tmp_path, loopback_node):
+    """ADR 0026 leg B for real: the gateway mirror lands on the node over
+    the loopback sshd, --delete purges strays the mirror no longer holds,
+    and --checksum keeps the contract of the direct sync."""
+    from dt.sync_relay import mirror_relative, push_command
+
+    port, gateway_home, env = loopback_node
+    mirror = gateway_home / mirror_relative("omni")
+    (mirror / "pkg").mkdir(parents=True)
+    (mirror / "train.py").write_text("print('v2')\n")
+    (mirror / "pkg" / "model.py").write_text("LAYERS = 12\n")
+
+    node_cache = tmp_path / "node-home" / "dt" / "sync" / "omni" / "code"
+    node_cache.mkdir(parents=True)
+    (node_cache / "train.py").write_text("print('v1')\n")
+    (node_cache / "stale.py").write_text("deleted upstream\n")
+
+    node = Node(name="worker", site="lab", lan_address="127.0.0.1", lan_port=port)
+    command = push_command(node, "omni", str(node_cache))
+    proc = _run_stage(command, env)
+
+    assert proc.returncode == 0, (proc.stdout, proc.stderr)
+    assert (node_cache / "train.py").read_text() == "print('v2')\n"
+    assert (node_cache / "pkg" / "model.py").read_text() == "LAYERS = 12\n"
+    assert not (node_cache / "stale.py").exists()
+    assert "Total transferred file size" in proc.stdout
+
+
+def test_sync_push_refuses_a_missing_mirror(tmp_path, loopback_node):
+    from dt.sync_relay import push_command
+
+    port, gateway_home, env = loopback_node
+    node = Node(name="worker", site="lab", lan_address="127.0.0.1", lan_port=port)
+
+    command = push_command(node, "never-staged", str(tmp_path / "cache"))
+    proc = _run_stage(command, env)
+
+    assert proc.returncode == 70
+    assert "DT_SYNC_RELAY_NO_MIRROR" in proc.stderr
+
+
 def test_inner_ssh_rejects_an_unknown_host_key(tmp_path, loopback_node):
     """StrictHostKeyChecking=yes must fail closed when the gateway has no
     pinned key for the node - the relay then falls back to direct instead of

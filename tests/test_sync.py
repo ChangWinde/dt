@@ -78,6 +78,9 @@ def test_sync_project_is_exact_resumable_remote_cache(tmp_path, monkeypatch):
         "transferred_gib": 1.0,
         "deleted_files": 7,
         "transferred_files": 12,
+        "route": "direct",
+        "route_gateway": None,
+        "route_reason": "node belongs to no configured site",
     }
 
 
@@ -1559,6 +1562,32 @@ def test_sync_cli_routes_explicit_artifacts_without_syncing_code(
     assert seen[0][4]["retries"] == 2
     row = json.loads(result.stdout)[0]
     assert row["mode"] == "artifacts"
+
+
+def test_sync_cli_rejects_unknown_route_and_artifact_gateway_conflict(monkeypatch):
+    import dt.cli as cli
+
+    monkeypatch.setattr(
+        cli,
+        "_cfg",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("invalid route must fail before config access")
+        ),
+    )
+
+    bad_mode = CliRunner().invoke(
+        cli.app,
+        ["sync", "n1", "--route", "fastest", "--json"],
+    )
+    assert bad_mode.exit_code == 1
+    assert "invalid --route" in json.loads(bad_mode.stdout)["message"]
+
+    conflict = CliRunner().invoke(
+        cli.app,
+        ["sync", "n1", "--artifact", "model.pt", "--route", "gateway", "--json"],
+    )
+    assert conflict.exit_code == 1
+    assert "artifact" in json.loads(conflict.stdout)["message"]
 
 
 def test_sync_cli_rejects_negative_retries_before_config(monkeypatch):

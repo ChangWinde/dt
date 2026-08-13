@@ -255,6 +255,21 @@ resumable and preserves partial data on interruption. `--force` can merge into
 a nonempty or differently owned directory and should be reserved for a
 reviewed recovery case.
 
+### Gateway-staged project sync
+
+`dt sync --route auto` (the default) applies the same evidence to project
+mirroring (ADR 0026): when the head dials the target node through a tunnel
+and the site `gateway` is directly reachable, the project is staged into a
+persistent, filtered mirror at `~/.dt/sync-staging/<project>/code` on the
+gateway and replayed to the node over the site LAN with the same
+`--delete --checksum` contract. The mirror makes every later staged sync
+delta-priced, and a sync that targets several nodes of one site crosses the
+WAN once. `--plan` always dry-runs against the node's real cache, artifact
+sync (`--artifact`) keeps the operator route, and any relay failure falls
+back to the direct sync (`relay_error` in the row reports why). Reclaim
+gateway space by deleting the mirror directory; the next staged sync
+rebuilds it.
+
 ### Gateway-staged recovery
 
 When the head dials the job node through a tunnel (an frp/autossh loopback
