@@ -192,10 +192,17 @@ def stage_command(
         "umask 077; "
         'root="$HOME/.dt/pull-staging"; '
         f'capsule="$HOME"/{capsule}; '
+        # The whole staging chain must be real directories: a symlinked root
+        # or capsule would silently redirect result bytes elsewhere. Check
+        # before mkdir so nothing is ever created behind a planted link.
+        'test ! -L "$HOME/.dt" && test ! -L "$root" || exit 70; '
         'mkdir -p "$capsule"/outputs; '
         'test -d "$capsule"/outputs && test ! -L "$capsule" '
         '&& test ! -L "$capsule"/outputs || exit 70; '
         'chmod 700 "$HOME/.dt" "$root" "$capsule"; '
+        # A resumed pull refreshes the capsule mtime so the age sweep below
+        # never reaps a capsule that is actively being retried.
+        'touch -- "$capsule" 2>/dev/null; '
         # Sweep abandoned sibling capsules so failed relays cannot grow the
         # gateway disk forever; the active capsule is excluded by name.
         f'find "$root" -mindepth 1 -maxdepth 1 -type d '
