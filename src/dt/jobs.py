@@ -905,6 +905,28 @@ def list_all(
     return [entries[job_id] for job_id in sorted(entries)]
 
 
+def registry_row_count(cfg: HeadConfig) -> int:
+    """How many registry records exist, without decoding any of them.
+
+    Every command's scan cost is linear in this number, so operators need a
+    cheap way to see it grow. Listing directory entries is the stat-only
+    floor of that scan (sub-millisecond where a full decode is tens of
+    milliseconds), which keeps the health check itself free.
+    """
+    directories = {cfg.legacy_registry_dir(), cfg.registry_dir()}
+    total = 0
+    for directory in directories:
+        try:
+            total += sum(
+                1
+                for name in os.listdir(directory)
+                if name.endswith(".json") and not name.startswith(".")
+            )
+        except OSError:
+            continue
+    return total
+
+
 def running_count(cfg: HeadConfig) -> int:
     """Running jobs, counting unreadable entries as running.
 

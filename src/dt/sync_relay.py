@@ -13,6 +13,7 @@ import shlex
 import subprocess
 import time
 from collections.abc import Callable
+from pathlib import PurePosixPath
 
 from .artifact_distribution import _TRANSFERRED_RE, _stat_total, inner_lan_ssh
 from .config import HeadConfig, Node
@@ -82,6 +83,44 @@ def mirror_relative(project_name: str) -> str:
     return f".dt/sync-staging/{sanitize_name(project_name)}/code"
 
 
+def artifact_mirror_relative(project_name: str) -> str:
+    """The gateway-side artifact mirror, relative to the gateway's home.
+
+    Artifacts keep their project-relative layout inside the mirror so the
+    LAN leg is a straight copy with the same file/directory semantics the
+    direct push uses.
+    """
+    return f".dt/sync-staging/{sanitize_name(project_name)}/artifacts"
+
+
+def _relative_parent(relative: str) -> str:
+    """The mirror-relative parent of one artifact, '' at the mirror root."""
+    parent = PurePosixPath(relative).parent
+    return "" if str(parent) == "." else str(parent)
+
+
+def prepare_artifact_mirror_command(project_name: str, relatives: list[str]) -> str:
+    """Create the private artifact-mirror chain and every artifact parent.
+
+    One command for the whole sync: the parents are known up front, so the
+    relay costs a single control round trip instead of one per artifact.
+    """
+    mirror = shlex.quote(artifact_mirror_relative(project_name))
+    parents = sorted({_relative_parent(relative) for relative in relatives} - {""})
+    extra = "".join(f' "$mirror"/{shlex.quote(parent)}' for parent in parents)
+    script = (
+        "umask 077; "
+        'root="$HOME/.dt/sync-staging"; '
+        f'mirror="$HOME"/{mirror}; '
+        'test ! -L "$HOME/.dt" && test ! -L "$root" || exit 70; '
+        f'mkdir -p "$mirror"{extra}; '
+        'test -d "$mirror" && test ! -L "$mirror" '
+        '&& test ! -L "$(dirname -- "$mirror")" || exit 70; '
+        'chmod 700 "$HOME/.dt" "$root" "$(dirname -- "$mirror")" "$mirror"'
+    )
+    return f"bash -c {shlex.quote(script)}"
+
+
 def prepare_mirror_command(project_name: str) -> str:
     """Build the gateway-side preparation for one project mirror.
 
@@ -144,13 +183,56 @@ def push_command(node: Node, project_name: str, target_rel: str) -> str:
     return f"bash -c {shlex.quote(script)}"
 
 
-def prepare_mirror(
-    route: RelayRoute,
+def push_artifact_command(
+    node: Node,
     project_name: str,
+    relative: str,
+    destination_rel: str,
     *,
-    runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
-) -> None:
-    """Create the private mirror chain on the gateway, or raise RelayError."""
+    is_dir: bool,
+) -> str:
+    """Build the LAN push for one staged artifact.
+
+    The semantics mirror the direct push exactly: a directory is replayed
+    into its own target with ``--delete``, a file lands in its parent.
+    """
+    if node.lan_address is None:
+        raise RelayError(f"node {node.name} advertises no LAN address")
+    mirror = shlex.quote(artifact_mirror_relative(project_name))
+    argv = [
+        "rsync",
+        "-a",
+        "--partial",
+        "--timeout=60",
+        "--stats",
+        "--checksum",
+    ]
+    if is_dir:
+        argv.append("--delete")
+    argv += ["-e", inner_lan_ssh(node.lan_port)]
+    target = f"{node.lan_address}:{shlex.quote(_remote_target_path(destination_rel))}"
+    staged = f'"$mirror"/{shlex.quote(relative)}' + ("/" if is_dir else "")
+    probe = "-d" if is_dir else "-e"
+    script = (
+        f'mirror="$HOME"/{mirror}; '
+        f'test {probe} "$mirror"/{shlex.quote(relative)} || {{ '
+        'echo "DT_SYNC_RELAY_NO_MIRROR" >&2; exit 70; }; '
+        'mkdir -p "$HOME/.ssh/dt/artifact"; '
+        'chmod 700 "$HOME/.ssh" "$HOME/.ssh/dt" "$HOME/.ssh/dt/artifact"; '
+        f"{shlex.join(argv)} -- {staged} {shlex.quote(target)}"
+    )
+    return f"bash -c {shlex.quote(script)}"
+
+
+def _run_gateway_command(
+    route: RelayRoute,
+    command: str,
+    *,
+    what: str,
+    timeout: float,
+    runner: Callable[..., "subprocess.CompletedProcess[str]"] | None,
+) -> "subprocess.CompletedProcess[str]":
+    """One gateway control call with the module's uniform failure contract."""
     if route.gateway is None:
         raise RelayError("relay route is missing its gateway")
     if runner is None:
@@ -159,8 +241,8 @@ def prepare_mirror(
         proc = runner(
             route.gateway.name,
             route.gateway.local,
-            prepare_mirror_command(project_name),
-            timeout=30,
+            command,
+            timeout=timeout,
             workload=SSHWorkload.ARTIFACT_RELAY,
         )
     except (RemoteError, OSError) as exc:
@@ -171,30 +253,86 @@ def prepare_mirror(
         detail = diagnostic_excerpt(
             proc.stderr,
             proc.stdout,
-            fallback=f"mirror preparation exited {proc.returncode}",
+            fallback=f"{what} exited {proc.returncode}",
         )
-        raise RelayError(f"gateway mirror preparation failed: {detail}")
+        raise RelayError(f"gateway {what} failed: {detail}")
+    return proc
 
 
-def push_mirror(
+def prepare_mirror(
+    route: RelayRoute,
+    project_name: str,
+    *,
+    runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
+) -> None:
+    """Create the private mirror chain on the gateway, or raise RelayError."""
+    _run_gateway_command(
+        route,
+        prepare_mirror_command(project_name),
+        what="mirror preparation",
+        timeout=30,
+        runner=runner,
+    )
+
+
+def prepare_artifact_mirror(
+    route: RelayRoute,
+    project_name: str,
+    relatives: list[str],
+    *,
+    runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
+) -> None:
+    """Create the artifact mirror and every artifact parent on the gateway."""
+    _run_gateway_command(
+        route,
+        prepare_artifact_mirror_command(project_name, relatives),
+        what="artifact mirror preparation",
+        timeout=30,
+        runner=runner,
+    )
+
+
+def push_artifact(
     cfg: HeadConfig,
     route: RelayRoute,
     project_name: str,
-    target_rel: str,
+    relative: str,
+    destination_rel: str,
     *,
+    is_dir: bool,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Execute leg B with bounded retries; returns the completed push.
+) -> "subprocess.CompletedProcess[str]":
+    """Replay one staged artifact to the node over the site LAN."""
+    if route.node is None:
+        raise RelayError("relay route is missing its node")
+    command = push_artifact_command(
+        route.node,
+        project_name,
+        relative,
+        destination_rel,
+        is_dir=is_dir,
+    )
+    return _retrying_push(cfg, route, command, what="artifact push", runner=runner)
 
-    The returned process carries leg B's ``--stats`` output: what actually
-    landed on the node, which is what the sync row reports. Raises
+
+def _retrying_push(
+    cfg: HeadConfig,
+    route: RelayRoute,
+    command: str,
+    *,
+    what: str,
+    runner: Callable[..., "subprocess.CompletedProcess[str]"] | None,
+) -> "subprocess.CompletedProcess[str]":
+    """Run one LAN push with bounded retries and passive throughput memory.
+
+    The returned process carries the push's ``--stats`` output: what
+    actually landed on the node, which is what the sync row reports. Raises
     ``RelayError`` on failure; the caller falls back to the direct sync.
     """
     if route.gateway is None or route.node is None:
         raise RelayError("relay route is missing its gateway")
     if runner is None:
         runner = run_on
-    command = push_command(route.node, project_name, target_rel)
     last = None
     for attempt in range(PUSH_ATTEMPTS):
         started = time.monotonic()
@@ -231,9 +369,24 @@ def push_mirror(
     detail = diagnostic_excerpt(
         last.stderr if last is not None else None,
         last.stdout if last is not None else None,
-        fallback=f"push exited {last.returncode if last else 'unknown'}",
+        fallback=f"{what} exited {last.returncode if last else 'unknown'}",
     )
-    raise RelayError(f"gateway -> node push failed: {detail}")
+    raise RelayError(f"gateway -> node {what} failed: {detail}")
+
+
+def push_mirror(
+    cfg: HeadConfig,
+    route: RelayRoute,
+    project_name: str,
+    target_rel: str,
+    *,
+    runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Replay the staged project mirror to the node over the site LAN."""
+    if route.node is None:
+        raise RelayError("relay route is missing its node")
+    command = push_command(route.node, project_name, target_rel)
+    return _retrying_push(cfg, route, command, what="push", runner=runner)
 
 
 def _record_push_sample(

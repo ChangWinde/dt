@@ -288,3 +288,25 @@ def doctor_center(cfg: HeadConfig) -> list[dict[str, Any]]:
             plural = "es" if count != 1 else ""
             checks["addrs"] = f"{count} address{plural} (redacted)"
     return rows
+
+
+# Every command's registry scan is linear in the row count (measured ~32 us
+# per row), so a history that grows without bound slowly taxes every
+# invocation. Warn well before it is painful and name the two existing
+# levers; dt never deletes an operator's experiment history on its own.
+REGISTRY_ADVISORY_ROWS = 2000
+
+
+def registry_growth_status(cfg: HeadConfig) -> str:
+    """One advisory label about registry size for the head's doctor row."""
+    from .jobs import registry_row_count
+
+    rows = registry_row_count(cfg)
+    if rows < REGISTRY_ADVISORY_ROWS:
+        return f"ok ({rows} rows)"
+    lever = (
+        "set queue.auto_clean_days"
+        if cfg.queue.auto_clean_days is None
+        else "run dt clean"
+    )
+    return f"large: {rows} rows slow every command; {lever}"

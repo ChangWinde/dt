@@ -60,7 +60,7 @@ from .dispatch import (
     reconcile_submission_request,
     submit,
 )
-from .doctor import doctor_center, relay_agent_status
+from .doctor import doctor_center, registry_growth_status, relay_agent_status
 from .forwarding import HeadCommand
 from .lifecycle import termination_probe, termination_verdict
 from .layout import (
@@ -14612,16 +14612,6 @@ def sync(
             exit_code=1,
             json_=json_,
         )
-    if artifacts and route == "gateway":
-        _fail_submission(
-            kind="invalid_argument",
-            message=(
-                "--route gateway applies to project sync only; artifact "
-                "sync keeps the operator SSH route (ADR 0026)"
-            ),
-            exit_code=1,
-            json_=json_,
-        )
     cfg = _cfg()
 
     def resume_argv() -> list[str]:
@@ -14741,6 +14731,7 @@ def sync(
                     artifact_progress,
                     plan=plan,
                     retries=retries,
+                    route=route,
                     on_retry=_rsync_retry_observer(
                         name,
                         "artifact-sync",
@@ -15660,11 +15651,13 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
         agent_label = (
             "ok" if agent_ok else (f"off ({n_queued} queued!)" if n_queued else "off")
         )
+        registry_label = registry_growth_status(cfg)
         local_names = {n.name for n in cfg.nodes if n.local}
         attached = False
         for r in rows:  # agent runs on the head itself -> its local node row
             if r["node"] in local_names:
                 r["checks"]["agent"] = agent_label
+                r["checks"]["registry"] = registry_label
                 if relay_status is not None:
                     r["checks"]["relay"] = relay_status
                 attached = True
@@ -15673,7 +15666,11 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
             # still runs the agent and the relay; without a synthetic row a
             # dead agent, a backlogged queue, and a broken relay would all
             # be invisible and doctor would exit 0.
-            checks: dict[str, str] = {"ssh": "ok", "agent": agent_label}
+            checks: dict[str, str] = {
+                "ssh": "ok",
+                "agent": agent_label,
+                "registry": registry_label,
+            }
             if relay_status is not None:
                 checks["relay"] = relay_status
             rows.append({"node": "(head)", "checks": checks, "unreachable": False})

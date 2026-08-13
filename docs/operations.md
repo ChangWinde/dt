@@ -264,11 +264,11 @@ persistent, filtered mirror at `~/.dt/sync-staging/<project>/code` on the
 gateway and replayed to the node over the site LAN with the same
 `--delete --checksum` contract. The mirror makes every later staged sync
 delta-priced, and a sync that targets several nodes of one site crosses the
-WAN once. `--plan` always dry-runs against the node's real cache, artifact
-sync (`--artifact`) keeps the operator route, and any relay failure falls
-back to the direct sync (`relay_error` in the row reports why). Reclaim
-gateway space by deleting the mirror directory; the next staged sync
-rebuilds it.
+WAN once. `--artifact` stages the same way, under
+`~/.dt/sync-staging/<project>/artifacts/`. `--plan` always dry-runs against
+the node's real cache, and any relay failure falls back to the direct sync
+(`relay_error` in the row reports why). Reclaim gateway space by deleting
+the mirror directory; the next staged sync rebuilds it.
 
 ### Gateway-staged recovery
 
@@ -367,3 +367,9 @@ dt free --json
 Run one bounded CPU-only canary, then one authorized bounded GPU canary before
 broad use. Preserve the job IDs and `dt info --json` outputs with the upgrade
 record.
+
+The head row's `registry` check reports how many job records every command
+must scan. Past a few thousand rows the label turns to `large:` and names
+the lever: set `queue.auto_clean_days` to retire ended jobs on a schedule,
+or run `dt clean` once. dt never retires experiment history on its own — an
+unset retention means unbounded growth by choice, not by accident.

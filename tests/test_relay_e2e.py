@@ -1,13 +1,17 @@
-"""End-to-end validation of gateway staging against a real loopback sshd.
+"""End-to-end validation of gateway staging against real loopback sshds.
 
-The unit tests in test_pull_relay.py verify command *strings*; the staging
-leg crosses three shell layers (pinned bash -> rsync -e inner ssh -> the
-node shell parsing the source path), and only real execution proves the
-quoting, the host-key pinning, the df guard, the GC sweep, and the private
-capsule chain actually compose. The harness runs a one-shot sshd on a
-loopback port as the "node", and executes the gateway-side script locally
-under an overridden HOME so nothing touches the developer's real home,
-known_hosts, or control sockets.
+The unit tests verify command *strings*; a relay leg crosses three shell
+layers (pinned bash -> rsync -e inner ssh -> the far shell parsing the
+path), and only real execution proves the quoting, the host-key pinning,
+the df guard, the GC sweep, and the private capsule chain actually compose.
+
+Two harness shapes run here. Single-hop tests start one sshd as the "node"
+and execute the gateway-side script locally under a sandbox HOME. The
+``relay_chain`` fixture starts two sshds and drives the complete
+head -> gateway -> node chain over SSH, so the control hop and both data
+legs are real. Nothing touches the developer's home, known_hosts, agent, or
+control sockets: trust material is injected through a PATH shim that
+forwards the production option string untouched.
 """
 
 import os
@@ -40,16 +44,26 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-@pytest.fixture
-def loopback_node(tmp_path):
-    """A real sshd on 127.0.0.1 plus a gateway HOME wired to trust it.
+class _Sshd:
+    """One running loopback sshd plus the key material a client needs."""
 
-    Returns ``(port, gateway_home, gateway_env)``: the gateway-side script
-    runs with ``HOME=gateway_home``, whose ``.ssh`` holds the client key and
-    a pinned known_hosts entry, so ``StrictHostKeyChecking=yes`` passes
-    without touching the real account.
-    """
-    keys = tmp_path / "keys"
+    def __init__(self, port: int, host_pub: str, client_key: Path, daemon):
+        self.port = port
+        self.host_pub = host_pub
+        self.client_key = client_key
+        self.daemon = daemon
+
+    def stop(self) -> None:
+        self.daemon.terminate()
+        try:
+            self.daemon.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.daemon.kill()
+
+
+def _spawn_sshd(root: Path, name: str) -> _Sshd:
+    """Start a one-shot sshd on a free loopback port, or skip the test."""
+    keys = root / f"keys-{name}"
     keys.mkdir()
     host_key = keys / "host_ed25519"
     client_key = keys / "client_ed25519"
@@ -59,7 +73,7 @@ def loopback_node(tmp_path):
             check=True,
         )
     port = _free_port()
-    sshd_dir = tmp_path / "sshd"
+    sshd_dir = root / f"sshd-{name}"
     sshd_dir.mkdir()
     config = sshd_dir / "sshd_config"
     config.write_text(
@@ -73,6 +87,7 @@ StrictModes no
 UsePAM no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
+PermitUserEnvironment no
 LogLevel ERROR
 """
     )
@@ -96,31 +111,42 @@ LogLevel ERROR
     else:
         daemon.terminate()
         pytest.skip("loopback sshd never opened its port")
+    return _Sshd(
+        port, (keys / "host_ed25519.pub").read_text().strip(), client_key, daemon
+    )
 
-    gateway_home = tmp_path / "gateway-home"
-    ssh_dir = gateway_home / ".ssh"
+
+def _trusting_env(root: Path, name: str, targets: list[_Sshd]) -> tuple[Path, dict]:
+    """A sandbox HOME plus an ssh shim that trusts exactly ``targets``.
+
+    OpenSSH resolves ``~`` through the passwd database, not ``$HOME``, so a
+    harness cannot redirect known_hosts or identities by overriding HOME
+    alone. The PATH shim injects the sandbox trust material FIRST (the first
+    ``-o`` wins in ssh) and then forwards the production option string
+    untouched - which is exactly the string under test. Muxing is disabled
+    because the production ControlPath would land in the real ``~/.ssh``.
+    """
+    home = root / f"home-{name}"
+    ssh_dir = home / ".ssh"
     ssh_dir.mkdir(parents=True)
-    gateway_home.chmod(0o700)
+    home.chmod(0o700)
     ssh_dir.chmod(0o700)
-    host_pub = (keys / "host_ed25519.pub").read_text().strip()
     known_hosts = ssh_dir / "known_hosts"
-    known_hosts.write_text(f"[127.0.0.1]:{port} {host_pub}\n")
-
-    # OpenSSH resolves ~ through the passwd database, not $HOME, so the
-    # harness cannot redirect known_hosts/identity by overriding HOME.
-    # A PATH shim injects the sandbox trust material FIRST (first -o wins in
-    # ssh) and then forwards the production option string untouched - which
-    # is exactly the string under test. Muxing is disabled because the
-    # production ControlPath would land in the developer's real ~/.ssh.
-    shim_dir = tmp_path / "shim"
+    known_hosts.write_text(
+        "".join(f"[127.0.0.1]:{t.port} {t.host_pub}\n" for t in targets)
+    )
+    shim_dir = root / f"shim-{name}"
     shim_dir.mkdir()
     real_ssh = shutil.which("ssh")
+    identities = " ".join(
+        f"-o IdentityFile={shlex.quote(str(t.client_key))}" for t in targets
+    )
     shim = shim_dir / "ssh"
     shim.write_text(
         "#!/bin/sh\n"
         f"exec {shlex.quote(real_ssh)} -F none "
         f"-o UserKnownHostsFile={shlex.quote(str(known_hosts))} "
-        f"-o IdentityFile={shlex.quote(str(client_key))} "
+        f"{identities} "
         "-o IdentitiesOnly=yes "
         "-o ControlMaster=no -o ControlPath=none "
         '"$@"\n'
@@ -128,21 +154,30 @@ LogLevel ERROR
     shim.chmod(0o755)
     env = {
         **os.environ,
-        "HOME": str(gateway_home),
+        "HOME": str(home),
         "PATH": f"{shim_dir}:{os.environ['PATH']}",
     }
     # The inner ssh must authenticate with the harness key only, never the
     # developer's agent.
     env.pop("SSH_AUTH_SOCK", None)
+    return home, env
 
+
+@pytest.fixture
+def loopback_node(tmp_path):
+    """A real sshd on 127.0.0.1 plus a gateway HOME wired to trust it.
+
+    Returns ``(port, gateway_home, gateway_env)``: the gateway-side script
+    runs with ``HOME=gateway_home``, whose trust material is injected by the
+    shim, so ``StrictHostKeyChecking=yes`` passes without touching the real
+    account.
+    """
+    node = _spawn_sshd(tmp_path, "node")
+    gateway_home, env = _trusting_env(tmp_path, "gateway", [node])
     try:
-        yield port, gateway_home, env
+        yield node.port, gateway_home, env
     finally:
-        daemon.terminate()
-        try:
-            daemon.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            daemon.kill()
+        node.stop()
 
 
 def _node_outputs(tmp_path) -> Path:
@@ -398,3 +433,191 @@ def test_inner_ssh_rejects_an_unknown_host_key(tmp_path, loopback_node):
     assert proc.returncode != 0
     staged = gateway_home / staging_relative("e2e-job") / "outputs"
     assert not any(staged.iterdir())
+
+
+@pytest.fixture
+def relay_chain(tmp_path):
+    """Two loopback sshds forming a real node -> gateway -> head chain.
+
+    The head (this process) reaches the gateway over SSH, the gateway
+    reaches the node over its own SSH, and each hop verifies a pinned host
+    key. Returns the node/gateway ports, the gateway's sandbox HOME, and
+    the head's environment.
+    """
+    node = _spawn_sshd(tmp_path, "node")
+    gateway = _spawn_sshd(tmp_path, "gateway")
+    gateway_home, gateway_env = _trusting_env(tmp_path, "gateway", [node])
+    _head_home, head_env = _trusting_env(tmp_path, "head", [gateway])
+    try:
+        yield node, gateway, gateway_home, gateway_env, head_env
+    finally:
+        gateway.stop()
+        node.stop()
+
+
+def _remote_bash(port: int, env: dict, command: str) -> list[str]:
+    """Run one production command on a loopback sshd under a sandbox env.
+
+    sshd hands the login shell the real account's environment, so the
+    harness pins HOME and the shim PATH for the remote side; the production
+    command itself is forwarded verbatim.
+    """
+    prefix = f"env HOME={shlex.quote(env['HOME'])} PATH={shlex.quote(env['PATH'])}"
+    return [
+        "ssh",
+        "-p",
+        str(port),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "127.0.0.1",
+        f"{prefix} {command}",
+    ]
+
+
+def test_full_pull_chain_moves_outputs_node_to_gateway_to_head(tmp_path, relay_chain):
+    """The whole ADR 0025 chain over two real sshds: the head instructs the
+    gateway, the gateway pulls the node over its own SSH, and the head then
+    recovers the staged tree, with every hop verifying a pinned host key."""
+    node_sshd, gateway_sshd, gateway_home, gateway_env, head_env = relay_chain
+    job_dir = _node_outputs(tmp_path)
+    node = Node(
+        name="worker",
+        site="lab",
+        lan_address="127.0.0.1",
+        lan_port=node_sshd.port,
+    )
+
+    # Leg A: the head asks the gateway to stage from the node.
+    stage = stage_command(
+        node,
+        "e2e-job",
+        str(job_dir),
+        excludes=["ckpt/"],
+        estimate_bytes=1 << 20,
+    )
+    staged_proc = subprocess.run(
+        _remote_bash(gateway_sshd.port, gateway_env, stage),
+        env=head_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert staged_proc.returncode == 0, (staged_proc.stdout, staged_proc.stderr)
+
+    # Leg B: the head recovers the staged capsule from the gateway.
+    destination = tmp_path / "recovered"
+    destination.mkdir()
+    capsule = f"{staging_relative('e2e-job')}/outputs"
+    recovered = subprocess.run(
+        [
+            "rsync",
+            "-a",
+            "--partial",
+            "--safe-links",
+            "--stats",
+            "-e",
+            f"ssh -p {gateway_sshd.port} -o BatchMode=yes",
+            "--",
+            f"127.0.0.1:{shlex.quote(str(gateway_home / capsule))}/",
+            f"{destination}/",
+        ],
+        env=head_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert (destination / "report.txt").read_text() == "final accuracy 0.97\n"
+    assert (destination / "metrics.json").is_file()
+    # The LAN-hop exclude held all the way to the head.
+    assert not (destination / "ckpt").exists()
+    # --safe-links dropped the escaping symlink at the first hop.
+    assert not (destination / "escape").exists()
+
+    # Cleanup runs on the gateway over the same control hop.
+    cleaned = subprocess.run(
+        _remote_bash(gateway_sshd.port, gateway_env, cleanup_command("e2e-job")),
+        env=head_env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert cleaned.returncode == 0, cleaned.stderr
+    assert not (gateway_home / staging_relative("e2e-job")).exists()
+
+
+def test_full_sync_chain_mirrors_head_to_gateway_to_node(tmp_path, relay_chain):
+    """The ADR 0026 chain over two real sshds: the head mirrors the project
+    onto the gateway, then the gateway replays it to the node over its own
+    SSH, deleting what the mirror no longer holds."""
+    from dt.sync_relay import (
+        mirror_relative,
+        prepare_mirror_command,
+        push_command,
+    )
+
+    node_sshd, gateway_sshd, gateway_home, gateway_env, head_env = relay_chain
+    project = tmp_path / "project"
+    (project / "pkg").mkdir(parents=True)
+    (project / "train.py").write_text("print('v2')\n")
+    (project / "pkg" / "model.py").write_text("LAYERS = 12\n")
+    node_cache = tmp_path / "node-cache"
+    node_cache.mkdir()
+    (node_cache / "stale.py").write_text("deleted upstream\n")
+
+    prepared = subprocess.run(
+        _remote_bash(gateway_sshd.port, gateway_env, prepare_mirror_command("omni")),
+        env=head_env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert prepared.returncode == 0, prepared.stderr
+
+    # Leg A: head -> gateway mirror over the operator route.
+    mirror = gateway_home / mirror_relative("omni")
+    leg_a = subprocess.run(
+        [
+            "rsync",
+            "-a",
+            "--delete",
+            "--checksum",
+            "-e",
+            f"ssh -p {gateway_sshd.port} -o BatchMode=yes",
+            "--",
+            f"{project}/",
+            f"127.0.0.1:{shlex.quote(str(mirror))}/",
+        ],
+        env=head_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert leg_a.returncode == 0, leg_a.stderr
+
+    # Leg B: the gateway replays the mirror to the node over the site LAN.
+    node = Node(
+        name="worker",
+        site="lab",
+        lan_address="127.0.0.1",
+        lan_port=node_sshd.port,
+    )
+    pushed = subprocess.run(
+        _remote_bash(
+            gateway_sshd.port,
+            gateway_env,
+            push_command(node, "omni", str(node_cache)),
+        ),
+        env=head_env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert pushed.returncode == 0, (pushed.stdout, pushed.stderr)
+    assert (node_cache / "train.py").read_text() == "print('v2')\n"
+    assert (node_cache / "pkg" / "model.py").read_text() == "LAYERS = 12\n"
+    assert not (node_cache / "stale.py").exists()

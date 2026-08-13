@@ -854,6 +854,7 @@ def sync_artifacts(
     *,
     plan: bool = False,
     retries: int = 2,
+    route: str = "auto",
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
     cancel_event: Event | None = None,
 ) -> dict[str, object]:
@@ -880,6 +881,34 @@ def sync_artifacts(
     total_deleted = 0
     total_files = 0
     total_files_known = True
+
+    # Gateway staging (ADR 0026): artifacts are the largest reusable inputs
+    # a project pushes, so a tunnel-bound head stages them into the
+    # persistent gateway mirror and replays over the site LAN. Plan mode and
+    # any relay failure keep the operator route.
+    relay_route = None
+    relay_error: str | None = None
+    if not plan:
+        relay_route = sync_relay.decide_sync_route(cfg, node.name, mode=route)
+        if relay_route.route == "gateway":
+            try:
+                sync_relay.prepare_artifact_mirror(
+                    relay_route,
+                    project_name,
+                    [relative for relative, *_rest in sources],
+                )
+            except sync_relay.RelayError as exc:
+                relay_error = str(exc)
+                log(
+                    f"gateway relay unavailable: {relay_error}; "
+                    "falling back to the direct route"
+                )
+    relaying = (
+        relay_route is not None
+        and relay_route.route == "gateway"
+        and relay_error is None
+    )
+    relayed_any = False
 
     with _sync_cache_lock(
         cfg,
@@ -950,18 +979,71 @@ def sync_artifacts(
                     directory=True,
                 )
             source_arg = f"{source}/" if is_dir else str(source)
-            proc = rsync(
-                source_arg,
-                destination,
-                delete=is_dir,
-                timeout=BULK_TRANSFER_TIMEOUT_S,
-                retries=retries,
-                on_retry=on_retry,
-                stats=True,
-                checksum=True,
-                dry_run=plan,
-                cancel_event=cancel_event,
-            )
+            proc = None
+            if relaying and relay_route is not None and relay_route.gateway is not None:
+                # Leg A stages into the mirror's copy of this artifact's
+                # own path, so leg B replays with the same file/directory
+                # semantics the direct push would use.
+                staged_rel = sync_relay.artifact_mirror_relative(project_name)
+                staged_parent = f"{staged_rel}/{relative}"
+                if not is_dir:
+                    staged_parent = str(PurePosixPath(staged_parent).parent)
+                try:
+                    leg_a = rsync(
+                        source_arg,
+                        rsync_destination(
+                            relay_route.gateway.name,
+                            relay_route.gateway.local,
+                            staged_parent,
+                            directory=True,
+                        ),
+                        delete=is_dir,
+                        timeout=BULK_TRANSFER_TIMEOUT_S,
+                        retries=retries,
+                        on_retry=on_retry,
+                        stats=True,
+                        checksum=True,
+                        cancel_event=cancel_event,
+                    )
+                    if leg_a.returncode != 0:
+                        raise sync_relay.RelayError(
+                            "head -> gateway staging failed: "
+                            + diagnostic_excerpt(
+                                leg_a.stderr,
+                                None,
+                                fallback=f"rsync exited {leg_a.returncode}",
+                            )
+                        )
+                    proc = sync_relay.push_artifact(
+                        cfg,
+                        relay_route,
+                        project_name,
+                        relative,
+                        target_rel if is_dir else parent_rel,
+                        is_dir=is_dir,
+                    )
+                    relayed_any = True
+                except sync_relay.RelayError as exc:
+                    relay_error = str(exc)
+                    relaying = False
+                    proc = None
+                    log(
+                        f"gateway relay failed for {relative!r}: {relay_error}; "
+                        "falling back to the direct route"
+                    )
+            if proc is None:
+                proc = rsync(
+                    source_arg,
+                    destination,
+                    delete=is_dir,
+                    timeout=BULK_TRANSFER_TIMEOUT_S,
+                    retries=retries,
+                    on_retry=on_retry,
+                    stats=True,
+                    checksum=True,
+                    dry_run=plan,
+                    cancel_event=cancel_event,
+                )
             if proc.returncode != 0:
                 detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
                 if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
@@ -1109,6 +1191,20 @@ def sync_artifacts(
             "paths": transient_files[:_ARTIFACT_TRANSIENT_PATH_LIMIT],
             "paths_truncated": len(transient_files) > _ARTIFACT_TRANSIENT_PATH_LIMIT,
         }
+    if relay_route is not None:
+        result["route"] = "gateway" if relayed_any else "direct"
+        result["route_gateway"] = (
+            relay_route.gateway.name
+            if relayed_any and relay_route.gateway is not None
+            else None
+        )
+        result["route_reason"] = (
+            relay_route.reason
+            if relay_error is None
+            else "gateway staging failed; synced over the direct route"
+        )
+        if relay_error is not None:
+            result["relay_error"] = relay_error
     if plan:
         result["plan"] = True
     return result
