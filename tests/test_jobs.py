@@ -362,3 +362,108 @@ def test_compact_refs_matches_the_quadratic_reference_on_adversarial_registries(
             assert compact_refs(records, minimum=minimum) == _reference_compact_refs(
                 records, minimum=minimum
             ), (minimum, records)
+
+
+def _cache_cfg(tmp_path):
+    return HeadConfig(
+        center="center-a",
+        nodes=[],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+
+
+def _cache_entry(job_id: str, name: str) -> JobEntry:
+    return JobEntry(
+        job_id=job_id,
+        name=name,
+        center="center-a",
+        project="p",
+        node="n",
+        node_local=False,
+        job_dir=f"jobs/{name}",
+        session=name,
+        cmd="true",
+    )
+
+
+def _count_decodes(monkeypatch):
+    """Count real row decodes without changing their behavior."""
+    calls = {"n": 0}
+    original = jobs._decode_entry_result
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(jobs, "_decode_entry_result", counting)
+    return calls
+
+
+def test_decode_cache_reuses_rows_until_the_file_revision_changes(
+    tmp_path, monkeypatch
+):
+    """A resident process must not re-validate unchanged registry rows, yet a
+    saved lifecycle change (atomic rename, new revision) must be seen (QR-P2).
+    """
+    cfg = _cache_cfg(tmp_path)
+    first = _cache_entry("20260812-0900_first_24a3", "first")
+    second = _cache_entry("20260812-0901_second_24a3", "second")
+    save(cfg, first)
+    save(cfg, second)
+    monkeypatch.setattr(jobs, "_DECODE_CACHE_ENABLED", True)
+    monkeypatch.setattr(jobs, "_DECODE_CACHE", {})
+    calls = _count_decodes(monkeypatch)
+
+    cold = jobs.list_all(cfg)
+    assert {e.job_id for e in cold} == {first.job_id, second.job_id}
+    cold_decodes = calls["n"]
+    assert cold_decodes >= 2
+
+    warm = jobs.list_all(cfg)
+    assert calls["n"] == cold_decodes
+    assert {e.job_id for e in warm} == {first.job_id, second.job_id}
+
+    first.reason = "revision-changed"
+    save(cfg, first)
+    refreshed = jobs.list_all(cfg)
+    assert calls["n"] == cold_decodes + 1
+    by_id = {e.job_id: e for e in refreshed}
+    assert by_id[first.job_id].reason == "revision-changed"
+    assert by_id[second.job_id].reason != "revision-changed"
+
+
+def test_decode_cache_forgets_deleted_rows(tmp_path, monkeypatch):
+    cfg = _cache_cfg(tmp_path)
+    keep = _cache_entry("20260812-0902_keep_24a3", "keep")
+    doomed = _cache_entry("20260812-0903_doomed_24a3", "doomed")
+    save(cfg, keep)
+    save(cfg, doomed)
+    monkeypatch.setattr(jobs, "_DECODE_CACHE_ENABLED", True)
+    monkeypatch.setattr(jobs, "_DECODE_CACHE", {})
+
+    assert len(jobs.list_all(cfg)) == 2
+    remove_record(cfg, doomed.job_id)
+
+    survivors = jobs.list_all(cfg)
+    assert [e.job_id for e in survivors] == [keep.job_id]
+    assert all(doomed.job_id not in key for key in jobs._DECODE_CACHE)
+
+
+def test_decode_cache_stays_off_for_one_shot_processes(tmp_path, monkeypatch):
+    """CLI invocations must keep the always-decode path: the cache only pays
+    off inside the resident agent, and the default must not change behavior
+    for short-lived processes."""
+    cfg = _cache_cfg(tmp_path)
+    save(cfg, _cache_entry("20260812-0904_solo_24a3", "solo"))
+    monkeypatch.setattr(jobs, "_DECODE_CACHE_ENABLED", False)
+    calls = _count_decodes(monkeypatch)
+
+    jobs.list_all(cfg)
+    jobs.list_all(cfg)
+
+    assert calls["n"] == 2
+    jobs.enable_registry_decode_cache()
+    assert jobs._DECODE_CACHE_ENABLED is True

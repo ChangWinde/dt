@@ -966,6 +966,100 @@ def test_clean_census_refuses_live_capsule_orphan_and_allows_quiet_one(tmp_path)
     assert load(cfg, "orphaned") is None
 
 
+@pytest.mark.skipif(shutil.which("zsh") is None, reason="zsh not installed")
+def test_clean_census_survives_a_zsh_login_shell(tmp_path):
+    """clean_jobs' census depends on POSIX word splitting; before the bash -c
+    wrap it ran under the node login shell, and zsh's no-split default read a
+    dead-leader group with live orphans as DEAD and deleted their data
+    (QR-B3). The runner here simulates a zsh login shell."""
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    node_home = tmp_path / "node-home"
+    workdir = node_home / "dt" / "jobs" / "zsh-node"
+    workdir.mkdir(parents=True)
+
+    # Dead leader, two surviving in-group children: pgrep -g output is
+    # multi-line, which zsh keeps as one unsplit word.
+    leader = subprocess.Popen(
+        ["bash", "-c", "sleep 30 & sleep 30 & exit 0"],
+        cwd=workdir,
+        start_new_session=True,
+    )
+    leader.wait(timeout=5)
+    save(
+        cfg,
+        _entry(
+            "zsh-node",
+            "finished",
+            created_at=1.0,
+            node="n1",
+            node_local=True,
+            pgid=leader.pid,
+        ),
+    )
+
+    def zsh_login_runner(node, local, command, timeout, check):
+        return subprocess.run(
+            ["zsh", "-c", command],
+            cwd=node_home,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    try:
+        report = maintenance.clean_jobs(
+            cfg,
+            cutoff_ts=100.0,
+            envs=False,
+            log=lambda _: None,
+            runner=zsh_login_runner,
+        )
+    finally:
+        try:
+            os.killpg(leader.pid, 9)
+        except ProcessLookupError:
+            pass
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["state_changed"]
+    assert workdir.is_dir()
+    assert load(cfg, "zsh-node") is not None
+
+
+def test_compact_command_pins_bash_for_its_census():
+    """compact's remote script shares the word-splitting census, so it must
+    never execute under the raw login shell (QR-B3)."""
+    from dt.compact import _remote_command
+
+    command = _remote_command([], apply=False, now=100.0)
+
+    assert command.startswith("bash -c ")
+
+
+def test_clean_jobs_delete_command_pins_bash(tmp_path):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry("pinned", "finished", created_at=1.0, node="n1", node_local=True),
+    )
+    commands = []
+
+    def runner(node, local, command, timeout, check):
+        commands.append(command)
+        return subprocess.CompletedProcess([], 75, "", "DT_CLEAN_LIVE LIVE")
+
+    maintenance.clean_jobs(
+        cfg, cutoff_ts=100.0, envs=False, log=lambda _: None, runner=runner
+    )
+
+    assert len(commands) == 1
+    assert commands[0].startswith("bash -c ")
+
+
 def test_dependency_settled_treats_recoverable_lost_as_pending():
     from dt.dispatch import LOST_RECOVERY_WINDOW_S, _dependency_settled
 
@@ -1218,6 +1312,25 @@ def test_deployment_cleanup_fails_closed_on_unsafe_markers(tmp_path):
     assert "dt command symlink is not resolvable" in result.stderr
 
 
+def test_deployment_cleanup_refuses_release_sweep_when_current_is_absent(tmp_path):
+    """A missing `current` symlink proves nothing about which release is
+    active; the sweep used to fall through with an empty keep and reap every
+    release including the rollback target (QR-B6)."""
+    home, base, installs = _deployment_home(tmp_path)
+    (base / "current").unlink()
+
+    result = _run_deployment_clean(home, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    removed = set(result.stdout.splitlines())
+    assert "release 1.0.0" not in removed
+    assert (base / "releases" / "1.0.0").is_dir()
+    assert (base / "releases" / "2.0.0").is_dir()
+    assert "unsafe current marker" in result.stderr
+    # Unrelated domains still proceed.
+    assert "staging stale-stage" in removed
+
+
 def test_environment_cleanup_quotes_operator_configured_path(tmp_path):
     from dt.maintenance import clean_envs_command
 
@@ -1377,6 +1490,99 @@ def test_clean_results_plan_then_removes_only_identity_verified_managed_pull(
     assert not owned.exists()
     assert unowned.is_dir()
     assert load(cfg, old.job_id) is None
+
+
+def test_clean_json_emits_versioned_plan_and_apply_envelopes(tmp_path, monkeypatch):
+    # QR-S1: the plan-first destructive flow agents are told to use finally
+    # has a machine-readable contract, mirroring dt_compact_v1.
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("old-done", "finished", created_at=1.0))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    plan = CliRunner().invoke(
+        cli.app, ["clean", "--before", "1970-01-02", "--plan", "--json"]
+    )
+    assert plan.exit_code == 0, plan.output
+    plan_payload = json.loads(plan.stdout)
+    assert plan_payload["schema_version"] == "dt_clean_v1"
+    assert plan_payload["mode"] == "plan"
+    assert plan_payload["eligible_jobs"] == 1
+    assert plan_payload["jobs"][0]["job_id"] == "old-done"
+    assert plan_payload["exit_code"] == 0
+    assert load(cfg, "old-done") is not None
+
+    refused = CliRunner().invoke(cli.app, ["clean", "--before", "1970-01-02", "--json"])
+    assert refused.exit_code == 1
+    refusal = json.loads(refused.stdout)
+    assert refusal["error"] == "confirmation_required"
+
+    applied = CliRunner().invoke(
+        cli.app, ["clean", "--before", "1970-01-02", "--json", "-y"]
+    )
+    assert applied.exit_code == 0, applied.output
+    apply_payload = json.loads(applied.stdout)
+    assert apply_payload["schema_version"] == "dt_clean_v1"
+    assert apply_payload["mode"] == "apply"
+    assert apply_payload["removed_jobs"] == 1
+    assert apply_payload["failures"] == []
+    assert load(cfg, "old-done") is None
+
+
+def test_ps_center_is_laptop_only_and_scopes_the_fan_out(tmp_path, monkeypatch):
+    # QR-S8: a multi-center laptop can scope queue observation to one center
+    # so an unreachable unrelated center cannot degrade the answer.
+    from dt.config import LaptopConfig
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    rejected = CliRunner().invoke(cli.app, ["ps", "--center", "x", "--json"])
+    assert rejected.exit_code == 1
+    assert "laptop-only" in rejected.stdout
+
+    laptop = LaptopConfig(centers={"a": "head-a", "b": "head-b"}, default_center="a")
+    seen: dict[str, dict[str, str]] = {}
+
+    def fake_gather(cfg_arg, status, **kwargs):
+        seen["centers"] = dict(cfg_arg.centers)
+        return [], {}
+
+    monkeypatch.setattr(cli, "_gather_ps_rows", fake_gather)
+    monkeypatch.setattr(cli, "_cfg", lambda: laptop)
+
+    result = CliRunner().invoke(cli.app, ["ps", "-c", "b", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert seen["centers"] == {"b": "head-b"}
+
+
+def test_agent_status_json_carries_schema_version(tmp_path, monkeypatch):
+    import dt.agent as agent_mod
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(agent_mod, "status", lambda cfg_: {"alive": False})
+
+    result = CliRunner().invoke(cli.app, ["agent", "status", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == "dt_agent_status_v1"
+    assert payload["alive"] is False
+
+
+def test_watch_documents_no_tails_and_keeps_compact_alias():
+    import re
+
+    result = CliRunner().invoke(cli.app, ["watch", "--help"], terminal_width=120)
+
+    assert result.exit_code == 0
+    # rich embeds ANSI styling inside option tokens under some terminals;
+    # compare against the plain text like the other help assertions do.
+    output = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.output)
+    normalized = " ".join(output.split())
+    assert "--no-tails" in normalized
+    assert "--compact" in normalized
 
 
 def test_clean_results_failure_retains_retryable_registry_record(tmp_path, monkeypatch):

@@ -426,6 +426,25 @@ def test_agent_heartbeat_atomically_replaces_symlink_without_following_it(tmp_pa
     assert outside.read_text() == "must survive\n"
 
 
+def test_agent_heartbeat_skips_disk_flushes(tmp_path, monkeypatch):
+    """The liveness stamp must not pay fsync: a lost write reads as stale,
+    which is the truth about a crashed agent (QR-P4)."""
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    cfg.root.mkdir(parents=True)
+    flushes = []
+    monkeypatch.setattr(agent.os, "fsync", lambda fd: flushes.append(fd), raising=False)
+
+    agent._write_heartbeat(cfg)
+
+    assert flushes == []
+    assert float(agent.heartbeat_path(cfg).read_text()) > 0
+    stamp_name = agent.heartbeat_path(cfg).name
+    leftovers = [p for p in cfg.root.rglob(f".{stamp_name}.*.tmp")]
+    assert leftovers == []
+
+
 def test_agent_autoclean_refuses_symlinked_retention_state(tmp_path, monkeypatch):
     import dt.agent as agent
 
@@ -1326,6 +1345,27 @@ def test_blocked_backoff_clears_once_the_job_dispatches(tmp_path, monkeypatch):
     outcome["value"] = ("started", "n1")
     agent._process_once_with_snapshot(cfg, lambda _m: None, blocked_backoff=backoff)
     assert backoff == {}
+
+
+def test_blocked_backoff_never_overflows_after_days_of_retries(monkeypatch):
+    """float ** raises OverflowError at 2.0**1024 where * returns inf; an
+    unguarded bump would poison the stored deadline and crash every poll
+    tick once one job stayed blocked ~3.5 days (QR-B1)."""
+    import dt.agent as agent
+
+    monkeypatch.setattr(agent.time, "monotonic", lambda: 1000.0)
+    backoff: dict[str, tuple[int, float]] = {}
+
+    for _bump in range(1200):
+        agent._bump_blocked_backoff(backoff, "stuck")
+
+    retries, deadline = backoff["stuck"]
+    assert deadline == 1000.0 + agent.BLOCKED_BACKOFF_CAP_S
+    assert retries <= 1024
+
+    backoff["stuck"] = (1024, 0.0)
+    agent._bump_blocked_backoff(backoff, "stuck")
+    assert backoff["stuck"][1] == 1000.0 + agent.BLOCKED_BACKOFF_CAP_S
 
 
 def test_agent_deduplicates_unchanged_blocked_diagnostics_across_ticks(

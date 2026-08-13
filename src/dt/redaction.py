@@ -69,6 +69,11 @@ def redact_remote_detail(text: str) -> str:
     """
     if not text:
         return text
+    # Clamp before the regexes: the dotted-token pattern is superlinear on
+    # long label runs, and this input can be attacker-influenced remote
+    # stderr. Only the first _REMOTE_DETAIL_MAX characters can survive the
+    # final cut, so scanning a few multiples of that loses nothing.
+    text = text[: _REMOTE_DETAIL_MAX * 4]
     text = redact_home_path(text)
     text = _USER_AT_HOST_RE.sub("<user>@", text)
     text = _DOTTED_TOKEN_RE.sub(_mask_dotted_token, text)

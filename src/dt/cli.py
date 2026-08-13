@@ -23,7 +23,7 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path, PurePath, PurePosixPath
 from threading import Event
@@ -300,6 +300,7 @@ def init_config(
         print(
             json.dumps(
                 {
+                    "schema_version": "dt_init_v1",
                     "config": str(target),
                     "next": next_steps,
                     "role": normalized_role,
@@ -326,7 +327,7 @@ def _find_or_die(cfg: HeadConfig, ref: str) -> jobs_mod.JobEntry:
     if entry is None:
         _entry, ambiguous = jobs_mod.resolve_ref(cfg, ref)
         if ambiguous:
-            display_refs = jobs_mod.compact_job_refs(jobs_mod.list_all(cfg))
+            display_refs = jobs_mod.compact_job_refs(jobs_mod.resolution_entries(cfg))
             choices = ", ".join(
                 f"{candidate.name}={display_refs[candidate.job_id]}"
                 for candidate in ambiguous[:5]
@@ -351,7 +352,7 @@ def _display_ref_for_entry(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> str:
         # readable instead of turning ``follow`` into the cryptic ``llow``.
         return entry.job_id
     entries_by_id = {
-        candidate.job_id: candidate for candidate in jobs_mod.list_all(cfg)
+        candidate.job_id: candidate for candidate in jobs_mod.resolution_entries(cfg)
     }
     entries_by_id[entry.job_id] = entry
     return jobs_mod.compact_job_refs(list(entries_by_id.values())).get(
@@ -364,7 +365,7 @@ def _display_refs_for_entries(
 ) -> dict[str, str]:
     """Return one collision-safe ref map for an atomic submission receipt."""
     entries_by_id = {
-        candidate.job_id: candidate for candidate in jobs_mod.list_all(cfg)
+        candidate.job_id: candidate for candidate in jobs_mod.resolution_entries(cfg)
     }
     entries_by_id.update((entry.job_id, entry) for entry in entries)
     return jobs_mod.compact_job_refs(list(entries_by_id.values()))
@@ -5242,11 +5243,21 @@ def ps(
         help="filter: queued/running/finished/killed/lost/failed/skipped",
         rich_help_panel="Filters",
     ),
+    center: Optional[str] = typer.Option(
+        None,
+        "-c",
+        "--center",
+        help="(laptop) scope queue observation to one configured center",
+        rich_help_panel="Filters",
+    ),
     active: bool = typer.Option(
         False,
         "--active",
-        help="show only queued and running jobs",
-        hidden=True,
+        help=(
+            "show only queued and running jobs (agent queries: the human "
+            "table already defaults to active)"
+        ),
+        rich_help_panel="Filters",
     ),
     recent: bool = typer.Option(
         False,
@@ -5443,6 +5454,22 @@ def ps(
             json_=json_,
         )
     cfg = _cfg()
+    if center is not None:
+        if not isinstance(cfg, LaptopConfig):
+            _fail_submission(
+                kind="invalid_argument",
+                message="--center is a laptop-only option",
+                exit_code=1,
+                json_=json_,
+            )
+        selected_center = _laptop_center(cfg, center)
+        # Scope the fan-out instead of filtering afterwards: unreachable
+        # unrelated centers must not degrade a single-center observation.
+        cfg = replace(
+            cfg,
+            centers={selected_center: cfg.centers[selected_center]},
+            default_center=selected_center,
+        )
     default_active_view = (
         not json_
         and status is None
@@ -6332,7 +6359,7 @@ def _log_terminal_exit_code(entry: jobs_mod.JobEntry) -> int | None:
     if entry.status == "finished":
         if entry.exit_code is None:
             return 68
-        return min(entry.exit_code, 125)
+        return _stable_wait_exit(entry.exit_code)
     if entry.status == "failed" and not _is_uncertain_launch(entry):
         return 68
     if entry.status == "killed":
@@ -6674,6 +6701,7 @@ def logs(
         print(
             json.dumps(
                 {
+                    "schema_version": "dt_job_logs_v1",
                     "job_id": entry.job_id,
                     "name": entry.name,
                     "status": entry.status,
@@ -7059,6 +7087,20 @@ def _probable_host_oom_hint(
     }
 
 
+def _stable_wait_exit(code: int) -> int:
+    """Clamp one experiment exit code into the stable ``dt wait`` band.
+
+    65-69 are reserved for dt's own terminal semantics (not found, killed,
+    lost, failed before start, dependency-skipped) and codes above 125 for
+    transport conventions. A raw experiment code inside either band
+    collapses to 64 or 125 so the bare process code never impersonates a
+    dt-assigned meaning; ``--json`` keeps the untruncated ``exit_code``.
+    """
+    if 65 <= code <= 69:
+        return 64
+    return min(code, 125)
+
+
 def _wait_terminal_result(
     entry: jobs_mod.JobEntry,
     error_lines: int,
@@ -7106,7 +7148,11 @@ def _wait_terminal_result(
                 if failure_hint is not None:
                     emit(f"[yellow]{escape(str(failure_hint['message']))}[/yellow]")
                     extra["failure_hint"] = failure_hint
-        return _submission_payload(entry, **extra), min(code, 125)
+        # Only experiment-produced codes are remapped out of the reserved
+        # band; the dt-assigned 68 for a missing exit code stays: the band
+        # is exactly where dt's own semantics live.
+        stable = 68 if entry.exit_code is None else _stable_wait_exit(code)
+        return _submission_payload(entry, **extra), stable
 
     if entry.status == "failed":
         failure_log: JsonDict | None = None
@@ -8951,18 +8997,22 @@ def info(
         )
         raise typer.Exit(route.invoke(forward_call))
 
-    if json_:
-        entry = jobs_mod.find(cfg, ref)
-        if entry is None:
-            _fail_submission(
-                kind="not_found",
-                message=f"no job matching {ref!r}",
-                exit_code=EXIT_NOT_FOUND,
-                json_=True,
-            )
-    else:
-        entry = _find_or_die(cfg, ref)
-    display_refs = jobs_mod.compact_job_refs(jobs_mod.list_all(cfg))
+    # One registry decode serves ref resolution, display refs, and the queue
+    # context below; a partial ref used to trigger three full scans (QR-P3).
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        if json_:
+            entry = jobs_mod.find(cfg, ref)
+            if entry is None:
+                _fail_submission(
+                    kind="not_found",
+                    message=f"no job matching {ref!r}",
+                    exit_code=EXIT_NOT_FOUND,
+                    json_=True,
+                )
+        else:
+            entry = _find_or_die(cfg, ref)
+        registry_snapshot = jobs_mod.resolution_entries(cfg)
+    display_refs = jobs_mod.compact_job_refs(registry_snapshot)
     display_ref = display_refs.get(entry.job_id, entry.job_id)
     initial_status = entry.status
     placed_prestart_failure = (
@@ -9056,10 +9106,11 @@ def info(
     }
     if entry.status == "queued":
         queue_context.update(
-            jobs_mod.queue_contexts(jobs_mod.list_all(cfg)).get(entry.job_id, {})
+            jobs_mod.queue_contexts(registry_snapshot).get(entry.job_id, {})
         )
 
     data = {
+        "schema_version": "dt_job_info_v1",
         "job_id": entry.job_id,
         "name": entry.name,
         "status": entry.status,
@@ -10425,8 +10476,12 @@ def watch(
     ),
     compact: bool = typer.Option(
         False,
+        "--no-tails",
         "--compact",
-        help="with --json, omit raw log tails and terminal resource summaries",
+        help=(
+            "with --json, omit raw log tails and terminal resource summaries "
+            "(--compact remains an alias)"
+        ),
     ),
 ) -> bool:
     """Monitor jobs until terminal; link loss auto-reconnects.
@@ -12180,7 +12235,12 @@ def _pull_unlocked(
 
     records = confirmed_records(logs_recovered=True)
     payload = {
+        "schema_version": "dt_pull_v1",
         "job_id": entry.job_id,
+        # `outcome` is the canonical operation-result key (matching kill);
+        # `status` stays one release for compatibility, then only `outcome`
+        # and the lifecycle-`job_status` remain.
+        "outcome": "pulled",
         "status": "pulled",
         "job_status": entry.status,
         "node": entry.node,
@@ -13158,14 +13218,40 @@ def clean(
         "--plan",
         help="preview eligible jobs and managed results without deleting anything",
     ),
+    json_: bool = typer.Option(
+        False,
+        "--json",
+        help="emit one dt_clean_v1 envelope on stdout (plan or apply)",
+    ),
     yes: bool = typer.Option(False, "-y", "--yes"),
 ) -> None:
     """Delete old job snapshots + logs on nodes and their registry entries."""
+    if json_ and not plan and not yes:
+        _fail_submission(
+            kind="confirmation_required",
+            message="clean --json requires -y (or --plan)",
+            exit_code=1,
+            json_=True,
+        )
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         if center is not None and all_centers:
-            err.print("[red]use either --center or --all-centers, not both[/red]")
-            raise typer.Exit(1)
+            _fail_submission(
+                kind="invalid_argument",
+                message="use either --center or --all-centers, not both",
+                exit_code=1,
+                json_=json_,
+            )
+        if all_centers and json_:
+            _fail_submission(
+                kind="invalid_argument",
+                message=(
+                    "clean --json reports one center; scope with --center "
+                    "instead of --all-centers"
+                ),
+                exit_code=1,
+                json_=True,
+            )
         rc = 0
         argv_tail = (
             [
@@ -13177,6 +13263,7 @@ def clean(
             + (["--deployments"] if deployments else [])
             + (["--results"] if results else [])
             + (["--plan"] if plan else [])
+            + (["--json"] if json_ else [])
             + (["-y"] if yes else [])
         )
         targets = (
@@ -13202,10 +13289,12 @@ def clean(
     try:
         cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
     except ValueError:
-        err.print(
-            f"[red]invalid --before {before!r}; expected a real YYYY-MM-DD date[/red]"
+        _fail_submission(
+            kind="invalid_argument",
+            message=f"invalid --before {before!r}; expected a real YYYY-MM-DD date",
+            exit_code=1,
+            json_=json_,
         )
-        raise typer.Exit(1)
     from .dispatch import clean_job_victims, clean_jobs
 
     projects = set(project) if project else None
@@ -13217,6 +13306,41 @@ def clean(
     )
     n_victims = len(victims)
     if plan:
+        if json_:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": "dt_clean_v1",
+                        "mode": "plan",
+                        "before": before,
+                        "projects": (
+                            sorted(projects) if projects is not None else None
+                        ),
+                        "eligible_jobs": n_victims,
+                        "jobs": [
+                            {
+                                "job_id": entry.job_id,
+                                "status": entry.status,
+                                "node": entry.node,
+                                "finished_at": entry.finished_at,
+                            }
+                            for entry in victims
+                        ],
+                        "managed_results": [
+                            {
+                                "job_id": managed_result.job_id,
+                                "path": redact_home_path(str(managed_result.path)),
+                            }
+                            for managed_result in managed_results
+                        ],
+                        "envs": envs,
+                        "deployments": deployments,
+                        "results": results,
+                        "exit_code": 0,
+                    }
+                )
+            )
+            return
         err.print(
             f"plan: {n_victims} ended job dirs"
             f" + {len(managed_results)} identity-verified managed results"
@@ -13243,8 +13367,35 @@ def clean(
                 f"[dim]... {len(managed_results) - preview_limit} more results[/dim]"
             )
         return
+
+    removed_results = 0
+
+    def clean_apply_payload(
+        removed_jobs: int,
+        eligible: int,
+        failures: list[JsonDict],
+        removed_deployment_trees: int,
+    ) -> JsonDict:
+        return {
+            "schema_version": "dt_clean_v1",
+            "mode": "apply",
+            "before": before,
+            "projects": sorted(projects) if projects is not None else None,
+            "eligible_jobs": eligible,
+            "removed_jobs": removed_jobs,
+            "removed_results": removed_results if results else None,
+            "removed_deployment_trees": (
+                removed_deployment_trees if deployments else None
+            ),
+            "failures": failures,
+            "exit_code": 1 if failures else 0,
+        }
+
     if not n_victims and not envs and not deployments and not managed_results:
-        err.print("nothing to clean")
+        if json_:
+            print(json.dumps(clean_apply_payload(0, 0, [], 0)))
+        else:
+            err.print("nothing to clean")
         return
     if not yes:
         if not sys.stdin.isatty():
@@ -13258,7 +13409,6 @@ def clean(
         if deployments:
             what += " + old release trees and installations"
         typer.confirm(f"{what}?", abort=True)
-    removed_results = 0
     managed_results_by_job: dict[str, list[_ManagedResult]] = {}
     for managed_result in managed_results:
         managed_results_by_job.setdefault(managed_result.job_id, []).append(
@@ -13304,6 +13454,25 @@ def clean(
     if deployments:
         suffix += f" + {removed_deployments} deployment trees"
     err.print(f"cleaned {report.removed}/{report.eligible} jobs{suffix}")
+    if json_:
+        print(
+            json.dumps(
+                clean_apply_payload(
+                    report.removed,
+                    report.eligible,
+                    [
+                        {
+                            "job_id": failure.job_id,
+                            "node": failure.node,
+                            "kind": failure.kind,
+                            "message": failure.message,
+                        }
+                        for failure in report.failures
+                    ],
+                    removed_deployments,
+                )
+            )
+        )
     if report.failures:
         err.print(
             f"[red]{len(report.failures)} job(s) retained after cleanup "
@@ -13996,7 +14165,7 @@ def agent_status(
     head_cfg = _need_head(cfg)
     st = agent_mod.status(head_cfg)
     if json_:
-        print(json.dumps(st))
+        print(json.dumps({"schema_version": "dt_agent_status_v1", **st}))
         return
     queue_label = None
     queue_head = st.get("queue_head")
@@ -15603,6 +15772,10 @@ def request_status(
             json_=json_,
         )
     payload: JsonDict = asdict(record)
+    # Every other agent surface names its contract key `schema_version`;
+    # the durable record's internal field is `schema`. Emit both during the
+    # convergence window so consumers can standardize on `schema_version`.
+    payload["schema_version"] = payload.get("schema")
     payload["job_found"] = entry is not None
     payload["job"] = (
         {
@@ -15647,8 +15820,10 @@ def request_status(
 app.command("init", rich_help_panel="Setup")(init_config)
 app.command("free", rich_help_panel="Everyday")(free)
 app.command("f", hidden=True)(free)
+# The `task` facade stays callable for compatibility but is hidden; its
+# single-letter alias was removed with it (QR-S16): an alias of an
+# already-hidden legacy command has no discoverable users.
 app.command("task", hidden=True)(task)
-app.command("t", hidden=True)(task)
 app.command("batch", rich_help_panel="Experiments")(batch)
 app.command("chain", rich_help_panel="Experiments")(chain)
 app.command(
@@ -15682,10 +15857,15 @@ app.command("rerun", rich_help_panel="Experiments")(rerun)
 app.command(
     "exec",
     context_settings=RUN_CTX,
-    options_metavar="REF [OPTIONS] -- COMMAND [ARGS]...",
+    options_metavar="[OPTIONS] -- COMMAND [ARGS]...",
     rich_help_panel="Experiments",
 )(exec_job)
-app.command("fork", context_settings=RUN_CTX, rich_help_panel="Experiments")(fork)
+app.command(
+    "fork",
+    context_settings=RUN_CTX,
+    options_metavar="[OPTIONS] [-- COMMAND [ARGS]...]",
+    rich_help_panel="Experiments",
+)(fork)
 app.command("pull", rich_help_panel="Everyday")(pull)
 app.command("kill", rich_help_panel="Operations")(kill)
 app.command("k", hidden=True)(kill)

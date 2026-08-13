@@ -1136,6 +1136,42 @@ def test_run_rejects_auto_center_with_request_id(monkeypatch):
     assert "auto cannot be combined with --request-id" in result.output
 
 
+def test_wait_enforces_the_reserved_exit_band():
+    # QR-S2: 65-69 always mean dt's own terminal semantics. An experiment
+    # that itself exits inside the band reports 64 so agents never mistake
+    # a real result for killed/lost/not-found; JSON keeps the true code.
+    entry = JobEntry(
+        job_id="20260813-0100_band_abcd",
+        name="band",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/20260813-0100_band_abcd",
+        session="dt_20260813-0100_band_abcd",
+        cmd="true",
+        status="finished",
+        exit_code=66,
+    )
+
+    payload, code = cli._wait_terminal_result(
+        entry,
+        error_lines=0,
+        emit=lambda _line: None,
+        write_tail=lambda _text: None,
+    )
+
+    assert code == 64
+    assert payload["exit_code"] == 66
+    assert cli._log_terminal_exit_code(entry) == 64
+    # Codes outside both reserved bands pass through; >125 keeps clamping.
+    assert cli._stable_wait_exit(0) == 0
+    assert cli._stable_wait_exit(64) == 64
+    assert cli._stable_wait_exit(70) == 70
+    assert cli._stable_wait_exit(125) == 125
+    assert cli._stable_wait_exit(200) == 125
+
+
 def test_finished_without_exit_code_is_infra_failure_not_success():
     from dt.jobs import effective_result_state
 

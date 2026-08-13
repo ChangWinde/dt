@@ -339,7 +339,11 @@ def _remote_command(
             lines.append('  emit planned "$job_id" "$bytes" code_would_be_removed')
         lines.append("fi")
     lines.append('exit "$compact_rc"')
-    return "\n".join(lines)
+    # The liveness census depends on POSIX word splitting; running the raw
+    # script under a zsh login shell would collapse multi-line pgrep/find
+    # output and misreport a live job as DEAD. Pin bash like the kill probe.
+    script = "\n".join(lines)
+    return f"bash -c {shlex.quote(script)}"
 
 
 def _remote_rows(

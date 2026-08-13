@@ -2884,8 +2884,10 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
     ]
     assert all(callable(observer) for observer in retry_observers)
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_pull_v1",
         "job_id": entry.job_id,
         "status": "pulled",
+        "outcome": "pulled",
         "job_status": "failed",
         "node": "n1",
         "destination": str(destination),
@@ -2961,8 +2963,10 @@ def test_pull_json_success_contract(tmp_path, monkeypatch):
 
     assert result.exit_code == 0
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_pull_v1",
         "job_id": "jid",
         "status": "pulled",
+        "outcome": "pulled",
         "job_status": "running",
         "node": "n1",
         "destination": str(destination),
@@ -5148,6 +5152,68 @@ def test_termination_probe_reports_pre_signal_exit_marker_without_signalling(
         straggler.wait(timeout=2)
 
 
+def test_liveness_census_sees_survivor_inside_glob_metachar_capsule(tmp_path):
+    """find -lname treats its operand as a glob: a capsule path containing
+    [ ] * ? used to match nothing, so a live orphan read DEAD and destructive
+    maintenance would delete a running job's data (QR-B2)."""
+    capsule = tmp_path / "gpu[0]" / "jobs" / "glob?job"
+    capsule.mkdir(parents=True)
+    survivor = subprocess.Popen(["sleep", "30"], cwd=capsule, start_new_session=True)
+    script_tail = (
+        f"dt_job_live_state {shlex.quote(str(capsule))} 0 '' "
+        f"{shlex.quote(str(capsule / 'process_start_ticks'))}"
+    )
+    try:
+        alive = subprocess.run(
+            ["bash", "-c", lifecycle.liveness_shell() + script_tail],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert alive.stdout.strip() == "LIVE", alive.stderr
+    finally:
+        survivor.terminate()
+        survivor.wait(timeout=2)
+
+    dead = subprocess.run(
+        ["bash", "-c", lifecycle.liveness_shell() + script_tail],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert dead.stdout.strip() == "DEAD", dead.stderr
+
+
+def test_termination_probe_signals_orphan_inside_glob_metachar_capsule(tmp_path):
+    """The kill probe's cwd scan shares the -lname pattern; before the fix a
+    job under a glob-metachar root was recorded killed without its orphan
+    ever being signalled (QR-B2)."""
+    job_dir = tmp_path / "runs[a]" / "jobs" / "glob-kill"
+    job_dir.mkdir(parents=True)
+    orphan = subprocess.Popen(["sleep", "30"], cwd=job_dir, start_new_session=True)
+    try:
+        command = lifecycle.termination_probe(
+            str(job_dir), None, "TERM", job_id="glob-kill"
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            cwd=Path.home(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        verdict, _detail = lifecycle.termination_verdict(
+            result.returncode, result.stdout, result.stderr
+        )
+        assert verdict == "DEAD", (result.stdout, result.stderr)
+        assert orphan.wait(timeout=5) != 0
+    finally:
+        if orphan.poll() is None:
+            orphan.kill()
+            orphan.wait(timeout=2)
+
+
 def test_termination_probe_sanitizes_forged_exit_marker_content(tmp_path):
     # The exit marker lives in a job-writable directory. Multi-line or
     # non-numeric content must collapse to a bare EXITED token instead of
@@ -5600,6 +5666,20 @@ def test_termination_verdict_bounds_untrusted_remote_diagnostics():
     assert detail is not None
     assert len(detail) <= 4096
     assert "[omitted]" in detail
+
+
+def test_termination_verdict_rejects_unicode_digit_exit_codes():
+    """The exit marker is job-writable remote content. str.isdigit() accepts
+    Unicode digits: superscript zero crashes int() and Arabic-Indic digits
+    fabricate a non-decimal exit code recorded as truth (QR-B4)."""
+    for forged in ("\u2070", "\u1369", "\u0661", "٤٢", "4\u06622"):
+        assert lifecycle.termination_verdict(0, f"EXITED {forged}\n", "") == (
+            "EXITED",
+            None,
+        )
+    assert lifecycle.termination_verdict(0, "EXITED 42\n", "") == ("EXITED", "42")
+    assert lifecycle.termination_verdict(0, "EXITED 255\n", "") == ("EXITED", "255")
+    assert lifecycle.termination_verdict(0, "EXITED 256\n", "") == ("EXITED", None)
 
 
 def test_dispatch_queued_blocks_on_unreadable_dependency(tmp_path):

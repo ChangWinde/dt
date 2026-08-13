@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 
 from .layout import (
@@ -127,6 +128,12 @@ def liveness_shell() -> str:
         process_identity_shell() + "dt_job_live_state() { "
         "dt_jl_jd=$1; dt_jl_pg=$2; dt_jl_boot=$3; dt_jl_ident=$4; "
         'case "$dt_jl_jd" in /*) :;; *) dt_jl_jd="$PWD/$dt_jl_jd";; esac; '
+        # find -lname treats its operand as a glob: a configured path holding
+        # [ ] * ? \ would silently match nothing and report a live job DEAD.
+        # Escape the metacharacters; without sed, use the literal readlink
+        # walk instead of the find fast path.
+        "dt_jl_pat=$(printf '%s\\n' \"$dt_jl_jd\" "
+        "| sed 's/[][\\*?]/\\\\&/g' 2>/dev/null) || dt_jl_pat=; "
         'case "$dt_jl_pg" in *[!0-9]*|"") dt_jl_pg=0;; esac; '
         'if [ -n "$dt_jl_boot" ]; then '
         "dt_jl_cur=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) "
@@ -148,9 +155,9 @@ def liveness_shell() -> str:
         'if dt_pid_zombie "$dt_jl_x"; then continue; fi; '
         '[ -e "/proc/$dt_jl_x" ] || continue; '
         "echo LIVE; return 0; done; fi; "
-        "if command -v find >/dev/null 2>&1; then "
+        'if command -v find >/dev/null 2>&1 && [ -n "$dt_jl_pat" ]; then '
         "dt_jl_cwd=$(find /proc -mindepth 2 -maxdepth 2 -type l -name cwd "
-        '\\( -lname "$dt_jl_jd" -o -lname "$dt_jl_jd/*" \\) '
+        '\\( -lname "$dt_jl_pat" -o -lname "$dt_jl_pat/*" \\) '
         "-printf '%h\\n' 2>/dev/null); dt_jl_frc=$?; "
         '[ "$dt_jl_frc" -gt 1 ] && dt_jl_deg=1; '
         '[ -n "$dt_jl_cwd" ] && { echo LIVE; return 0; }; '
@@ -226,9 +233,9 @@ def termination_probe(
         # so it must still *count as alive*. Splitting the two stops a
         # corrupt-but-present identity file from being reported falsely dead.
          + "sig_scan() { "
-        "if command -v find >/dev/null 2>&1; then "
+        'if command -v find >/dev/null 2>&1 && [ -n "$DT_KPAT" ]; then '
         "dt_sig_raw=$(find /proc -mindepth 2 -maxdepth 2 -type l -name cwd "
-        '\\( -lname "$DT_KJD" -o -lname "$DT_KJD/*" \\) '
+        '\\( -lname "$DT_KPAT" -o -lname "$DT_KPAT/*" \\) '
         "-printf '%h\\n' 2>/dev/null); "
         "for dt_sig_h in $dt_sig_raw; do printf '%s\\n' \"${dt_sig_h##*/}\"; done; "
         "else for dt_sig_p in /proc/[0-9]*; do "
@@ -254,9 +261,9 @@ def termination_probe(
         'if dt_pid_zombie "$dt_su_x"; then continue; fi; '
         '[ -e "/proc/$dt_su_x" ] || continue; '
         'dt_su_pids="$dt_su_pids $dt_su_x"; done; fi; '
-        "if command -v find >/dev/null 2>&1; then "
+        'if command -v find >/dev/null 2>&1 && [ -n "$DT_KPAT" ]; then '
         "dt_su_cwd=$(find /proc -mindepth 2 -maxdepth 2 -type l -name cwd "
-        '\\( -lname "$DT_KJD" -o -lname "$DT_KJD/*" \\) '
+        '\\( -lname "$DT_KPAT" -o -lname "$DT_KPAT/*" \\) '
         "-printf '%h\\n' 2>/dev/null); dt_su_frc=$?; "
         # find exits 1 merely because it could not stat other users' /proc
         # entries; only >=2 (missing/incompatible find, fork failure) is a
@@ -269,6 +276,10 @@ def termination_probe(
         '[ "$dt_su_deg" -eq 1 ] && echo DEGRADED || echo OK; '
         "for dt_su_x in $dt_su_pids; do printf '%s\\n' \"$dt_su_x\"; done; }; "
         + 'case "$DT_KJD" in /*) :;; *) DT_KJD="$PWD/$DT_KJD";; esac; '
+        # Literalize glob metacharacters for the find -lname census; an
+        # empty pattern routes both scans to the literal readlink walk.
+        + "DT_KPAT=$(printf '%s\\n' \"$DT_KJD\" "
+        + "| sed 's/[][\\*?]/\\\\&/g' 2>/dev/null) || DT_KPAT=; "
         # Distinguish a read failure (probe infrastructure down: masked
         # /proc, fork exhaustion) from a genuine mismatch (node rebooted).
         + 'DT_KBOOT_MATCH=1; DT_KBOOT_UNKNOWN=0; if [ -n "$DT_KBOOT" ]; then '
@@ -340,6 +351,10 @@ def termination_probe(
             "/process_start_ticks"
         ),
     ]
+    # C locale pins bash's [!0-9] pattern to ASCII: under a UTF-8 locale it
+    # passes Unicode digits through, and the job-writable exit marker could
+    # then crash or fool termination_verdict downstream.
+    envs.append("LC_ALL=C")
     if session is not None:
         envs.append(f"DT_KSESSION={shlex.quote(session)}")
     if cancel_sentinel:
@@ -371,7 +386,11 @@ def termination_verdict(
     exited, _, recorded = verdict.partition(" ")
     if exited == "EXITED":
         code = recorded.strip()
-        if code.isdigit() and len(code) <= 3 and 0 <= int(code) <= 255:
+        # ASCII digits only: str.isdigit() accepts Unicode digits, and a
+        # job-writable marker containing one would either crash int() here
+        # (superscripts) or fabricate a non-decimal exit code (Arabic-Indic
+        # digits). The marker is remote content; validate, never trust.
+        if re.fullmatch(r"[0-9]{1,3}", code) and int(code) <= 255:
             return "EXITED", code
         return "EXITED", None
     return "UNVERIFIED", diagnostic_excerpt(

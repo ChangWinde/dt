@@ -202,7 +202,11 @@ def clean_deployments_command(cutoff: datetime) -> str:
         'case "$dt_dep_tgt" in releases/*) keep="${dt_dep_tgt#releases/}";; '
         "*) dt_dep_safe=0;; esac; "
         'case "$keep" in ""|.|..|*/*) dt_dep_safe=0;; esac; '
-        'elif [ -e "$current" ]; then dt_dep_safe=0; fi; '
+        # A missing current is as unprovable as a non-symlink one: with no
+        # evidence of which release is active, an empty keep would let the
+        # sweep reap every release including the rollback target.
+        'elif [ -e "$current" ]; then dt_dep_safe=0; '
+        "else dt_dep_safe=0; fi; "
         '[ "$dt_dep_safe" -eq 1 ] || '
         'echo "release sweep skipped: unsafe current marker" >&2; '
         'if [ "$dt_dep_safe" -eq 1 ] && [ -d "$releases" ] '
@@ -581,11 +585,18 @@ def clean_jobs(
                     + '[ "$dt_jl_state" = DEAD ] || '
                     + '{ echo "DT_CLEAN_LIVE $dt_jl_state" >&2; exit 75; }; '
                 )
+                # The census inside live_guard depends on POSIX word
+                # splitting; a bare command would run under the node's login
+                # shell, and zsh's no-split default turns a live census into
+                # a false DEAD. Pin bash exactly like the kill probe does.
+                delete_script = (
+                    f"{live_guard}rm -rf -- {node_path_expression(managed_dir)}"
+                )
                 try:
                     proc = runner(
                         entry.node,
                         entry.node_local,
-                        f"{live_guard}rm -rf -- {node_path_expression(managed_dir)}",
+                        f"bash -c {shlex.quote(delete_script)}",
                         60,
                         False,
                     )
