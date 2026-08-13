@@ -177,3 +177,56 @@ def test_directory_reader_refuses_symlinks_and_repairs_stray_modes(tmp_path):
         assert os.stat(stray).st_mode & 0o777 == 0o600
         with pytest.raises(PrivateStateError, match="size limit"):
             read_name("big.json")
+
+
+def test_fsync_tree_prefers_one_filesystem_flush(tmp_path, monkeypatch):
+    """When syncfs succeeds, the per-file walk must be skipped entirely: one
+    syscall flushes the whole filesystem in milliseconds where the walk needs
+    seconds on large snapshots (QR-P1)."""
+    import dt.private_state as ps
+
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.txt").write_bytes(b"a")
+    flushed = []
+    monkeypatch.setattr(ps, "_syncfs_tree", lambda path: True)
+    monkeypatch.setattr(ps.os, "fsync", lambda fd: flushed.append(fd))
+
+    ps.fsync_tree(root)
+
+    assert flushed == []
+
+
+def test_fsync_tree_falls_back_to_the_per_file_walk(tmp_path, monkeypatch):
+    """Where syncfs is unavailable (non-Linux libc, refused fd) every file and
+    directory must still be flushed individually."""
+    import dt.private_state as ps
+
+    root = tmp_path / "tree"
+    (root / "nested").mkdir(parents=True)
+    (root / "a.txt").write_bytes(b"a")
+    (root / "nested" / "b.txt").write_bytes(b"b")
+    flushed = []
+    monkeypatch.setattr(ps, "_syncfs_tree", lambda path: False)
+    monkeypatch.setattr(ps.os, "fsync", lambda fd: flushed.append(fd))
+
+    ps.fsync_tree(root)
+
+    # Two files, and fsync_dir on each of the two directories.
+    assert len(flushed) >= 4
+
+
+def test_syncfs_helper_flushes_a_real_directory():
+    """On this CI platform (Linux) the libc fast path must actually work; a
+    False here would silently reintroduce the seconds-long walk."""
+    import sys
+    import tempfile
+
+    import dt.private_state as ps
+
+    with tempfile.TemporaryDirectory() as scratch:
+        outcome = ps._syncfs_tree(ps.Path(scratch))
+    if sys.platform.startswith("linux"):
+        assert outcome is True
+    else:
+        assert outcome in (True, False)

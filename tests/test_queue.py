@@ -426,6 +426,25 @@ def test_agent_heartbeat_atomically_replaces_symlink_without_following_it(tmp_pa
     assert outside.read_text() == "must survive\n"
 
 
+def test_agent_heartbeat_skips_disk_flushes(tmp_path, monkeypatch):
+    """The liveness stamp must not pay fsync: a lost write reads as stale,
+    which is the truth about a crashed agent (QR-P4)."""
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    cfg.root.mkdir(parents=True)
+    flushes = []
+    monkeypatch.setattr(agent.os, "fsync", lambda fd: flushes.append(fd), raising=False)
+
+    agent._write_heartbeat(cfg)
+
+    assert flushes == []
+    assert float(agent.heartbeat_path(cfg).read_text()) > 0
+    stamp_name = agent.heartbeat_path(cfg).name
+    leftovers = [p for p in cfg.root.rglob(f".{stamp_name}.*.tmp")]
+    assert leftovers == []
+
+
 def test_agent_autoclean_refuses_symlinked_retention_state(tmp_path, monkeypatch):
     import dt.agent as agent
 

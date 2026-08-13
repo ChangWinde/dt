@@ -765,6 +765,27 @@ def load(cfg: HeadConfig, job_id: str) -> JobEntry | None:
     return None
 
 
+_DECODE_CACHE_ENABLED = False
+_DECODE_CACHE_MAX = 65536
+_DECODE_CACHE: dict[str, tuple[tuple[int, int, int], JobEntry]] = {}
+
+
+def enable_registry_decode_cache() -> None:
+    """Reuse decoded registry rows across scans inside one resident process.
+
+    Every persistent lifecycle change flows through ``save()``'s atomic
+    rename, so ``(st_ino, st_size, st_mtime_ns)`` identifies one on-disk
+    revision of a row exactly; a matching stat means the previous decode is
+    still the truth and the ~90% of scan cost spent on json plus validation
+    can be skipped (QR-P2). Only the long-lived agent enables this: one-shot
+    CLI processes gain nothing from a process-local cache. Cached objects
+    follow the same read-only-or-``replace()`` contract as
+    ``shared_resolution_snapshot`` scopes.
+    """
+    global _DECODE_CACHE_ENABLED
+    _DECODE_CACHE_ENABLED = True
+
+
 def list_all(
     cfg: HeadConfig,
     *,
@@ -778,6 +799,7 @@ def list_all(
     """
     entries: dict[str, JobEntry] = {}
     origins: dict[str, str] = {}
+    cache_seen: set[str] = set()
     directories = [(cfg.legacy_registry_dir(), LEGACY_LAYOUT)]
     current = cfg.registry_dir()
     if current != cfg.legacy_registry_dir():
@@ -817,12 +839,43 @@ def list_all(
                         raise RegistryError(
                             f"cannot safely open registry record: {name}"
                         ) from exc
+                    cache_key = None
+                    if _DECODE_CACHE_ENABLED and result is not None:
+                        _, info = result
+                        cache_key = f"{directory}/{name}"
+                        cache_seen.add(cache_key)
+                        revision = (info.st_ino, info.st_size, info.st_mtime_ns)
+                        cached = _DECODE_CACHE.get(cache_key)
+                        if cached is not None and cached[0] == revision:
+                            entry = cached[1]
+                            if entry.job_id in entries and damage is not None:
+                                damage.append(
+                                    RegistryDamage(
+                                        path=name,
+                                        detail=(
+                                            "split-brain registry row: exists "
+                                            f"in both {origins[entry.job_id]} "
+                                            f"and {directory}; run dt migrate "
+                                            "to reconcile"
+                                        ),
+                                    )
+                                )
+                            entries[entry.job_id] = entry
+                            origins[entry.job_id] = str(directory)
+                            continue
                     entry = _decode_entry_result(
                         result,
                         name=name,
                         layout=layout,
                         expected_job_id=name[: -len(".json")],
                     )
+                    if cache_key is not None and result is not None:
+                        _, info = result
+                        if len(_DECODE_CACHE) < _DECODE_CACHE_MAX:
+                            _DECODE_CACHE[cache_key] = (
+                                (info.st_ino, info.st_size, info.st_mtime_ns),
+                                entry,
+                            )
                     if entry.job_id in entries and damage is not None:
                         # A crashed migration window can leave the same job in
                         # both registries. save() routes by storage_layout, so
@@ -846,6 +899,9 @@ def list_all(
                         detail = " ".join(str(exc).split()) or type(exc).__name__
                         damage.append(RegistryDamage(path=name, detail=detail))
                     continue
+    if _DECODE_CACHE_ENABLED and _DECODE_CACHE:
+        for key in [k for k in _DECODE_CACHE if k not in cache_seen]:
+            del _DECODE_CACHE[key]
     return [entries[job_id] for job_id in sorted(entries)]
 
 
@@ -944,7 +1000,14 @@ def shared_resolution_snapshot(cfg: HeadConfig) -> Iterator[None]:
         _resolution_snapshot.reset(token)
 
 
-def _resolution_entries(cfg: HeadConfig) -> list[JobEntry]:
+def resolution_entries(cfg: HeadConfig) -> list[JobEntry]:
+    """The registry decode serving the active resolution scope, if any.
+
+    Inside a ``shared_resolution_snapshot`` scope this reuses the one scan
+    that already served ref resolution, so commands can derive display refs
+    and queue context without decoding the registry again (QR-P3). Outside a
+    scope it is plain ``list_all``.
+    """
     scope = _resolution_snapshot.get()
     if scope is None:
         return list_all(cfg)
@@ -952,6 +1015,9 @@ def _resolution_entries(cfg: HeadConfig) -> list[JobEntry]:
     if key not in scope:
         scope[key] = list_all(cfg)
     return scope[key]
+
+
+_resolution_entries = resolution_entries
 
 
 def resolve_ref(

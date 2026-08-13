@@ -47,6 +47,7 @@ from .jobs import (
     RegistryDamage,
     agent_wake_path,
     effective_result_state,
+    enable_registry_decode_cache,
     list_all,
     refresh_status,
 )
@@ -399,8 +400,35 @@ def _rotate_agent_log(cfg: HeadConfig) -> bool:
 
 
 def _write_heartbeat(cfg: HeadConfig) -> None:
+    """Refresh the liveness stamp without paying durability it cannot use.
+
+    The heartbeat exists to look FRESH; a crash that loses the last write
+    makes the agent look stale, which is exactly the truth. Rename keeps
+    readers tear-free, and skipping the two fsyncs saves ~6 ms and tens of
+    thousands of real disk flushes per day on an active head (QR-P4).
+    """
     path = heartbeat_path(cfg)
-    _atomic_private_write(path, f"{time.time():.6f}\n".encode("ascii"))
+    payload = f"{time.time():.6f}\n".encode("ascii")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.write(descriptor, payload)
+        finally:
+            os.close(descriptor)
+        os.replace(temporary, path)
+    except OSError:
+        # Best-effort by design: one missed beat reads as a slightly older
+        # stamp, and persistent failure surfaces through heartbeat_health.
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
 
 
 def alive_pid(cfg: HeadConfig) -> int | None:
@@ -1008,6 +1036,9 @@ def run_loop(cfg: HeadConfig) -> int:
         print("another dt agent is already running", file=sys.stderr)
         return 1
     _atomic_private_write(_pid_path(cfg), f"{os.getpid()}\n".encode("ascii"))
+    # Resident process: registry scans repeat every tick, so decoded rows are
+    # reused until their file revision changes (QR-P2).
+    enable_registry_decode_cache()
 
     stop = {"flag": False}
 
