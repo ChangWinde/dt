@@ -83,9 +83,12 @@ verified bootstrap independently on both minors, and produces:
 (cd dist && sha256sum -c SHA256SUMS)
 python3 -m json.tool dist/release-audit.json
 python3 -m json.tool dist/release-manifest.json
-VERSION=0.8.0
+VERSION=$(uv version --short)
 git tag -a "v$VERSION" -m "DistTrainer $VERSION"
 ```
+
+Deriving `VERSION` from the project metadata keeps the tag, the bundle
+filenames, and `pyproject.toml` from drifting apart.
 
 The manifest must report `git_dirty: false` and the intended release commit.
 Do not move or recreate a published tag.
@@ -98,7 +101,7 @@ from the verified bundle. For PyPI, first confirm the `disttrainer` name,
 copyright-holder authorization, and trusted-publisher configuration, then use:
 
 ```bash
-VERSION=0.8.0
+VERSION=$(uv version --short)
 uv publish "dist/disttrainer-$VERSION-py3-none-any.whl" \
   "dist/disttrainer-$VERSION.tar.gz"
 ```
@@ -118,7 +121,7 @@ Each host retains the complete verified bundle below
 `~/.local/share/disttrainer/releases/VERSION/`. To restore a retained version:
 
 ```bash
-VERSION=0.8.0
+VERSION=<retained version to restore>
 scripts/deploy.sh --plan --rollback "$VERSION" HEAD_A
 scripts/deploy.sh --rollback "$VERSION" HEAD_A
 ```

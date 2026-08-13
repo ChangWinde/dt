@@ -29,7 +29,15 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 - `dt sync --route auto|direct|gateway` applies the same routing to project
   mirroring through a persistent gateway mirror, so every staged sync after
   the first is delta-priced and one site's nodes cost a single WAN transfer
-  plus LAN replays. `--plan` and `--artifact` keep the operator route.
+  plus LAN replays. `--artifact` stages the same way, keeping each
+  artifact's project-relative layout so the LAN replay preserves the exact
+  file/directory semantics of a direct push. `--plan` never stages.
+
+- `dt doctor` reports a `registry` check on the head: how many job records
+  every command must scan, and past a few thousand rows which lever to
+  reach for (`queue.auto_clean_days` or `dt clean`). It is advisory and
+  never fails the health check — dt does not retire experiment history on
+  its own.
 
 - `dt clean --deployments` garbage-collects old release trees, staging
   directories, and installations, never touching the live release or the

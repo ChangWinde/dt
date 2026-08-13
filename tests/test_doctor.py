@@ -445,3 +445,36 @@ def test_doctor_flags_stale_lan_address_and_exits_nonzero(tmp_path, monkeypatch)
     result = CliRunner().invoke(cli.app, ["doctor", "--json"])
 
     assert result.exit_code == 1, result.output
+
+
+def test_registry_growth_is_advisory_and_names_the_available_lever(tmp_path):
+    """Scan cost is linear in the row count, so doctor surfaces growth. dt
+    never deletes experiment history on its own, so the label points at the
+    operator's own levers instead."""
+    from dt.config import QueueCfg
+    from dt.doctor import REGISTRY_ADVISORY_ROWS, registry_growth_status
+
+    cfg = _cfg(tmp_path)
+    registry = cfg.registry_dir()
+    registry.mkdir(parents=True, exist_ok=True)
+
+    assert registry_growth_status(cfg) == "ok (0 rows)"
+
+    for index in range(3):
+        (registry / f"job-{index}.json").write_text("{}")
+    # Hidden and non-record files never count toward the scan.
+    (registry / ".tmp.json").write_text("{}")
+    (registry / "notes.txt").write_text("x")
+    assert registry_growth_status(cfg) == "ok (3 rows)"
+
+    for index in range(3, REGISTRY_ADVISORY_ROWS):
+        (registry / f"job-{index}.json").write_text("{}")
+
+    large = registry_growth_status(cfg)
+    assert large.startswith(f"large: {REGISTRY_ADVISORY_ROWS} rows")
+    # No retention configured yet: point at the setting, not at deletion.
+    assert "set queue.auto_clean_days" in large
+
+    retained = _cfg(tmp_path)
+    retained.queue = QueueCfg(auto_clean_days=14)
+    assert "run dt clean" in registry_growth_status(retained)

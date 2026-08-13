@@ -101,10 +101,8 @@ rewritten by leg A before every replay.
   under `~/.dt/sync-staging/`. This is deliberate (delta pricing) and
   documented; operators reclaim it by deleting the directory, and the next
   staged sync rebuilds it.
-- `sync_artifacts` keeps the operator route: it is a per-artifact
-  orchestration (remote checks, plan previews, manifest publication) whose
-  relay would duplicate most of that machinery on the gateway for the same
-  first-push win; explicitly out of scope until evidence demands it.
+- `sync_artifacts` stages through the same gateway mirror (see the
+  amendment below).
 - Plan mode, laptop forwarding, resume argv, retries, and cancellation are
   unchanged; `--route` forwards like every other sync option.
 
@@ -118,3 +116,28 @@ rewritten by leg A before every replay.
   checksum behavior.
 - The full suite stays green; existing sync contract tests guard the
   direct path.
+
+## Amendment: artifacts stage through the same mirror
+
+The original decision left `sync_artifacts` on the operator route, reasoning
+that its per-artifact orchestration would have to be duplicated on the
+gateway. That trade was wrong on the sizes involved: `--artifact` exists
+precisely for the large reusable inputs a project pushes (datasets, base
+checkpoints), so it carries more tunnel-bound bytes than the code mirror it
+was excluded from.
+
+Artifacts now stage through `~/.dt/sync-staging/<project>/artifacts/`,
+keeping each artifact's project-relative path inside the mirror so the LAN
+leg replays with exactly the semantics the direct push uses: a directory
+into its own target with `--delete`, a file into its parent, both with
+`--checksum`. Every parent directory is created in one preparation call
+before the loop, so the relay costs a single extra control round trip
+regardless of artifact count.
+
+Unchanged from the original decision: `--plan` never stages, a failure at
+any point falls back to the direct route for the remaining artifacts (and
+reports `relay_error`), and the row's transferred counts come from the leg
+that actually reached the node. The manifest publication stays on the
+operator route deliberately — it is a few kilobytes whose whole purpose is
+to record what the node received, so routing it through a cache would add
+a staleness window for no bandwidth gain.

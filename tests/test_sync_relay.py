@@ -341,6 +341,182 @@ def test_sync_project_falls_back_when_the_push_fails(tmp_path, monkeypatch):
     assert "push failed" in row["relay_error"]
 
 
+def test_artifact_mirror_prepares_every_parent_once():
+    """One control round trip creates the mirror and all artifact parents,
+    instead of one per artifact (ADR 0026)."""
+    command = sync_relay.prepare_artifact_mirror_command(
+        "omni",
+        ["data/train.bin", "data/eval.bin", "configs/base.yaml", "top.txt"],
+    )
+
+    assert command.startswith("bash -c ")
+    assert 'test ! -L "$HOME/.dt"' in command
+    assert '"$mirror"/configs' in command
+    assert '"$mirror"/data' in command
+    # A root-level artifact contributes no extra parent.
+    assert '"$mirror"/top.txt' not in command
+    # Parents are deduplicated.
+    assert command.count('"$mirror"/data') == 1
+
+
+def test_artifact_push_matches_direct_semantics():
+    node = Node(name="worker", site="lab", lan_address="10.0.0.7", lan_port=2222)
+
+    directory = sync_relay.push_artifact_command(
+        node, "omni", "data", "dt/artifacts/omni/data", is_dir=True
+    )
+    assert "--delete" in directory
+    assert "--checksum" in directory
+    assert '"$mirror"/data/' in directory
+    assert 'test -d "$mirror"/data' in directory
+
+    single = sync_relay.push_artifact_command(
+        node, "omni", "data/train.bin", "dt/artifacts/omni/data", is_dir=False
+    )
+    # A file must not carry --delete: it lands beside its siblings.
+    assert "--delete" not in single
+    assert 'test -e "$mirror"/data/train.bin' in single
+    assert "10.0.0.7:" in single
+
+
+def test_artifact_push_requires_a_lan_address():
+    with pytest.raises(RelayError):
+        sync_relay.push_artifact_command(
+            Node(name="dark", site="lab"), "omni", "a", "b", is_dir=False
+        )
+
+
+def _artifact_project(tmp_path):
+    project = tmp_path / "project"
+    (project / "data").mkdir(parents=True, exist_ok=True)
+    (project / "data" / "train.bin").write_bytes(b"x" * 2048)
+    (project / "model.pt").write_bytes(b"y" * 4096)
+    return project
+
+
+def test_sync_artifacts_stages_each_artifact_through_the_gateway(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    project = _artifact_project(tmp_path)
+    rsync_calls = []
+    relay_calls = []
+
+    def fake_rsync(src, dst, **kwargs):
+        rsync_calls.append((src, dst))
+        return subprocess.CompletedProcess([], 0, _stats(files=2), "")
+
+    def fake_relay(node, local, command, timeout=15, check=False, **kw):
+        relay_calls.append(command)
+        return subprocess.CompletedProcess([], 0, _stats(files=2), "")
+
+    monkeypatch.setattr(dispatch, "rsync", fake_rsync)
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(sync_relay, "run_on", fake_relay)
+
+    row = dispatch.sync_artifacts(
+        cfg,
+        "omni",
+        project,
+        cfg.nodes[0],
+        ["data", "model.pt"],
+        lambda _m: None,
+        route="gateway",
+    )
+
+    # Every artifact staged into the gateway mirror, none straight to the node.
+    staged = [dst for _src, dst in rsync_calls if dst.startswith("gw:")]
+    assert any("sync-staging/omni/artifacts/data" in dst for dst in staged)
+    assert not any(dst.startswith("worker:") for _src, dst in rsync_calls[:2])
+    # Prepare once (no rsync), then one LAN push per artifact.
+    prepares = [cmd for cmd in relay_calls if "rsync" not in cmd]
+    pushes = [cmd for cmd in relay_calls if "rsync" in cmd]
+    assert len(prepares) == 1 and "sync-staging" in prepares[0]
+    assert len(pushes) == 2
+    assert row["route"] == "gateway"
+    assert row["route_gateway"] == "gw"
+    assert "relay_error" not in row
+
+
+def test_sync_artifacts_falls_back_when_a_leg_fails(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    project = _artifact_project(tmp_path)
+    rsync_calls = []
+
+    def fake_rsync(src, dst, **kwargs):
+        rsync_calls.append(dst)
+        if dst.startswith("gw:"):
+            return subprocess.CompletedProcess([], 23, "", "permission denied")
+        return subprocess.CompletedProcess([], 0, _stats(files=2), "")
+
+    monkeypatch.setattr(dispatch, "rsync", fake_rsync)
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        sync_relay,
+        "run_on",
+        lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    messages = []
+
+    row = dispatch.sync_artifacts(
+        cfg,
+        "omni",
+        project,
+        cfg.nodes[0],
+        ["data", "model.pt"],
+        messages.append,
+        route="gateway",
+    )
+
+    # The first artifact tried the gateway, failed, and every artifact
+    # (including that one) landed over the direct route.
+    assert rsync_calls[0].startswith("gw:")
+    assert any(dst.startswith("worker:") for dst in rsync_calls)
+    assert row["route"] == "direct"
+    assert "staging failed" in row["relay_error"]
+    assert any("falling back" in message for message in messages)
+
+
+def test_sync_artifacts_plan_never_stages(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    project = _artifact_project(tmp_path)
+
+    monkeypatch.setattr(
+        dispatch,
+        "rsync",
+        lambda src, dst, **kw: subprocess.CompletedProcess([], 0, _stats(), ""),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""),
+    )
+
+    def exploding_relay(*a, **k):
+        raise AssertionError("plan must never touch the gateway")
+
+    monkeypatch.setattr(sync_relay, "run_on", exploding_relay)
+
+    row = dispatch.sync_artifacts(
+        cfg,
+        "omni",
+        project,
+        cfg.nodes[0],
+        ["model.pt"],
+        lambda _m: None,
+        plan=True,
+        route="gateway",
+    )
+
+    assert "route" not in row
+
+
 def test_sync_plan_never_stages(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     project = _project(tmp_path)

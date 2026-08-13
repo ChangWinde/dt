@@ -1564,7 +1564,7 @@ def test_sync_cli_routes_explicit_artifacts_without_syncing_code(
     assert row["mode"] == "artifacts"
 
 
-def test_sync_cli_rejects_unknown_route_and_artifact_gateway_conflict(monkeypatch):
+def test_sync_cli_rejects_unknown_route_modes(monkeypatch):
     import dt.cli as cli
 
     monkeypatch.setattr(
@@ -1579,15 +1579,9 @@ def test_sync_cli_rejects_unknown_route_and_artifact_gateway_conflict(monkeypatc
         cli.app,
         ["sync", "n1", "--route", "fastest", "--json"],
     )
+
     assert bad_mode.exit_code == 1
     assert "invalid --route" in json.loads(bad_mode.stdout)["message"]
-
-    conflict = CliRunner().invoke(
-        cli.app,
-        ["sync", "n1", "--artifact", "model.pt", "--route", "gateway", "--json"],
-    )
-    assert conflict.exit_code == 1
-    assert "artifact" in json.loads(conflict.stdout)["message"]
 
 
 def test_sync_cli_rejects_negative_retries_before_config(monkeypatch):
