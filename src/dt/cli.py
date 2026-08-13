@@ -47,7 +47,14 @@ from . import jobs as jobs_mod
 from . import ps_query as ps_query_mod
 from . import submission_group as group_mod
 from .completion import CompletionSignals
-from .config import ConfigError, HeadConfig, LaptopConfig, config_path, load
+from .config import (
+    ConfigError,
+    HeadConfig,
+    LaptopConfig,
+    config_path,
+    head_bwlimit_kbps,
+    load,
+)
 from .dispatch import (
     DispatchError,
     FailedBeforeStart,
@@ -1378,6 +1385,12 @@ def free(
                 cfg.center,
                 probe_center(cfg, use_cache=not (watch or fresh)),
             )
+            # A drained node still probes as free; without the marker the
+            # capacity view would advertise GPUs placement refuses to use.
+            drained_names = {node.name for node in cfg.nodes if node.drained}
+            for row in rows:
+                if row.get("node") in drained_names:
+                    row["drained"] = True
             if include_scheduler:
                 rows = _with_free_scheduler_context(cfg, rows)
             return rows, {}
@@ -11731,6 +11744,14 @@ def _pull_unlocked(
             "the head dials the node through a tunnel; direct/gateway force"
         ),
     ),
+    bwlimit: Optional[int] = typer.Option(
+        None,
+        "--bwlimit",
+        help=(
+            "cap head-side transfer legs at KBPS KiB/s (site default: "
+            "sites.<name>.bwlimit_kbps; LAN replays stay unthrottled)"
+        ),
+    ),
     _cfg_override: HeadConfig | LaptopConfig | None = None,
     _result: JsonDict | None = None,
     _cancel_event: Event | None = None,
@@ -11746,6 +11767,14 @@ def _pull_unlocked(
                 f"invalid --route {route!r}; "
                 f"choose one of {', '.join(pull_relay.ROUTE_MODES)}"
             ),
+            exit_code=1,
+            json_=json_,
+        )
+    bwlimit = bwlimit if isinstance(bwlimit, int) else None
+    if bwlimit is not None and bwlimit <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="pull --bwlimit must be a positive KiB/s integer",
             exit_code=1,
             json_=json_,
         )
@@ -11770,6 +11799,8 @@ def _pull_unlocked(
             argv += ["--retries", str(retries)]
         if route != "auto":
             argv += ["--route", route]
+        if bwlimit is not None:
+            argv += ["--bwlimit", str(bwlimit)]
         if json_:
             argv.append("--json")
         else:
@@ -12101,6 +12132,7 @@ def _pull_unlocked(
         outputs_bytes=remote_outputs_bytes,
         mode=route,
     )
+    effective_bwlimit = head_bwlimit_kbps(cfg, entry.node, bwlimit)
     relay_error: str | None = None
     if outputs_present:
         src = rsync_destination(
@@ -12207,6 +12239,7 @@ def _pull_unlocked(
                     retries=retries,
                     safe_links=True,
                     stats=stats,
+                    bwlimit_kbps=effective_bwlimit,
                     on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
                     **cancel_kwargs,
                 )
@@ -12219,6 +12252,7 @@ def _pull_unlocked(
                     retries=retries,
                     safe_links=True,
                     stats=stats,
+                    bwlimit_kbps=effective_bwlimit,
                     on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
                     **cancel_kwargs,
                 )
@@ -12325,6 +12359,7 @@ def _pull_unlocked(
             timeout=4 * 3600,
             retries=retries,
             safe_links=True,
+            bwlimit_kbps=effective_bwlimit,
             on_retry=_rsync_retry_observer(ref, "run_logs", retry_events),
             **cancel_kwargs,
         )
@@ -12337,6 +12372,7 @@ def _pull_unlocked(
                 timeout=4 * 3600,
                 retries=retries,
                 safe_links=True,
+                bwlimit_kbps=effective_bwlimit,
                 on_retry=_rsync_retry_observer(ref, "run_logs", retry_events),
                 **cancel_kwargs,
             )
@@ -12491,6 +12527,7 @@ def _pull_group_one(
     force: bool,
     retries: int,
     route: str,
+    bwlimit: int | None,
     cancel_event: Event,
 ) -> JsonDict:
     result: JsonDict = {}
@@ -12505,6 +12542,7 @@ def _pull_group_one(
                 True,
                 retries,
                 route=route,
+                bwlimit=bwlimit,
                 _cfg_override=cfg,
                 _result=result,
                 _cancel_event=cancel_event,
@@ -12567,6 +12605,14 @@ def pull(
             "the head dials the node through a tunnel; direct/gateway force"
         ),
     ),
+    bwlimit: Optional[int] = typer.Option(
+        None,
+        "--bwlimit",
+        help=(
+            "cap head-side transfer legs at KBPS KiB/s (site default: "
+            "sites.<name>.bwlimit_kbps; LAN replays stay unthrottled)"
+        ),
+    ),
     file: Optional[Path] = typer.Option(
         None,
         "--file",
@@ -12623,6 +12669,14 @@ def pull(
             exit_code=1,
             json_=json_,
         )
+    bwlimit = bwlimit if isinstance(bwlimit, int) else None
+    if bwlimit is not None and bwlimit <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="pull --bwlimit must be a positive KiB/s integer",
+            exit_code=1,
+            json_=json_,
+        )
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         if len(refs) == 1:
@@ -12635,6 +12689,7 @@ def pull(
                 json_,
                 retries,
                 route=route,
+                bwlimit=bwlimit,
                 _cfg_override=cfg,
                 _collection=collection,
             )
@@ -12668,6 +12723,8 @@ def pull(
             argv += ["--retries", str(retries)]
         if route != "auto":
             argv += ["--route", route]
+        if bwlimit is not None:
+            argv += ["--bwlimit", str(bwlimit)]
         if json_:
             argv.append("--json")
         else:
@@ -12701,6 +12758,7 @@ def pull(
             json_,
             retries,
             route=route,
+            bwlimit=bwlimit,
             _cfg_override=cfg,
             _collection=collection,
         )
@@ -12736,6 +12794,7 @@ def pull(
                     json_,
                     retries,
                     route=route,
+                    bwlimit=bwlimit,
                     _cfg_override=cfg,
                     _collection=collection,
                 )
@@ -12755,6 +12814,8 @@ def pull(
                 resume += ["--retries", str(retries)]
             if route != "auto":
                 resume += ["--route", route]
+            if bwlimit is not None:
+                resume += ["--bwlimit", str(bwlimit)]
             if json_:
                 resume.append("--json")
             _pull_interrupted(
@@ -12818,6 +12879,7 @@ def pull(
                 force,
                 retries,
                 route,
+                bwlimit,
                 cancel_event,
             ): index
             for index, ref, entry, destination in work_items
@@ -12857,6 +12919,8 @@ def pull(
             resume += ["--retries", str(retries)]
         if route != "auto":
             resume += ["--route", route]
+        if bwlimit is not None:
+            resume += ["--bwlimit", str(bwlimit)]
         if json_:
             resume.append("--json")
         _pull_interrupted(
@@ -14584,6 +14648,14 @@ def sync(
             "force"
         ),
     ),
+    bwlimit: Optional[int] = typer.Option(
+        None,
+        "--bwlimit",
+        help=(
+            "cap head-side transfer legs at KBPS KiB/s (site default: "
+            "sites.<name>.bwlimit_kbps; LAN replays stay unthrottled)"
+        ),
+    ),
 ) -> None:
     """Incrementally rsync project code or explicit reusable inputs to nodes.
 
@@ -14612,6 +14684,14 @@ def sync(
             exit_code=1,
             json_=json_,
         )
+    bwlimit = bwlimit if isinstance(bwlimit, int) else None
+    if bwlimit is not None and bwlimit <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="sync --bwlimit must be a positive KiB/s integer",
+            exit_code=1,
+            json_=json_,
+        )
     cfg = _cfg()
 
     def resume_argv() -> list[str]:
@@ -14628,6 +14708,8 @@ def sync(
             argv += ["--retries", str(retries)]
         if route != "auto":
             argv += ["--route", route]
+        if bwlimit is not None:
+            argv += ["--bwlimit", str(bwlimit)]
         if json_:
             argv.append("--json")
         return argv
@@ -14645,6 +14727,8 @@ def sync(
             argv += ["--retries", str(retries)]
         if route != "auto":
             argv += ["--route", route]
+        if bwlimit is not None:
+            argv += ["--bwlimit", str(bwlimit)]
         if json_:
             argv.append("--json")
 
@@ -14732,6 +14816,7 @@ def sync(
                     plan=plan,
                     retries=retries,
                     route=route,
+                    bwlimit_kbps=bwlimit,
                     on_retry=_rsync_retry_observer(
                         name,
                         "artifact-sync",
@@ -14749,6 +14834,7 @@ def sync(
                     plan=True,
                     retries=retries,
                     route=route,
+                    bwlimit_kbps=bwlimit,
                     on_retry=_rsync_retry_observer(
                         name,
                         "sync",
@@ -14765,6 +14851,7 @@ def sync(
                     messages.append,
                     retries=retries,
                     route=route,
+                    bwlimit_kbps=bwlimit,
                     on_retry=_rsync_retry_observer(
                         name,
                         "sync",
@@ -15653,8 +15740,11 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
         )
         registry_label = registry_growth_status(cfg)
         local_names = {n.name for n in cfg.nodes if n.local}
+        drained_names = {n.name for n in cfg.nodes if n.drained}
         attached = False
         for r in rows:  # agent runs on the head itself -> its local node row
+            if r["node"] in drained_names:
+                r["checks"]["drained"] = "yes (nodes[].drained)"
             if r["node"] in local_names:
                 r["checks"]["agent"] = agent_label
                 r["checks"]["registry"] = registry_label

@@ -2046,10 +2046,12 @@ def test_pull_multiple_ctrl_c_cancels_workers_and_prints_exact_resume(
         force,
         retries,
         route,
+        bwlimit,
         cancel_event,
     ):
         assert retries == 0
         assert route == "auto"
+        assert bwlimit is None
         if ref == "one":
             assert second_started.wait(timeout=1)
             raise KeyboardInterrupt
@@ -2127,6 +2129,7 @@ def test_pull_collection_uses_managed_root_and_job_subdirectories(
         _force,
         _retries,
         _route,
+        _bwlimit,
         _cancel_event,
     ):
         destinations[ref] = destination
@@ -2788,6 +2791,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
                 "retries": 2,
                 "safe_links": True,
                 "stats": False,
+                "bwlimit_kbps": None,
             },
         ),
         (
@@ -2798,6 +2802,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
                 "timeout": 4 * 3600,
                 "retries": 2,
                 "safe_links": True,
+                "bwlimit_kbps": None,
             },
         ),
     ]
@@ -2883,6 +2888,7 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
                 "timeout": 4 * 3600,
                 "retries": 2,
                 "safe_links": True,
+                "bwlimit_kbps": None,
             },
         )
     ]

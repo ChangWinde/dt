@@ -31,7 +31,7 @@ from pathlib import Path, PurePosixPath
 from threading import Event
 from typing import Callable, Mapping, cast
 
-from .config import ConfigError, HeadConfig, Node, Project
+from .config import ConfigError, HeadConfig, Node, Project, head_bwlimit_kbps
 from .artifact_distribution import DistributionError, TransferExecutor
 from .lifecycle import termination_probe, termination_verdict
 from .layout import (
@@ -614,6 +614,7 @@ def sync_project(
     plan: bool = False,
     retries: int = 2,
     route: str = "auto",
+    bwlimit_kbps: int | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
     cancel_event: Event | None = None,
 ) -> dict[str, object]:
@@ -637,6 +638,7 @@ def sync_project(
             plan=plan,
             retries=retries,
             route=route,
+            bwlimit_kbps=bwlimit_kbps,
             on_retry=on_retry,
             cancel_event=cancel_event,
         )
@@ -652,6 +654,7 @@ def _sync_project_locked(
     plan: bool,
     retries: int,
     route: str = "auto",
+    bwlimit_kbps: int | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None,
     cancel_event: Event | None,
 ) -> dict[str, object]:
@@ -723,6 +726,7 @@ def _sync_project_locked(
     relay_route = None
     relay_error: str | None = None
     relayed_proc: subprocess.CompletedProcess[str] | None = None
+    effective_bwlimit = head_bwlimit_kbps(cfg, node.name, bwlimit_kbps)
     if not plan:
         relay_route = sync_relay.decide_sync_route(cfg, node.name, mode=route)
     if (
@@ -752,6 +756,7 @@ def _sync_project_locked(
                     delete_excluded=True,
                     timeout=BULK_TRANSFER_TIMEOUT_S,
                     retries=retries,
+                    bwlimit_kbps=effective_bwlimit,
                     on_retry=on_retry,
                     stats=True,
                     checksum=True,
@@ -790,6 +795,7 @@ def _sync_project_locked(
             delete_excluded=True,
             timeout=BULK_TRANSFER_TIMEOUT_S,
             retries=retries,
+            bwlimit_kbps=effective_bwlimit,
             on_retry=on_retry,
             stats=True,
             checksum=True,
@@ -855,6 +861,7 @@ def sync_artifacts(
     plan: bool = False,
     retries: int = 2,
     route: str = "auto",
+    bwlimit_kbps: int | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
     cancel_event: Event | None = None,
 ) -> dict[str, object]:
@@ -888,6 +895,7 @@ def sync_artifacts(
     # any relay failure keep the operator route.
     relay_route = None
     relay_error: str | None = None
+    effective_bwlimit = head_bwlimit_kbps(cfg, node.name, bwlimit_kbps)
     if not plan:
         relay_route = sync_relay.decide_sync_route(cfg, node.name, mode=route)
         if relay_route.route == "gateway":
@@ -1000,6 +1008,7 @@ def sync_artifacts(
                         delete=is_dir,
                         timeout=BULK_TRANSFER_TIMEOUT_S,
                         retries=retries,
+                        bwlimit_kbps=effective_bwlimit,
                         on_retry=on_retry,
                         stats=True,
                         checksum=True,
@@ -1038,6 +1047,7 @@ def sync_artifacts(
                     delete=is_dir,
                     timeout=BULK_TRANSFER_TIMEOUT_S,
                     retries=retries,
+                    bwlimit_kbps=effective_bwlimit,
                     on_retry=on_retry,
                     stats=True,
                     checksum=True,
@@ -1153,6 +1163,7 @@ def sync_artifacts(
                     manifest_destination,
                     timeout=60,
                     retries=retries,
+                    bwlimit_kbps=effective_bwlimit,
                     on_retry=on_retry,
                     checksum=True,
                     cancel_event=cancel_event,
@@ -1943,6 +1954,22 @@ def capacity_reason(status: NodeStatus, wanted: int) -> str:
     return "; ".join([base, *reasons])
 
 
+def drained_probe_reasons(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    probe_reasons: dict[str, str],
+) -> None:
+    """Overwrite capacity reasons with the drain verdict for drained nodes.
+
+    A drained node usually probes as free, so its capacity reason would
+    claim availability that placement will never use; the drain reason is
+    the truthful one for queues, --no-queue failures, and free --explain.
+    """
+    for node in cfg.nodes:
+        if node.drained and (spec.node is None or spec.node == node.name):
+            probe_reasons[node.name] = "drained: maintenance (nodes[].drained)"
+
+
 def pick_candidates(
     statuses: list[NodeStatus], nodes: list[Node], spec: RunSpec, reserve: int = 0
 ) -> list[Node]:
@@ -1954,6 +1981,10 @@ def pick_candidates(
             raise ConfigError(
                 f"unknown node {spec.node!r}; configured: {list(by_name)}"
             )
+        # Drain wins over an explicit pin: the whole point of draining is
+        # that no new work starts, including deliberately targeted work.
+        if by_name[spec.node].drained:
+            return []
         status = next((item for item in statuses if item.node == spec.node), None)
         if status is not None and disk_rejection_reason(status, spec) is not None:
             return []
@@ -1968,11 +1999,17 @@ def pick_candidates(
         reverse=True,
     )
     if spec.gpus == 0:
-        return [by_name[s.node] for s in ranked if s.node in by_name]
+        return [
+            by_name[s.node]
+            for s in ranked
+            if s.node in by_name and not by_name[s.node].drained
+        ]
     return [
         by_name[s.node]
         for s in ranked
-        if len(s.free_gpus) - reserve >= spec.gpus and s.node in by_name
+        if len(s.free_gpus) - reserve >= spec.gpus
+        and s.node in by_name
+        and not by_name[s.node].drained
     ]
 
 
@@ -4289,6 +4326,7 @@ def _submit_prepared_once(
         for s in statuses
         if spec.node is None or s.node == spec.node  # pinned: others not tried
     }
+    drained_probe_reasons(cfg, spec, probe_reasons)
     if statuses and all(status.unreachable for status in statuses):
         if no_queue:
             raise NoReachableNode(probe_reasons)
@@ -4933,6 +4971,7 @@ def _dispatch_queued_active(
     probe_reasons = {
         status.node: probe_rejection_reason(status, spec) for status in statuses
     }
+    drained_probe_reasons(cfg, spec, probe_reasons)
     try:
         candidates = pick_candidates(statuses, cfg.nodes, spec, _reserve_for(cfg, spec))
     except ConfigError as e:

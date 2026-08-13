@@ -115,6 +115,7 @@ proxy: http://proxy.example.invalid:8080
 | `nodes[].lan_port` | Site-LAN SSH port, defaults to 22 and requires `lan_address` when explicitly set |
 | `nodes[].artifact_seed` | Whether the node may host a trusted artifact cache; defaults to true |
 | `nodes[].transfer_cost` | Non-negative route cost recorded by transfer plans; defaults to 1 |
+| `nodes[].drained` | Maintenance switch: no new placements (pins included) while running jobs finish; defaults to false |
 
 Node order does not grant a permanent placement preference. `dt` probes
 eligible nodes and selects fitting capacity while respecting explicit pins and
@@ -141,6 +142,7 @@ configuration loading fail. DT never infers a site from a hostname.
 | `sites.NAME.route_circuit_failures` | `2` | Consecutive direct-edge transport failures before the route circuit opens; range 1–10 |
 | `sites.NAME.route_circuit_cooldown_s` | `60` | Initial cooldown before one half-open route probe; range 1–3600 seconds |
 | `sites.NAME.route_circuit_max_cooldown_s` | `900` | Maximum exponential cooldown; at least the initial cooldown and at most 86400 seconds |
+| `sites.NAME.bwlimit_kbps` | unset | Head-side transfer budget (KiB/s) for pull/sync legs touching the head; intra-site LAN replays stay unthrottled; `--bwlimit` overrides |
 
 Both `site-cache-first` and `topology-aware` authenticate their site-internal
 SSH hops by forwarding the head operator's ssh-agent to the selected trusted

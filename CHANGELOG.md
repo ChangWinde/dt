@@ -8,6 +8,17 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Added
 
+- `dt pull --bwlimit KBPS` and `dt sync --bwlimit KBPS` cap head-side
+  transfer legs, with `sites.<name>.bwlimit_kbps` as the per-site default,
+  so bulk recovery cannot starve interactive sessions on a shared uplink.
+  Intra-site LAN replays deliberately stay unthrottled.
+
+- `nodes[].drained: true` drains a node for maintenance: no new placements
+  (explicit pins included) while running jobs finish undisturbed. The drain
+  is visible everywhere capacity is discussed — `dt free` marks the node,
+  `dt doctor` reports a check, and queue explanations say `drained:
+  maintenance` instead of claiming free GPUs that placement will refuse.
+
 - Bulk data prefers real capacity instead of the operator's SSH route. The
   head classifies every control route as `direct`, `relayed` (an frp/autossh
   tunnel), `proxied` (a jump host), `local`, or `opaque`, learns per-edge

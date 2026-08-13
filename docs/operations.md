@@ -255,6 +255,25 @@ resumable and preserves partial data on interruption. `--force` can merge into
 a nonempty or differently owned directory and should be reserved for a
 reviewed recovery case.
 
+### Transfer bandwidth budget
+
+`dt pull --bwlimit KBPS` and `dt sync --bwlimit KBPS` cap the head-side
+transfer legs (rsync `--bwlimit`, KiB/s) so a checkpoint recovery cannot
+starve interactive sessions sharing the head's uplink.
+`sites.<name>.bwlimit_kbps` sets a per-site default; the flag overrides it.
+The budget deliberately never throttles intra-site LAN replays — those are
+the legs gateway staging exists to keep fast.
+
+### Draining a node for maintenance
+
+Set `nodes[].drained: true` and the agent (which reloads the config every
+tick) stops placing new jobs there — explicit `--node` pins included —
+while running jobs finish undisturbed. `dt free` marks the node
+`(drained)`, `dt doctor` reports a `drained` check, queued jobs explain
+`drained: maintenance` instead of a misleading capacity claim, and
+`dt free --explain` never promises a drained node. Lift the flag to
+return the node to service; no state file or restart is involved.
+
 ### Gateway-staged project sync
 
 `dt sync --route auto` (the default) applies the same evidence to project

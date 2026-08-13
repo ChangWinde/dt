@@ -179,7 +179,23 @@ def _capacity_state(
         )
     free, total, unavailable, disk_free = capacity
     configured = {node.name for node in cfg.nodes}
+    drained = {node.name for node in cfg.nodes if node.drained}
     candidates = {entry.pin_node} if entry.pin_node is not None else configured
+    # Placement never uses a drained node (pick_candidates filters them,
+    # pins included), so the explanation must not promise one either.
+    if entry.pin_node is not None and entry.pin_node in drained:
+        return (
+            "waiting_node",
+            f"pinned node {entry.pin_node} is drained for maintenance",
+            f"nodes[].drained must be lifted on {entry.pin_node} or the job repinned",
+        )
+    candidates -= drained
+    if not candidates:
+        return (
+            "waiting_node",
+            "every eligible node is drained for maintenance",
+            "at least one node must have nodes[].drained lifted",
+        )
     if entry.pin_node is not None and entry.pin_node in unavailable:
         return (
             "waiting_node",

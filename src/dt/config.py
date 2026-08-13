@@ -56,6 +56,30 @@ _LOAD_CACHE: (
 ) = None
 
 
+def site_of_node(cfg: "HeadConfig", node_name: str) -> Site | None:
+    """The site a node belongs to, or None outside any site."""
+    return next(
+        (site for site in cfg.sites.values() if node_name in site.nodes),
+        None,
+    )
+
+
+def head_bwlimit_kbps(
+    cfg: "HeadConfig",
+    node_name: str,
+    override: int | None,
+) -> int | None:
+    """Effective head-side transfer budget for one counterpart node.
+
+    An explicit CLI value wins; otherwise the node's site default applies.
+    None means unthrottled, exactly today's behavior.
+    """
+    if override is not None:
+        return override
+    site = site_of_node(cfg, node_name)
+    return site.bwlimit_kbps if site is not None else None
+
+
 def config_path() -> Path:
     return Path(os.environ.get("DT_CONFIG", "~/.config/dt/config.yaml")).expanduser()
 
@@ -86,6 +110,10 @@ class Node:
     lan_port: int = 22
     artifact_seed: bool = True
     transfer_cost: float = 1.0
+    # Maintenance switch: a drained node accepts no new placements while its
+    # running jobs finish undisturbed. Config-driven because the config is
+    # the control plane and the agent reloads it every tick.
+    drained: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +131,9 @@ class Site:
     route_circuit_failures: int = 2
     route_circuit_cooldown_s: float = 60.0
     route_circuit_max_cooldown_s: float = 900.0
+    # Head-side uplink budget (KiB/s) for transfers with this site's nodes;
+    # applies to legs touching the head, never intra-site LAN replays.
+    bwlimit_kbps: int | None = None
 
 
 @dataclass
@@ -481,6 +512,7 @@ def _parse_nodes(raw: object) -> list[Node]:
                     "lan_port",
                     "artifact_seed",
                     "transfer_cost",
+                    "drained",
                 },
                 "node entry",
             )
@@ -531,6 +563,9 @@ def _parse_nodes(raw: object) -> list[Node]:
             )
             if transfer_cost < 0:
                 raise ConfigError("`nodes[].transfer_cost` must be non-negative")
+            drained = item.get("drained", False)
+            if not isinstance(drained, bool):
+                raise ConfigError("`nodes[].drained` must be true or false")
             nodes.append(
                 Node(
                     name=name,
@@ -542,6 +577,7 @@ def _parse_nodes(raw: object) -> list[Node]:
                     lan_port=lan_port,
                     artifact_seed=artifact_seed,
                     transfer_cost=transfer_cost,
+                    drained=drained,
                 )
             )
         else:
@@ -584,6 +620,7 @@ def _parse_sites(raw: object, nodes: list[Node]) -> dict[str, Site]:
                 "route_circuit_failures",
                 "route_circuit_cooldown_s",
                 "route_circuit_max_cooldown_s",
+                "bwlimit_kbps",
             },
             f"site {name!r}",
         )
@@ -688,6 +725,14 @@ def _parse_sites(raw: object, nodes: list[Node]) -> dict[str, Site]:
                 f"sites.{name}.route_circuit_max_cooldown_s must be between "
                 "the base cooldown and 86400"
             )
+        raw_bwlimit = site.get("bwlimit_kbps")
+        bwlimit_kbps: int | None = None
+        if raw_bwlimit is not None:
+            bwlimit_kbps = _integer(raw_bwlimit, f"sites.{name}.bwlimit_kbps")
+            if not 1 <= bwlimit_kbps <= 10**9:
+                raise ConfigError(
+                    f"sites.{name}.bwlimit_kbps must be between 1 and 10^9"
+                )
         if artifact_policy == "site-cache-first":
             missing_lan = [
                 member
@@ -713,6 +758,7 @@ def _parse_sites(raw: object, nodes: list[Node]) -> dict[str, Site]:
             route_circuit_failures=route_circuit_failures,
             route_circuit_cooldown_s=route_circuit_cooldown_s,
             route_circuit_max_cooldown_s=route_circuit_max_cooldown_s,
+            bwlimit_kbps=bwlimit_kbps,
         )
     unassigned = [node.name for node in nodes if node.name not in assigned]
     if unassigned:

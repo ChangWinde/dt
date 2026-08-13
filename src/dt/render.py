@@ -245,6 +245,10 @@ def free_table(rows: list[JsonRow], who: bool = False) -> Table:
         )
     for r in rows:
         target = escape(str(r["node"] if one_center else f"{r['center']}/{r['node']}"))
+        if r.get("drained"):
+            # The GPUs may probe free, but placement refuses them; showing
+            # the marker next to the name keeps the capacity view truthful.
+            target = f"[dim]{target} (drained)[/dim]"
         if r.get("error"):
             compact_issue = _compact_remote_error(r["error"])
             issue_text = compact_issue

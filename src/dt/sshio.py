@@ -948,6 +948,7 @@ def rsync(
     itemize: bool = False,
     private_destination: bool = False,
     safe_links: bool = False,
+    bwlimit_kbps: int | None = None,
     cancel_event: Event | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -956,6 +957,10 @@ def rsync(
     checkpoint pulls over flaky links)."""
     if isinstance(retries, bool) or not 0 <= retries <= MAX_TRANSFER_RETRIES:
         raise ValueError(f"rsync retries must be between 0 and {MAX_TRANSFER_RETRIES}")
+    if bwlimit_kbps is not None and (
+        isinstance(bwlimit_kbps, bool) or bwlimit_kbps <= 0
+    ):
+        raise ValueError("rsync bwlimit_kbps must be a positive integer")
     # --timeout is rsync's own io-stall detector: a NAT link that freezes
     # mid-stream aborts in 60s instead of hanging the dispatcher forever
     # (--partial + retries then resumes where it stopped)
@@ -969,6 +974,10 @@ def rsync(
     ]
     if stats:
         cmd.append("--stats")
+    if bwlimit_kbps is not None:
+        # The caller's uplink budget: dt applies it to legs that touch the
+        # head (the constrained WAN hop), never to intra-site LAN replays.
+        cmd.append(f"--bwlimit={bwlimit_kbps}")
     if checksum:
         cmd.append("--checksum")
     if dry_run:
