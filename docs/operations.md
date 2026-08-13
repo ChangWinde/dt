@@ -175,6 +175,18 @@ scope the dry run with `dt topology --site SITE --source NODE --json` or
 intentional. The hard ceiling is 4,096 edges, and discovery still performs no
 Artifact transfer or subnet scan.
 
+`dt topology` also classifies every head-to-node control route: `relayed`
+means the operator SSH route enters a local tunnel endpoint (frp, autossh,
+`ssh -L`) whose bandwidth bulk data would inherit, `proxied` means a jump
+host, `direct` means the node observed the head's own address, and `opaque`
+means NAT or an unknown middlebox. `dt doctor` repeats the warning per node.
+When a relayed node needs bulk traffic, join it to a site or pin
+`lan_address` so transfers leave the tunnel. `dt topology --measure` streams
+a bounded payload over every healthy site edge and control route and records
+MiB/s; completed transfers keep those numbers fresh automatically, and route
+ranking prefers measured-faster edges (half-decade buckets, unmeasured edges
+stay optimistic until first use).
+
 Read-only topology and GPU telemetry probes may retry once through a fresh,
 non-multiplexed DT overlay when stderr proves a stale ControlMaster. The retry
 shares the original deadline and bypasses both final-target and implicit

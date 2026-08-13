@@ -22,10 +22,18 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from threading import Lock
+from typing import Callable
 
 from .config import HeadConfig, Node, Site
 from .jobs import list_all
 from .layout import node_path, node_path_expression
+from .link_metrics import (
+    MIN_SAMPLE_SECONDS,
+    LinkMetricsError,
+    LinkSample,
+    PersistentLinkMetrics,
+    site_link_scope,
+)
 from .route_health import (
     PersistentRouteHealth,
     RouteCircuitDecision,
@@ -51,6 +59,12 @@ ADVERTISEMENT_MAX_HOST_KEYS = 32
 ADVERTISEMENT_MAX_HOST_KEY_TEXT = 16 * 1024
 DEFAULT_TOPOLOGY_EDGE_LIMIT = 256
 MAX_TOPOLOGY_EDGE_LIMIT = 4096
+# Bounded two-step throughput probe (ADR 0024): small first, escalate once
+# when the link is fast enough that the small sample says little.
+BANDWIDTH_PROBE_SMALL_BYTES = 2 << 20
+BANDWIDTH_PROBE_LARGE_BYTES = 16 << 20
+BANDWIDTH_PROBE_ESCALATE_UNDER_S = 1.5
+BANDWIDTH_PROBE_TIMEOUT_S = 30.0
 _RFC1918_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
@@ -93,6 +107,11 @@ class NodeAdvertisement:
     ssh_port: int
     addresses: tuple[InterfaceAddress, ...]
     host_keys: tuple[str, ...]
+    # What the node's sshd observed about the control connection
+    # (SSH_CONNECTION client/server addresses). None on nodes running an
+    # older DT that does not report them.
+    ssh_client_address: str | None = None
+    ssh_server_address: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +138,9 @@ class DiscoveredRoute:
     endpoint: DirectEndpoint | None
     probe_latency_ms: float
     score: float
+    # Smoothed measured throughput of this edge (bytes/second) when the
+    # link-metrics store has evidence; None means never measured.
+    throughput_bps: float | None = None
 
     def artifact_source(self, site: Site) -> ArtifactSource:
         kind: SourceKind = (
@@ -250,18 +272,37 @@ print(json.dumps({
     "ssh_port": port,
     "addresses": addresses,
     "host_keys": host_keys,
+    "ssh_connection": {
+        "client": connection[0] if len(connection) >= 4 else "",
+        "server": connection[2] if len(connection) >= 4 else "",
+    },
 }, sort_keys=True))
 """
 
 
+def safe_connection_address(value: object) -> str | None:
+    """Accept one SSH_CONNECTION address as evidence, or nothing at all."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return str(ipaddress.ip_address(value.split("%", 1)[0]))
+    except (ValueError, binascii.Error):
+        return None
+
+
 def _safe_advertisement(node: Node, payload: object) -> NodeAdvertisement:
-    if not isinstance(payload, dict) or set(payload) != {
+    required = {
         "schema_version",
         "user",
         "ssh_port",
         "addresses",
         "host_keys",
-    }:
+    }
+    # ssh_connection is optional so a fleet mid-rollout (older nodes without
+    # it) keeps advertising; classification simply degrades to "opaque".
+    if not isinstance(payload, dict) or not (
+        set(payload) == required or set(payload) == required | {"ssh_connection"}
+    ):
         raise TopologyDiscoveryError(f"{node.name} returned an invalid advertisement")
     if payload.get("schema_version") != ADVERTISEMENT_SCHEMA:
         raise TopologyDiscoveryError(
@@ -341,12 +382,20 @@ def _safe_advertisement(node: Node, payload: object) -> NodeAdvertisement:
         raise TopologyDiscoveryError(
             f"{node.name} did not advertise a readable SSH host public key"
         )
+    ssh_client_address = None
+    ssh_server_address = None
+    raw_connection = payload.get("ssh_connection")
+    if isinstance(raw_connection, dict):
+        ssh_client_address = safe_connection_address(raw_connection.get("client"))
+        ssh_server_address = safe_connection_address(raw_connection.get("server"))
     return NodeAdvertisement(
         node=node.name,
         user=user,
         ssh_port=port,
         addresses=tuple(addresses),
         host_keys=tuple(sorted(set(host_keys))),
+        ssh_client_address=ssh_client_address,
+        ssh_server_address=ssh_server_address,
     )
 
 
@@ -359,6 +408,205 @@ def _interface_penalty(name: str) -> float:
     if lowered.startswith(("en", "eth", "wl", "bond", "ib")):
         return 0.0
     return 5.0
+
+
+@dataclass(frozen=True)
+class ControlRouteClass:
+    """How the head's SSH route to one node is classified (ADR 0024).
+
+    ``label`` is one of ``local``, ``direct``, ``relayed``, ``proxied``, or
+    ``opaque``. Classification is evidence for operators and ranking priors;
+    it never disqualifies the only route that works.
+    """
+
+    label: str
+    evidence: str
+
+
+def resolved_ssh_options(
+    node: Node,
+    *,
+    runner: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run,
+) -> dict[str, str]:
+    """Resolve the operator's effective SSH options for one node, locally.
+
+    ``ssh -G`` never connects; it prints the resolved client configuration.
+    Failure to resolve is not evidence of anything and returns nothing.
+    """
+    if node.local:
+        return {}
+    try:
+        proc = runner(
+            ["ssh", "-G", "--", node.name],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    options: dict[str, str] = {}
+    for line in (proc.stdout or "").splitlines()[:512]:
+        key, _, value = line.partition(" ")
+        lowered = key.lower()
+        if lowered in {"hostname", "proxycommand", "proxyjump", "port", "user"}:
+            options.setdefault(lowered, value.strip())
+    return options
+
+
+def local_interface_addresses(
+    *,
+    runner: Callable[..., "subprocess.CompletedProcess[str]"] = subprocess.run,
+) -> frozenset[str]:
+    """Best-effort set of this head's own global IPv4 addresses.
+
+    Only Linux ``ip -j`` is consulted; on other platforms the set is empty
+    and classification simply cannot prove ``direct`` (loopback and proxy
+    evidence still work, which covers the tunnel cases that matter).
+    """
+    try:
+        proc = runner(
+            ["ip", "-j", "-4", "address", "show", "scope", "global"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return frozenset()
+    if proc.returncode != 0:
+        return frozenset()
+    try:
+        interfaces = json.loads(proc.stdout or "[]")
+    except json.JSONDecodeError:
+        return frozenset()
+    found: set[str] = set()
+    if isinstance(interfaces, list):
+        for interface in interfaces:
+            if not isinstance(interface, dict):
+                continue
+            for item in interface.get("addr_info") or []:
+                if isinstance(item, dict) and isinstance(item.get("local"), str):
+                    found.add(item["local"])
+    return frozenset(found)
+
+
+def measure_control_route(
+    node: Node,
+    *,
+    probe_bytes: int,
+    runner: Callable[..., "subprocess.CompletedProcess[bytes]"] | None = None,
+) -> tuple[int, float]:
+    """Stream one bounded payload over the operator's SSH route to a node.
+
+    This measures the head-to-node upload direction - the leg snapshot
+    pushes and cold cache uploads actually pay. The result feeds the same
+    link-metrics store under the ``control`` scope.
+    """
+    from .sshio import ssh_cmd
+
+    if node.local:
+        raise TopologyDiscoveryError(
+            f"{node.name} runs on this head; its control route has no "
+            "network to measure"
+        )
+    run = runner or subprocess.run
+    argv = ssh_cmd(node.name, "cat >/dev/null", workload=SSHWorkload.ARTIFACT_RELAY)
+    started = time.monotonic()
+    try:
+        proc = run(
+            argv,
+            input=b"\0" * int(probe_bytes),
+            capture_output=True,
+            timeout=BANDWIDTH_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TopologyDiscoveryError(
+            f"control-route probe to {node.name} timed out after "
+            f"{BANDWIDTH_PROBE_TIMEOUT_S:.0f}s"
+        ) from exc
+    except OSError as exc:
+        raise TopologyDiscoveryError(
+            f"control-route probe to {node.name} could not start ({type(exc).__name__})"
+        ) from exc
+    elapsed = time.monotonic() - started
+    if proc.returncode != 0:
+        raise TopologyDiscoveryError(
+            f"control-route probe to {node.name} failed (exit {proc.returncode})"
+        )
+    return int(probe_bytes), max(0.05, elapsed)
+
+
+def classify_control_route(
+    node: Node,
+    *,
+    client_address: str | None,
+    server_address: str | None,
+    ssh_options: dict[str, str] | None,
+    head_addresses: frozenset[str],
+) -> ControlRouteClass:
+    """Classify one head-to-node SSH route from unambiguous evidence only.
+
+    - a loopback dial target or a loopback client seen by the node's sshd
+      means the route enters a local tunnel endpoint (frp, autossh, ssh -L);
+    - a configured ProxyJump/ProxyCommand means a deliberate intermediary;
+    - the node seeing one of the head's own addresses proves a direct path;
+    - anything else stays ``opaque`` (NAT or unknown middlebox), because an
+      opaque route is not proof of low bandwidth.
+    """
+    if node.local:
+        return ControlRouteClass("local", "node runs on this head")
+    options = ssh_options or {}
+    hostname = options.get("hostname", "")
+    if hostname:
+        loopback_dial = hostname.lower() == "localhost"
+        if not loopback_dial:
+            try:
+                loopback_dial = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                loopback_dial = False
+        if loopback_dial:
+            return ControlRouteClass(
+                "relayed",
+                "ssh dials a loopback endpoint: a local tunnel "
+                "(frp/autossh/ssh -L) carries this route",
+            )
+    if options.get("proxycommand", "none") not in {"", "none"} or options.get(
+        "proxyjump", "none"
+    ) not in {"", "none"}:
+        return ControlRouteClass(
+            "proxied",
+            "ssh config routes this node through a jump host or proxy command",
+        )
+    client = client_address
+    server = server_address
+    for observed in (client, server):
+        if observed is None:
+            continue
+        try:
+            if ipaddress.ip_address(observed).is_loopback:
+                return ControlRouteClass(
+                    "relayed",
+                    "the node's sshd saw a loopback peer: the connection "
+                    "enters through a local tunnel endpoint",
+                )
+        except ValueError:
+            continue
+    if client is not None and client in head_addresses:
+        return ControlRouteClass(
+            "direct",
+            "the node's sshd saw this head's own address",
+        )
+    if client is None:
+        return ControlRouteClass(
+            "opaque",
+            "node did not report the peer its sshd observed "
+            "(older DT or stripped environment)",
+        )
+    return ControlRouteClass(
+        "opaque",
+        "an unidentified middlebox (NAT or relay) sits between head and node",
+    )
 
 
 def _job_code_dir(job_dir: str) -> str:
@@ -384,10 +632,13 @@ class TopologyDiscovery:
         cfg: HeadConfig,
         topology: TopologyRegistry,
         route_health: RouteHealth | None = None,
+        *,
+        link_metrics: PersistentLinkMetrics | None = None,
     ):
         self.cfg = cfg
         self.topology = topology
         self.route_health = route_health or PersistentRouteHealth(cfg)
+        self.link_metrics = link_metrics or PersistentLinkMetrics(cfg)
         self._advertisement_lock = Lock()
         self._advertisements: dict[str, Future[NodeAdvertisement]] = {}
         self._route_lock = Lock()
@@ -725,6 +976,111 @@ class TopologyDiscovery:
         )
         return False, latency_ms, kind
 
+    def _timed_stream(
+        self,
+        source: Node,
+        destination_name: str,
+        endpoint: DirectEndpoint,
+        size: int,
+        latency_ms: float,
+    ) -> tuple[int, float]:
+        """Stream one bounded zero payload over the pinned direct channel."""
+        setup, inner = self.inner_ssh(endpoint)
+        command = (
+            f"{setup}head -c {int(size)} /dev/zero | "
+            f"{inner} -- {shlex.quote(endpoint.destination)} 'cat >/dev/null'"
+        )
+        started = time.monotonic()
+        try:
+            proc = run_on(
+                source.name,
+                source.local,
+                command,
+                timeout=BANDWIDTH_PROBE_TIMEOUT_S,
+                workload=SSHWorkload.ARTIFACT_RELAY,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TopologyDiscoveryError(
+                f"bandwidth probe {source.name} -> {destination_name} timed "
+                f"out after {BANDWIDTH_PROBE_TIMEOUT_S:.0f}s"
+            ) from exc
+        except (RemoteError, OSError) as exc:
+            raise TopologyDiscoveryError(
+                f"bandwidth probe {source.name} -> {destination_name} failed "
+                f"({type(exc).__name__})"
+            ) from exc
+        elapsed = time.monotonic() - started
+        if proc.returncode != 0:
+            kind = classify_rsync_failure(
+                proc.returncode,
+                proc.stdout or "",
+                proc.stderr or "",
+            )
+            raise TopologyDiscoveryError(
+                f"bandwidth probe {source.name} -> {destination_name} failed ({kind})"
+            )
+        # The control probe already paid the connection setup; subtract it so
+        # short streams on fast LANs are not dominated by handshake time.
+        return int(size), max(0.05, elapsed - latency_ms / 1000.0)
+
+    def measure_route(self, source: Node, destination: Node) -> LinkSample:
+        """Actively measure one site edge and fold it into the edge memory.
+
+        Two-step adaptive: a small stream first; when the link finishes it
+        quickly, one larger stream makes the sample meaningful. A very fast
+        edge whose large stream still completes under the minimum sample
+        window records a floored lower bound - "at least this fast" is enough
+        for bucketed ranking.
+        """
+        site = self.topology.site_for(source)
+        if site is None or self.topology.site_for(destination) != site:
+            raise TopologyDiscoveryError(
+                f"measured edge {source.name} -> {destination.name} is not in one site"
+            )
+        endpoint, healthy, latency_ms, kind = self._direct_route_probe(
+            source,
+            destination,
+        )
+        if not healthy:
+            raise TopologyDiscoveryError(
+                f"direct route {source.name} -> {destination.name} failed ({kind})"
+            )
+        moved, elapsed = self._timed_stream(
+            source,
+            destination.name,
+            endpoint,
+            BANDWIDTH_PROBE_SMALL_BYTES,
+            latency_ms,
+        )
+        if elapsed < BANDWIDTH_PROBE_ESCALATE_UNDER_S:
+            moved, elapsed = self._timed_stream(
+                source,
+                destination.name,
+                endpoint,
+                BANDWIDTH_PROBE_LARGE_BYTES,
+                latency_ms,
+            )
+        try:
+            sample = self.link_metrics.record(
+                site_link_scope(site),
+                source.name,
+                destination.name,
+                transferred_bytes=moved,
+                elapsed_seconds=max(elapsed, MIN_SAMPLE_SECONDS),
+                origin="probe",
+            )
+        except LinkMetricsError as exc:
+            raise TopologyDiscoveryError(
+                f"bandwidth sample for {source.name} -> {destination.name} "
+                f"could not be recorded: {exc}"
+            ) from exc
+        if sample is None:
+            raise TopologyDiscoveryError(
+                f"bandwidth probe {source.name} -> {destination.name} "
+                "produced no usable sample"
+            )
+        return sample
+
     def _direct_route_probe(
         self,
         source: Node,
@@ -935,7 +1291,28 @@ class TopologyDiscovery:
             endpoint=endpoint,
             probe_latency_ms=latency_ms,
             score=score,
+            throughput_bps=self.edge_throughput_bps(replica.node, destination),
         )
+
+    def edge_throughput_bps(self, source: Node, destination: Node) -> float | None:
+        """Smoothed measured rate for one site edge, or None when unknown.
+
+        Throughput memory is an efficiency signal only: damaged or missing
+        metrics degrade to "unmeasured" and must never fail a route that
+        host-key pinning and digest verification already protect.
+        """
+        site = self.topology.site_for(source)
+        if site is None or self.topology.site_for(destination) != site:
+            return None
+        try:
+            sample = self.link_metrics.sample(
+                site_link_scope(site),
+                source.name,
+                destination.name,
+            )
+        except LinkMetricsError:
+            return None
+        return None if sample is None else sample.smoothed_bps
 
     def discover_edges(
         self,

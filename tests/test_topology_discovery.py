@@ -874,3 +874,212 @@ def test_known_hosts_setup_uses_unpredictable_private_temporary(tmp_path):
     assert target.stat().st_mode & 0o777 == 0o600
     assert list(target.parent.glob(f"{target.name}.tmp.*")) == []
     assert ".tmp.$$" not in setup
+
+
+def test_advertisement_reports_and_validates_ssh_connection(tmp_path, monkeypatch):
+    # ADR 0024: the node reports the peer its sshd observed so the head can
+    # classify the control route. Older nodes without the field, and garbage
+    # values, degrade to None instead of failing the advertisement.
+    import dt.topology_discovery as module
+
+    cfg = _cfg(tmp_path)
+    payload = json.loads(_advertisement("worker", "10.0.0.5"))
+    payload["ssh_connection"] = {"client": "127.0.0.1", "server": "10.0.0.5"}
+
+    def fake_run_on(node, local, command, **kwargs):
+        return subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
+    advertisement = TopologyDiscovery(cfg, TopologyRegistry(cfg)).advertise(
+        cfg.nodes[2]
+    )
+
+    assert advertisement.ssh_client_address == "127.0.0.1"
+    assert advertisement.ssh_server_address == "10.0.0.5"
+
+    assert '"ssh_connection"' in _ADVERTISEMENT_SCRIPT
+
+    legacy = json.loads(_advertisement("worker", "10.0.0.5"))
+
+    def legacy_run_on(node, local, command, **kwargs):
+        return subprocess.CompletedProcess([], 0, json.dumps(legacy), "")
+
+    monkeypatch.setattr(module, "run_on", legacy_run_on)
+    older = TopologyDiscovery(cfg, TopologyRegistry(cfg)).advertise(cfg.nodes[2])
+    assert older.ssh_client_address is None
+    assert older.ssh_server_address is None
+
+    poisoned = dict(payload)
+    poisoned["ssh_connection"] = {"client": "not-an-ip; rm -rf /", "server": 7}
+
+    def poisoned_run_on(node, local, command, **kwargs):
+        return subprocess.CompletedProcess([], 0, json.dumps(poisoned), "")
+
+    monkeypatch.setattr(module, "run_on", poisoned_run_on)
+    unsafe = TopologyDiscovery(cfg, TopologyRegistry(cfg)).advertise(cfg.nodes[2])
+    assert unsafe.ssh_client_address is None
+    assert unsafe.ssh_server_address is None
+
+
+def test_classify_control_route_identifies_tunnels_and_direct_paths(tmp_path):
+    from dt.topology_discovery import classify_control_route
+
+    node = Node(name="worker-1")
+    local_node = Node(name="here", local=True)
+    head = frozenset({"192.168.1.10"})
+
+    assert (
+        classify_control_route(
+            local_node,
+            client_address=None,
+            server_address=None,
+            ssh_options={},
+            head_addresses=head,
+        ).label
+        == "local"
+    )
+    # frp/autossh local forward: ssh dials 127.0.0.1:NNNN.
+    relayed_dial = classify_control_route(
+        node,
+        client_address=None,
+        server_address=None,
+        ssh_options={"hostname": "127.0.0.1", "port": "6022"},
+        head_addresses=head,
+    )
+    assert relayed_dial.label == "relayed"
+    assert "tunnel" in relayed_dial.evidence
+    # frp server-side: the node's sshd sees a loopback peer.
+    relayed_peer = classify_control_route(
+        node,
+        client_address="127.0.0.1",
+        server_address=None,
+        ssh_options={"hostname": "worker-1"},
+        head_addresses=head,
+    )
+    assert relayed_peer.label == "relayed"
+    assert (
+        classify_control_route(
+            node,
+            client_address=None,
+            server_address=None,
+            ssh_options={"hostname": "worker-1", "proxyjump": "bastion"},
+            head_addresses=head,
+        ).label
+        == "proxied"
+    )
+    assert (
+        classify_control_route(
+            node,
+            client_address="192.168.1.10",
+            server_address="192.168.1.77",
+            ssh_options={"hostname": "worker-1"},
+            head_addresses=head,
+        ).label
+        == "direct"
+    )
+    # NAT or unknown middlebox: real evidence is absent, stay opaque.
+    opaque = classify_control_route(
+        node,
+        client_address="203.0.113.9",
+        server_address="192.168.1.77",
+        ssh_options={"hostname": "worker-1"},
+        head_addresses=head,
+    )
+    assert opaque.label == "opaque"
+    assert (
+        classify_control_route(
+            node,
+            client_address=None,
+            server_address=None,
+            ssh_options={},
+            head_addresses=head,
+        ).label
+        == "opaque"
+    )
+
+
+def test_route_attaches_measured_throughput(tmp_path, monkeypatch):
+    # The ranking consumes the smoothed sample recorded for the exact edge.
+    from dt.link_metrics import PersistentLinkMetrics, site_link_scope
+
+    cfg = _cfg(tmp_path)
+    store = PersistentLinkMetrics(cfg)
+    store.record(
+        site_link_scope(cfg.sites["psibot"]),
+        "psibot-ys",
+        "psibot-ds",
+        transferred_bytes=64 << 20,
+        elapsed_seconds=1.0,
+    )
+    discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg), link_metrics=store)
+
+    assert discovery.edge_throughput_bps(cfg.nodes[2], cfg.nodes[3]) == pytest.approx(
+        64 * (1 << 20)
+    )
+    # An edge without evidence stays unmeasured rather than guessed.
+    assert discovery.edge_throughput_bps(cfg.nodes[3], cfg.nodes[2]) is None
+    # Cross-site pairs are never scored from site metrics.
+    assert discovery.edge_throughput_bps(cfg.nodes[0], cfg.nodes[2]) is None
+
+
+def test_measure_route_streams_and_records_a_probe_sample(tmp_path, monkeypatch):
+    import dt.topology_discovery as module
+
+    cfg = _cfg(tmp_path)
+    streams = []
+
+    def fake_run_on(node, local, command, **kwargs):
+        if "python3 -c" in command:
+            return subprocess.CompletedProcess(
+                [], 0, _advertisement("worker", "10.0.0.7"), ""
+            )
+        if "head -c" in command:
+            streams.append(command)
+            time.sleep(0.06)
+            return subprocess.CompletedProcess([], 0, "", "")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
+    discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
+
+    sample = discovery.measure_route(cfg.nodes[2], cfg.nodes[3])
+
+    # Fast small stream escalates once to the larger payload.
+    assert len(streams) == 2
+    assert f"head -c {module.BANDWIDTH_PROBE_SMALL_BYTES}" in streams[0]
+    assert f"head -c {module.BANDWIDTH_PROBE_LARGE_BYTES}" in streams[1]
+    assert "cat >/dev/null" in streams[1]
+    assert sample.origin == "probe"
+    assert sample.smoothed_bps > 0
+    stored = discovery.link_metrics.sample("site:psibot", "psibot-ys", "psibot-ds")
+    assert stored is not None and stored.origin == "probe"
+
+
+def test_measure_control_route_uses_operator_ssh_route(tmp_path):
+    from dt.topology_discovery import measure_control_route
+
+    calls = {}
+
+    def fake_runner(argv, **kwargs):
+        calls["argv"] = argv
+        calls["size"] = len(kwargs.get("input") or b"")
+        time.sleep(0.06)
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    moved, elapsed = measure_control_route(
+        Node(name="worker-1"),
+        probe_bytes=2 << 20,
+        runner=fake_runner,
+    )
+
+    assert moved == 2 << 20
+    assert calls["size"] == 2 << 20
+    assert "worker-1" in calls["argv"]
+    assert elapsed >= 0.05
+
+    with pytest.raises(TopologyDiscoveryError, match="no network|no\\s+network"):
+        measure_control_route(
+            Node(name="here", local=True),
+            probe_bytes=1 << 20,
+            runner=fake_runner,
+        )

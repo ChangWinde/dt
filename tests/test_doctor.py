@@ -188,6 +188,67 @@ def test_check_node_redacts_remote_ssh_failure_detail(monkeypatch):
     )
 
 
+def test_annotate_control_route_classes_flags_tunnels_and_redacts_peers(
+    tmp_path, monkeypatch
+):
+    # ADR 0024: a relayed operator route is exactly where bulk data silently
+    # crawls; doctor says so, and the raw observed peer addresses never
+    # reach the shareable rows.
+    import dt.topology_discovery as discovery_module
+
+    cfg = _cfg(
+        tmp_path,
+        nodes=[
+            Node(name="head", local=True),
+            Node(name="tunneled"),
+            Node(name="lan-node"),
+            Node(name="down"),
+        ],
+    )
+    rows = [
+        {"node": "head", "checks": {"ssh": "ok"}, "unreachable": False},
+        {
+            "node": "tunneled",
+            "checks": {"ssh": "ok", "peer": "127.0.0.1", "peer_server": ""},
+            "unreachable": False,
+        },
+        {
+            "node": "lan-node",
+            "checks": {"ssh": "ok", "peer": "192.168.1.10", "peer_server": ""},
+            "unreachable": False,
+        },
+        {
+            "node": "down",
+            "checks": {"ssh": "fail: timeout", "peer": "10.0.0.9"},
+            "unreachable": True,
+        },
+    ]
+    monkeypatch.setattr(
+        discovery_module,
+        "local_interface_addresses",
+        lambda **kwargs: frozenset({"192.168.1.10"}),
+    )
+    monkeypatch.setattr(
+        discovery_module,
+        "resolved_ssh_options",
+        lambda node, **kwargs: {"hostname": node.name},
+    )
+
+    doctor.annotate_control_route_classes(cfg, rows)
+
+    checks = {row["node"]: row["checks"] for row in rows}
+    assert checks["head"]["link"] == "local"
+    assert checks["tunneled"]["link"].startswith("relayed")
+    assert "tunnel" in checks["tunneled"]["link"]
+    assert checks["lan-node"]["link"] == "direct"
+    assert "link" not in checks["down"]
+    for row_checks in checks.values():
+        assert "peer" not in row_checks
+        assert "peer_server" not in row_checks
+        assert "127.0.0.1" not in str(row_checks.get("link", ""))
+    assert "DT_PEER=" in doctor.CHECK_SNIPPET
+
+
 def test_doctor_center_reduces_addresses_to_a_count(tmp_path, monkeypatch):
     # A31-2: the raw interface inventory exists only to compute the lan
     # verdict; the JSON view gets a count, not the internal address list.

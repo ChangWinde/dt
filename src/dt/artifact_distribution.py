@@ -21,6 +21,13 @@ from uuid import uuid4
 from . import snapshot_hash as snapshot_hash_mod
 from .config import HeadConfig, Node, Site
 from .layout import node_path, node_path_expression, rsync_destination
+from .link_metrics import (
+    CONTROL_LINK_SCOPE,
+    LinkMetricsError,
+    PersistentLinkMetrics,
+    site_link_scope,
+    throughput_bucket,
+)
 from .private_state import openat_create_retry
 from .sshio import (
     BULK_TRANSFER_TIMEOUT_S,
@@ -46,6 +53,20 @@ from .topology_discovery import (
 _TRANSFERRED_RE = re.compile(r"Total transferred file size: ([\d,.]+) bytes")
 _FILES_RE = re.compile(r"Number of regular files transferred: ([\d,]+)")
 _TRANSFER_LOG_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _route_order_key(route: DiscoveredRoute) -> tuple[int, float, float]:
+    """Measured capacity ranks first, the static score breaks ties.
+
+    Half-decade throughput buckets stop near-equal edges from flapping, and
+    an unmeasured edge ranks optimistically so it gets tried, measured, and
+    settled into its true bucket (ADR 0024).
+    """
+    return (
+        throughput_bucket(route.throughput_bps),
+        route.score,
+        -route.replica.recorded_at,
+    )
 
 
 class DistributionError(RuntimeError):
@@ -374,7 +395,36 @@ class TransferExecutor:
         self.topology = TopologyRegistry(cfg)
         self.planner = TransferPlanner(self.topology)
         self.verifier = ArtifactVerifier()
-        self.discovery = TopologyDiscovery(cfg, self.topology)
+        self.link_metrics = PersistentLinkMetrics(cfg)
+        self.discovery = TopologyDiscovery(
+            cfg,
+            self.topology,
+            link_metrics=self.link_metrics,
+        )
+
+    def _record_link_sample(
+        self,
+        scope: str,
+        source: str,
+        destination: str,
+        transferred_bytes: int,
+        elapsed_seconds: float,
+    ) -> None:
+        """Fold one completed bulk transfer into the edge's throughput memory.
+
+        Efficiency-only state: a failure to remember a sample must never fail
+        the transfer that produced it (ADR 0024).
+        """
+        try:
+            self.link_metrics.record(
+                scope,
+                source,
+                destination,
+                transferred_bytes=transferred_bytes,
+                elapsed_seconds=elapsed_seconds,
+            )
+        except LinkMetricsError:
+            pass
 
     def _verified_transfer(
         self,
@@ -511,6 +561,7 @@ class TransferExecutor:
             )
 
         def transfer(checksum: bool) -> tuple[int, int | None]:
+            transfer_started = time.monotonic()
             proc = rsync(
                 f"{source}/",
                 rsync_destination(
@@ -535,10 +586,15 @@ class TransferExecutor:
                 raise DistributionError(
                     f"cross-site cache transfer to {cache_node.name} failed: {detail}"
                 )
-            return (
-                _stat_total(_TRANSFERRED_RE, proc.stdout) or 0,
-                _stat_total(_FILES_RE, proc.stdout),
+            moved = _stat_total(_TRANSFERRED_RE, proc.stdout) or 0
+            self._record_link_sample(
+                CONTROL_LINK_SCOPE,
+                "head",
+                cache_node.name,
+                moved,
+                time.monotonic() - transfer_started,
             )
+            return moved, _stat_total(_FILES_RE, proc.stdout)
 
         transferred = self._verified_transfer(
             transfer,
@@ -681,6 +737,7 @@ class TransferExecutor:
 
         last: subprocess.CompletedProcess[str] | None = None
         for attempt in range(3):
+            attempt_started = time.monotonic()
             try:
                 last = run_on(
                     cache_node.name,
@@ -695,10 +752,16 @@ class TransferExecutor:
                     f"failed ({type(exc).__name__})"
                 ) from exc
             if last.returncode == 0:
-                return (
-                    _stat_total(_TRANSFERRED_RE, last.stdout) or 0,
-                    _stat_total(_FILES_RE, last.stdout),
-                )
+                moved = _stat_total(_TRANSFERRED_RE, last.stdout) or 0
+                if destination.name != cache_node.name:
+                    self._record_link_sample(
+                        site_link_scope(site),
+                        cache_node.name,
+                        destination.name,
+                        moved,
+                        time.monotonic() - attempt_started,
+                    )
+                return moved, _stat_total(_FILES_RE, last.stdout)
             if attempt < 2 and rsync_failure_retryable(
                 last.returncode,
                 last.stdout or "",
@@ -756,7 +819,7 @@ class TransferExecutor:
                 elif issue is not None:
                     replica = futures[future]
                     log(f"topology candidate {replica.node.name} unavailable: {issue}")
-        routes.sort(key=lambda route: (route.score, -route.replica.recorded_at))
+        routes.sort(key=_route_order_key)
         return routes, present
 
     def _p2p_transfer(
@@ -818,6 +881,7 @@ class TransferExecutor:
 
         last: subprocess.CompletedProcess[str] | None = None
         for attempt in range(3):
+            attempt_started = time.monotonic()
             try:
                 last = run_on(
                     source_node.name,
@@ -857,10 +921,17 @@ class TransferExecutor:
                 )
                 raise error from exc
             if last.returncode == 0:
-                return (
-                    _stat_total(_TRANSFERRED_RE, last.stdout) or 0,
-                    _stat_total(_FILES_RE, last.stdout),
-                )
+                moved = _stat_total(_TRANSFERRED_RE, last.stdout) or 0
+                site = self.topology.site_for(source_node)
+                if site is not None and source_node.name != destination.name:
+                    self._record_link_sample(
+                        site_link_scope(site),
+                        source_node.name,
+                        destination.name,
+                        moved,
+                        time.monotonic() - attempt_started,
+                    )
+                return moved, _stat_total(_FILES_RE, last.stdout)
             if attempt < 2 and rsync_failure_retryable(
                 last.returncode,
                 last.stdout or "",
@@ -1179,6 +1250,7 @@ class TransferExecutor:
         log: Callable[[str], None] = lambda message: None,
     ) -> DistributionResult:
         def transfer(checksum: bool) -> tuple[int, int | None]:
+            transfer_started = time.monotonic()
             proc = rsync(
                 f"{source}/",
                 rsync_destination(
@@ -1205,10 +1277,15 @@ class TransferExecutor:
                 raise DistributionError(
                     f"explicit direct fallback to {destination.name} failed: {detail}"
                 )
-            return (
-                _stat_total(_TRANSFERRED_RE, proc.stdout) or 0,
-                _stat_total(_FILES_RE, proc.stdout),
+            moved = _stat_total(_TRANSFERRED_RE, proc.stdout) or 0
+            self._record_link_sample(
+                CONTROL_LINK_SCOPE,
+                "head",
+                destination.name,
+                moved,
+                time.monotonic() - transfer_started,
             )
+            return moved, _stat_total(_FILES_RE, proc.stdout)
 
         transferred_bytes, transferred_files = self._verified_transfer(
             transfer,

@@ -14832,6 +14832,14 @@ def topology(
         max=4096,
         help="explicit upper bound on active directed-edge probes",
     ),
+    measure: bool = typer.Option(
+        False,
+        "--measure",
+        help=(
+            "also stream a bounded payload over every healthy edge and "
+            "control route to measure real throughput (recorded for ranking)"
+        ),
+    ),
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
     """Discover direct node-to-node data edges without transferring artifacts."""
@@ -14847,6 +14855,8 @@ def topology(
             argv += ["--destination", destination]
         if max_edges != 256:
             argv += ["--max-edges", str(max_edges)]
+        if measure:
+            argv.append("--measure")
         if json_:
             argv.append("--json")
         raise typer.Exit(forward_call(head, argv, tty=False))
@@ -14866,10 +14876,36 @@ def topology(
             json_=json_,
         )
 
+    from .link_metrics import (
+        CONTROL_LINK_SCOPE,
+        LinkMetricsError,
+        site_link_scope,
+    )
     from .topology import TopologyRegistry
-    from .topology_discovery import TopologyDiscovery, TopologyDiscoveryError
+    from .topology_discovery import (
+        TopologyDiscovery,
+        TopologyDiscoveryError,
+        classify_control_route,
+        local_interface_addresses,
+        measure_control_route,
+        resolved_ssh_options,
+    )
 
     discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
+
+    def edge_sample(scope: str, edge_source: str, edge_destination: str) -> JsonDict:
+        try:
+            sample = discovery.link_metrics.sample(scope, edge_source, edge_destination)
+        except LinkMetricsError:
+            return {}
+        if sample is None:
+            return {}
+        return {
+            "throughput_mib_s": round(sample.smoothed_bps / (1 << 20), 2),
+            "throughput_origin": sample.origin,
+            "throughput_age_s": round(sample.age_s(), 1),
+        }
+
     selected = [cfg.sites[site]] if site is not None else list(cfg.sites.values())
     if source is not None or destination is not None:
         selected = [
@@ -14906,9 +14942,34 @@ def topology(
                 exit_code=1,
                 json_=json_,
             )
-        edges = [asdict(edge) for edge in discovered]
-        direct_edges += sum(edge["status"] == "direct" for edge in edges)
-        unavailable_edges += sum(edge["status"] != "direct" for edge in edges)
+        if measure:
+            registry = discovery.topology
+            for probe_edge in discovered:
+                if probe_edge.status != "direct":
+                    continue
+                try:
+                    discovery.measure_route(
+                        registry.node(probe_edge.source),
+                        registry.node(probe_edge.destination),
+                    )
+                except TopologyDiscoveryError as exc:
+                    err.print(
+                        f"[yellow]measure {escape(probe_edge.source)} → "
+                        f"{escape(probe_edge.destination)}: "
+                        f"{escape(str(exc))}[/yellow]"
+                    )
+        edges = [asdict(discovered_edge) for discovered_edge in discovered]
+        for edge_row in edges:
+            if edge_row["status"] == "direct":
+                edge_row.update(
+                    edge_sample(
+                        site_link_scope(configured_site),
+                        str(edge_row["source"]),
+                        str(edge_row["destination"]),
+                    )
+                )
+        direct_edges += sum(edge_row["status"] == "direct" for edge_row in edges)
+        unavailable_edges += sum(edge_row["status"] != "direct" for edge_row in edges)
         site_rows.append(
             {
                 "site": configured_site.name,
@@ -14924,10 +14985,92 @@ def topology(
                 "edges": edges,
             }
         )
+    # Control routes: how the head itself reaches each node. This is where a
+    # low-bandwidth frp/jump tunnel hides; classify it from evidence and show
+    # any measured throughput so operators know what bulk data would ride.
+    control_scope = (
+        [name for configured_site in selected for name in configured_site.nodes]
+        if site is not None
+        else [node.name for node in cfg.nodes]
+    )
+    head_addresses = local_interface_addresses()
+    control_rows: list[JsonDict] = []
+    seen_control: set[str] = set()
+    for name in control_scope:
+        if name in seen_control:
+            continue
+        seen_control.add(name)
+        node = next((item for item in cfg.nodes if item.name == name), None)
+        if node is None:
+            continue
+        client_address = None
+        server_address = None
+        if not node.local:
+            try:
+                advertisement = discovery.advertise(node)
+                client_address = advertisement.ssh_client_address
+                server_address = advertisement.ssh_server_address
+            except TopologyDiscoveryError as exc:
+                control_rows.append(
+                    {
+                        "node": node.name,
+                        "link_class": "unreachable",
+                        "evidence": str(exc),
+                    }
+                )
+                continue
+        route_class = classify_control_route(
+            node,
+            client_address=client_address,
+            server_address=server_address,
+            ssh_options=resolved_ssh_options(node),
+            head_addresses=head_addresses,
+        )
+        row: JsonDict = {
+            "node": node.name,
+            "link_class": route_class.label,
+            "evidence": route_class.evidence,
+        }
+        if measure and not node.local:
+            from .topology_discovery import (
+                BANDWIDTH_PROBE_ESCALATE_UNDER_S,
+                BANDWIDTH_PROBE_LARGE_BYTES,
+                BANDWIDTH_PROBE_SMALL_BYTES,
+            )
+            from .link_metrics import MIN_SAMPLE_SECONDS
+
+            try:
+                moved, elapsed = measure_control_route(
+                    node,
+                    probe_bytes=BANDWIDTH_PROBE_SMALL_BYTES,
+                )
+                if elapsed < BANDWIDTH_PROBE_ESCALATE_UNDER_S:
+                    moved, elapsed = measure_control_route(
+                        node,
+                        probe_bytes=BANDWIDTH_PROBE_LARGE_BYTES,
+                    )
+                discovery.link_metrics.record(
+                    CONTROL_LINK_SCOPE,
+                    "head",
+                    node.name,
+                    transferred_bytes=moved,
+                    elapsed_seconds=max(elapsed, MIN_SAMPLE_SECONDS),
+                    origin="probe",
+                )
+            except (TopologyDiscoveryError, LinkMetricsError) as exc:
+                err.print(
+                    f"[yellow]measure head → {escape(node.name)}: "
+                    f"{escape(str(exc))}[/yellow]"
+                )
+        if not node.local:
+            row.update(edge_sample(CONTROL_LINK_SCOPE, "head", node.name))
+        control_rows.append(row)
+
     payload: JsonDict = {
         "schema_version": "dt_topology_v1",
         "center": cfg.center,
         "sites": site_rows,
+        "control_routes": control_rows,
         "summary": {
             "sites": len(site_rows),
             "edge_limit": max_edges,
@@ -14938,9 +15081,23 @@ def topology(
     if json_:
         print(json.dumps(payload))
         return
+
+    def throughput_suffix(row: JsonDict) -> str:
+        rate = row.get("throughput_mib_s")
+        if rate is None:
+            return ""
+        age = float(row.get("throughput_age_s") or 0.0)
+        if age < 90:
+            age_text = "now"
+        elif age < 5400:
+            age_text = f"{age / 60:.0f}m ago"
+        else:
+            age_text = f"{age / 3600:.1f}h ago"
+        origin = escape(str(row.get("throughput_origin") or "transfer"))
+        return f"  {float(rate):.1f} MiB/s [dim]({origin}, {age_text})[/dim]"
+
     if not site_rows:
         out.print("[dim]No sites configured; artifact routing is direct.[/dim]")
-        return
     for site_row in site_rows:
         out.print(
             f"[bold]{escape(str(site_row['site']))}[/bold] · "
@@ -14961,6 +15118,7 @@ def topology(
                 out.print(
                     f"  [green]direct[/green] {source} → {destination}  "
                     f"{latency:.1f}ms  {endpoint}  [dim]{origin}[/dim]"
+                    f"{throughput_suffix(edge)}"
                 )
             else:
                 kind = escape(str(edge["error_kind"] or "unavailable"))
@@ -14968,6 +15126,25 @@ def topology(
                     f"  [yellow]unavailable[/yellow] {source} → "
                     f"{destination}  [dim]{kind}[/dim]"
                 )
+    if control_rows:
+        out.print("[bold]control routes[/bold] · head → node (operator SSH)")
+        style_by_class = {
+            "local": "dim",
+            "direct": "green",
+            "opaque": "yellow",
+            "proxied": "magenta",
+            "relayed": "red",
+            "unreachable": "red",
+        }
+        for row in control_rows:
+            label = str(row.get("link_class") or "opaque")
+            style = style_by_class.get(label, "yellow")
+            out.print(
+                f"  [{style}]{escape(label)}[/{style}] head → "
+                f"{escape(str(row.get('node')))}"
+                f"{throughput_suffix(row)}  "
+                f"[dim]{escape(str(row.get('evidence') or ''))}[/dim]"
+            )
 
 
 def doctor(json_: bool = typer.Option(False, "--json")) -> None:

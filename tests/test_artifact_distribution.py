@@ -692,6 +692,74 @@ def test_explicit_direct_fallback_reacquires_destination_lock(tmp_path, monkeypa
     assert result.queue_seconds == 0.25
 
 
+def test_route_order_prefers_measured_capacity_then_static_score():
+    # ADR 0024: measured buckets rank first; unmeasured edges stay
+    # optimistic so they get tried and learned; proven tunnel-grade sinks.
+    from dt.artifact_distribution import _route_order_key
+
+    def _route(score, recorded_at, throughput_bps):
+        replica = ArtifactReplica(
+            kind="peer",
+            node=Node(name=f"n-{score}"),
+            code_dir="dt/jobs/x/code",
+            recorded_at=recorded_at,
+        )
+        return DiscoveredRoute(
+            replica=replica,
+            endpoint=None,
+            probe_latency_ms=1.0,
+            score=score,
+            throughput_bps=throughput_bps,
+        )
+
+    fast = _route(score=5.0, recorded_at=1.0, throughput_bps=200 * (1 << 20))
+    unmeasured_cheap = _route(score=0.1, recorded_at=2.0, throughput_bps=None)
+    tunnel = _route(score=0.0, recorded_at=3.0, throughput_bps=0.5 * (1 << 20))
+
+    ordered = sorted([tunnel, unmeasured_cheap, fast], key=_route_order_key)
+
+    assert [route.replica.node.name for route in ordered] == [
+        "n-5.0",
+        "n-0.1",
+        "n-0.0",
+    ]
+
+
+def test_lan_fanout_records_a_passive_throughput_sample(tmp_path, monkeypatch):
+    # A completed bulk transfer teaches the ranker at zero marginal cost.
+    import time as time_module
+
+    import dt.artifact_distribution as module
+
+    cfg = _cfg(tmp_path)
+    executor = TransferExecutor(cfg)
+
+    def fake_run_on(node, local, command, **kwargs):
+        time_module.sleep(0.3)
+        return subprocess.CompletedProcess([], 0, _stats(64 << 20, 3), "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
+
+    moved, files = executor._fanout(
+        cfg.sites["psibot"],
+        cfg.nodes[1],  # cache psibot-hm
+        cfg.nodes[2],  # destination psibot-ds
+        "d" * 64,
+        "~/dt/worker/jobs/j/code",
+        None,
+    )
+
+    assert moved == 64 << 20
+    sample = executor.link_metrics.sample(
+        "site:psibot",
+        cfg.nodes[1].name,
+        cfg.nodes[2].name,
+    )
+    assert sample is not None
+    assert sample.origin == "transfer"
+    assert sample.smoothed_bps > (32 << 20)  # ~64 MiB in ~0.3s
+
+
 def test_lan_fanout_does_not_retry_authentication_failure(tmp_path, monkeypatch):
     import dt.artifact_distribution as module
 
