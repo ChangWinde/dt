@@ -32,11 +32,16 @@ SECRET_PATTERN = re.compile(
     rb"xox[baprs]-[A-Za-z0-9-]+"
 )
 LOCAL_PATH_PATTERN = re.compile(rb"/home/[A-Za-z0-9._-]+/|/tmp/")
+# Must cover every payload-directory file in payload_hash.RUNTIME_PAYLOAD_NAMES
+# (snapshot_hash.py lives in dt/ and is injected at dispatch time). A test in
+# tests/test_release_audit.py locks the two lists together so a packaging
+# exclude cannot silently drop a runtime-required file past this audit.
 REQUIRED_PAYLOADS = {
     "dt/payload/artifact_verify.py",
     "dt/payload/cuda_probe.py",
     "dt/payload/launcher.sh",
     "dt/payload/phase.sh",
+    "dt/payload/result.py",
     "dt/payload/telemetry.py",
     "dt/payload/wrapper.sh",
 }

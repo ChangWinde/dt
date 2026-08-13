@@ -284,6 +284,41 @@ def test_compact_refuses_lost_job_whose_process_is_alive(tmp_path, monkeypatch):
     assert (root / "code").is_dir()
 
 
+def test_compact_refuses_finished_job_with_live_capsule_orphan(tmp_path, monkeypatch):
+    # A22-7/A12-2: the guard is a full census on every candidate, not a bare
+    # kill -0 of a lost row's recorded leader. A finished row whose capsule
+    # still hosts a live orphan (dead leader, no pgid on record) must be
+    # refused instead of having code/ pruned under the process.
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(digest)
+    save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    root = _workdir(node_home, entry)
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+    orphan = subprocess.Popen(
+        ["sleep", "30"], cwd=root / "outputs", start_new_session=True
+    )
+    try:
+        report = compact_mod.compact_jobs(
+            cfg,
+            cutoff_ts=100.0,
+            before="1970-01-01",
+            apply=True,
+        )
+    finally:
+        orphan.terminate()
+        orphan.wait(timeout=2)
+
+    assert report.exit_code == 0
+    assert report.payload["state_changed_jobs"] == 1
+    row = next(
+        item for item in report.payload["rows"] if item["job_id"] == entry.job_id
+    )
+    assert row["detail"] == "job_process_is_running"
+    assert (root / "code").is_dir()
+
+
 def test_compact_refuses_corrupt_archive_before_contacting_node(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     digest = _archive(cfg)

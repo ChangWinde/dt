@@ -111,7 +111,7 @@ proxy: http://proxy.example.invalid:8080
 | `nodes[].root` | Optional worker base override for that node; DT derives `worker/` below it |
 | `nodes[].probe_timeout_s` | Optional live telemetry deadline; defaults to 15 seconds and must be in `(0, 120]` |
 | `nodes[].site` | Explicit site membership; must agree with exactly one `sites.NAME.nodes` entry |
-| `nodes[].lan_address` | Optional operator-pinned direct SSH endpoint; required by `site-cache-first`, while `topology-aware` can discover a shared interface |
+| `nodes[].lan_address` | Optional operator-pinned direct SSH endpoint as a bare host or `user@host` (no `host:port` or IPv6 literal; set `lan_port` instead); required by `site-cache-first`, while `topology-aware` can discover a shared interface |
 | `nodes[].lan_port` | Site-LAN SSH port, defaults to 22 and requires `lan_address` when explicitly set |
 | `nodes[].artifact_seed` | Whether the node may host a trusted artifact cache; defaults to true |
 | `nodes[].transfer_cost` | Non-negative route cost recorded by transfer plans; defaults to 1 |
@@ -216,6 +216,14 @@ SSH multiplexing is separated end to end:
 - head-to-node bulk data uses `~/.ssh/dt/artifact/%C`;
 - gateway-executed LAN fan-out uses `~/.ssh/dt/artifact-relay/%C` with a
   30-second persist window.
+
+Unix sockets cap the whole path at ~104 bytes, so when the state directory is
+too deep for that budget (long home paths, containerized state roots) DT
+relocates the sockets to a short per-user runtime directory
+(`$XDG_RUNTIME_DIR/dt-m-<hash>/…`, falling back to the system temp dir) and
+keeps multiplexing; the hash pins the sockets to their state root. If nothing
+fits, the overlay disables multiplexing explicitly rather than letting every
+mux attempt fail.
 
 DT supplies a generated `-F` overlay to OpenSSH, so implicit ProxyJump
 subprocesses inherit the selected pool. A final-target `ControlPath` override

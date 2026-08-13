@@ -868,6 +868,104 @@ def test_clean_refuses_misdirected_node_identity(tmp_path):
     assert load(cfg, "flipped") is not None
 
 
+def test_clean_guard_census_covers_all_terminal_victims(tmp_path):
+    # A22-7/A12-2: the live guard is a full identity census on every victim,
+    # not a bare kill -0 on lost rows only. A LIVE state refuses deletion and
+    # keeps the registry row pointing at the surviving workdir.
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry("guarded", "finished", created_at=1.0, node="n1", node_local=True),
+    )
+    commands = []
+
+    def runner(node, local, command, timeout, check):
+        commands.append(command)
+        return subprocess.CompletedProcess([], 75, "", "DT_CLEAN_LIVE LIVE")
+
+    report = maintenance.clean_jobs(
+        cfg, cutoff_ts=100.0, envs=False, log=lambda _: None, runner=runner
+    )
+
+    assert len(commands) == 1
+    assert "dt_job_live_state" in commands[0]
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["state_changed"]
+    assert load(cfg, "guarded") is not None
+
+
+def test_clean_treats_unprovable_liveness_as_refusal(tmp_path):
+    # A census that cannot prove death (masked /proc, broken enumerators)
+    # must refuse deletion instead of reading blindness as emptiness.
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry("blind", "killed", created_at=1.0, node="n1", node_local=True),
+    )
+
+    def runner(node, local, command, timeout, check):
+        return subprocess.CompletedProcess([], 75, "", "DT_CLEAN_LIVE UNPROVEN")
+
+    report = maintenance.clean_jobs(
+        cfg, cutoff_ts=100.0, envs=False, log=lambda _: None, runner=runner
+    )
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["liveness_unproven"]
+    assert load(cfg, "blind") is not None
+
+
+def test_clean_census_refuses_live_capsule_orphan_and_allows_quiet_one(tmp_path):
+    # Real census: a live process whose cwd is inside the capsule blocks the
+    # rm -rf even though the row is terminal and records no pgid; once the
+    # capsule is quiet the same sweep removes it.
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    node_home = tmp_path / "node-home"
+    workdir = node_home / "dt" / "jobs" / "orphaned"
+    workdir.mkdir(parents=True)
+    save(
+        cfg,
+        _entry("orphaned", "finished", created_at=1.0, node="n1", node_local=True),
+    )
+
+    def runner(node, local, command, timeout, check):
+        return subprocess.run(
+            ["bash", "-c", command],
+            cwd=node_home,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    orphan = subprocess.Popen(["sleep", "30"], cwd=workdir, start_new_session=True)
+    try:
+        refused = maintenance.clean_jobs(
+            cfg, cutoff_ts=100.0, envs=False, log=lambda _: None, runner=runner
+        )
+    finally:
+        orphan.terminate()
+        orphan.wait(timeout=2)
+
+    assert refused.removed == 0
+    assert [failure.kind for failure in refused.failures] == ["state_changed"]
+    assert workdir.is_dir()
+    assert load(cfg, "orphaned") is not None
+
+    removed = maintenance.clean_jobs(
+        cfg, cutoff_ts=100.0, envs=False, log=lambda _: None, runner=runner
+    )
+
+    assert removed.removed == 1
+    assert not workdir.exists()
+    assert load(cfg, "orphaned") is None
+
+
 def test_dependency_settled_treats_recoverable_lost_as_pending():
     from dt.dispatch import LOST_RECOVERY_WINDOW_S, _dependency_settled
 
@@ -1016,6 +1114,108 @@ def test_clean_retains_registry_when_related_local_cleanup_fails(tmp_path):
     assert report.removed == 0
     assert [failure.kind for failure in report.failures] == ["local_cleanup_failed"]
     assert load(cfg, entry.job_id) is not None
+
+
+def _deployment_home(tmp_path):
+    """Build one node home with a deploy tree and a tool-installation root."""
+    home = tmp_path / "node-home"
+    base = home / ".local" / "share" / "disttrainer"
+    releases = base / "releases"
+    incoming = base / "incoming"
+    installs = base / "installations"
+    for version in ("1.0.0", "2.0.0", "3.0.0"):
+        (releases / version).mkdir(parents=True)
+        (releases / version / "wheel.whl").write_text(version)
+    (base / "current").symlink_to("releases/2.0.0")
+    (incoming / "stale-stage").mkdir(parents=True)
+    (incoming / "fresh-stage").mkdir(parents=True)
+    (base / ".removing.junk.123").mkdir()
+    for install in ("py3.11-aaa-bbb", "py3.11-ccc-ddd", "py3.11-eee-fff"):
+        (installs / install / "bin").mkdir(parents=True)
+        (installs / install / "bin" / "dt").write_text("#!/bin/sh\n")
+    (installs / ".incoming.xyz").mkdir()
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    (bin_dir / "dt").symlink_to(installs / "py3.11-aaa-bbb" / "bin" / "dt")
+    old = (1.0, 1.0)
+    for stale in (
+        releases / "1.0.0",
+        releases / "2.0.0",
+        incoming / "stale-stage",
+        installs / "py3.11-aaa-bbb",
+        installs / "py3.11-ccc-ddd",
+    ):
+        os.utime(stale, old)
+    return home, base, installs
+
+
+def _run_deployment_clean(home, tmp_path):
+    from dt.maintenance import clean_deployments_command
+
+    command = clean_deployments_command(datetime.now() - timedelta(days=1))
+    env = {**os.environ, "HOME": str(home)}
+    env.pop("XDG_DATA_HOME", None)
+    env.pop("DT_INSTALL_ROOT", None)
+    return subprocess.run(
+        command,
+        shell=True,
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def test_deployment_cleanup_keeps_current_live_and_fresh_trees(tmp_path):
+    # A29-9: releases/ and installations/ accumulate one tree per deploy
+    # forever. The sweep removes only provably old entries and never the
+    # release `current` points at, the installation the dt command resolves
+    # into, or anything fresh; leftover quarantines are finished.
+    home, base, installs = _deployment_home(tmp_path)
+
+    result = _run_deployment_clean(home, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    removed = set(result.stdout.splitlines())
+    assert removed == {
+        "release 1.0.0",
+        "staging stale-stage",
+        "installation py3.11-ccc-ddd",
+    }
+    releases = base / "releases"
+    assert not (releases / "1.0.0").exists()
+    assert (releases / "2.0.0").is_dir()  # current target, old but kept
+    assert (releases / "3.0.0").is_dir()  # fresh
+    assert not (base / "incoming" / "stale-stage").exists()
+    assert (base / "incoming" / "fresh-stage").is_dir()
+    assert not (base / ".removing.junk.123").exists()
+    assert (installs / "py3.11-aaa-bbb").is_dir()  # live, old but kept
+    assert not (installs / "py3.11-ccc-ddd").exists()
+    assert (installs / "py3.11-eee-fff").is_dir()  # fresh
+    assert (installs / ".incoming.xyz").is_dir()  # bootstrap's domain
+    assert not list(base.glob(".removing.*"))
+    assert not list(installs.glob(".removing.*"))
+
+
+def test_deployment_cleanup_fails_closed_on_unsafe_markers(tmp_path):
+    # An unsafe `current` marker skips the whole release sweep and an
+    # unresolvable dt symlink skips every installation; staging cleanup
+    # still proceeds, and the refusals are visible on stderr.
+    home, base, installs = _deployment_home(tmp_path)
+    (base / "current").unlink()
+    (base / "current").write_text("not a symlink\n")
+    (home / ".local" / "bin" / "dt").unlink()
+
+    result = _run_deployment_clean(home, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    removed = set(result.stdout.splitlines())
+    assert removed == {"staging stale-stage"}
+    assert (base / "releases" / "1.0.0").is_dir()
+    assert (installs / "py3.11-ccc-ddd").is_dir()
+    assert "unsafe current marker" in result.stderr
+    assert "dt command symlink is not resolvable" in result.stderr
 
 
 def test_environment_cleanup_quotes_operator_configured_path(tmp_path):

@@ -138,7 +138,7 @@ def test_lan_annotation_flags_drifted_pinned_address(tmp_path):
     doctor.annotate_lan_addresses(cfg, rows)
 
     assert rows[0]["checks"]["lan"] == "ok"
-    assert rows[1]["checks"]["lan"] == "stale: 10.0.0.9 not on node"
+    assert rows[1]["checks"]["lan"] == "stale: pinned address not on node"
     assert rows[2]["checks"]["lan"] == "unknown"
     assert "lan" not in rows[3]["checks"]
     # A user@ip endpoint compares by its host part and never leaks the user.
@@ -161,6 +161,124 @@ def test_check_node_parses_advertised_addresses(monkeypatch):
     row = doctor.check_node(Node(name="n1"))
 
     assert row["checks"]["addrs"] == "10.0.0.5,172.17.0.1"
+
+
+def test_check_node_redacts_remote_ssh_failure_detail(monkeypatch):
+    # A31-3: raw remote stderr (hostnames, addresses) must not ride into
+    # doctor rows, which travel verbatim into `dt doctor --json`.
+    def failing_run_on(name, local, snippet, timeout):
+        return subprocess.CompletedProcess(
+            ["ssh"],
+            255,
+            stdout="",
+            stderr=(
+                "ssh: connect to host gpu-node-7.dc2.internal port 22222: "
+                "No route to host\n"
+            ),
+        )
+
+    monkeypatch.setattr(doctor, "run_on", failing_run_on)
+
+    row = doctor.check_node(Node(name="n1"))
+
+    assert row["unreachable"] is True
+    assert (
+        row["checks"]["ssh"]
+        == "ssh: connect to host <host> port 22222: No route to host"
+    )
+
+
+def test_annotate_control_route_classes_flags_tunnels_and_redacts_peers(
+    tmp_path, monkeypatch
+):
+    # ADR 0024: a relayed operator route is exactly where bulk data silently
+    # crawls; doctor says so, and the raw observed peer addresses never
+    # reach the shareable rows.
+    import dt.topology_discovery as discovery_module
+
+    cfg = _cfg(
+        tmp_path,
+        nodes=[
+            Node(name="head", local=True),
+            Node(name="tunneled"),
+            Node(name="lan-node"),
+            Node(name="down"),
+        ],
+    )
+    rows = [
+        {"node": "head", "checks": {"ssh": "ok"}, "unreachable": False},
+        {
+            "node": "tunneled",
+            "checks": {"ssh": "ok", "peer": "127.0.0.1", "peer_server": ""},
+            "unreachable": False,
+        },
+        {
+            "node": "lan-node",
+            "checks": {"ssh": "ok", "peer": "192.168.1.10", "peer_server": ""},
+            "unreachable": False,
+        },
+        {
+            "node": "down",
+            "checks": {"ssh": "fail: timeout", "peer": "10.0.0.9"},
+            "unreachable": True,
+        },
+    ]
+    monkeypatch.setattr(
+        discovery_module,
+        "local_interface_addresses",
+        lambda **kwargs: frozenset({"192.168.1.10"}),
+    )
+    monkeypatch.setattr(
+        discovery_module,
+        "resolved_ssh_options",
+        lambda node, **kwargs: {"hostname": node.name},
+    )
+
+    doctor.annotate_control_route_classes(cfg, rows)
+
+    checks = {row["node"]: row["checks"] for row in rows}
+    assert checks["head"]["link"] == "local"
+    assert checks["tunneled"]["link"].startswith("relayed")
+    assert "tunnel" in checks["tunneled"]["link"]
+    assert checks["lan-node"]["link"] == "direct"
+    assert "link" not in checks["down"]
+    for row_checks in checks.values():
+        assert "peer" not in row_checks
+        assert "peer_server" not in row_checks
+        assert "127.0.0.1" not in str(row_checks.get("link", ""))
+    assert "DT_PEER=" in doctor.CHECK_SNIPPET
+
+
+def test_doctor_center_reduces_addresses_to_a_count(tmp_path, monkeypatch):
+    # A31-2: the raw interface inventory exists only to compute the lan
+    # verdict; the JSON view gets a count, not the internal address list.
+    cfg = _cfg(
+        tmp_path,
+        nodes=[
+            Node(name="pinned", lan_address="10.0.0.5"),
+            Node(name="silent"),
+        ],
+    )
+
+    def fake_run_on(name, local, snippet, timeout):
+        if name == "pinned":
+            return subprocess.CompletedProcess(
+                ["ssh"],
+                0,
+                stdout="DT_SSH=ok\nDT_ADDRS=10.0.0.5,172.17.0.1\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(
+            ["ssh"], 0, stdout="DT_SSH=ok\nDT_ADDRS=\n", stderr=""
+        )
+
+    monkeypatch.setattr(doctor, "run_on", fake_run_on)
+
+    rows = {row["node"]: row for row in doctor.doctor_center(cfg)}
+
+    assert rows["pinned"]["checks"]["lan"] == "ok"
+    assert rows["pinned"]["checks"]["addrs"] == "2 addresses (redacted)"
+    assert rows["silent"]["checks"]["addrs"] == "missing"
 
 
 def test_doctor_reports_relay_failure_and_exits_nonzero(tmp_path, monkeypatch):
@@ -264,6 +382,37 @@ def test_doctor_fails_on_gpu_driver_error_text(tmp_path, monkeypatch):
     result = CliRunner().invoke(cli.app, ["doctor", "--json"])
 
     assert result.exit_code == 1, result.output
+
+
+def test_orchestrator_head_without_local_node_still_reports_relay(
+    tmp_path, monkeypatch
+):
+    # Zero local nodes is a legal head shape (pure orchestrator); the agent
+    # and relay verdicts must not silently lose their carrier row.
+    cfg = _cfg(
+        tmp_path,
+        nodes=[Node(name="n1"), Node(name="n2")],
+        sites=_relay_site("n1", "n2"),
+    )
+    rows = [
+        {"node": "n1", "checks": {"ssh": "ok"}, "unreachable": False},
+        {"node": "n2", "checks": {"ssh": "ok"}, "unreachable": False},
+    ]
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "doctor_center", lambda cfg_arg: rows)
+    monkeypatch.setattr(
+        cli, "relay_agent_status", lambda cfg_arg: "fail: no agent socket"
+    )
+    monkeypatch.setattr(agent_mod, "alive_pid", lambda cfg_arg: None)
+    monkeypatch.setattr(cli.jobs_mod, "queued_entries", lambda cfg_arg: [])
+
+    result = CliRunner().invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    head_row = next(row for row in payload if row["node"] == "(head)")
+    assert head_row["checks"]["relay"] == "fail: no agent socket"
+    assert head_row["checks"]["agent"] == "off"
 
 
 def test_alive_pid_probe_is_readonly_on_fresh_root(tmp_path):

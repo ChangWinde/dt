@@ -1,7 +1,10 @@
+import hashlib
+import os
 import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -11,7 +14,10 @@ import dt.sshio as sshio
 
 
 def _transport_home(tmp_path, monkeypatch):
-    state = tmp_path / "ssh-state"
+    # The mux socket directory must fit the sun_path budget (45 bytes); a
+    # pytest tmp_path is far deeper and would trigger relocation. Tests that
+    # assert the default under-state layout therefore use a short state root.
+    state = Path(tempfile.mkdtemp(prefix="dtssh-", dir="/tmp"))
     user_config = tmp_path / "ssh-config"
     user_config.write_text(
         """\
@@ -102,7 +108,7 @@ def test_included_forward_agent_cannot_leak_to_control_or_artifact(
 def test_proxyjump_inherits_artifact_overlay_instead_of_global_socket(
     tmp_path, monkeypatch
 ):
-    _transport_home(tmp_path, monkeypatch)
+    state, _user_config, _system_config = _transport_home(tmp_path, monkeypatch)
     config = sshio.ssh_pool_config(sshio.SSHWorkload.ARTIFACT)
 
     expanded = subprocess.run(
@@ -112,7 +118,7 @@ def test_proxyjump_inherits_artifact_overlay_instead_of_global_socket(
         check=True,
     ).stdout
 
-    assert f"controlpath {tmp_path}/ssh-state/artifact/" in expanded
+    assert f"controlpath {state}/artifact/" in expanded
     assert "proxyjump bastion" in expanded
     assert "/tmp/global-worker" not in expanded
     # OpenSSH passes the active -F file into its implicit ProxyJump process.
@@ -202,6 +208,63 @@ def test_rsync_preserves_default_destination_permissions(monkeypatch):
     sshio.rsync("source/", "worker:target/")
 
     assert not any(value.startswith("--chmod=") for value in seen["cmd"])
+
+
+def test_deep_state_root_relocates_mux_sockets_within_sun_path(tmp_path, monkeypatch):
+    # A state root deeper than the sun_path budget (long $HOME, containerized
+    # state dirs) must not silently lose multiplexing: every mux attempt
+    # would die with "ControlPath too long" and each connection would pay a
+    # full handshake. Relocate the sockets to a short runtime root instead.
+    _transport_home(tmp_path, monkeypatch)
+    deep_state = tmp_path / "very" / "deep" / "containerized" / "ssh-state"
+    monkeypatch.setenv("DT_SSH_STATE_DIR", str(deep_state))
+    runtime = Path(tempfile.mkdtemp(prefix="rt", dir="/tmp"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+    config = sshio.ssh_pool_config(sshio.SSHWorkload.ARTIFACT_RELAY)
+
+    assert config == deep_state / "artifact-relay.conf"
+    tag = hashlib.sha256(os.fsencode(str(deep_state))).hexdigest()[:8]
+    target = runtime / f"dt-m-{tag}" / "artifact-relay"
+    text = config.read_text()
+    assert "ControlMaster auto" in text
+    assert str(target / "%C") in text
+    assert len(os.fsencode(str(target))) + 58 <= 103
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
+
+
+def test_distinct_state_roots_never_share_relocated_mux_sockets(tmp_path, monkeypatch):
+    _transport_home(tmp_path, monkeypatch)
+    runtime = Path(tempfile.mkdtemp(prefix="rt", dir="/tmp"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    targets = []
+    for name in ("one", "two"):
+        deep_state = tmp_path / "deep-enough-to-relocate" / name
+        monkeypatch.setenv("DT_SSH_STATE_DIR", str(deep_state))
+        text = sshio.ssh_pool_config(sshio.SSHWorkload.CONTROL).read_text()
+        line = next(row for row in text.splitlines() if "ControlPath" in row)
+        targets.append(line)
+
+    assert targets[0] != targets[1]
+
+
+def test_unfittable_socket_roots_degrade_to_no_mux(tmp_path, monkeypatch):
+    # If no candidate directory fits sun_path, an explicit ControlMaster no
+    # keeps every connection working at full-handshake cost instead of
+    # failing each mux attempt with "ControlPath too long".
+    _transport_home(tmp_path, monkeypatch)
+    deep = tmp_path / ("d" * 60)
+    monkeypatch.setenv("DT_SSH_STATE_DIR", str(deep / "state"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(deep / "runtime"))
+    monkeypatch.setattr(sshio.tempfile, "gettempdir", lambda: str(deep / "tmp"))
+
+    config = sshio.ssh_pool_config(sshio.SSHWorkload.CONTROL)
+
+    text = config.read_text()
+    assert "ControlMaster no" in text
+    assert "ControlPath none" in text
+    assert config == deep / "state" / "control.conf"
 
 
 def test_ssh_pool_refuses_symlinked_state_directory(tmp_path, monkeypatch):
