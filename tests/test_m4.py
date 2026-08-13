@@ -966,6 +966,100 @@ def test_clean_census_refuses_live_capsule_orphan_and_allows_quiet_one(tmp_path)
     assert load(cfg, "orphaned") is None
 
 
+@pytest.mark.skipif(shutil.which("zsh") is None, reason="zsh not installed")
+def test_clean_census_survives_a_zsh_login_shell(tmp_path):
+    """clean_jobs' census depends on POSIX word splitting; before the bash -c
+    wrap it ran under the node login shell, and zsh's no-split default read a
+    dead-leader group with live orphans as DEAD and deleted their data
+    (QR-B3). The runner here simulates a zsh login shell."""
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    node_home = tmp_path / "node-home"
+    workdir = node_home / "dt" / "jobs" / "zsh-node"
+    workdir.mkdir(parents=True)
+
+    # Dead leader, two surviving in-group children: pgrep -g output is
+    # multi-line, which zsh keeps as one unsplit word.
+    leader = subprocess.Popen(
+        ["bash", "-c", "sleep 30 & sleep 30 & exit 0"],
+        cwd=workdir,
+        start_new_session=True,
+    )
+    leader.wait(timeout=5)
+    save(
+        cfg,
+        _entry(
+            "zsh-node",
+            "finished",
+            created_at=1.0,
+            node="n1",
+            node_local=True,
+            pgid=leader.pid,
+        ),
+    )
+
+    def zsh_login_runner(node, local, command, timeout, check):
+        return subprocess.run(
+            ["zsh", "-c", command],
+            cwd=node_home,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    try:
+        report = maintenance.clean_jobs(
+            cfg,
+            cutoff_ts=100.0,
+            envs=False,
+            log=lambda _: None,
+            runner=zsh_login_runner,
+        )
+    finally:
+        try:
+            os.killpg(leader.pid, 9)
+        except ProcessLookupError:
+            pass
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["state_changed"]
+    assert workdir.is_dir()
+    assert load(cfg, "zsh-node") is not None
+
+
+def test_compact_command_pins_bash_for_its_census():
+    """compact's remote script shares the word-splitting census, so it must
+    never execute under the raw login shell (QR-B3)."""
+    from dt.compact import _remote_command
+
+    command = _remote_command([], apply=False, now=100.0)
+
+    assert command.startswith("bash -c ")
+
+
+def test_clean_jobs_delete_command_pins_bash(tmp_path):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry("pinned", "finished", created_at=1.0, node="n1", node_local=True),
+    )
+    commands = []
+
+    def runner(node, local, command, timeout, check):
+        commands.append(command)
+        return subprocess.CompletedProcess([], 75, "", "DT_CLEAN_LIVE LIVE")
+
+    maintenance.clean_jobs(
+        cfg, cutoff_ts=100.0, envs=False, log=lambda _: None, runner=runner
+    )
+
+    assert len(commands) == 1
+    assert commands[0].startswith("bash -c ")
+
+
 def test_dependency_settled_treats_recoverable_lost_as_pending():
     from dt.dispatch import LOST_RECOVERY_WINDOW_S, _dependency_settled
 
@@ -1216,6 +1310,25 @@ def test_deployment_cleanup_fails_closed_on_unsafe_markers(tmp_path):
     assert (installs / "py3.11-ccc-ddd").is_dir()
     assert "unsafe current marker" in result.stderr
     assert "dt command symlink is not resolvable" in result.stderr
+
+
+def test_deployment_cleanup_refuses_release_sweep_when_current_is_absent(tmp_path):
+    """A missing `current` symlink proves nothing about which release is
+    active; the sweep used to fall through with an empty keep and reap every
+    release including the rollback target (QR-B6)."""
+    home, base, installs = _deployment_home(tmp_path)
+    (base / "current").unlink()
+
+    result = _run_deployment_clean(home, tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    removed = set(result.stdout.splitlines())
+    assert "release 1.0.0" not in removed
+    assert (base / "releases" / "1.0.0").is_dir()
+    assert (base / "releases" / "2.0.0").is_dir()
+    assert "unsafe current marker" in result.stderr
+    # Unrelated domains still proceed.
+    assert "staging stale-stage" in removed
 
 
 def test_environment_cleanup_quotes_operator_configured_path(tmp_path):

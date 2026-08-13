@@ -145,11 +145,21 @@ class PersistentLinkMetrics:
 
     @contextmanager
     def _locked(self, key: str) -> Iterator[tuple[int, str]]:
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        info = self.root.lstat()
+        # A stray file or broken symlink at the state path makes mkdir raise
+        # FileExistsError; consumers catch only LinkMetricsError, and this
+        # module's contract is to degrade to "unmeasured", never to fail the
+        # transfer that produced a sample.
+        try:
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            info = self.root.lstat()
+        except OSError as exc:
+            raise LinkMetricsError("link metrics directory is unsafe") from exc
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             raise LinkMetricsError("link metrics directory is unsafe")
-        self.root.chmod(0o700)
+        try:
+            self.root.chmod(0o700)
+        except OSError as exc:
+            raise LinkMetricsError("link metrics directory is unsafe") from exc
         directory_flags = os.O_RDONLY
         if hasattr(os, "O_DIRECTORY"):
             directory_flags |= os.O_DIRECTORY

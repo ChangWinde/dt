@@ -72,3 +72,18 @@ def test_remote_detail_is_bounded_and_never_raises_on_noise():
     noisy = "x" * 500
     assert len(redact_remote_detail(noisy)) <= 160
     assert redact_remote_detail("") == ""
+
+
+def test_remote_detail_clamps_before_scanning_hostile_input():
+    """The dotted-token regex is superlinear on long label runs and the input
+    is remote-controlled stderr; a 100 KB line must be clamped before the
+    scan instead of burning seconds of head CPU (QR-B7)."""
+    import time
+
+    hostile = "a." * 50_000 + "fail"
+    start = time.perf_counter()
+    result = redact_remote_detail(hostile)
+    elapsed = time.perf_counter() - start
+
+    assert len(result) <= 160
+    assert elapsed < 0.5

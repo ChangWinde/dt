@@ -192,6 +192,30 @@ def test_damaged_state_fails_visibly_on_read_but_heals_on_write(tmp_path):
     assert store.sample("site:s", "n1", "n2") is not None
 
 
+def test_stray_file_at_state_root_degrades_to_link_metrics_error(tmp_path):
+    """A regular file or dangling symlink where the link-metrics directory
+    belongs must surface as LinkMetricsError: consumers catch exactly that to
+    keep throughput memory efficiency-only, and a raw FileExistsError would
+    fail an already-successful transfer (QR-B5)."""
+    cfg = _cfg(tmp_path)
+    root = cfg.control_state_dir() / "link-metrics"
+    root.parent.mkdir(parents=True, exist_ok=True)
+    root.write_text("stray")
+    store = PersistentLinkMetrics(cfg)
+
+    with pytest.raises(LinkMetricsError):
+        store.sample("site:s", "n1", "n2")
+    with pytest.raises(LinkMetricsError):
+        store.record(
+            "site:s", "n1", "n2", transferred_bytes=4 << 20, elapsed_seconds=1.0
+        )
+
+    root.unlink()
+    root.symlink_to(tmp_path / "missing-target")
+    with pytest.raises(LinkMetricsError):
+        store.sample("site:s", "n1", "n2")
+
+
 def test_state_rejects_wrong_key_and_oversize(tmp_path):
     cfg = _cfg(tmp_path)
     store = PersistentLinkMetrics(cfg)

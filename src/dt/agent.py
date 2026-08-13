@@ -589,8 +589,13 @@ def _bump_blocked_backoff(
     if blocked_backoff is None:
         return
     retries = blocked_backoff.get(job_id, (0, 0.0))[0]
-    delay = min(BLOCKED_BACKOFF_CAP_S, BLOCKED_BACKOFF_BASE_S * (2.0**retries))
-    blocked_backoff[job_id] = (retries + 1, time.monotonic() + delay)
+    # 2.0**1024 raises OverflowError (float ** raises where * returns inf),
+    # which would wedge every subsequent poll tick once a job has been
+    # blocked for a few days. The delay saturates at the cap long before
+    # that, so bound both the exponent and the stored counter.
+    exponent = min(retries, 16)
+    delay = min(BLOCKED_BACKOFF_CAP_S, BLOCKED_BACKOFF_BASE_S * (2.0**exponent))
+    blocked_backoff[job_id] = (min(retries + 1, 16), time.monotonic() + delay)
 
 
 def _process_once_with_snapshot(
