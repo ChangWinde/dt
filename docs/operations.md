@@ -175,6 +175,21 @@ scope the dry run with `dt topology --site SITE --source NODE --json` or
 intentional. The hard ceiling is 4,096 edges, and discovery still performs no
 Artifact transfer or subnet scan.
 
+`dt topology` also classifies every head-to-node control route: `relayed`
+means the operator SSH route enters a local tunnel endpoint (frp, autossh,
+`ssh -L`) whose bandwidth bulk data would inherit, `proxied` means a jump
+host, `direct` means the node observed the head's own address, and `opaque`
+means NAT or an unknown middlebox. `dt doctor` repeats the warning per node.
+When a relayed node needs bulk traffic, join it to a site or pin
+`lan_address` so transfers leave the tunnel. `dt topology --measure` streams
+a bounded payload over every healthy site edge and control route and records
+MiB/s; completed transfers keep those numbers fresh automatically, and route
+ranking prefers measured-faster edges (half-decade buckets, unmeasured edges
+stay optimistic until first use). A slow measurement cannot pin a healthy
+edge permanently: below-optimistic evidence expires after 15 minutes, the
+edge ranks as unmeasured again and earns a retrial, and one congested
+transfer folds in at low weight while recovery folds in at high weight.
+
 Read-only topology and GPU telemetry probes may retry once through a fresh,
 non-multiplexed DT overlay when stderr proves a stale ControlMaster. The retry
 shares the original deadline and bypasses both final-target and implicit
@@ -187,6 +202,10 @@ boot before treating the process group as task-owned. Jobs started by an older
 DT build have no identity marker and are accepted only while their wrapper cwd
 is still inside the job capsule. An identity mismatch is reported as `lost`;
 DT fails closed instead of signaling a possibly reused process or tmux session.
+A job whose exit marker predates the signal is reported as completed and keeps
+its recorded result: `dt kill` never rewrites a real completion into a kill.
+Use `--sweep` to signal leftover processes of an already-terminal job; the
+sweep reports what it found and leaves the terminal record untouched.
 
 Then choose one action:
 
@@ -196,6 +215,7 @@ Then choose one action:
 | Exact-code repeat required | `dt fork JOB -n NEW_NAME` |
 | Queued job no longer needed | `dt kill JOB -y` |
 | Running job must stop | `dt kill JOB -y`; add `--force` only after TERM failure is confirmed |
+| Terminal job left processes behind | `dt kill JOB -y --sweep`; signals leftovers, never rewrites the recorded result |
 | Transfer interrupted | Rerun the same `dt pull` command |
 | SSH disconnected | Reconnect with `dt watch`, `dt logs -f`, or `dt wait`; do not resubmit blindly |
 | Launch outcome uncertain | Inspect, then use verified `dt kill JOB -y` cleanup before retrying |
@@ -283,10 +303,20 @@ Cleanup removes old terminal jobs and optional managed data:
 dt clean --before 2026-07-01 --plan
 dt clean --before 2026-07-01 -p smoke --plan
 dt clean --before 2026-07-01 --results --envs --plan
+dt clean --before 2026-07-01 --deployments -y
 ```
 
 Review the exact plan before adding `-y`. Project filters are repeatable.
 Active dependency chains protect predecessor outputs from premature cleanup.
+
+`--deployments` sweeps `releases/`, deploy staging, and tool installations
+older than the cutoff on every configured node. The release `current` points
+at and the installation the `dt` command resolves into are never candidates
+regardless of age; keep the cutoff older than your rollback horizon, because
+a release removed by the sweep is no longer available to `--rollback`. The
+sweep holds the same locks as `deploy.sh` and `bootstrap.sh`, and an unsafe
+`current` marker or unresolvable `dt` command skips that whole tree with a
+visible diagnostic.
 
 ## Operational checks after changes
 

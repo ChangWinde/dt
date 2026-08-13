@@ -34,6 +34,50 @@ def _cfg(tmp_path, **site_overrides):
     )
 
 
+def test_circuit_lock_survives_spurious_enoent(tmp_path, monkeypatch):
+    # macOS/APFS: concurrent openat(dir_fd, O_CREAT) from threads of one
+    # process spuriously fails ENOENT (~1e-4/op); without a bounded retry a
+    # healthy candidate route reads "invalid circuit state" and is dropped.
+    import os as os_mod
+
+    cfg, site = _cfg(tmp_path)
+    health = PersistentRouteHealth(cfg)
+    real_open = os_mod.open
+    flakes = {"remaining": 2}
+
+    def flaky_open(name, flags, mode=0o777, *, dir_fd=None):
+        if isinstance(name, str) and name.endswith(".lock") and flakes["remaining"] > 0:
+            flakes["remaining"] -= 1
+            raise FileNotFoundError(name)
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os_mod, "open", flaky_open)
+
+    decision = health.decision(site, "source", "destination")
+
+    assert decision.is_open is False
+    assert flakes["remaining"] == 0
+
+
+def test_circuit_lock_still_fails_closed_on_real_enoent(tmp_path, monkeypatch):
+    # A directory that is actually gone must still surface, not retry forever.
+    import os as os_mod
+
+    cfg, site = _cfg(tmp_path)
+    health = PersistentRouteHealth(cfg)
+    real_open = os_mod.open
+
+    def gone_open(name, flags, mode=0o777, *, dir_fd=None):
+        if isinstance(name, str) and name.endswith(".lock"):
+            raise FileNotFoundError(name)
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os_mod, "open", gone_open)
+
+    with pytest.raises(RouteHealthError, match="lock is unsafe"):
+        health.decision(site, "source", "destination")
+
+
 def test_route_circuit_plateau_does_not_reset_the_ladder(tmp_path):
     cfg, site = _cfg(
         tmp_path,

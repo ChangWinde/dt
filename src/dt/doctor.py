@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .config import HeadConfig, Node
+from .redaction import redact_remote_detail
 from .sshio import RemoteError, run_on
 
 # Site policies whose transfers authenticate through a forwarded head agent.
@@ -64,6 +65,13 @@ if command -v rsync >/dev/null 2>&1; then echo DT_RSYNC=ok; else echo DT_RSYNC=m
 if command -v flock >/dev/null 2>&1; then echo DT_FLOCK=ok; else echo DT_FLOCK=missing; fi
 if command -v python3 >/dev/null 2>&1; then echo DT_PYTHON3=ok; else echo DT_PYTHON3=missing; fi
 if command -v timeout >/dev/null 2>&1; then echo DT_TIMEOUT=ok; else echo DT_TIMEOUT=missing; fi
+# What this sshd observed about the control connection: a loopback peer
+# means the route enters through a local tunnel endpoint (frp/autossh).
+# Consumed and redacted head-side; never rendered raw.
+dt_peer="${SSH_CONNECTION%% *}"
+echo "DT_PEER=$dt_peer"
+dt_peer_server=$(printf '%s' "${SSH_CONNECTION:-}" | awk '{print $3}')
+echo "DT_PEER_SERVER=$dt_peer_server"
 # Both families: an IPv6-pinned lan_address would otherwise always read
 # "stale" because the reported set only ever contained IPv4 addresses.
 dt_addrs=$({ ip -4 -o addr show scope global 2>/dev/null; ip -6 -o addr show scope global 2>/dev/null; } | awk '{print $4}' | cut -d/ -f1 | paste -sd, -)
@@ -80,16 +88,18 @@ def check_node(node: Node) -> dict[str, Any]:
     try:
         proc = run_on(node.name, node.local, CHECK_SNIPPET, timeout=20)
     except Exception as e:
+        # Remote stderr crosses a trust boundary and doctor rows travel in
+        # shareable JSON: keep the failure vocabulary, drop endpoint names.
         return {
             "node": node.name,
-            "checks": {"ssh": f"fail: {e}"},
+            "checks": {"ssh": f"fail: {redact_remote_detail(str(e))}"},
             "unreachable": isinstance(e, (RemoteError, OSError)),
         }
     if proc.returncode != 0 and "DT_SSH=ok" not in proc.stdout:
         msg = (proc.stderr or "").strip().splitlines()
         return {
             "node": node.name,
-            "checks": {"ssh": msg[-1] if msg else "fail"},
+            "checks": {"ssh": redact_remote_detail(msg[-1]) if msg else "fail"},
             "unreachable": proc.returncode == 255,
         }
     for line in proc.stdout.splitlines():
@@ -203,7 +213,58 @@ def annotate_lan_addresses(cfg: HeadConfig, rows: list[dict[str, Any]]) -> None:
         if pinned_ip in reported:
             checks["lan"] = "ok"
         else:
-            checks["lan"] = f"stale: {host} not on node"
+            # The verdict is enough to act on; the pinned address itself is
+            # the operator's own config value and must not ride along into
+            # shareable doctor output.
+            checks["lan"] = "stale: pinned address not on node"
+
+
+def annotate_control_route_classes(
+    cfg: HeadConfig,
+    rows: list[dict[str, Any]],
+) -> None:
+    """Classify each node's control route; consume and redact peer evidence.
+
+    Operators tunneling SSH through frp or a jump host get a visible warning
+    that bulk data would ride the tunnel too, with the raw observed peer
+    addresses never rendered (ADR 0024).
+    """
+    from .topology_discovery import (
+        classify_control_route,
+        local_interface_addresses,
+        resolved_ssh_options,
+        safe_connection_address,
+    )
+
+    head_addresses = local_interface_addresses()
+    nodes = {node.name: node for node in cfg.nodes}
+    for row in rows:
+        checks = row.get("checks", {})
+        client = safe_connection_address(checks.pop("peer", None))
+        server = safe_connection_address(checks.pop("peer_server", None))
+        node = nodes.get(str(row.get("node")))
+        if node is None:
+            continue
+        if node.local:
+            checks["link"] = "local"
+            continue
+        if checks.get("ssh") != "ok":
+            continue
+        route_class = classify_control_route(
+            node,
+            client_address=client,
+            server_address=server,
+            ssh_options=resolved_ssh_options(node),
+            head_addresses=head_addresses,
+        )
+        if route_class.label in {"relayed", "proxied"}:
+            checks["link"] = (
+                f"{route_class.label}: {route_class.evidence}; bulk transfers "
+                "ride this tunnel unless the node joins a site or pins "
+                "lan_address"
+            )
+        else:
+            checks["link"] = route_class.label
 
 
 def doctor_center(cfg: HeadConfig) -> list[dict[str, Any]]:
@@ -214,4 +275,16 @@ def doctor_center(cfg: HeadConfig) -> list[dict[str, Any]]:
     for r in rows:
         r["center"] = cfg.center
     annotate_lan_addresses(cfg, rows)
+    annotate_control_route_classes(cfg, rows)
+    # The raw interface list exists only to drive the lan verdict above.
+    # `dt doctor --json` output lands in CI logs and tickets, so the
+    # per-node internal address inventory is reduced to a count once the
+    # verdict is computed.
+    for r in rows:
+        checks = r.get("checks", {})
+        raw_addresses = str(checks.get("addrs", ""))
+        if raw_addresses and raw_addresses != "missing":
+            count = len([part for part in raw_addresses.split(",") if part.strip()])
+            plural = "es" if count != 1 else ""
+            checks["addrs"] = f"{count} address{plural} (redacted)"
     return rows

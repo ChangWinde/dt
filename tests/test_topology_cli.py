@@ -4,7 +4,25 @@ from typer.testing import CliRunner
 
 from dt import cli
 from dt.config import HeadConfig, Node, Site
-from dt.topology_discovery import TopologyEdge
+from dt.topology_discovery import NodeAdvertisement, TopologyEdge
+
+
+def _patch_advertise(monkeypatch, client_address="127.0.0.1"):
+    import dt.topology_discovery as discovery_module
+
+    monkeypatch.setattr(
+        discovery_module.TopologyDiscovery,
+        "advertise",
+        lambda self, node: NodeAdvertisement(
+            node=node.name,
+            user="w",
+            ssh_port=22,
+            addresses=(),
+            host_keys=("ssh-ed25519 AAAA",),
+            ssh_client_address=client_address,
+            ssh_server_address=None,
+        ),
+    )
 
 
 def _cfg(tmp_path):
@@ -67,6 +85,7 @@ def test_topology_json_exposes_bounded_directed_graph(tmp_path, monkeypatch):
         "discover_edges",
         lambda self, site, **kwargs: _edges(),
     )
+    _patch_advertise(monkeypatch)
 
     result = CliRunner().invoke(cli.app, ["topology", "--json"])
 
@@ -89,6 +108,12 @@ def test_topology_json_exposes_bounded_directed_graph(tmp_path, monkeypatch):
     assert payload["sites"][0]["edges"][0]["endpoint_origin"] == (
         "advertised-shared-subnet"
     )
+    control = {row["node"]: row for row in payload["control_routes"]}
+    assert control["head"]["link_class"] == "local"
+    # The node's sshd saw a loopback peer: an frp-style tunnel carries the
+    # operator route, and the JSON says so with evidence.
+    assert control["worker"]["link_class"] == "relayed"
+    assert "tunnel" in control["worker"]["evidence"]
 
 
 def test_topology_human_output_explains_direct_and_failed_edges(tmp_path, monkeypatch):
@@ -100,6 +125,7 @@ def test_topology_human_output_explains_direct_and_failed_edges(tmp_path, monkey
         "discover_edges",
         lambda self, site, **kwargs: _edges(),
     )
+    _patch_advertise(monkeypatch)
 
     result = CliRunner().invoke(cli.app, ["topology", "--site", "lab"])
 
@@ -108,6 +134,61 @@ def test_topology_human_output_explains_direct_and_failed_edges(tmp_path, monkey
     assert "2.5ms" in result.stdout
     assert "worker → head" in result.stdout
     assert "timeout" in result.stdout
+    assert "control routes" in result.stdout
+    assert "relayed" in result.stdout
+
+
+def test_topology_shows_measured_throughput_for_edges_and_control(
+    tmp_path, monkeypatch
+):
+    # Samples recorded by earlier transfers or probes surface on both the
+    # site edges and the head's control routes, with origin and age.
+    import dt.topology_discovery as discovery_module
+    from dt.link_metrics import (
+        CONTROL_LINK_SCOPE,
+        PersistentLinkMetrics,
+        site_link_scope,
+    )
+
+    cfg = _cfg(tmp_path)
+    store = PersistentLinkMetrics(cfg)
+    store.record(
+        site_link_scope(cfg.sites["lab"]),
+        "head",
+        "worker",
+        transferred_bytes=90 << 20,
+        elapsed_seconds=1.0,
+    )
+    store.record(
+        CONTROL_LINK_SCOPE,
+        "head",
+        "worker",
+        transferred_bytes=2 << 20,
+        elapsed_seconds=1.0,
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        discovery_module.TopologyDiscovery,
+        "discover_edges",
+        lambda self, site, **kwargs: _edges(),
+    )
+    _patch_advertise(monkeypatch, client_address="203.0.113.9")
+
+    result = CliRunner().invoke(cli.app, ["topology", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    direct_edge = payload["sites"][0]["edges"][0]
+    assert direct_edge["throughput_mib_s"] == 90.0
+    assert direct_edge["throughput_origin"] == "transfer"
+    control = {row["node"]: row for row in payload["control_routes"]}
+    assert control["worker"]["link_class"] == "opaque"
+    assert control["worker"]["throughput_mib_s"] == 2.0
+
+    human = CliRunner().invoke(cli.app, ["topology"])
+    assert human.exit_code == 0, human.output
+    assert "90.0 MiB/s" in human.stdout
+    assert "2.0 MiB/s" in human.stdout
 
 
 def test_topology_unknown_site_is_structured_failure(tmp_path, monkeypatch):

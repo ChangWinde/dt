@@ -258,6 +258,137 @@ def test_unexpected_submit_error_is_uncertain_and_never_relaunched(
     assert record.error_kind == "OSError"
 
 
+def _uncertain_launch_request(
+    cfg: HeadConfig,
+    source: StoredSnapshot,
+    monkeypatch,
+    request_id: str,
+) -> str:
+    """Drive one submission into an uncertain receipt with a real job row."""
+    from dt.jobs import UNCERTAIN_LAUNCH_PREFIX
+
+    captured: dict[str, str] = {}
+
+    def uncertain_launch(cfg_, spec, **kwargs):
+        job_id = kwargs["allocated_job_id"]
+        captured["job_id"] = job_id
+        row = JobEntry(
+            job_id=job_id,
+            name=spec.name,
+            center=cfg_.center,
+            project=spec.project or "p",
+            node="n1",
+            node_local=False,
+            job_dir=f"~/dt/jobs/{job_id}",
+            session=f"dt_{job_id}",
+            cmd="true",
+            status="failed",
+            reason=UNCERTAIN_LAUNCH_PREFIX + "ssh dropped mid-launch",
+            created_at=kwargs["submitted_at"],
+            request_id=spec.request_id,
+        )
+        save(cfg_, row)
+        raise OSError("connection dropped after the launch boundary")
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", uncertain_launch)
+    spec = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        request_id=request_id,
+    )
+    with pytest.raises(OSError):
+        _submit(cfg, spec, source)
+    record = intent_mod.load(cfg, request_id)
+    assert record is not None and record.state == "uncertain"
+    return captured["job_id"]
+
+
+def test_uncertain_receipt_confirms_after_verified_kill(tmp_path, monkeypatch):
+    # A02-7: the uncertain receipt used to be a permanent dead end - even
+    # after `dt kill` proved the launch dead, the same request id answered
+    # RequestOutcomeUnknown forever, pushing callers to abandon the id and
+    # resubmit blind. A verified postmortem now settles the receipt.
+    from dt.jobs import load as load_job
+
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    request_id = "agent-uncertain-killed"
+    job_id = _uncertain_launch_request(cfg, source, monkeypatch, request_id)
+
+    row = load_job(cfg, job_id)
+    assert row is not None
+    row.status = "killed"
+    row.result_state = "cancelled"
+    row.finished_at = 4321.0
+    row.reason = "uncertain launch cleanup confirmed dead by user (TERM)"
+    save(cfg, row)
+
+    spec = RunSpec(
+        name="train", gpus=1, cmd=["true"], project="p", request_id=request_id
+    )
+    with pytest.raises(dispatch.FailedBeforeStart):
+        _submit(cfg, spec, source)
+
+    record = intent_mod.load(cfg, request_id)
+    assert record is not None
+    assert record.state == "confirmed"
+    assert record.error_kind == "failed_before_start"
+
+
+def test_uncertain_receipt_replays_a_recovered_completion(tmp_path, monkeypatch):
+    # The EXITED postmortem can prove the uncertain launch actually ran to
+    # completion; the receipt must become a normal idempotent replay of that
+    # job instead of inviting a duplicate run.
+    from dt.jobs import load as load_job
+
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    request_id = "agent-uncertain-finished"
+    job_id = _uncertain_launch_request(cfg, source, monkeypatch, request_id)
+
+    row = load_job(cfg, job_id)
+    assert row is not None
+    row.status = "finished"
+    row.exit_code = 0
+    row.finished_at = 4321.0
+    row.reason = "completed before kill; recorded from exit marker"
+    save(cfg, row)
+
+    spec = RunSpec(
+        name="train", gpus=1, cmd=["true"], project="p", request_id=request_id
+    )
+    replayed = _submit(cfg, spec, source)
+
+    assert replayed.job_id == job_id
+    assert replayed.status == "finished"
+    record = intent_mod.load(cfg, request_id)
+    assert record is not None
+    assert record.state == "confirmed"
+    assert record.error_kind is None
+
+
+def test_uncertain_receipt_stays_closed_while_the_row_is_unresolved(
+    tmp_path, monkeypatch
+):
+    # Without a verified resolution the receipt keeps refusing duplicates.
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    request_id = "agent-uncertain-open"
+    _uncertain_launch_request(cfg, source, monkeypatch, request_id)
+
+    spec = RunSpec(
+        name="train", gpus=1, cmd=["true"], project="p", request_id=request_id
+    )
+    with pytest.raises(RequestOutcomeUnknown):
+        _submit(cfg, spec, source)
+
+    record = intent_mod.load(cfg, request_id)
+    assert record is not None
+    assert record.state == "uncertain"
+
+
 def test_request_claim_write_failure_is_a_known_prelaunch_rejection(
     tmp_path,
     monkeypatch,

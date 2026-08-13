@@ -31,10 +31,12 @@ from .layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
     job_control_dir,
+    job_state_dir,
     node_path,
     node_path_expression,
     normalize_node_root,
 )
+from .lifecycle import liveness_shell
 from .private_state import PrivateStateError, read_bounded_regular
 from .snapshot_hash import tree_sha256
 from .sshio import RemoteError, run_on
@@ -248,17 +250,28 @@ def _remote_command(
             "emit() { printf 'DT_COMPACT_V1\\t%s\\t%s\\t%s\\t%s\\n' "
             '"$1" "$2" "$3" "$4"; }'
         ),
+        # Full identity census for every candidate, not a bare kill -0 on
+        # lost rows only: a dead leader's live orphans or a false-terminal
+        # row must block deletion, and an unprovable census must refuse
+        # rather than prune under processes it cannot see.
+        liveness_shell(),
     ]
     for candidate in candidates:
         root = node_path_expression(candidate.entry.job_dir)
         job_id = shlex.quote(candidate.entry.job_id)
         receipt = shlex.quote(_receipt(candidate, now))
-        live_guard = (
-            f"kill -0 {candidate.entry.pgid} 2>/dev/null"
-            if candidate.entry.status == "lost"
-            and isinstance(candidate.entry.pgid, int)
-            and candidate.entry.pgid > 0
-            else "false"
+        pgid = (
+            candidate.entry.pgid
+            if isinstance(candidate.entry.pgid, int) and candidate.entry.pgid > 0
+            else 0
+        )
+        boot_id = shlex.quote(candidate.entry.boot_id or "")
+        identity_file = node_path_expression(
+            job_state_dir(
+                candidate.entry.job_dir,
+                candidate.entry.storage_layout,
+            )
+            + "/process_start_ticks"
         )
         control = job_control_dir(
             candidate.entry.job_dir,
@@ -270,13 +283,19 @@ def _remote_command(
                 f"control={node_path_expression(control)}",
                 f"job_id={job_id}",
                 'code="$root/code"',
+                (
+                    'dt_live=$(dt_job_live_state "$root" '
+                    f"{pgid} {boot_id} {identity_file})"
+                ),
                 'if [ ! -e "$root" ] && [ ! -L "$root" ]; then',
                 '  emit missing "$job_id" 0 job_dir_absent',
                 'elif [ -L "$root" ] || [ ! -d "$root" ]; then',
                 '  emit unsafe "$job_id" 0 unsafe_job_dir',
                 "  compact_rc=1",
-                f"elif {live_guard}; then",
-                '  emit state_changed "$job_id" 0 lost_process_is_running',
+                'elif [ "$dt_live" = LIVE ]; then',
+                '  emit state_changed "$job_id" 0 job_process_is_running',
+                'elif [ "$dt_live" != DEAD ]; then',
+                '  emit state_changed "$job_id" 0 job_liveness_unproven',
                 'elif [ ! -e "$code" ] && [ ! -L "$code" ]; then',
                 '  emit already_compact "$job_id" 0 code_absent',
                 'elif [ -L "$code" ] || [ ! -d "$code" ]; then',

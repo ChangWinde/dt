@@ -47,9 +47,11 @@ changes, and request expensive fields explicitly with `--fields`. Reserve the
 legacy full-array `dt ps --json` contract for offline inventory or compatibility.
 
 `dt run --no-queue` restores fail-fast behavior and returns exit 2 when no
-capacity fits. A job-specific blocker does not hold up runnable work behind it.
-FIFO is preserved among jobs competing for the same capacity; a busy pinned
-node does not block later work pinned to a different node.
+capacity fits. A job-specific blocker does not hold up runnable work behind it
+and is retried on a capped exponential backoff; dependency waits stay cheap
+and are re-checked every tick. FIFO is preserved among jobs competing for the
+same capacity; a busy pinned node does not block later work pinned to a
+different node.
 
 To preload independent work on one node:
 

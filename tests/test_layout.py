@@ -468,7 +468,11 @@ def test_role_cleanup_uses_persisted_worker_root_after_config_change(tmp_path):
     )
 
     assert report.removed == 1
-    assert commands == ["rm -rf -- /old/dt/worker/jobs/old-root-job"]
+    assert len(commands) == 1
+    # Both the liveness census and the deletion must target the persisted
+    # worker root, not the freshly configured one.
+    assert commands[0].endswith("rm -rf -- /old/dt/worker/jobs/old-root-job")
+    assert "dt_job_live_state /old/dt/worker/jobs/old-root-job" in commands[0]
     assert load(cfg, entry.job_id) is None
 
 

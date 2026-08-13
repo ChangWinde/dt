@@ -26,10 +26,12 @@ from .jobs import (
 from .layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
+    job_state_dir,
     node_path,
     node_path_expression,
     normalize_node_root,
 )
+from .lifecycle import liveness_shell
 from .snapshot_store import load_state, lock, save_state
 from .sshio import diagnostic_excerpt
 
@@ -145,6 +147,144 @@ def clean_envs(
         gone = [line for line in (proc.stdout or "").splitlines() if line.strip()]
         if gone:
             log(f"{node.name}: removed {len(gone)} stale envs ({', '.join(gone)})")
+            removed += len(gone)
+    return removed
+
+
+def clean_deployments_command(cutoff: datetime) -> str:
+    """Sweep old dt release trees and tool installations on one node.
+
+    Contract ("never over-delete"):
+
+    - the release ``current`` points at and the installation the ``dt``
+      command symlink resolves into are never candidates, regardless of age;
+    - every other entry must be provably older than the cutoff - a failed
+      age probe keeps it (blindness is not emptiness);
+    - victims are quarantine-renamed before deletion so an interrupted sweep
+      never leaves a half tree at a canonical path, and quarantines left by
+      a crashed earlier sweep are finished first;
+    - the deploy tree sweep holds ``deploy.lock`` and the installations
+      sweep holds the same directory-inode lock as ``bootstrap.sh``, so an
+      in-flight deploy or install cannot race the sweep;
+    - an unsafe ``current`` marker or an unresolvable ``dt`` symlink skips
+      that whole tree with a visible diagnostic;
+    - roots relocated at install time (``DT_INSTALL_ROOT``/``XDG_DATA_HOME``
+      overrides not present in the login environment) simply do not match
+      and stay untouched.
+    """
+    stamp = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    script = (
+        "umask 077; "
+        "command -v flock >/dev/null 2>&1 || "
+        '{ echo "flock is required for safe deployment cleanup" >&2; exit 69; }; '
+        "dt_dep_old() { "
+        f'dt_dep_probe=$(find "$1" -maxdepth 0 ! -newermt "{stamp}" '
+        "-print 2>/dev/null) || return 1; "
+        '[ -n "$dt_dep_probe" ]; }; '
+        "dt_dep_reap() { "
+        'dt_dep_name=$(basename -- "$1"); '
+        'dt_dep_doomed="$2/.removing.$dt_dep_name.$$"; '
+        'mv -f -- "$1" "$dt_dep_doomed" 2>/dev/null || return 1; '
+        'rm -rf -- "$dt_dep_doomed"; '
+        'printf \'%s %s\\n\' "$3" "$dt_dep_name"; }; '
+        'base="$HOME/.local/share/disttrainer"; '
+        'if [ -d "$base" ] && [ ! -L "$base" ]; then '
+        "( flock -w 10 9 || "
+        '{ echo "deploy tree busy; sweep skipped" >&2; exit 0; }; '
+        'for dt_dep_left in "$base"/.removing.*; do '
+        '[ -e "$dt_dep_left" ] || continue; '
+        '[ -L "$dt_dep_left" ] && continue; '
+        'rm -rf -- "$dt_dep_left"; done; '
+        'releases="$base/releases"; current="$base/current"; '
+        'keep=""; dt_dep_safe=1; '
+        'if [ -L "$current" ]; then '
+        'dt_dep_tgt=$(readlink -- "$current") || dt_dep_safe=0; '
+        'case "$dt_dep_tgt" in releases/*) keep="${dt_dep_tgt#releases/}";; '
+        "*) dt_dep_safe=0;; esac; "
+        'case "$keep" in ""|.|..|*/*) dt_dep_safe=0;; esac; '
+        'elif [ -e "$current" ]; then dt_dep_safe=0; fi; '
+        '[ "$dt_dep_safe" -eq 1 ] || '
+        'echo "release sweep skipped: unsafe current marker" >&2; '
+        'if [ "$dt_dep_safe" -eq 1 ] && [ -d "$releases" ] '
+        '&& [ ! -L "$releases" ]; then '
+        'for dt_dep_r in "$releases"/*; do '
+        '[ -e "$dt_dep_r" ] || continue; '
+        '{ [ -d "$dt_dep_r" ] && [ ! -L "$dt_dep_r" ]; } || continue; '
+        '[ "$(basename -- "$dt_dep_r")" = "$keep" ] && continue; '
+        'dt_dep_old "$dt_dep_r" || continue; '
+        'dt_dep_reap "$dt_dep_r" "$base" release; done; fi; '
+        'incoming="$base/incoming"; '
+        'if [ -d "$incoming" ] && [ ! -L "$incoming" ]; then '
+        'for dt_dep_s in "$incoming"/*; do '
+        '[ -e "$dt_dep_s" ] || continue; '
+        '[ -L "$dt_dep_s" ] && continue; '
+        'dt_dep_old "$dt_dep_s" || continue; '
+        'dt_dep_reap "$dt_dep_s" "$base" staging; done; fi '
+        ') 9>>"$base/deploy.lock"; fi; '
+        'root="${XDG_DATA_HOME:-$HOME/.local/share}/disttrainer/installations"; '
+        'if [ -d "$root" ] && [ ! -L "$root" ]; then '
+        "( flock -x -w 10 8 || "
+        '{ echo "installation root busy; sweep skipped" >&2; exit 0; }; '
+        'for dt_dep_left in "$root"/.removing.*; do '
+        '[ -e "$dt_dep_left" ] || continue; '
+        '[ -L "$dt_dep_left" ] && continue; '
+        'rm -rf -- "$dt_dep_left"; done; '
+        # readlink -f succeeds even when the final component is missing, so
+        # the resolved target must itself exist and live inside this root
+        # before it can prove anything; otherwise no installation can be
+        # ruled live and the whole tree is skipped.
+        'live=$(readlink -f -- "$HOME/.local/bin/dt" 2>/dev/null) '
+        '&& [ -e "$live" ] || live=""; '
+        'case "$live" in "$root"/*) :;; *) live="";; esac; '
+        'if [ -n "$live" ]; then '
+        'for dt_dep_d in "$root"/*; do '
+        '[ -e "$dt_dep_d" ] || continue; '
+        'case "$(basename -- "$dt_dep_d")" in .*) continue;; esac; '
+        '{ [ -d "$dt_dep_d" ] && [ ! -L "$dt_dep_d" ]; } || continue; '
+        'case "$live" in "$dt_dep_d"/*) continue;; esac; '
+        'dt_dep_old "$dt_dep_d" || continue; '
+        'dt_dep_reap "$dt_dep_d" "$root" installation; done; '
+        "else "
+        'echo "installations sweep skipped: dt command symlink is not resolvable" >&2; '
+        "fi "
+        ') 8<"$root"; fi'
+    )
+    return f"bash -c {shlex.quote(script)}"
+
+
+def clean_deployments(
+    cfg: HeadConfig,
+    cutoff_ts: float,
+    log: Log,
+    *,
+    runner: Runner,
+) -> int:
+    """Remove old release trees and installations from every configured node."""
+    cutoff = datetime.fromtimestamp(cutoff_ts)
+    command = clean_deployments_command(cutoff)
+    removed = 0
+    for node in cfg.nodes:
+        try:
+            proc = runner(node.name, node.local, command, 120, False)
+        except Exception as exc:
+            log(f"{node.name}: deployment clean skipped ({exc})")
+            continue
+        if proc.returncode != 0:
+            detail = diagnostic_excerpt(proc.stderr, proc.stdout)
+            suffix = f": {detail}" if detail else ""
+            log(
+                f"{node.name}: deployment clean skipped "
+                f"(remote command exited {proc.returncode}{suffix})"
+            )
+            continue
+        skipped = " ".join((proc.stderr or "").split())
+        if skipped:
+            log(f"{node.name}: {skipped}")
+        gone = [line for line in (proc.stdout or "").splitlines() if line.strip()]
+        if gone:
+            log(
+                f"{node.name}: removed {len(gone)} deployment trees ({', '.join(gone)})"
+            )
             removed += len(gone)
     return removed
 
@@ -418,12 +558,29 @@ def clean_jobs(
                         )
                     )
                     continue
-                live_guard = ""
-                if entry.status == "lost" and entry.pgid is not None:
-                    live_guard = (
-                        f"if kill -0 {entry.pgid} 2>/dev/null; then "
-                        "echo DT_CLEAN_LIVE >&2; exit 75; fi; "
-                    )
+                # Every victim gets the full identity census, not a bare
+                # kill -0 on the recorded leader for lost rows only: a dead
+                # leader with live in-capsule orphans, a false-terminal row
+                # from an earlier bad postmortem, or an unprovable probe must
+                # all refuse deletion instead of pulling the directory out
+                # from under running processes and unregistering them.
+                identity_file = node_path_expression(
+                    job_state_dir(managed_dir, entry.storage_layout)
+                    + "/process_start_ticks"
+                )
+                pgid = (
+                    int(entry.pgid)
+                    if isinstance(entry.pgid, int) and entry.pgid > 0
+                    else 0
+                )
+                live_guard = (
+                    liveness_shell()
+                    + "dt_jl_state=$(dt_job_live_state "
+                    + f"{node_path_expression(managed_dir)} {pgid} "
+                    + f"{shlex.quote(entry.boot_id or '')} {identity_file}); "
+                    + '[ "$dt_jl_state" = DEAD ] || '
+                    + '{ echo "DT_CLEAN_LIVE $dt_jl_state" >&2; exit 75; }; '
+                )
                 try:
                     proc = runner(
                         entry.node,
@@ -447,13 +604,20 @@ def clean_jobs(
                 if proc.returncode != 0:
                     detail = diagnostic_excerpt(proc.stderr, proc.stdout)
                     if proc.returncode == 75 and "DT_CLEAN_LIVE" in detail:
-                        message = "lost job process is running; cleanup refused"
+                        unproven = "UNPROVEN" in detail
+                        message = (
+                            "job liveness could not be proven; cleanup refused"
+                            if unproven
+                            else "job processes are still running; cleanup refused"
+                        )
                         log(f"{entry.job_id}: {message}; registry retained")
                         failures.append(
                             CleanFailure(
                                 job_id=entry.job_id,
                                 node=entry.node,
-                                kind="state_changed",
+                                kind=(
+                                    "liveness_unproven" if unproven else "state_changed"
+                                ),
                                 message=message,
                             )
                         )

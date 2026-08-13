@@ -16,6 +16,7 @@ from typing import Callable, Iterator, Protocol
 from uuid import uuid4
 
 from .config import HeadConfig, Site
+from .private_state import openat_create_retry
 
 SCHEMA_VERSION = "dt_route_health_v1"
 MAX_STATE_BYTES = 4096
@@ -157,7 +158,12 @@ class PersistentRouteHealth:
             if hasattr(os, "O_NOFOLLOW"):
                 lock_flags |= os.O_NOFOLLOW
             try:
-                lock_fd = os.open(f"{key}.lock", lock_flags, 0o600, dir_fd=directory_fd)
+                lock_fd = openat_create_retry(
+                    f"{key}.lock",
+                    lock_flags,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
             except OSError as exc:
                 raise RouteHealthError("route circuit lock is unsafe") from exc
             lock_info = os.fstat(lock_fd)
@@ -220,7 +226,9 @@ class PersistentRouteHealth:
             flags |= os.O_NOFOLLOW
         descriptor = -1
         try:
-            descriptor = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+            descriptor = openat_create_retry(
+                temporary, flags, 0o600, dir_fd=directory_fd
+            )
             view = memoryview(encoded)
             while view:
                 written = os.write(descriptor, view)

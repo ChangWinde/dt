@@ -83,7 +83,10 @@ invoking service does not inherit ownership of active jobs.
 The agent resolves dependencies before probing GPU capacity. Dependencies can
 require success, any terminal completion, or selected typed result states. A
 false predicate becomes `skipped / dependency_skipped`. A pending dependency
-is a job-specific blocker, so unrelated runnable work can pass it. A failed or
+is a cheap local wait, re-checked every tick, and unrelated runnable work can
+pass it. A job-specific placement blocker (missing path, unfit or full node)
+also lets later work pass, but its own retries re-probe nodes, so they run on
+a capped exponential backoff instead of at full poll cadence. A failed or
 false dependency never consumes a GPU lease.
 
 Capacity waits retain FIFO fairness among jobs that can use the same capacity.
@@ -159,6 +162,21 @@ replicas rank ahead of the site cache at equal configured cost. Only a true
 cold miss uses the head-to-cache WAN leg. The selected peer tree and final
 destination are both fully re-hashed, so registry provenance alone is never
 treated as content proof.
+
+Verified routes additionally rank by measured capacity (ADR 0024). Every bulk
+transfer that moves enough data records `bytes/seconds` into a private,
+bounded per-edge link-metrics store, and `dt topology --measure` feeds the
+same store with bounded active streams. Ranking sorts by half-decade
+throughput bucket before the static score, so a proven-fast direct edge beats
+a proven-slow one without flapping between near-equals; an unmeasured edge
+ranks optimistically so it gets tried, measured, and settled. The head's own
+control route to each node is classified from evidence (a loopback dial or a
+loopback peer observed by the node's sshd means an frp/autossh-style tunnel;
+ProxyJump/ProxyCommand means a deliberate intermediary; the node seeing the
+head's own address proves a direct path; anything else stays opaque).
+Classification and measurements label `dt topology` and `dt doctor` and bias
+efficiency only - they never veto the sole working route, and host-key
+pinning, digest verification, and the route circuit stay authoritative.
 
 Discovery never scans address ranges or trusts names as topology. Automatic
 endpoints normally require a subnet advertised by both source and destination.

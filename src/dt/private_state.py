@@ -36,11 +36,34 @@ def ensure_private_directory(path: Path, *, create: bool = True) -> bool:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise PrivateStateError(f"private directory is unsafe: {path}")
     if stat.S_IMODE(info.st_mode) != 0o700:
+        # Only rewrite a wrong mode: read paths (list_all behind shell tab
+        # completion, status probes) call this constantly, and an
+        # unconditional chmod is a metadata write/ctime churn on every probe.
         try:
             path.chmod(0o700)
         except OSError as exc:
             raise PrivateStateError(f"cannot secure private directory: {path}") from exc
     return True
+
+
+def openat_create_retry(name: str, flags: int, mode: int, *, dir_fd: int) -> int:
+    """``os.open`` with ``O_CREAT`` under ``dir_fd``, retrying spurious ENOENT.
+
+    On macOS/APFS, concurrent ``openat(dir_fd, ..., O_CREAT)`` calls from
+    threads of one process can spuriously fail with ENOENT (~1e-4/op) even
+    though the directory exists. The retry is idempotent under O_CREAT and DT
+    lock/temp names are never deleted or reused, so a bounded retry is safe;
+    a real ENOENT (directory actually removed) still surfaces on the last
+    attempt.
+    """
+    attempts = 3
+    for attempt in range(attempts):
+        try:
+            return os.open(name, flags, mode, dir_fd=dir_fd)
+        except FileNotFoundError:
+            if attempt == attempts - 1:
+                raise
+    raise AssertionError("unreachable")
 
 
 def open_private_regular(

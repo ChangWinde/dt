@@ -202,6 +202,26 @@ def test_resolve_snapshot_backfill_requires_original_digest(tmp_path, monkeypatc
     assert tree_sha256(remote_code) in message
 
 
+def test_resolve_snapshot_backfill_unreachable_source_fails_over(tmp_path, monkeypatch):
+    # A transport-level backfill failure means the source node is currently
+    # unreachable, exactly like the main snapshot path; a DispatchError here
+    # would mark the fork/rerun rejected instead of retrying or failing over.
+    from dt.sshio import RemoteError
+
+    cfg = _cfg(tmp_path)
+    old = _entry(snapshot_sha256="b" * 64)
+
+    def unreachable_rsync(src, dst, **kwargs):
+        return subprocess.CompletedProcess(
+            [], 255, "", "ssh: connect to host n1 port 22: Connection refused"
+        )
+
+    monkeypatch.setattr(dispatch, "rsync", unreachable_rsync)
+
+    with pytest.raises(RemoteError, match="backfill failed"):
+        dispatch.resolve_snapshot(cfg, old)
+
+
 def test_fork_spec_defaults_to_actual_node_and_allows_command_override():
     old = _entry(pin_node=None)
     spec = dispatch.fork_spec_from_entry(

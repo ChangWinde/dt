@@ -2311,7 +2311,11 @@ def test_doctor_probe_preserves_complete_ssh_error_for_json(monkeypatch):
 
     row = doctor.check_node(Node(name="psibot-ds"))
 
-    assert row["checks"]["ssh"] == detail
+    # The full failure vocabulary must survive into JSON (nothing truncated
+    # away), while the remote endpoint identity is redacted (A31-3).
+    assert (
+        row["checks"]["ssh"] == "ssh: connect to host <addr> port 22: No route to host"
+    )
 
 
 def test_doctor_probe_reports_contract_runtime_dependencies(monkeypatch):

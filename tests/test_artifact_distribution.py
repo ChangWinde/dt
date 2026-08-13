@@ -1,3 +1,4 @@
+import shlex
 import subprocess
 import threading
 import json
@@ -10,6 +11,8 @@ from dt.artifact_distribution import (
     ArtifactRouteError,
     DistributionError,
     TransferExecutor,
+    _destination_prepare_rsync_path,
+    _route_failure_kind,
 )
 from dt.config import HeadConfig, Node, Site
 from dt.sshio import SSHWorkload
@@ -753,6 +756,74 @@ def test_explicit_direct_fallback_reacquires_destination_lock(tmp_path, monkeypa
     assert lock_depth == 0
     assert result.fallback_direct is True
     assert result.queue_seconds == 0.25
+
+
+def test_route_order_prefers_measured_capacity_then_static_score():
+    # ADR 0024: measured buckets rank first; unmeasured edges stay
+    # optimistic so they get tried and learned; proven tunnel-grade sinks.
+    from dt.artifact_distribution import _route_order_key
+
+    def _route(score, recorded_at, throughput_bps):
+        replica = ArtifactReplica(
+            kind="peer",
+            node=Node(name=f"n-{score}"),
+            code_dir="dt/jobs/x/code",
+            recorded_at=recorded_at,
+        )
+        return DiscoveredRoute(
+            replica=replica,
+            endpoint=None,
+            probe_latency_ms=1.0,
+            score=score,
+            throughput_bps=throughput_bps,
+        )
+
+    fast = _route(score=5.0, recorded_at=1.0, throughput_bps=200 * (1 << 20))
+    unmeasured_cheap = _route(score=0.1, recorded_at=2.0, throughput_bps=None)
+    tunnel = _route(score=0.0, recorded_at=3.0, throughput_bps=0.5 * (1 << 20))
+
+    ordered = sorted([tunnel, unmeasured_cheap, fast], key=_route_order_key)
+
+    assert [route.replica.node.name for route in ordered] == [
+        "n-5.0",
+        "n-0.1",
+        "n-0.0",
+    ]
+
+
+def test_lan_fanout_records_a_passive_throughput_sample(tmp_path, monkeypatch):
+    # A completed bulk transfer teaches the ranker at zero marginal cost.
+    import time as time_module
+
+    import dt.artifact_distribution as module
+
+    cfg = _cfg(tmp_path)
+    executor = TransferExecutor(cfg)
+
+    def fake_run_on(node, local, command, **kwargs):
+        time_module.sleep(0.3)
+        return subprocess.CompletedProcess([], 0, _stats(64 << 20, 3), "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
+
+    moved, files = executor._fanout(
+        cfg.sites["psibot"],
+        cfg.nodes[1],  # cache psibot-hm
+        cfg.nodes[2],  # destination psibot-ds
+        "d" * 64,
+        "~/dt/worker/jobs/j/code",
+        None,
+    )
+
+    assert moved == 64 << 20
+    sample = executor.link_metrics.sample(
+        "site:psibot",
+        cfg.nodes[1].name,
+        cfg.nodes[2].name,
+    )
+    assert sample is not None
+    assert sample.origin == "transfer"
+    assert sample.smoothed_bps > (32 << 20)  # ~64 MiB in ~0.3s
 
 
 def test_lan_fanout_does_not_retry_authentication_failure(tmp_path, monkeypatch):
@@ -1696,3 +1767,51 @@ def test_p2p_destination_with_spaces_survives_the_receiver_shell(tmp_path, monke
     )
 
     assert _receiver_shell_words(commands[0]) == ["dt/worker/my jobs/new/code/"]
+
+
+def test_destination_prepare_failure_identifies_itself(tmp_path):
+    # A symlinked destination kills the remote end before rsync starts; the
+    # local side then reads EOF/exit 12. Without the stderr marker that would
+    # classify as "transport" and poison the circuit for a healthy edge.
+    target = tmp_path / "dest"
+    (tmp_path / "real").mkdir()
+    target.symlink_to(tmp_path / "real")
+    command = _destination_prepare_rsync_path(shlex.quote(str(target))).removeprefix(
+        "--rsync-path="
+    )
+
+    # rsync appends its server argv after the --rsync-path string, like ssh.
+    proc = subprocess.run(
+        ["sh", "-c", f"{command} --server"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 1
+    assert "dt: destination prepare failed" in proc.stderr
+    assert _route_failure_kind(12, stderr=proc.stderr) is None
+
+
+def test_destination_prepare_success_execs_rsync_with_private_slot(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "rsync").write_text(
+        '#!/bin/sh\necho "FAKE_RSYNC_RAN $@"\n', encoding="utf-8"
+    )
+    (fake_bin / "rsync").chmod(0o755)
+    destination = tmp_path / "slot"
+    command = _destination_prepare_rsync_path(
+        shlex.quote(str(destination))
+    ).removeprefix("--rsync-path=")
+
+    proc = subprocess.run(
+        ["sh", "-c", f"{command} --server"],
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "FAKE_RSYNC_RAN --server" in proc.stdout
+    assert destination.is_dir()
+    assert (destination.stat().st_mode & 0o777) == 0o700
