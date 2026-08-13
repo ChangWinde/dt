@@ -2045,9 +2045,11 @@ def test_pull_multiple_ctrl_c_cancels_workers_and_prints_exact_resume(
         lite,
         force,
         retries,
+        route,
         cancel_event,
     ):
         assert retries == 0
+        assert route == "auto"
         if ref == "one":
             assert second_started.wait(timeout=1)
             raise KeyboardInterrupt
@@ -2124,6 +2126,7 @@ def test_pull_collection_uses_managed_root_and_job_subdirectories(
         _lite,
         _force,
         _retries,
+        _route,
         _cancel_event,
     ):
         destinations[ref] = destination
@@ -2784,6 +2787,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
                 "timeout": 4 * 3600,
                 "retries": 2,
                 "safe_links": True,
+                "stats": False,
             },
         ),
         (
@@ -2903,6 +2907,9 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
             "*.safetensors",
             "**/profiler/*trace.json*",
         ],
+        "route": "direct",
+        "route_gateway": None,
+        "route_reason": "job node belongs to no configured site",
         "application_outputs_recovered": False,
         "records_scope": "dt_reserved",
         "outputs_present": False,
@@ -2984,6 +2991,9 @@ def test_pull_json_success_contract(tmp_path, monkeypatch):
             "*.mp4",
         ],
         "remote_outputs_bytes": 16106127360,
+        "route": "direct",
+        "route_gateway": None,
+        "route_reason": "job node belongs to no configured site",
         "application_outputs_recovered": True,
         "records_scope": "dt_reserved",
         "records": ["dt/job.json", "dt/stdout.log"],

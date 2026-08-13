@@ -104,10 +104,12 @@ from .render import (
     out,
     ps_table,
 )
+from . import pull_relay
 from .sshio import (
     MAX_TRANSFER_RETRIES,
     RSYNC_RETRYABLE_EXIT_CODES,
     RSYNC_UNREACHABLE_EXIT_CODES,
+    diagnostic_excerpt,
     ssh_base,
     RemoteError,
     RsyncRetryEvent,
@@ -11720,6 +11722,14 @@ def _pull_unlocked(
         "--retries",
         help="link retries after the first attempt (0 = fail fast)",
     ),
+    route: str = typer.Option(
+        "auto",
+        "--route",
+        help=(
+            "outputs transfer route: auto stages via the site gateway when "
+            "the head dials the node through a tunnel; direct/gateway force"
+        ),
+    ),
     _cfg_override: HeadConfig | LaptopConfig | None = None,
     _result: JsonDict | None = None,
     _cancel_event: Event | None = None,
@@ -11727,6 +11737,17 @@ def _pull_unlocked(
 ) -> None:
     """Fetch outputs plus job metadata/stdout back to the head node."""
     retries = retries if isinstance(retries, int) else 2
+    route = route if isinstance(route, str) else "auto"
+    if route not in pull_relay.ROUTE_MODES:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"invalid --route {route!r}; "
+                f"choose one of {', '.join(pull_relay.ROUTE_MODES)}"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
     cfg = _cfg_override or _cfg()
     excludes = list(exclude or [])
     if lite:
@@ -11746,6 +11767,8 @@ def _pull_unlocked(
             argv.append("--force")
         if retries != 2:
             argv += ["--retries", str(retries)]
+        if route != "auto":
+            argv += ["--route", route]
         if json_:
             argv.append("--json")
         else:
@@ -12071,6 +12094,13 @@ def _pull_unlocked(
         )
         return paths
 
+    pull_route = pull_relay.decide_pull_route(
+        cfg,
+        entry.node,
+        outputs_bytes=remote_outputs_bytes,
+        mode=route,
+    )
+    relay_error: str | None = None
     if outputs_present:
         src = rsync_destination(
             entry.node,
@@ -12078,6 +12108,55 @@ def _pull_unlocked(
             outputs_rel,
             directory=True,
         )
+        if pull_route.route == "gateway" and pull_route.gateway is not None:
+            # Leg A (ADR 0025): stage outputs onto the site gateway over the
+            # LAN so the slow head tunnel never carries the bulk bytes. Any
+            # failure falls back to the unchanged direct pull below.
+            gateway_name = pull_route.gateway.name
+            try:
+                if json_:
+                    pull_relay.stage_outputs(
+                        cfg,
+                        pull_route,
+                        entry.job_id,
+                        entry.job_dir,
+                        excludes=output_excludes,
+                        estimate_bytes=remote_outputs_bytes,
+                    )
+                else:
+                    with err.status(
+                        f"staging outputs {entry.node} -> {gateway_name} "
+                        "over the site LAN..."
+                    ):
+                        pull_relay.stage_outputs(
+                            cfg,
+                            pull_route,
+                            entry.job_id,
+                            entry.job_dir,
+                            excludes=output_excludes,
+                            estimate_bytes=remote_outputs_bytes,
+                        )
+                src = (
+                    f"{gateway_name}:"
+                    + shlex.quote(
+                        pull_relay.staging_relative(entry.job_id) + "/outputs"
+                    )
+                    + "/"
+                )
+            except pull_relay.RelayError as exc:
+                relay_error = str(exc)
+                pull_route = pull_relay.PullRoute(
+                    "direct",
+                    None,
+                    None,
+                    None,
+                    "gateway staging failed; recovered over the direct route",
+                )
+                if not json_:
+                    err.print(
+                        f"[yellow]gateway relay failed:[/yellow] {escape(relay_error)}"
+                    )
+                    err.print("[dim]falling back to the direct route[/dim]")
         # resilient by design: --partial + 2 retries resume where the link
         # broke, with a 4h budget for multi-GB checkpoints.
         if lite and not json_:
@@ -12111,29 +12190,87 @@ def _pull_unlocked(
             if remote_outputs_bytes is not None and not excludes
             else ""
         )
-        if json_:
-            proc = rsync(
-                src,
-                f"{dst}/",
-                excludes=output_excludes,
-                timeout=4 * 3600,
-                retries=retries,
-                safe_links=True,
-                on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
-                **cancel_kwargs,
-            )
-        else:
-            with err.status(f"pulling {pull_size}outputs from {entry.node}..."):
-                proc = rsync(
-                    src,
+
+        def run_outputs_rsync(
+            source: str,
+            label: str,
+            *,
+            stats: bool,
+        ) -> subprocess.CompletedProcess[str]:
+            if json_:
+                return rsync(
+                    source,
                     f"{dst}/",
                     excludes=output_excludes,
                     timeout=4 * 3600,
                     retries=retries,
                     safe_links=True,
+                    stats=stats,
                     on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
                     **cancel_kwargs,
                 )
+            with err.status(f"pulling {pull_size}outputs from {label}..."):
+                return rsync(
+                    source,
+                    f"{dst}/",
+                    excludes=output_excludes,
+                    timeout=4 * 3600,
+                    retries=retries,
+                    safe_links=True,
+                    stats=stats,
+                    on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
+                    **cancel_kwargs,
+                )
+
+        relayed = pull_route.route == "gateway" and pull_route.gateway is not None
+        source_label = (
+            f"{pull_route.gateway.name} (staged)"
+            if relayed and pull_route.gateway is not None
+            else entry.node
+        )
+        leg_started = time.monotonic()
+        proc = run_outputs_rsync(src, source_label, stats=relayed)
+        if relayed and proc.returncode == 0:
+            # Leg B succeeded: feed the evidence base and drop the capsule.
+            pull_relay.record_pull_leg(
+                cfg,
+                pull_route,
+                proc.stdout or "",
+                time.monotonic() - leg_started,
+            )
+            if not pull_relay.cleanup_staging(pull_route, entry.job_id):
+                if not json_:
+                    err.print(
+                        "[dim]gateway staging cleanup deferred; the 7-day "
+                        "sweep will finish it[/dim]"
+                    )
+        elif relayed and proc.returncode != 0:
+            # Leg B failed: the staged capsule stays for resume, but this
+            # pull still owes the user their data over the direct route.
+            relay_error = diagnostic_excerpt(
+                proc.stderr,
+                None,
+                fallback=f"staged transfer exited {proc.returncode}",
+            )
+            pull_route = pull_relay.PullRoute(
+                "direct",
+                None,
+                None,
+                None,
+                "gateway leg failed; recovered over the direct route",
+            )
+            if not json_:
+                err.print(
+                    f"[yellow]staged transfer failed:[/yellow] {escape(relay_error)}"
+                )
+                err.print("[dim]falling back to the direct route[/dim]")
+            src = rsync_destination(
+                entry.node,
+                entry.node_local,
+                outputs_rel,
+                directory=True,
+            )
+            proc = run_outputs_rsync(src, entry.node, stats=False)
         if proc.returncode != 0:
             detail = (proc.stderr or f"rsync exited {proc.returncode}").strip()
             retry_note = (
@@ -12247,6 +12384,12 @@ def _pull_unlocked(
         "destination": str(dst),
         "lite": lite,
         "excludes": excludes,
+        "route": pull_route.route,
+        "route_gateway": (
+            pull_route.gateway.name if pull_route.gateway is not None else None
+        ),
+        "route_reason": pull_route.reason,
+        **({"relay_error": relay_error} if relay_error is not None else {}),
         **(
             {"remote_outputs_bytes": remote_outputs_bytes}
             if remote_outputs_bytes is not None
@@ -12346,6 +12489,7 @@ def _pull_group_one(
     lite: bool,
     force: bool,
     retries: int,
+    route: str,
     cancel_event: Event,
 ) -> JsonDict:
     result: JsonDict = {}
@@ -12359,6 +12503,7 @@ def _pull_group_one(
                 force,
                 True,
                 retries,
+                route=route,
                 _cfg_override=cfg,
                 _result=result,
                 _cancel_event=cancel_event,
@@ -12413,6 +12558,14 @@ def pull(
         "--retries",
         help="link retries after the first attempt (0 = fail fast)",
     ),
+    route: str = typer.Option(
+        "auto",
+        "--route",
+        help=(
+            "outputs transfer route: auto stages via the site gateway when "
+            "the head dials the node through a tunnel; direct/gateway force"
+        ),
+    ),
     file: Optional[Path] = typer.Option(
         None,
         "--file",
@@ -12458,6 +12611,17 @@ def pull(
         operation="pull",
         json_=json_,
     )
+    route = route if isinstance(route, str) else "auto"
+    if route not in pull_relay.ROUTE_MODES:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"invalid --route {route!r}; "
+                f"choose one of {', '.join(pull_relay.ROUTE_MODES)}"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         if len(refs) == 1:
@@ -12469,6 +12633,7 @@ def pull(
                 force,
                 json_,
                 retries,
+                route=route,
                 _cfg_override=cfg,
                 _collection=collection,
             )
@@ -12500,6 +12665,8 @@ def pull(
             argv.append("--force")
         if retries != 2:
             argv += ["--retries", str(retries)]
+        if route != "auto":
+            argv += ["--route", route]
         if json_:
             argv.append("--json")
         else:
@@ -12532,6 +12699,7 @@ def pull(
             force,
             json_,
             retries,
+            route=route,
             _cfg_override=cfg,
             _collection=collection,
         )
@@ -12566,6 +12734,7 @@ def pull(
                     force,
                     json_,
                     retries,
+                    route=route,
                     _cfg_override=cfg,
                     _collection=collection,
                 )
@@ -12583,6 +12752,8 @@ def pull(
                 resume.append("--force")
             if retries != 2:
                 resume += ["--retries", str(retries)]
+            if route != "auto":
+                resume += ["--route", route]
             if json_:
                 resume.append("--json")
             _pull_interrupted(
@@ -12645,6 +12816,7 @@ def pull(
                 lite,
                 force,
                 retries,
+                route,
                 cancel_event,
             ): index
             for index, ref, entry, destination in work_items
@@ -12682,6 +12854,8 @@ def pull(
             resume.append("--force")
         if retries != 2:
             resume += ["--retries", str(retries)]
+        if route != "auto":
+            resume += ["--route", route]
         if json_:
             resume.append("--json")
         _pull_interrupted(
