@@ -129,5 +129,9 @@ an ordinary resume. JSON reports the outcome additively in `dt_pull_v1`:
   retention on failure.
 - Behavioral: relay leg failure falls back to a successful direct pull;
   JSON carries `route`/`relay_error`; passive samples land in both scopes.
+- End-to-end: a one-shot loopback sshd executes the staging leg for real
+  (three shell layers, strict host keys, safe-links, df guard, GC, private
+  capsule chain, resume, cleanup) so command-string unit tests can never
+  drift from what the shells actually parse.
 - The full suite must stay green; pull's existing contract tests are the
   regression net for the direct path.
