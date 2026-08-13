@@ -235,6 +235,43 @@ def _stat_total(pattern: re.Pattern[str], stdout: str) -> int | None:
     return total if found else None
 
 
+def inner_lan_ssh(port: int) -> str:
+    """The intra-site SSH transport for bulk data between site members.
+
+    Proxies are disabled on purpose: this hop must ride the LAN edge, never
+    loop back through the head's tunnel. Host keys stay strict against the
+    executing node's own known_hosts. Shared by snapshot fan-out, P2P
+    transfers, and gateway-staged pull (ADR 0025).
+    """
+    return shlex.join(
+        [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=3",
+            "-o",
+            "ServerAliveInterval=15",
+            "-o",
+            "ServerAliveCountMax=4",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "ProxyJump=none",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            "-o",
+            "ControlMaster=auto",
+            "-o",
+            "ControlPath=~/.ssh/dt/artifact/%C",
+            "-o",
+            "ControlPersist=300",
+            "-p",
+            str(port),
+        ]
+    )
+
+
 def _cache_root(cfg: HeadConfig, site: Site, cache_node: Node) -> str:
     if site.cache_root is not None:
         return site.cache_root
@@ -658,33 +695,7 @@ class TransferExecutor:
 
     @staticmethod
     def _inner_ssh(port: int) -> str:
-        return shlex.join(
-            [
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "-o",
-                "ConnectTimeout=3",
-                "-o",
-                "ServerAliveInterval=15",
-                "-o",
-                "ServerAliveCountMax=4",
-                "-o",
-                "ProxyCommand=none",
-                "-o",
-                "ProxyJump=none",
-                "-o",
-                "StrictHostKeyChecking=yes",
-                "-o",
-                "ControlMaster=auto",
-                "-o",
-                "ControlPath=~/.ssh/dt/artifact/%C",
-                "-o",
-                "ControlPersist=300",
-                "-p",
-                str(port),
-            ]
-        )
+        return inner_lan_ssh(port)
 
     def _fanout(
         self,

@@ -113,6 +113,13 @@ into `info`, `logs`, and `agent status` for detailed evidence.
 Pull retries and resumes interrupted transfers. Use `--lite` or repeatable
 `--exclude` filters when large checkpoints are not needed.
 
+When the head reaches the job node only through a tunnel and the node's site
+configures a directly reachable `gateway`, `dt pull` automatically stages
+outputs through that gateway over the site LAN (`--route auto`; ADR 0025).
+The JSON payload reports `route`, `route_gateway`, and `route_reason`;
+`relay_error` appears when staging failed and the pull recovered over the
+direct route. Force behavior with `--route direct` or `--route gateway`.
+
 `dt topology --json` classifies every head-to-node control route: `relayed`
 means the SSH route enters a local tunnel (frp/autossh) whose low bandwidth
 bulk transfers would inherit — join the node to a site or pin `lan_address`

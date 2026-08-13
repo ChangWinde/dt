@@ -255,6 +255,22 @@ resumable and preserves partial data on interruption. `--force` can merge into
 a nonempty or differently owned directory and should be reserved for a
 reviewed recovery case.
 
+### Gateway-staged recovery
+
+When the head dials the job node through a tunnel (an frp/autossh loopback
+forward or a `ProxyJump`), `dt pull --route auto` (the default) stages
+`outputs/` from the node onto the configured site `gateway` over the site LAN
+and then pulls the staged copy over the gateway's better route (ADR 0025).
+The decision uses only local `ssh -G` evidence, requires a known outputs size
+of at least 64 MiB, and any failure — gateway unreachable, staging disk full,
+staged transfer error — falls back to the direct pull automatically. JSON
+output reports `route`, `route_gateway`, `route_reason`, and `relay_error`
+when a fallback happened. `--route direct` pins today's behavior;
+`--route gateway` forces staging where the site topology allows it. Staged
+capsules live under `~/.dt/pull-staging/<job-id>` on the gateway, are private
+(0700), deleted after a successful pull, kept for resume after a failed one,
+and swept after seven days when abandoned.
+
 ## Storage inventory
 
 ```bash
