@@ -3,13 +3,156 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat as stat_module
 import shutil
 import subprocess
 import time
+from collections.abc import Iterator
 from pathlib import Path
+
+import pytest
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def _process_start_ticks(pid: int) -> int | None:
+    """Return the Linux process identity component that survives PID reuse."""
+    try:
+        stat = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    end = stat.rfind(")")
+    if end < 0:
+        raise AssertionError(f"invalid /proc stat for fake agent pid {pid}")
+    fields = stat[end + 2 :].split()
+    if len(fields) <= 19:
+        raise AssertionError(f"truncated /proc stat for fake agent pid {pid}")
+    if fields[0] == "Z":
+        return None
+    return int(fields[19])
+
+
+def _owned_fake_agent_identity(pid: int, root: Path) -> int | None:
+    """Validate that a PID still names a fake agent owned by this test root."""
+    start_ticks = _process_start_ticks(pid)
+    if start_ticks is None:
+        return None
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    argv = [os.fsdecode(part) for part in raw.split(b"\0") if part]
+    if len(argv) != 4 or Path(argv[0]).name != "bash" or argv[2:] != ["agent", "run"]:
+        if _process_start_ticks(pid) != start_ticks:
+            return None
+        raise AssertionError(f"refusing to control unexpected fake-agent pid {pid}")
+    command = Path(argv[1]).resolve(strict=False)
+    try:
+        command.relative_to(root.resolve(strict=False))
+    except ValueError as exc:
+        raise AssertionError(
+            f"refusing to control fake-agent pid {pid} outside {root}"
+        ) from exc
+    return start_ticks
+
+
+def _wait_for_owned_fake_agent_identity(
+    pid: int, root: Path, timeout: float
+) -> int | None:
+    """Wait through fork-to-exec while retaining fail-closed identity checks."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return _owned_fake_agent_identity(pid, root)
+        except AssertionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _same_process(pid: int, start_ticks: int) -> bool:
+    return _process_start_ticks(pid) == start_ticks
+
+
+def _wait_for_process_exit(pid: int, start_ticks: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _same_process(pid, start_ticks) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return not _same_process(pid, start_ticks)
+
+
+def _create_stop_lease(path: Path) -> None:
+    """Create a private cooperative-stop marker without following links."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        metadata = path.lstat()
+        if not stat_module.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise AssertionError(f"unsafe existing fake-agent stop lease: {path}")
+    else:
+        os.close(fd)
+
+
+def _reap_owned_fake_agents(root: Path) -> set[int]:
+    """Reap owned agents and return those that were live before cleanup."""
+    records: dict[int, set[Path]] = {}
+    errors: list[str] = []
+    ownership_files = sorted(root.rglob(".fake-dt-agent.owned"))
+    pidfiles = sorted(root.rglob(".fake-dt-agent.pid"))
+    for path in [*ownership_files, *pidfiles]:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.isascii() or not line.isdecimal():
+                errors.append(f"invalid fake-agent pid record in {path}")
+                continue
+            pid = int(line)
+            if pid <= 1:
+                errors.append(f"unsafe fake-agent pid {pid} in {path}")
+                continue
+            records.setdefault(pid, set()).add(path.parent)
+    for pid, owners in records.items():
+        if len(owners) > 1:
+            errors.append(f"fake-agent pid {pid} has conflicting owners")
+
+    live_owned: set[int] = set()
+    for pid, state_roots in sorted(records.items()):
+        try:
+            start_ticks = _wait_for_owned_fake_agent_identity(pid, root, 1.0)
+        except AssertionError as exc:
+            errors.append(str(exc))
+            continue
+        if start_ticks is None:
+            continue
+        live_owned.add(pid)
+        for state_root in sorted(state_roots):
+            try:
+                _create_stop_lease(state_root / f".fake-dt-agent.stop.{pid}")
+            except (AssertionError, OSError) as exc:
+                errors.append(str(exc))
+        if not _wait_for_process_exit(pid, start_ticks, 1.0):
+            errors.append(f"fake agent pid {pid} survived test cleanup")
+
+    survivors: list[int] = []
+    for pid in sorted(records):
+        try:
+            if _owned_fake_agent_identity(pid, root) is not None:
+                survivors.append(pid)
+        except AssertionError as exc:
+            errors.append(str(exc))
+    if survivors:
+        errors.append(f"fake agent processes leaked: {survivors}")
+    if errors:
+        raise AssertionError("; ".join(errors))
+    return live_owned
+
+
+@pytest.fixture(autouse=True)
+def _fake_agent_process_cleanup(tmp_path: Path) -> Iterator[None]:
+    """Make fake deploy processes test-owned resources even after assertion failures."""
+    yield
+    leaked = _reap_owned_fake_agents(tmp_path)
+    assert leaked == set(), f"test returned with live fake agents: {sorted(leaked)}"
 
 
 def _write_executable(path: Path, content: str) -> None:
@@ -146,8 +289,28 @@ if [[ "\${1:-}" == "agent" ]]; then
     fi
     if [[ "\${2:-}" == "run" \
           && "\${DT_FAKE_AGENT_LEGACY_VERSION:-}" == "$version" ]]; then
-        trap 'exit 0' TERM INT
-        while :; do sleep 60 & wait \$!; done
+        stop_file="\$HOME/.fake-dt-agent.stop.\$\$"
+        owner_pid="\${DT_FAKE_AGENT_OWNER_PID:-}"
+        owner_start_ticks="\${DT_FAKE_AGENT_OWNER_START_TICKS:-}"
+        (umask 077; printf '%s\\n' "\$\$" >> "\$HOME/.fake-dt-agent.owned")
+        while [[ ! -e "\$stop_file" ]]; do
+            if [[ ! "\$owner_pid" =~ ^[0-9]+$ || "\$owner_pid" -le 1 \
+                  || ! "\$owner_start_ticks" =~ ^[0-9]+$ ]]; then
+                exit 0
+            fi
+            owner_stat=""
+            IFS= read -r owner_stat < "/proc/\$owner_pid/stat" || exit 0
+            owner_fields="\${owner_stat##*) }"
+            owner_parts=()
+            read -r -a owner_parts <<< "\$owner_fields"
+            if [[ "\${#owner_parts[@]}" -le 19 \
+                  || "\${owner_parts[0]}" == "Z" \
+                  || "\${owner_parts[19]}" != "\$owner_start_ticks" ]]; then
+                exit 0
+            fi
+            sleep 0.05
+        done
+        exit 0
     fi
     if [[ "\${2:-}" == "status" && "\${DT_FAKE_AGENT_RUNNING:-0}" == "1" ]]; then
         if [[ "\${DT_FAKE_AGENT_LEGACY_VERSION:-}" == "$version" ]]; then
@@ -179,12 +342,25 @@ if [[ "\${1:-}" == "agent" ]]; then
         if [[ "\${2:-}" == "stop" ]]; then
             if [[ -f "\$pidfile" ]]; then
                 read -r pid < "\$pidfile"
-                kill "\$pid" 2>/dev/null || true
+                if [[ "\$pid" =~ ^[0-9]+$ && "\$pid" -gt 1 ]] \
+                   && kill -0 "\$pid" 2>/dev/null; then
+                    stop_file="\$HOME/.fake-dt-agent.stop.\$pid"
+                    (umask 077; set -o noclobber; : > "\$stop_file") 2>/dev/null || {
+                        [[ -f "\$stop_file" && ! -L "\$stop_file" \
+                           && -O "\$stop_file" ]] || exit 1
+                    }
+                    for ((attempt = 0; attempt < 100; attempt++)); do
+                        kill -0 "\$pid" 2>/dev/null || break
+                        sleep 0.01
+                    done
+                    kill -0 "\$pid" 2>/dev/null && exit 1
+                fi
                 rm -f "\$pidfile"
             fi
         elif [[ "\${DT_FAKE_AGENT_LEGACY_VERSION:-}" == "$version" ]]; then
             dt agent run >/dev/null 2>&1 &
-            printf '%s\\n' "\$!" > "\$pidfile"
+            agent_pid=\$!
+            printf '%s\\n' "\$agent_pid" > "\$pidfile"
         fi
         if [[ -n "\${DT_FAKE_AGENT_LOG:-}" ]]; then
             printf '%s\\n' "\${2}" >> "\${DT_FAKE_AGENT_LOG}"
@@ -288,9 +464,13 @@ fi
 exit 1
 """,
     )
+    owner_start_ticks = _process_start_ticks(os.getpid())
+    assert owner_start_ticks is not None
     env = os.environ.copy()
     env.update(
         {
+            "DT_FAKE_AGENT_OWNER_PID": str(os.getpid()),
+            "DT_FAKE_AGENT_OWNER_START_TICKS": str(owner_start_ticks),
             "FAKE_REMOTE_ROOT": str(remote),
             "PATH": f"{fake_bin}:{env['PATH']}",
         }
@@ -313,6 +493,104 @@ def _installed_version(remote_home: Path) -> str:
         [str(remote_home / ".local" / "bin" / "dt")],
         text=True,
     ).strip()
+
+
+def _start_cleanup_test_agent(tmp_path: Path) -> tuple[int, int]:
+    env, remote_home = _transport(tmp_path)
+    release = _release(tmp_path, "0.9.0", "cleanup")
+    deployed = _deploy(env, str(release), "head")
+    assert deployed.returncode == 0, deployed.stdout + deployed.stderr
+    command = remote_home / ".local" / "bin" / "dt"
+    agent_env = env.copy()
+    agent_env.update(
+        {
+            "DT_FAKE_AGENT_LEGACY_VERSION": "0.9.0",
+            "HOME": str(remote_home),
+            "PATH": f"{command.parent}:{env['PATH']}",
+        }
+    )
+    started = subprocess.run(
+        [str(command), "agent", "start"],
+        env=agent_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert started.returncode == 0, started.stdout + started.stderr
+    pid = int((remote_home / ".fake-dt-agent.pid").read_text(encoding="utf-8"))
+    start_ticks = _wait_for_owned_fake_agent_identity(pid, tmp_path, 1.0)
+    assert start_ticks is not None
+    ownership = remote_home / ".fake-dt-agent.owned"
+    deadline = time.monotonic() + 1.0
+    while (
+        not ownership.exists()
+        or str(pid) not in ownership.read_text(encoding="utf-8").splitlines()
+    ) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert str(pid) in ownership.read_text(encoding="utf-8").splitlines()
+    return pid, start_ticks
+
+
+def test_fake_agent_cleanup_reaps_an_owned_background_process(tmp_path):
+    pid, start_ticks = _start_cleanup_test_agent(tmp_path)
+
+    assert _reap_owned_fake_agents(tmp_path) == {pid}
+
+    assert _wait_for_process_exit(pid, start_ticks, 0.1)
+
+
+def test_fake_agent_cleanup_continues_after_a_bad_ownership_record(tmp_path):
+    pid, start_ticks = _start_cleanup_test_agent(tmp_path)
+    ownership = next(tmp_path.rglob(".fake-dt-agent.owned"))
+    ownership.write_text(f"not-a-pid\n{pid}\n", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="invalid fake-agent pid record"):
+        _reap_owned_fake_agents(tmp_path)
+
+    assert _wait_for_process_exit(pid, start_ticks, 0.1)
+    ownership.write_text(f"{pid}\n", encoding="utf-8")
+
+
+def test_fake_agent_stop_lease_rejects_a_symlink(tmp_path):
+    outside = tmp_path / "outside"
+    stop_lease = tmp_path / ".fake-dt-agent.stop.42"
+    stop_lease.symlink_to(outside)
+
+    with pytest.raises(AssertionError, match="unsafe existing fake-agent stop lease"):
+        _create_stop_lease(stop_lease)
+
+    assert not outside.exists()
+
+
+def test_fake_legacy_agent_exits_when_owner_identity_changes(tmp_path):
+    env, remote_home = _transport(tmp_path)
+    release = _release(tmp_path, "0.9.0", "owner-mismatch")
+    assert _deploy(env, str(release), "head").returncode == 0
+    command = remote_home / ".local" / "bin" / "dt"
+    agent_env = env.copy()
+    agent_env.update(
+        {
+            "DT_FAKE_AGENT_LEGACY_VERSION": "0.9.0",
+            "DT_FAKE_AGENT_OWNER_START_TICKS": "0",
+            "HOME": str(remote_home),
+            "PATH": f"{command.parent}:{env['PATH']}",
+        }
+    )
+
+    started = subprocess.run(
+        [str(command), "agent", "start"],
+        env=agent_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert started.returncode == 0, started.stdout + started.stderr
+    pid = int((remote_home / ".fake-dt-agent.pid").read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 1.0
+    while _process_start_ticks(pid) is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert _process_start_ticks(pid) is None
 
 
 def test_deploy_upgrade_and_explicit_rollback_are_atomic(tmp_path):
@@ -366,11 +644,22 @@ def test_rollback_uses_current_bootstrap_for_a_legacy_retained_release(tmp_path)
     assert (base / "active-command").read_text(encoding="utf-8") == f"{custom_dt}\n"
     marker = base / "current"
     assert marker.readlink() == Path("releases/0.9.0")
-    subprocess.run(
+    pidfile = remote_home / ".fake-dt-agent.pid"
+    agent_pid = int(pidfile.read_text(encoding="utf-8"))
+    start_ticks = _owned_fake_agent_identity(agent_pid, tmp_path)
+    assert start_ticks is not None
+    # Direct execution bypasses fake SSH, so bind HOME to the fake remote explicitly.
+    stop_env = env.copy()
+    stop_env["HOME"] = str(remote_home)
+    stopped = subprocess.run(
         [str(custom_dt), "agent", "stop"],
-        env=env,
-        check=True,
+        env=stop_env,
+        capture_output=True,
+        text=True,
+        check=False,
     )
+    assert stopped.returncode == 0, stopped.stdout + stopped.stderr
+    assert _wait_for_process_exit(agent_pid, start_ticks, 1.0)
 
 
 def test_deploy_bounds_a_hung_resident_agent_preflight(tmp_path):
