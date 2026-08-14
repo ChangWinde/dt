@@ -12,10 +12,21 @@ dt run -g 1 -n baseline -- python train.py --seed 7
 Use `-f` when the calling shell should follow and return the process exit code.
 Without `-f`, stdout ends with the bare job ID so scripts can capture it.
 
+Inspect the submission decision without creating any state:
+
+```bash
+dt run --plan --json -- python train.py --seed 7
+```
+
+The preview includes placement and queue reasons, source bytes, and environment
+cache status. Capacity can change after the preview; a plan does not reserve a
+node or GPU.
+
 Useful guards:
 
 ```bash
 dt run -g 1 -n bounded \
+  --min-vram-mib 40000 \
   --max-hours 12 \
   --max-vram-mib 23500 \
   --max-job-memory-mib 60000 \
@@ -23,8 +34,25 @@ dt run -g 1 -n bounded \
   -- python train.py
 ```
 
+`--min-vram-mib` requires that every selected GPU expose at least that much
+total device memory. Missing or malformed GPU-memory inventory is ineligible;
+CPU-only jobs do not depend on GPU inventory. This placement constraint is
+separate from the `--max-vram-mib` runtime usage guard.
+
 A guard violation terminates the complete managed process tree and leaves
 structured evidence under `outputs/dt/`.
+
+Export a value locally, then import its name with repeatable `--env NAME`:
+
+```bash
+export DATASET_SPLIT=validation
+dt run --env DATASET_SPLIT -- python evaluate.py
+```
+
+dt sends the value through private stdin and records it for exact `rerun`/`fork`
+behavior, while public output exposes names only. The value remains stored
+under the trusted Unix identity; use an external secret manager when that
+persistence contract is not acceptable.
 
 ## Independent sweep
 

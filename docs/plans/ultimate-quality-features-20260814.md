@@ -37,15 +37,15 @@ is a cache hit, and how many bytes of source the snapshot would ship.
 Read-only, JSON-first, built on the scheduler-explanation machinery that
 `dt free --explain` already trusts.
 
-### 4. Recorded job environment: `--env KEY=VALUE`
+### 4. Recorded job environment: `--env NAME`
 
 Real training runs need `WANDB_API_KEY`, `HF_TOKEN`, dataset toggles.
 Today those must live in node shell profiles — invisible to the spec, so
 `rerun` cannot faithfully replay them and two nodes can silently disagree.
-A repeatable `--env` records the pair in the job spec (job.json), injects
-it through the launch path, and replays on `rerun`/`fork`. The operation
-journal already never records argv, so secrets stay out of shared state;
-`dt info` reports the keys (values live only in the job's own record).
+A repeatable `--env NAME` imports the value from the caller, forwards it over
+private stdin, records it in the private job spec, and replays it on
+`rerun`/`fork`. Values never enter DT or SSH argv; `dt info` reports names only
+(values live in the job's owner-only record).
 
 ## Deliberately deferred, with reasons
 

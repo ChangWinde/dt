@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted; authentication detail superseded by ADR 0030
 
 ## Context
 

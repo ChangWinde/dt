@@ -34,7 +34,7 @@ the adjacent `bootstrap.sh`:
 
 ```bash
 bash bootstrap.sh \
-  disttrainer-0.8.0-py3-none-any.whl \
+  disttrainer-0.9.0-py3-none-any.whl \
   runtime-constraints.txt
 export PATH="${UV_TOOL_BIN_DIR:-$HOME/.local/bin}:$PATH"
 dt --version
