@@ -105,10 +105,5 @@ jobs:
       - name: Install Python
         run: uv python install 3.11
 
-      - name: Sync locked security environment
-        env:
-          UV_PYTHON: "3.11"
-        run: uv sync --locked --no-dev --group security
-
       - name: Audit source and runtime dependencies
         run: scripts/security-check.sh

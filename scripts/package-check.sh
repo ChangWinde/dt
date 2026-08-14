@@ -42,7 +42,15 @@ fi
 
 uv lock --check "${UV_NETWORK[@]}"
 if [[ "${DT_PACKAGE_SKIP_SYNC:-0}" != "1" ]]; then
+    # Qualification may run beside tests or CLI smoke checks. Never replace
+    # the checkout's shared .venv merely because this matrix leg targets a
+    # different supported Python minor.
+    PACKAGE_ENV="$WORK_DIR/project-env"
+    export UV_PROJECT_ENVIRONMENT="$PACKAGE_ENV"
     uv sync --locked --all-groups "${UV_NETWORK[@]}"
+    # `uv build --no-build-isolation` selects its backend interpreter through
+    # UV_PYTHON, independently of UV_PROJECT_ENVIRONMENT.
+    export UV_PYTHON="$PACKAGE_ENV/bin/python"
 fi
 
 uv build --no-build-isolation "${UV_NETWORK[@]}" --out-dir "$BUILD_A"

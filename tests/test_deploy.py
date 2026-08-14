@@ -61,9 +61,37 @@ if [[ "${DT_BLOCK_VERSION:-}" == "$version" ]]; then
     : > "$DT_BLOCK_DIR/entered"
     while [[ ! -e "$DT_BLOCK_DIR/release" ]]; do sleep 0.01; done
 fi
-mkdir -p "$HOME/.local/bin"
-printf '#!/usr/bin/env bash\necho "dt %s"\n' "$version" > "$HOME/.local/bin/dt"
-chmod 700 "$HOME/.local/bin/dt"
+tool_bin=${UV_TOOL_BIN_DIR:-$HOME/.local/bin}
+mkdir -p "$tool_bin"
+cat > "$tool_bin/dt" <<FAKE_DT
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "agent" ]]; then
+    if [[ "\${2:-}" == "status" && "\${DT_FAKE_AGENT_RUNNING:-0}" == "1" ]]; then
+        stale=false
+        if [[ "\${DT_FAKE_AGENT_ATTEST_FAIL_VERSION:-}" == "$version" ]]; then
+            stale=true
+        fi
+        printf '{"alive":true,"runtime_command_available":true,"runtime_command_stale":%s,"runtime_command_target":"active","active_command_target":"active"}\\n' "\$stale"
+        exit 0
+    fi
+    if [[ "\${2:-}" == "stop" || "\${2:-}" == "start" ]]; then
+        if [[ -n "\${DT_FAKE_AGENT_LOG:-}" ]]; then
+            printf '%s\\n' "\${2}" >> "\${DT_FAKE_AGENT_LOG}"
+        fi
+        exit 0
+    fi
+fi
+echo "dt $version"
+FAKE_DT
+chmod 700 "$tool_bin/dt"
+if [[ -n "${DT_ACTIVATION_ROOT:-}" ]]; then
+    printf '%s\n' "$tool_bin/dt" > "$DT_ACTIVATION_ROOT/active-command"
+    if [[ -n "${DT_RELEASE_MARKER_TARGET:-}" ]]; then
+        next="$DT_ACTIVATION_ROOT/.current.fake.$$"
+        ln -s "$DT_RELEASE_MARKER_TARGET" "$next"
+        mv -Tf "$next" "$DT_ACTIVATION_ROOT/current"
+    fi
+fi
 """,
     )
     checksummed = [
@@ -120,6 +148,13 @@ host=$1
 shift
 home="$FAKE_REMOTE_ROOT/$host"
 mkdir -p "$home"
+if [[ -n "${FAKE_SSH_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$FAKE_SSH_LOG"
+fi
+if [[ "${FAKE_REMOTE_NO_BASH:-0}" == "1" \
+      && "$*" == "command -v bash >/dev/null 2>&1" ]]; then
+    exit 127
+fi
 PATH="${FAKE_REMOTE_PATH:-$PATH}" HOME="$home" /bin/bash -c "$1"
 """,
     )
@@ -199,6 +234,91 @@ def test_deploy_upgrade_and_explicit_rollback_are_atomic(tmp_path):
     assert rollback.returncode == 0, rollback.stderr
     assert _installed_version(remote_home) == "dt 0.9.0"
     assert (base / "current").readlink() == Path("releases/0.9.0")
+
+
+def test_upgrade_and_rollback_restart_and_attest_a_resident_agent(tmp_path):
+    env, _remote_home = _transport(tmp_path)
+    first = _release(tmp_path, "0.9.0")
+    second = _release(tmp_path, "0.9.1")
+    agent_log = tmp_path / "agent-actions.log"
+    env["DT_FAKE_AGENT_RUNNING"] = "1"
+    env["DT_FAKE_AGENT_LOG"] = str(agent_log)
+
+    assert _deploy(env, str(first), "head").returncode == 0
+    upgraded = _deploy(env, str(second), "head")
+    rolled_back = _deploy(env, "--rollback", "0.9.0", "head")
+
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+    assert rolled_back.returncode == 0, rolled_back.stdout + rolled_back.stderr
+    assert agent_log.read_text("utf-8").splitlines() == [
+        "stop",
+        "start",
+        "stop",
+        "start",
+    ]
+
+
+def test_agent_attestation_failure_rolls_back_activation(tmp_path):
+    env, remote_home = _transport(tmp_path)
+    first = _release(tmp_path, "0.9.0")
+    second = _release(tmp_path, "0.9.1")
+    env["DT_FAKE_AGENT_RUNNING"] = "1"
+    env["DT_FAKE_AGENT_ATTEST_FAIL_VERSION"] = "0.9.1"
+
+    assert _deploy(env, str(first), "head").returncode == 0
+    refused = _deploy(env, str(second), "head")
+
+    assert refused.returncode == 1
+    assert "identity; attempting automatic rollback" in refused.stderr
+    assert _installed_version(remote_home) == "dt 0.9.0"
+    current = remote_home / ".local" / "share" / "disttrainer" / "current"
+    assert current.readlink() == Path("releases/0.9.0")
+
+
+def test_explicit_rollback_attestation_failure_restores_current_release(tmp_path):
+    env, remote_home = _transport(tmp_path)
+    first = _release(tmp_path, "0.9.0")
+    second = _release(tmp_path, "0.9.1")
+    env["DT_FAKE_AGENT_RUNNING"] = "1"
+
+    assert _deploy(env, str(first), "head").returncode == 0
+    assert _deploy(env, str(second), "head").returncode == 0
+    env["DT_FAKE_AGENT_ATTEST_FAIL_VERSION"] = "0.9.0"
+    refused = _deploy(env, "--rollback", "0.9.0", "head")
+
+    assert refused.returncode == 1
+    assert "attestation failed; restoring" in refused.stderr
+    assert _installed_version(remote_home) == "dt 0.9.1"
+    current = remote_home / ".local" / "share" / "disttrainer" / "current"
+    assert current.readlink() == Path("releases/0.9.1")
+
+
+def test_deploy_uses_explicit_remote_bash_and_reports_missing_capability(tmp_path):
+    env, remote_home = _transport(tmp_path)
+    release = _release(tmp_path, "0.9.0")
+    ssh_log = tmp_path / "ssh.log"
+    env["FAKE_SSH_LOG"] = str(ssh_log)
+
+    deployed = _deploy(env, str(release), "head")
+
+    assert deployed.returncode == 0, deployed.stdout + deployed.stderr
+    commands = ssh_log.read_text("utf-8").splitlines()
+    assert "command -v bash >/dev/null 2>&1" in commands
+    assert all(
+        command == "command -v bash >/dev/null 2>&1"
+        or command.startswith("bash -s -- ")
+        for command in commands
+    )
+
+    missing = tmp_path / "missing"
+    missing.mkdir()
+    env2, _remote_home2 = _transport(missing)
+    env2["FAKE_REMOTE_NO_BASH"] = "1"
+    refused = _deploy(env2, str(release), "head")
+
+    assert refused.returncode == 3
+    assert '"schema_version":"dt_deploy_capability_v1"' in refused.stderr
+    assert '"bash":false' in refused.stderr
 
 
 def test_deploy_and_rollback_find_uv_when_ssh_path_omits_user_bin(tmp_path):

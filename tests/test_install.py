@@ -612,3 +612,76 @@ def test_release_bootstrap_upgrade_and_rollback_reuse_verified_environments(tmp_
     assert targets[2] == targets[0]
     calls = log.read_text("utf-8").splitlines()
     assert sum(call.startswith("venv ") for call in calls) == 2
+
+
+def test_release_bootstrap_recovers_interrupted_command_and_marker_activation(
+    tmp_path,
+):
+    first_wheel, first_constraints = _release_bundle(tmp_path / "first", "0.6.2")
+    second_wheel, second_constraints = _release_bundle(tmp_path / "second", "0.6.3")
+    fake_bin, log = _fake_commands(tmp_path)
+    env = _install_env(tmp_path, fake_bin, log)
+    activation = tmp_path / "activation"
+    (activation / "releases" / "0.6.2").mkdir(parents=True)
+    (activation / "releases" / "0.6.3").mkdir(parents=True)
+    env["DT_ACTIVATION_ROOT"] = str(activation)
+
+    env["DT_RELEASE_MARKER_TARGET"] = "releases/0.6.2"
+    first = subprocess.run(
+        ["bash", str(ROOT / "bootstrap.sh"), str(first_wheel), str(first_constraints)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert first.returncode == 0, first.stderr
+    command = tmp_path / "tool-bin" / "dt"
+    old_target = command.readlink()
+    assert (activation / "current").readlink() == Path("releases/0.6.2")
+
+    env["DT_RELEASE_MARKER_TARGET"] = "releases/0.6.3"
+    env["DT_BOOTSTRAP_FAIL_AFTER_COMMAND"] = "1"
+    interrupted = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "bootstrap.sh"),
+            str(second_wheel),
+            str(second_constraints),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert interrupted.returncode == 91
+    assert "injected interruption" in interrupted.stderr
+    assert command.readlink() != old_target
+    assert (activation / "current").readlink() == Path("releases/0.6.2")
+    assert (activation / "activation.pending").is_file()
+
+    env.pop("DT_BOOTSTRAP_FAIL_AFTER_COMMAND")
+    recovered = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "bootstrap.sh"),
+            str(second_wheel),
+            str(second_constraints),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert not (activation / "activation.pending").exists()
+    assert (activation / "current").readlink() == Path("releases/0.6.3")
+    assert (activation / "active-command").read_text().strip() == str(command)
+    assert (
+        subprocess.check_output([str(command)], text=True)
+        .strip()
+        .startswith("dt 0.6.3")
+    )

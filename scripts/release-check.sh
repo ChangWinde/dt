@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_DIR"
 
-for tool in uv git python3 sha256sum; do
+for tool in uv git python3 sha256sum tar; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "release-check: missing required tool: $tool" >&2
         exit 3
@@ -41,7 +41,10 @@ WORK_DIR="$(mktemp -d /tmp/disttrainer-release.XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 BUILD_A="$WORK_DIR/build-a"
 BUILD_B="$WORK_DIR/build-b"
-mkdir -p "$BUILD_A" "$BUILD_B"
+SOURCE_TREE="$WORK_DIR/source"
+QUALITY_ENV="$WORK_DIR/quality-env"
+TRACKED_MANIFEST="$WORK_DIR/tracked-files.nul"
+mkdir -p "$BUILD_A" "$BUILD_B" "$SOURCE_TREE"
 
 UV_NETWORK=()
 if [[ "${DT_RELEASE_OFFLINE:-0}" == "1" ]]; then
@@ -49,27 +52,48 @@ if [[ "${DT_RELEASE_OFFLINE:-0}" == "1" ]]; then
 fi
 
 uv lock --check "${UV_NETWORK[@]}"
-if [[ "${DT_RELEASE_SKIP_SYNC:-0}" != "1" ]]; then
-    uv sync --locked --all-groups "${UV_NETWORK[@]}"
-fi
+SOURCE_COMMIT="$(git rev-parse HEAD)"
+[[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || {
+    echo "release-check: could not resolve an exact source commit" >&2
+    exit 1
+}
+git ls-tree -r --name-only -z "$SOURCE_COMMIT" > "$TRACKED_MANIFEST"
+git archive --format=tar "$SOURCE_COMMIT" | tar -xf - -C "$SOURCE_TREE"
+cat > "$SOURCE_TREE/src/dt/_provenance.py" <<EOF
+"""Build provenance injected by the formal release gate."""
 
-uv run --no-sync pytest -q -p no:cacheprovider
-uv run --no-sync python scripts/docs.py
-uv run --no-sync python scripts/repo_hygiene.py
-uv run --no-sync ruff check .
-uv run --no-sync ruff format --check .
-uv run --no-sync mypy --strict --no-incremental \
-    --cache-dir="$WORK_DIR/mypy" --follow-imports=skip \
-    src/dt scripts/audit_release.py scripts/release_contract.py
-bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
-    install.sh scripts/package-check.sh scripts/release-check.sh \
-    scripts/security-check.sh
+SOURCE_COMMIT: str | None = "$SOURCE_COMMIT"
+EOF
+
+uv venv --python 3.11 "$QUALITY_ENV" >/dev/null
+VIRTUAL_ENV="$QUALITY_ENV" uv sync --project "$SOURCE_TREE" \
+    --active --locked --all-groups \
+    "${UV_NETWORK[@]}"
+
+(
+    cd "$SOURCE_TREE"
+    export DT_REPO_HYGIENE_MANIFEST="$TRACKED_MANIFEST"
+    "$QUALITY_ENV/bin/pytest" -q -p no:cacheprovider
+    "$QUALITY_ENV/bin/python" scripts/docs.py
+    "$QUALITY_ENV/bin/ruff" check .
+    "$QUALITY_ENV/bin/ruff" format --check .
+    "$QUALITY_ENV/bin/mypy" --strict --no-incremental \
+        --cache-dir="$WORK_DIR/mypy" --follow-imports=skip \
+        src/dt scripts/audit_release.py scripts/release_contract.py
+    bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
+        install.sh scripts/package-check.sh scripts/release-check.sh \
+        scripts/security-check.sh
+)
+DT_REPO_HYGIENE_MANIFEST="$TRACKED_MANIFEST" \
+    "$QUALITY_ENV/bin/python" "$SOURCE_TREE/scripts/repo_hygiene.py"
 git diff --check
 
-SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$SOURCE_COMMIT")"
 export SOURCE_DATE_EPOCH
-uv build --no-build-isolation "${UV_NETWORK[@]}" --out-dir "$BUILD_A"
-uv build --no-build-isolation "${UV_NETWORK[@]}" --out-dir "$BUILD_B"
+uv build --no-build-isolation --python "$QUALITY_ENV/bin/python" \
+    "${UV_NETWORK[@]}" --out-dir "$BUILD_A" "$SOURCE_TREE"
+uv build --no-build-isolation --python "$QUALITY_ENV/bin/python" \
+    "${UV_NETWORK[@]}" --out-dir "$BUILD_B" "$SOURCE_TREE"
 
 WHEEL_NAME="${DISTRIBUTION}-${RELEASE_VERSION}-py3-none-any.whl"
 SDIST_NAME="${DISTRIBUTION}-${RELEASE_VERSION}.tar.gz"
@@ -85,18 +109,34 @@ for artifact in "$WHEEL_NAME" "$SDIST_NAME"; do
     fi
 done
 
-uv export --format requirements.txt --no-dev --no-emit-project --locked \
+python3 - "$BUILD_A/$WHEEL_NAME" "$SOURCE_COMMIT" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+wheel = pathlib.Path(sys.argv[1])
+commit = sys.argv[2]
+with zipfile.ZipFile(wheel) as archive:
+    provenance = archive.read("dt/_provenance.py").decode("utf-8")
+expected = f'SOURCE_COMMIT: str | None = "{commit}"'
+if expected not in provenance:
+    raise SystemExit("release-check: wheel is not bound to the reviewed commit")
+PY
+
+uv export --project "$SOURCE_TREE" --format requirements.txt --no-dev \
+    --no-emit-project --locked \
     --no-annotate --no-header "${UV_NETWORK[@]}" \
     -o "$OUT_DIR/runtime-constraints.txt" >/dev/null
 uv export --preview-features sbom-export \
-    --format cyclonedx1.5 --no-dev --no-emit-project --locked \
+    --project "$SOURCE_TREE" --format cyclonedx1.5 \
+    --no-dev --no-emit-project --locked \
     "${UV_NETWORK[@]}" -o "$OUT_DIR/sbom.cdx.json" >/dev/null
 
-cp bootstrap.sh "$OUT_DIR/"
+cp "$SOURCE_TREE/bootstrap.sh" "$OUT_DIR/"
 cp "$BUILD_A/$WHEEL_NAME" "$OUT_DIR/"
 cp "$BUILD_A/$SDIST_NAME" "$OUT_DIR/"
 
-python3 scripts/audit_release.py \
+python3 "$SOURCE_TREE/scripts/audit_release.py" \
     --sdist "$OUT_DIR/$SDIST_NAME" \
     --wheel "$OUT_DIR/$WHEEL_NAME" \
     --bundle-dir "$OUT_DIR" \
@@ -113,6 +153,7 @@ for release_python in 3.10 3.11; do
     INSTALL_ENV="$WORK_DIR/install-$release_python"
     TOOL_BIN_DIR="$WORK_DIR/tool-bin-$release_python"
     INSTALL_ROOT="$WORK_DIR/installations-$release_python"
+    ACTIVATION_ROOT="$WORK_DIR/activation-$release_python"
     CONFIG_PATH="$WORK_DIR/config-$release_python.yaml"
     uv venv --python "$release_python" "$INSTALL_ENV" >/dev/null
     uv --no-config pip install "${UV_NETWORK[@]}" \
@@ -123,7 +164,8 @@ for release_python in 3.10 3.11; do
         --python "$INSTALL_ENV/bin/python" \
         --no-deps "$BUILD_A/$WHEEL_NAME" >/dev/null
     uv --no-config pip check --python "$INSTALL_ENV/bin/python" >/dev/null
-    [[ "$("$INSTALL_ENV/bin/dt" --version)" == "dt $RELEASE_VERSION" ]]
+    EXPECTED_VERSION_OUTPUT="dt $RELEASE_VERSION (${SOURCE_COMMIT:0:12})"
+    [[ "$("$INSTALL_ENV/bin/dt" --version)" == "$EXPECTED_VERSION_OUTPUT" ]]
     "$INSTALL_ENV/bin/dt" --help >/dev/null
     for command in init free run ps logs wait info request pull batch chain compare \
         watch metrics rerun exec fork attach kill clean events storage compact sync \
@@ -136,6 +178,7 @@ for release_python in 3.10 3.11; do
     BOOTSTRAP_ENV=(
         "UV_TOOL_BIN_DIR=$TOOL_BIN_DIR"
         "DT_INSTALL_ROOT=$INSTALL_ROOT"
+        "DT_ACTIVATION_ROOT=$ACTIVATION_ROOT"
         "DT_CONFIG=$CONFIG_PATH"
         "DT_PYTHON=$release_python"
     )
@@ -144,12 +187,13 @@ for release_python in 3.10 3.11; do
     fi
     env "${BOOTSTRAP_ENV[@]}" bash "$OUT_DIR/bootstrap.sh" \
         "$OUT_DIR/$WHEEL_NAME" "$OUT_DIR/runtime-constraints.txt" >/dev/null
-    [[ "$("$TOOL_BIN_DIR/dt" --version)" == "dt $RELEASE_VERSION" ]]
+    [[ "$("$TOOL_BIN_DIR/dt" --version)" == "$EXPECTED_VERSION_OUTPUT" ]]
+    [[ "$(<"$ACTIVATION_ROOT/active-command")" == "$TOOL_BIN_DIR/dt" ]]
     [[ ! -e "$CONFIG_PATH" ]]
     echo "release-check: Python $release_python wheel/bootstrap PASS"
 done
 
-python3 - "$OUT_DIR" "$DISTRIBUTION" "$RELEASE_VERSION" <<'PY'
+python3 - "$OUT_DIR" "$DISTRIBUTION" "$RELEASE_VERSION" "$SOURCE_COMMIT" <<'PY'
 import hashlib
 import json
 import pathlib
@@ -159,6 +203,7 @@ import sys
 out = pathlib.Path(sys.argv[1])
 distribution = sys.argv[2]
 version = sys.argv[3]
+source_commit = sys.argv[4]
 artifacts = {}
 for path in sorted(out.iterdir()):
     if path.name == "release-manifest.json" or not path.is_file():
@@ -184,9 +229,7 @@ manifest = {
     "schema_version": "disttrainer_release_manifest_v1",
     "distribution": distribution,
     "version": version,
-    "git_commit": subprocess.check_output(
-        ["git", "rev-parse", "HEAD"], text=True
-    ).strip(),
+    "git_commit": source_commit,
     "git_dirty": False,
     "artifacts": artifacts,
 }
