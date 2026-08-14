@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -14,6 +15,49 @@ ROOT = Path(__file__).parents[1]
 def _write_executable(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
+
+
+def _refresh_release_metadata(root: Path) -> None:
+    """Rebuild a fake bundle after a test changes one declared artifact."""
+    (root / "release-manifest.json").unlink(missing_ok=True)
+    version = json.loads((root / "release-audit.json").read_text())["version"]
+    checksummed = [
+        root / f"disttrainer-{version}-py3-none-any.whl",
+        root / f"disttrainer-{version}.tar.gz",
+        root / "runtime-constraints.txt",
+        root / "sbom.cdx.json",
+        root / "release-audit.json",
+        root / "bootstrap.sh",
+    ]
+    (root / "SHA256SUMS").write_text(
+        "".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+            for path in checksummed
+        ),
+        encoding="utf-8",
+    )
+    artifacts = {
+        path.name: {
+            "bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for path in root.iterdir()
+    }
+    (root / "release-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "disttrainer_release_manifest_v1",
+                "distribution": "disttrainer",
+                "version": version,
+                "git_commit": "a" * 40,
+                "git_dirty": False,
+                "artifacts": artifacts,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 def _release(
@@ -66,7 +110,59 @@ mkdir -p "$tool_bin"
 cat > "$tool_bin/dt" <<FAKE_DT
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "agent" ]]; then
+    if [[ "\${2:-}" == "status" \
+          && "\${DT_FAKE_AGENT_STATUS_HANG_VERSION:-}" == "$version" ]]; then
+        trap '' TERM
+        while :; do sleep 60; done
+    fi
+    if [[ "\${2:-}" == "\${DT_FAKE_AGENT_ACTION_HANG:-}" && "\${DT_FAKE_AGENT_ACTION_HANG_VERSION:-}" == "$version" ]]; then
+        trap '' TERM
+        while :; do sleep 60; done
+    fi
+    if [[ "\${2:-}" == "status" && "\${DT_FAKE_AGENT_STATUS_MODE:-}" == "invalid" ]]; then
+        printf 'not-json\\n'
+        exit 0
+    fi
+    if [[ "\${2:-}" == "status" && "\${DT_FAKE_AGENT_POST_STATUS_MODE_VERSION:-}" == "$version" ]]; then
+        printf 'not-json\\n'
+        exit 0
+    fi
+    if [[ "\${2:-}" == "status" && "\${DT_FAKE_AGENT_STATUS_MODE:-}" == "oversized" ]]; then
+        printf '%*s' 70000 '' | tr ' ' x
+        exit 0
+    fi
+    if [[ "\${2:-}" == "status" && "\${DT_FAKE_AGENT_RACE:-0}" == "1" ]]; then
+        counter="\$HOME/.fake-dt-agent-race-count"
+        count=0
+        if [[ -f "\$counter" ]]; then read -r count < "\$counter"; fi
+        count="\$((count + 1))"
+        printf '%s\\n' "\$count" > "\$counter"
+        if [[ "\$count" == "1" ]]; then
+            printf '{"alive":false,"pid":null}\\n'
+        else
+            printf '{"alive":true,"runtime_command_available":true,"runtime_command_stale":false,"runtime_command_target":"active","active_command_target":"active"}\\n'
+        fi
+        exit 0
+    fi
+    if [[ "\${2:-}" == "run" \
+          && "\${DT_FAKE_AGENT_LEGACY_VERSION:-}" == "$version" ]]; then
+        trap 'exit 0' TERM INT
+        while :; do sleep 60 & wait \$!; done
+    fi
     if [[ "\${2:-}" == "status" && "\${DT_FAKE_AGENT_RUNNING:-0}" == "1" ]]; then
+        if [[ "\${DT_FAKE_AGENT_LEGACY_VERSION:-}" == "$version" ]]; then
+            pid=0
+            if [[ -f "\$HOME/.fake-dt-agent.pid" ]]; then
+                read -r pid < "\$HOME/.fake-dt-agent.pid"
+            fi
+            if [[ "\$pid" =~ ^[0-9]+$ && "\$pid" -gt 1 ]] \
+               && kill -0 "\$pid" 2>/dev/null; then
+                printf '{"alive":true,"pid":%s}\\n' "\$pid"
+            else
+                printf '{"alive":false,"pid":null}\\n'
+            fi
+            exit 0
+        fi
         stale=false
         if [[ "\${DT_FAKE_AGENT_ATTEST_FAIL_VERSION:-}" == "$version" ]]; then
             stale=true
@@ -74,7 +170,22 @@ if [[ "\${1:-}" == "agent" ]]; then
         printf '{"alive":true,"runtime_command_available":true,"runtime_command_stale":%s,"runtime_command_target":"active","active_command_target":"active"}\\n' "\$stale"
         exit 0
     fi
+    if [[ "\${2:-}" == "status" ]]; then
+        printf '{"alive":false,"pid":null}\\n'
+        exit 0
+    fi
     if [[ "\${2:-}" == "stop" || "\${2:-}" == "start" ]]; then
+        pidfile="\$HOME/.fake-dt-agent.pid"
+        if [[ "\${2:-}" == "stop" ]]; then
+            if [[ -f "\$pidfile" ]]; then
+                read -r pid < "\$pidfile"
+                kill "\$pid" 2>/dev/null || true
+                rm -f "\$pidfile"
+            fi
+        elif [[ "\${DT_FAKE_AGENT_LEGACY_VERSION:-}" == "$version" ]]; then
+            dt agent run >/dev/null 2>&1 &
+            printf '%s\\n' "\$!" > "\$pidfile"
+        fi
         if [[ -n "\${DT_FAKE_AGENT_LOG:-}" ]]; then
             printf '%s\\n' "\${2}" >> "\${DT_FAKE_AGENT_LOG}"
         fi
@@ -94,44 +205,24 @@ if [[ -n "${DT_ACTIVATION_ROOT:-}" ]]; then
 fi
 """,
     )
-    checksummed = [
-        wheel,
-        sdist,
-        root / "runtime-constraints.txt",
-        root / "sbom.cdx.json",
-        root / "release-audit.json",
-        root / "bootstrap.sh",
-    ]
-    (root / "SHA256SUMS").write_text(
-        "".join(
-            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
-            for path in checksummed
-        ),
-        encoding="utf-8",
-    )
-    artifacts = {
-        path.name: {
-            "bytes": path.stat().st_size,
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        }
-        for path in root.iterdir()
-    }
-    (root / "release-manifest.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "disttrainer_release_manifest_v1",
-                "distribution": "disttrainer",
-                "version": version,
-                "git_commit": "a" * 40,
-                "git_dirty": False,
-                "artifacts": artifacts,
-            },
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    _refresh_release_metadata(root)
     return root
+
+
+def _make_marker_unaware(release: Path) -> None:
+    """Turn one fake bundle into a pre-atomic-activation release."""
+    bootstrap = release / "bootstrap.sh"
+    text = bootstrap.read_text(encoding="utf-8")
+    marker_block = r"""    if [[ -n "${DT_RELEASE_MARKER_TARGET:-}" ]]; then
+        next="$DT_ACTIVATION_ROOT/.current.fake.$$"
+        ln -s "$DT_RELEASE_MARKER_TARGET" "$next"
+        mv -Tf "$next" "$DT_ACTIVATION_ROOT/current"
+    fi
+"""
+    if marker_block not in text:
+        raise AssertionError("fake bootstrap marker contract changed")
+    bootstrap.write_text(text.replace(marker_block, ""), encoding="utf-8")
+    _refresh_release_metadata(release)
 
 
 def _transport(tmp_path: Path) -> tuple[dict[str, str], Path]:
@@ -185,6 +276,18 @@ done
 cp -a "$source". "$destination/"
 """,
     )
+    _write_executable(
+        fake_bin / "systemctl",
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ " $* " == *" --property MainPID "* && " $* " == *" --value "* ]]; then
+    read -r pid < "$HOME/.fake-dt-agent.pid"
+    printf '%s\n' "$((pid + ${DT_FAKE_SYSTEMD_MAINPID_OFFSET:-0}))"
+    exit 0
+fi
+exit 1
+""",
+    )
     env = os.environ.copy()
     env.update(
         {
@@ -236,15 +339,194 @@ def test_deploy_upgrade_and_explicit_rollback_are_atomic(tmp_path):
     assert (base / "current").readlink() == Path("releases/0.9.0")
 
 
+def test_rollback_uses_current_bootstrap_for_a_legacy_retained_release(tmp_path):
+    """Legacy rollback uses today's marker protocol and the recorded tool bin."""
+    env, remote_home = _transport(tmp_path)
+    original = _release(tmp_path, "0.9.0", "original")
+    legacy = _release(tmp_path, "0.9.0", "legacy")
+    current = _release(tmp_path, "0.10.0")
+    env["DT_FAKE_AGENT_RUNNING"] = "1"
+    env["DT_FAKE_AGENT_LEGACY_VERSION"] = "0.9.0"
+    base = remote_home / ".local" / "share" / "disttrainer"
+    custom_dt = remote_home / "custom tools" / "dt"
+    base.mkdir(parents=True)
+    (base / "active-command").write_text(f"{custom_dt}\n", encoding="utf-8")
+
+    assert _deploy(env, str(original), "head").returncode == 0
+    _make_marker_unaware(legacy)
+    retained = base / "releases" / "0.9.0"
+    shutil.copytree(legacy, retained, dirs_exist_ok=True)
+
+    upgraded = _deploy(env, str(current), "head")
+    rolled_back = _deploy(env, "--rollback", "0.9.0", "head")
+
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+    assert rolled_back.returncode == 0, rolled_back.stdout + rolled_back.stderr
+    assert subprocess.check_output([str(custom_dt)], text=True).strip() == "dt 0.9.0"
+    assert (base / "active-command").read_text(encoding="utf-8") == f"{custom_dt}\n"
+    marker = base / "current"
+    assert marker.readlink() == Path("releases/0.9.0")
+    subprocess.run(
+        [str(custom_dt), "agent", "stop"],
+        env=env,
+        check=True,
+    )
+
+
+def test_deploy_bounds_a_hung_resident_agent_preflight(tmp_path):
+    """An unknown liveness result fails closed before changing activation."""
+    env, remote_home = _transport(tmp_path)
+    previous = _release(tmp_path, "0.9.0")
+    current = _release(tmp_path, "0.9.1")
+    assert _deploy(env, str(previous), "head").returncode == 0
+    env["DT_FAKE_AGENT_STATUS_HANG_VERSION"] = "0.9.0"
+
+    started = time.monotonic()
+    upgraded = _deploy(env, str(current), "head")
+    elapsed = time.monotonic() - started
+
+    assert upgraded.returncode == 1
+    assert "invalid status contract" in upgraded.stderr
+    assert elapsed < 4.0
+    assert _installed_version(remote_home) == "dt 0.9.0"
+    base = remote_home / ".local" / "share" / "disttrainer"
+    assert (base / "current").readlink() == Path("releases/0.9.0")
+    assert not (base / "releases" / "0.9.1").exists()
+
+
+def test_deploy_rejects_invalid_and_oversized_agent_preflight(tmp_path):
+    """Only a bounded, typed liveness contract authorizes activation."""
+    env, remote_home = _transport(tmp_path)
+    previous = _release(tmp_path, "0.9.0")
+    current = _release(tmp_path, "0.9.1")
+    assert _deploy(env, str(previous), "head").returncode == 0
+
+    for mode in ("invalid", "oversized"):
+        env["DT_FAKE_AGENT_STATUS_MODE"] = mode
+        refused = _deploy(env, str(current), "head")
+        assert refused.returncode == 1
+        assert "invalid status contract" in refused.stderr
+
+    assert _installed_version(remote_home) == "dt 0.9.0"
+    base = remote_home / ".local" / "share" / "disttrainer"
+    assert (base / "current").readlink() == Path("releases/0.9.0")
+    assert not (base / "releases" / "0.9.1").exists()
+
+
+def test_deploy_converges_agent_started_between_preflight_and_activation(tmp_path):
+    """A RestartSec race is re-probed and attested after activation."""
+    env, remote_home = _transport(tmp_path)
+    previous = _release(tmp_path, "0.9.0")
+    current = _release(tmp_path, "0.9.1")
+    agent_log = tmp_path / "agent-race-actions.log"
+    assert _deploy(env, str(previous), "head").returncode == 0
+    env["DT_FAKE_AGENT_RACE"] = "1"
+    env["DT_FAKE_AGENT_LOG"] = str(agent_log)
+
+    upgraded = _deploy(env, str(current), "head")
+
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+    assert agent_log.read_text(encoding="utf-8").splitlines() == ["stop", "start"]
+    assert _installed_version(remote_home) == "dt 0.9.1"
+
+
+def test_post_activation_unknown_restores_without_starting_stopped_agent(tmp_path):
+    """Recovery preserves an operator-stopped queue authority."""
+    env, remote_home = _transport(tmp_path)
+    previous = _release(tmp_path, "0.9.0")
+    current = _release(tmp_path, "0.9.1")
+    agent_log = tmp_path / "stopped-agent-actions.log"
+    assert _deploy(env, str(previous), "head").returncode == 0
+    env["DT_FAKE_AGENT_POST_STATUS_MODE_VERSION"] = "0.9.1"
+    env["DT_FAKE_AGENT_LOG"] = str(agent_log)
+
+    refused = _deploy(env, str(current), "head")
+
+    assert refused.returncode == 1
+    assert "restoring the stopped release" in refused.stderr
+    assert agent_log.read_text(encoding="utf-8").splitlines() == ["stop", "stop"]
+    assert _installed_version(remote_home) == "dt 0.9.0"
+    marker = remote_home / ".local" / "share" / "disttrainer" / "current"
+    assert marker.readlink() == Path("releases/0.9.0")
+
+
+def test_post_rollback_unknown_restores_without_starting_stopped_agent(tmp_path):
+    """Explicit rollback preserves an operator-stopped queue authority."""
+    env, remote_home = _transport(tmp_path)
+    previous = _release(tmp_path, "0.9.0")
+    current = _release(tmp_path, "0.10.0")
+    agent_log = tmp_path / "stopped-rollback-actions.log"
+    assert _deploy(env, str(previous), "head").returncode == 0
+    assert _deploy(env, str(current), "head").returncode == 0
+    env["DT_FAKE_AGENT_POST_STATUS_MODE_VERSION"] = "0.9.0"
+    env["DT_FAKE_AGENT_LOG"] = str(agent_log)
+
+    refused = _deploy(env, "--rollback", "0.9.0", "head")
+
+    assert refused.returncode == 1
+    assert "restoring the stopped release" in refused.stderr
+    assert agent_log.read_text(encoding="utf-8").splitlines() == ["stop", "stop"]
+    assert _installed_version(remote_home) == "dt 0.10.0"
+    marker = remote_home / ".local" / "share" / "disttrainer" / "current"
+    assert marker.readlink() == Path("releases/0.10.0")
+
+
+def test_deploy_bounds_hung_agent_restart_and_restores_previous(tmp_path):
+    """Post-activation stop/start cannot retain the lock or strand a release."""
+    env, remote_home = _transport(tmp_path)
+    previous = _release(tmp_path, "0.9.0")
+    current = _release(tmp_path, "0.9.1")
+    env["DT_FAKE_AGENT_RUNNING"] = "1"
+    assert _deploy(env, str(previous), "head").returncode == 0
+    env["DT_FAKE_AGENT_ACTION_HANG"] = "start"
+    env["DT_FAKE_AGENT_ACTION_HANG_VERSION"] = "0.9.1"
+    fake_timeout = Path(env["PATH"].split(os.pathsep, 1)[0]) / "timeout"
+    _write_executable(
+        fake_timeout,
+        '#!/usr/bin/env bash\nshift 3\nexec /usr/bin/timeout -k 0.1 0.1 "$@"\n',
+    )
+
+    started = time.monotonic()
+    refused = _deploy(env, str(current), "head")
+    elapsed = time.monotonic() - started
+
+    assert refused.returncode == 1
+    assert "identity; attempting automatic rollback" in refused.stderr
+    assert elapsed < 3.0
+    assert _installed_version(remote_home) == "dt 0.9.0"
+    marker = remote_home / ".local" / "share" / "disttrainer" / "current"
+    assert marker.readlink() == Path("releases/0.9.0")
+
+
+def test_legacy_agent_attestation_rejects_systemd_pid_mismatch(tmp_path):
+    """A legacy status PID cannot substitute for the supervised MainPID."""
+    env, remote_home = _transport(tmp_path)
+    legacy = _release(tmp_path, "0.9.0")
+    current = _release(tmp_path, "0.10.0")
+    env["DT_FAKE_AGENT_RUNNING"] = "1"
+    env["DT_FAKE_AGENT_LEGACY_VERSION"] = "0.9.0"
+    assert _deploy(env, str(legacy), "head").returncode == 0
+    assert _deploy(env, str(current), "head").returncode == 0
+    env["DT_FAKE_SYSTEMD_MAINPID_OFFSET"] = "1"
+
+    refused = _deploy(env, "--rollback", "0.9.0", "head")
+
+    assert refused.returncode == 1
+    assert "attestation failed; restoring" in refused.stderr
+    assert _installed_version(remote_home) == "dt 0.10.0"
+    marker = remote_home / ".local" / "share" / "disttrainer" / "current"
+    assert marker.readlink() == Path("releases/0.10.0")
+
+
 def test_upgrade_and_rollback_restart_and_attest_a_resident_agent(tmp_path):
     env, _remote_home = _transport(tmp_path)
     first = _release(tmp_path, "0.9.0")
     second = _release(tmp_path, "0.9.1")
     agent_log = tmp_path / "agent-actions.log"
-    env["DT_FAKE_AGENT_RUNNING"] = "1"
     env["DT_FAKE_AGENT_LOG"] = str(agent_log)
 
     assert _deploy(env, str(first), "head").returncode == 0
+    env["DT_FAKE_AGENT_RUNNING"] = "1"
     upgraded = _deploy(env, str(second), "head")
     rolled_back = _deploy(env, "--rollback", "0.9.0", "head")
 

@@ -5815,6 +5815,7 @@ def _dispatch_queued_active(
         after_complete=entry.after_complete,
         after_result=entry.after_result,
         after_result_states=list(entry.after_result_states),
+        request_id=entry.request_id,
         rerun_of=entry.rerun_of,
         rerun_source_snapshot_sha256=entry.rerun_source_snapshot_sha256,
         artifact_manifest=entry.artifact_manifest,
