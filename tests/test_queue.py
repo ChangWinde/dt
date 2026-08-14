@@ -2816,6 +2816,7 @@ def test_dispatch_queued_replays_setup_extras_and_fork_lineage(tmp_path, monkeyp
         cache_source_env_hash="6fb61a247969",
         cache_mode="clone",
         snapshot_sha256="a" * 64,
+        request_id="queued-request-identity",
     )
     (dispatch.stage_dir(cfg, entry.job_id) / "code").mkdir(parents=True)
     save(cfg, entry)
@@ -2867,6 +2868,7 @@ def test_dispatch_queued_replays_setup_extras_and_fork_lineage(tmp_path, monkeyp
     assert seen["spec"].cache_source_env_hash == "6fb61a247969"
     assert seen["spec"].cache_source_snapshot_sha256 == "a" * 64
     assert seen["spec"].cache_mode == "clone"
+    assert seen["spec"].request_id == "queued-request-identity"
     assert seen["created_at"] == 1.0
     assert seen["payload_sha256"] is None
     assert load(cfg, entry.job_id).dispatch_node is None

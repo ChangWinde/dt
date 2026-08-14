@@ -119,6 +119,19 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- Queue-agent placement preserves the durable `request_id` when a queued row
+  becomes running or finished, so `dt info` keeps the same idempotency lineage
+  as `dt request` after delayed dispatch.
+
+- Explicit rollback can activate a retained release whose older bootstrap
+  predates the atomic release marker. The current verified bootstrap performs
+  the downgrade, and legacy agents are accepted only after their reported PID,
+  systemd `MainPID`, bounded `/proc` argv, and active command all agree. Agent
+  probes and lifecycle operations are bounded, invalid liveness fails closed,
+  custom tool directories remain authoritative, and a post-activation probe
+  closes the systemd restart window before deployment returns. Recovery never
+  starts an agent that was verifiably stopped before the transition.
+
 - Concurrent immediate and resident dispatchers now acquire one durable
   compare-and-swap attempt owner. A contender cannot replace the recovery
   token or launch a second process, and `--no-queue` never deletes a row while

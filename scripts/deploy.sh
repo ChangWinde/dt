@@ -127,10 +127,14 @@ stage="$HOME/$stage_relative"
 final="$HOME/$final_relative"
 current="$base/current"
 trap 'if [[ -d "$stage" && ! -L "$stage" ]]; then find "$stage" -depth -delete; fi' EXIT
-command -v flock >/dev/null 2>&1 || {
-    echo 'deploy: capability {"schema_version":"dt_deploy_capability_v1","flock":false}' >&2
-    exit 3
-}
+for tool in flock head python3 timeout; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        printf '%s\n' \
+            "deploy: capability {\"schema_version\":\"dt_deploy_capability_v1\",\"$tool\":false}" \
+            >&2
+        exit 3
+    }
+done
 exec 9<"$base"
 flock -w 30 9
 [[ -d "$stage" && ! -L "$stage" ]] || {
@@ -153,12 +157,44 @@ if [[ -f "$base/active-command" && ! -L "$base/active-command" ]]; then
         active_command="$recorded_command"
     fi
 fi
+probe_agent_state() {
+    local command="$1"
+    local command_dir status_json
+    command_dir="$(dirname "$command")"
+    status_json="$(
+        timeout -k 1 1 env PATH="$command_dir${PATH:+:$PATH}" \
+            "$command" agent status --json 2>/dev/null \
+            | head -c 65537
+    )" || return 1
+    [[ "${#status_json}" -le 65536 ]] || return 1
+    python3 - "$status_json" <<'PY'
+import json
+import sys
+
+try:
+    row = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+    raise SystemExit(1)
+if not isinstance(row, dict) or type(row.get("alive")) is not bool:
+    raise SystemExit(1)
+print("running" if row["alive"] else "stopped")
+PY
+}
+
 agent_was_running=0
-if [[ -x "$active_command" ]] \
-   && status_json="$("$active_command" agent status --json 2>/dev/null)" \
-   && python3 -c 'import json,sys; raise SystemExit(not json.loads(sys.argv[1]).get("alive"))' \
-        "$status_json"; then
-    agent_was_running=1
+if [[ -x "$active_command" ]]; then
+    agent_state="$(probe_agent_state "$active_command")" || {
+        echo 'deploy: active agent returned an invalid status contract' >&2
+        exit 1
+    }
+    [[ "$agent_state" == "running" || "$agent_state" == "stopped" ]] || {
+        echo 'deploy: active agent returned an unknown status state' >&2
+        exit 1
+    }
+    [[ "$agent_state" == "stopped" ]] || agent_was_running=1
+elif [[ -L "$current" ]]; then
+    echo 'deploy: current release command is unavailable for agent attestation' >&2
+    exit 1
 fi
 if [[ -L "$current" ]]; then
     previous_link="$(readlink "$current")"
@@ -198,6 +234,12 @@ else
     mv "$stage" "$final"
 fi
 
+activation_bootstrap="$final/bootstrap.sh"
+[[ -f "$activation_bootstrap" && ! -L "$activation_bootstrap" ]] || {
+    echo 'deploy: activation bootstrap is unsafe or missing' >&2
+    exit 1
+}
+
 activate_release() {
     local release="$1"
     local release_version="$2"
@@ -219,7 +261,7 @@ activate_release() {
             DT_ACTIVATION_LOCK_FD=9 \
             DT_RELEASE_MARKER_TARGET="releases/$release_version" \
             DT_ARTIFACT_SHA256="$release_digest" \
-            bash bootstrap.sh "$release_wheel" runtime-constraints.txt
+            bash "$activation_bootstrap" "$release_wheel" runtime-constraints.txt
     )
     IFS= read -r active_command < "$base/active-command"
     [[ -x "$active_command" ]]
@@ -239,23 +281,91 @@ if ! activate_release "$final" "$version"; then
     exit 1
 fi
 
+stop_agent_bounded() {
+    local command="$1"
+    local command_dir
+    command_dir="$(dirname "$command")"
+    timeout -k 2 30 env PATH="$command_dir${PATH:+:$PATH}" \
+        "$command" agent stop >/dev/null
+}
+
+start_agent_bounded() {
+    local command="$1"
+    local command_dir
+    command_dir="$(dirname "$command")"
+    timeout -k 2 30 env PATH="$command_dir${PATH:+:$PATH}" \
+        "$command" agent start >/dev/null
+}
+
 restart_and_attest_agent() {
     local command="$1"
-    "$command" agent stop >/dev/null || return 1
-    "$command" agent start >/dev/null || return 1
+    local command_dir
+    command_dir="$(dirname "$command")"
+    stop_agent_bounded "$command" || return 1
+    start_agent_bounded "$command" || return 1
     verified=0
     for _attempt in {1..50}; do
-        if status_json="$("$command" agent status --json 2>/dev/null)" \
-           && python3 -c '
-import json, sys
-row = json.loads(sys.argv[1])
-raise SystemExit(not (
-    row.get("alive")
-    and row.get("runtime_command_available")
-    and not row.get("runtime_command_stale")
-    and row.get("runtime_command_target") == row.get("active_command_target")
-))
-' "$status_json"; then
+        if status_json="$(
+                timeout -k 1 1 env PATH="$command_dir${PATH:+:$PATH}" \
+                    "$command" agent status --json 2>/dev/null \
+                    | head -c 65537
+            )" \
+           && [[ "${#status_json}" -le 65536 ]] \
+           && python3 - "$command" "$status_json" <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+command = pathlib.Path(sys.argv[1])
+row = json.loads(sys.argv[2])
+if not isinstance(row, dict) or row.get("alive") is not True:
+    raise SystemExit(1)
+if "runtime_command_available" in row:
+    raise SystemExit(not (
+        row.get("runtime_command_available") is True
+        and row.get("runtime_command_stale") is False
+        and row.get("runtime_command_target") == row.get("active_command_target")
+    ))
+
+# Releases predating the runtime-command record still need a safe rollback
+# path. Prove that the reported process is the supervised MainPID and that its
+# argv is the stable DT command now resolving to the activated installation.
+pid = row.get("pid")
+if type(pid) is not int or pid <= 1:
+    raise SystemExit(1)
+main_pid = subprocess.run(
+    [
+        "systemctl", "--user", "show", "--property", "MainPID", "--value",
+        "disttrainer-agent.service",
+    ],
+    check=True,
+    capture_output=True,
+    text=True,
+    timeout=1,
+).stdout.strip()
+if main_pid != str(pid):
+    raise SystemExit(1)
+with open(f"/proc/{pid}/cmdline", "rb", buffering=0) as stream:
+    raw = stream.read(4097)
+if len(raw) > 4096:
+    raise SystemExit(1)
+parts = [part for part in raw.split(b"\0") if part]
+matched = False
+for index in range(len(parts) - 2):
+    if parts[index + 1:index + 3] != [b"agent", b"run"]:
+        continue
+    candidate = pathlib.Path(os.fsdecode(parts[index]))
+    if not candidate.is_absolute() or candidate.name != "dt":
+        continue
+    if candidate.resolve(strict=True) == command.resolve(strict=True):
+        matched = True
+        break
+if not matched:
+    raise SystemExit(1)
+PY
+        then
             verified=1
             break
         fi
@@ -264,6 +374,38 @@ raise SystemExit(not (
     [[ "$verified" == "1" ]]
 }
 
+# A supervisor can leave RestartSec after the preflight and start the old
+# image before activation. Re-probe after activation; any running or unknown
+# state must be converged through a bounded restart and identity attestation.
+if ! post_agent_state="$(probe_agent_state "$active_command")"; then
+    if [[ "$agent_was_running" == "0" ]]; then
+        echo 'deploy: post-activation agent state is unknown; restoring the stopped release' >&2
+        stop_agent_bounded "$active_command" || {
+            echo 'deploy: cannot prove the candidate agent stopped; manual recovery is required' >&2
+            exit 1
+        }
+        if [[ -n "$previous" && "$previous" != "$final" \
+              && -d "$previous" && ! -L "$previous" ]]; then
+            (cd "$previous" && sha256sum -c SHA256SUMS)
+            activate_release "$previous" "$previous_version"
+            stop_agent_bounded "$active_command" || {
+                echo 'deploy: restored release could not be kept stopped' >&2
+                exit 1
+            }
+            restored_state="$(probe_agent_state "$active_command")" || {
+                echo 'deploy: restored stopped-agent state is unproven' >&2
+                exit 1
+            }
+            [[ "$restored_state" == "stopped" ]] || {
+                echo 'deploy: restored release unexpectedly started an agent' >&2
+                exit 1
+            }
+        fi
+        exit 1
+    fi
+elif [[ "$post_agent_state" == "running" ]]; then
+    agent_was_running=1
+fi
 if [[ "$agent_was_running" == "1" ]] \
    && ! restart_and_attest_agent "$active_command"; then
     echo 'deploy: restarted agent did not attest the active command identity; attempting automatic rollback' >&2
@@ -293,10 +435,14 @@ releases="$base/releases"
     echo 'deploy: release base is unsafe' >&2
     exit 1
 }
-command -v flock >/dev/null 2>&1 || {
-    echo 'deploy: capability {"schema_version":"dt_deploy_capability_v1","flock":false}' >&2
-    exit 3
-}
+for tool in flock head python3 timeout; do
+    command -v "$tool" >/dev/null 2>&1 || {
+        printf '%s\n' \
+            "deploy: capability {\"schema_version\":\"dt_deploy_capability_v1\",\"$tool\":false}" \
+            >&2
+        exit 3
+    }
+done
 exec 9<"$base"
 flock -w 30 9
 retained="$HOME/$relative"
@@ -327,6 +473,11 @@ if [[ -L "$current" ]]; then
     (cd "$previous" && sha256sum -c SHA256SUMS)
 fi
 (cd "$retained" && sha256sum -c SHA256SUMS)
+activation_bootstrap="${previous:-$retained}/bootstrap.sh"
+[[ -f "$activation_bootstrap" && ! -L "$activation_bootstrap" ]] || {
+    echo 'deploy: activation bootstrap is unsafe or missing' >&2
+    exit 1
+}
 tool_bin="$HOME/.local/bin"
 active_before="$tool_bin/dt"
 if [[ -f "$base/active-command" && ! -L "$base/active-command" ]]; then
@@ -336,12 +487,44 @@ if [[ -f "$base/active-command" && ! -L "$base/active-command" ]]; then
         active_before="$active"
     fi
 fi
+probe_agent_state() {
+    local command="$1"
+    local command_dir status_json
+    command_dir="$(dirname "$command")"
+    status_json="$(
+        timeout -k 1 1 env PATH="$command_dir${PATH:+:$PATH}" \
+            "$command" agent status --json 2>/dev/null \
+            | head -c 65537
+    )" || return 1
+    [[ "${#status_json}" -le 65536 ]] || return 1
+    python3 - "$status_json" <<'PY'
+import json
+import sys
+
+try:
+    row = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+    raise SystemExit(1)
+if not isinstance(row, dict) or type(row.get("alive")) is not bool:
+    raise SystemExit(1)
+print("running" if row["alive"] else "stopped")
+PY
+}
+
 agent_was_running=0
-if [[ -x "$active_before" ]] \
-   && status_json="$("$active_before" agent status --json 2>/dev/null)" \
-   && python3 -c 'import json,sys; raise SystemExit(not json.loads(sys.argv[1]).get("alive"))' \
-        "$status_json"; then
-    agent_was_running=1
+if [[ -x "$active_before" ]]; then
+    agent_state="$(probe_agent_state "$active_before")" || {
+        echo 'deploy: active agent returned an invalid status contract' >&2
+        exit 1
+    }
+    [[ "$agent_state" == "running" || "$agent_state" == "stopped" ]] || {
+        echo 'deploy: active agent returned an unknown status state' >&2
+        exit 1
+    }
+    [[ "$agent_state" == "stopped" ]] || agent_was_running=1
+elif [[ -L "$current" ]]; then
+    echo 'deploy: current release command is unavailable for agent attestation' >&2
+    exit 1
 fi
 
 activate_release() {
@@ -358,7 +541,7 @@ activate_release() {
             DT_ACTIVATION_LOCK_FD=9 \
             DT_RELEASE_MARKER_TARGET="releases/$release_version" \
             DT_ARTIFACT_SHA256="$digest" \
-            bash bootstrap.sh "$wheel" runtime-constraints.txt
+            bash "$activation_bootstrap" "$wheel" runtime-constraints.txt
     )
     IFS= read -r active < "$base/active-command"
     installed_version="$("$active" --version)"
@@ -367,23 +550,87 @@ activate_release() {
     test "$(readlink "$current")" = "releases/$release_version"
 }
 
+stop_agent_bounded() {
+    local command="$1"
+    local command_dir
+    command_dir="$(dirname "$command")"
+    timeout -k 2 30 env PATH="$command_dir${PATH:+:$PATH}" \
+        "$command" agent stop >/dev/null
+}
+
+start_agent_bounded() {
+    local command="$1"
+    local command_dir
+    command_dir="$(dirname "$command")"
+    timeout -k 2 30 env PATH="$command_dir${PATH:+:$PATH}" \
+        "$command" agent start >/dev/null
+}
+
 restart_and_attest_agent() {
     local command="$1"
-    "$command" agent stop >/dev/null || return 1
-    "$command" agent start >/dev/null || return 1
+    local command_dir
+    command_dir="$(dirname "$command")"
+    stop_agent_bounded "$command" || return 1
+    start_agent_bounded "$command" || return 1
     verified=0
     for _attempt in {1..50}; do
-        if status_json="$("$command" agent status --json 2>/dev/null)" \
-           && python3 -c '
-import json, sys
-row = json.loads(sys.argv[1])
-raise SystemExit(not (
-    row.get("alive")
-    and row.get("runtime_command_available")
-    and not row.get("runtime_command_stale")
-    and row.get("runtime_command_target") == row.get("active_command_target")
-))
-' "$status_json"; then
+        if status_json="$(
+                timeout -k 1 1 env PATH="$command_dir${PATH:+:$PATH}" \
+                    "$command" agent status --json 2>/dev/null \
+                    | head -c 65537
+            )" \
+           && [[ "${#status_json}" -le 65536 ]] \
+           && python3 - "$command" "$status_json" <<'PY'
+import json
+import os
+import pathlib
+import subprocess
+import sys
+
+command = pathlib.Path(sys.argv[1])
+row = json.loads(sys.argv[2])
+if not isinstance(row, dict) or row.get("alive") is not True:
+    raise SystemExit(1)
+if "runtime_command_available" in row:
+    raise SystemExit(not (
+        row.get("runtime_command_available") is True
+        and row.get("runtime_command_stale") is False
+        and row.get("runtime_command_target") == row.get("active_command_target")
+    ))
+pid = row.get("pid")
+if type(pid) is not int or pid <= 1:
+    raise SystemExit(1)
+main_pid = subprocess.run(
+    [
+        "systemctl", "--user", "show", "--property", "MainPID", "--value",
+        "disttrainer-agent.service",
+    ],
+    check=True,
+    capture_output=True,
+    text=True,
+    timeout=1,
+).stdout.strip()
+if main_pid != str(pid):
+    raise SystemExit(1)
+with open(f"/proc/{pid}/cmdline", "rb", buffering=0) as stream:
+    raw = stream.read(4097)
+if len(raw) > 4096:
+    raise SystemExit(1)
+parts = [part for part in raw.split(b"\0") if part]
+matched = False
+for index in range(len(parts) - 2):
+    if parts[index + 1:index + 3] != [b"agent", b"run"]:
+        continue
+    candidate = pathlib.Path(os.fsdecode(parts[index]))
+    if not candidate.is_absolute() or candidate.name != "dt":
+        continue
+    if candidate.resolve(strict=True) == command.resolve(strict=True):
+        matched = True
+        break
+if not matched:
+    raise SystemExit(1)
+PY
+        then
             verified=1
             break
         fi
@@ -398,6 +645,33 @@ if ! activate_release "$retained" "$version"; then
         activate_release "$previous" "$previous_version"
     fi
     exit 1
+fi
+if ! post_agent_state="$(probe_agent_state "$active")"; then
+    if [[ "$agent_was_running" == "0" ]]; then
+        echo 'deploy: post-rollback agent state is unknown; restoring the stopped release' >&2
+        stop_agent_bounded "$active" || {
+            echo 'deploy: cannot prove the rollback candidate stopped; manual recovery is required' >&2
+            exit 1
+        }
+        if [[ -n "$previous" && "$previous" != "$retained" ]]; then
+            activate_release "$previous" "$previous_version"
+            stop_agent_bounded "$active" || {
+                echo 'deploy: restored release could not be kept stopped' >&2
+                exit 1
+            }
+            restored_state="$(probe_agent_state "$active")" || {
+                echo 'deploy: restored stopped-agent state is unproven' >&2
+                exit 1
+            }
+            [[ "$restored_state" == "stopped" ]] || {
+                echo 'deploy: restored release unexpectedly started an agent' >&2
+                exit 1
+            }
+        fi
+        exit 1
+    fi
+elif [[ "$post_agent_state" == "running" ]]; then
+    agent_was_running=1
 fi
 if [[ "$agent_was_running" == "1" ]] \
    && ! restart_and_attest_agent "$active"; then
