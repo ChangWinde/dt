@@ -824,6 +824,48 @@ def test_compare_metric_gate_fails_when_improvement_misses_threshold(
     assert "required 1.000%" in gate["failures"][0]
 
 
+def test_compare_metric_large_finite_values_do_not_overflow_or_fail_open(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    entries = [
+        _entry(f"20260724-190{index}_{name}_aaaa", name)
+        for index, name in enumerate(("a1", "a2", "b1", "b2"))
+    ]
+    for entry in entries:
+        save(cfg, entry)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, json.dumps({"status": "ok", "value": 1e308, "path": "m.json"}), ""
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "compare",
+            *(entry.job_id for entry in entries),
+            "--metric",
+            "m.json::score",
+            "--groups",
+            "AABB",
+            "--min-improvement",
+            "1",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout, parse_constant=lambda value: pytest.fail(value))
+    metric = payload["metric"]
+    assert [group["mean"] for group in metric["groups"]] == [1e308, 1e308]
+    assert metric["gate"]["pass"] is False
+    assert metric["gate"]["observed_improvement_pct"] == 0.0
+
+
 def test_compare_metric_gate_allows_bounded_regression(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     first = _entry("20260724-1900_a1_aaaa", "baseline")

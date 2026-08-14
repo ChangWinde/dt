@@ -77,7 +77,7 @@ def test_exec_cli_submits_without_project_or_environment_sync(tmp_path, monkeypa
     source = _source()
     seen: dict[str, object] = {}
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_find_or_die", lambda _cfg, _ref: source)
+    monkeypatch.setattr(cli, "_find_or_die", lambda _cfg, _ref, **_kwargs: source)
 
     def fake_submit_fork(cfg_, source_, spec, log, no_queue=False):
         seen.update(source=source_, spec=spec, no_queue=no_queue)
@@ -131,7 +131,7 @@ def test_exec_cli_rejects_source_without_recorded_environment(tmp_path, monkeypa
     cfg = _cfg(tmp_path)
     source = _source(env_hash=None)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_find_or_die", lambda _cfg, _ref: source)
+    monkeypatch.setattr(cli, "_find_or_die", lambda _cfg, _ref, **_kwargs: source)
 
     result = CliRunner().invoke(
         cli.app,

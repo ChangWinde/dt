@@ -22,6 +22,7 @@ import fcntl
 import json
 import math
 import os
+import selectors
 import shlex
 import shutil
 import signal
@@ -35,13 +36,15 @@ from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from threading import Event, Thread
 from types import FrameType
 from typing import Callable
 
 from . import completion as completion_mod
-from .config import HeadConfig
+from .config import HeadConfig, active_dt_command
 from .dispatch import clean_jobs, dispatch_queued
 from .jobs import (
+    DISPATCH_PROTOCOL_VERSION,
     LOST_RECHECK_S as jobs_lost_recheck_s,
     JobEntry,
     RegistryDamage,
@@ -106,6 +109,14 @@ def log_path(cfg: HeadConfig) -> Path:
 
 def heartbeat_path(cfg: HeadConfig) -> Path:
     return cfg.agent_dir() / "agent.heartbeat"
+
+
+def scheduler_tick_path(cfg: HeadConfig) -> Path:
+    return cfg.agent_dir() / "agent.scheduler-tick"
+
+
+def runtime_command_path(cfg: HeadConfig) -> Path:
+    return cfg.agent_dir() / "agent.runtime-command"
 
 
 def _open_private_regular(
@@ -199,6 +210,30 @@ def _linger_enabled() -> bool | None:
     return True if value == "yes" else False if value == "no" else None
 
 
+def supervisor_capabilities() -> dict[str, object]:
+    """Machine-readable local prerequisites for persistent queue service."""
+    systemd_user = _systemd_user_available()
+    crontab = shutil.which("crontab") is not None
+    bash = shutil.which("bash") is not None
+    missing = [
+        name
+        for name, available in (
+            ("systemd-user-or-crontab", systemd_user or crontab),
+            ("bash", bash),
+        )
+        if not available
+    ]
+    return {
+        "schema_version": "dt_agent_capabilities_v1",
+        "systemd_user": systemd_user,
+        "crontab": crontab,
+        "bash": bash,
+        "persistent_supervisor": systemd_user or crontab,
+        "available": not missing,
+        "missing": missing,
+    }
+
+
 def _systemd_quote(value: str) -> str:
     escaped = (
         value.replace("\\", "\\\\")
@@ -215,20 +250,16 @@ def _systemd_output_spec(path: Path) -> str:
     raw = str(path)
     if not path.is_absolute() or "\x00" in raw or "\n" in raw or "\r" in raw:
         raise ValueError("systemd log path must be absolute and single-line")
-    escaped = (
-        raw.replace("\\", "\\x5c")
-        .replace(" ", "\\x20")
-        .replace("\t", "\\x09")
-        .replace('"', "\\x22")
-        .replace("'", "\\x27")
-        .replace("%", "%%")
-    )
-    return f"append:{escaped}"
+    # systemd does not decode shell-style \xNN sequences in append: paths;
+    # those bytes become a different literal filename. Quote the complete
+    # value with the unit-file grammar instead, preserving spaces while still
+    # escaping specifiers, quotes, and backslashes.
+    return _systemd_quote(f"append:{raw}")
 
 
 def render_systemd_unit(cfg: HeadConfig, dt_bin: Path | None = None) -> str:
     """Return the rootless supervisor contract for the queue agent."""
-    binary = dt_bin or Path(shutil.which("dt") or Path.home() / ".local/bin/dt")
+    binary = dt_bin or active_dt_command()
     agent_log = _systemd_output_spec(log_path(cfg))
     lines = [
         "[Unit]",
@@ -431,6 +462,64 @@ def _write_heartbeat(cfg: HeadConfig) -> None:
             pass
 
 
+def _heartbeat_pulse(
+    cfg: HeadConfig,
+    stop: Event,
+    *,
+    interval_s: float = 30.0,
+) -> None:
+    """Keep liveness fresh while one dispatch tick performs long remote work."""
+    while not stop.is_set():
+        _write_heartbeat(cfg)
+        stop.wait(interval_s)
+
+
+def _write_scheduler_tick(cfg: HeadConfig, *, next_poll_s: float) -> None:
+    """Publish scheduler progress independently from process liveness."""
+    completed_at = time.time()
+    payload = json.dumps(
+        {
+            "completed_at": completed_at,
+            "next_due_at": completed_at + max(0.0, next_poll_s),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    _atomic_private_write(
+        scheduler_tick_path(cfg),
+        (payload + "\n").encode("ascii"),
+    )
+
+
+def _active_command_identity() -> tuple[str, str, int, int]:
+    """Stable identity of the command selected by the installer contract."""
+    command = active_dt_command()
+    try:
+        resolved = command.resolve(strict=True)
+        metadata = resolved.stat()
+    except (OSError, RuntimeError):
+        return str(command), "", -1, -1
+    return str(command), str(resolved), metadata.st_dev, metadata.st_ino
+
+
+def _write_runtime_command(
+    cfg: HeadConfig, identity: tuple[str, str, int, int]
+) -> None:
+    """Bind status evidence to the executable identity loaded by this process."""
+    payload = json.dumps(
+        {
+            "command": identity[0],
+            "dispatch_protocol": DISPATCH_PROTOCOL_VERSION,
+            "target": identity[1],
+            "device": identity[2],
+            "inode": identity[3],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    _atomic_private_write(runtime_command_path(cfg), (payload + "\n").encode())
+
+
 def alive_pid(cfg: HeadConfig) -> int | None:
     """The running agent's pid, or None. Truth is the flock, not the pid file.
 
@@ -607,7 +696,8 @@ def _process_once_with_snapshot(
 ) -> tuple[list[tuple[str, str]], list[JobEntry]]:
     """One poll tick: reconcile active jobs, then walk the queue FIFO.
 
-    - started / failed / skipped / killed / cancel-failed: move on to the next job
+    - started / finished / failed / skipped / killed / cancel-failed: move on
+      to the next job
     - waiting (dependency not settled): skip it; the check is one local
       registry read, so it is retried every tick for a fast chain reaction
     - blocked (job-specific: missing dataset path, unfit nodes): skip it so
@@ -696,6 +786,25 @@ def _process_once_with_snapshot(
                     "center": cfg.center,
                     "node": detail,
                     "exit_code": None,
+                },
+                log,
+            )
+        elif outcome == "finished":
+            log(
+                f"{entry.job_id} recovered completed launch on {entry.node} "
+                f"(exit {entry.exit_code})"
+            )
+            notify(
+                cfg,
+                {
+                    "event": "finished",
+                    "job_id": entry.job_id,
+                    "name": entry.name,
+                    "center": cfg.center,
+                    "node": entry.node,
+                    "exit_code": entry.exit_code,
+                    "result_state": entry.result_state,
+                    "recovered": True,
                 },
                 log,
             )
@@ -939,9 +1048,13 @@ def _sync_completion_watchers(
     watchers: dict[str, subprocess.Popen[bytes]],
     log: Callable[[str], None],
     entries: list[JobEntry] | None = None,
+    disabled: set[str] | None = None,
 ) -> None:
     """Watch running dt jobs only while queued work can use the released card."""
     entries = list_all(cfg) if entries is None else entries
+    disabled = disabled if disabled is not None else set()
+    active_ids = {entry.job_id for entry in entries if entry.status == "running"}
+    disabled.intersection_update(active_ids)
     desired: dict[str, JobEntry] = {}
     if any(entry.status == "queued" for entry in entries):
         desired = {
@@ -958,11 +1071,12 @@ def _sync_completion_watchers(
         _stop_completion_watcher(watchers.pop(job_id))
 
     for job_id, entry in desired.items():
-        if job_id in watchers:
+        if job_id in watchers or job_id in disabled:
             continue
         try:
             watchers[job_id] = _spawn_completion_watcher(entry)
         except (OSError, ValueError) as exc:
+            disabled.add(job_id)
             detail = " ".join(str(exc).split()) or type(exc).__name__
             log(f"{job_id} completion watch unavailable ({detail}); polling fallback")
             continue
@@ -972,6 +1086,7 @@ def _sync_completion_watchers(
 def _consume_completion_events(
     watchers: dict[str, subprocess.Popen[bytes]],
     log: Callable[[str], None],
+    disabled: set[str] | None = None,
 ) -> list[str]:
     completed: list[str] = []
     for job_id, process in list(watchers.items()):
@@ -983,6 +1098,8 @@ def _consume_completion_events(
             completed.append(job_id)
             log(f"{job_id} completion signal received")
         else:
+            if disabled is not None:
+                disabled.add(job_id)
             log(
                 f"{job_id} completion watch ended without a signal "
                 f"(exit {returncode}); polling fallback"
@@ -1008,6 +1125,7 @@ def _sleep_until_next_poll(
     stop: dict[str, bool],
     completion_watchers: dict[str, subprocess.Popen[bytes]] | None = None,
     log: Callable[[str], None] | None = None,
+    completion_watch_disabled: set[str] | None = None,
     *,
     queue_active: bool | None = None,
 ) -> str:
@@ -1019,6 +1137,7 @@ def _sleep_until_next_poll(
         if completion_watchers and _consume_completion_events(
             completion_watchers,
             log or (lambda message: None),
+            completion_watch_disabled,
         ):
             return "completion"
         if _consume_agent_wake(cfg):
@@ -1087,11 +1206,22 @@ def run_loop(cfg: HeadConfig) -> int:
     )
     born_with = _code_fingerprint()
     born_identity = _runtime_identity(cfg)
+    born_command_identity = _active_command_identity()
+    _write_runtime_command(cfg, born_command_identity)
     rejected_restart: tuple[int, float] | None = None
     completion_watchers: dict[str, subprocess.Popen[bytes]] = {}
+    completion_watch_disabled: set[str] = set()
     blocked_log_state: dict[str, str] = {}
     blocked_backoff: dict[str, tuple[int, float]] = {}
     fd_released = False
+    heartbeat_stop = Event()
+    heartbeat_thread = Thread(
+        target=_heartbeat_pulse,
+        args=(cfg, heartbeat_stop),
+        name="dt-agent-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
     try:
         while not stop["flag"]:
             queue_active: bool | None = None
@@ -1127,28 +1257,42 @@ def run_loop(cfg: HeadConfig) -> int:
                     completion_watchers,
                     log,
                     entries,
+                    completion_watch_disabled,
                 )
                 queue_active = any(entry.status == "queued" for entry in entries)
                 _maybe_autoclean(cfg, log)
                 rotate_log()
             except Exception as e:  # keep the loop alive, always
                 log(f"poll error: {e}")
+            try:
+                _write_scheduler_tick(
+                    cfg,
+                    next_poll_s=_next_poll_delay(cfg, queue_active=queue_active),
+                )
+            except OSError as exc:
+                log(f"scheduler progress stamp unavailable: {exc}")
             dt_bin: Path | None
             try:
-                dt_bin = Path.home() / ".local/bin/dt"
+                current_command_identity = _active_command_identity()
+                dt_bin = Path(current_command_identity[0])
             except (OSError, RuntimeError) as exc:
                 # A supervisor with a stripped environment (no resolvable
                 # home) must not kill the queue loop; self-upgrade simply
                 # stays off until the environment is coherent again.
                 log(f"self-upgrade check skipped: {exc}")
                 dt_bin = None
+                current_command_identity = born_command_identity
             current_fingerprint = _code_fingerprint()
             now = time.monotonic()
+            command_changed = current_command_identity != born_command_identity
+            code_changed = (
+                current_fingerprint is not None and current_fingerprint != born_with
+            )
+            replacement_token = hash((current_fingerprint, current_command_identity))
             if (
                 dt_bin is not None
-                and current_fingerprint is not None
-                and current_fingerprint != born_with
-                and not _latched(rejected_restart, current_fingerprint, now)
+                and (command_changed or code_changed)
+                and not _latched(rejected_restart, replacement_token, now)
                 and dt_bin.exists()
             ):
                 # deploy/git pull happened: exec ourselves to run the new
@@ -1159,7 +1303,7 @@ def run_loop(cfg: HeadConfig) -> int:
                     ready, detail = False, f"preflight crashed: {exc}"
                 if not ready:
                     rejected_restart = (
-                        current_fingerprint,
+                        replacement_token,
                         now + PREFLIGHT_RETRY_S,
                     )
                     log(
@@ -1168,7 +1312,8 @@ def run_loop(cfg: HeadConfig) -> int:
                         f"{PREFLIGHT_RETRY_S:g}s ({detail})"
                     )
                     continue
-                log("dt code changed on disk; restarting agent")
+                reason = "active command changed" if command_changed else "code changed"
+                log(f"dt {reason}; restarting agent")
                 try:
                     _stop_completion_watchers(completion_watchers)
                     _pid_path(cfg).unlink(missing_ok=True)
@@ -1200,12 +1345,16 @@ def run_loop(cfg: HeadConfig) -> int:
                 stop,
                 completion_watchers,
                 log,
+                completion_watch_disabled,
                 queue_active=queue_active,
             )
     finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=1.0)
         _stop_completion_watchers(completion_watchers)
         log("agent down")
         _pid_path(cfg).unlink(missing_ok=True)
+        runtime_command_path(cfg).unlink(missing_ok=True)
         if not fd_released:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
@@ -1216,8 +1365,24 @@ def start_detached(cfg: HeadConfig) -> bool:
     """Start the installed supervisor or a detached compatibility process."""
     if alive_pid(cfg) is not None:
         return False
+    dt_command = active_dt_command()
+    if dt_command.is_file():
+        # A stopped supervisor is still a future scheduling authority. Refuse
+        # to start it unless its executable understands the rows the current
+        # CLI may just have queued; otherwise an old agent can race the new
+        # immediate dispatcher as soon as systemd launches it.
+        if active_command_dispatch_protocol(dt_command) != DISPATCH_PROTOCOL_VERSION:
+            return False
+    else:
+        current = Path(sys.argv[0])
+        if not current.is_file() or not os.access(current, os.X_OK):
+            return False
+        dt_command = current
     if systemd_unit_path().is_file() and _systemd_user_available():
-        proc = _systemctl("start", SYSTEMD_UNIT)
+        try:
+            proc = _systemctl("start", SYSTEMD_UNIT)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
         if proc.returncode != 0:
             return False
         for _ in range(30):
@@ -1225,9 +1390,7 @@ def start_detached(cfg: HeadConfig) -> bool:
                 return True
             time.sleep(0.1)
         return alive_pid(cfg) is not None
-    dt_bin = str(Path.home() / ".local/bin/dt")
-    if not Path(dt_bin).exists():
-        dt_bin = sys.argv[0]
+    dt_bin = str(dt_command)
     log_descriptor = _open_private_regular(
         log_path(cfg),
         os.O_WRONLY | os.O_APPEND | os.O_CREAT,
@@ -1253,15 +1416,20 @@ def stop_agent(cfg: HeadConfig) -> bool:
     if pid is None:
         return False
     if systemd_unit_path().is_file() and _systemd_user_available():
-        proc = _systemctl("stop", SYSTEMD_UNIT)
-        if proc.returncode != 0:
-            return False
-        for _ in range(50):
-            if alive_pid(cfg) is None:
-                return True
-            time.sleep(0.1)
-        return alive_pid(cfg) is None
-    if pid > 0:
+        try:
+            proc = _systemctl("stop", SYSTEMD_UNIT)
+        except (OSError, subprocess.TimeoutExpired):
+            proc = None
+        if proc is not None and proc.returncode == 0:
+            for _ in range(50):
+                if alive_pid(cfg) is None:
+                    return True
+                time.sleep(0.1)
+        # The unit may exist while the lock is held by a manually launched
+        # compatibility agent. A successful systemctl no-op must not turn
+        # `dt agent stop` into a false "no agent" report.
+        pid = alive_pid(cfg)
+    if pid is not None and pid > 0:
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -1275,7 +1443,7 @@ def stop_agent(cfg: HeadConfig) -> bool:
 
 def install_crontab(cfg: HeadConfig | None = None) -> str:
     """Idempotently add the @reboot line. Returns the line installed."""
-    dt_bin = str(Path.home() / ".local/bin/dt")
+    dt_bin = str(active_dt_command())
     agent_dir = cfg.agent_dir() if cfg is not None else Path.home() / "dt"
     agent_log = log_path(cfg) if cfg is not None else agent_dir / "agent.log"
     if cfg is not None:
@@ -1311,7 +1479,18 @@ def remove_agent_crontab() -> bool:
 
 def install_supervisor(cfg: HeadConfig) -> dict[str, object]:
     """Install the strongest available rootless lifetime supervisor."""
-    if _systemd_user_available():
+    capabilities = supervisor_capabilities()
+    if not capabilities["available"]:
+        missing = capabilities["missing"]
+        assert isinstance(missing, list)
+        return {
+            "supervisor": "unavailable",
+            "restart_policy": "none",
+            "fallback": False,
+            "capabilities": capabilities,
+            "warning": "missing required head capabilities: " + ", ".join(missing),
+        }
+    if capabilities["systemd_user"]:
         unit_path = systemd_unit_path()
         previous = _systemd_unit_snapshot(unit_path)
         previously_enabled = False
@@ -1367,7 +1546,13 @@ def install_supervisor(cfg: HeadConfig) -> dict[str, object]:
             "fallback": False,
             "legacy_cron_removed": cron_removed,
             "linger_enabled": _linger_enabled(),
+            "capabilities": capabilities,
         }
+    # ``available`` above establishes that crontab is present when the systemd
+    # user manager is not; keeping this guard explicit protects future schema
+    # changes from silently reaching install_crontab without the executable.
+    if not capabilities["crontab"]:
+        raise RuntimeError("supervisor capability result is inconsistent")
     line = install_crontab(cfg)
     return {
         "supervisor": "crontab",
@@ -1378,18 +1563,21 @@ def install_supervisor(cfg: HeadConfig) -> dict[str, object]:
             "systemd user manager unavailable; crontab cannot isolate the agent "
             "from an invoking service cgroup"
         ),
+        "capabilities": capabilities,
     }
 
 
 def _supervisor_status() -> dict[str, object]:
     path = systemd_unit_path()
     if not path.is_file():
+        capabilities = supervisor_capabilities()
         return {
             "supervisor": "detached-or-crontab",
             "supervisor_state": None,
             "restart_policy": "reboot-only-or-none",
             "unit": None,
             "linger_enabled": None,
+            "capabilities": capabilities,
         }
     if not _systemd_user_available():
         return {
@@ -1399,11 +1587,21 @@ def _supervisor_status() -> dict[str, object]:
             "unit": SYSTEMD_UNIT,
             "linger_enabled": _linger_enabled(),
         }
-    proc = _systemctl(
-        "show",
-        SYSTEMD_UNIT,
-        "--property=ActiveState,SubState,UnitFileState",
-    )
+    try:
+        proc = _systemctl(
+            "show",
+            SYSTEMD_UNIT,
+            "--property=ActiveState,SubState,UnitFileState",
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {
+            "supervisor": "systemd-user",
+            "supervisor_state": "query-failed",
+            "restart_policy": "always",
+            "unit": SYSTEMD_UNIT,
+            "unit_file_state": None,
+            "linger_enabled": _linger_enabled(),
+        }
     values: dict[str, str] = {}
     if proc.returncode == 0:
         for line in proc.stdout.splitlines():
@@ -1424,29 +1622,218 @@ def _supervisor_status() -> dict[str, object]:
 
 
 def heartbeat_health(cfg: HeadConfig, *, alive: bool) -> dict[str, object]:
+    def timestamp(path: Path) -> tuple[float | None, float | None]:
+        try:
+            observed = float(_read_private_text(path, max_bytes=128).strip())
+            if not math.isfinite(observed) or observed <= 0:
+                raise ValueError
+            return observed, max(0.0, time.time() - observed)
+        except (OSError, UnicodeError, ValueError):
+            return None, None
+
+    heartbeat_at, heartbeat_age_s = timestamp(heartbeat_path(cfg))
+    scheduler_tick_at: float | None = None
+    scheduler_tick_age_s: float | None = None
+    scheduler_next_due_at: float | None = None
     try:
-        heartbeat_at = float(
-            _read_private_text(heartbeat_path(cfg), max_bytes=128).strip()
-        )
-        heartbeat_age_s = max(0.0, time.time() - heartbeat_at)
-    except (OSError, UnicodeError, ValueError):
-        heartbeat_at = None
-        heartbeat_age_s = None
+        scheduler_payload = _read_private_text(
+            scheduler_tick_path(cfg), max_bytes=1024
+        ).strip()
+        decoded = json.loads(scheduler_payload)
+        if not isinstance(decoded, dict):
+            raise ValueError
+        scheduler_tick_at = float(decoded["completed_at"])
+        scheduler_next_due_at = float(decoded["next_due_at"])
+        if (
+            not math.isfinite(scheduler_tick_at)
+            or not math.isfinite(scheduler_next_due_at)
+            or scheduler_tick_at <= 0
+            or scheduler_next_due_at < scheduler_tick_at
+        ):
+            raise ValueError
+        scheduler_tick_age_s = max(0.0, time.time() - scheduler_tick_at)
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        # v0.9.0 development builds wrote a bare timestamp; accepting it keeps
+        # upgrades observable while the next completed tick adopts the richer
+        # deadline-aware record.
+        scheduler_tick_at, scheduler_tick_age_s = timestamp(scheduler_tick_path(cfg))
     # One tick may legitimately spend tens of seconds reconciling several
     # slow SSH nodes.  A two-minute floor avoids declaring a healthy agent
     # stale mid-probe while still detecting a wedged loop promptly.
     heartbeat_stale_after_s = max(120.0, cfg.queue.poll_s * 2 + 5)
+    heartbeat_stale = (
+        alive
+        and heartbeat_age_s is not None
+        and heartbeat_age_s > heartbeat_stale_after_s
+    )
+    scheduler_stalled = (
+        alive
+        and scheduler_tick_age_s is not None
+        and (
+            time.time()
+            > (
+                scheduler_next_due_at + 120.0
+                if scheduler_next_due_at is not None
+                else scheduler_tick_at + heartbeat_stale_after_s
+                if scheduler_tick_at is not None
+                else math.inf
+            )
+        )
+    )
     return {
         "heartbeat_at": heartbeat_at,
         "heartbeat_age_s": heartbeat_age_s,
         "heartbeat_available": heartbeat_age_s is not None,
         "heartbeat_stale_after_s": heartbeat_stale_after_s,
-        "heartbeat_stale": (
-            alive
-            and heartbeat_age_s is not None
-            and heartbeat_age_s > heartbeat_stale_after_s
+        "heartbeat_stale": heartbeat_stale,
+        "process_pulse_at": heartbeat_at,
+        "process_pulse_age_s": heartbeat_age_s,
+        "process_pulse_available": heartbeat_age_s is not None,
+        "process_pulse_stale": heartbeat_stale,
+        "scheduler_tick_at": scheduler_tick_at,
+        "scheduler_tick_age_s": scheduler_tick_age_s,
+        "scheduler_next_due_at": scheduler_next_due_at,
+        "scheduler_tick_available": scheduler_tick_age_s is not None,
+        "scheduler_stall_grace_s": 120.0,
+        "scheduler_stall_after_s": (
+            scheduler_next_due_at - scheduler_tick_at + 120.0
+            if scheduler_next_due_at is not None and scheduler_tick_at is not None
+            else heartbeat_stale_after_s
         ),
+        "scheduler_stalled": scheduler_stalled,
     }
+
+
+def _runtime_command_status(cfg: HeadConfig, *, alive: bool) -> dict[str, object]:
+    active = _active_command_identity()
+    runtime: object = None
+    try:
+        runtime = json.loads(
+            _read_private_text(runtime_command_path(cfg), max_bytes=4096)
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        runtime = None
+    if not isinstance(runtime, dict):
+        runtime = {}
+    runtime_tuple = (
+        runtime.get("command"),
+        runtime.get("target"),
+        runtime.get("device"),
+        runtime.get("inode"),
+    )
+    available = all(
+        (
+            isinstance(runtime_tuple[0], str),
+            isinstance(runtime_tuple[1], str),
+            isinstance(runtime_tuple[2], int),
+            isinstance(runtime_tuple[3], int),
+        )
+    )
+    dispatch_protocol = runtime.get("dispatch_protocol")
+    protocol_available = isinstance(dispatch_protocol, str)
+    protocol_compatible = not alive or dispatch_protocol == DISPATCH_PROTOCOL_VERSION
+    stale = alive and available and runtime_tuple != active
+    return {
+        "client_dispatch_protocol": DISPATCH_PROTOCOL_VERSION,
+        "active_command": active[0],
+        "active_command_target": active[1] or None,
+        "runtime_command_target": runtime_tuple[1] if available else None,
+        "runtime_command_available": available,
+        "runtime_command_stale": stale,
+        "runtime_dispatch_protocol": (
+            dispatch_protocol if protocol_available else None
+        ),
+        "runtime_dispatch_protocol_available": protocol_available,
+        "runtime_dispatch_protocol_compatible": protocol_compatible,
+    }
+
+
+def active_command_dispatch_protocol(command: Path) -> str | None:
+    """Read one bounded protocol advertisement from an installed command.
+
+    The command is trusted installation state, but it may be stale or damaged.
+    A pipe lets us stop its whole process group as soon as output exceeds the
+    protocol envelope instead of allowing an unbounded temporary file write.
+    """
+    process: subprocess.Popen[bytes] | None = None
+    selector: selectors.BaseSelector | None = None
+    payload = bytearray()
+    deadline = time.monotonic() + 5.0
+    try:
+        process = subprocess.Popen(
+            [str(command), "agent", "protocol"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, 5.0)
+            events = selector.select(remaining)
+            if not events:
+                raise subprocess.TimeoutExpired(process.args, 5.0)
+            block = os.read(process.stdout.fileno(), 4097 - len(payload))
+            if not block:
+                selector.unregister(process.stdout)
+                break
+            payload.extend(block)
+            if len(payload) > 4096:
+                _terminate_protocol_probe(process)
+                return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, 5.0)
+        process.wait(timeout=remaining)
+    except (OSError, subprocess.TimeoutExpired):
+        if process is not None:
+            _terminate_protocol_probe(process)
+        return None
+    except BaseException:
+        if process is not None:
+            _terminate_protocol_probe(process)
+        raise
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+    if process.returncode != 0:
+        return None
+    try:
+        value = payload.decode("ascii").strip()
+    except UnicodeError:
+        return None
+    return value if value == DISPATCH_PROTOCOL_VERSION else None
+
+
+def _terminate_protocol_probe(process: subprocess.Popen[bytes]) -> None:
+    """Kill and reap a protocol probe and every descendant in its session."""
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    interrupted = False
+    while True:
+        try:
+            process.wait()
+            break
+        except KeyboardInterrupt:
+            interrupted = True
+    if interrupted:
+        raise KeyboardInterrupt
 
 
 def _adaptive_handoff_state(
@@ -1499,7 +1886,9 @@ def status(cfg: HeadConfig) -> dict[str, object]:
         cfg,
         entries,
         agent_alive=pid is not None,
-        agent_heartbeat_stale=bool(health["heartbeat_stale"]),
+        agent_heartbeat_stale=bool(
+            health["heartbeat_stale"] or health["scheduler_stalled"]
+        ),
         registry_damage=len(damage),
     )
     return {
@@ -1508,6 +1897,7 @@ def status(cfg: HeadConfig) -> dict[str, object]:
         "pid": pid,
         **_supervisor_status(),
         **health,
+        **_runtime_command_status(cfg, alive=pid is not None),
         "scheduler": scheduler,
         "queued": len(q),
         "queue_head": q[0].job_id if q else None,

@@ -16,6 +16,8 @@ the suite always observes DT's own defaults.
 
 import os
 
+import pytest
+
 os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
 os.environ["GIT_CONFIG_SYSTEM"] = os.devnull
 
@@ -29,3 +31,21 @@ for _ambient_terminal_variable in (
     "CLICOLOR_FORCE",
 ):
     os.environ.pop(_ambient_terminal_variable, None)
+
+
+@pytest.fixture(autouse=True)
+def _compatible_idle_agent_protocol(monkeypatch):
+    """Keep submission tests independent of the user's installed DT release.
+
+    Tests that exercise the real active-command probe override this narrow seam
+    explicitly.  The resident-agent branch and the probe implementation retain
+    their own focused contract tests.
+    """
+    import dt.dispatch as dispatch
+    from dt.jobs import DISPATCH_PROTOCOL_VERSION
+
+    monkeypatch.setattr(
+        dispatch,
+        "_active_command_dispatch_protocol",
+        lambda: DISPATCH_PROTOCOL_VERSION,
+    )

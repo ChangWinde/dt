@@ -196,7 +196,9 @@ def test_compact_apply_removes_only_code_and_writes_recovery_receipt(
     assert receipt["snapshot_sha256"] == digest
 
 
-def test_compact_is_idempotent_when_code_is_already_absent(tmp_path, monkeypatch):
+def test_compact_repairs_receipt_when_code_was_deleted_before_publish(
+    tmp_path, monkeypatch
+):
     cfg = _cfg(tmp_path)
     digest = _archive(cfg)
     entry = _entry(digest)
@@ -215,8 +217,86 @@ def test_compact_is_idempotent_when_code_is_already_absent(tmp_path, monkeypatch
     )
 
     assert report.exit_code == 0
-    assert report.payload["already_compact_jobs"] == 1
+    assert report.payload["compacted_jobs"] == 1
+    assert report.payload["repaired_receipts"] == 1
     assert (root / "outputs" / "model.pt").is_file()
+    receipt = json.loads((root / "code-pruned.json").read_text())
+    assert receipt["job_id"] == entry.job_id
+    assert receipt["snapshot_sha256"] == digest
+
+
+def test_compact_repairs_a_corrupt_receipt_when_code_is_absent(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(digest)
+    save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    root = node_home / entry.job_dir
+    root.mkdir(parents=True)
+    (root / "code-pruned.json").write_text('{"job_id":"wrong"}\n')
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg,
+        cutoff_ts=100.0,
+        before="1970-01-01",
+        apply=True,
+    )
+
+    assert report.exit_code == 0
+    assert report.payload["repaired_receipts"] == 1
+    assert json.loads((root / "code-pruned.json").read_text())["job_id"] == entry.job_id
+
+
+def test_compact_retry_repairs_receipt_after_post_delete_fsync_failure(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(digest)
+    save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    root = _workdir(node_home, entry)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_sync = fake_bin / "sync"
+    fake_sync.write_text("#!/bin/sh\nexit 1\n")
+    fake_sync.chmod(0o700)
+
+    def failing_sync_runner(node_name, is_local, command, timeout=15, check=False):
+        del node_name, is_local, check
+        return subprocess.run(
+            ["bash", "-c", command],
+            cwd=node_home,
+            env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    monkeypatch.setattr(compact_mod, "run_on", failing_sync_runner)
+    failed = compact_mod.compact_jobs(
+        cfg,
+        cutoff_ts=100.0,
+        before="1970-01-01",
+        apply=True,
+    )
+
+    assert failed.exit_code == 1
+    assert not (root / "code").exists()
+    assert not (root / "code-pruned.json").exists()
+
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+    repaired = compact_mod.compact_jobs(
+        cfg,
+        cutoff_ts=100.0,
+        before="1970-01-01",
+        apply=True,
+    )
+
+    assert repaired.exit_code == 0
+    assert repaired.payload["repaired_receipts"] == 1
+    assert json.loads((root / "code-pruned.json").read_text())["job_id"] == entry.job_id
 
 
 def test_compact_apply_reloads_registry_and_skips_recovered_job(tmp_path, monkeypatch):

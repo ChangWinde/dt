@@ -375,7 +375,7 @@ def atomic_write_regular(path: Path, payload: bytes, *, mode: int = 0o600) -> No
         for _attempt in range(10):
             candidate = f".{path.name}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
             try:
-                descriptor = os.open(
+                descriptor = openat_create_retry(
                     candidate,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                     mode,

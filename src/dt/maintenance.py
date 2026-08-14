@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 import shlex
 import shutil
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -32,6 +34,7 @@ from .layout import (
     normalize_node_root,
 )
 from .lifecycle import liveness_shell
+from .private_state import PrivateStateError, private_lock
 from .snapshot_store import load_state, lock, save_state
 from .sshio import diagnostic_excerpt
 
@@ -56,6 +59,36 @@ class CleanReport:
     eligible: int
     removed: int
     failures: list[CleanFailure]
+    removed_envs: int = 0
+
+
+@dataclass
+class SweepReport:
+    removed: int
+    failures: list[CleanFailure]
+
+
+@contextmanager
+def environment_retention_lock(cfg: HeadConfig) -> Iterator[None]:
+    """Serialize exact-environment submission with retention snapshots.
+
+    A cleanup command carries a point-in-time registry keep-set to each node.
+    Without this head-side lock, an exact-environment job can be persisted
+    after that snapshot but before the remote deletion, leaving a queued job
+    that references an environment cleanup just removed.
+    """
+    with private_lock(cfg.state_dir() / "environment-retention.lock") as acquired:
+        if not acquired:  # blocking locks currently always acquire
+            raise PrivateStateError("environment-retention lock was not acquired")
+        yield
+
+
+def _cutoff_epoch(cutoff: datetime) -> int:
+    """Return a conservative integral epoch independent of node timezone."""
+    timestamp = cutoff.timestamp()
+    if not math.isfinite(timestamp):
+        raise ValueError("cleanup cutoff must be finite")
+    return math.floor(timestamp)
 
 
 def envs_in_use(cfg: HeadConfig) -> dict[str, set[str]]:
@@ -96,7 +129,7 @@ def clean_envs_command(
     if any(re.fullmatch(r"[0-9a-f]{12}", identity) is None for identity in keep):
         raise ValueError("invalid environment identity; cleanup refused")
     keep_csv = "," + ",".join(sorted(keep)) + ","
-    stamp = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_epoch = _cutoff_epoch(cutoff)
     script = (
         f"cd {node_path_expression(envs_dir)} 2>/dev/null || exit 0; "
         "command -v flock >/dev/null 2>&1 || "
@@ -108,8 +141,14 @@ def clean_envs_command(
         # by every running wrapper. Re-check age only after taking the lock:
         # a just-launched job may have refreshed mtime while cleanup waited.
         '( flock -n 9 || exit 0; [ -d "$d" ] || exit 0; '
-        f'[ -n "$(find "$d" -maxdepth 0 -newermt "{stamp}" 2>/dev/null)" ] '
-        '&& exit 0; rm -rf -- "$d" && echo "$d" ) 9<>"$d.lock"; done'
+        'dt_env_mtime=$(stat -c %Y -- "$d" 2>/dev/null) '
+        '|| { echo "age probe failed for $d; kept" >&2; exit 0; }; '
+        'case "$dt_env_mtime" in ""|*[!0-9]*) '
+        'echo "age probe failed for $d; kept" >&2; exit 0;; esac; '
+        f'[ "$dt_env_mtime" -ge {cutoff_epoch} ] && exit 0; '
+        'if rm -rf -- "$d"; then echo "$d"; '
+        'else echo "environment removal failed for $d; kept" >&2; fi '
+        ') 9<>"$d.lock"; done'
     )
     return f"bash -c {shlex.quote(script)}"
 
@@ -120,35 +159,51 @@ def clean_envs(
     log: Log,
     *,
     runner: Runner,
-) -> int:
+) -> SweepReport:
     """Remove stale shared environments from every configured node."""
     cutoff = datetime.fromtimestamp(cutoff_ts)
-    used = envs_in_use(cfg)
     removed = 0
-    for node in cfg.nodes:
-        try:
-            command = clean_envs_command(
-                cfg.envs_for(node),
-                cutoff,
-                used.get(node.name, set()),
-            )
-            proc = runner(node.name, node.local, command, 120, False)
-        except Exception as exc:
-            log(f"{node.name}: env clean skipped ({exc})")
-            continue
-        if proc.returncode != 0:
-            detail = diagnostic_excerpt(proc.stderr, proc.stdout)
-            suffix = f": {detail}" if detail else ""
-            log(
-                f"{node.name}: env clean skipped "
-                f"(remote command exited {proc.returncode}{suffix})"
-            )
-            continue
-        gone = [line for line in (proc.stdout or "").splitlines() if line.strip()]
-        if gone:
-            log(f"{node.name}: removed {len(gone)} stale envs ({', '.join(gone)})")
-            removed += len(gone)
-    return removed
+    failures: list[CleanFailure] = []
+    with environment_retention_lock(cfg):
+        used = envs_in_use(cfg)
+        for node in cfg.nodes:
+            try:
+                command = clean_envs_command(
+                    cfg.envs_for(node),
+                    cutoff,
+                    used.get(node.name, set()),
+                )
+                proc = runner(node.name, node.local, command, 120, False)
+            except Exception as exc:
+                message = f"env clean skipped ({exc})"
+                log(f"{node.name}: {message}")
+                failures.append(
+                    CleanFailure("-", node.name, "env_clean_failed", message)
+                )
+                continue
+            if proc.returncode != 0:
+                detail = diagnostic_excerpt(proc.stderr, proc.stdout)
+                suffix = f": {detail}" if detail else ""
+                message = (
+                    "env clean skipped "
+                    f"(remote command exited {proc.returncode}{suffix})"
+                )
+                log(f"{node.name}: {message}")
+                failures.append(
+                    CleanFailure("-", node.name, "env_clean_failed", message)
+                )
+                continue
+            incomplete = " ".join((proc.stderr or "").split())
+            if incomplete:
+                log(f"{node.name}: {incomplete}")
+                failures.append(
+                    CleanFailure("-", node.name, "env_clean_incomplete", incomplete)
+                )
+            gone = [line for line in (proc.stdout or "").splitlines() if line.strip()]
+            if gone:
+                log(f"{node.name}: removed {len(gone)} stale envs ({', '.join(gone)})")
+                removed += len(gone)
+    return SweepReport(removed=removed, failures=failures)
 
 
 def clean_deployments_command(cutoff: datetime) -> str:
@@ -172,21 +227,22 @@ def clean_deployments_command(cutoff: datetime) -> str:
       overrides not present in the login environment) simply do not match
       and stay untouched.
     """
-    stamp = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    cutoff_epoch = _cutoff_epoch(cutoff)
     script = (
         "umask 077; "
         "command -v flock >/dev/null 2>&1 || "
         '{ echo "flock is required for safe deployment cleanup" >&2; exit 69; }; '
         "dt_dep_old() { "
-        f'dt_dep_probe=$(find "$1" -maxdepth 0 ! -newermt "{stamp}" '
-        "-print 2>/dev/null) || return 1; "
-        '[ -n "$dt_dep_probe" ]; }; '
+        'dt_dep_mtime=$(stat -c %Y -- "$1" 2>/dev/null) || return 1; '
+        'case "$dt_dep_mtime" in ""|*[!0-9]*) return 1;; esac; '
+        f'[ "$dt_dep_mtime" -lt {cutoff_epoch} ]; }}; '
         "dt_dep_reap() { "
         'dt_dep_name=$(basename -- "$1"); '
         'dt_dep_doomed="$2/.removing.$dt_dep_name.$$"; '
         'mv -f -- "$1" "$dt_dep_doomed" 2>/dev/null || return 1; '
-        'rm -rf -- "$dt_dep_doomed"; '
-        'printf \'%s %s\\n\' "$3" "$dt_dep_name"; }; '
+        'if rm -rf -- "$dt_dep_doomed"; then '
+        'printf \'%s %s\\n\' "$3" "$dt_dep_name"; '
+        'else echo "$3 removal incomplete: $dt_dep_doomed" >&2; return 1; fi; }; '
         'base="$HOME/.local/share/disttrainer"; '
         'if [ -d "$base" ] && [ ! -L "$base" ]; then '
         "( flock -w 10 9 || "
@@ -194,7 +250,8 @@ def clean_deployments_command(cutoff: datetime) -> str:
         'for dt_dep_left in "$base"/.removing.*; do '
         '[ -e "$dt_dep_left" ] || continue; '
         '[ -L "$dt_dep_left" ] && continue; '
-        'rm -rf -- "$dt_dep_left"; done; '
+        'rm -rf -- "$dt_dep_left" || '
+        'echo "release quarantine cleanup failed: $dt_dep_left" >&2; done; '
         'releases="$base/releases"; current="$base/current"; '
         'keep=""; dt_dep_safe=1; '
         'if [ -L "$current" ]; then '
@@ -232,7 +289,8 @@ def clean_deployments_command(cutoff: datetime) -> str:
         'for dt_dep_left in "$root"/.removing.*; do '
         '[ -e "$dt_dep_left" ] || continue; '
         '[ -L "$dt_dep_left" ] && continue; '
-        'rm -rf -- "$dt_dep_left"; done; '
+        'rm -rf -- "$dt_dep_left" || '
+        'echo "installation quarantine cleanup failed: $dt_dep_left" >&2; done; '
         # readlink -f succeeds even when the final component is missing, so
         # the resolved target must itself exist and live inside this root
         # before it can prove anything; otherwise no installation can be
@@ -262,35 +320,47 @@ def clean_deployments(
     log: Log,
     *,
     runner: Runner,
-) -> int:
+) -> SweepReport:
     """Remove old release trees and installations from every configured node."""
     cutoff = datetime.fromtimestamp(cutoff_ts)
     command = clean_deployments_command(cutoff)
     removed = 0
+    failures: list[CleanFailure] = []
     for node in cfg.nodes:
         try:
             proc = runner(node.name, node.local, command, 120, False)
         except Exception as exc:
-            log(f"{node.name}: deployment clean skipped ({exc})")
+            message = f"deployment clean skipped ({exc})"
+            log(f"{node.name}: {message}")
+            failures.append(
+                CleanFailure("-", node.name, "deployment_clean_failed", message)
+            )
             continue
         if proc.returncode != 0:
             detail = diagnostic_excerpt(proc.stderr, proc.stdout)
             suffix = f": {detail}" if detail else ""
-            log(
-                f"{node.name}: deployment clean skipped "
+            message = (
+                "deployment clean skipped "
                 f"(remote command exited {proc.returncode}{suffix})"
+            )
+            log(f"{node.name}: {message}")
+            failures.append(
+                CleanFailure("-", node.name, "deployment_clean_failed", message)
             )
             continue
         skipped = " ".join((proc.stderr or "").split())
         if skipped:
             log(f"{node.name}: {skipped}")
+            failures.append(
+                CleanFailure("-", node.name, "deployment_clean_incomplete", skipped)
+            )
         gone = [line for line in (proc.stdout or "").splitlines() if line.strip()]
         if gone:
             log(
                 f"{node.name}: removed {len(gone)} deployment trees ({', '.join(gone)})"
             )
             removed += len(gone)
-    return removed
+    return SweepReport(removed=removed, failures=failures)
 
 
 def clean_job_victims(
@@ -472,9 +542,19 @@ def clean_jobs(
     projects: set[str] | None = None,
     runner: Runner,
     before_registry_remove: BeforeRegistryRemove | None = None,
+    authorized: Sequence[JobEntry] | None = None,
 ) -> CleanReport:
-    """Delete only confirmed managed data and retain failed records for retry."""
-    victims = clean_job_victims(cfg, cutoff_ts, projects=projects)
+    """Delete only the preview-authorized set, shrinking on revalidation.
+
+    Interactive confirmation authorizes an exact point-in-time set.  Apply may
+    refuse a row whose state changed, but must never discover and delete a new
+    row that was absent from the prompt or plan.
+    """
+    victims = (
+        list(authorized)
+        if authorized is not None
+        else clean_job_victims(cfg, cutoff_ts, projects=projects)
+    )
     removed_entries: list[JobEntry] = []
     failures: list[CleanFailure] = []
     for selected in victims:
@@ -495,11 +575,35 @@ def clean_jobs(
                     )
                 )
                 continue
-            if entry is None or not _still_cleanable(
-                cfg,
-                entry,
-                cutoff_ts,
-                projects,
+            authorized_identity = (
+                selected.job_id,
+                selected.node,
+                selected.node_local,
+                selected.job_dir,
+                selected.storage_layout,
+                selected.updated_at,
+            )
+            current_identity = (
+                (
+                    entry.job_id,
+                    entry.node,
+                    entry.node_local,
+                    entry.job_dir,
+                    entry.storage_layout,
+                    entry.updated_at,
+                )
+                if entry is not None
+                else None
+            )
+            if (
+                entry is None
+                or current_identity != authorized_identity
+                or not _still_cleanable(
+                    cfg,
+                    entry,
+                    cutoff_ts,
+                    projects,
+                )
             ):
                 message = "job state or active references changed after cleanup plan"
                 log(f"{selected.job_id}: {message}; registry retained")
@@ -673,10 +777,12 @@ def clean_jobs(
         # skipping env cleanup) over a snapshot-store hiccup would hide what
         # was actually done.
         log(f"snapshot cleanup incomplete: {exc}")
-    if envs:
-        clean_envs(cfg, cutoff_ts, log, runner=runner)
+    env_report = clean_envs(cfg, cutoff_ts, log, runner=runner) if envs else None
+    if env_report is not None:
+        failures.extend(env_report.failures)
     return CleanReport(
         eligible=len(victims),
         removed=len(removed_entries),
         failures=failures,
+        removed_envs=env_report.removed if env_report is not None else 0,
     )

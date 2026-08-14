@@ -12,6 +12,7 @@ skipped  - a dependency predicate completed false; no user command ran
 from __future__ import annotations
 
 import bisect
+import copy
 import fcntl
 import hashlib
 import json
@@ -43,7 +44,7 @@ from .layout import (
     node_path_expression,
     normalize_node_root,
 )
-from .lifecycle import process_identity_shell, validate_job_capsule
+from .lifecycle import liveness_shell, validate_job_capsule
 from .private_state import (
     PrivateStateError,
     atomic_write,
@@ -54,6 +55,7 @@ from .private_state import (
     read_bounded,
 )
 from .sshio import run_on
+from . import custom_env as custom_env_mod
 
 NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
 MAX_SAFE_NAME_LENGTH = 64
@@ -76,6 +78,11 @@ RESULT_STATES = frozenset(
         "dependency_skipped",
     }
 )
+# Bump whenever two resident dispatchers cannot safely share queued rows.  A
+# submitting CLI refuses an alive agent that does not advertise this exact
+# value, preventing mixed-release duplicate launches during upgrades or source
+# development.
+DISPATCH_PROTOCOL_VERSION = "dt_dispatch_attempt_v1"
 JOB_STATUSES = frozenset(
     {"queued", "running", "finished", "killed", "lost", "failed", "skipped"}
 )
@@ -176,6 +183,7 @@ class JobEntry:
     payload_sha256: str | None = None  # exact dt node-runtime content identity
     artifact_manifest: str | None = None  # frozen shared-input content identity
     max_hours: float | None = None
+    min_vram_mib: int | None = None  # minimum total memory on every selected GPU
     max_vram_mib: int | None = None  # per-selected-GPU device-memory guard
     max_job_memory_mib: int | None = None  # attributed host-memory guard
     created_at: float = field(default_factory=time.time)  # submission/queue time
@@ -187,6 +195,10 @@ class JobEntry:
     require_disk_gib: int | None = None
     pin_node: str | None = None
     reason: str | None = None  # queue blocker, failure/loss, or lifecycle warning
+    # Private crash-recovery hint written before a queued remote attempt. It
+    # is cleared only after the attempt is proven absent or adopted.
+    dispatch_node: str | None = None
+    dispatch_token: str | None = None
     placement_failures: dict[str, str] = field(default_factory=dict)
     env_hash: str | None = None  # shared reproducible venv identity (12 hex)
     snapshot_duration_s: float | None = None  # successful node snapshot transfer
@@ -196,6 +208,14 @@ class JobEntry:
     setup_ran: bool | None = None  # this launch executed the project setup hook
     env_mode: str | None = None  # sync (default) or exact reuse
     env_source_job: str | None = None
+    # Private values are persisted for queue/rerun fidelity but never emitted
+    # by public JSON surfaces. Those expose ``custom_env_keys`` only.
+    custom_env: dict[str, str] = field(default_factory=dict)
+    # Registry scans retain only names.  Exact ``load()`` calls keep the
+    # values for dispatch/replay; lifecycle scans must not pin every historic
+    # secret in the resident agent merely to render public state.
+    custom_env_keys: list[str] = field(default_factory=list)
+    custom_env_loaded: bool = field(default=True, repr=False)
     boot_id: str | None = None  # compute-node boot identity at launch
     started_at: float | None = None  # dispatch success time (queued_at = created_at)
     setup: str | None = None  # project post-sync hook (replayed by rerun)
@@ -228,6 +248,10 @@ class JobEntry:
     worker_roots: dict[str, str] = field(default_factory=dict)
     job_relpath: str | None = None
     recovered_at: float | None = None
+    # A role-layout migration publishes the registry destination before it
+    # removes the legacy capsule.  Persist this bit in the same transaction so
+    # an interrupted/unwritable cleanup is discoverable and safely retryable.
+    legacy_cleanup_pending: bool = False
 
 
 def effective_result_state(entry: JobEntry) -> str | None:
@@ -261,7 +285,68 @@ def is_uncertain_launch(entry: JobEntry) -> bool:
     )
 
 
-_JOB_ENTRY_FIELDS = frozenset(item.name for item in fields(JobEntry))
+def dependency_settled(entry: JobEntry, *, now: float | None = None) -> bool:
+    """Whether an irreversible dependent transition may observe ``entry``.
+
+    A legacy lost row may not have ``finished_at``.  Treat its last durable
+    registry update (or creation time as the final compatibility fallback) as
+    the start of the rescue window; missing data must delay, never accelerate,
+    an irreversible skip/release decision.
+    """
+    if entry.status not in {"finished", "killed", "lost", "failed", "skipped"}:
+        return False
+    if is_uncertain_launch(entry):
+        return False
+    if entry.status != "lost":
+        return True
+    observed_at = entry.finished_at or entry.updated_at or entry.created_at
+    return (time.time() if now is None else now) - observed_at > LOST_RECHECK_S
+
+
+def transition_terminal(
+    entry: JobEntry,
+    *,
+    status: str,
+    result_state: str,
+    reason: str | None,
+    finished_at: float | None = None,
+) -> None:
+    """Apply the cross-field invariants shared by terminal transitions."""
+    if status not in {"finished", "killed", "lost", "failed", "skipped"}:
+        raise ValueError(f"{status!r} is not a terminal job status")
+    if result_state not in RESULT_STATES:
+        raise ValueError(f"{result_state!r} is not a typed result state")
+    entry.status = status
+    entry.result_state = result_state
+    entry.reason = reason
+    entry.finished_at = time.time() if finished_at is None else finished_at
+
+
+_INTERNAL_JOB_FIELDS = frozenset({"custom_env_keys", "custom_env_loaded"})
+_JOB_ENTRY_FIELDS = frozenset(
+    item.name for item in fields(JobEntry) if item.name not in _INTERNAL_JOB_FIELDS
+)
+PRIVATE_JOB_FIELDS = frozenset(
+    {"custom_env", "dispatch_node", "dispatch_token", *_INTERNAL_JOB_FIELDS}
+)
+
+
+def public_job_record(entry: JobEntry) -> dict[str, object]:
+    """Return the canonical public projection of a private registry row."""
+    # ``dataclasses.asdict`` recursively deep-copies private values before we
+    # discard them.  Besides wasting most of a bounded ``ps`` query's CPU, that
+    # transiently duplicates secrets.  Copy only the public mutable members.
+    record: dict[str, object] = {
+        item.name: copy.deepcopy(getattr(entry, item.name))
+        for item in fields(JobEntry)
+        if item.name not in PRIVATE_JOB_FIELDS
+    }
+    record["custom_env_keys"] = (
+        sorted(entry.custom_env)
+        if entry.custom_env_loaded
+        else list(entry.custom_env_keys)
+    )
+    return record
 
 
 def _count_starting_with(sorted_values: list[str], prefix: str) -> int:
@@ -330,6 +415,7 @@ def _decode_entry(
     layout: str | None = None,
     registry_updated_at: float | None = None,
     expected_job_id: str | None = None,
+    include_private: bool = True,
 ) -> JobEntry:
     if not isinstance(raw, dict):
         raise TypeError("job registry entry must be a JSON object")
@@ -338,9 +424,15 @@ def _decode_entry(
         raise ValueError("job registry identity is unsafe")
     if expected_job_id is not None and raw_job_id != expected_job_id:
         raise ValueError("job registry identity does not match its filename")
-    entry = JobEntry(
-        **{key: value for key, value in raw.items() if key in _JOB_ENTRY_FIELDS}
-    )
+    payload = {key: value for key, value in raw.items() if key in _JOB_ENTRY_FIELDS}
+    try:
+        normalized_custom_env = custom_env_mod.validate(payload.get("custom_env", {}))
+    except custom_env_mod.CustomEnvironmentError as exc:
+        raise ValueError(str(exc)) from exc
+    payload["custom_env"] = normalized_custom_env if include_private else {}
+    entry = JobEntry(**payload)
+    entry.custom_env_keys = sorted(normalized_custom_env)
+    entry.custom_env_loaded = include_private
     # Early launchers persisted an empty string when no uv environment existed.
     # Normalize that historical sentinel before validating the current optional
     # identity contract.
@@ -362,7 +454,11 @@ def _decode_entry(
         raise ValueError("job registry has invalid required text fields")
     if not isinstance(entry.status, str) or entry.status not in JOB_STATUSES:
         raise ValueError("job registry has an invalid lifecycle status")
-    if not isinstance(entry.node_local, bool) or not isinstance(entry.git_dirty, bool):
+    if (
+        not isinstance(entry.node_local, bool)
+        or not isinstance(entry.git_dirty, bool)
+        or not isinstance(entry.legacy_cleanup_pending, bool)
+    ):
         raise ValueError("job registry has invalid boolean fields")
     if (
         not isinstance(entry.gpus, list)
@@ -444,6 +540,8 @@ def _decode_entry(
         entry.require_path,
         entry.pin_node,
         entry.reason,
+        entry.dispatch_node,
+        entry.dispatch_token,
         entry.env_hash,
         entry.env_mode,
         entry.env_source_job,
@@ -468,6 +566,23 @@ def _decode_entry(
     )
     if any(value is not None and not isinstance(value, str) for value in optional_text):
         raise ValueError("job registry has invalid optional text fields")
+    if entry.legacy_cleanup_pending and (
+        entry.storage_layout != ROLE_LAYOUT
+        or entry.status not in {"finished", "killed"}
+        or entry.node == "-"
+        or entry.worker_root is None
+        or entry.job_relpath != f"jobs/{entry.job_id}"
+    ):
+        raise ValueError("job registry has an invalid pending legacy cleanup")
+    if (
+        entry.dispatch_token is not None
+        and re.fullmatch(r"[0-9a-f]{32}", entry.dispatch_token) is None
+    ):
+        raise ValueError("job registry has an invalid dispatch token")
+    if (entry.dispatch_node is None) != (entry.dispatch_token is None):
+        raise ValueError("job registry has an incomplete dispatch attempt identity")
+    if entry.dispatch_node is not None and entry.status != "queued":
+        raise ValueError("only queued jobs may retain a dispatch attempt identity")
     digest_fields = (
         entry.snapshot_sha256,
         entry.payload_sha256,
@@ -519,13 +634,19 @@ def _decode_entry(
         or entry.max_hours <= 0
     ):
         raise ValueError("job registry has an invalid runtime limit")
-    positive_integer_limits = (entry.max_vram_mib, entry.max_job_memory_mib)
+    positive_integer_limits = (
+        entry.min_vram_mib,
+        entry.max_vram_mib,
+        entry.max_job_memory_mib,
+    )
     if any(
         value is not None
         and (isinstance(value, bool) or not isinstance(value, int) or value <= 0)
         for value in positive_integer_limits
     ):
         raise ValueError("job registry has invalid positive resource limits")
+    if entry.min_vram_mib is not None and entry.gpus_requested == 0:
+        raise ValueError("job registry has a GPU memory requirement on a CPU job")
     if entry.require_disk_gib is not None and (
         isinstance(entry.require_disk_gib, bool)
         or not isinstance(entry.require_disk_gib, int)
@@ -602,6 +723,7 @@ def _decode_entry_result(
     name: str,
     layout: str | None,
     expected_job_id: str,
+    include_private: bool = True,
 ) -> JobEntry:
     if result is None:
         raise RegistryError(f"registry record disappeared: {name}")
@@ -615,6 +737,7 @@ def _decode_entry_result(
         layout=layout,
         registry_updated_at=info.st_mtime,
         expected_job_id=expected_job_id,
+        include_private=include_private,
     )
 
 
@@ -668,11 +791,38 @@ def save(cfg: HeadConfig, entry: JobEntry) -> None:
     else:
         path = cfg.registry_dir() / f"{entry.job_id}.json"
     _require_private_directory(path.parent, create=True)
+    persisted = entry
+    if not entry.custom_env_loaded:
+        # Lifecycle scans intentionally discard private values.  A later
+        # status transition must preserve the exact stored mapping rather than
+        # silently clearing replay credentials.  Resolve just this row at the
+        # write boundary and verify its public key set did not change.
+        current_entry = load(cfg, job_id)
+        if current_entry is None:
+            raise RegistryError(
+                "cannot preserve unloaded custom environment: registry row vanished"
+            )
+        if sorted(current_entry.custom_env) != entry.custom_env_keys:
+            raise RegistryError(
+                "custom environment changed while the registry row was being updated"
+            )
+        persisted = copy.deepcopy(entry)
+        persisted.custom_env = dict(current_entry.custom_env)
+        persisted.custom_env_keys = sorted(current_entry.custom_env)
+        persisted.custom_env_loaded = True
+
     # Keep registry mutation time independent from lifecycle clocks that tests
     # and callers may deliberately freeze. Nanosecond wall time also avoids an
     # extra consumption of a mocked finite event sequence in failure paths.
-    entry.updated_at = time.time_ns() / 1_000_000_000
-    document = asdict(entry)
+    updated_at = time.time_ns() / 1_000_000_000
+    entry.updated_at = updated_at
+    persisted.updated_at = updated_at
+    entry.custom_env_keys = (
+        sorted(entry.custom_env) if entry.custom_env_loaded else entry.custom_env_keys
+    )
+    document = asdict(persisted)
+    for name in _INTERNAL_JOB_FIELDS:
+        document.pop(name, None)
     # Validate and bound the final document before it can replace authoritative
     # state. A successful writer must never create a row its own reader rejects.
     _decode_entry(document, expected_job_id=job_id)
@@ -745,11 +895,12 @@ def pull_destination_lock(cfg: HeadConfig, destination: Path) -> Iterator[None]:
 def load(cfg: HeadConfig, job_id: str) -> JobEntry | None:
     if not _valid_job_id(job_id):
         return None
-    current = cfg.registry_dir()
-    _require_private_directory(current, create=True)
-    candidates = [(current / f"{job_id}.json", cfg.layout)]
+    current = cfg.registry_path()
+    candidates: list[tuple[Path, str]] = []
+    if _require_private_directory(current, create=False):
+        candidates.append((current / f"{job_id}.json", cfg.layout))
     legacy = cfg.legacy_registry_dir() / f"{job_id}.json"
-    if legacy != candidates[0][0]:
+    if legacy != current / f"{job_id}.json":
         if _require_private_directory(legacy.parent, create=False):
             candidates.append((legacy, LEGACY_LAYOUT))
     for path, layout in candidates:
@@ -801,7 +952,7 @@ def list_all(
     origins: dict[str, str] = {}
     cache_seen: set[str] = set()
     directories = [(cfg.legacy_registry_dir(), LEGACY_LAYOUT)]
-    current = cfg.registry_dir()
+    current = cfg.registry_path()
     if current != cfg.legacy_registry_dir():
         directories.append((current, cfg.layout))
     for directory, layout in directories:
@@ -847,7 +998,12 @@ def list_all(
                         revision = (info.st_ino, info.st_size, info.st_mtime_ns)
                         cached = _DECODE_CACHE.get(cache_key)
                         if cached is not None and cached[0] == revision:
-                            entry = cached[1]
+                            # The resident agent mutates rows while attempting
+                            # lifecycle transitions. Keep the cached decode as
+                            # an immutable snapshot of the on-disk revision so
+                            # a failed save cannot make unsaved state appear
+                            # durable on the next scan.
+                            entry = copy.deepcopy(cached[1])
                             if entry.job_id in entries and damage is not None:
                                 damage.append(
                                     RegistryDamage(
@@ -868,13 +1024,14 @@ def list_all(
                         name=name,
                         layout=layout,
                         expected_job_id=name[: -len(".json")],
+                        include_private=False,
                     )
                     if cache_key is not None and result is not None:
                         _, info = result
                         if len(_DECODE_CACHE) < _DECODE_CACHE_MAX:
                             _DECODE_CACHE[cache_key] = (
                                 (info.st_ino, info.st_size, info.st_mtime_ns),
-                                entry,
+                                copy.deepcopy(entry),
                             )
                     if entry.job_id in entries and damage is not None:
                         # A crashed migration window can leave the same job in
@@ -913,7 +1070,7 @@ def registry_row_count(cfg: HeadConfig) -> int:
     floor of that scan (sub-millisecond where a full decode is tens of
     milliseconds), which keeps the health check itself free.
     """
-    directories = {cfg.legacy_registry_dir(), cfg.registry_dir()}
+    directories = {cfg.legacy_registry_dir(), cfg.registry_path()}
     total = 0
     for directory in directories:
         try:
@@ -1033,7 +1190,7 @@ def resolution_entries(cfg: HeadConfig) -> list[JobEntry]:
     scope = _resolution_snapshot.get()
     if scope is None:
         return list_all(cfg)
-    key = str(cfg.registry_dir())
+    key = str(cfg.registry_path())
     if key not in scope:
         scope[key] = list_all(cfg)
     return scope[key]
@@ -1122,7 +1279,7 @@ def _refresh_status_locked(
     # forged status marker followed by a fake token stream) cannot change the
     # probe's line protocol and rewrite a running job into a terminal state.
     probe = (
-        process_identity_shell() + "dt_probe_field() { "
+        liveness_shell() + "dt_probe_field() { "
         'if [ -f "$1" ]; then head -c 128 -- "$1" 2>/dev/null '
         "| tr -d '\\r\\n'; echo; else echo UNKNOWN; fi; }; "
         + f"DT_WPID={wrapper_pid}; "
@@ -1131,18 +1288,28 @@ def _refresh_status_locked(
         + f"DT_WBOOT={shlex.quote(entry.boot_id or '')}; "
         + "cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo UNKNOWN; "
         f"echo {STATUS_MARK}; "
-        f"if [ -f {state}/exit_code ]; then "
+        'dt_process_owned "$DT_WPID" "$DT_WIDENT" "$DT_WJOB" '
+        '"$DT_WBOOT"; dt_identity=$?; '
+        'dt_live=$(dt_job_live_state "$DT_WJOB" "$DT_WPID" '
+        '"$DT_WBOOT" "$DT_WIDENT"); '
+        f'if [ -f {state}/exit_code ] && [ "$dt_live" = DEAD ]; then '
         f"dt_probe_field {state}/exit_code; "
         f"dt_probe_field {state}/started_at; "
         f"dt_probe_field {state}/finished_at; "
-        'elif dt_process_owned "$DT_WPID" "$DT_WIDENT" "$DT_WJOB" '
-        '"$DT_WBOOT"; then '
+        'elif [ "$dt_identity" -eq 2 ]; then '
+        f"echo UNVERIFIED; dt_probe_field {state}/started_at; echo UNKNOWN; "
+        'elif [ "$dt_live" = LIVE ]; then '
         f"echo RUNNING; dt_probe_field {state}/started_at; echo UNKNOWN; "
-        "else dt_identity_rc=$?; "
-        f'[ "$dt_identity_rc" -eq 2 ] && echo STALE || echo LOST; '
-        f"dt_probe_field {state}/started_at; echo UNKNOWN; fi; "
+        'elif [ "$dt_live" = UNPROVEN ]; then '
+        f"echo UNVERIFIED; dt_probe_field {state}/started_at; echo UNKNOWN; "
+        "else "
+        f"echo LOST; dt_probe_field {state}/started_at; echo UNKNOWN; fi; "
         f"dt_probe_field {state}/result_state"
     )
+    # Remote login shells may be zsh, whose default does not word-split the
+    # procfs tail used by process_identity_shell. Pin the parser to bash just
+    # like destructive lifecycle callers do.
+    probe = f"env LC_ALL=C bash -c {shlex.quote(probe)}"
     try:
         proc = run_on(entry.node, entry.node_local, probe, timeout=timeout)
         if proc.returncode != 0:
@@ -1184,12 +1351,19 @@ def _refresh_status_locked(
                 else "UNKNOWN"
             )
         else:
-            # Backward-compatible parsing for older/mocked two-line probes.
-            current_boot_id = tokens[-2] if len(tokens) >= 2 else None
-            token = tokens[-1] if tokens else "LOST"
-            started_token = "UNKNOWN"
-            finished_token = "UNKNOWN"
-            result_token = "UNKNOWN"
+            # This command always emits STATUS_MARK before reading any
+            # job-writable field. Missing framing therefore means the remote
+            # shell did not execute the trusted probe we sent. Legacy two-line
+            # output is ambiguous with workload-controlled stdout and must not
+            # drive a lifecycle transition.
+            if observation is not None:
+                observation.update(
+                    status_probe_error=(
+                        "status probe response is missing trusted protocol marker; "
+                        "registry retained"
+                    )
+                )
+            return entry
     except Exception as exc:
         if observation is not None:
             observation.update(
@@ -1212,7 +1386,7 @@ def _refresh_status_locked(
 
     remote_started_at = positive_timestamp(started_token)
     remote_finished_at = positive_timestamp(finished_token)
-    if token not in ("RUNNING", "LOST", "STALE"):
+    if token not in ("RUNNING", "LOST", "STALE", "UNVERIFIED"):
         try:
             exit_code = int(token)
         except ValueError:
@@ -1257,6 +1431,18 @@ def _refresh_status_locked(
         save(cfg, entry)
         return entry
     if token == "RUNNING":
+        if entry.status == "lost" and dependency_settled(entry):
+            # After the documented rescue window, dependents may already have
+            # made irreversible decisions from the terminal record.  A late
+            # ambiguous probe cannot reopen that history.
+            if observation is not None:
+                observation.update(
+                    status_probe_error=(
+                        "late running evidence arrived after the lost-job "
+                        "recovery window; registry retained"
+                    )
+                )
+            return entry
         changed = False
         if remote_started_at is not None and entry.started_at != remote_started_at:
             entry.started_at = remote_started_at
@@ -1271,8 +1457,32 @@ def _refresh_status_locked(
         ):
             entry.reason = None
             changed = True
+        # A rescued ``lost`` row must not carry its old terminal meaning into
+        # the running state.  Status, exit code and typed result are one state
+        # transition, never independently sticky fields.
+        if entry.exit_code is not None:
+            entry.exit_code = None
+            changed = True
+        if entry.result_state is not None:
+            entry.result_state = None
+            changed = True
+        if entry.finished_at is not None:
+            entry.finished_at = None
+            changed = True
         if changed:
             save(cfg, entry)
+        return entry
+    if token == "UNVERIFIED":
+        # A live PID whose boot/start identity cannot be proven may be either
+        # this job or a recycled foreign process. Neither completion nor loss
+        # is established, so preserve the durable lifecycle record.
+        if observation is not None:
+            observation.update(
+                status_probe_error=(
+                    "wrapper process identity or survivor census is unverified; "
+                    "registry retained"
+                )
+            )
         return entry
     if token in {"LOST", "STALE"}:
         lost_reason = (

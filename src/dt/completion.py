@@ -25,7 +25,7 @@ def completion_watch_command(entry: JobEntry) -> str:
     )
     job_dir = node_path_expression(entry.job_dir.rstrip("/"))
     boot_id = shlex.quote(entry.boot_id or "")
-    return (
+    script = (
         process_identity_shell()
         + f"DT_WPID={int(entry.pgid)}; DT_WIDENT={state_dir}/process_start_ticks; "
         + f"DT_WJOB={job_dir}; DT_WBOOT={boot_id}; "
@@ -33,6 +33,7 @@ def completion_watch_command(entry: JobEntry) -> str:
         + 'dt_process_owned "$DT_WPID" "$DT_WIDENT" "$DT_WJOB" '
         + '"$DT_WBOOT"; do sleep 0.1; done'
     )
+    return f"env LC_ALL=C bash -c {shlex.quote(script)}"
 
 
 def spawn_completion_watcher(entry: JobEntry) -> subprocess.Popen[bytes]:

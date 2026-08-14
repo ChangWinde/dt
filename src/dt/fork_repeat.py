@@ -77,10 +77,11 @@ def build_receipt(
     request_id: str | None = None,
     idempotent_replay: bool = False,
 ) -> JsonDict:
-    interrupted = (
-        isinstance(error, dict)
-        and error.get("kind") == "fork_repeat_submission_interrupted"
-    )
+    uncertain = isinstance(error, dict) and error.get("kind") in {
+        "fork_repeat_submission_interrupted",
+        "submission_unknown",
+        "uncertain_launch",
+    }
     rows = [
         host.submission_payload(
             entry,
@@ -106,7 +107,7 @@ def build_receipt(
             else "partial"
             if entries
             else "unknown"
-            if interrupted
+            if uncertain
             else "failed"
         ),
         "repeat_ref_job_id": old.job_id,
@@ -139,6 +140,8 @@ def build_receipt(
         }
     if entries and entries[0].max_hours is not None:
         receipt["max_hours"] = entries[0].max_hours
+    if entries and entries[0].min_vram_mib is not None:
+        receipt["min_vram_mib"] = entries[0].min_vram_mib
     if entries and entries[0].max_vram_mib is not None:
         receipt["max_vram_mib"] = entries[0].max_vram_mib
     if entries and entries[0].max_job_memory_mib is not None:
@@ -265,7 +268,7 @@ def forward_laptop(
         kind="submission_protocol",
         message=(
             f"head returned no complete {SCHEMA} receipt (exit {rc}); "
-            f"inspect `dt ps -w` for prefix {name_prefix!r}"
+            f"inspect `dt ps -w` for forks of source ref {ref!r}"
         ),
         exit_code=1,
         json_=json_,
@@ -291,6 +294,7 @@ def run(
     inherit_cache: bool,
     artifact_manifest: str | None,
     max_hours: float | None,
+    min_vram_mib: int | None = None,
     max_vram_mib: int | None,
     max_job_memory_mib: int | None,
     cold_cache_env: str | None,
@@ -323,6 +327,10 @@ def run(
                 "inherit_cache": inherit_cache,
                 "artifact_manifest": artifact_manifest,
                 "max_hours": max_hours,
+                # Bind the effective inherited-or-overridden shape, not merely
+                # the optional CLI override. A retry must conflict if the
+                # persisted source contract was changed underneath it.
+                "min_vram_mib": spec.min_vram_mib,
                 "max_vram_mib": max_vram_mib,
                 "max_job_memory_mib": max_job_memory_mib,
             }
@@ -402,7 +410,7 @@ def run(
                 json_=json_,
             )
         try:
-            replay_spec = build_spec(f"{prefix}-001")
+            replay_spec = build_spec(_member_name(prefix, 1, repeat))
             replay_spec.request_id = group_mod.item_request_id(request_id, 1)
             verified_entry = dispatch_mod.submit_fork(
                 cfg,
@@ -528,7 +536,11 @@ def run(
                 item_label="fork repeat item",
             )
             if failed_entry is not None:
-                if request_id is not None and group_intent_sha256 is not None:
+                if (
+                    failure.get("kind") != "uncertain_launch"
+                    and request_id is not None
+                    and group_intent_sha256 is not None
+                ):
                     try:
                         group_record = group_mod.locked_record_job(
                             cfg,
@@ -599,6 +611,7 @@ def run(
                 "fork_repeat_submission_interrupted",
                 "submission_unknown",
                 "idempotency_conflict",
+                "uncertain_launch",
             }
         )
         try:

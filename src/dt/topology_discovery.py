@@ -121,6 +121,10 @@ class ArtifactReplica:
     node: Node
     code_dir: str
     recorded_at: float
+    # Peer replicas remain owned by a job capsule.  Carry its identity so the
+    # transfer executor can hold the same per-job retention lock as cleanup.
+    # Site-cache replicas have no owning registry row.
+    job_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -448,7 +452,9 @@ def resolved_ssh_options(
     if proc.returncode != 0:
         return {}
     options: dict[str, str] = {}
-    for line in (proc.stdout or "").splitlines()[:512]:
+    # Parse every option within one bounded payload. A configuration with many
+    # forwards can legitimately push proxyjump/proxycommand past line 512.
+    for line in (proc.stdout or "")[: 1024 * 1024].splitlines():
         key, _, value = line.partition(" ")
         lowered = key.lower()
         if lowered in {"hostname", "proxycommand", "proxyjump", "port", "user"}:
@@ -486,6 +492,15 @@ def local_interface_addresses(
         for interface in interfaces:
             if not isinstance(interface, dict):
                 continue
+            interface_name = interface.get("ifname")
+            if (
+                isinstance(interface_name, str)
+                and _interface_penalty(interface_name) >= 100.0
+            ):
+                # docker0/virbr0 commonly expose the same gateway address on
+                # every host. Treating that self-address as proof of a direct
+                # head-to-node path suppresses the tunnel warning.
+                continue
             for item in interface.get("addr_info") or []:
                 if isinstance(item, dict) and isinstance(item.get("local"), str):
                     found.add(item["local"])
@@ -512,9 +527,22 @@ def measure_control_route(
             "network to measure"
         )
     run = runner or subprocess.run
-    argv = ssh_cmd(node.name, "cat >/dev/null", workload=SSHWorkload.ARTIFACT_RELAY)
-    started = time.monotonic()
+    warmup_argv = ssh_cmd(node.name, "true", workload=SSHWorkload.ARTIFACT)
+    argv = ssh_cmd(node.name, "cat >/dev/null", workload=SSHWorkload.ARTIFACT)
     try:
+        warmup = run(
+            warmup_argv,
+            capture_output=True,
+            timeout=BANDWIDTH_PROBE_TIMEOUT_S,
+        )
+        if warmup.returncode != 0:
+            raise TopologyDiscoveryError(
+                f"control-route warmup to {node.name} failed (exit {warmup.returncode})"
+            )
+        # The warmup establishes this workload's isolated ControlMaster. Only
+        # time the payload leg so SSH handshake latency does not masquerade as
+        # low bulk throughput and suppress probe escalation.
+        started = time.monotonic()
         proc = run(
             argv,
             input=b"\0" * int(probe_bytes),
@@ -745,6 +773,7 @@ class TopologyDiscovery:
                 node=node,
                 code_dir=code_dir,
                 recorded_at=entry.started_at or entry.created_at,
+                job_id=entry.job_id,
             )
             prior = newest.get(node.name)
             if prior is None or candidate.recorded_at > prior.recorded_at:
@@ -906,6 +935,11 @@ class TopologyDiscovery:
     @classmethod
     def inner_ssh(cls, endpoint: DirectEndpoint) -> tuple[str, str]:
         setup, known_hosts = cls._known_hosts_setup(endpoint)
+        pool_identity = hashlib.sha256(
+            (endpoint.host_key_alias + "\0" + "\n".join(endpoint.host_keys)).encode(
+                "utf-8"
+            )
+        ).hexdigest()[:20]
         command = shlex.join(
             [
                 "ssh",
@@ -922,6 +956,8 @@ class TopologyDiscovery:
                 "-o",
                 "ProxyJump=none",
                 "-o",
+                "ForwardAgent=no",
+                "-o",
                 "StrictHostKeyChecking=yes",
                 "-o",
                 "GlobalKnownHostsFile=/dev/null",
@@ -932,7 +968,7 @@ class TopologyDiscovery:
                 "-o",
                 "ControlMaster=auto",
                 "-o",
-                "ControlPath=~/.ssh/dt/artifact/%C",
+                (f"ControlPath=~/.ssh/dt/artifact/pinned-{pool_identity}-%C"),
                 "-o",
                 "ControlPersist=300",
                 "-p",
@@ -960,13 +996,15 @@ class TopologyDiscovery:
         except subprocess.TimeoutExpired:
             latency_ms = max(0.0, (time.monotonic() - started) * 1000)
             return False, latency_ms, "timeout"
-        except (RemoteError, OSError):
-            # A probe that could not complete or start is a transport-level
-            # outcome. Return a stable ROUTE_TRANSPORT_FAILURE_KINDS category so
-            # the circuit accumulates the failure instead of a Python class name
-            # ("RemoteError"/"OSError") that never matches and silently drops it.
+        except RemoteError:
             latency_ms = max(0.0, (time.monotonic() - started) * 1000)
             return False, latency_ms, "transport"
+        except OSError:
+            # EMFILE/ENOMEM or a missing local ssh binary says nothing about
+            # the remote edge. Keep it outside ROUTE_TRANSPORT_FAILURE_KINDS
+            # so host pressure cannot poison the persistent route circuit.
+            latency_ms = max(0.0, (time.monotonic() - started) * 1000)
+            return False, latency_ms, "local"
         latency_ms = max(0.0, (time.monotonic() - started) * 1000)
         if proc.returncode == 0:
             return True, latency_ms, "ok"
@@ -1116,7 +1154,22 @@ class TopologyDiscovery:
                 ) from exc
             if prior.is_open:
                 raise RouteCircuitOpen(source.name, destination.name, prior)
-            endpoint = self.endpoint(source, destination)
+            try:
+                endpoint = self.endpoint(source, destination)
+            except BaseException:
+                # decision() reserves one half-open trial before endpoint
+                # construction. Advertisement/configuration failures occur
+                # before a probe can settle that trial, so return the claim.
+                if prior.failures >= site.route_circuit_failures:
+                    try:
+                        self.route_health.release_reservation(
+                            site,
+                            source.name,
+                            destination.name,
+                        )
+                    except RouteHealthError:
+                        pass
+                raise
             healthy, latency_ms, kind = self.probe_route(source, endpoint)
             try:
                 if healthy:

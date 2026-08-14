@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import subprocess
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
@@ -12,6 +13,7 @@ from .jobs import JobEntry
 from .layout import display_node_path, node_path_expression
 
 JsonDict = dict[str, Any]
+AUTOMATIC_TAIL_MAX_BYTES = 256 * 1024
 
 
 class ResourceRunner(Protocol):
@@ -61,7 +63,11 @@ class ResourceTelemetryQuery:
 
     def command(self, *, require_file: bool) -> str:
         path = node_path_expression(self.path)
-        reader = f"tail -n {self.tail} -- {path}" if self.tail else f"cat -- {path}"
+        reader = (
+            f"tail -c {AUTOMATIC_TAIL_MAX_BYTES} -- {path} | tail -n {self.tail}"
+            if self.tail
+            else f"cat -- {path}"
+        )
         if require_file:
             return f"test -f {path} && {reader}"
         return f"{reader} 2>/dev/null || true"
@@ -160,13 +166,18 @@ def parse_resource_jsonl(text: str) -> tuple[list[JsonDict], int]:
 # real metric (timestamps ~1e9, MiB ~1e6, percent 0-100) so summaries stay
 # finite and JSON-valid.
 _MAX_METRIC_MAGNITUDE = 10**15
+_MAX_GPU_INDEX = 255
+_MAX_GPU_ERROR_CHARS = 1024
+_MAX_RETAINED_PHASE_SPANS = 256
+_PHASE_SPAN_HEAD = _MAX_RETAINED_PHASE_SPANS // 2
+_PHASE_SPAN_TAIL = _MAX_RETAINED_PHASE_SPANS - _PHASE_SPAN_HEAD
 
 
 def _safe_number(value: object) -> int | float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     if isinstance(value, float):
-        if not math.isfinite(value):
+        if not math.isfinite(value) or abs(value) > _MAX_METRIC_MAGNITUDE:
             return None
     elif abs(value) > _MAX_METRIC_MAGNITUDE:
         return None
@@ -305,24 +316,29 @@ class _ResourceAccumulator:
     """Aggregate dt_resource_v1 rows one at a time.
 
     Produces the same summary as the historical whole-list aggregation
-    (bit-identical sums, means, peaks, and interval statistics) while
-    retaining only fixed-size statistics plus the set of distinct
-    timestamps, so an unbounded ``--tail 0`` read no longer materializes
-    every parsed row and per-metric list.
+    (bit-identical sums, means, and peaks) while retaining fixed-size state.
+    Timestamp interval statistics stay exact for the append-ordered telemetry
+    contract; a corrupt/non-monotonic stream reports the interval as
+    unavailable instead of retaining an unbounded de-duplication set.
     """
 
     __slots__ = (
         "samples",
         "timestamps",
         "timestamp_count",
-        "distinct_timestamps",
+        "timestamp_last",
+        "sample_interval_total",
+        "sample_interval_count",
+        "timestamps_monotonic",
         "gpus",
+        "ignored_gpu_samples",
         "host_cpu",
         "host_mem",
         "host_total",
         "host_io",
         "gpu_error_count",
         "gpu_error_last",
+        "gpu_error_last_truncated",
         "job_count",
         "job_cpu",
         "job_rss",
@@ -333,6 +349,8 @@ class _ResourceAccumulator:
         "job_reads",
         "job_writes",
         "phase_spans_done",
+        "phase_spans_tail",
+        "phase_spans_count",
         "phase_current",
         "phase_accumulator",
     )
@@ -341,14 +359,19 @@ class _ResourceAccumulator:
         self.samples = 0
         self.timestamps = _MinMax()
         self.timestamp_count = 0
-        self.distinct_timestamps: set[int | float] = set()
+        self.timestamp_last: int | float | None = None
+        self.sample_interval_total: int | float = 0
+        self.sample_interval_count = 0
+        self.timestamps_monotonic = True
         self.gpus: dict[str, _GpuStats] = {}
+        self.ignored_gpu_samples = 0
         self.host_cpu = _SeriesStats()
         self.host_mem = _SeriesStats()
         self.host_total = _SeriesStats()
         self.host_io = _SeriesStats()
         self.gpu_error_count = 0
         self.gpu_error_last: str | None = None
+        self.gpu_error_last_truncated = False
         self.job_count = 0
         self.job_cpu = _SeriesStats()
         self.job_rss = _SeriesStats()
@@ -359,6 +382,8 @@ class _ResourceAccumulator:
         self.job_reads = _SeriesStats()
         self.job_writes = _SeriesStats()
         self.phase_spans_done: list[dict[str, object]] | None = None
+        self.phase_spans_tail: deque[dict[str, object]] | None = None
+        self.phase_spans_count = 0
         self.phase_current: str | None = None
         self.phase_accumulator: _ResourceAccumulator | None = None
 
@@ -369,14 +394,25 @@ class _ResourceAccumulator:
             assert isinstance(timestamp, (int, float))
             self.timestamp_count += 1
             self.timestamps.add(timestamp)
-            self.distinct_timestamps.add(timestamp)
-        for gpu in row.get("gpus") or []:
+            if self.timestamp_last is not None:
+                if timestamp > self.timestamp_last:
+                    self.sample_interval_total += timestamp - self.timestamp_last
+                    self.sample_interval_count += 1
+                elif timestamp < self.timestamp_last:
+                    self.timestamps_monotonic = False
+            self.timestamp_last = timestamp
+        raw_gpus = row.get("gpus")
+        gpu_rows = raw_gpus if isinstance(raw_gpus, list) else []
+        for gpu in gpu_rows:
             if (
                 isinstance(gpu, dict)
                 and isinstance(gpu.get("index"), int)
                 and not isinstance(gpu.get("index"), bool)
             ):
                 gpu = cast(JsonDict, gpu)
+                if not 0 <= gpu["index"] <= _MAX_GPU_INDEX:
+                    self.ignored_gpu_samples += 1
+                    continue
                 stats = self.gpus.setdefault(str(gpu["index"]), _GpuStats())
                 stats.add(gpu, timestamp)
         host = row.get("host")
@@ -387,7 +423,18 @@ class _ResourceAccumulator:
             self.host_io.add(host.get("io_pressure"))
         if row.get("gpu_error") not in (None, ""):
             self.gpu_error_count += 1
-            self.gpu_error_last = str(row["gpu_error"])
+            raw_error = row["gpu_error"]
+            # Only telemetry strings are diagnostic content. Rendering a
+            # malformed collection with str() can allocate another copy of an
+            # attacker-sized structure before the bound is applied.
+            if isinstance(raw_error, str):
+                error = raw_error
+            elif isinstance(raw_error, bool) or _safe_number(raw_error) is not None:
+                error = str(raw_error)
+            else:
+                error = f"<invalid {type(raw_error).__name__} gpu_error>"
+            self.gpu_error_last_truncated = len(error) > _MAX_GPU_ERROR_CHARS
+            self.gpu_error_last = error[:_MAX_GPU_ERROR_CHARS]
         job = row.get("job")
         if isinstance(job, dict):
             self.job_count += 1
@@ -405,6 +452,7 @@ class _ResourceAccumulator:
     def _track_phase(self, row: JsonDict) -> None:
         if self.phase_spans_done is None:
             self.phase_spans_done = []
+            self.phase_spans_tail = deque(maxlen=_PHASE_SPAN_TAIL)
         phase = row.get("phase")
         if not safe_phase_name(phase):
             self._close_phase()
@@ -420,29 +468,28 @@ class _ResourceAccumulator:
         if self.phase_current is not None and self.phase_accumulator is not None:
             assert self.phase_spans_done is not None
             sampled = self.phase_accumulator.summary(include_phases=False)
-            self.phase_spans_done.append(
-                {
-                    "phase": self.phase_current,
-                    "samples": sampled["samples"],
-                    "sampled_started_at": sampled["started_at"],
-                    "sampled_finished_at": sampled["finished_at"],
-                    "sampled_duration_s": sampled["duration_s"],
-                    "gpus": sampled["gpus"],
-                    "job": sampled["job"],
-                }
-            )
+            span = {
+                "phase": self.phase_current,
+                "samples": sampled["samples"],
+                "sampled_started_at": sampled["started_at"],
+                "sampled_finished_at": sampled["finished_at"],
+                "sampled_duration_s": sampled["duration_s"],
+                "gpus": sampled["gpus"],
+                "job": sampled["job"],
+            }
+            self.phase_spans_count += 1
+            if len(self.phase_spans_done) < _PHASE_SPAN_HEAD:
+                self.phase_spans_done.append(span)
+            else:
+                assert self.phase_spans_tail is not None
+                self.phase_spans_tail.append(span)
         self.phase_current = None
         self.phase_accumulator = None
 
     def _sample_interval(self) -> int | float | None:
-        # Positive gaps between consecutive sorted timestamps telescope over
-        # duplicates, so summing the gaps of the distinct sorted values in
-        # ascending order reproduces the historical result bit for bit.
-        if len(self.distinct_timestamps) < 2:
+        if not self.timestamps_monotonic or not self.sample_interval_count:
             return None
-        ordered = sorted(self.distinct_timestamps)
-        intervals = [later - earlier for earlier, later in zip(ordered, ordered[1:])]
-        return sum(intervals) / len(intervals)
+        return self.sample_interval_total / self.sample_interval_count
 
     def summary(self, *, include_phases: bool = True) -> dict[str, object]:
         gpu_summary = {
@@ -499,13 +546,24 @@ class _ResourceAccumulator:
                 "io_pressure_peak": self.host_io.peak,
             },
         }
+        if not self.timestamps_monotonic:
+            summary["sample_interval_status"] = "non_monotonic_timestamps"
+        if self.ignored_gpu_samples:
+            summary["ignored_gpu_samples"] = self.ignored_gpu_samples
+        if self.gpu_error_last_truncated:
+            summary["gpu_error_last_truncated"] = True
         if include_phases:
             summary["phases"] = self.phase_spans()
+            retained = len(cast(list[object], summary["phases"]))
+            omitted = self.phase_spans_count - retained
+            if omitted:
+                summary["phase_spans_omitted"] = omitted
+                summary["phase_spans_head_count"] = len(self.phase_spans_done or [])
         return summary
 
     def phase_spans(self) -> list[dict[str, object]]:
         self._close_phase()
-        return list(self.phase_spans_done or [])
+        return [*(self.phase_spans_done or []), *(self.phase_spans_tail or [])]
 
 
 def summarize_resources(

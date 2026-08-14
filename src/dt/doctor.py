@@ -5,23 +5,17 @@ every declared node plus the tool prerequisites on it. Covers the M0 list.
 from __future__ import annotations
 
 import ipaddress
-import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .config import HeadConfig, Node
 from .redaction import redact_remote_detail
 from .sshio import RemoteError, run_on
 
-# Site policies whose transfers authenticate through a forwarded head agent.
-RELAY_POLICIES = frozenset({"site-cache-first", "topology-aware"})
-RELAY_SERVICE_SOCKET = "dt-ssh-agent.sock"
-_SSH_ADD_TIMEOUT_S = 5.0
-
 CHECK_SNIPPET = r"""
 echo DT_SSH=ok
+if command -v bash >/dev/null 2>&1; then echo DT_BASH=ok; else echo DT_BASH=missing; fi
 doctor_net() {
     fmt_speed() {
         awk -v s="${1:-0}" 'BEGIN{
@@ -83,6 +77,21 @@ wait "$dt_net_pid"
 DOCTOR_MAX_WORKERS = 32
 
 
+def head_capability_checks() -> dict[str, str]:
+    """Structured head prerequisites for doctor/automation consumers."""
+    from .agent import supervisor_capabilities
+
+    capabilities = supervisor_capabilities()
+    return {
+        "bash": "ok" if capabilities["bash"] else "missing",
+        "supervisor": (
+            "ok"
+            if capabilities["persistent_supervisor"]
+            else "missing: systemd-user or crontab"
+        ),
+    }
+
+
 def check_node(node: Node) -> dict[str, Any]:
     checks: dict[str, str] = {}
     try:
@@ -116,54 +125,15 @@ def relay_agent_status(
     environ: Mapping[str, str] | None = None,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
 ) -> str | None:
-    """Report whether a relay-capable ssh-agent is reachable on this head.
+    """Compatibility shim: topology relays no longer forward operator agents.
 
-    ``site-cache-first`` and ``topology-aware`` transfers authenticate their
-    site-internal SSH hops by forwarding the head operator's agent, so a head
-    without a keyed agent fails every such transfer with a bare
-    ``authentication`` error. Returns ``None`` when no configured site uses a
-    relay policy.
+    Gateway-to-worker hops authenticate only with gateway-local credentials.
+    Their availability is verified by the real topology/transfer probe, not by
+    inspecting a head-side ssh-agent.  The optional arguments remain accepted
+    so older callers can upgrade without a signature break.
     """
-    if not any(site.artifact_policy in RELAY_POLICIES for site in cfg.sites.values()):
-        return None
-    env = dict(environ if environ is not None else os.environ)
-    run = runner or subprocess.run
-    candidates: list[str] = []
-    configured = env.get("SSH_AUTH_SOCK", "").strip()
-    if configured:
-        candidates.append(configured)
-    runtime_dir = env.get("XDG_RUNTIME_DIR", "").strip()
-    if runtime_dir:
-        service_socket = str(Path(runtime_dir) / RELAY_SERVICE_SOCKET)
-        if service_socket not in candidates:
-            candidates.append(service_socket)
-    failure = "fail: no agent socket"
-    for socket_path in candidates:
-        try:
-            if not Path(socket_path).is_socket():
-                failure = "fail: socket missing"
-                continue
-        except OSError:
-            failure = "fail: socket missing"
-            continue
-        try:
-            proc = run(
-                ["ssh-add", "-l"],
-                env={**env, "SSH_AUTH_SOCK": socket_path},
-                capture_output=True,
-                text=True,
-                timeout=_SSH_ADD_TIMEOUT_S,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            failure = "fail: agent unreachable"
-            continue
-        if proc.returncode == 0:
-            return "ok"
-        if proc.returncode == 1:
-            failure = "fail: no keys loaded"
-            continue
-        failure = "fail: agent unreachable"
-    return failure
+    del cfg, environ, runner
+    return None
 
 
 def annotate_lan_addresses(cfg: HeadConfig, rows: list[dict[str, Any]]) -> None:

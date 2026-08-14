@@ -14,6 +14,7 @@ import subprocess
 import time
 from collections.abc import Callable
 from pathlib import PurePosixPath
+from threading import Event
 
 from .artifact_distribution import _TRANSFERRED_RE, _stat_total, inner_lan_ssh
 from .config import HeadConfig, Node
@@ -163,6 +164,7 @@ def push_command(node: Node, project_name: str, target_rel: str) -> str:
     argv = [
         "rsync",
         "-a",
+        "--protect-args",
         "--partial",
         "--timeout=60",
         "--stats",
@@ -171,7 +173,7 @@ def push_command(node: Node, project_name: str, target_rel: str) -> str:
         "-e",
         inner_lan_ssh(node.lan_port),
     ]
-    target = f"{node.lan_address}:{shlex.quote(_remote_target_path(target_rel))}"
+    target = f"{node.lan_address}:{_remote_target_path(target_rel)}"
     script = (
         f'mirror="$HOME"/{mirror}; '
         'test -d "$mirror" && test ! -L "$mirror" || { '
@@ -202,6 +204,7 @@ def push_artifact_command(
     argv = [
         "rsync",
         "-a",
+        "--protect-args",
         "--partial",
         "--timeout=60",
         "--stats",
@@ -210,7 +213,7 @@ def push_artifact_command(
     if is_dir:
         argv.append("--delete")
     argv += ["-e", inner_lan_ssh(node.lan_port)]
-    target = f"{node.lan_address}:{shlex.quote(_remote_target_path(destination_rel))}"
+    target = f"{node.lan_address}:{_remote_target_path(destination_rel)}"
     staged = f'"$mirror"/{shlex.quote(relative)}' + ("/" if is_dir else "")
     probe = "-d" if is_dir else "-e"
     script = (
@@ -231,6 +234,7 @@ def _run_gateway_command(
     what: str,
     timeout: float,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] | None,
+    cancel_event: Event | None,
 ) -> "subprocess.CompletedProcess[str]":
     """One gateway control call with the module's uniform failure contract."""
     if route.gateway is None:
@@ -244,6 +248,7 @@ def _run_gateway_command(
             command,
             timeout=timeout,
             workload=SSHWorkload.ARTIFACT_RELAY,
+            cancel_event=cancel_event,
         )
     except (RemoteError, OSError) as exc:
         raise RelayError(
@@ -264,6 +269,7 @@ def prepare_mirror(
     project_name: str,
     *,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
+    cancel_event: Event | None = None,
 ) -> None:
     """Create the private mirror chain on the gateway, or raise RelayError."""
     _run_gateway_command(
@@ -272,6 +278,7 @@ def prepare_mirror(
         what="mirror preparation",
         timeout=30,
         runner=runner,
+        cancel_event=cancel_event,
     )
 
 
@@ -281,6 +288,7 @@ def prepare_artifact_mirror(
     relatives: list[str],
     *,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
+    cancel_event: Event | None = None,
 ) -> None:
     """Create the artifact mirror and every artifact parent on the gateway."""
     _run_gateway_command(
@@ -289,6 +297,7 @@ def prepare_artifact_mirror(
         what="artifact mirror preparation",
         timeout=30,
         runner=runner,
+        cancel_event=cancel_event,
     )
 
 
@@ -301,6 +310,7 @@ def push_artifact(
     *,
     is_dir: bool,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
+    cancel_event: Event | None = None,
 ) -> "subprocess.CompletedProcess[str]":
     """Replay one staged artifact to the node over the site LAN."""
     if route.node is None:
@@ -312,7 +322,14 @@ def push_artifact(
         destination_rel,
         is_dir=is_dir,
     )
-    return _retrying_push(cfg, route, command, what="artifact push", runner=runner)
+    return _retrying_push(
+        cfg,
+        route,
+        command,
+        what="artifact push",
+        runner=runner,
+        cancel_event=cancel_event,
+    )
 
 
 def _retrying_push(
@@ -322,6 +339,7 @@ def _retrying_push(
     *,
     what: str,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] | None,
+    cancel_event: Event | None,
 ) -> "subprocess.CompletedProcess[str]":
     """Run one LAN push with bounded retries and passive throughput memory.
 
@@ -335,6 +353,8 @@ def _retrying_push(
         runner = run_on
     last = None
     for attempt in range(PUSH_ATTEMPTS):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RelayError("gateway -> node push cancelled locally")
         started = time.monotonic()
         try:
             last = runner(
@@ -343,6 +363,7 @@ def _retrying_push(
                 command,
                 timeout=PUSH_TIMEOUT_S,
                 workload=SSHWorkload.ARTIFACT_RELAY,
+                cancel_event=cancel_event,
             )
         except (RemoteError, OSError) as exc:
             raise RelayError(
@@ -363,7 +384,12 @@ def _retrying_push(
             last.stdout or "",
             last.stderr or "",
         ):
-            time.sleep(min(5 * (attempt + 1), 15))
+            delay = min(5 * (attempt + 1), 15)
+            if cancel_event is not None:
+                if cancel_event.wait(delay):
+                    raise RelayError("gateway -> node push cancelled locally")
+            else:
+                time.sleep(delay)
             continue
         break
     detail = diagnostic_excerpt(
@@ -381,12 +407,20 @@ def push_mirror(
     target_rel: str,
     *,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
+    cancel_event: Event | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Replay the staged project mirror to the node over the site LAN."""
     if route.node is None:
         raise RelayError("relay route is missing its node")
     command = push_command(route.node, project_name, target_rel)
-    return _retrying_push(cfg, route, command, what="push", runner=runner)
+    return _retrying_push(
+        cfg,
+        route,
+        command,
+        what="push",
+        runner=runner,
+        cancel_event=cancel_event,
+    )
 
 
 def _record_push_sample(

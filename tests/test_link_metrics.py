@@ -216,6 +216,49 @@ def test_stray_file_at_state_root_degrades_to_link_metrics_error(tmp_path):
         store.sample("site:s", "n1", "n2")
 
 
+def test_lock_syscall_errors_never_escape_as_raw_os_errors(tmp_path, monkeypatch):
+    store = PersistentLinkMetrics(_cfg(tmp_path))
+
+    def denied(*_args, **_kwargs):
+        raise OSError("simulated lock filesystem failure")
+
+    monkeypatch.setattr("dt.link_metrics.os.fchmod", denied)
+
+    with pytest.raises(LinkMetricsError, match="lock is unsafe"):
+        store.sample("site:s", "n1", "n2")
+
+
+def test_absurd_remote_byte_counter_is_ignored_without_float_overflow(tmp_path):
+    store = PersistentLinkMetrics(_cfg(tmp_path))
+
+    assert (
+        store.record(
+            "site:s",
+            "n1",
+            "n2",
+            transferred_bytes=10**400,
+            elapsed_seconds=1.0,
+        )
+        is None
+    )
+
+
+def test_future_slow_sample_is_unmeasured_after_a_clock_step_back(tmp_path):
+    from dt.link_metrics import effective_throughput_bps
+
+    store = PersistentLinkMetrics(_cfg(tmp_path), clock=lambda: 2000.0)
+    sample = store.record(
+        "site:s",
+        "n1",
+        "n2",
+        transferred_bytes=2 << 20,
+        elapsed_seconds=1.0,
+    )
+
+    assert sample is not None
+    assert effective_throughput_bps(sample, now=1000.0) is None
+
+
 def test_state_rejects_wrong_key_and_oversize(tmp_path):
     cfg = _cfg(tmp_path)
     store = PersistentLinkMetrics(cfg)

@@ -255,6 +255,8 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
         "run_on",
         lambda *args, **kwargs: subprocess.CompletedProcess([], 0, probe, ""),
     )
+    monkeypatch.setattr(cli.os, "urandom", lambda _size: b"\x00" * 16)
+    probe = probe.replace(cli.INFO_MARK, f"@@DT-{'00' * 16}@@")
 
     result = CliRunner().invoke(cli.app, ["info", "j", "--json"])
 
@@ -1258,6 +1260,8 @@ def test_info_metrics_tail_uses_the_shared_telemetry_query(tmp_path, monkeypatch
         return subprocess.CompletedProcess([], 0, probe, "")
 
     monkeypatch.setattr(cli, "run_on", run)
+    monkeypatch.setattr(cli.os, "urandom", lambda _size: b"\x01" * 16)
+    probe = probe.replace(cli.INFO_MARK, f"@@DT-{'01' * 16}@@")
 
     result = CliRunner().invoke(
         cli.app,
@@ -1269,9 +1273,49 @@ def test_info_metrics_tail_uses_the_shared_telemetry_query(tmp_path, monkeypatch
     assert summary["tail_limit"] == 12
     assert summary["path"] == "~/dt/jobs/tail-info/outputs/dt/resources.jsonl"
     assert any(
-        "tail -n 12 -- dt/jobs/tail-info/outputs/dt/resources.jsonl" in command
+        "tail -c 262144 -- dt/jobs/tail-info/outputs/dt/resources.jsonl | tail -n 12"
+        in command
         for command in commands
     )
+
+
+def test_info_marks_persisted_node_clock_duration_as_cross_clock(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entry = JobEntry(
+        job_id="clock-skew",
+        name="clock-skew",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/clock-skew",
+        session="dt_clock_skew",
+        cmd="true",
+        status="running",
+        started_at=200.0,
+    )
+    cli.jobs_mod.save(cfg, entry)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "refresh_status", lambda _cfg, current: current)
+    monkeypatch.setattr(cli, "_info_live", lambda _entry, *_args: {"unreachable": True})
+    monkeypatch.setattr(cli, "_job_resources", lambda _cfg, _entry: None)
+    monkeypatch.setattr(cli.time, "time", lambda: 180.0)
+
+    result = CliRunner().invoke(cli.app, ["info", "clock-skew", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["duration_s"] == -20.0
+    assert payload["timestamp_domains"]["started_at"] == "registry"
+    assert payload["timestamp_domains"]["duration_s"] == "mixed"
+    assert payload["cross_clock_intervals_approximate"] is True
 
 
 def test_info_rejects_negative_metrics_tail_before_loading_config(monkeypatch):
@@ -2849,9 +2893,8 @@ def test_wait_nonzero_prints_error_tail_and_preserves_exit_code(tmp_path, monkey
     assert "guarded command failed" in result.output
     assert "referenced failure log" in result.output
     assert "Triton root cause: sentinel" in result.output
-    assert commands[-1].endswith(
-        "dt/jobs/failed-job/outputs/registry/train.failure.log"
-    )
+    assert "dt/jobs/failed-job/outputs/registry/train.failure.log" in commands[-1]
+    assert f"tail -c {cli.AUTO_LOG_TAIL_MAX_BYTES}" in commands[-1]
 
 
 def test_wait_long_job_id_uses_recognizable_name_and_compact_ref(tmp_path, monkeypatch):
@@ -3587,6 +3630,50 @@ def test_wait_multiple_json_collects_all_results_in_ref_order(tmp_path, monkeypa
     assert [job["exit_code"] for job in payload["jobs"]] == [0, 7]
     assert [job["name"] for job in payload["jobs"]] == ["ok", "bad"]
     assert result.stdout.count("\n") == 1
+
+
+def test_wait_group_human_handles_finished_record_without_exit_code(
+    tmp_path, monkeypatch
+):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entries = [
+        JobEntry(
+            job_id=job_id,
+            name=name,
+            center="c",
+            project="p",
+            node="n1",
+            node_local=False,
+            job_dir=f"dt/jobs/{job_id}",
+            session=f"dt_{job_id}",
+            cmd="true",
+            status="finished",
+            exit_code=exit_code,
+        )
+        for job_id, name, exit_code in (
+            ("ok-id", "ok", 0),
+            ("anomaly-id", "anomaly", None),
+        )
+    ]
+    for entry in entries:
+        cli.jobs_mod.save(cfg, entry)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["wait", "ok-id", "anomaly-id", "--error-lines", "0"],
+    )
+
+    assert result.exit_code == 68, result.output
+    assert "result unavailable" in result.output
+    assert "1/2 succeeded" in " ".join(result.output.split())
 
 
 def test_job_ref_file_rejects_direct_refs_and_empty_files(tmp_path):
@@ -5994,6 +6081,26 @@ def test_laptop_ps_issue_filter_is_applied_before_each_head_window(monkeypatch):
     ]
 
 
+def test_laptop_ps_issue_limit_is_forwarded_to_v2_head_window(monkeypatch):
+    cfg = LaptopConfig(centers={"a": "head-a"}, default_center="a")
+    seen = []
+
+    def fake_gather(cfg_, status, **kwargs):
+        seen.append((cfg_, status, kwargs))
+        return [], {}
+
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "_gather_ps_rows", fake_gather)
+
+    result = CliRunner().invoke(cli.app, ["ps", "--issues", "--limit", "15"])
+
+    assert result.exit_code == 0, result.output
+    assert len(seen) == 1
+    assert seen[0][2]["issues_only"] is True
+    assert seen[0][2]["remote_window"] is True
+    assert seen[0][2]["limit"] == 15
+
+
 def test_laptop_ps_issue_window_falls_back_from_v1_semantics(monkeypatch):
     import dt.remote as remote_mod
 
@@ -6907,6 +7014,40 @@ def test_ps_limit_rejects_nonpositive_values_with_machine_error(tmp_path, monkey
             "reasons": {},
             "exit_code": 1,
         }
+
+
+def test_ps_rejects_unknown_status_with_machine_error(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, ["ps", "--status", "finisehd", "--json"])
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "invalid_argument"
+    assert "unknown --status 'finisehd'" in payload["message"]
+
+
+def test_laptop_ps_unknown_center_has_machine_error(monkeypatch):
+    cfg = LaptopConfig(centers={"east": "head-a"}, default_center="east")
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, ["ps", "-c", "west", "--json"])
+
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout) == {
+        "error": "invalid_argument",
+        "message": "unknown center 'west'; configured: ['east']",
+        "reasons": {},
+        "exit_code": 1,
+    }
 
 
 def test_ps_active_rejects_status_filter(tmp_path, monkeypatch):
@@ -8031,7 +8172,7 @@ def test_logs_follow_running_job_uses_wrapper_pid_and_returns_job_exit(
     assert len(commands) == 1
     assert "-t" not in commands[0]
     assert any("tail --pid=321 -s 0.2 -n 9 -F" in token for token in commands[0])
-    assert any("tr -d" in token and "\\000" in token for token in commands[0])
+    assert any("-I -m dt.terminal" in token for token in commands[0])
     normalized = " ".join(result.output.split())
     assert "log stream complete" in normalized
     assert "finished · exit 7" in normalized

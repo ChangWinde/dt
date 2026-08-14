@@ -13,12 +13,24 @@ import time
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 from typing import Protocol
+from uuid import uuid4
 
 from .config import HeadConfig, Node
 from .jobs import MAX_JOB_RECORD_BYTES, JobEntry, job_lock, list_all, load, save
-from .layout import LEGACY_LAYOUT, ROLE_LAYOUT, node_path_expression
+from .layout import (
+    LEGACY_LAYOUT,
+    ROLE_LAYOUT,
+    job_state_dir,
+    node_path_expression,
+)
+from .lifecycle import liveness_shell
 from .payload_hash import RUNTIME_PAYLOAD_NAMES
-from .private_state import PrivateStateError, read_bounded_regular
+from .private_state import (
+    PrivateStateError,
+    fsync_dir,
+    fsync_tree,
+    read_bounded_regular,
+)
 from .snapshot_hash import tree_sha256
 from .snapshot_store import lock as snapshot_store_lock
 
@@ -319,6 +331,23 @@ def _legacy_job_path(entry: JobEntry) -> bool:
     )
 
 
+def _active_source_consumers(entries: list[JobEntry]) -> dict[str, list[str]]:
+    """Map every job capsule still referenced by queued/running work."""
+    consumers: dict[str, list[str]] = {}
+    for entry in entries:
+        if entry.status not in {"queued", "running"}:
+            continue
+        for source_job in {
+            entry.cache_source_job,
+            entry.after_success,
+            entry.after_complete,
+            entry.after_result,
+        } - {None}:
+            assert source_job is not None
+            consumers.setdefault(source_job, []).append(entry.job_id)
+    return consumers
+
+
 def _bounded_json_check(expression: str, *, max_bytes: int) -> str:
     """Build one bounded remote JSON identity check."""
     return shlex.quote(
@@ -342,7 +371,7 @@ def _worker_probe_command(entry: JobEntry, destination: str) -> str:
         'if [ -L "$src" ] || [ ! -d "$src" ]; then '
         f"printf '{_MARKER}\\tblocked\\t-1\\tunsafe_or_missing_source\\n'; "
         'elif [ -L "$src/meta.json" ] || [ ! -f "$src/meta.json" ] '
-        f'|| ! python3 -c {meta_reader} "$src/meta.json" "$job_id"; then '
+        f'|| ! python3 -I -c {meta_reader} "$src/meta.json" "$job_id"; then '
         f"printf '{_MARKER}\\tblocked\\t-1\\tmetadata_identity_mismatch\\n'; "
         'elif [ -e "$dst" ] || [ -L "$dst" ]; then '
         f"printf '{_MARKER}\\tblocked\\t-1\\tdestination_requires_review\\n'; "
@@ -358,6 +387,8 @@ def _worker_row(
     entry: JobEntry,
     node: Node,
     runner: MigrationRunner,
+    *,
+    active_consumers: list[str] | None = None,
 ) -> dict[str, object]:
     destination = cfg.worker_job_dir(node, entry.job_id)
     row: dict[str, object] = {
@@ -371,8 +402,19 @@ def _worker_row(
         "blocker": None,
     }
     if entry.status not in _TERMINAL_MIGRATABLE:
+        row["status"] = "blocked"
+        row["blocker"] = (
+            f"job is {entry.status}; pending cleanup waits for terminal state"
+        )
+        return row
+    if entry.status not in _TERMINAL_MIGRATABLE:
         row["blocker"] = (
             f"job is {entry.status}; active or uncertain jobs stay in place"
+        )
+        return row
+    if active_consumers:
+        row["blocker"] = "source capsule is referenced by active job " + ", ".join(
+            sorted(active_consumers)
         )
         return row
     if not _legacy_job_path(entry):
@@ -411,15 +453,94 @@ def _worker_row(
     return row
 
 
+def _pending_worker_row(
+    entry: JobEntry,
+    node: Node,
+    runner: MigrationRunner,
+) -> dict[str, object]:
+    """Describe a role-layout job whose verified legacy copy still needs removal."""
+    source = f"dt/jobs/{entry.job_id}"
+    row: dict[str, object] = {
+        "scope": f"worker:{node.name}",
+        "kind": "job_cleanup",
+        "identity": entry.job_id,
+        "source": source,
+        "destination": entry.job_dir,
+        "bytes": None,
+        "status": "cleanup_pending",
+        "blocker": None,
+    }
+    source_expression = node_path_expression(source)
+    command = (
+        f"src={source_expression}; "
+        'if [ ! -e "$src" ] && [ ! -L "$src" ]; then '
+        f"printf '{_MARKER}\\tcleanup_pending\\t0\\t-\\n'; "
+        'elif [ -L "$src" ] || [ ! -d "$src" ]; then '
+        f"printf '{_MARKER}\\tblocked\\t-1\\tunsafe_legacy_source\\n'; "
+        'else b=$(timeout 60s du -s -B1 -- "$src" 2>/dev/null | '
+        "awk 'NR == 1 {print $1}'); "
+        f"printf '{_MARKER}\\tcleanup_pending\\t%s\\t-\\n' "
+        '"${b:--1}"; fi'
+    )
+    try:
+        proc = runner(node.name, node.local, command, timeout=90)
+    except Exception as exc:
+        row["status"] = "blocked"
+        row["blocker"] = " ".join(str(exc).split()) or type(exc).__name__
+        return row
+    lines = [
+        line.split("\t", 3)
+        for line in (proc.stdout or "").splitlines()
+        if line.startswith(f"{_MARKER}\t")
+    ]
+    if proc.returncode != 0 or not lines or len(lines[-1]) != 4:
+        row["status"] = "blocked"
+        row["blocker"] = " ".join(
+            (
+                proc.stderr or proc.stdout or f"worker probe exited {proc.returncode}"
+            ).split()
+        )
+        return row
+    _, status, bytes_text, blocker = lines[-1]
+    row["status"] = status
+    row["blocker"] = None if blocker == "-" else blocker
+    try:
+        parsed_bytes = int(bytes_text)
+        row["bytes"] = parsed_bytes if parsed_bytes >= 0 else None
+    except ValueError:
+        row["bytes"] = None
+    return row
+
+
 def plan_layout(
     cfg: HeadConfig,
     *,
     runner: MigrationRunner,
 ) -> dict[str, object]:
     """Inventory every compatible move without mutating local or remote state."""
+    entries = list_all(cfg)
     rows = [*_registry_rows(cfg), *_snapshot_rows(cfg), *_legacy_rows(cfg)]
     nodes = {node.name: node for node in cfg.nodes}
-    for entry in list_all(cfg):
+    active_consumers = _active_source_consumers(entries)
+    for entry in entries:
+        if entry.legacy_cleanup_pending:
+            node = nodes.get(entry.node)
+            if node is None:
+                rows.append(
+                    {
+                        "scope": f"worker:{entry.node}",
+                        "kind": "job_cleanup",
+                        "identity": entry.job_id,
+                        "source": f"dt/jobs/{entry.job_id}",
+                        "destination": entry.job_dir,
+                        "bytes": None,
+                        "status": "blocked",
+                        "blocker": "worker is no longer configured",
+                    }
+                )
+            else:
+                rows.append(_pending_worker_row(entry, node, runner))
+            continue
         if entry.storage_layout not in {None, LEGACY_LAYOUT} or entry.node == "-":
             continue
         node = nodes.get(entry.node)
@@ -437,7 +558,15 @@ def plan_layout(
                 }
             )
             continue
-        rows.append(_worker_row(cfg, entry, node, runner))
+        rows.append(
+            _worker_row(
+                cfg,
+                entry,
+                node,
+                runner,
+                active_consumers=active_consumers.get(entry.job_id),
+            )
+        )
     counts: dict[str, int] = {}
     for row in rows:
         status = str(row["status"])
@@ -477,6 +606,7 @@ def _copy_registry_row(row: dict[str, object]) -> None:
         if not _same_file(source, destination):
             raise OSError("registry duplicate changed after migration plan")
         source.unlink()
+        fsync_dir(source.parent)
         return
     descriptor, temp_name = tempfile.mkstemp(
         prefix=f".{destination.name}.",
@@ -521,6 +651,7 @@ def _copy_registry_row(row: dict[str, object]) -> None:
             raise OSError("registry source changed during migration")
         source.unlink()
         completed = True
+        fsync_dir(source.parent)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -543,8 +674,27 @@ def _copy_snapshot_row(row: dict[str, object]) -> None:
     destination = Path(str(row["destination"]))
     digest = str(row["identity"])
     if row["status"] == "duplicate_verified":
+        # Revalidate both trees while the snapshot-store lock is held, then
+        # rename the source to an unpredictable same-directory tombstone. The
+        # rename pins the exact directory identity that was attested before
+        # recursive removal; a stale plan can never delete a replacement that
+        # appeared at the legacy digest path.
+        _snapshot_identity(source, digest)
         _snapshot_identity(destination, digest)
-        shutil.rmtree(source)
+        fsync_tree(destination)
+        fsync_dir(destination.parent)
+        tombstone = source.parent / f".{digest}.cleanup-{uuid4().hex}"
+        os.rename(source, tombstone)
+        try:
+            fsync_dir(source.parent)
+            _snapshot_identity(tombstone, digest)
+            shutil.rmtree(tombstone)
+            fsync_dir(source.parent)
+        except Exception:
+            if not source.exists() and not source.is_symlink() and tombstone.exists():
+                os.rename(tombstone, source)
+                fsync_dir(source.parent)
+            raise
         return
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(
@@ -554,9 +704,15 @@ def _copy_snapshot_row(row: dict[str, object]) -> None:
     try:
         shutil.copytree(source, temporary, symlinks=True)
         _snapshot_identity(temporary, digest)
+        # The destination becomes the only copy below. Flush the copied tree
+        # before publishing its name, then flush the rename before deleting
+        # the legacy source.
+        fsync_tree(temporary)
         os.replace(temporary, destination)
+        fsync_dir(destination.parent)
         _snapshot_identity(destination, digest)
         shutil.rmtree(source)
+        fsync_dir(source.parent)
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
 
@@ -583,6 +739,7 @@ def _worker_copy_command(entry: JobEntry, destination: str) -> str:
         'cp -a -- "$src/." "$tmp/" || { rm -rf -- "$tmp"; exit 74; }; '
         'chmod 700 "$tmp" || exit 74; '
         "command -v diff >/dev/null 2>&1 || exit 82; "
+        "command -v sync >/dev/null 2>&1 || exit 88; "
         'diff -qr --no-dereference "$src" "$tmp" >/dev/null || exit 83; '
         '[ ! -e "$tmp/.dt" ] && [ ! -L "$tmp/.dt" ] || exit 84; '
         'mkdir -p "$tmp/.dt/payload" "$tmp/.dt/state" || exit 75; '
@@ -611,10 +768,11 @@ def _worker_copy_command(entry: JobEntry, destination: str) -> str:
         'if [ -e "$tmp/$name" ] || [ -L "$tmp/$name" ]; then '
         '[ ! -L "$tmp/$name" ] || exit 87; '
         'mv -- "$tmp/$name" "$tmp/.dt/$name"; fi; done; '
-        f'python3 -c {verify} "$tmp/.dt/meta.json" "$job_id" || exit 79; '
+        f'python3 -I -c {verify} "$tmp/.dt/meta.json" "$job_id" || exit 79; '
         'printf \'{"schema_version":"dt_layout_v1","job_id":"%s"}\\n\' '
         '"$job_id" >"$tmp/.dt/layout.json" || exit 80; '
-        'chmod 700 "$tmp" || exit 81; mv -- "$tmp" "$dst" || exit 81; '
+        'chmod 700 "$tmp" || exit 81; sync -f "$tmp" || exit 88; '
+        'mv -- "$tmp" "$dst" || exit 81; sync -f "$parent" || exit 88; '
         f"printf '{_MARKER}\\tcopied\\n'"
     )
     return (
@@ -625,12 +783,23 @@ def _worker_copy_command(entry: JobEntry, destination: str) -> str:
 
 def _worker_delete_source_command(entry: JobEntry) -> str:
     source = node_path_expression(entry.job_dir)
-    return (
-        f"src={source}; "
-        '[ ! -L "$src" ] && [ -d "$src" ] || exit 70; '
-        'find "$src" -xdev -depth -delete >/dev/null 2>&1; '
-        '[ ! -e "$src" ] && [ ! -L "$src" ]'
+    identity = node_path_expression(
+        f"{job_state_dir(entry.job_dir, entry.storage_layout)}/process_start_ticks"
     )
+    script = (
+        liveness_shell() + f"src={source}; ident={identity}; "
+        '[ ! -e "$src" ] && [ ! -L "$src" ] && exit 0; '
+        '[ ! -L "$src" ] && [ -d "$src" ] || exit 70; '
+        f'dt_live=$(dt_job_live_state "$src" {entry.pgid or 0} '
+        f'{shlex.quote(entry.boot_id or "")} "$ident"); '
+        '[ "$dt_live" = DEAD ] || '
+        '{ echo "source capsule is $dt_live; kept" >&2; exit 75; }; '
+        "command -v sync >/dev/null 2>&1 || exit 76; "
+        'find "$src" -xdev -depth -delete >/dev/null 2>&1; '
+        '[ ! -e "$src" ] && [ ! -L "$src" ] && '
+        'sync -f "${src%/*}" >/dev/null 2>&1'
+    )
+    return f"env LC_ALL=C bash -c {shlex.quote(script)}"
 
 
 def apply_layout(
@@ -650,6 +819,7 @@ def apply_layout(
         if raw.get("status") not in {
             "movable",
             "duplicate_verified",
+            "cleanup_pending",
         }:
             continue
         kind = raw.get("kind")
@@ -660,6 +830,42 @@ def apply_layout(
             elif kind == "snapshot":
                 with snapshot_store_lock(cfg):
                     _copy_snapshot_row(raw)
+            elif kind == "job_cleanup":
+                job_id = str(raw["identity"])
+                with job_lock(cfg, job_id):
+                    current = load(cfg, job_id)
+                    if (
+                        current is None
+                        or not current.legacy_cleanup_pending
+                        or current.storage_layout != ROLE_LAYOUT
+                        or current.job_dir != raw.get("destination")
+                    ):
+                        raise RuntimeError("cleanup state changed after migration plan")
+                    node = nodes.get(current.node)
+                    if node is None:
+                        raise RuntimeError("worker configuration changed after plan")
+                    legacy_entry = JobEntry(**current.__dict__)
+                    legacy_entry.job_dir = str(raw["source"])
+                    legacy_entry.storage_layout = LEGACY_LAYOUT
+                    deleted = runner(
+                        node.name,
+                        node.local,
+                        _worker_delete_source_command(legacy_entry),
+                        timeout=600,
+                    )
+                    if deleted.returncode != 0:
+                        detail = " ".join(
+                            (
+                                deleted.stderr
+                                or deleted.stdout
+                                or f"delete exited {deleted.returncode}"
+                            ).split()
+                        )
+                        raise RuntimeError(
+                            "legacy cleanup remains pending for retry: " + detail
+                        )
+                    current.legacy_cleanup_pending = False
+                    save(cfg, current)
             elif kind == "job":
                 job_id = str(raw["identity"])
                 with job_lock(cfg, job_id):
@@ -671,6 +877,22 @@ def apply_layout(
                         or current.storage_layout not in {None, LEGACY_LAYOUT}
                     ):
                         raise RuntimeError("job state changed after migration plan")
+                    consumers = _active_source_consumers(list_all(cfg)).get(job_id, [])
+                    if consumers:
+                        raise RuntimeError(
+                            "source capsule is referenced by active job "
+                            + ", ".join(sorted(consumers))
+                        )
+                    legacy_record = cfg.legacy_registry_dir() / f"{job_id}.json"
+                    role_record = cfg.registry_path() / f"{job_id}.json"
+                    if legacy_record.exists() or legacy_record.is_symlink():
+                        raise RuntimeError(
+                            "registry migration prerequisite is incomplete"
+                        )
+                    if role_record.is_symlink() or not role_record.is_file():
+                        raise RuntimeError(
+                            "role registry record is unavailable after migration"
+                        )
                     node = nodes.get(current.node)
                     if node is None:
                         raise RuntimeError("worker configuration changed after plan")
@@ -691,6 +913,7 @@ def apply_layout(
                     current.storage_layout = ROLE_LAYOUT
                     current.worker_root = cfg.worker_root_for(node)
                     current.job_relpath = f"jobs/{current.job_id}"
+                    current.legacy_cleanup_pending = True
                     save(cfg, current)
                     deleted = runner(
                         node.name,
@@ -708,8 +931,11 @@ def apply_layout(
                         )
                         raise RuntimeError(
                             "new capsule is active but the legacy duplicate was "
-                            f"retained for manual review: {detail}"
+                            "retained; cleanup remains pending for the next "
+                            f"migration apply: {detail}"
                         )
+                    current.legacy_cleanup_pending = False
+                    save(cfg, current)
             else:
                 continue
         except Exception as exc:

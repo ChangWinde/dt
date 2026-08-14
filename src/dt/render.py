@@ -46,7 +46,7 @@ def compact_path(path: str, *, max_chars: int = 56) -> str:
 def compress_indices(indices: list[int]) -> str:
     if not indices:
         return "-"
-    indices = sorted(indices)
+    indices = sorted(set(indices))
     parts: list[str] = []
     start = prev = indices[0]
     for i in indices[1:]:
@@ -88,7 +88,8 @@ def busy_owners(gpus: list[JsonRow]) -> str:
             else (g.get("users") or ["?"])
         )
         for u in owners:
-            counts[u] = counts.get(u, 0) + 1
+            label = escape(str(u))
+            counts[label] = counts.get(label, 0) + 1
     return " ".join(
         f"{u}\u00d7{n}" for u, n in sorted(counts.items(), key=lambda kv: -kv[1])
     )
@@ -329,9 +330,10 @@ def free_table(rows: list[JsonRow], who: bool = False) -> Table:
             io = "[yellow]GPU inventory![/yellow]"
         elif disk_low and disk_free_fraction is not None:
             io = f"[yellow]disk {disk_free_fraction * 100:.1f}%[/yellow]"
-        style = "green" if free else "dim"
-        availability = f"{len(free)}/{len(gpus)}"
-        if free:
+        drained = bool(r.get("drained"))
+        style = "yellow" if drained else "green" if free else "dim"
+        availability = "drained" if drained else f"{len(free)}/{len(gpus)}"
+        if free and not drained:
             availability += f" [{idx}]"
         values = [
             target,

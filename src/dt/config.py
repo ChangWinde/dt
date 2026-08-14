@@ -9,11 +9,12 @@ from __future__ import annotations
 import math
 import os
 import re
+import shutil
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import yaml  # type: ignore[import-untyped]
@@ -82,6 +83,66 @@ def head_bwlimit_kbps(
 
 def config_path() -> Path:
     return Path(os.environ.get("DT_CONFIG", "~/.config/dt/config.yaml")).expanduser()
+
+
+def installation_state_dir() -> Path:
+    """Persistent user-scoped installation state shared by every DT launcher."""
+    data_home = Path(
+        os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+    ).expanduser()
+    return data_home / "disttrainer"
+
+
+def active_command_record_path() -> Path:
+    """Location written atomically by ``bootstrap.sh`` after activation."""
+    return installation_state_dir() / "active-command"
+
+
+def active_dt_command() -> Path:
+    """Resolve the one persisted DT command, with a legacy-safe fallback.
+
+    The record prevents a custom ``UV_TOOL_BIN_DIR`` installation from being
+    forgotten by the queue agent, cron, or laptop forwarding code.  A malformed
+    or stale record is ignored rather than executed.
+    """
+    descriptor = -1
+    try:
+        record = active_command_record_path()
+        descriptor = os.open(
+            record,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(descriptor)
+        if stat.S_ISREG(before.st_mode) and before.st_size <= 4096:
+            payload = os.read(descriptor, 4097)
+            after = os.fstat(descriptor)
+            stable = (
+                before.st_dev == after.st_dev
+                and before.st_ino == after.st_ino
+                and before.st_size == after.st_size
+                and before.st_mtime_ns == after.st_mtime_ns
+                and len(payload) == before.st_size
+            )
+            lines = payload.decode("utf-8").splitlines()
+            raw = lines[0] if stable and len(lines) == 1 else ""
+            if (
+                raw
+                and not any(character in raw for character in "\x00\r\n")
+                and Path(raw).is_absolute()
+                and Path(raw).is_file()
+                and os.access(raw, os.X_OK)
+            ):
+                return Path(raw)
+    except (OSError, UnicodeError):
+        pass
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    legacy = Path.home() / ".local" / "bin" / "dt"
+    if legacy.is_file() and os.access(legacy, os.X_OK):
+        return legacy
+    discovered = shutil.which("dt")
+    return Path(discovered) if discovered else legacy
 
 
 def _config_file_signature(
@@ -239,13 +300,17 @@ class HeadConfig:
         return "dt/jobs"
 
     def registry_dir(self) -> Path:
-        d = (
+        d = self.registry_path()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def registry_path(self) -> Path:
+        """Return the registry location without creating control-plane state."""
+        return (
             self.head_root / "state" / "registry"
             if self.layout == ROLE_LAYOUT
             else self.root / "registry"
         )
-        d.mkdir(parents=True, exist_ok=True)
-        return d
 
     def cache_dir(self) -> Path:
         d = self.head_root / "cache"
@@ -377,8 +442,9 @@ def _mapping(value: object, label: str) -> dict[str, Any]:
 
 
 def _optional_mapping(data: dict[str, Any], key: str) -> dict[str, Any]:
-    value = data.get(key)
-    return {} if value is None else _mapping(value, key)
+    if key not in data:
+        return {}
+    return _mapping(data[key], key)
 
 
 def _reject_unknown(
@@ -398,12 +464,64 @@ def _nonempty_string(value: object, label: str) -> str:
 
 
 def _require_rooted_path(text: str, label: str) -> None:
-    if not text.startswith(("~", "/")):
+    if not (text.startswith("~/") or text.startswith("/")):
         raise ConfigError(
             f"`{label}` must be absolute or start with ~/; a relative path "
             "resolves against the working directory and can snapshot the "
             "wrong tree"
         )
+
+
+def _project_root(value: object, label: str) -> Path:
+    """Return one canonical, non-ambiguous project root.
+
+    Project roots are snapshot authority.  Accepting a filesystem root, home,
+    traversal component, control byte, or an existing symlink would let a
+    small configuration typo snapshot data far outside the intended project.
+    """
+    text = _nonempty_string(value, label)
+    _require_rooted_path(text, label)
+    if any(character in text for character in "\x00\r\n"):
+        raise ConfigError(f"`{label}` must not contain control characters")
+    lexical = Path(text)
+    if any(part in {".", ".."} for part in text.split("/")):
+        raise ConfigError(f"`{label}` must not contain `.` or `..` components")
+    expanded = lexical.expanduser()
+    if not expanded.is_absolute():
+        raise ConfigError(f"`{label}` could not be expanded to an absolute path")
+    normalized = Path(os.path.abspath(os.fspath(expanded)))
+    try:
+        canonical = normalized.resolve(strict=False)
+        home = Path.home().resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(f"`{label}` cannot be resolved safely: {exc}") from None
+    if canonical == Path(canonical.anchor):
+        raise ConfigError(f"`{label}` must not be a filesystem root")
+    if canonical == home:
+        raise ConfigError(f"`{label}` must not be the user's home directory")
+    if canonical != normalized:
+        raise ConfigError(
+            f"`{label}` must be canonical and must not traverse symlinks "
+            f"({normalized} resolves to {canonical})"
+        )
+    return canonical
+
+
+def revalidate_project_root(path: Path, label: str = "project path") -> Path:
+    """Re-check a cached project root at the snapshot boundary.
+
+    Config parsing establishes the same invariant initially; callers use this
+    public guard immediately before filesystem traversal so a later deletion
+    or symlink replacement fails closed instead of changing snapshot authority.
+    """
+    canonical = _project_root(str(path), label)
+    try:
+        metadata = canonical.stat()
+    except OSError as exc:
+        raise ConfigError(f"`{label}` is unavailable: {exc}") from None
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ConfigError(f"`{label}` must be an existing directory")
+    return canonical
 
 
 def _config_id(value: object, label: str) -> str:
@@ -425,12 +543,36 @@ def _require_item_limit(size: int, label: str, maximum: int) -> None:
         raise ConfigError(f"`{label}` has {size} entries; maximum is {maximum}")
 
 
+def _http_url(value: object, label: str, *, noun: str = "URL") -> str:
+    url = _nonempty_string(value, label)
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in url):
+        raise ConfigError(
+            f"`{label}` must be an HTTP(S) {noun} with a valid hostname and port"
+        )
+    try:
+        parsed = urlsplit(url)
+        hostname = parsed.hostname
+        # Accessing ``port`` performs urllib's numeric/range validation.
+        port = parsed.port
+    except ValueError:
+        raise ConfigError(
+            f"`{label}` must be an HTTP(S) {noun} with a valid hostname and port"
+        ) from None
+    if (
+        parsed.scheme not in {"http", "https"}
+        or hostname is None
+        or any(character.isspace() for character in hostname)
+        or parsed.netloc.endswith(":")
+        or port == 0
+    ):
+        raise ConfigError(
+            f"`{label}` must be an HTTP(S) {noun} with a valid hostname and port"
+        )
+    return url
+
+
 def _webhook_url(value: object) -> str:
-    webhook = _nonempty_string(value, "webhook")
-    parsed = urlsplit(webhook)
-    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
-        raise ConfigError("`webhook` must be an HTTP(S) URL with a hostname")
-    return webhook
+    return _http_url(value, "webhook")
 
 
 def _ssh_destination(value: object, label: str) -> str:
@@ -442,6 +584,16 @@ def _ssh_destination(value: object, label: str) -> str:
     ):
         raise ConfigError(
             f"`{label}` must be a safe SSH alias, host, or user@host destination"
+        )
+    return destination
+
+
+def _node_destination(value: object, label: str) -> str:
+    destination = _ssh_destination(value, label)
+    if any(character in destination for character in ":[]"):
+        raise ConfigError(
+            f"`{label}` node name cannot contain a colon or brackets because "
+            "it is used in rsync host:path targets"
         )
     return destination
 
@@ -497,7 +649,7 @@ def _parse_nodes(raw: object) -> list[Node]:
     nodes: list[Node] = []
     for item in raw:
         if isinstance(item, str):
-            name = _ssh_destination(item, "nodes[].name")
+            name = _node_destination(item, "nodes[].name")
             nodes.append(Node(name=name))
         elif isinstance(item, dict):
             _reject_unknown(
@@ -516,7 +668,7 @@ def _parse_nodes(raw: object) -> list[Node]:
                 },
                 "node entry",
             )
-            name = _ssh_destination(item.get("name"), "nodes[].name")
+            name = _node_destination(item.get("name"), "nodes[].name")
             local = item.get("local", False)
             if not isinstance(local, bool):
                 raise ConfigError("`nodes[].local` must be true or false")
@@ -606,6 +758,8 @@ def _parse_sites(raw: object, nodes: list[Node]) -> dict[str, Site]:
     sites: dict[str, Site] = {}
     for raw_name, value in mapping.items():
         name = _config_id(raw_name, "site names")
+        if name in sites:
+            raise ConfigError(f"sites has duplicate name {name!r} after normalization")
         site = _mapping(value, f"sites.{name}")
         _reject_unknown(
             site,
@@ -835,6 +989,10 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         centers: dict[str, str] = {}
         for raw_name, val in raw_centers.items():
             name = _config_id(raw_name, "centers name")
+            if name in centers:
+                raise ConfigError(
+                    f"centers has duplicate name {name!r} after normalization"
+                )
             if isinstance(val, dict):
                 _reject_unknown(val, {"head"}, f"centers.{name}")
                 head = _ssh_destination(val.get("head"), f"centers.{name}.head")
@@ -926,6 +1084,10 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
         projects: dict[str, Project] = {}
         for raw_name, p in raw_projects.items():
             name = _config_id(raw_name, "projects name")
+            if name in projects:
+                raise ConfigError(
+                    f"projects has duplicate name {name!r} after normalization"
+                )
             if isinstance(p, dict):
                 _reject_unknown(
                     p,
@@ -934,8 +1096,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 )
                 if "path" not in p:
                     raise ConfigError(f"project {name!r} needs a `path`")
-                project_path = _nonempty_string(p["path"], f"projects.{name}.path")
-                _require_rooted_path(project_path, f"projects.{name}.path")
+                project_path = _project_root(p["path"], f"projects.{name}.path")
                 raw_setup = p.get("setup")
                 setup = (
                     _nonempty_string(raw_setup, f"projects.{name}.setup")
@@ -967,15 +1128,14 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                         if normalized_extra not in extras:
                             extras.append(normalized_extra)
                 projects[name] = Project(
-                    path=Path(project_path).expanduser(),
+                    path=project_path,
                     setup=setup,
                     setup_inputs=setup_inputs,
                     extras=extras,
                 )
             else:
-                project_path = _nonempty_string(p, f"projects.{name}")
-                _require_rooted_path(project_path, f"projects.{name}")
-                projects[name] = Project(path=Path(project_path).expanduser())
+                project_path = _project_root(p, f"projects.{name}")
+                projects[name] = Project(path=project_path)
         qraw = _optional_mapping(data, "queue")
         _reject_unknown(
             qraw,
@@ -1076,17 +1236,10 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             # The value is exported verbatim as HTTP_PROXY/HTTPS_PROXY for
             # every job and environment build, so it must be a real HTTP(S)
             # proxy URL, mirroring the webhook validation.
-            proxy = _nonempty_string(raw_proxy, "proxy")
-            parsed_proxy = urlsplit(proxy)
-            if parsed_proxy.scheme not in {"http", "https"} or (
-                parsed_proxy.hostname is None
-            ):
-                raise ConfigError(
-                    "`proxy` must be an HTTP(S) proxy URL with a hostname, "
-                    "for example http://host:3128"
-                )
+            proxy = _http_url(raw_proxy, "proxy", noun="proxy URL")
         nodes = _parse_nodes(data.get("nodes") or [])
-        sites = _parse_sites(data.get("sites"), nodes)
+        raw_sites = _mapping(data["sites"], "sites") if "sites" in data else None
+        sites = _parse_sites(raw_sites, nodes)
         return HeadConfig(
             center=center,
             nodes=nodes,
@@ -1121,12 +1274,25 @@ class _UniqueKeyLoader(yaml.SafeLoader):  # type: ignore[misc]  # yaml is untype
     ``<<`` merge-key overrides keep their standard meaning.
     """
 
-    def construct_mapping(
-        self, node: yaml.MappingNode, deep: bool = False
-    ) -> dict[object, object]:
+    def _reject_duplicate_nodes(
+        self,
+        node: yaml.MappingNode,
+        visited: set[int],
+        *,
+        deep: bool,
+    ) -> None:
+        if id(node) in visited:
+            return
+        visited.add(id(node))
         seen: set[object] = set()
-        for key_node, _value_node in node.value:
+        for key_node, value_node in node.value:
             if key_node.tag == "tag:yaml.org,2002:merge":
+                if isinstance(value_node, yaml.MappingNode):
+                    self._reject_duplicate_nodes(value_node, visited, deep=deep)
+                elif isinstance(value_node, yaml.SequenceNode):
+                    for child in value_node.value:
+                        if isinstance(child, yaml.MappingNode):
+                            self._reject_duplicate_nodes(child, visited, deep=deep)
                 continue
             key = self.construct_object(key_node, deep=deep)
             try:
@@ -1143,8 +1309,12 @@ class _UniqueKeyLoader(yaml.SafeLoader):  # type: ignore[misc]  # yaml is untype
                     key_node.start_mark,
                 )
             seen.add(key)
-        mapping: dict[object, object] = super().construct_mapping(node, deep=deep)
-        return mapping
+
+    def construct_mapping(
+        self, node: yaml.MappingNode, deep: bool = False
+    ) -> dict[object, object]:
+        self._reject_duplicate_nodes(node, set(), deep=deep)
+        return cast(dict[object, object], super().construct_mapping(node, deep=deep))
 
 
 def _parse_yaml_strict(payload: str) -> object:

@@ -1,6 +1,5 @@
 import json
 import os
-import socket as socket_mod
 import subprocess
 
 from typer.testing import CliRunner
@@ -34,84 +33,13 @@ def _relay_site(*node_names: str, policy: str = "topology-aware") -> dict[str, S
     }
 
 
-def _bind_socket(path):
-    server = socket_mod.socket(socket_mod.AF_UNIX, socket_mod.SOCK_STREAM)
-    server.bind(str(path))
-    return server
-
-
-def _runner(returncode: int):
-    def run(argv, **kwargs):
-        assert argv == ["ssh-add", "-l"]
-        return subprocess.CompletedProcess(argv, returncode, stdout="", stderr="")
-
-    return run
-
-
-def test_relay_status_is_absent_without_relay_sites(tmp_path):
-    assert (
-        doctor.relay_agent_status(_cfg(tmp_path), environ={}, runner=_runner(0)) is None
-    )
-    direct = _cfg(tmp_path, sites=_relay_site("n1", policy="direct"))
-    assert doctor.relay_agent_status(direct, environ={}, runner=_runner(0)) is None
-
-
-def test_relay_status_uses_configured_agent_socket(tmp_path):
-    sock = tmp_path / "agent.sock"
-    server = _bind_socket(sock)
-    try:
-        cfg = _cfg(tmp_path, sites=_relay_site("n1"))
-        env = {"SSH_AUTH_SOCK": str(sock)}
-        assert doctor.relay_agent_status(cfg, environ=env, runner=_runner(0)) == "ok"
-        assert (
-            doctor.relay_agent_status(cfg, environ=env, runner=_runner(1))
-            == "fail: no keys loaded"
-        )
-    finally:
-        server.close()
-
-
-def test_relay_status_falls_back_to_service_socket(tmp_path):
-    runtime = tmp_path / "run"
-    runtime.mkdir()
-    server = _bind_socket(runtime / doctor.RELAY_SERVICE_SOCKET)
-    try:
-        cfg = _cfg(tmp_path, sites=_relay_site("n1"))
-        env = {"XDG_RUNTIME_DIR": str(runtime)}
-        assert doctor.relay_agent_status(cfg, environ=env, runner=_runner(0)) == "ok"
-    finally:
-        server.close()
-
-
-def test_relay_status_fails_closed_without_any_socket(tmp_path):
+def test_relay_status_is_absent_because_gateway_uses_local_credentials(tmp_path):
     cfg = _cfg(tmp_path, sites=_relay_site("n1"))
-    assert (
-        doctor.relay_agent_status(cfg, environ={}, runner=_runner(0))
-        == "fail: no agent socket"
-    )
-    env = {"SSH_AUTH_SOCK": str(tmp_path / "missing.sock")}
-    assert (
-        doctor.relay_agent_status(cfg, environ=env, runner=_runner(0))
-        == "fail: socket missing"
-    )
 
+    def should_not_run(*_args, **_kwargs):
+        raise AssertionError("head ssh-agent must not be probed")
 
-def test_relay_status_reports_unreachable_agent(tmp_path):
-    sock = tmp_path / "agent.sock"
-    server = _bind_socket(sock)
-
-    def timing_out(argv, **kwargs):
-        raise subprocess.TimeoutExpired(argv, 5)
-
-    try:
-        cfg = _cfg(tmp_path, sites=_relay_site("n1"))
-        env = {"SSH_AUTH_SOCK": str(sock)}
-        assert (
-            doctor.relay_agent_status(cfg, environ=env, runner=timing_out)
-            == "fail: agent unreachable"
-        )
-    finally:
-        server.close()
+    assert doctor.relay_agent_status(cfg, environ={}, runner=should_not_run) is None
 
 
 def test_lan_annotation_flags_drifted_pinned_address(tmp_path):
@@ -161,6 +89,24 @@ def test_check_node_parses_advertised_addresses(monkeypatch):
     row = doctor.check_node(Node(name="n1"))
 
     assert row["checks"]["addrs"] == "10.0.0.5,172.17.0.1"
+
+
+def test_worker_doctor_reports_bash_capability_from_the_remote_path(monkeypatch):
+    def fake_run_on(name, local, snippet, timeout):
+        assert "command -v bash" in snippet
+        return subprocess.CompletedProcess(
+            ["ssh"],
+            0,
+            stdout="DT_SSH=ok\nDT_BASH=missing\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(doctor, "run_on", fake_run_on)
+
+    row = doctor.check_node(Node(name="minimal"))
+
+    assert row["checks"]["ssh"] == "ok"
+    assert row["checks"]["bash"] == "missing"
 
 
 def test_check_node_redacts_remote_ssh_failure_detail(monkeypatch):
@@ -279,6 +225,24 @@ def test_doctor_center_reduces_addresses_to_a_count(tmp_path, monkeypatch):
     assert rows["pinned"]["checks"]["lan"] == "ok"
     assert rows["pinned"]["checks"]["addrs"] == "2 addresses (redacted)"
     assert rows["silent"]["checks"]["addrs"] == "missing"
+
+
+def test_head_capability_checks_report_missing_supervisor_and_bash(monkeypatch):
+    import dt.agent as agent
+
+    monkeypatch.setattr(
+        agent,
+        "supervisor_capabilities",
+        lambda: {
+            "bash": False,
+            "persistent_supervisor": False,
+        },
+    )
+
+    assert doctor.head_capability_checks() == {
+        "bash": "missing",
+        "supervisor": "missing: systemd-user or crontab",
+    }
 
 
 def test_doctor_reports_relay_failure_and_exits_nonzero(tmp_path, monkeypatch):

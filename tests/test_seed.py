@@ -78,7 +78,8 @@ def test_seed_json_runs_nodes_concurrently_and_reports_exact_bytes(
     lock = threading.Lock()
     rsync_calls = []
 
-    def fake_run_on(name, local, command, timeout):
+    def fake_run_on(name, local, command, timeout, **kwargs):
+        assert kwargs["cancel_event"] is not None
         with lock:
             started.add(name)
             if len(started) == 2:
@@ -208,6 +209,36 @@ def test_seed_reports_component_retry_without_polluting_json(tmp_path, monkeypat
     assert result.stdout.count("\n") == 1
     assert "n1 · uv-cache attempt 1/2 failed" in result.stderr
     assert "retry 2/2 in 5s" in result.stderr
+
+
+def test_seed_ctrl_c_cancels_active_transfer_and_preserves_partial_cache(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path, [Node(name="n1")])
+    _local_seed_sources(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    observed = {}
+
+    def fake_run_on(*args, **kwargs):
+        observed["prepare_event"] = kwargs["cancel_event"]
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    def interrupted_rsync(*args, **kwargs):
+        observed["transfer_event"] = kwargs["cancel_event"]
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "run_on", fake_run_on)
+    monkeypatch.setattr(cli, "rsync", interrupted_rsync)
+
+    result = CliRunner().invoke(cli.app, ["seed", "n1", "--json"])
+
+    assert result.exit_code == 130
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "seed_interrupted"
+    assert "partial cache data were retained" in payload["message"]
+    assert observed["prepare_event"] is observed["transfer_event"]
+    assert observed["transfer_event"].is_set()
 
 
 def test_seed_plan_json_is_read_only_and_reports_local_source_size(

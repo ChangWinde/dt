@@ -2,10 +2,11 @@
 
 import pytest
 
+from dt import cli
 from dt.config import ConfigError, HeadConfig, Node, parse
 from dt.dispatch import RunSpec, drained_probe_reasons, pick_candidates
 from dt.probe import Gpu, NodeStatus
-from dt.scheduler import _capacity_state
+from dt.scheduler import _capacity_state, _resource_capacity
 from dt.jobs import JobEntry
 
 
@@ -115,17 +116,25 @@ def test_scheduler_explains_drained_states(tmp_path):
         gpus_requested=1,
         pin_node="n1",
     )
-    capacity = ({"n1": 4, "n2": 0}, {"n1": 4, "n2": 4}, set(), {})
+    capacity = _resource_capacity(
+        [
+            {"node": "n1", "gpus": [{"free": True}] * 4},
+            {"node": "n2", "gpus": [{"free": False}] * 4},
+        ]
+    )
+    assert capacity is not None
 
-    state, reason, _need = _capacity_state(cfg, entry, capacity)
+    state, reason, _need, selected = _capacity_state(cfg, entry, capacity)
     assert state == "waiting_node"
     assert "drained for maintenance" in reason
+    assert selected is None
 
     entry.pin_node = None
-    state, reason, _need = _capacity_state(cfg, entry, capacity)
+    state, reason, _need, selected = _capacity_state(cfg, entry, capacity)
     # n1 is drained; n2 has no free GPUs -> ordinary capacity wait, with the
     # drained node excluded from the promise.
     assert state == "waiting_capacity"
+    assert selected is None
 
     cfg_all = HeadConfig(
         center="c",
@@ -135,6 +144,28 @@ def test_scheduler_explains_drained_states(tmp_path):
         root=tmp_path / "dt",
         envs="~/dt/envs",
     )
-    state, reason, _need = _capacity_state(cfg_all, entry, capacity)
+    state, reason, _need, selected = _capacity_state(cfg_all, entry, capacity)
     assert state == "waiting_node"
     assert "every eligible node is drained" in reason
+    assert selected is None
+
+
+def test_free_explanation_never_advertises_drained_capacity():
+    rows = [
+        {
+            "center": "c",
+            "node": "n1",
+            "drained": True,
+            "gpus": [{"index": 0, "free": True}, {"index": 1, "free": True}],
+            "_scheduler": {"running": 0, "queued": 0},
+        }
+    ]
+
+    explanation = cli._free_center_explanation("c", rows)
+
+    assert explanation["capacity"]["gpus_free"] == 0
+    assert explanation["capacity"]["free_by_node"] == {"n1": 0}
+    assert explanation["capacity"]["physically_free_on_drained_nodes"] == 2
+    assert explanation["state"] == "idle_capacity_drained"
+    assert explanation["actions"] == []
+    assert cli._best_free_submit_node(rows) is None

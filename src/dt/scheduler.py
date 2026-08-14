@@ -5,22 +5,66 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from .config import HeadConfig
-from .jobs import JobEntry, LOST_RECHECK_S, effective_result_state
+from .jobs import (
+    JobEntry,
+    dependency_settled,
+    effective_result_state,
+    is_uncertain_launch,
+)
 
 SCHEDULER_SCHEMA = "dt_scheduler_state_v1"
 
 
+@dataclass
+class _ResourceCapacity:
+    free: dict[str, int]
+    total: dict[str, int]
+    unavailable: set[str]
+    disk_free: dict[str, float]
+    free_gpu_memory_mib: dict[str, list[int | None]]
+    gpu_memory_mib: dict[str, list[int | None]]
+    gpu_inventory_unknown: set[str]
+    memory_inventory_unknown: set[str]
+
+
+def _gpu_total_mib(row: Mapping[str, object]) -> int | None:
+    """Read the unit-bearing probe key, accepting the stable legacy key."""
+    raw = row.get("mem_total_mib", row.get("mem_total"))
+    if (
+        not isinstance(raw, (int, float))
+        or isinstance(raw, bool)
+        or not math.isfinite(float(raw))
+        or raw <= 0
+        or int(raw) != raw
+    ):
+        return None
+    return int(raw)
+
+
+def _dependency_wait_reason(entry: JobEntry) -> str:
+    if is_uncertain_launch(entry):
+        return "has an uncertain launch outcome"
+    if entry.status == "lost":
+        return "is lost but inside the rescue window"
+    return f"is {entry.status}"
+
+
 def _resource_capacity(
     resources: Sequence[Mapping[str, object]] | None,
-) -> tuple[dict[str, int], dict[str, int], set[str], dict[str, float]] | None:
+) -> _ResourceCapacity | None:
     if resources is None:
         return None
     free: dict[str, int] = {}
     total: dict[str, int] = {}
     unavailable: set[str] = set()
     disk_free: dict[str, float] = {}
+    free_gpu_memory_mib: dict[str, list[int | None]] = {}
+    gpu_memory_mib: dict[str, list[int | None]] = {}
+    gpu_inventory_unknown: set[str] = set()
+    memory_inventory_unknown: set[str] = set()
     for row in resources:
         node = row.get("node")
         if not isinstance(node, str) or not node:
@@ -31,9 +75,25 @@ def _resource_capacity(
         raw_gpus = row.get("gpus")
         gpus = raw_gpus if isinstance(raw_gpus, list) else []
         total[node] = len(gpus)
-        free[node] = sum(
-            gpu.get("free") is True for gpu in gpus if isinstance(gpu, dict)
-        )
+        memory_rows: list[int | None] = []
+        free_memory_rows: list[int | None] = []
+        for gpu in gpus:
+            if not isinstance(gpu, Mapping):
+                gpu_inventory_unknown.add(node)
+                memory_inventory_unknown.add(node)
+                continue
+            memory = _gpu_total_mib(gpu)
+            memory_rows.append(memory)
+            if memory is None:
+                memory_inventory_unknown.add(node)
+            if gpu.get("free") is True:
+                free_memory_rows.append(memory)
+        if not isinstance(raw_gpus, list) or row.get("gpu_inventory_error"):
+            gpu_inventory_unknown.add(node)
+            memory_inventory_unknown.add(node)
+        gpu_memory_mib[node] = memory_rows
+        free_gpu_memory_mib[node] = free_memory_rows
+        free[node] = len(free_memory_rows)
         system = row.get("system")
         if isinstance(system, Mapping):
             reported = system.get("disk_free_gib")
@@ -43,12 +103,23 @@ def _resource_capacity(
                 and math.isfinite(float(reported))
             ):
                 disk_free[node] = float(reported)
-    return free, total, unavailable, disk_free
+    return _ResourceCapacity(
+        free=free,
+        total=total,
+        unavailable=unavailable,
+        disk_free=disk_free,
+        free_gpu_memory_mib=free_gpu_memory_mib,
+        gpu_memory_mib=gpu_memory_mib,
+        gpu_inventory_unknown=gpu_inventory_unknown,
+        memory_inventory_unknown=memory_inventory_unknown,
+    )
 
 
 def _dependency_state(
     entry: JobEntry,
     by_id: Mapping[str, JobEntry],
+    *,
+    now: float,
 ) -> tuple[str, str, str] | None:
     result_dependency = entry.after_result
     if result_dependency is not None:
@@ -59,17 +130,12 @@ def _dependency_state(
                 f"result dependency {result_dependency} was not found",
                 "repair or replace the missing predecessor",
             )
-        if predecessor.status not in {
-            "finished",
-            "killed",
-            "lost",
-            "failed",
-            "skipped",
-        }:
+        if not dependency_settled(predecessor, now=now):
             expected = ",".join(entry.after_result_states)
             return (
                 "waiting_dependency",
-                f"result dependency {result_dependency} is {predecessor.status}",
+                f"result dependency {result_dependency} "
+                f"{_dependency_wait_reason(predecessor)}",
                 f"dependency must complete as one of [{expected}]",
             )
         observed = effective_result_state(predecessor) or predecessor.status
@@ -89,16 +155,11 @@ def _dependency_state(
                 f"completion dependency {completion_dependency} was not found",
                 "repair or replace the missing predecessor",
             )
-        if predecessor.status not in {
-            "finished",
-            "killed",
-            "lost",
-            "failed",
-            "skipped",
-        }:
+        if not dependency_settled(predecessor, now=now):
             return (
                 "waiting_dependency",
-                f"completion dependency {completion_dependency} is {predecessor.status}",
+                f"completion dependency {completion_dependency} "
+                f"{_dependency_wait_reason(predecessor)}",
                 f"dependency {completion_dependency} must reach any terminal result",
             )
         return None
@@ -112,27 +173,11 @@ def _dependency_state(
             f"dependency {dependency} was not found",
             "repair or replace the missing predecessor",
         )
-    if predecessor.status in {"queued", "running"}:
+    if not dependency_settled(predecessor, now=now):
         return (
             "waiting_dependency",
-            f"dependency {dependency} is {predecessor.status}",
+            f"dependency {dependency} {_dependency_wait_reason(predecessor)}",
             f"dependency {dependency} must finish successfully",
-        )
-    if (
-        predecessor.status == "lost"
-        and predecessor.finished_at is not None
-        and time.time() - predecessor.finished_at <= LOST_RECHECK_S
-    ):
-        # dispatch_queued holds (does not skip) a dependent while a lost
-        # predecessor is still inside the agent's rescue window, because a
-        # late exit marker can flip it back to finished. Explain it the same
-        # way so `dt free --explain` does not claim a skip that will not
-        # happen yet.
-        return (
-            "waiting_dependency",
-            f"dependency {dependency} is lost but inside the rescue window",
-            f"dependency {dependency} must finish successfully or exhaust "
-            "its rescue window",
         )
     if (
         predecessor.status != "finished"
@@ -169,18 +214,30 @@ def _persisted_wait(
 def _capacity_state(
     cfg: HeadConfig,
     entry: JobEntry,
-    capacity: tuple[dict[str, int], dict[str, int], set[str], dict[str, float]] | None,
-) -> tuple[str, str, str]:
+    capacity: _ResourceCapacity | None,
+) -> tuple[str, str, str, str | None]:
     if capacity is None:
         return (
             "pending_dispatch",
             entry.reason or "waiting for the next scheduler pass",
             "the agent must complete a fresh capacity probe",
+            None,
         )
-    free, total, unavailable, disk_free = capacity
-    configured = {node.name for node in cfg.nodes}
+    free = capacity.free
+    total = capacity.total
+    unavailable = capacity.unavailable
+    disk_free = capacity.disk_free
+    configured = [node.name for node in cfg.nodes]
+    configured_set = set(configured)
     drained = {node.name for node in cfg.nodes if node.drained}
-    candidates = {entry.pin_node} if entry.pin_node is not None else configured
+    if entry.pin_node is not None and entry.pin_node not in configured_set:
+        return (
+            "blocked_invalid_pin",
+            f"pinned node {entry.pin_node} is not configured",
+            "repair the persisted pin or restore the configured node",
+            None,
+        )
+    candidates = [entry.pin_node] if entry.pin_node is not None else list(configured)
     # Placement never uses a drained node (pick_candidates filters them,
     # pins included), so the explanation must not promise one either.
     if entry.pin_node is not None and entry.pin_node in drained:
@@ -188,26 +245,30 @@ def _capacity_state(
             "waiting_node",
             f"pinned node {entry.pin_node} is drained for maintenance",
             f"nodes[].drained must be lifted on {entry.pin_node} or the job repinned",
+            None,
         )
-    candidates -= drained
+    candidates = [node for node in candidates if node not in drained]
     if not candidates:
         return (
             "waiting_node",
             "every eligible node is drained for maintenance",
             "at least one node must have nodes[].drained lifted",
+            None,
         )
     if entry.pin_node is not None and entry.pin_node in unavailable:
         return (
             "waiting_node",
             f"pinned node {entry.pin_node} is unavailable",
             f"node {entry.pin_node} must become reachable",
+            None,
         )
-    reachable = candidates & set(total)
+    reachable = [node for node in candidates if node in total]
     if not reachable:
         return (
             "waiting_node",
             "no eligible node has a usable resource snapshot",
             "an eligible node must become reachable",
+            None,
         )
     wanted = max(0, entry.gpus_requested)
     # dispatch._reserve_for keeps no reserve for pinned jobs: pinning is an
@@ -226,15 +287,34 @@ def _capacity_state(
         # Unknown disk is not gated: fall back to the prior GPU-only view.
         return have is None or have >= required_disk
 
-    gpu_fitting = [
-        node for node in reachable if max(0, free.get(node, 0) - reserve) >= wanted
-    ]
+    minimum = entry.min_vram_mib
+
+    def gpu_fit(node: str) -> bool:
+        free_count = free.get(node, 0)
+        if wanted == 0:
+            return True
+        if node in capacity.gpu_inventory_unknown:
+            return False
+        if free_count - wanted < reserve:
+            return False
+        if minimum is None:
+            return free_count >= wanted
+        return (
+            sum(
+                memory is not None and memory >= minimum
+                for memory in capacity.free_gpu_memory_mib.get(node, [])
+            )
+            >= wanted
+        )
+
+    gpu_fitting = [node for node in reachable if gpu_fit(node)]
     fitting = [node for node in gpu_fitting if disk_ok(node)]
     if fitting:
         return (
             "runnable",
             f"{fitting[0]} currently satisfies the resource request",
             "the live agent can dispatch this job now",
+            fitting[0],
         )
     if gpu_fitting and required_disk > 0:
         return (
@@ -242,19 +322,98 @@ def _capacity_state(
             entry.reason
             or f"eligible nodes have GPUs free but under {required_disk} GiB disk",
             f"one eligible node must free at least {required_disk} GiB of disk",
+            None,
         )
-    max_inventory = max((total.get(node, 0) for node in reachable), default=0)
+    inventory_known = [
+        node
+        for node in reachable
+        if node not in capacity.gpu_inventory_unknown
+        and (minimum is None or node not in capacity.memory_inventory_unknown)
+    ]
+    if minimum is None:
+        max_inventory = max(
+            (total.get(node, 0) for node in inventory_known),
+            default=0,
+        )
+    else:
+        max_inventory = max(
+            (
+                sum(
+                    memory is not None and memory >= minimum
+                    for memory in capacity.gpu_memory_mib.get(node, [])
+                )
+                for node in inventory_known
+            ),
+            default=0,
+        )
     if wanted > max_inventory:
+        unknown = [
+            node
+            for node in candidates
+            if node in unavailable
+            or node in capacity.gpu_inventory_unknown
+            or (minimum is not None and node in capacity.memory_inventory_unknown)
+        ]
+        if unknown:
+            inventory_unknown = [
+                node
+                for node in unknown
+                if node in capacity.gpu_inventory_unknown
+                or (minimum is not None and node in capacity.memory_inventory_unknown)
+            ]
+            return (
+                "waiting_gpu_inventory" if inventory_unknown else "waiting_node",
+                (
+                    "GPU memory inventory is unavailable on eligible nodes"
+                    if minimum is not None
+                    else (
+                        "GPU inventory is unavailable on eligible nodes"
+                        if inventory_unknown
+                        else "reachable nodes are too small but eligible inventory is unavailable"
+                    )
+                ),
+                f"inventory for {', '.join(unknown)} must become available",
+                None,
+            )
+        shape = f" with at least {minimum} MiB each" if minimum is not None else ""
         return (
             "blocked_resource_mismatch",
-            f"requests {wanted} GPUs but eligible nodes expose at most {max_inventory}",
+            f"requests {wanted} GPUs{shape} but eligible nodes expose at most "
+            f"{max_inventory}",
             "change the resource request or eligible node set",
+            None,
         )
+    shape = f" with at least {minimum} MiB each" if minimum is not None else ""
     return (
         "waiting_capacity",
-        entry.reason or f"waiting for {wanted} GPU capacity",
-        f"one eligible node must have {wanted + reserve} free GPUs before reserve",
+        entry.reason or f"waiting for {wanted} GPU capacity{shape}",
+        f"one eligible node must have {wanted} fitting GPUs and leave "
+        f"{reserve} free in reserve",
+        None,
     )
+
+
+def _consume_capacity(
+    capacity: _ResourceCapacity,
+    node: str,
+    entry: JobEntry,
+) -> None:
+    """Consume the cards this forecasted placement would actually select."""
+    remaining = capacity.free_gpu_memory_mib.get(node, [])
+    minimum = entry.min_vram_mib
+    for _ in range(entry.gpus_requested):
+        selected = next(
+            (
+                index
+                for index, memory in enumerate(remaining)
+                if minimum is None or (memory is not None and memory >= minimum)
+            ),
+            None,
+        )
+        if selected is None:
+            return
+        remaining.pop(selected)
+        capacity.free[node] = max(0, capacity.free.get(node, 0) - 1)
 
 
 def scheduler_snapshot(
@@ -272,13 +431,17 @@ def scheduler_snapshot(
         key=lambda entry: entry.created_at,
     )
     running = sum(entry.status == "running" for entry in entries) + registry_damage
+    forecast_running = running
     by_id = {entry.job_id: entry for entry in entries}
     capacity = _resource_capacity(resources)
+    physical_free = dict(capacity.free) if capacity is not None else {}
+    now = time.time()
     rows: list[dict[str, object]] = []
     unpinned_capacity_wait: str | None = None
     busy_pins: dict[str, str] = {}
     for position, entry in enumerate(queue, start=1):
-        dependency = _dependency_state(entry, by_id)
+        selected_node: str | None = None
+        dependency = _dependency_state(entry, by_id, now=now)
         persisted = _persisted_wait(
             entry,
             has_resource_snapshot=capacity is not None,
@@ -287,12 +450,17 @@ def scheduler_snapshot(
             state, reason, condition = dependency
         elif persisted is not None:
             state, reason, condition = persisted
-        elif cfg.queue.max_my_jobs is not None and running >= cfg.queue.max_my_jobs:
+        elif (
+            cfg.queue.max_my_jobs is not None
+            and forecast_running >= cfg.queue.max_my_jobs
+        ):
             state = "waiting_quota"
             reason = f"max_my_jobs={cfg.queue.max_my_jobs} is reached"
             condition = f"running DT jobs must fall below {cfg.queue.max_my_jobs}"
         else:
-            state, reason, condition = _capacity_state(cfg, entry, capacity)
+            state, reason, condition, selected_node = _capacity_state(
+                cfg, entry, capacity
+            )
 
         fifo_owner: str | None = None
         if state == "runnable":
@@ -312,6 +480,15 @@ def scheduler_snapshot(
             state = "waiting_fifo"
             reason = f"FIFO capacity is reserved for earlier job {fifo_owner}"
             condition = f"earlier overlapping job {fifo_owner} must dispatch or unblock"
+            selected_node = None
+
+        if state == "runnable":
+            # Forecast queue order against one finite snapshot.  Without this,
+            # every row independently sees the same card and the JSON contract
+            # claims several simultaneous owners for one GPU.
+            forecast_running += 1
+            if capacity is not None and selected_node is not None:
+                _consume_capacity(capacity, selected_node, entry)
 
         if state == "waiting_capacity" and entry.gpus_requested > 0:
             if entry.pin_node is None:
@@ -328,6 +505,8 @@ def scheduler_snapshot(
                 "next_condition": condition,
                 "pin_node": entry.pin_node,
                 "gpus_requested": entry.gpus_requested,
+                "min_vram_mib": entry.min_vram_mib,
+                "selected_node": selected_node,
                 "after_success": entry.after_success,
                 "after_complete": entry.after_complete,
                 "after_result": entry.after_result,
@@ -357,6 +536,24 @@ def scheduler_snapshot(
         state = "idle"
         idle_reason = "queue is empty"
     next_row = runnable[0] if runnable else (rows[0] if rows else None)
+    resource_rows: list[dict[str, object]] = []
+    if capacity is not None:
+        remaining_free = capacity.free
+        reserve = max(0, cfg.queue.reserve_free_per_node)
+        for node in cfg.nodes:
+            resource_rows.append(
+                {
+                    "node": node.name,
+                    "drained": node.drained,
+                    "available": node.name in capacity.total,
+                    "physical_free_gpus": physical_free.get(node.name),
+                    "schedulable_free_gpus": (
+                        0
+                        if node.drained
+                        else max(0, remaining_free.get(node.name, 0) - reserve)
+                    ),
+                }
+            )
     return {
         "schema_version": SCHEDULER_SCHEMA,
         "state": state,
@@ -373,5 +570,9 @@ def scheduler_snapshot(
         "next_job_id": next_row["job_id"] if next_row else None,
         "next_condition": next_row["next_condition"] if next_row else None,
         "registry_damage": registry_damage,
+        "capacity": {
+            "schema_version": "dt_schedulable_capacity_v1",
+            "nodes": resource_rows,
+        },
         "queue": rows,
     }

@@ -571,6 +571,15 @@ def test_rsync_stats_sum_multiple_retry_attempt_blocks():
     assert dispatch.deleted_files(stdout) == 6
 
 
+def test_rsync_stats_parse_localized_bytes_without_float_rounding():
+    stdout = (
+        "Total transferred file size: 3.145.728 bytes\n"
+        "Total transferred file size: 9,007,199,254,740,993 bytes\n"
+    )
+
+    assert dispatch.transferred_bytes(stdout) == 9_007_199_257_886_721
+
+
 def test_rsync_delete_excluded_removes_previously_mirrored_cache(tmp_path):
     source = tmp_path / "source"
     mirror = tmp_path / "mirror"

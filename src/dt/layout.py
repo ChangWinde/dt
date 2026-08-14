@@ -141,4 +141,7 @@ def rsync_destination(
         return rendered.rstrip("/") + suffix
     remote_path = path[2:] if path.startswith("~/") else path
     rendered = remote_path.rstrip("/") + suffix
-    return f"{node_name}:{shlex.quote(rendered)}"
+    # This value is one subprocess argv element. Shell quotes belong only at a
+    # shell-rendering boundary; embedding them here makes modern rsync escape
+    # the quotes again and address a path whose name literally contains `'`.
+    return f"{node_name}:{rendered}"

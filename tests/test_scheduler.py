@@ -122,6 +122,86 @@ def test_lost_predecessor_in_rescue_window_is_waiting_not_skipped(tmp_path):
     assert "rescue window" in child["reason"]
 
 
+def test_legacy_lost_without_finished_time_uses_update_rescue_window(tmp_path):
+    import time
+
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(
+        "parent",
+        1,
+        status="lost",
+        node="n1",
+        finished_at=None,
+        updated_at=time.time(),
+    )
+    dependent = _entry("child", 2, after_complete="parent")
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [predecessor, dependent],
+        resources=_resources(),
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+
+    assert snapshot["queue"][0]["state"] == "waiting_dependency"
+
+
+def test_scheduler_forecast_consumes_capacity_once(tmp_path):
+    cfg = _cfg(tmp_path)
+    resources = [{"node": "n1", "gpus": [{"free": True}], "error": None}]
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [_entry("first", 1), _entry("second", 2)],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+
+    assert [row["state"] for row in snapshot["queue"]] == [
+        "runnable",
+        "waiting_capacity",
+    ]
+    assert snapshot["capacity"] == {
+        "schema_version": "dt_schedulable_capacity_v1",
+        "nodes": [
+            {
+                "node": "n1",
+                "drained": False,
+                "available": True,
+                "physical_free_gpus": 1,
+                "schedulable_free_gpus": 0,
+            },
+            {
+                "node": "n2",
+                "drained": False,
+                "available": False,
+                "physical_free_gpus": None,
+                "schedulable_free_gpus": 0,
+            },
+        ],
+    }
+
+
+def test_unreachable_large_node_prevents_false_permanent_mismatch(tmp_path):
+    cfg = _cfg(tmp_path)
+    resources = [
+        {"node": "n1", "gpus": [{"free": True}], "error": None},
+        {"node": "n2", "gpus": [], "error": "timeout"},
+    ]
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [_entry("large", 1, gpus_requested=2)],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+
+    assert snapshot["queue"][0]["state"] == "waiting_node"
+
+
 def test_lost_predecessor_past_rescue_window_is_blocked_skipped(tmp_path):
     import time
 
@@ -176,6 +256,64 @@ def test_scheduler_snapshot_explains_false_typed_result_predicate(tmp_path):
     assert snapshot["blocked_queued"] == 1
     assert snapshot["queue"][0]["state"] == "blocked_predicate_false"
     assert snapshot["queue"][0]["reason"] == ("result dependency completed as success")
+
+
+def test_all_dependency_kinds_wait_for_uncertain_or_rescuable_predecessors(tmp_path):
+    import time
+
+    from dt.jobs import UNCERTAIN_LAUNCH_PREFIX
+
+    cfg = _cfg(tmp_path)
+    cases = [
+        _entry(
+            "uncertain",
+            1,
+            status="failed",
+            reason=f"{UNCERTAIN_LAUNCH_PREFIX}cancellation unverified",
+        ),
+        _entry(
+            "lost",
+            2,
+            status="lost",
+            finished_at=time.time(),
+        ),
+    ]
+    for predecessor in cases:
+        dependents = [
+            _entry("success", 3, after_success=predecessor.job_id),
+            _entry("complete", 4, after_complete=predecessor.job_id),
+            _entry(
+                "result",
+                5,
+                after_result=predecessor.job_id,
+                after_result_states=["success"],
+            ),
+        ]
+        snapshot = scheduler_snapshot(
+            cfg,
+            [predecessor, *dependents],
+            resources=_resources(),
+            agent_alive=True,
+            agent_heartbeat_stale=False,
+        )
+
+        assert {row["state"] for row in snapshot["queue"]} == {"waiting_dependency"}
+
+
+def test_scheduler_marks_removed_pinned_node_as_invalid(tmp_path):
+    cfg = _cfg(tmp_path)
+    entry = _entry("orphaned-pin", 1, pin_node="removed-node")
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [entry],
+        resources=_resources(),
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+
+    assert snapshot["queue"][0]["state"] == "blocked_invalid_pin"
+    assert snapshot["blocked_queued"] == 1
 
 
 def test_pinned_job_is_exempt_from_the_unpinned_reserve(tmp_path):

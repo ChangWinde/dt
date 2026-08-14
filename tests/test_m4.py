@@ -4,9 +4,11 @@ import json
 import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 
 import dt.agent as agent
 import pytest
@@ -514,7 +516,7 @@ def test_rerun_cli_uses_standard_submission_payload_and_reason(tmp_path, monkeyp
         reason="waiting: n1 unreachable: No route to host",
     )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref: old)
+    monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref, **_kwargs: old)
 
     def submit_rerun(cfg_, spec, cwd, log, no_queue=False):
         assert spec.after_success == "guard"
@@ -588,7 +590,7 @@ def test_rerun_cli_reports_unchanged_snapshot(tmp_path, monkeypatch):
         rerun_snapshot_changed=False,
     )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref: old)
+    monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref, **_kwargs: old)
     monkeypatch.setattr(
         cli,
         "submit",
@@ -618,7 +620,7 @@ def test_rerun_rejects_exact_cache_binding_before_submission(tmp_path, monkeypat
         cache_env="TORCHINDUCTOR_CACHE_DIR",
     )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref: old)
+    monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref, **_kwargs: old)
     monkeypatch.setattr(
         cli,
         "submit",
@@ -1409,6 +1411,137 @@ def test_environment_cleanup_respects_lifetime_lock(tmp_path):
     assert not stale.exists()
 
 
+def test_environment_cleanup_keeps_every_env_when_age_probe_fails(tmp_path):
+    from dt.maintenance import clean_envs_command
+
+    envs = tmp_path / "envs"
+    fresh = envs / "a1b2c3d4e5f6"
+    fresh.mkdir(parents=True)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    fake_stat = tools / "stat"
+    fake_stat.write_text("#!/bin/sh\nexit 2\n")
+    fake_stat.chmod(0o755)
+    command = clean_envs_command(
+        str(envs),
+        datetime.now() - timedelta(days=1),
+        keep=set(),
+    )
+
+    result = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert fresh.is_dir()
+    assert "age probe failed" in result.stderr
+
+
+def test_environment_cleanup_compares_epoch_across_node_timezones(tmp_path):
+    from dt.maintenance import clean_envs_command
+
+    envs = tmp_path / "envs"
+    stale = envs / "a1b2c3d4e5f6"
+    fresh = envs / "b1b2c3d4e5f6"
+    stale.mkdir(parents=True)
+    fresh.mkdir()
+    os.utime(stale, (100.0, 100.0))
+    os.utime(fresh, (300.0, 300.0))
+    command = clean_envs_command(
+        str(envs),
+        datetime.fromtimestamp(200.0, timezone.utc),
+        keep=set(),
+    )
+
+    result = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        env={**os.environ, "TZ": "Pacific/Honolulu"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not stale.exists()
+    assert fresh.is_dir()
+
+
+def test_exact_environment_submit_serializes_retention_snapshot(tmp_path, monkeypatch):
+    import dt.dispatch as dispatch
+    from dt.maintenance import clean_envs
+
+    cfg = _cfg(tmp_path)
+    source = _entry(
+        "source",
+        "finished",
+        created_at=1.0,
+        node="n1",
+        snapshot_sha256="a" * 64,
+        env_hash="a1b2c3d4e5f6",
+    )
+    save(cfg, source)
+    spec = dispatch.environment_reuse_spec_from_entry(
+        source,
+        cmd=["python", "diagnose.py"],
+    )
+    submission_entered = Event()
+    permit_submission = Event()
+    cleanup_started = Event()
+    observed_command: list[str] = []
+
+    def fake_submit_prepared(cfg_, spec_, **_kwargs):
+        submission_entered.set()
+        assert permit_submission.wait(2)
+        entry = _entry(
+            "queued-exec",
+            "queued",
+            created_at=2.0,
+            env_hash=spec_.env_hash_override,
+            env_mode="reuse",
+            env_source_job=source.job_id,
+            pin_node="n1",
+        )
+        save(cfg_, entry)
+        return entry
+
+    def runner(_node, _local, command, _timeout, _check):
+        observed_command.append(command)
+        cleanup_started.set()
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(dispatch, "_submit_prepared", fake_submit_prepared)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        submitting = pool.submit(
+            dispatch.submit_fork,
+            cfg,
+            source,
+            spec,
+            lambda _message: None,
+        )
+        assert submission_entered.wait(2)
+        cleaning = pool.submit(
+            clean_envs,
+            cfg,
+            100.0,
+            lambda _message: None,
+            runner=runner,
+        )
+        assert not cleanup_started.wait(0.1)
+        permit_submission.set()
+        assert submitting.result(timeout=2).job_id == "queued-exec"
+        assert cleaning.result(timeout=2).failures == []
+
+    assert cleanup_started.is_set()
+    assert len(observed_command) == 1
+    assert ",a1b2c3d4e5f6," in observed_command[0]
+
+
 def test_environment_cleanup_protects_queued_exact_environment(tmp_path):
     from dt.maintenance import envs_in_use
 
@@ -1775,6 +1908,46 @@ def test_legacy_storage_inventory_counts_agent_state_and_log_rotations(tmp_path)
         "agent_last_autoclean",
     } <= set(head)
     assert payload["total_bytes"] >= len(b"activerotatedheartbeatstamp")
+
+
+def test_clean_json_reports_deployment_sweep_failures(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 255, "", "ssh: connect to host n1: No route to host"
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "clean",
+            "--before",
+            "2099-01-01",
+            "--deployments",
+            "-y",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    assert payload["removed_deployment_trees"] == 0
+    assert payload["exit_code"] == 1
+    assert payload["failures"] == [
+        {
+            "job_id": "-",
+            "node": "n1",
+            "kind": "deployment_clean_failed",
+            "message": (
+                "deployment clean skipped (remote command exited 255: "
+                "ssh: connect to host n1: No route to host)"
+            ),
+        }
+    ]
 
 
 def test_storage_defaults_to_scope_summary_and_keeps_details_explicit(

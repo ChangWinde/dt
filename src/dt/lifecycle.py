@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -10,10 +11,40 @@ from .layout import (
     MAX_NODE_PATH_BYTES,
     MAX_NODE_PATH_COMPONENT_BYTES,
     job_cancel_path,
+    job_control_dir,
     job_state_dir,
     node_path_expression,
 )
 from .sshio import diagnostic_excerpt
+
+
+_RUNTIME_SESSION_MAX_BYTES = 256
+_RUNTIME_ID_HEX_CHARS = 20
+
+
+def runtime_identity(session: str) -> tuple[str, str]:
+    """Return the deterministic tmux socket and systemd scope for a job.
+
+    The tmux server is the process that must be born inside the independent
+    scope.  A per-job socket guarantees ``tmux new-session`` cannot silently
+    connect to a server inherited from an older service cgroup.  Hashing keeps
+    both names within tmux/systemd limits without placing registry text in a
+    filesystem or unit name.
+    """
+    if (
+        not isinstance(session, str)
+        or not session
+        or any(char in session for char in "\x00\r\n")
+    ):
+        raise ValueError("tmux session identity is unsafe")
+    try:
+        encoded = session.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("tmux session identity is unsafe") from exc
+    if len(encoded) > _RUNTIME_SESSION_MAX_BYTES:
+        raise ValueError("tmux session identity is unsafe")
+    identity = hashlib.sha256(encoded).hexdigest()[:_RUNTIME_ID_HEX_CHARS]
+    return f"dt-job-{identity}", f"dt-runtime-{identity}.scope"
 
 
 def validate_job_capsule(path: str, *, job_id: str | None = None) -> str:
@@ -74,9 +105,20 @@ def process_identity_shell() -> str:
         '[ "$dt_ps_tail" != "$dt_ps_line" ] || return 1; '
         'set -- $dt_ps_tail; [ "$#" -ge 1 ] || return 1; '
         "printf '%s\\n' \"${1}\"; }; "
+        "dt_pid_has_live_task() { dt_pht_seen=0; "
+        'for dt_pht_path in "/proc/$1/task/"[0-9]*; do '
+        '[ -e "$dt_pht_path" ] || continue; dt_pht_seen=1; '
+        "dt_pht_tid=${dt_pht_path##*/}; "
+        # An unreadable extant task is not proof of death. Fail toward live
+        # so maintenance never deletes a capsule under an uncheckable thread.
+        'dt_pht_state=$(dt_pid_state "$dt_pht_tid") || return 0; '
+        'case "$dt_pht_state" in Z|X|x) :;; *) return 0;; esac; done; '
+        '[ "$dt_pht_seen" -eq 1 ] && return 1; return 0; }; '
         "dt_pid_zombie() { "
         'dt_pz_st=$(dt_pid_state "$1") || return 1; '
-        'case "$dt_pz_st" in Z|X|x) return 0;; *) return 1;; esac; }; '
+        'case "$dt_pz_st" in Z|X|x) '
+        'dt_pid_has_live_task "$1" && return 1; return 0;; '
+        "*) return 1;; esac; }; "
         "dt_pid_cwd_owned() { "
         'dt_pc_cwd=$(readlink "/proc/$1/cwd" 2>/dev/null) || return 1; '
         'case "$dt_pc_cwd" in "$2"|"$2"/*) return 0;; *) return 1;; esac; }; '
@@ -110,6 +152,63 @@ def process_identity_shell() -> str:
     )
 
 
+def runtime_scope_shell() -> str:
+    """Return fail-closed helpers for a recorded systemd user scope.
+
+    ``dt_scope_marker STATE EXPECTED`` prints the validated unit and returns
+    0, returns 1 when no scope was used (legacy or portable fallback), and 2
+    for a malformed/mismatched marker. ``dt_scope_census UNIT`` prints a
+    status line followed by every non-zombie PID in the scope hierarchy.
+    Inspection failures are ``DEGRADED``; callers must never translate them
+    into proof of death.
+    """
+    return (
+        "dt_scope_marker() { "
+        'dt_sm_path="$1/runtime_scope"; dt_sm_expected=$2; '
+        '[ -e "$dt_sm_path" ] || [ -L "$dt_sm_path" ] || return 1; '
+        '[ -f "$dt_sm_path" ] && [ ! -L "$dt_sm_path" ] || return 2; '
+        'dt_sm_size=$(wc -c <"$dt_sm_path" 2>/dev/null) || return 2; '
+        'case "$dt_sm_size" in *[!0-9]*|"") return 2;; esac; '
+        '[ "$dt_sm_size" -gt 0 ] && [ "$dt_sm_size" -le 64 ] || return 2; '
+        'dt_sm_value=$(cat "$dt_sm_path" 2>/dev/null) || return 2; '
+        '[ "${#dt_sm_value}" -eq 37 ] || return 2; '
+        'case "$dt_sm_value" in dt-runtime-[0-9a-f]*.scope) :;; *) return 2;; esac; '
+        "dt_sm_hex=${dt_sm_value#dt-runtime-}; dt_sm_hex=${dt_sm_hex%.scope}; "
+        '[ "${#dt_sm_hex}" -eq 20 ] || return 2; '
+        'case "$dt_sm_hex" in *[!0-9a-f]*) return 2;; esac; '
+        '[ -z "$dt_sm_expected" ] || [ "$dt_sm_value" = "$dt_sm_expected" ] '
+        '|| return 2; printf "%s\\n" "$dt_sm_value"; }; '
+        "dt_scope_census() { "
+        "dt_sc_unit=$1; command -v systemctl >/dev/null 2>&1 "
+        "|| { echo DEGRADED; return 0; }; "
+        'dt_sc_load=$(systemctl --user show "$dt_sc_unit" '
+        "--property=LoadState --value 2>/dev/null) "
+        "|| { echo DEGRADED; return 0; }; "
+        'case "$dt_sc_load" in not-found|"") echo ABSENT; return 0;; esac; '
+        'dt_sc_active=$(systemctl --user show "$dt_sc_unit" '
+        "--property=ActiveState --value 2>/dev/null) "
+        "|| { echo DEGRADED; return 0; }; "
+        'dt_sc_cg=$(systemctl --user show "$dt_sc_unit" '
+        "--property=ControlGroup --value 2>/dev/null) "
+        "|| { echo DEGRADED; return 0; }; "
+        'if [ -z "$dt_sc_cg" ]; then case "$dt_sc_active" in '
+        "inactive|failed|dead) echo ABSENT;; *) echo DEGRADED;; esac; return 0; fi; "
+        'case "$dt_sc_cg" in /*) :;; *) echo DEGRADED; return 0;; esac; '
+        'case "/$dt_sc_cg/" in */../*|*/./*) echo DEGRADED; return 0;; esac; '
+        'dt_sc_root="/sys/fs/cgroup$dt_sc_cg"; '
+        '[ -d "$dt_sc_root" ] || { echo DEGRADED; return 0; }; '
+        'dt_sc_raw=$(find "$dt_sc_root" -type f -name cgroup.procs '
+        "-exec cat -- {} + 2>/dev/null); dt_sc_rc=$?; "
+        '[ "$dt_sc_rc" -eq 0 ] || { echo DEGRADED; return 0; }; '
+        "for dt_sc_pid in $dt_sc_raw; do "
+        'case "$dt_sc_pid" in *[!0-9]*|""|0) echo DEGRADED; return 0;; esac; '
+        "done; echo OK; for dt_sc_pid in $dt_sc_raw; do "
+        'if dt_pid_zombie "$dt_sc_pid"; then continue; fi; '
+        '[ -e "/proc/$dt_sc_pid" ] || continue; '
+        'printf "%s\\n" "$dt_sc_pid"; done; }; '
+    )
+
+
 def liveness_shell() -> str:
     """Signal-free census answering whether any process still belongs to a job.
 
@@ -125,7 +224,7 @@ def liveness_shell() -> str:
     only cause an over-refusal here, never a wrong-target signal.
     """
     return (
-        process_identity_shell() + "dt_job_live_state() { "
+        process_identity_shell() + runtime_scope_shell() + "dt_job_live_state() { "
         "dt_jl_jd=$1; dt_jl_pg=$2; dt_jl_boot=$3; dt_jl_ident=$4; "
         'case "$dt_jl_jd" in /*) :;; *) dt_jl_jd="$PWD/$dt_jl_jd";; esac; '
         # find -lname treats its operand as a glob: a configured path holding
@@ -139,6 +238,15 @@ def liveness_shell() -> str:
         "dt_jl_cur=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) "
         "|| { echo UNPROVEN; return 0; }; "
         '[ "$dt_jl_cur" = "$dt_jl_boot" ] || { echo DEAD; return 0; }; fi; '
+        "dt_jl_state=${dt_jl_ident%/*}; "
+        'dt_jl_scope=$(dt_scope_marker "$dt_jl_state" ""); dt_jl_src=$?; '
+        '[ "$dt_jl_src" -eq 2 ] && { echo UNPROVEN; return 0; }; '
+        'if [ "$dt_jl_src" -eq 0 ]; then '
+        'dt_jl_sc=$(dt_scope_census "$dt_jl_scope"); '
+        'dt_jl_shead=$(printf "%s\\n" "$dt_jl_sc" | sed -n "1p"); '
+        'case "$dt_jl_shead" in DEGRADED) echo UNPROVEN; return 0;; '
+        'OK) [ "$(printf "%s\\n" "$dt_jl_sc" | sed -n "2p")" ] '
+        "&& { echo LIVE; return 0; };; esac; fi; "
         'dt_process_owned "$dt_jl_pg" "$dt_jl_ident" "$dt_jl_jd" ""; dt_jl_rc=$?; '
         'if [ "$dt_jl_rc" -eq 0 ] || [ "$dt_jl_rc" -eq 2 ]; then '
         "echo LIVE; return 0; fi; "
@@ -169,6 +277,82 @@ def liveness_shell() -> str:
     )
 
 
+LAUNCH_RECOVERY_MARK = "@@DT_LAUNCH_RECOVERY_V1@@"
+
+
+def launch_recovery_probe(job_dir: str, session: str, *, layout: str | None) -> str:
+    """Build a signal-free probe for a queued launch whose receipt was lost.
+
+    The first trusted marker anchors a bounded line protocol. Worker-owned
+    files may describe a result, but cannot add protocol records or make a
+    reused PID look owned: live adoption still requires the procfs identity
+    proof shared with status, kill, and maintenance.
+    """
+    job_dir = validate_job_capsule(job_dir)
+    state_dir = job_state_dir(job_dir, layout)
+    control_dir = job_control_dir(job_dir, layout)
+    job = node_path_expression(job_dir)
+    state = node_path_expression(state_dir)
+    control = node_path_expression(control_dir)
+    socket, _scope = runtime_identity(session)
+    script = (
+        liveness_shell() + "dt_recover_field() { "
+        '[ -f "$1" ] && [ ! -L "$1" ] '
+        "&& { head -c 128 -- \"$1\" 2>/dev/null | tr -d '\\r\\n'; echo; } "
+        "|| echo UNKNOWN; }; "
+        + f"DT_RJOB={job}; DT_RSTATE={state}; DT_RCONTROL={control}; "
+        + f"DT_RSESSION={shlex.quote(session)}; "
+        + f"DT_RSOCKET={shlex.quote(socket)}; "
+        + "cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo UNKNOWN; "
+        + f"echo {LAUNCH_RECOVERY_MARK}; "
+        'DT_RPID=$(dt_recover_field "$DT_RSTATE/pgid"); '
+        'case "$DT_RPID" in *[!0-9]*|""|0|UNKNOWN) DT_RPID=0;; esac; '
+        'DT_RBOOT=$(dt_recover_field "$DT_RSTATE/boot_id"); '
+        'case "$DT_RBOOT" in *[!A-Za-z0-9-]*|""|UNKNOWN) DT_RBOOT="";; esac; '
+        'DT_RLIVE=$(dt_job_live_state "$DT_RJOB" "$DT_RPID" "$DT_RBOOT" '
+        '"$DT_RSTATE/process_start_ticks"); '
+        'case "$DT_RLIVE" in UNPROVEN) echo UNPROVEN; exit 0;; esac; '
+        'if [ "$DT_RLIVE" = LIVE ]; then '
+        '[ "$DT_RPID" -gt 0 ] && [ -n "$DT_RBOOT" ] '
+        "|| { echo UNPROVEN; exit 0; }; "
+        'dt_process_owned "$DT_RPID" "$DT_RSTATE/process_start_ticks" '
+        '"$DT_RJOB" "$DT_RBOOT"; DT_RIDENTITY=$?; '
+        'if [ "$DT_RIDENTITY" -eq 0 ]; then echo RUNNING; '
+        'dt_recover_field "$DT_RSTATE/pgid"; '
+        'dt_recover_field "$DT_RSTATE/gpus"; '
+        'dt_recover_field "$DT_RSTATE/started_at"; '
+        'dt_recover_field "$DT_RCONTROL/env-key"; exit 0; fi; '
+        # A survivor whose wrapper identity is absent or mismatched proves
+        # that retry is unsafe, but never proves which process owns the PGID.
+        "echo UNPROVEN; exit 0; fi; "
+        # Worker files are considered terminal only after the boot/identity
+        # checks and a complete survivor census have proved the capsule dead.
+        # Requiring the wrapper-owned timestamp pair also makes a lone
+        # task-written exit_code fail closed as an uncertain launch.
+        '[ -n "$DT_RBOOT" ] && [ -s "$DT_RSTATE/exit_code" ] '
+        '&& [ ! -L "$DT_RSTATE/exit_code" ] '
+        '&& [ -s "$DT_RSTATE/started_at" ] '
+        '&& [ ! -L "$DT_RSTATE/started_at" ] '
+        '&& [ -s "$DT_RSTATE/finished_at" ] '
+        '&& [ ! -L "$DT_RSTATE/finished_at" ] '
+        "&& { echo FINISHED; "
+        'dt_recover_field "$DT_RSTATE/exit_code"; '
+        'dt_recover_field "$DT_RSTATE/pgid"; '
+        'dt_recover_field "$DT_RSTATE/gpus"; '
+        'dt_recover_field "$DT_RSTATE/started_at"; '
+        'dt_recover_field "$DT_RSTATE/finished_at"; '
+        'dt_recover_field "$DT_RSTATE/result_state"; '
+        'dt_recover_field "$DT_RCONTROL/env-key"; exit 0; }; '
+        'if [ -s "$DT_RSTATE/started_at" ] '
+        '|| tmux -L "$DT_RSOCKET" has-session -t "$DT_RSESSION" 2>/dev/null '
+        '|| tmux -L dt has-session -t "$DT_RSESSION" 2>/dev/null; then '
+        "echo UNPROVEN; else echo NONE; fi"
+    )
+    # Pin procfs parsing to bash; a zsh login shell does not word-split the
+    # stat tail used by process_identity_shell.
+    return f"env LC_ALL=C bash -c {shlex.quote(script)}"
+
+
 def termination_probe(
     job_dir: str,
     pgid: int | None,
@@ -178,6 +362,7 @@ def termination_probe(
     job_id: str | None = None,
     session: str | None = None,
     cancel_sentinel: bool = False,
+    cancel_token: str | None = None,
     layout: str | None = None,
     ignore_exit_marker: bool = False,
 ) -> str:
@@ -192,31 +377,55 @@ def termination_probe(
     """
     if sig not in {"TERM", "KILL"}:
         raise ValueError(f"unsupported termination signal: {sig!r}")
+    if cancel_token is not None and re.fullmatch(r"[0-9a-f]{32}", cancel_token) is None:
+        raise ValueError("cancel token is unsafe")
+    if cancel_token is not None and not cancel_sentinel:
+        raise ValueError("cancel token requires a cancellation sentinel")
     job_dir = validate_job_capsule(job_dir, job_id=job_id)
+    runtime_socket = ""
+    runtime_scope = ""
+    if session is not None:
+        runtime_socket, runtime_scope = runtime_identity(session)
     prefix = (
-        'touch "$DT_KCANCEL" 2>/dev/null || '
-        '{ echo "cancel sentinel write failed" >&2; exit 69; }; '
+        "dt_k_cancel_parent=${DT_KCANCEL%/*}; "
+        'dt_k_cancel_tmp="$DT_KCANCEL.tmp.$$"; '
+        'if [ "$dt_k_cancel_parent" != "$DT_KCANCEL" ] && '
+        'mkdir -p -- "$dt_k_cancel_parent" 2>/dev/null && '
+        '[ -d "$dt_k_cancel_parent" ] && [ ! -L "$dt_k_cancel_parent" ] && '
+        'chmod 700 -- "$dt_k_cancel_parent" 2>/dev/null && '
+        'rm -f -- "$dt_k_cancel_tmp" 2>/dev/null && '
+        'printf "%s\\n" "$DT_KCANCEL_VALUE" >"$dt_k_cancel_tmp" 2>/dev/null && '
+        'chmod 600 -- "$dt_k_cancel_tmp" 2>/dev/null && '
+        'mv -f -- "$dt_k_cancel_tmp" "$DT_KCANCEL" 2>/dev/null; then :; else '
+        'rm -f -- "$dt_k_cancel_tmp" 2>/dev/null; '
+        'echo "cancel sentinel write failed" >&2; exit 69; fi; '
         if cancel_sentinel
         else ""
     )
     close_session = (
+        'tmux -L "$DT_KSOCKET" kill-session -t "$DT_KSESSION" 2>/dev/null; '
         'tmux -L dt kill-session -t "$DT_KSESSION" 2>/dev/null; '
         if session is not None
         else ""
     )
     script = (
-        process_identity_shell() + "owned_group() { "
+        process_identity_shell() + runtime_scope_shell() + "expected_scope() { "
+        'dt_es_unit=$(dt_scope_marker "$DT_KSTATE" "$DT_KSCOPE"); dt_es_rc=$?; '
+        'case "$dt_es_rc" in 0) dt_scope_census "$dt_es_unit";; '
+        "1) echo ABSENT;; *) echo DEGRADED;; esac; }; " + "owned_group() { "
         'dt_process_owned "$DT_KPG" "$DT_KIDENT" "$DT_KJD" "$DT_KBOOT"; }; '
         # group_open() answers "is it safe to treat the PGID as ours for
-        # group-wide signalling and the pgrep census?".  Safe cases: the
-        # leader slot was reaped (a pid number cannot be recycled while any
-        # process, zombie included, still anchors it as a pgid), or the slot
+        # group-wide signalling and the pgrep census?". Safe cases: the
+        # leader slot was reaped *and the original group still has members*
+        # (those members keep the PGID reserved), or the slot
         # holds a zombie of our own group.  A zombie leader with a recorded
         # identity must still prove its start ticks so a recycled-then-died
         # foreign leader never opens someone else's group to our signals.
          + "group_open() { "
         '[ "$DT_KPG" -gt 0 ] || return 1; '
-        '[ ! -e "/proc/$DT_KPG" ] && return 0; '
+        '[ ! -e "/proc/$DT_KPG" ] && '
+        "{ command -v pgrep >/dev/null 2>&1 || return 1; "
+        'pgrep -g "$DT_KPG" >/dev/null 2>&1; return $?; }; '
         'dt_pid_zombie "$DT_KPG" || return 1; '
         'dt_go_pg=$(dt_pid_group "$DT_KPG") || return 1; '
         '[ "$dt_go_pg" = "$DT_KPG" ] || return 1; '
@@ -246,6 +455,11 @@ def termination_probe(
         # (missing/br0ken pgrep or find, fork exhaustion) so an empty census
         # under a broken probe reports UNVERIFIED, never a false DEAD.
          + "survivors() { dt_su_deg=0; dt_su_pids=''; dt_su_grun=0; "
+        "dt_su_sc=$(expected_scope); "
+        'dt_su_sh=$(printf "%s\\n" "$dt_su_sc" | sed -n "1p"); '
+        'case "$dt_su_sh" in DEGRADED) dt_su_deg=1;; OK) '
+        'dt_su_sp=$(printf "%s\\n" "$dt_su_sc" | sed -n \'2,$p\'); '
+        'dt_su_pids="$dt_su_pids $dt_su_sp";; esac; '
         'if [ "$DT_KGROUP_OWNED" -eq 1 ]; then dt_su_grun=1; '
         'elif [ "$DT_KLEADER_GONE" -eq 1 ] && group_open; then dt_su_grun=1; fi; '
         'if [ "$dt_su_grun" -eq 1 ]; then '
@@ -288,23 +502,6 @@ def termination_probe(
         '[ "$DT_KBOOT_UNKNOWN" -eq 0 ] && [ "$dt_k_current_boot" != "$DT_KBOOT" ] '
         + "&& DT_KBOOT_MATCH=0; fi; "
         + prefix
-        # An exit marker that exists before any signal is sent means the job
-        # completed on its own; the caller must preserve that result instead
-        # of rewriting it into a kill.  Markers written after our signal do
-        # not take this path, so a wrapper that records its own TERM death
-        # still reads as a confirmed kill.  The marker file lives in a
-        # job-writable directory: reduce it to a bare bounded number so
-        # remote content can never forge another verdict line.
-        + (
-            ""
-            if ignore_exit_marker
-            else 'if [ -s "$DT_KSTATE"/exit_code ]; then '
-            'dt_k_exit=$(cat "$DT_KSTATE"/exit_code 2>/dev/null) || dt_k_exit=UNKNOWN; '
-            'case "$dt_k_exit" in *[!0-9]*|"") dt_k_exit=UNKNOWN;; esac; '
-            '[ "$dt_k_exit" = UNKNOWN ] || [ "${#dt_k_exit}" -le 3 ] '
-            "|| dt_k_exit=UNKNOWN; "
-            'echo "EXITED $dt_k_exit"; exit 0; fi; '
-        )
         # A proven boot mismatch is the one safe DEAD shortcut: the node
         # rebooted, so nothing from the recorded boot can still be running.
         + '[ "$DT_KBOOT_UNKNOWN" -eq 0 ] && [ "$DT_KBOOT_MATCH" -eq 0 ] '
@@ -314,13 +511,44 @@ def termination_probe(
         "DT_KGROUP_OWNED=0; DT_KLEADER_GONE=0; "
         '[ "$dt_k_owned_rc" -eq 0 ] && DT_KGROUP_OWNED=1; '
         '[ "$dt_k_owned_rc" -eq 1 ] && DT_KLEADER_GONE=1; '
-        # A dead leader (rc=1) cannot have had its PGID reused as a group, so
-        # signalling the whole group reaches in-group orphans that chdir'd
-        # out of the capsule; group_open() separates a freed or zombie-held
-        # PID (ours) from one reused by another user.
-         + "dt_k_grun=0; "
+        # A task can prewrite exit_code while its wrapper is still live.
+        # Census first; only an exact, non-degraded empty census may preserve
+        # a valid pre-signal completion marker. Malformed marker content is
+        # never itself a terminal verdict.
+        + "dt_k_pre=$(survivors); "
+        + 'dt_k_pre_head=$(printf "%s\\n" "$dt_k_pre" | sed -n "1p"); '
+        + '[ "$dt_k_pre" = OK ] && [ "$dt_k_owned_rc" -eq 2 ] '
+        "&& { echo UNPROVEN; exit 3; }; "
+        + (
+            ""
+            if ignore_exit_marker
+            else 'if [ "$dt_k_pre" = OK ] '
+            '&& [ -f "$DT_KSTATE/exit_code" ] '
+            '&& [ ! -L "$DT_KSTATE/exit_code" ]; then '
+            'dt_k_size=$(wc -c <"$DT_KSTATE/exit_code" 2>/dev/null) '
+            "|| dt_k_size=0; "
+            'case "$dt_k_size" in *[!0-9]*|"") dt_k_size=0;; esac; '
+            'if [ "$dt_k_size" -gt 0 ] && [ "$dt_k_size" -le 4 ]; then '
+            'dt_k_exit=$(cat "$DT_KSTATE/exit_code" 2>/dev/null) '
+            "|| dt_k_exit=UNKNOWN; "
+            'case "$dt_k_exit" in *[!0-9]*|"") dt_k_exit=UNKNOWN;; esac; '
+            '[ "$dt_k_exit" = UNKNOWN ] || [ "${#dt_k_exit}" -le 3 ] '
+            "|| dt_k_exit=UNKNOWN; "
+            '[ "$dt_k_exit" = UNKNOWN ] '
+            '|| { echo "EXITED $dt_k_exit"; exit 0; }; fi; fi; '
+        )
+        + '[ "$dt_k_pre_head" = DEGRADED ] && { echo UNPROVEN; exit 3; }; '
+        # A dead leader's extant group keeps its numeric PGID reserved, so
+        # signalling reaches in-group orphans that chdir'd out of the capsule.
+        # group_open() refuses an empty/free PGID, closing the check-to-signal
+        # reuse window where an unrelated group could otherwise take it.
+        + "dt_k_grun=0; "
         '[ "$DT_KGROUP_OWNED" -eq 1 ] && dt_k_grun=1; '
         '[ "$DT_KLEADER_GONE" -eq 1 ] && group_open && dt_k_grun=1; '
+        'dt_k_scope=; if [ -n "$DT_KSCOPE" ]; then '
+        'dt_k_scope=$(dt_scope_marker "$DT_KSTATE" "$DT_KSCOPE" 2>/dev/null); fi; '
+        'if [ -n "$dt_k_scope" ]; then systemctl --user kill --signal="$DT_KSIG" '
+        '--kill-whom=all "$dt_k_scope" 2>/dev/null || :; fi; '
         '[ "$dt_k_grun" -eq 1 ] && kill -"$DT_KSIG" -- -"$DT_KPG" 2>/dev/null; '
         "for pid in $(sig_scan | sort -u); do "
         # rc=2 (unproven live leader): never signal a PID that shares the
@@ -333,8 +561,9 @@ def termination_probe(
         + close_session
         + "for i in 1 2 3 4 5 6; do sleep 0.5; "
         "dt_k_out=$(survivors); "
-        'case "$dt_k_out" in '
-        "OK) echo DEAD; exit 0;; "
+        'dt_k_out_head=$(printf "%s\\n" "$dt_k_out" | sed -n "1p"); '
+        'case "$dt_k_out_head" in '
+        'OK) [ "$dt_k_out" = OK ] && { echo DEAD; exit 0; };; '
         "DEGRADED) echo UNPROVEN; exit 3;; "
         "esac; done; "
         "echo ALIVE"
@@ -357,10 +586,15 @@ def termination_probe(
     envs.append("LC_ALL=C")
     if session is not None:
         envs.append(f"DT_KSESSION={shlex.quote(session)}")
+        envs.append(f"DT_KSOCKET={shlex.quote(runtime_socket)}")
+        envs.append(f"DT_KSCOPE={shlex.quote(runtime_scope)}")
+    else:
+        envs.append("DT_KSCOPE=")
     if cancel_sentinel:
         envs.append(
             f"DT_KCANCEL={node_path_expression(job_cancel_path(job_dir, layout))}"
         )
+        envs.append(f"DT_KCANCEL_VALUE={shlex.quote(cancel_token or '*')}")
     return f"env {' '.join(envs)} bash -c {shlex.quote(script)}"
 
 

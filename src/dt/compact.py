@@ -260,6 +260,15 @@ def _remote_command(
         root = node_path_expression(candidate.entry.job_dir)
         job_id = shlex.quote(candidate.entry.job_id)
         receipt = shlex.quote(_receipt(candidate, now))
+        receipt_check = shlex.quote(
+            "import json,sys; "
+            f"b=open(sys.argv[1], 'rb').read({_SNAPSHOT_METADATA_MAX_BYTES + 1}); "
+            f"d=json.loads(b) if len(b) <= {_SNAPSHOT_METADATA_MAX_BYTES} else {{}}; "
+            "raise SystemExit(0 if "
+            f"d.get('schema_version') == 'dt_workdir_prune_v1' and "
+            f"d.get('job_id') == {candidate.entry.job_id!r} and "
+            f"d.get('snapshot_sha256') == {candidate.digest!r} else 1)"
+        )
         pgid = (
             candidate.entry.pgid
             if isinstance(candidate.entry.pgid, int) and candidate.entry.pgid > 0
@@ -283,6 +292,7 @@ def _remote_command(
                 f"control={node_path_expression(control)}",
                 f"job_id={job_id}",
                 'code="$root/code"',
+                'receipt_path="$control/code-pruned.json"',
                 (
                     'dt_live=$(dt_job_live_state "$root" '
                     f"{pgid} {boot_id} {identity_file})"
@@ -297,10 +307,57 @@ def _remote_command(
                 'elif [ "$dt_live" != DEAD ]; then',
                 '  emit state_changed "$job_id" 0 job_liveness_unproven',
                 'elif [ ! -e "$code" ] && [ ! -L "$code" ]; then',
-                '  emit already_compact "$job_id" 0 code_absent',
+                '  if [ -L "$receipt_path" ] || '
+                '{ [ -e "$receipt_path" ] && [ ! -f "$receipt_path" ]; }; then',
+                '    emit unsafe "$job_id" 0 unsafe_receipt_path',
+                "    compact_rc=1",
+                '  elif [ -f "$receipt_path" ] && '
+                f'python3 -I -c {receipt_check} "$receipt_path"; then',
+                '    emit already_compact "$job_id" 0 code_absent',
+            ]
+        )
+        if apply:
+            lines.extend(
+                [
+                    '  elif [ ! -d "$control" ] || [ -L "$control" ]; then',
+                    '    emit unsafe "$job_id" 0 unsafe_control_dir',
+                    "    compact_rc=1",
+                    "  elif ! command -v sync >/dev/null 2>&1; then",
+                    '    emit failed "$job_id" 0 durability_tool_missing',
+                    "    compact_rc=1",
+                    "  else",
+                    '    receipt_tmp="$control/.code-pruned.$$.tmp"',
+                    (
+                        f"    if (umask 077; printf '%s' {receipt} "
+                        '>"$receipt_tmp") && chmod 600 "$receipt_tmp" '
+                        '&& sync -f "$receipt_tmp" '
+                        '&& mv -f -- "$receipt_tmp" "$receipt_path" '
+                        '&& sync -f "$control"; then'
+                    ),
+                    '      emit receipt_repaired "$job_id" 0 code_absent',
+                    "    else",
+                    '      rm -f -- "$receipt_tmp"',
+                    '      emit failed "$job_id" 0 receipt_repair_failed',
+                    "      compact_rc=1",
+                    "    fi",
+                    "  fi",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "  else",
+                    '    emit receipt_missing "$job_id" 0 code_absent_or_receipt_invalid',
+                    "  fi",
+                ]
+            )
+        lines.extend(
+            [
                 'elif [ -L "$code" ] || [ ! -d "$code" ]; then',
                 '  emit unsafe "$job_id" 0 unsafe_code_path',
                 "  compact_rc=1",
+                'elif [ -L "$receipt_path" ] || [ -e "$receipt_path" ]; then',
+                '  emit state_changed "$job_id" 0 receipt_exists_while_code_present',
                 "else",
                 (
                     '  bytes=$(timeout 60s du -s -B1 -- "$code" '
@@ -312,16 +369,24 @@ def _remote_command(
         if apply:
             lines.extend(
                 [
+                    '  if [ ! -d "$control" ] || [ -L "$control" ]; then',
+                    '    emit unsafe "$job_id" "$bytes" unsafe_control_dir',
+                    "    compact_rc=1",
+                    "  elif ! command -v sync >/dev/null 2>&1; then",
+                    '    emit failed "$job_id" "$bytes" durability_tool_missing',
+                    "    compact_rc=1",
                     (
-                        '  if find "$code" -xdev -depth -delete '
+                        '  elif find "$code" -xdev -depth -delete '
                         '>/dev/null 2>&1 && [ ! -e "$code" ] '
                         '&& [ ! -L "$code" ]; then'
                     ),
                     '    receipt_tmp="$control/.code-pruned.$$.tmp"',
                     (
                         f"    if (umask 077; printf '%s' {receipt} "
-                        '>"$receipt_tmp") && '
-                        'mv -f -- "$receipt_tmp" "$control/code-pruned.json"; then'
+                        '>"$receipt_tmp") && chmod 600 "$receipt_tmp" '
+                        '&& sync -f "$receipt_tmp" '
+                        '&& mv -f -- "$receipt_tmp" "$receipt_path" '
+                        '&& sync -f "$control"; then'
                     ),
                     '      emit compacted "$job_id" "$bytes" code_removed',
                     "    else",
@@ -526,6 +591,7 @@ def compact_jobs(
                 "rows": [],
                 "planned_jobs": 0,
                 "compacted_jobs": 0,
+                "repaired_receipts": 0,
                 "already_compact_jobs": 0,
                 "missing_job_dirs": 0,
                 "state_changed_jobs": 0,
@@ -555,7 +621,8 @@ def compact_jobs(
         **common,
         "rows": rows,
         "planned_jobs": counts["planned"],
-        "compacted_jobs": counts["compacted"],
+        "compacted_jobs": counts["compacted"] + counts["receipt_repaired"],
+        "repaired_receipts": counts["receipt_repaired"],
         "already_compact_jobs": counts["already_compact"],
         "missing_job_dirs": counts["missing"],
         "state_changed_jobs": counts["state_changed"],

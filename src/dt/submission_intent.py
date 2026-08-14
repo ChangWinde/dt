@@ -48,6 +48,15 @@ class RequestRecordError(RuntimeError):
     """A durable request record is malformed or cannot be trusted."""
 
 
+class RequestDurabilityUnknown(RequestRecordError):
+    """A record was published but its directory entry was not durably synced.
+
+    The new path is visible to the live process, but a host crash could still
+    lose the rename.  Callers must therefore fail closed instead of reporting
+    a known pre-launch rejection that an automated client may safely retry.
+    """
+
+
 class RequestLockError(RequestRecordError):
     """The per-request serialization lock could not be acquired."""
 
@@ -235,11 +244,16 @@ def save(cfg: HeadConfig, record: RequestRecord) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            raise RequestDurabilityUnknown(
+                "submission request record was published but its durability is unknown"
+            ) from exc
     finally:
         try:
             os.unlink(temporary)
@@ -292,8 +306,13 @@ def transition(
 
 
 @contextmanager
-def lock(cfg: HeadConfig, request_id: str) -> Iterator[None]:
-    """Serialize every decision for one untrusted request identity."""
+def lock(
+    cfg: HeadConfig,
+    request_id: str,
+    *,
+    blocking: bool = True,
+) -> Iterator[bool]:
+    """Serialize decisions, optionally reporting an in-flight owner."""
     digest = request_digest(request_id)
     lock_root = cfg.state_dir()
     try:
@@ -317,8 +336,15 @@ def lock(cfg: HeadConfig, request_id: str) -> Iterator[None]:
         descriptor = os.fdopen(fd, "a", encoding="utf-8")
     except OSError as exc:
         raise RequestLockError("cannot safely open durable submission lock") from exc
+    operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        fcntl.flock(descriptor, operation)
+    except BlockingIOError:
+        try:
+            yield False
+        finally:
+            descriptor.close()
+        return
     except OSError as exc:
         try:
             descriptor.close()
@@ -328,7 +354,7 @@ def lock(cfg: HeadConfig, request_id: str) -> Iterator[None]:
             f"cannot acquire durable submission lock: {exc}"
         ) from exc
     try:
-        yield
+        yield True
     finally:
         # Closing the descriptor releases the lock even if an explicit unlock
         # fails.  A cleanup error must never turn a known submit outcome into

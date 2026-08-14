@@ -215,18 +215,25 @@ def test_laptop_query_merges_center_pages_and_scopes_refs(monkeypatch):
             "updated_at": created_at,
             "status": "running",
         }
-        return {
-            "schema_version": ps_query.SCHEMA_VERSION,
-            "summary": {
-                "total": 1,
-                "by_status": {"running": 1},
-                "by_result_state": {},
-                "by_center": {center: 1},
-                "by_node": {},
-            },
-            "page": {"eligible": 1, "returned": 1, "next_cursor": None},
-            "jobs": [row],
-        }
+        return ps_query.build_payload(
+            [row],
+            center=center,
+            status=None,
+            active_only=False,
+            issues_only=False,
+            since=None,
+            selected_fields=(
+                "display_ref",
+                "status",
+                "center",
+                "created_at",
+                "job_id",
+                "updated_at",
+            ),
+            limit=50,
+            cursor=None,
+            summary_only=False,
+        )
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(

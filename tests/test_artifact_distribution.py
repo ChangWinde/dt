@@ -1,8 +1,8 @@
+import json
+import os
 import shlex
 import subprocess
 import threading
-import json
-import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import pytest
@@ -11,18 +11,30 @@ from dt.artifact_distribution import (
     ArtifactRouteError,
     DistributionError,
     TransferExecutor,
+    _FILES_RE,
+    _TRANSFERRED_RE,
     _destination_prepare_rsync_path,
     _route_failure_kind,
+    _stat_total,
 )
 from dt.config import HeadConfig, Node, Site
-from dt.sshio import SSHWorkload
-from dt.sshio import RemoteError
+from dt.jobs import JobEntry, job_lock, save
+from dt.sshio import RemoteError, SSHWorkload
 from dt.topology_discovery import (
     ArtifactReplica,
     DirectEndpoint,
     DiscoveredRoute,
     TopologyDiscoveryError,
 )
+
+
+def test_unpinned_lan_transport_has_a_distinct_mux_namespace():
+    from dt.artifact_distribution import inner_lan_ssh
+
+    command = inner_lan_ssh(22)
+
+    assert "ControlPath=~/.ssh/dt/artifact/lan-%C" in command
+    assert "ForwardAgent=no" in command
 
 
 def _cfg(tmp_path):
@@ -66,6 +78,30 @@ def _stats(bytes_: int, files: int) -> str:
         f"Number of regular files transferred: {files}\n"
         f"Total transferred file size: {bytes_} bytes\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("pattern", "line", "expected"),
+    [
+        (
+            _TRANSFERRED_RE,
+            "Total transferred file size: 3.145.728 bytes\n",
+            3_145_728,
+        ),
+        (
+            _TRANSFERRED_RE,
+            "Total transferred file size: 9,007,199,254,740,993 bytes\n",
+            9_007_199_254_740_993,
+        ),
+        (
+            _FILES_RE,
+            "Number of regular files transferred: 12.345\n",
+            12_345,
+        ),
+    ],
+)
+def test_rsync_stats_parse_localized_integral_counts_exactly(pattern, line, expected):
+    assert _stat_total(pattern, line) == expected
 
 
 def _topology_cfg(tmp_path):
@@ -141,7 +177,7 @@ def test_cache_miss_uploads_once_then_fans_out_over_lan(tmp_path, monkeypatch):
     assert rsync_calls[0][1].startswith("psibot-hm:")
     assert rsync_calls[0][2]["timeout"] == module.BULK_TRANSFER_TIMEOUT_S
     assert any(
-        "lyf@172.16.6.91" in command and "artifact/%C" in command
+        "lyf@172.16.6.91" in command and "artifact/lan-%C" in command
         for _node, command, _kwargs in calls
     )
     assert any(
@@ -589,9 +625,16 @@ def test_site_cache_commands_reject_symlinked_mutable_leaves(tmp_path, monkeypat
     assert prepare.count("test ! -L") >= 4
     assert "mkdir -p" in prepare
     assert "chmod 700" in prepare
+    assert "-name '.partial-*'" in prepare
+    assert "-name '.corrupt-*'" in prepare
+    assert "-mtime +7" in prepare
     assert "complete.tmp-" in publish
     assert "test ! -L" in publish
     assert "mv -f" in publish
+    assert "sync -f" in publish
+    # File, staged directory, and containing cache directory are all flushed
+    # around the atomic publication boundary.
+    assert publish.count("sync -f") >= 4
 
 
 def test_remote_verifier_rejects_a_symlinked_artifact_root(tmp_path, monkeypatch):
@@ -758,12 +801,21 @@ def test_explicit_direct_fallback_reacquires_destination_lock(tmp_path, monkeypa
     assert result.queue_seconds == 0.25
 
 
-def test_route_order_prefers_measured_capacity_then_static_score():
+def test_route_order_prefers_local_then_measured_capacity_then_static_score():
     # ADR 0024: measured buckets rank first; unmeasured edges stay
     # optimistic so they get tried and learned; proven tunnel-grade sinks.
     from dt.artifact_distribution import _route_order_key
 
-    def _route(score, recorded_at, throughput_bps):
+    endpoint = DirectEndpoint(
+        destination="worker@10.0.0.2",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="configured",
+        link_cost=0.0,
+    )
+
+    def _route(score, recorded_at, throughput_bps, *, local=False):
         replica = ArtifactReplica(
             kind="peer",
             node=Node(name=f"n-{score}"),
@@ -772,7 +824,7 @@ def test_route_order_prefers_measured_capacity_then_static_score():
         )
         return DiscoveredRoute(
             replica=replica,
-            endpoint=None,
+            endpoint=None if local else endpoint,
             probe_latency_ms=1.0,
             score=score,
             throughput_bps=throughput_bps,
@@ -781,10 +833,17 @@ def test_route_order_prefers_measured_capacity_then_static_score():
     fast = _route(score=5.0, recorded_at=1.0, throughput_bps=200 * (1 << 20))
     unmeasured_cheap = _route(score=0.1, recorded_at=2.0, throughput_bps=None)
     tunnel = _route(score=0.0, recorded_at=3.0, throughput_bps=0.5 * (1 << 20))
+    local = _route(
+        score=0.0,
+        recorded_at=0.5,
+        throughput_bps=None,
+        local=True,
+    )
 
-    ordered = sorted([tunnel, unmeasured_cheap, fast], key=_route_order_key)
+    ordered = sorted([tunnel, unmeasured_cheap, fast, local], key=_route_order_key)
 
     assert [route.replica.node.name for route in ordered] == [
+        "n-0.0",
         "n-5.0",
         "n-0.1",
         "n-0.0",
@@ -824,6 +883,31 @@ def test_lan_fanout_records_a_passive_throughput_sample(tmp_path, monkeypatch):
     assert sample is not None
     assert sample.origin == "transfer"
     assert sample.smoothed_bps > (32 << 20)  # ~64 MiB in ~0.3s
+
+
+def test_same_node_fanout_refuses_a_symlinked_destination(tmp_path, monkeypatch):
+    import dt.artifact_distribution as module
+
+    cfg = _cfg(tmp_path)
+    commands = []
+
+    def succeeded(_node, _local, command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess([], 0, _stats(1, 1), "")
+
+    monkeypatch.setattr(module, "run_on", succeeded)
+
+    TransferExecutor(cfg)._fanout(
+        cfg.sites["psibot"],
+        cfg.nodes[1],
+        cfg.nodes[1],
+        "a" * 64,
+        "~/dt/worker/jobs/job/code",
+        None,
+    )
+
+    guard = 'test ! -L "$HOME"/dt/worker/jobs/job/code || exit 73'
+    assert guard in commands[0]
 
 
 def test_lan_fanout_does_not_retry_authentication_failure(tmp_path, monkeypatch):
@@ -1252,6 +1336,43 @@ def test_p2p_data_command_runs_on_source_and_forbids_proxyjump(tmp_path, monkeyp
     assert "lyf@172.16.6.91:dt/worker/jobs/new/code/" in command
 
 
+def test_same_node_p2p_refuses_a_symlinked_destination(tmp_path, monkeypatch):
+    import dt.artifact_distribution as module
+
+    cfg = _topology_cfg(tmp_path)
+    source = cfg.nodes[1]
+    replica = ArtifactReplica(
+        kind="peer",
+        node=source,
+        code_dir="~/dt/worker/jobs/prior/code",
+        recorded_at=10.0,
+    )
+    route = DiscoveredRoute(
+        replica=replica,
+        endpoint=None,
+        probe_latency_ms=0.0,
+        score=0.0,
+        throughput_bps=None,
+    )
+    commands = []
+
+    def succeeded(_node, _local, command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess([], 0, _stats(1, 1), "")
+
+    monkeypatch.setattr(module, "run_on", succeeded)
+
+    TransferExecutor(cfg)._p2p_transfer(
+        route,
+        source,
+        "~/dt/worker/jobs/new/code",
+        None,
+    )
+
+    guard = 'test ! -L "$HOME"/dt/worker/jobs/new/code || exit 73'
+    assert guard in commands[0]
+
+
 def test_p2p_destination_path_cannot_inject_source_or_receiver_shell(
     tmp_path, monkeypatch
 ):
@@ -1508,6 +1629,95 @@ def test_topology_aware_tries_next_verified_replica_after_peer_failure(
     assert result.plan.source.kind == "site-cache"
     assert result.cache_hit is True
     assert result.cross_site_bytes == 0
+    assert [attempt.event() for attempt in result.failed_attempts] == [
+        {
+            "source": cfg.nodes[1].name,
+            "destination": cfg.nodes[2].name,
+            "source_kind": "peer",
+            "failure_kind": "artifact",
+        }
+    ]
+    persisted = (
+        (cfg.control_state_dir() / "transfers" / "events.jsonl")
+        .read_text()
+        .splitlines()
+    )
+    assert json.loads(persisted[-1])["failed_attempts"] == [
+        result.failed_attempts[0].event()
+    ]
+
+
+def test_peer_transfer_retains_source_job_against_cleanup(tmp_path, monkeypatch):
+    cfg = _topology_cfg(tmp_path)
+    digest = "7" * 64
+    source_job = "source-job"
+    source_dir = "~/dt/worker/jobs/source-job"
+    save(
+        cfg,
+        JobEntry(
+            job_id=source_job,
+            name="source",
+            center=cfg.center,
+            project="p",
+            node=cfg.nodes[1].name,
+            node_local=cfg.nodes[1].local,
+            job_dir=source_dir,
+            session="dt_source",
+            cmd="true",
+            status="finished",
+            snapshot_sha256=digest,
+        ),
+    )
+    replica = ArtifactReplica(
+        kind="peer",
+        node=cfg.nodes[1],
+        code_dir=f"{source_dir}/code",
+        recorded_at=10.0,
+        job_id=source_job,
+    )
+    route = _direct_route(replica, cfg.nodes[2])
+    executor = TransferExecutor(cfg)
+    transfer_started = threading.Event()
+    release_transfer = threading.Event()
+    cleanup_locked = threading.Event()
+    monkeypatch.setattr(executor.verifier, "require", lambda *args: None)
+    monkeypatch.setattr(
+        executor.discovery,
+        "record_transfer_success",
+        lambda *_args: None,
+    )
+
+    def transfer(*_args, **_kwargs):
+        transfer_started.set()
+        assert release_transfer.wait(2)
+        return 1, 1
+
+    monkeypatch.setattr(executor, "_p2p_transfer", transfer)
+
+    def contend_for_cleanup_lock():
+        with job_lock(cfg, source_job):
+            cleanup_locked.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        moving = pool.submit(
+            executor._transfer_verified_routes,
+            [route],
+            digest,
+            cfg.nodes[2],
+            "~/dt/worker/jobs/destination/code",
+            None,
+            lambda _message: None,
+        )
+        assert transfer_started.wait(2)
+        cleanup = pool.submit(contend_for_cleanup_lock)
+        assert not cleanup_locked.wait(0.1)
+        release_transfer.set()
+        selected, moved, files, failures = moving.result(timeout=2)
+        cleanup.result(timeout=2)
+
+    assert selected == route
+    assert (moved, files, failures) == (1, 1, [])
+    assert cleanup_locked.is_set()
 
 
 def test_bulk_route_failures_open_persistent_edge_circuit(tmp_path, monkeypatch):
@@ -1699,16 +1909,18 @@ def test_verified_transfer_does_not_resend_on_verifier_transport_failure(tmp_pat
     assert modes == [False]
 
 
-def _receiver_shell_words(command: str) -> list[str]:
-    """Split the rsync remote path the way the receiving shell would."""
+def _sender_remote_path(command: str) -> str:
+    """Return the protected endpoint path passed as one rsync argv value."""
     import shlex as _shlex
 
+    assert "--protect-args" in command
+    assert "--secluded-args" not in command
     tail = command.rsplit(" -- ", 1)[1]
     source_and_target = _shlex.split(tail)
     assert len(source_and_target) == 2
     target = source_and_target[1]
     _address, _, remote_path = target.partition(":")
-    return _shlex.split(remote_path)
+    return remote_path
 
 
 def test_fanout_destination_with_spaces_survives_the_receiver_shell(
@@ -1736,7 +1948,7 @@ def test_fanout_destination_with_spaces_survives_the_receiver_shell(
     )
 
     lan_command = next(c for c in commands if "lyf@172.16.6.91" in c)
-    assert _receiver_shell_words(lan_command) == ["dt/worker/my jobs/new/code/"]
+    assert _sender_remote_path(lan_command) == "dt/worker/my jobs/new/code/"
 
 
 def test_p2p_destination_with_spaces_survives_the_receiver_shell(tmp_path, monkeypatch):
@@ -1766,7 +1978,7 @@ def test_p2p_destination_with_spaces_survives_the_receiver_shell(tmp_path, monke
         None,
     )
 
-    assert _receiver_shell_words(commands[0]) == ["dt/worker/my jobs/new/code/"]
+    assert _sender_remote_path(commands[0]) == "dt/worker/my jobs/new/code/"
 
 
 def test_destination_prepare_failure_identifies_itself(tmp_path):

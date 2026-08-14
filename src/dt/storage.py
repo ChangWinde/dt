@@ -202,8 +202,11 @@ def _node_row(
             f"if [ -d {path} ]; then "
             f"b=$(timeout 45s du -s -B1 -- {path} 2>/dev/null | "
             "awk 'NR == 1 {print $1}'); "
-            f"n=$(find {path} -mindepth 1 -maxdepth 1 -type d 2>/dev/null | "
-            "wc -l); "
+            f"if dt_found=$(find {path} -mindepth 1 -maxdepth 1 "
+            "-type d -printf 'x\\n' 2>/dev/null); then "
+            'if [ -n "$dt_found" ]; then '
+            "n=$(printf '%s\\n' \"$dt_found\" | wc -l); else n=0; fi; "
+            "else n=-1; fi; "
             "else b=0; n=0; fi; "
             f'printf \'{kind}\\t%s\\t%s\\n\' "${{b:--1}}" "$n"'
         )
@@ -249,11 +252,17 @@ def _node_row(
         base[kind] = {
             "path": paths[kind],
             "bytes": max(0, bytes_value) if bytes_value >= 0 else None,
-            "entries": max(0, entries),
+            "entries": max(0, entries) if entries >= 0 else None,
         }
-    timed_out = [kind for kind, values in parsed.items() if values[0] < 0]
-    if timed_out:
-        base["error"] = "size scan timed out: " + ", ".join(timed_out)
+    size_unknown = [kind for kind, values in parsed.items() if values[0] < 0]
+    entries_unknown = [kind for kind, values in parsed.items() if values[1] < 0]
+    errors: list[str] = []
+    if size_unknown:
+        errors.append("size scan timed out: " + ", ".join(size_unknown))
+    if entries_unknown:
+        errors.append("entry scan failed: " + ", ".join(entries_unknown))
+    if errors:
+        base["error"] = "; ".join(errors)
     return base
 
 
@@ -289,8 +298,13 @@ def inventory(
             "legacy_state": cfg.root / "state",
         }
         legacy_paths.update(_agent_state_paths(cfg.root, prefix="legacy_agent"))
+        current_paths = set(head_paths.values())
         head_paths.update(
-            {kind: path for kind, path in legacy_paths.items() if path.exists()}
+            {
+                kind: path
+                for kind, path in legacy_paths.items()
+                if path not in current_paths and path.exists()
+            }
         )
     else:
         head_paths = {
@@ -312,11 +326,7 @@ def inventory(
         # Loaded head configurations always have a node, but direct library
         # callers and migration tests can construct a head-only inventory.
         node_rows = []
-    head_bytes = sum(
-        bytes_value
-        for row in head_rows
-        if isinstance((bytes_value := row.get("bytes")), int)
-    )
+    head_bytes = deduplicated_storage_bytes(head_rows)
     total_bytes = head_bytes + sum(
         deduplicated_storage_bytes(
             [
@@ -329,7 +339,9 @@ def inventory(
         for row in node_rows
     )
     unknown_sections = [
-        f"head:{row['kind']}" for row in head_rows if row.get("bytes") is None
+        f"head:{row['kind']}"
+        for row in head_rows
+        if row.get("bytes") is None or row.get("entries") is None
     ]
     unknown_sections.extend(
         f"worker:{row['node']}:{kind}"
@@ -337,7 +349,7 @@ def inventory(
         for kind, section in row.items()
         if kind not in {"node", "error", "managed_root"}
         and isinstance(section, dict)
-        and section.get("bytes") is None
+        and (section.get("bytes") is None or section.get("entries") is None)
     )
     unknown_sections.extend(
         f"worker:{row['node']}:probe"

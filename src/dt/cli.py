@@ -42,6 +42,7 @@ from typing import (
 import typer
 from rich.markup import escape
 
+from . import custom_env as custom_env_mod
 from . import fork_repeat as fork_repeat_mod
 from . import jobs as jobs_mod
 from . import ps_query as ps_query_mod
@@ -51,6 +52,7 @@ from .config import (
     ConfigError,
     HeadConfig,
     LaptopConfig,
+    Node,
     config_path,
     head_bwlimit_kbps,
     load,
@@ -64,12 +66,19 @@ from .dispatch import (
     RequestOutcomeUnknown,
     RequestRejected,
     RunSpec,
+    preview_submission,
     reconcile_submission_request,
+    require_compatible_resident_agent,
     submit,
 )
-from .doctor import doctor_center, registry_growth_status, relay_agent_status
+from .doctor import (
+    doctor_center,
+    head_capability_checks,
+    registry_growth_status,
+    relay_agent_status,
+)
 from .forwarding import HeadCommand
-from .lifecycle import termination_probe, termination_verdict
+from .lifecycle import runtime_identity, termination_probe, termination_verdict
 from .layout import (
     ROLE_LAYOUT,
     display_node_path,
@@ -79,6 +88,7 @@ from .layout import (
     node_path_expression,
     rsync_destination,
 )
+from .monitoring import AUTOMATIC_TAIL_MAX_BYTES as AUTO_LOG_TAIL_MAX_BYTES
 from .monitoring import ResourceTelemetryQuery
 from .monitoring import parse_resource_jsonl as _parse_resource_jsonl  # noqa: F401
 from .monitoring import safe_phase_name as _safe_phase_name
@@ -100,6 +110,7 @@ from .remote import (
     forward_call,
     forward_capture_stdout,
     forward_exec,
+    remote_dt,
 )
 from .render import (
     DISK_LOW_FREE_FRACTION,
@@ -121,10 +132,10 @@ from .sshio import (
     ssh_base,
     RemoteError,
     RsyncRetryEvent,
-    remote_dt,
     rsync,
     run_on,
 )
+from .terminal import sanitize_terminal_text
 from .storage import deduplicated_storage_bytes
 from .storage import inventory as storage_inventory
 from .storage import local_tree_disk_bytes
@@ -138,6 +149,7 @@ from .submission import (
 from . import submission_intent as intent_mod
 from . import operation_log as operation_log_mod
 from .transfers import collection_parts as _collection_parts
+from .transfers import ensure_collection_root as _ensure_collection_root
 from .transfers import collection_root as _collection_root
 from .transfers import pull_job_record as _pull_job_record
 from .transfers import pull_outputs_probe_bytes as _pull_outputs_probe_bytes
@@ -332,7 +344,12 @@ def _need_head(cfg: HeadConfig | LaptopConfig) -> HeadConfig:
     return cfg
 
 
-def _find_or_die(cfg: HeadConfig, ref: str) -> jobs_mod.JobEntry:
+def _find_or_die(
+    cfg: HeadConfig,
+    ref: str,
+    *,
+    json_: bool = False,
+) -> jobs_mod.JobEntry:
     entry = jobs_mod.find(cfg, ref)
     if entry is None:
         _entry, ambiguous = jobs_mod.resolve_ref(cfg, ref)
@@ -345,13 +362,18 @@ def _find_or_die(cfg: HeadConfig, ref: str) -> jobs_mod.JobEntry:
             remainder = len(ambiguous) - min(len(ambiguous), 5)
             if remainder:
                 choices += f", +{remainder} more"
-            err.print(
-                f"[red]ambiguous job reference {escape(repr(ref))}[/red]; "
-                f"use one of: {escape(choices)}"
+            _fail_submission(
+                kind="ambiguous_reference",
+                message=(f"ambiguous job reference {ref!r}; use one of: {choices}"),
+                exit_code=EXIT_NOT_FOUND,
+                json_=json_,
             )
-            raise typer.Exit(EXIT_NOT_FOUND)
-        err.print(f"[red]no job matching {escape(repr(ref))}[/red]")
-        raise typer.Exit(EXIT_NOT_FOUND)
+        _fail_submission(
+            kind="not_found",
+            message=f"no job matching {ref!r}",
+            exit_code=EXIT_NOT_FOUND,
+            json_=json_,
+        )
     return entry
 
 
@@ -737,6 +759,9 @@ def _free_scheduler_context(
             "queue_head_gpus_requested": (
                 head.gpus_requested if head is not None else None
             ),
+            "queue_head_min_vram_mib": (
+                head.min_vram_mib if head is not None else None
+            ),
             "reserve_free_per_node": cfg.queue.reserve_free_per_node,
             "agent_alive": agent_pid is not None,
             "agent_heartbeat_stale": health["heartbeat_stale"],
@@ -757,6 +782,7 @@ def _free_scheduler_context(
             "queue_head_reason": None,
             "queue_head_pin_node": None,
             "queue_head_gpus_requested": None,
+            "queue_head_min_vram_mib": None,
             "reserve_free_per_node": None,
             "agent_alive": None,
             "agent_heartbeat_stale": None,
@@ -819,7 +845,27 @@ def _best_free_submit_node(rows: list[JsonDict]) -> object:
             ),
         )
 
-    return max(rows, key=rank).get("node")
+    eligible = [row for row in rows if not row.get("drained")]
+    if not eligible:
+        return None
+    return max(eligible, key=rank).get("node")
+
+
+def _free_gpu_meets_minimum(gpu: object, minimum_mib: int | None) -> bool:
+    """Whether one public probe row is free and satisfies a memory shape."""
+    if not isinstance(gpu, dict) or gpu.get("free") is not True:
+        return False
+    if minimum_mib is None:
+        return True
+    raw_total = gpu.get("mem_total_mib", gpu.get("mem_total"))
+    return (
+        isinstance(raw_total, (int, float))
+        and not isinstance(raw_total, bool)
+        and math.isfinite(float(raw_total))
+        and raw_total > 0
+        and int(raw_total) == raw_total
+        and raw_total >= minimum_mib
+    )
 
 
 def _public_free_rows(rows: list[JsonDict]) -> list[JsonDict]:
@@ -856,13 +902,23 @@ def _free_center_explanation(
     reachable = [row for row in rows if not row.get("error")]
     unavailable = [row for row in rows if row.get("error")]
     total = sum(len(row.get("gpus") or []) for row in reachable)
-    free_by_node = {
+    physical_free_by_node = {
         str(row.get("node")): sum(
             bool(gpu.get("free")) for gpu in row.get("gpus") or []
         )
         for row in reachable
     }
+    free_by_node = {
+        str(row.get("node")): (
+            0 if row.get("drained") else physical_free_by_node[str(row.get("node"))]
+        )
+        for row in reachable
+    }
     free_count = sum(free_by_node.values())
+    drained_nodes = [str(row.get("node")) for row in reachable if row.get("drained")]
+    drained_free_count = sum(
+        physical_free_by_node.get(node, 0) for node in drained_nodes
+    )
     gpu_inventory_errors = {
         str(row.get("node")): str(row["gpu_inventory_error"])
         for row in reachable
@@ -888,6 +944,9 @@ def _free_center_explanation(
         "free_by_node": free_by_node,
         "dt_lease_owners": lease_owners,
     }
+    if drained_nodes:
+        capacity["drained_nodes"] = drained_nodes
+        capacity["physically_free_on_drained_nodes"] = drained_free_count
     if gpu_inventory_errors:
         capacity["gpu_inventory_errors"] = gpu_inventory_errors
     result: JsonDict = {
@@ -948,6 +1007,12 @@ def _free_center_explanation(
                     best_node,
                     center=center if pin_center else None,
                 )
+            )
+        elif drained_free_count:
+            result["state"] = "idle_capacity_drained"
+            result["message"] = (
+                f"{drained_free_count} physically free GPU "
+                f"{'is' if drained_free_count == 1 else 'are'} excluded by node drain"
             )
         elif total:
             result["state"] = "idle_external_gpu_occupancy"
@@ -1149,15 +1214,44 @@ def _free_scheduler_table(
         center_rows = [row for row in rows if row.get("center") == center]
         reachable = [row for row in center_rows if not row.get("error")]
         total = sum(len(row.get("gpus") or []) for row in reachable)
-        free_count = sum(
-            1 for row in reachable for gpu in row.get("gpus") or [] if gpu.get("free")
-        )
-        free_by_node = {
+        physical_free_by_node = {
             str(row.get("node")): sum(
                 bool(gpu.get("free")) for gpu in row.get("gpus") or []
             )
             for row in reachable
         }
+        free_by_node = {
+            str(row.get("node")): (
+                0 if row.get("drained") else physical_free_by_node[str(row.get("node"))]
+            )
+            for row in reachable
+        }
+        minimum = context.get("queue_head_min_vram_mib")
+        minimum = (
+            minimum
+            if isinstance(minimum, int)
+            and not isinstance(minimum, bool)
+            and minimum > 0
+            else None
+        )
+        fitting_free_by_node = {
+            str(row.get("node")): (
+                0
+                if row.get("drained")
+                else sum(
+                    _free_gpu_meets_minimum(gpu, minimum)
+                    for gpu in row.get("gpus") or []
+                )
+            )
+            for row in reachable
+        }
+        fitting_free_count = sum(fitting_free_by_node.values())
+        free_count = sum(free_by_node.values())
+        drained_free_count = sum(
+            physical_free_by_node[str(row.get("node"))]
+            for row in reachable
+            if row.get("drained")
+        )
         lease_owners = list(
             dict.fromkeys(
                 str(gpu.get("lease_owner") or "unknown")
@@ -1198,6 +1292,11 @@ def _free_scheduler_table(
                     f" · submit: dt task {escape(str(best_node))} "
                     f"'COMMAND' -n NAME{center_suffix}"
                 )
+            elif drained_free_count:
+                action = (
+                    f"[yellow]{drained_free_count} physically free GPU "
+                    f"{'is' if drained_free_count == 1 else 'are'} drained[/yellow]"
+                )
             elif total:
                 action = "idle: no dt work queued; GPUs are occupied outside dt"
             elif gpu_inventory_errors:
@@ -1225,7 +1324,7 @@ def _free_scheduler_table(
             elif isinstance(reason, str) and "max_my_jobs=" in reason:
                 action = "[yellow]next waits for dt concurrency quota[/yellow]"
             elif isinstance(pin_node, str) and pin_node:
-                pin_free = free_by_node.get(pin_node)
+                pin_free = fitting_free_by_node.get(pin_node)
                 if pin_free is None:
                     action = (
                         f"[yellow]next waits for {escape(pin_node)}; "
@@ -1236,7 +1335,7 @@ def _free_scheduler_table(
                         f"[yellow]next is dispatching on {escape(pin_node)}[/yellow]"
                     )
                 else:
-                    elsewhere = max(0, free_count - pin_free)
+                    elsewhere = max(0, sum(fitting_free_by_node.values()) - pin_free)
                     action = (
                         f"[yellow]next needs {wanted} {gpu_word} on "
                         f"{escape(pin_node)}[/yellow]"
@@ -1252,11 +1351,15 @@ def _free_scheduler_table(
                     reserve if isinstance(reserve, int) and reserve > 0 else 0
                 )
                 effective = {
-                    node: max(0, count - reserve_count)
+                    node: (
+                        fitting_free_by_node.get(node, 0)
+                        if count - wanted >= reserve_count
+                        else 0
+                    )
                     for node, count in free_by_node.items()
                 }
                 best = max(effective.values(), default=0)
-                raw_best = max(free_by_node.values(), default=0)
+                raw_best = max(fitting_free_by_node.values(), default=0)
                 if best >= wanted:
                     action = "[yellow]next is dispatching[/yellow]"
                 elif raw_best >= wanted and reserve_count:
@@ -1266,14 +1369,22 @@ def _free_scheduler_table(
                     )
                     if explain:
                         action += f" · reserve_free_per_node={reserve_count}"
-                elif free_count:
+                elif fitting_free_count:
+                    free_label = (
+                        f"{fitting_free_count} fitting free"
+                        if minimum is not None
+                        else f"{fitting_free_count} free"
+                    )
                     action = (
                         f"[yellow]next needs {wanted} {gpu_word} together; "
-                        f"{free_count} free {'GPU is' if free_count == 1 else 'GPUs are'} "
+                        f"{free_label} "
+                        f"{'GPU is' if fitting_free_count == 1 else 'GPUs are'} "
                         "split across nodes[/yellow]"
                     )
                 else:
                     action = f"next needs {wanted} {gpu_word} capacity"
+            if minimum is not None:
+                action += f" · ≥{minimum:,} MiB/GPU"
         else:
             running_nodes = context.get("running_nodes")
             successor_node = "NODE"
@@ -1561,6 +1672,19 @@ def _captured_submission_identity(
     return None, None
 
 
+def _read_custom_env_envelope() -> dict[str, str]:
+    """Read one bounded binary environment envelope from standard input."""
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    raw = stream.read(custom_env_mod.MAX_CUSTOM_ENV_TOTAL_BYTES + 1)
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+    if len(raw) > custom_env_mod.MAX_CUSTOM_ENV_TOTAL_BYTES:
+        raise custom_env_mod.CustomEnvironmentError(
+            "custom environment envelope exceeds 64 KiB"
+        )
+    return custom_env_mod.decode_nul_pairs(raw)
+
+
 def _forward_laptop_submission(
     head: str,
     argv: list[str],
@@ -1569,6 +1693,7 @@ def _forward_laptop_submission(
     recovery_label: str,
     json_: bool,
     request_id: str | None = None,
+    stdin_bytes: bytes | None = None,
 ) -> tuple[int, str | None]:
     """Forward one submission without ever retrying an ambiguous mutation."""
     recovery_action = (
@@ -1588,12 +1713,21 @@ def _forward_laptop_submission(
         f"{action} submission interrupted; outcome unknown. {recovery_action}."
     )
     try:
-        rc, captured = forward_capture_stdout(
-            head,
-            argv,
-            tty=False,
-            emit_stdout=False,
-        )
+        if stdin_bytes is None:
+            rc, captured = forward_capture_stdout(
+                head,
+                argv,
+                tty=False,
+                emit_stdout=False,
+            )
+        else:
+            rc, captured = forward_capture_stdout(
+                head,
+                argv,
+                tty=False,
+                emit_stdout=False,
+                stdin_bytes=stdin_bytes,
+            )
     except KeyboardInterrupt:
         _fail_submission(
             kind="submission_unknown",
@@ -1654,6 +1788,7 @@ def _validate_submission_resources(
     *,
     gpus: int,
     max_hours: float | None,
+    min_vram_mib: int | None = None,
     max_vram_mib: int | None = None,
     max_job_memory_mib: int | None = None,
     require_disk_gib: int | None = None,
@@ -1665,6 +1800,7 @@ def _validate_submission_resources(
         validate_resources(
             gpus=gpus,
             max_hours=max_hours,
+            min_vram_mib=min_vram_mib,
             max_vram_mib=max_vram_mib,
             max_job_memory_mib=max_job_memory_mib,
             require_disk_gib=require_disk_gib,
@@ -1748,16 +1884,18 @@ def _read_failed_start_log(
         proc = run_on(
             entry.node,
             entry.node_local,
-            f"tail -n {lines} -- {node_path_expression(path)}",
+            f"test -r {node_path_expression(path)} && "
+            f"tail -c {AUTO_LOG_TAIL_MAX_BYTES} -- {node_path_expression(path)} | "
+            f"tail -n {lines}",
             timeout=30,
         )
     except Exception as exc:
-        result["error"] = str(exc)
+        result["error"] = _bounded_log_error(exc)
         return result
     result["tail"] = _sanitize_log_text(proc.stdout or "")
     if proc.returncode != 0:
         detail = proc.stderr or proc.stdout or f"log read exited {proc.returncode}"
-        result["error"] = " ".join(_sanitize_log_text(detail).split())
+        result["error"] = _bounded_log_error(detail)
     return result
 
 
@@ -1836,6 +1974,7 @@ def _submit_entry(
     *,
     no_queue: bool,
     json_: bool = False,
+    claimed_action: Callable[[], None] | None = None,
 ) -> tuple[jobs_mod.JobEntry, bool | None]:
     """Shared head-side submission path for `run` and the compact `task` UX."""
 
@@ -1843,7 +1982,25 @@ def _submit_entry(
         err.print(f"[dim]{escape(msg)}[/dim]")
 
     try:
-        entry = submit(cfg, spec, Path.cwd(), log, no_queue=no_queue)
+        if claimed_action is None:
+            entry = submit(cfg, spec, Path.cwd(), log, no_queue=no_queue)
+        else:
+            entry = submit(
+                cfg,
+                spec,
+                Path.cwd(),
+                log,
+                no_queue=no_queue,
+                claimed_action=claimed_action,
+            )
+    except _OperationFailure as exc:
+        _fail_submission(
+            kind=exc.kind,
+            message=exc.message,
+            reasons=exc.reasons,
+            exit_code=exc.exit_code,
+            json_=json_,
+        )
     except FailedBeforeStart as e:
         failure_log = _maybe_read_failed_start_log(e.entry)
         _emit_failed_start(
@@ -2010,6 +2167,8 @@ def _submission_payload(
         payload["require_disk_gib"] = entry.require_disk_gib
     if entry.max_hours is not None:
         payload["max_hours"] = entry.max_hours
+    if entry.min_vram_mib is not None:
+        payload["min_vram_mib"] = entry.min_vram_mib
     if entry.max_vram_mib is not None:
         payload["max_vram_mib"] = entry.max_vram_mib
     if entry.max_job_memory_mib is not None:
@@ -2028,12 +2187,15 @@ def _submission_payload(
     if entry.request_id:
         payload["request_id"] = entry.request_id
         payload["idempotent_replay"] = bool(getattr(entry, "_request_replayed", False))
-    if entry.env_hash or entry.env_mode or entry.env_source_job:
-        payload["environment"] = {
+    if entry.env_hash or entry.env_mode or entry.env_source_job or entry.custom_env:
+        environment_payload: JsonDict = {
             "mode": entry.env_mode or "sync",
             "identity": entry.env_hash,
             "source_job_id": entry.env_source_job,
         }
+        if entry.custom_env:
+            environment_payload["variables"] = sorted(entry.custom_env)
+        payload["environment"] = environment_payload
     result_state = jobs_mod.effective_result_state(entry)
     if result_state is not None:
         payload["result_state"] = result_state
@@ -2089,7 +2251,10 @@ def _emit_submission(
     from rich.markup import escape
 
     if json_:
-        print(json.dumps(_submission_payload(entry, **(payload_extra or {}))))
+        extra = dict(payload_extra or {})
+        if agent_started is not None:
+            extra["agent_started"] = agent_started
+        print(json.dumps(_submission_payload(entry, **extra)))
         return
     display_ref = _display_ref_for_entry(cfg, entry)
     name = escape(entry.name)
@@ -2208,6 +2373,12 @@ def run(
         help="kill the job group after N hours",
         rich_help_panel="Scheduling & safety",
     ),
+    min_vram_mib: Optional[int] = typer.Option(
+        None,
+        "--min-vram-mib",
+        help="require at least N MiB total memory on every allocated GPU",
+        rich_help_panel="Scheduling & safety",
+    ),
     max_vram_mib: Optional[int] = typer.Option(
         None,
         "--max-vram-mib",
@@ -2265,10 +2436,27 @@ def run(
         help="retry-safe caller identity; reuse returns the original job",
         rich_help_panel="Reproducibility",
     ),
+    environment: Optional[list[str]] = typer.Option(
+        None,
+        "--env",
+        help="import one private job variable by name (repeatable)",
+        rich_help_panel="Reproducibility",
+    ),
+    environment_stdin: bool = typer.Option(
+        False,
+        "--env-envelope-stdin",
+        hidden=True,
+    ),
     no_queue: bool = typer.Option(
         False,
         "--no-queue",
         help="fail fast (exit 2) instead of queueing when no card is free",
+        rich_help_panel="Scheduling & safety",
+    ),
+    plan: bool = typer.Option(
+        False,
+        "--plan",
+        help="preview placement, snapshot bytes, and environment cache without submitting",
         rich_help_panel="Scheduling & safety",
     ),
     follow: bool = typer.Option(
@@ -2296,6 +2484,22 @@ def run(
     cmd = list(ctx.args)
     artifacts = artifact or []
     result_states = when_result or []
+    try:
+        if environment_stdin:
+            if environment:
+                raise custom_env_mod.CustomEnvironmentError(
+                    "--env cannot be combined with the private stdin envelope"
+                )
+            custom_env = _read_custom_env_envelope()
+        else:
+            custom_env = custom_env_mod.parse(environment or [])
+    except custom_env_mod.CustomEnvironmentError as exc:
+        _fail_submission(
+            kind="invalid_argument",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
     while cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd or not any(part.strip() for part in cmd):
@@ -2323,6 +2527,7 @@ def run(
     _validate_submission_resources(
         gpus=gpus,
         max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
         max_vram_mib=max_vram_mib,
         max_job_memory_mib=max_job_memory_mib,
         require_disk_gib=require_disk_gib,
@@ -2330,9 +2535,21 @@ def run(
         json_=json_,
     )
     _validate_submission_request_id(request_id, json_=json_)
+    if plan and follow:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--plan cannot be combined with --follow",
+            exit_code=1,
+            json_=json_,
+        )
 
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
+        env_envelope = (
+            custom_env_mod.encode_nul_pairs(custom_env).encode("utf-8")
+            if custom_env
+            else None
+        )
         if center == "auto":
             if request_id:
                 # Retry-safe submission stores its receipt on one chosen head.
@@ -2358,12 +2575,15 @@ def run(
             from .remote import best_center
 
             with err.status("probing all centers..."):
-                raw_rows, errors = fan_json(cfg, ["free"])
+                raw_rows, errors = fan_json(cfg, ["free", "--scheduler-context"])
                 rows = cast(list[JsonDict], raw_rows)
             picked = best_center(
                 rows,
                 gpus,
                 require_disk_gib=require_disk_gib or 0,
+                min_vram_mib=min_vram_mib,
+                node=node,
+                require_scheduling_contract=True,
             )
             if picked is None:
                 if errors:
@@ -2402,6 +2622,7 @@ def run(
             .option("--require-path", require_path or None)
             .option("--require-disk-gib", require_disk_gib)
             .option("--max-hours", max_hours)
+            .option("--min-vram-mib", min_vram_mib)
             .option("--max-vram-mib", max_vram_mib)
             .option("--max-job-memory-mib", max_job_memory_mib)
             .option("--artifact-manifest", artifact_manifest or None)
@@ -2411,10 +2632,24 @@ def run(
             .option("--after-result", after_result or None)
             .repeat("--when-result", result_states)
             .option("--request-id", request_id or None)
+            .flag("--env-envelope-stdin", env_envelope is not None)
             .flag("--no-queue", no_queue)
+            .flag("--plan", plan)
             .flag("--json", json_)
             .passthrough(cmd)
         )
+        if plan:
+            if env_envelope is None:
+                rc = forward_call(route.head, route.argv())
+            else:
+                rc, _captured = forward_capture_stdout(
+                    route.head,
+                    route.argv(),
+                    tty=False,
+                    emit_stdout=True,
+                    stdin_bytes=env_envelope,
+                )
+            raise typer.Exit(rc)
         rc = _forward_submission_workflow(
             route.head,
             route.argv(),
@@ -2425,6 +2660,7 @@ def run(
             lines=lines,
             json_=json_,
             request_id=request_id,
+            stdin_bytes=env_envelope,
         )
         raise typer.Exit(rc)
 
@@ -2437,6 +2673,7 @@ def run(
         require_path=require_path,
         require_disk_gib=require_disk_gib,
         max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
         max_vram_mib=max_vram_mib,
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
@@ -2445,7 +2682,93 @@ def run(
         after_result=after_result,
         after_result_states=tuple(result_states),
         request_id=request_id,
+        custom_env=tuple(custom_env.items()),
     )
+    if plan:
+        node = request.node
+        after_success_id = None
+        if request.after_success:
+            after_success_id, node = _resolve_submission_dependency(
+                cfg,
+                request.after_success,
+                requested_node=node,
+                json_=json_,
+            )
+        after_complete_id = None
+        if request.after_complete:
+            after_complete_id = _resolve_completion_dependency(
+                cfg,
+                request.after_complete,
+                json_=json_,
+            )
+        after_result_id = None
+        if request.after_result:
+            after_result_id = _resolve_completion_dependency(
+                cfg,
+                request.after_result,
+                json_=json_,
+            )
+        resolved = request.resolved(
+            node=node,
+            project=request.project,
+            artifact_manifest=request.artifact_manifest,
+            after_success=after_success_id,
+            after_complete=after_complete_id,
+            after_result=after_result_id,
+        )
+        try:
+            payload = preview_submission(
+                cfg,
+                resolved.to_run_spec(),
+                Path.cwd(),
+                no_queue=no_queue,
+            )
+        except (DispatchError, ConfigError) as exc:
+            _fail_submission(
+                kind="plan_failed",
+                message=str(exc),
+                exit_code=EXIT_ENV,
+                json_=json_,
+            )
+        payload["artifacts"] = {
+            "requested": list(artifacts),
+            "sync_required": bool(artifacts),
+            "manifest": artifact_manifest,
+        }
+        if custom_env:
+            environment_row = cast(
+                JsonDict,
+                payload.setdefault("environment", {}),
+            )
+            environment_row["variables"] = sorted(custom_env)
+        if json_:
+            print(json.dumps(payload))
+        else:
+            placement = cast(JsonDict, payload["placement"])
+            outcome = str(placement.get("outcome") or "unknown")
+            selected = placement.get("selected_node")
+            gpus_preview = placement.get("selected_gpus") or []
+            target = (
+                f"{selected} · GPU {','.join(map(str, gpus_preview)) or 'cpu'}"
+                if selected
+                else str(placement.get("reason") or "placement unresolved")
+            )
+            out.print(f"[bold]plan[/bold] {escape(outcome)} · {escape(target)}")
+            snapshot_row = cast(JsonDict, payload["snapshot"])
+            out.print(
+                f"snapshot {_format_transfer_bytes(snapshot_row['source_bytes'])} · "
+                "no state written"
+            )
+            environment_row = cast(JsonDict, payload["environment"])
+            out.print(
+                f"environment {escape(str(environment_row.get('status')))}"
+                + (
+                    f" · {escape(str(environment_row.get('identity')))}"
+                    if environment_row.get("identity")
+                    else ""
+                )
+            )
+        return
     entry, agent_started, artifact_sync = _submit_request(
         cfg,
         request,
@@ -2542,6 +2865,7 @@ def _sync_task_artifacts_raw(
     server: str,
     project: str | None,
     artifacts: list[str],
+    expected_manifest_sha256: str | None = None,
 ) -> tuple[str, str, JsonDict]:
     """Sync explicit inputs to one task node and return its immutable binding."""
     from rich.markup import escape
@@ -2581,6 +2905,7 @@ def _sync_task_artifacts_raw(
                 "artifact-sync",
                 retry_events,
             ),
+            expected_manifest_sha256=expected_manifest_sha256,
         )
     except RemoteError as exc:
         unreachable = (
@@ -2630,34 +2955,6 @@ def _emit_task_artifact_sync_success(
     )
 
 
-def _sync_task_artifacts(
-    cfg: HeadConfig,
-    *,
-    server: str,
-    project: str | None,
-    artifacts: list[str],
-    json_: bool,
-) -> tuple[str, str, JsonDict]:
-    try:
-        result = _sync_task_artifacts_raw(
-            cfg,
-            server=server,
-            project=project,
-            artifacts=artifacts,
-        )
-    except _OperationFailure as exc:
-        _fail_submission(
-            kind=exc.kind,
-            message=exc.message,
-            reasons=exc.reasons,
-            exit_code=exc.exit_code,
-            json_=json_,
-        )
-    if not json_:
-        _emit_task_artifact_sync_success(server, result[1], result[2])
-    return result
-
-
 def _submit_request(
     cfg: HeadConfig,
     request: SubmissionRequest,
@@ -2694,6 +2991,8 @@ def _submit_request(
     project = request.project
     artifact_manifest = request.artifact_manifest
     artifact_sync: JsonDict | None = None
+    artifact_node: str | None = None
+    claimed_action: Callable[[], None] | None = None
     if artifacts:
         if node is None:
             _fail_submission(
@@ -2705,13 +3004,43 @@ def _submit_request(
                 exit_code=1,
                 json_=json_,
             )
-        project, artifact_manifest, artifact_sync = _sync_task_artifacts(
-            cfg,
-            server=node,
-            project=project,
-            artifacts=artifacts,
-            json_=json_,
-        )
+        artifact_node = node
+        from .dispatch import artifact_manifest_identity, resolve_project
+
+        try:
+            project, project_cfg = resolve_project(cfg, project, Path.cwd())
+            artifact_manifest = artifact_manifest_identity(
+                project,
+                project_cfg.path,
+                artifacts,
+            )
+        except (ConfigError, DispatchError) as exc:
+            _fail_submission(
+                kind="artifact_sync_failed",
+                message=str(exc),
+                exit_code=1,
+                json_=json_,
+            )
+
+        def publish_artifacts() -> None:
+            nonlocal artifact_sync
+            synced_project, synced_manifest, row = _sync_task_artifacts_raw(
+                cfg,
+                server=artifact_node,
+                project=project,
+                artifacts=artifacts,
+                expected_manifest_sha256=artifact_manifest,
+            )
+            if synced_project != project or synced_manifest != artifact_manifest:
+                raise _OperationFailure(
+                    "artifact_sync_failed",
+                    "artifact sync returned an identity different from the "
+                    "claimed submission intent",
+                    1,
+                )
+            artifact_sync = row
+
+        claimed_action = publish_artifacts
 
     resolved = request.resolved(
         node=node,
@@ -2726,7 +3055,16 @@ def _submit_request(
         resolved.to_run_spec(),
         no_queue=no_queue,
         json_=json_,
+        claimed_action=claimed_action,
     )
+    if artifact_sync is not None and not json_:
+        if artifact_node is None or artifact_manifest is None:
+            raise RuntimeError("artifact sync completed without a bound identity")
+        _emit_task_artifact_sync_success(
+            artifact_node,
+            artifact_manifest,
+            artifact_sync,
+        )
     return entry, agent_started, artifact_sync
 
 
@@ -2759,6 +3097,7 @@ def _forward_submission_workflow(
     lines: int,
     json_: bool,
     request_id: str | None = None,
+    stdin_bytes: bytes | None = None,
 ) -> int:
     """Submit exactly once from a laptop and optionally follow by job identity."""
     rc, job_id = _forward_laptop_submission(
@@ -2768,6 +3107,7 @@ def _forward_submission_workflow(
         recovery_label=recovery_label,
         json_=json_,
         request_id=request_id,
+        stdin_bytes=stdin_bytes,
     )
     if rc != 0 or not follow:
         return rc
@@ -2852,6 +3192,11 @@ def task(
         help="minimum free space needed on the job filesystem (GiB)",
     ),
     max_hours: Optional[float] = typer.Option(None, "--max-hours"),
+    min_vram_mib: Optional[int] = typer.Option(
+        None,
+        "--min-vram-mib",
+        help="require at least N MiB total memory on every allocated GPU",
+    ),
     max_vram_mib: Optional[int] = typer.Option(
         None,
         "--max-vram-mib",
@@ -2947,6 +3292,7 @@ def task(
     _validate_submission_resources(
         gpus=gpus,
         max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
         max_vram_mib=max_vram_mib,
         max_job_memory_mib=max_job_memory_mib,
         require_disk_gib=require_disk_gib,
@@ -2959,13 +3305,14 @@ def task(
     picked_name = name or _derived_task_name(command)
     if isinstance(cfg, LaptopConfig):
         route = (
-            _head_command(cfg, center, "task", server, command)
+            _head_command(cfg, center, "task")
             .option("-g", gpus)
             .option("-n", picked_name)
             .option("-p", project or None)
             .option("--require-path", require_path or None)
             .option("--require-disk-gib", require_disk_gib)
             .option("--max-hours", max_hours)
+            .option("--min-vram-mib", min_vram_mib)
             .option("--max-vram-mib", max_vram_mib)
             .option("--max-job-memory-mib", max_job_memory_mib)
             .option("--artifact-manifest", artifact_manifest or None)
@@ -2977,6 +3324,7 @@ def task(
             .option("--request-id", request_id or None)
             .flag("--no-queue", no_queue)
             .flag("--json", json_)
+            .passthrough([server, command])
         )
         rc = _forward_submission_workflow(
             route.head,
@@ -3000,6 +3348,7 @@ def task(
         require_path=require_path,
         require_disk_gib=require_disk_gib,
         max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
         max_vram_mib=max_vram_mib,
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
@@ -3330,6 +3679,14 @@ def _batch_receipt(
         receipt["next_commands"] = next_commands
     if artifact_manifest:
         receipt["artifact_manifest"] = artifact_manifest
+    requested_min_vram = {
+        entry.min_vram_mib for entry in entries if entry.min_vram_mib is not None
+    }
+    if len(requested_min_vram) == 1:
+        # A chain may start with a CPU stage and use GPUs later. The group
+        # receipt describes the GPU-stage contract even when entry 0 has no
+        # GPU shape requirement; per-job rows remain authoritative.
+        receipt["min_vram_mib"] = requested_min_vram.pop()
     if entries and entries[0].max_vram_mib is not None:
         receipt["max_vram_mib"] = entries[0].max_vram_mib
     if entries and entries[0].max_job_memory_mib is not None:
@@ -3517,6 +3874,11 @@ def _inventory_command(
         help="minimum free space needed by every item (GiB)",
     ),
     max_hours: Optional[float] = typer.Option(None, "--max-hours"),
+    min_vram_mib: Optional[int] = typer.Option(
+        None,
+        "--min-vram-mib",
+        help="minimum total memory required on every allocated GPU (MiB)",
+    ),
     max_vram_mib: Optional[int] = typer.Option(
         None,
         "--max-vram-mib",
@@ -3603,6 +3965,7 @@ def _inventory_command(
     _validate_submission_resources(
         gpus=max(requested_gpus),
         max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
         max_vram_mib=max_vram_mib,
         max_job_memory_mib=max_job_memory_mib,
         require_disk_gib=require_disk_gib,
@@ -3628,6 +3991,7 @@ def _inventory_command(
             .option("--require-path", require_path or None)
             .option("--require-disk-gib", require_disk_gib)
             .option("--max-hours", max_hours)
+            .option("--min-vram-mib", min_vram_mib)
             .option("--max-vram-mib", max_vram_mib)
             .option("--max-job-memory-mib", max_job_memory_mib)
             .option("--artifact-manifest", artifact_manifest or None)
@@ -3647,17 +4011,57 @@ def _inventory_command(
             )
         )
 
+    try:
+        require_compatible_resident_agent(cfg)
+    except ConfigError as exc:
+        _fail_submission(
+            kind="agent_incompatible",
+            message=str(exc),
+            exit_code=EXIT_ENV,
+            json_=json_,
+        )
+
     artifact_sync: JsonDict | None = None
+    artifact_action: Callable[[], None] | None = None
     failure: JsonDict | None = None
     failure_code = 0
     if artifacts:
         try:
-            project, artifact_manifest, artifact_sync = _sync_task_artifacts_raw(
-                cfg,
-                server=server,
-                project=project,
-                artifacts=artifacts,
+            from .dispatch import artifact_manifest_identity, resolve_project
+
+            project, project_cfg = resolve_project(cfg, project, Path.cwd())
+            artifact_manifest = artifact_manifest_identity(
+                project,
+                project_cfg.path,
+                artifacts,
             )
+        except (ConfigError, DispatchError) as exc:
+            failure, failure_code, _entry = _batch_error(exc)
+        else:
+
+            def publish_artifacts() -> None:
+                nonlocal artifact_sync
+                synced_project, synced_manifest, row = _sync_task_artifacts_raw(
+                    cfg,
+                    server=server,
+                    project=project,
+                    artifacts=artifacts,
+                    expected_manifest_sha256=artifact_manifest,
+                )
+                if synced_project != project or synced_manifest != artifact_manifest:
+                    raise _OperationFailure(
+                        "artifact_sync_failed",
+                        "artifact sync returned an identity different from the "
+                        "claimed group intent",
+                        1,
+                    )
+                artifact_sync = row
+
+            artifact_action = publish_artifacts
+
+    if request_id is None and artifact_action is not None and failure is None:
+        try:
+            artifact_action()
         except _OperationFailure as exc:
             failure, failure_code, _entry = _batch_error(exc)
         except KeyboardInterrupt:
@@ -3665,16 +4069,19 @@ def _inventory_command(
                 "kind": f"{policy.command}_artifact_sync_interrupted",
                 "message": (
                     f"{policy.command} artifact sync interrupted before job "
-                    "submission; "
-                    f"no jobs were registered. Rerun the same {policy.command} "
-                    "to resume the partial transfer."
+                    "submission; no jobs were registered. Rerun the same "
+                    f"{policy.command} to resume the partial transfer."
                 ),
                 "reasons": {},
                 "exit_code": 130,
             }
             failure_code = 130
         else:
-            if not json_:
+            if (
+                not json_
+                and artifact_sync is not None
+                and artifact_manifest is not None
+            ):
                 _emit_task_artifact_sync_success(
                     server,
                     artifact_manifest,
@@ -3699,6 +4106,7 @@ def _inventory_command(
                 "require_path": require_path,
                 "require_disk_gib": require_disk_gib,
                 "max_hours": max_hours,
+                "min_vram_mib": min_vram_mib,
                 "max_vram_mib": max_vram_mib,
                 "max_job_memory_mib": max_job_memory_mib,
                 "artifact_manifest": artifact_manifest,
@@ -3711,12 +4119,38 @@ def _inventory_command(
                 group_intent_sha256,
                 operation=policy.command,
                 requested=len(items),
+                claimed_action=artifact_action,
             )
+            if (
+                artifact_sync is not None
+                and artifact_manifest is not None
+                and not json_
+            ):
+                _emit_task_artifact_sync_success(
+                    server,
+                    artifact_manifest,
+                    artifact_sync,
+                )
             entries = group_mod.load_entries_or_fail(cfg, group_record)
             if group_record.state == "confirmed":
                 group_terminal_replay = True
                 failure = _group_failure(group_record)
                 failure_code = group_record.exit_code or 0
+        except _OperationFailure as exc:
+            failure, failure_code, _entry = _batch_error(exc)
+        except KeyboardInterrupt:
+            failure = {
+                "kind": f"{policy.command}_artifact_sync_interrupted",
+                "message": (
+                    f"{policy.command} artifact sync interrupted before job "
+                    "submission; no jobs were registered. The request was "
+                    "durably rejected; inspect the partial transfer and use "
+                    "a new request id to try again."
+                ),
+                "reasons": {"request_id": request_id},
+                "exit_code": 130,
+            }
+            failure_code = 130
         except group_mod.GroupRequestConflict as exc:
             failure = {
                 "kind": "idempotency_conflict",
@@ -3725,6 +4159,28 @@ def _inventory_command(
                 "exit_code": 1,
             }
             failure_code = 1
+        except group_mod.GroupRequestRejected as exc:
+            group_record = exc.record
+            if group_record is not None:
+                failure = _group_failure(group_record)
+                failure_code = int(failure["exit_code"]) if failure is not None else 1
+            else:
+                failure = {
+                    "kind": "submission_rejected",
+                    "message": str(exc),
+                    "reasons": {"request_id": request_id},
+                    "exit_code": EXIT_ENV,
+                }
+                failure_code = EXIT_ENV
+        except group_mod.GroupRequestOutcomeUnknown as exc:
+            group_record = exc.record
+            failure = {
+                "kind": "submission_unknown",
+                "message": str(exc),
+                "reasons": {"request_id": request_id},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
         except intent_mod.RequestLockError as exc:
             failure = {
                 "kind": "submission_rejected",
@@ -3805,6 +4261,7 @@ def _inventory_command(
             require_path=require_path,
             require_disk_gib=require_disk_gib,
             max_hours=max_hours,
+            min_vram_mib=min_vram_mib if first_gpus > 0 else None,
             max_vram_mib=max_vram_mib if first_gpus > 0 else None,
             max_job_memory_mib=max_job_memory_mib,
             artifact_manifest=artifact_manifest,
@@ -3890,6 +4347,7 @@ def _inventory_command(
                         require_path=require_path,
                         require_disk_gib=require_disk_gib,
                         max_hours=max_hours,
+                        min_vram_mib=(min_vram_mib if item_gpus > 0 else None),
                         max_vram_mib=max_vram_mib if item_gpus > 0 else None,
                         max_job_memory_mib=max_job_memory_mib,
                         artifact_manifest=artifact_manifest,
@@ -3909,6 +4367,7 @@ def _inventory_command(
                         cmd=["bash", "-c", command],
                     )
                     spec.gpus = item_gpus
+                    spec.min_vram_mib = min_vram_mib if item_gpus > 0 else None
                     spec.max_vram_mib = max_vram_mib if item_gpus > 0 else None
                     spec.request_id = (
                         group_mod.item_request_id(request_id, index)
@@ -4032,6 +4491,7 @@ def _inventory_command(
         and group_record is not None
         and group_intent_sha256 is not None
         and not group_terminal_replay
+        and group_record.state != "rejected"
     ):
         uncertain = bool(
             failure
@@ -4143,6 +4603,12 @@ def batch(
     max_hours: Optional[float] = typer.Option(
         None, "--max-hours", rich_help_panel="Resources & safety"
     ),
+    min_vram_mib: Optional[int] = typer.Option(
+        None,
+        "--min-vram-mib",
+        help="minimum total memory required on every allocated GPU (MiB)",
+        rich_help_panel="Resources & safety",
+    ),
     max_vram_mib: Optional[int] = typer.Option(
         None,
         "--max-vram-mib",
@@ -4188,6 +4654,7 @@ def batch(
         require_path=require_path,
         require_disk_gib=require_disk_gib,
         max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
         max_vram_mib=max_vram_mib,
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
@@ -4249,6 +4716,12 @@ def chain(
     max_hours: Optional[float] = typer.Option(
         None, "--max-hours", rich_help_panel="Resources & safety"
     ),
+    min_vram_mib: Optional[int] = typer.Option(
+        None,
+        "--min-vram-mib",
+        help="minimum total memory required on every allocated GPU (MiB)",
+        rich_help_panel="Resources & safety",
+    ),
     max_vram_mib: Optional[int] = typer.Option(
         None,
         "--max-vram-mib",
@@ -4295,6 +4768,7 @@ def chain(
         require_path=require_path,
         require_disk_gib=require_disk_gib,
         max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
         max_vram_mib=max_vram_mib,
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
@@ -4769,7 +5243,7 @@ def _gather_ps_rows(
     rows = []
     for entry in entries:
         row = {
-            **asdict(entry),
+            **jobs_mod.public_job_record(entry),
             "display_ref": display_refs[entry.job_id],
         }
         row["result_state"] = jobs_mod.effective_result_state(entry)
@@ -4959,6 +5433,10 @@ def _legacy_ps_query_rows(
     for row in rows:
         row.setdefault("center", center)
         row.setdefault("updated_at", row.get("created_at"))
+        # Pre-query heads may not yet expose compact display references. The
+        # laptop scopes them again after merge; a temporary full id keeps the
+        # v1 projected row typed without inventing an ambiguous short ref.
+        row.setdefault("display_ref", row.get("job_id"))
         row["result_state"] = ps_query_mod.effective_result_state(row)
     if status is not None:
         rows = [row for row in rows if row.get("status") == status]
@@ -4999,11 +5477,42 @@ def _gather_laptop_ps_query(
     )
     data_by_center, fan_errors = fan_json_by_center(cfg, remote_argv)
 
+    expected_query = ps_query_mod.query_contract(
+        status=status,
+        active_only=active_only,
+        issues_only=issues_only,
+        since=since,
+        selected_fields=internal_fields,
+        limit=None if summary_only else limit,
+        cursor=cursor,
+        summary_only=summary_only,
+    )
+    invalid_contract_centers: list[str] = []
+    for center, payload in list(data_by_center.items()):
+        try:
+            ps_query_mod.validate_payload_contract(
+                payload,
+                center=center,
+                expected_query=expected_query,
+                expected_fields=internal_fields,
+                expected_cursor=cursor,
+            )
+        except ps_query_mod.QueryError as exc:
+            data_by_center.pop(center, None)
+            fan_errors[center] = str(exc)
+            invalid_contract_centers.append(center)
+
     fallback_centers = [
         center
         for center, message in fan_errors.items()
         if ps_query_mod.unsupported_remote_query(message)
     ]
+    if since is None:
+        fallback_centers.extend(
+            center
+            for center in invalid_contract_centers
+            if center not in fallback_centers
+        )
     if fallback_centers and since is None:
         fallback_cfg = LaptopConfig(
             centers={center: cfg.centers[center] for center in fallback_centers},
@@ -5059,37 +5568,42 @@ def _gather_laptop_ps_query(
 
     summaries: list[JsonDict] = []
     candidates: list[JsonDict] = []
+    partial_errors: dict[str, str] = {}
     eligible = 0
     for center in cfg.centers:
         payload = data_by_center.get(center)
         if payload is None:
             continue
-        if not isinstance(payload, dict) or payload.get("schema_version") != (
-            ps_query_mod.SCHEMA_VERSION
-        ):
-            fan_errors[center] = "invalid ps query object from head"
+        try:
+            payload = ps_query_mod.validate_payload_contract(
+                payload,
+                center=center,
+                expected_query=expected_query,
+                expected_fields=internal_fields,
+                expected_cursor=cursor,
+            )
+        except ps_query_mod.QueryError as exc:
+            fan_errors[center] = str(exc)
             continue
         summary = payload.get("summary")
         page = payload.get("page")
         jobs = payload.get("jobs")
-        if (
-            not isinstance(summary, dict)
-            or not isinstance(page, dict)
-            or not isinstance(jobs, list)
-            or not all(isinstance(row, dict) for row in jobs)
-            or not isinstance(page.get("eligible"), int)
-            or isinstance(page.get("eligible"), bool)
-            or int(page["eligible"]) < len(jobs)
-        ):
-            fan_errors[center] = "invalid ps query contract from head"
-            continue
+        assert isinstance(summary, dict)
+        assert isinstance(page, dict)
+        assert isinstance(jobs, list)
         typed_jobs = cast(list[JsonDict], jobs)
-        if any(row.get("center") != center for row in typed_jobs):
-            fan_errors[center] = "ps query rows have the wrong owning center"
-            continue
         summaries.append(cast(JsonDict, summary))
         candidates.extend(typed_jobs)
         eligible += int(page["eligible"])
+        head_errors = payload["errors"]
+        assert isinstance(head_errors, dict)
+        partial_errors.update(
+            {
+                f"{center}:{key}": value
+                for key, value in head_errors.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+        )
 
     try:
         merged_summary = ps_query_mod.merge_summaries(summaries)
@@ -5118,7 +5632,7 @@ def _gather_laptop_ps_query(
             digest=digest,
             order=order,
         )
-    failures = dict(fan_errors)
+    failures = ps_query_mod.bounded_errors({**partial_errors, **fan_errors})
     payload = {
         "schema_version": ps_query_mod.SCHEMA_VERSION,
         "generated_at": time.time(),
@@ -5240,7 +5754,7 @@ def _ps_view(
     caption += f" · refresh {poll:g}s · Ctrl-C stop"
     if errors:
         detail = "; ".join(f"{center}: {message}" for center, message in errors.items())
-        caption += f" · [yellow]{detail}[/yellow]"
+        caption += f" · [yellow]{escape(detail)}[/yellow]"
     return ps_table(
         visible,
         wide=wide,
@@ -5406,6 +5920,16 @@ def ps(
             exit_code=1,
             json_=json_,
         )
+    if status is not None and status not in jobs_mod.JOB_STATUSES:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"unknown --status {status!r}; expected one of "
+                + ", ".join(sorted(jobs_mod.JOB_STATUSES))
+            ),
+            exit_code=1,
+            json_=json_,
+        )
     if limit is not None and limit <= 0:
         _fail_submission(
             kind="invalid_argument",
@@ -5478,6 +6002,15 @@ def ps(
                 exit_code=1,
                 json_=json_,
             )
+        if center not in cfg.centers:
+            _fail_submission(
+                kind="invalid_argument",
+                message=(
+                    f"unknown center {center!r}; configured: {sorted(cfg.centers)}"
+                ),
+                exit_code=1,
+                json_=json_,
+            )
         selected_center = _laptop_center(cfg, center)
         # Scope the fan-out instead of filtering afterwards: unreachable
         # unrelated centers must not degrade a single-center observation.
@@ -5522,15 +6055,10 @@ def ps(
 
     def gather(include_progress: bool) -> tuple[list[JsonDict], dict[str, str]]:
         window_kwargs: JsonDict = {"remote_window": True} if remote_window else {}
-        if (
-            limit is not None
-            and not legacy_issue_window
-            and not query_mode
-            and not issues
-        ):
-            # With --issues the limit must apply after issue filtering (below),
-            # or the newest N rows are taken before the older failures are even
-            # considered and the panel reads all-green.
+        if limit is not None and not legacy_issue_window and not query_mode:
+            # The v2 head applies issue filtering before this limit. Legacy v1
+            # windows remain excluded above because they cannot prove that
+            # ordering and would otherwise hide older failures.
             window_kwargs["limit"] = limit
         if issues and not legacy_issue_window:
             # The legacy v1 window contract ships the full superset and lets
@@ -5858,7 +6386,6 @@ _LOG_THROUGHPUT_RE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:samples/s)?\b",
     re.IGNORECASE | re.MULTILINE,
 )
-_LOG_NUL_RUN_RE = re.compile(r"\x00+")
 
 
 def _stable_remote_exit(returncode: int) -> int:
@@ -5903,7 +6430,7 @@ def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
         'dt_log_mtime="$dt_nested_mtime"; '
         "fi; fi; "
         f"dt_resource_sample=$(tail -n 1 -- {node_path_expression(resources_path)} "
-        "2>/dev/null || true); "
+        f"2>/dev/null | tail -c {AUTO_LOG_TAIL_MAX_BYTES} || true); "
         'dt_log_display="$dt_log_source"; '
         'case "$dt_log_display" in "$HOME"/*) '
         'dt_log_display="~/${dt_log_display#"$HOME"/}";; esac; '
@@ -5911,7 +6438,8 @@ def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
         f'{shlex.quote(LOG_SOURCE_MARK)} "$dt_log_display" '
         f'{shlex.quote(LOG_MTIME_MARK)} "$dt_log_mtime" '
         f'{shlex.quote(RESOURCE_SAMPLE_MARK)} "$dt_resource_sample"; '
-        f'tail -n {lines} -- "$dt_log_source"'
+        f'tail -c {AUTO_LOG_TAIL_MAX_BYTES} -- "$dt_log_source" | '
+        f"tail -n {lines}"
     )
 
 
@@ -5941,14 +6469,17 @@ def _safe_job_log_source(entry: jobs_mod.JobEntry, raw: str) -> tuple[str, str] 
 
 
 def _sanitize_log_text(text: str) -> str:
-    """Make captured log views terminal-safe without hiding omitted raw bytes."""
+    """Make captured log views terminal-safe and mark every removed control."""
+    return sanitize_terminal_text(text)
 
-    def replacement(match: re.Match[str]) -> str:
-        count = len(match.group(0))
-        unit = "byte" if count == 1 else "bytes"
-        return f"[dt: omitted {count} NUL {unit}]"
 
-    return _LOG_NUL_RUN_RE.sub(replacement, text)
+def _bounded_log_error(detail: object) -> str:
+    """Return a single-line diagnostic without re-emitting an unbounded log."""
+    try:
+        raw = str(detail)
+    except Exception:
+        raw = type(detail).__name__
+    return " ".join(_sanitize_log_text(raw[:4096]).split())[:4096]
 
 
 def _safe_job_resource_sample(value: object) -> JsonDict | None:
@@ -5970,18 +6501,22 @@ def _safe_job_resource_sample(value: object) -> JsonDict | None:
             return None
         safe_job[key] = candidate
 
+    def safe_metric(candidate: object) -> bool:
+        if not isinstance(candidate, (int, float)) or isinstance(candidate, bool):
+            return False
+        try:
+            return math.isfinite(float(candidate)) and 0 <= float(candidate) <= 10**15
+        except OverflowError:
+            return False
+
     for key in ("rss_mib", "cpu_pct", "read_mib_s", "write_mib_s"):
         candidate = job.get(key)
         if candidate is None and key != "rss_mib":
             safe_job[key] = None
             continue
-        if (
-            not isinstance(candidate, (int, float))
-            or isinstance(candidate, bool)
-            or not math.isfinite(float(candidate))
-            or float(candidate) < 0
-        ):
+        if not safe_metric(candidate):
             return None
+        assert isinstance(candidate, (int, float))
         safe_job[key] = candidate
 
     for key in ("pss_mib", "pss_anon_mib"):
@@ -5991,13 +6526,9 @@ def _safe_job_resource_sample(value: object) -> JsonDict | None:
         if candidate is None:
             safe_job[key] = None
             continue
-        if (
-            not isinstance(candidate, (int, float))
-            or isinstance(candidate, bool)
-            or not math.isfinite(float(candidate))
-            or float(candidate) < 0
-        ):
+        if not safe_metric(candidate):
             return None
+        assert isinstance(candidate, (int, float))
         safe_job[key] = candidate
 
     safe: JsonDict = {
@@ -6555,16 +7086,20 @@ def _follow_job_log(
                 if entry.node_local
                 else node_path_expression(log_path)
             )
-            pipeline = (
-                f"{shlex.join(['tail', *tail_options])} -- {target} "
-                "| LC_ALL=C tr -d '\\000'"
-            )
-            safe_tail = ["bash", "-o", "pipefail", "-c", pipeline]
-            follow_cmd = (
-                safe_tail
+            tail_command = f"{shlex.join(['tail', *tail_options])} -- {target}"
+            source_command = (
+                tail_command
                 if entry.node_local
-                else [*ssh_base(), entry.node, shlex.join(safe_tail)]
+                else shlex.join([*ssh_base(), entry.node, tail_command])
             )
+            filter_command = shlex.join([sys.executable, "-I", "-m", "dt.terminal"])
+            follow_cmd = [
+                "bash",
+                "-o",
+                "pipefail",
+                "-c",
+                f"{source_command} | {filter_command}",
+            ]
             follower = subprocess.run(
                 follow_cmd,
                 check=False,
@@ -6751,15 +7286,44 @@ def attach(ref: str = REF_ARG) -> None:
         "tmux session",
         display_ref=_display_ref_for_entry(cfg, entry),
     )
-    # -L dt: jobs live on dt's dedicated tmux server (see launcher.sh)
+    runtime_socket, _runtime_scope = runtime_identity(entry.session)
+    session = entry.session
     if entry.node_local:
-        os.execvp("tmux", ["tmux", "-L", "dt", "attach", "-t", entry.session])
+        selected_socket = runtime_socket
+        current = subprocess.run(
+            ["tmux", "-L", runtime_socket, "has-session", "-t", session],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if current.returncode != 0:
+            legacy = subprocess.run(
+                ["tmux", "-L", "dt", "has-session", "-t", session],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if legacy.returncode == 0:
+                selected_socket = "dt"
+        os.execvp(
+            "tmux",
+            ["tmux", "-L", selected_socket, "attach", "-t", session],
+        )
+    quoted_session = shlex.quote(session)
+    quoted_socket = shlex.quote(runtime_socket)
+    attach_command = (
+        f"if tmux -L {quoted_socket} has-session -t {quoted_session} 2>/dev/null; "
+        f"then exec tmux -L {quoted_socket} attach -t {quoted_session}; "
+        f"elif tmux -L dt has-session -t {quoted_session} 2>/dev/null; "
+        f"then exec tmux -L dt attach -t {quoted_session}; "
+        "else echo 'dt: tmux session is unavailable' >&2; exit 1; fi"
+    )
     remote = subprocess.run(
         [
             *ssh_base(),
             "-t",
             entry.node,
-            f"tmux -L dt attach -t {shlex.quote(entry.session)}",
+            attach_command,
         ],
         check=False,
     )
@@ -6974,14 +7538,16 @@ def _read_finished_failure_log(
         proc = run_on(
             entry.node,
             entry.node_local,
-            f"tail -n {error_lines} {node_path_expression(log_path)}",
+            f"test -r {node_path_expression(log_path)} && "
+            f"tail -c {AUTO_LOG_TAIL_MAX_BYTES} -- "
+            f"{node_path_expression(log_path)} | tail -n {error_lines}",
             timeout=30,
         )
         primary_tail = _sanitize_log_text(proc.stdout or "")
         failure_log["tail"] = primary_tail
         if proc.returncode != 0:
             detail = proc.stderr or proc.stdout or f"log read exited {proc.returncode}"
-            compact_detail = " ".join(_sanitize_log_text(detail).split())
+            compact_detail = _bounded_log_error(detail)
             failure_log["error"] = compact_detail
             emit(
                 f"[yellow]could not read failure log: {escape(compact_detail)}[/yellow]"
@@ -7002,7 +7568,10 @@ def _read_finished_failure_log(
                 referenced_proc = run_on(
                     entry.node,
                     entry.node_local,
-                    f"tail -n {error_lines} {node_path_expression(referenced_path)}",
+                    f"test -r {node_path_expression(referenced_path)} && "
+                    f"tail -c {AUTO_LOG_TAIL_MAX_BYTES} -- "
+                    f"{node_path_expression(referenced_path)} | "
+                    f"tail -n {error_lines}",
                     timeout=30,
                 )
                 referenced_tail = _sanitize_log_text(referenced_proc.stdout or "")
@@ -7013,7 +7582,7 @@ def _read_finished_failure_log(
                         or referenced_proc.stdout
                         or f"log read exited {referenced_proc.returncode}"
                     )
-                    compact_failure = " ".join(_sanitize_log_text(failure).split())
+                    compact_failure = _bounded_log_error(failure)
                     referenced_log["error"] = compact_failure
                     emit(
                         "[yellow]could not read referenced failure log "
@@ -7023,8 +7592,9 @@ def _read_finished_failure_log(
                     emit(f"[red]referenced failure log ({referenced}):[/red]")
                     write_tail(referenced_tail)
     except Exception as exc:
-        failure_log["error"] = str(exc)
-        emit(f"[yellow]could not read failure log: {escape(str(exc))}[/yellow]")
+        compact_error = _bounded_log_error(exc)
+        failure_log["error"] = compact_error
+        emit(f"[yellow]could not read failure log: {escape(compact_error)}[/yellow]")
     return failure_log
 
 
@@ -7289,10 +7859,17 @@ def _render_wait_group(payload: JsonDict) -> None:
     table.add_column("reason")
     for raw in jobs:
         assert isinstance(raw, dict)
-        code = int(raw["exit_code"])
         status = str(raw["status"])
+        raw_code = raw.get("exit_code")
+        code = (
+            int(raw_code)
+            if isinstance(raw_code, int) and not isinstance(raw_code, bool)
+            else None
+        )
         if code == 0:
             result = "[green]✓ ok[/green]"
+        elif status == "finished" and code is None:
+            result = "[red]✗ result unavailable[/red]"
         elif status == "finished":
             result = f"[red]✗ exit {code}[/red]"
         elif status == "killed":
@@ -7605,22 +8182,23 @@ INFO_RESOURCE_TAIL = 3600
 INFO_PHASE_TAIL = 256
 
 
-def _parse_marked(text: str, n: int) -> list[str]:
+def _parse_marked(text: str, n: int, *, marker: str = INFO_MARK) -> list[str]:
     """Split probe output on marker lines into exactly n trimmed segments."""
-    segs = [s.strip() for s in text.split(INFO_MARK)]
+    segs = [s.strip() for s in text.split(marker)]
     segs += [""] * n
     return segs[:n]
 
 
 def _fmt_duration(seconds: float) -> str:
-    s = int(seconds)
+    sign = "-" if seconds < 0 else ""
+    s = int(abs(seconds))
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
     if h:
-        return f"{h}h{m:02d}m"
+        return f"{sign}{h}h{m:02d}m"
     if m:
-        return f"{m}m{s:02d}s"
-    return f"{s}s"
+        return f"{sign}{m}m{s:02d}s"
+    return f"{sign}{s}s"
 
 
 def _fmt_memory_mib(value: object, *, compact: bool = False) -> str:
@@ -7755,6 +8333,7 @@ def _compact_watch_snapshot(snapshot: JsonDict) -> JsonDict:
         "gpus",
         "duration_s",
         "max_hours",
+        "min_vram_mib",
         "max_vram_mib",
         "max_job_memory_mib",
         "max_hours_exceeded",
@@ -7928,6 +8507,7 @@ def _watch_snapshot(
         "gpu_isolation": _gpu_isolation_contract(entry),
         "duration_s": duration,
         "max_hours": entry.max_hours,
+        "min_vram_mib": entry.min_vram_mib,
         "max_vram_mib": entry.max_vram_mib,
         "max_job_memory_mib": entry.max_job_memory_mib,
         "max_hours_exceeded": max_hours_overdue is not None,
@@ -8084,6 +8664,11 @@ def _watch_view(snapshot: JsonDict) -> Any:
                 " · completion unconfirmed[/yellow]"
             )
         t.add_row("guard", guard_text)
+    if snapshot.get("min_vram_mib") is not None:
+        t.add_row(
+            "GPU requirement",
+            f"≥{int(snapshot['min_vram_mib']):,} MiB/GPU",
+        )
     if snapshot.get("max_vram_mib") is not None:
         t.add_row("VRAM guard", f"{int(snapshot['max_vram_mib']):,} MiB/GPU")
     if snapshot.get("max_job_memory_mib") is not None:
@@ -8340,12 +8925,19 @@ def _phase_spans_for_human(
         for span in summary.get("phases") or []
         if isinstance(span, dict) and _safe_phase_name(span.get("phase"))
     ]
-    if len(spans) <= max_spans:
+    already_omitted = summary.get("phase_spans_omitted")
+    if (
+        not isinstance(already_omitted, int)
+        or isinstance(already_omitted, bool)
+        or already_omitted < 0
+    ):
+        already_omitted = 0
+    if len(spans) <= max_spans and not already_omitted:
         return spans, 0
     keep = max_spans - 1
     head = (keep + 1) // 2
     tail = keep - head
-    omitted = len(spans) - keep
+    omitted = already_omitted + max(0, len(spans) - keep)
     tail_spans = spans[-tail:] if tail else []
     return [*spans[:head], None, *tail_spans], omitted
 
@@ -8811,14 +9403,16 @@ def _info_live(
     resource_reader = ResourceTelemetryQuery(entry, resource_tail).command(
         require_file=False
     )
+    marker = f"@@DT-{os.urandom(16).hex()}@@"
     probe = (
-        f"cat {state}/started_at 2>/dev/null; echo {INFO_MARK}; "
-        f"cat {state}/finished_at 2>/dev/null; echo {INFO_MARK}; "
-        f"du -sh {job}/outputs 2>/dev/null | cut -f1; echo {INFO_MARK}; "
-        f"test -f {control}/code_dirty.patch && echo yes; echo {INFO_MARK}; "
+        f"cat {state}/started_at 2>/dev/null; echo {marker}; "
+        f"cat {state}/finished_at 2>/dev/null; echo {marker}; "
+        f"du -sh {job}/outputs 2>/dev/null | cut -f1; echo {marker}; "
+        f"test -f {control}/code_dirty.patch && echo yes; echo {marker}; "
         f"{resource_reader}; "
-        f"echo {INFO_MARK}; tail -n {INFO_PHASE_TAIL} "
-        f"{job}/outputs/dt/phases.jsonl 2>/dev/null || true; echo {INFO_MARK}; "
+        f"echo {marker}; tail -n {INFO_PHASE_TAIL} "
+        f"{job}/outputs/dt/phases.jsonl 2>/dev/null | "
+        f"tail -c {AUTO_LOG_TAIL_MAX_BYTES} || true; echo {marker}; "
         f"cat {job}/outputs/dt/resource-guard.json 2>/dev/null || true"
     )
     try:
@@ -8833,7 +9427,7 @@ def _info_live(
             resource_text,
             phase_text,
             guard_text,
-        ) = _parse_marked(proc.stdout or "", 7)
+        ) = _parse_marked(proc.stdout or "", 7, marker=marker)
         resource_guard = None
         try:
             candidate = json.loads(guard_text)
@@ -9081,11 +9675,24 @@ def info(
     live_finished = live.get("finished_at")
     started = live_started or entry.started_at
     finished = live_finished or entry.finished_at
-    started_domain = "node" if live_started is not None else "registry"
-    finished_domain = "node" if live_finished is not None else "registry"
+    started_domain: str | None = (
+        "node"
+        if live_started is not None
+        else "registry"
+        if entry.started_at is not None
+        else None
+    )
+    finished_domain: str | None = (
+        "node"
+        if live_finished is not None
+        else "registry"
+        if entry.finished_at is not None
+        else None
+    )
+    duration_domain: str | None
     if started and not finished and entry.status == "running":
         duration = time.time() - started
-        duration_domain = "mixed" if started_domain == "node" else "head"
+        duration_domain = "mixed"
     elif started and finished:
         duration = finished - started
         duration_domain = (
@@ -9100,8 +9707,13 @@ def info(
         "finished_at": finished_domain,
         "duration_s": duration_domain,
     }
-    cross_clock_intervals_approximate = (
-        "node" in timestamp_domains.values() or duration_domain == "mixed"
+    cross_clock_intervals_approximate = any(
+        domain in {"node", "registry", "mixed"}
+        for domain in (
+            timestamp_domains["started_at"],
+            timestamp_domains["finished_at"],
+            duration_domain,
+        )
     )
     resource_summary = ResourceTelemetryQuery(entry, metrics_tail).summarize(
         str(live.get("resource_text") or ""),
@@ -9188,10 +9800,12 @@ def info(
         "env_hash": entry.env_hash,
         "env_mode": entry.env_mode or "sync",
         "env_source_job": entry.env_source_job,
+        "custom_env_keys": sorted(entry.custom_env),
         "setup_inputs": entry.setup_inputs,
         "extras": entry.extras,
         "boot_id": entry.boot_id,
         "max_hours": entry.max_hours,
+        "min_vram_mib": entry.min_vram_mib,
         "max_vram_mib": entry.max_vram_mib,
         "max_job_memory_mib": entry.max_job_memory_mib,
         "resource_guard": live.get("resource_guard"),
@@ -9477,6 +10091,8 @@ def info(
                 "completion unconfirmed)[/yellow]"
             )
         rows.append(("max hours", max_hours_text))
+    if entry.min_vram_mib is not None:
+        rows.append(("min GPU memory", f"{entry.min_vram_mib:,} MiB/GPU"))
     if entry.max_vram_mib is not None:
         rows.append(("max VRAM", f"{entry.max_vram_mib:,} MiB/GPU"))
     if entry.max_job_memory_mib is not None:
@@ -9580,6 +10196,7 @@ COMPARE_CONTROLS = (
     ("boot_id", "node boot"),
     ("require_path", "required path"),
     ("require_disk_gib", "required disk"),
+    ("min_vram_mib", "min GPU memory"),
     ("max_vram_mib", "max VRAM"),
     ("max_job_memory_mib", "max job memory"),
 )
@@ -9618,6 +10235,7 @@ def _compare_payload(entries: list[jobs_mod.JobEntry]) -> JsonDict:
                 "artifact_manifest",
                 "require_path",
                 "require_disk_gib",
+                "min_vram_mib",
                 "max_vram_mib",
                 "max_job_memory_mib",
             }
@@ -9920,28 +10538,38 @@ def _compare_metric_payload(
             if row_label == label
         ]
         numbers = [value for _job_id, value in rows]
-        mean = sum(numbers) / len(numbers)
-        value_range = max(numbers) - min(numbers)
+        # Scale before summing: the arithmetic mean of finite floats remains
+        # representable even when a naive intermediate sum would overflow.
+        mean = math.fsum(value / len(numbers) for value in numbers)
+        minimum = min(numbers)
+        maximum = max(numbers)
+        raw_range = maximum - minimum
+        value_range = raw_range if math.isfinite(raw_range) else None
+        raw_spread = (
+            value_range / abs(mean) * 100.0
+            if len(numbers) > 1 and mean != 0 and value_range is not None
+            else None
+        )
+        spread = raw_spread if raw_spread is None or math.isfinite(raw_spread) else None
         groups.append(
             {
                 "label": label,
                 "job_ids": [job_id for job_id, _value in rows],
                 "count": len(numbers),
                 "mean": mean,
-                "min": min(numbers),
-                "max": max(numbers),
+                "min": minimum,
+                "max": maximum,
                 "range": value_range,
-                "spread_pct": (
-                    value_range / abs(mean) * 100.0
-                    if len(numbers) > 1 and mean != 0
-                    else None
-                ),
+                "spread_pct": spread,
             }
         )
     baseline_mean = _compare_numeric_field(groups[0], "mean")
     for group in groups:
         mean = _compare_numeric_field(group, "mean")
-        change = (mean / baseline_mean - 1.0) * 100.0 if baseline_mean != 0 else None
+        raw_change = (
+            (mean / baseline_mean - 1.0) * 100.0 if baseline_mean != 0 else None
+        )
+        change = raw_change if raw_change is None or math.isfinite(raw_change) else None
         group["change_vs_baseline_pct"] = change
         group["improvement_vs_baseline_pct"] = (
             -change if lower_is_better and change is not None else change
@@ -9968,7 +10596,9 @@ def _compare_metric_payload(
 def _compare_numeric_field(row: JsonDict, field: str) -> float:
     value = row[field]
     assert not isinstance(value, bool) and isinstance(value, (int, float))
-    return float(value)
+    number = float(value)
+    assert math.isfinite(number)
+    return number
 
 
 def _compare_metric_gate(
@@ -9983,7 +10613,14 @@ def _compare_metric_gate(
     baseline, candidate = groups
     assert isinstance(baseline, dict)
     assert isinstance(candidate, dict)
-    observed_improvement = candidate.get("improvement_vs_baseline_pct")
+    raw_improvement = candidate.get("improvement_vs_baseline_pct")
+    observed_improvement = (
+        float(raw_improvement)
+        if isinstance(raw_improvement, (int, float))
+        and not isinstance(raw_improvement, bool)
+        and math.isfinite(float(raw_improvement))
+        else None
+    )
     failures: list[str] = []
     if min_improvement is not None:
         if observed_improvement is None:
@@ -10014,7 +10651,11 @@ def _compare_metric_gate(
         for group in groups:
             assert isinstance(group, dict)
             spread = group.get("spread_pct")
-            if spread is None:
+            if (
+                not isinstance(spread, (int, float))
+                or isinstance(spread, bool)
+                or not math.isfinite(float(spread))
+            ):
                 failures.append(
                     f"{group['label']} spread unavailable (need at least two runs)"
                 )
@@ -10354,7 +10995,11 @@ def compare(
                     json_=json_,
                 )
             try:
-                entries.append(jobs_mod.JobEntry(**json.loads(proc.stdout)))
+                record = json.loads(proc.stdout)
+                if not isinstance(record, dict):
+                    raise TypeError("registry response must be an object")
+                record.pop("custom_env_keys", None)
+                entries.append(jobs_mod.JobEntry(**record))
             except (TypeError, ValueError, json.JSONDecodeError) as exc:
                 _fail_submission(
                     kind="lookup_failed",
@@ -10796,6 +11441,11 @@ def rerun(
         None, "-n", "--name", help="new job name (default: same as before)"
     ),
     no_queue: bool = typer.Option(False, "--no-queue"),
+    min_vram_mib: Optional[int] = typer.Option(
+        None,
+        "--min-vram-mib",
+        help="override the minimum total memory required on each GPU (MiB)",
+    ),
     request_id: Optional[str] = typer.Option(
         None,
         "--request-id",
@@ -10804,6 +11454,13 @@ def rerun(
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
     """Resubmit once: same command/GPUs/pins, today's project code."""
+    if min_vram_mib is not None and min_vram_mib <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--min-vram-mib must be a positive integer",
+            exit_code=1,
+            json_=json_,
+        )
     _validate_submission_request_id(request_id, json_=json_)
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
@@ -10811,6 +11468,7 @@ def rerun(
         route = (
             HeadCommand.start(head, "rerun", ref)
             .option("-n", name or None)
+            .option("--min-vram-mib", min_vram_mib)
             .option("--request-id", request_id or None)
             .flag("--no-queue", no_queue)
             .flag("--json", json_)
@@ -10828,7 +11486,14 @@ def rerun(
     from .dispatch import spec_from_entry
     from rich.markup import escape
 
-    old = _find_or_die(cfg, ref)
+    old = _find_or_die(cfg, ref, json_=json_)
+    if min_vram_mib is not None and old.gpus_requested == 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--min-vram-mib requires at least one GPU",
+            exit_code=1,
+            json_=json_,
+        )
     old_display_ref = _display_ref_for_entry(cfg, old)
     if old.cache_source_job:
         _fail_submission(
@@ -10843,6 +11508,8 @@ def rerun(
             json_=json_,
         )
     spec = spec_from_entry(old, name)
+    if min_vram_mib is not None:
+        spec.min_vram_mib = min_vram_mib
     spec.request_id = request_id
     err.print(
         f"[dim]rerun source: {escape(old.name)} · ref {escape(old_display_ref)}[/dim]"
@@ -10907,13 +11574,17 @@ def rerun(
             json_=json_,
         )
 
+    agent_started = None
     if entry.status == "queued":
         from . import agent as agent_mod
 
         if agent_mod.alive_pid(cfg) is None:
-            agent_mod.start_detached(cfg)
+            agent_started = agent_mod.start_detached(cfg)
     if json_:
-        print(json.dumps(_submission_payload(entry)))
+        extra = {}
+        if agent_started is not None:
+            extra["agent_started"] = agent_started
+        print(json.dumps(_submission_payload(entry, **extra)))
     else:
         display_ref = _display_ref_for_entry(cfg, entry)
         if getattr(entry, "_request_replayed", False):
@@ -10922,12 +11593,19 @@ def rerun(
                 f"{escape(entry.request_id or '')} · no new job created"
             )
         if entry.status == "queued":
+            agent_note = ""
+            if agent_started:
+                agent_note = " · agent started"
+            elif agent_started is False:
+                agent_note = " · [red]agent failed[/red]"
             err.print(
                 f"[cyan]queued[/cyan] {escape(entry.name)} · "
-                f"rerun of {escape(old_display_ref)}"
+                f"rerun of {escape(old_display_ref)}{agent_note}"
             )
             if entry.reason:
                 err.print(f"[yellow]reason: {escape(entry.reason)}[/yellow]")
+            if agent_started is False:
+                err.print("[red]next: dt agent run[/red]")
         else:
             gpu_text = ",".join(map(str, entry.gpus)) or "cpu"
             err.print(
@@ -11035,7 +11713,7 @@ def exec_job(
 
     from . import dispatch as dispatch_mod
 
-    source = _find_or_die(cfg, ref)
+    source = _find_or_die(cfg, ref, json_=json_)
     try:
         spec = dispatch_mod.environment_reuse_spec_from_entry(
             source,
@@ -11144,6 +11822,8 @@ def exec_job(
         f"{escape(_display_ref_for_entry(cfg, source))}"
     )
     err.print("[dim]project sync off · environment sync off[/dim]")
+    if agent_started is False:
+        err.print("[red]agent failed · next: dt agent run[/red]")
     err.print(f"[dim]next: dt watch {escape(display_ref)}[/dim]")
     print(entry.job_id)
 
@@ -11214,6 +11894,12 @@ def fork(
         help="override the source job's runaway guard for the new fork(s)",
         rich_help_panel="Scheduling & safety",
     ),
+    min_vram_mib: Optional[int] = typer.Option(
+        None,
+        "--min-vram-mib",
+        help="override the minimum total memory required on each GPU (MiB)",
+        rich_help_panel="Scheduling & safety",
+    ),
     max_vram_mib: Optional[int] = typer.Option(
         None,
         "--max-vram-mib",
@@ -11252,6 +11938,13 @@ def fork(
         _fail_submission(
             kind="invalid_argument",
             message="--max-hours must be a finite positive number",
+            exit_code=1,
+            json_=json_,
+        )
+    if min_vram_mib is not None and min_vram_mib <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--min-vram-mib must be a positive integer",
             exit_code=1,
             json_=json_,
         )
@@ -11324,11 +12017,17 @@ def fork(
             .flag("--inherit-cache", inherit_cache)
             .option("--artifact-manifest", artifact_manifest)
             .option("--max-hours", max_hours)
+            .option("--min-vram-mib", min_vram_mib)
             .option("--max-vram-mib", max_vram_mib)
             .option("--max-job-memory-mib", max_job_memory_mib)
             .option("--request-id", request_id or None)
             .flag("--no-queue", no_queue)
-            .flag("--json", json_)
+            # Repeat forwarding always consumes the head's durable group
+            # receipt, even when the laptop renders it for a human. Without
+            # this, the head prints bare job ids after creating every member
+            # and the laptop reports a protocol failure that invites a
+            # duplicate retry.
+            .flag("--json", json_ or repeat > 1)
         )
         if command:
             route = route.passthrough(command)
@@ -11359,12 +12058,19 @@ def fork(
     from . import dispatch as dispatch_mod
     from rich.markup import escape
 
-    old = _find_or_die(cfg, ref)
+    old = _find_or_die(cfg, ref, json_=json_)
     old_display_ref = _display_ref_for_entry(cfg, old)
     if max_vram_mib is not None and old.gpus_requested == 0:
         _fail_submission(
             kind="invalid_argument",
             message="--max-vram-mib requires at least one GPU",
+            exit_code=1,
+            json_=json_,
+        )
+    if min_vram_mib is not None and old.gpus_requested == 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--min-vram-mib requires at least one GPU",
             exit_code=1,
             json_=json_,
         )
@@ -11378,7 +12084,7 @@ def fork(
                 exit_code=EXIT_ENV,
                 json_=json_,
             )
-        source = _find_or_die(cfg, old.cache_source_job)
+        source = _find_or_die(cfg, old.cache_source_job, json_=json_)
     else:
         if old.cache_source_job and not reuse_cache and not clone_cache:
             if (
@@ -11436,6 +12142,8 @@ def fork(
             ]
         if max_hours is not None:
             item_spec.max_hours = max_hours
+        if min_vram_mib is not None:
+            item_spec.min_vram_mib = min_vram_mib
         if max_vram_mib is not None:
             item_spec.max_vram_mib = max_vram_mib
         if max_job_memory_mib is not None:
@@ -11443,7 +12151,9 @@ def fork(
         return item_spec
 
     prefix = jobs_mod.sanitize_name((name or f"{old.name}-fork").strip())
-    first_name = name if repeat == 1 else f"{prefix}-001"
+    first_name = (
+        name if repeat == 1 else fork_repeat_mod._member_name(prefix, 1, repeat)
+    )
     try:
         spec = build_spec(first_name)
         if repeat == 1:
@@ -11497,6 +12207,7 @@ def fork(
             inherit_cache=inherit_cache,
             artifact_manifest=artifact_manifest,
             max_hours=max_hours,
+            min_vram_mib=min_vram_mib,
             max_vram_mib=max_vram_mib,
             max_job_memory_mib=max_job_memory_mib,
             cold_cache_env=cold_cache_env,
@@ -11576,6 +12287,11 @@ def fork(
                     forked_from=entry.forked_from or source.job_id,
                     max_hours=entry.max_hours,
                     exact_snapshot=exact,
+                    **(
+                        {"agent_started": agent_started}
+                        if agent_started is not None
+                        else {}
+                    ),
                 )
             )
         )
@@ -11588,13 +12304,19 @@ def fork(
             f"{escape(entry.request_id or '')} · no new job created"
         )
     if entry.status == "queued":
-        agent_note = " · agent started" if agent_started else ""
+        agent_note = ""
+        if agent_started:
+            agent_note = " · agent started"
+        elif agent_started is False:
+            agent_note = " · [red]agent failed[/red]"
         err.print(
             f"[cyan]queued[/cyan] {escape(entry.name)} · "
             f"fork of {escape(source_display_ref)}{agent_note}"
         )
         if entry.reason:
             err.print(f"[yellow]reason: {escape(entry.reason)}[/yellow]")
+        if agent_started is False:
+            err.print("[red]next: dt agent run[/red]")
     else:
         gpu_text = ",".join(map(str, entry.gpus)) or "cpu"
         err.print(
@@ -11902,15 +12624,28 @@ def _pull_unlocked(
                 "outputs",
                 display_ref=_display_ref_for_entry(cfg, entry),
             )
+    if _collection:
+        try:
+            collection_base = _ensure_collection_root(cfg, _collection)
+        except ValueError as exc:
+            fail(
+                "destination_unusable",
+                str(exc),
+                1,
+                job_id=entry.job_id,
+                node=entry.node,
+            )
+    else:
+        collection_base = None
     dst = (
         Path(to).expanduser()
         if to
         else (
-            _collection_root(cfg, _collection) / entry.job_id
-            if _collection
+            collection_base / entry.job_id
+            if collection_base is not None
             else cfg.job_results_dir(entry.job_id)
         )
-    )
+    ).absolute()
     if dst.is_symlink():
         fail(
             "destination_conflict",
@@ -12001,24 +12736,46 @@ def _pull_unlocked(
                     destination=str(dst),
                     existing_job_id=existing_job_id,
                 )
-        elif any(dst.iterdir()):
-            fail(
-                "destination_conflict",
-                f"{dst} is non-empty and has no dt/job.json; "
-                "use --force to merge or overwrite files",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-                destination=str(dst),
-                existing_job_id=None,
-            )
+        else:
+            try:
+                destination_nonempty = any(dst.iterdir())
+            except OSError as exc:
+                fail(
+                    "destination_unusable",
+                    f"cannot inspect local destination {dst}: {exc}",
+                    1,
+                    job_id=entry.job_id,
+                    node=entry.node,
+                    destination=str(dst),
+                )
+            if destination_nonempty:
+                fail(
+                    "destination_conflict",
+                    f"{dst} is non-empty and has no dt/job.json; "
+                    "use --force to merge or overwrite files",
+                    1,
+                    job_id=entry.job_id,
+                    node=entry.node,
+                    destination=str(dst),
+                    existing_job_id=None,
+                )
     outputs_rel = f"{entry.job_dir}/outputs"
-    check = run_on(
-        entry.node,
-        entry.node_local,
-        _pull_outputs_probe_command(outputs_rel),
-        timeout=10,
-    )
+    try:
+        check = run_on(
+            entry.node,
+            entry.node_local,
+            _pull_outputs_probe_command(outputs_rel),
+            timeout=10,
+        )
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        detail = " ".join(str(exc).split()) or type(exc).__name__
+        fail(
+            "unreachable",
+            f"cannot inspect outputs on {entry.node}: {detail}",
+            EXIT_UNREACHABLE,
+            job_id=entry.job_id,
+            node=entry.node,
+        )
     if check.returncode not in (0, 1):
         detail = (
             check.stderr or check.stdout or f"outputs probe exited {check.returncode}"
@@ -12065,8 +12822,18 @@ def _pull_unlocked(
     outputs_present = check.returncode == 0
     if outputs_present:
         remote_outputs_bytes = _pull_outputs_probe_bytes(check.stdout)
-    dst.mkdir(parents=True, exist_ok=True)
-    records_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        records_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        fail(
+            "destination_unusable",
+            f"cannot create local destination {dst}: {exc}",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+        )
     try:
         records_info = records_dir.lstat()
     except OSError as exc:
@@ -12119,9 +12886,20 @@ def _pull_unlocked(
             # A launched job always has stdout.log. The fallback keeps
             # mocked/legacy pull behavior stable after a successful logs rsync.
             paths.append("dt/stdout.log")
+        try:
+            record_files = sorted(records_dir.iterdir())
+        except OSError as exc:
+            fail(
+                "destination_unusable",
+                f"cannot inspect local records directory {records_dir}: {exc}",
+                1,
+                job_id=entry.job_id,
+                node=entry.node,
+                destination=str(dst),
+            )
         paths.extend(
             f"dt/{path.name}"
-            for path in sorted(records_dir.iterdir())
+            for path in record_files
             if path.is_file() and path.name not in {"job.json", "stdout.log"}
         )
         return paths
@@ -12155,6 +12933,7 @@ def _pull_unlocked(
                         entry.job_dir,
                         excludes=output_excludes,
                         estimate_bytes=remote_outputs_bytes,
+                        cancel_event=_cancel_event,
                     )
                 else:
                     with err.status(
@@ -12168,6 +12947,7 @@ def _pull_unlocked(
                             entry.job_dir,
                             excludes=output_excludes,
                             estimate_bytes=remote_outputs_bytes,
+                            cancel_event=_cancel_event,
                         )
                 src = (
                     f"{gateway_name}:"
@@ -12532,21 +13312,22 @@ def _pull_group_one(
 ) -> JsonDict:
     result: JsonDict = {}
     try:
-        with jobs_mod.pull_destination_lock(cfg, destination):
-            _pull_unlocked(
-                entry.job_id,
-                str(destination),
-                exclude,
-                lite,
-                force,
-                True,
-                retries,
-                route=route,
-                bwlimit=bwlimit,
-                _cfg_override=cfg,
-                _result=result,
-                _cancel_event=cancel_event,
-            )
+        with jobs_mod.job_lock(cfg, entry.job_id):
+            with jobs_mod.pull_destination_lock(cfg, destination):
+                _pull_unlocked(
+                    entry.job_id,
+                    str(destination),
+                    exclude,
+                    lite,
+                    force,
+                    True,
+                    retries,
+                    route=route,
+                    bwlimit=bwlimit,
+                    _cfg_override=cfg,
+                    _result=result,
+                    _cancel_event=cancel_event,
+                )
     except typer.Exit as exc:
         result.setdefault("exit_code", int(exc.exit_code))
     except Exception as exc:
@@ -12784,20 +13565,21 @@ def pull(
             )
         ).absolute()
         try:
-            with jobs_mod.pull_destination_lock(cfg, destination):
-                _pull_unlocked(
-                    entry.job_id,
-                    to,
-                    exclude,
-                    lite,
-                    force,
-                    json_,
-                    retries,
-                    route=route,
-                    bwlimit=bwlimit,
-                    _cfg_override=cfg,
-                    _collection=collection,
-                )
+            with jobs_mod.job_lock(cfg, entry.job_id):
+                with jobs_mod.pull_destination_lock(cfg, destination):
+                    _pull_unlocked(
+                        entry.job_id,
+                        to,
+                        exclude,
+                        lite,
+                        force,
+                        json_,
+                        retries,
+                        route=route,
+                        bwlimit=bwlimit,
+                        _cfg_override=cfg,
+                        _collection=collection,
+                    )
         except KeyboardInterrupt:
             resume = ["dt", "pull", refs[0]]
             if to:
@@ -12825,19 +13607,27 @@ def pull(
             )
         return
 
-    root = (
-        Path(to).expanduser()
-        if to
-        else (
-            _collection_root(cfg, collection)
-            if collection
+    try:
+        root = (
+            Path(to).expanduser()
+            if to
             else (
-                cfg.results_dir() / "jobs"
-                if cfg.layout == ROLE_LAYOUT
-                else cfg.results_dir()
+                _ensure_collection_root(cfg, collection)
+                if collection
+                else (
+                    cfg.results_dir() / "jobs"
+                    if cfg.layout == ROLE_LAYOUT
+                    else cfg.results_dir()
+                )
             )
+        ).absolute()
+    except ValueError as exc:
+        _fail_submission(
+            kind="destination_unusable",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
         )
-    ).absolute()
     if root.exists() and not root.is_dir():
         _fail_submission(
             kind="destination_conflict",
@@ -13270,17 +14060,16 @@ def kill(
                     row = payload[0]
                     if not isinstance(row, dict):
                         raise ValueError("head returned invalid kill result")
+                    row_exit = row.get("exit_code")
+                    if not isinstance(row_exit, int) or isinstance(row_exit, bool):
+                        raise ValueError("head returned invalid kill exit code")
                     rows.append(row)
                     outcomes.append(
                         "ok"
-                        if int(row.get("exit_code", 1)) == 0
-                        else (
-                            "notfound"
-                            if int(row.get("exit_code", 1)) == EXIT_NOT_FOUND
-                            else "failed"
-                        )
+                        if row_exit == 0
+                        else ("notfound" if row_exit == EXIT_NOT_FOUND else "failed")
                     )
-                except (RemoteError, ValueError, json.JSONDecodeError) as e:
+                except (RemoteError, TypeError, ValueError, json.JSONDecodeError) as e:
                     rows.append(
                         {
                             "ref": ref,
@@ -13301,30 +14090,91 @@ def kill(
             if all(outcome == "unreachable" for outcome in outcomes):
                 raise typer.Exit(EXIT_UNREACHABLE)
             raise typer.Exit(1)
-        rc = 0
         argv_tail = (
             (["-y"] if yes else [])
             + (["--force"] if force else [])
             + (["--sweep"] if sweep else [])
         )
+        human_outcomes: list[str] = []
         for ref in refs:
-            _, head = _locate(cfg, ref)
-            rc |= forward_call(head, ["kill", ref, *argv_tail], tty=not yes)
-        raise typer.Exit(rc)
+            human_lookup_errors: dict[str, str] = {}
+            human_unreachable: set[str] = set()
+            hit = find_center(
+                cfg,
+                ref,
+                errors=human_lookup_errors,
+                unreachable=human_unreachable,
+            )
+            if hit is None:
+                if human_lookup_errors:
+                    detail = "; ".join(
+                        f"{name}: {message}"
+                        for name, message in human_lookup_errors.items()
+                    )
+                    err.print(
+                        "[red]cannot determine which center owns job "
+                        f"{escape(ref)!s}: {escape(detail)}[/red]"
+                    )
+                    human_outcomes.append(
+                        "unreachable"
+                        if set(human_lookup_errors) == human_unreachable
+                        else "failed"
+                    )
+                else:
+                    err.print(
+                        f"[red]no center's registry knows job {escape(ref)!s}[/red]"
+                    )
+                    human_outcomes.append("notfound")
+                continue
+            _center, head, _entry = hit
+            code = forward_call(head, ["kill", ref, *argv_tail], tty=not yes)
+            human_outcomes.append(
+                "ok"
+                if code == 0
+                else "notfound"
+                if code == EXIT_NOT_FOUND
+                else "unreachable"
+                if code == EXIT_UNREACHABLE
+                else "failed"
+            )
+        if all(outcome == "ok" for outcome in human_outcomes):
+            return
+        if len(human_outcomes) == 1 and human_outcomes[0] == "notfound":
+            raise typer.Exit(EXIT_NOT_FOUND)
+        if all(outcome == "unreachable" for outcome in human_outcomes):
+            raise typer.Exit(EXIT_UNREACHABLE)
+        raise typer.Exit(1)
 
     cfg = _need_head(cfg)
     rows = [{} for _ref in refs] if json_ else []
-    outcomes = [
-        _kill_one(
-            cfg,
-            ref,
-            yes,
-            force,
-            rows[index] if json_ else None,
-            sweep=sweep,
-        )
-        for index, ref in enumerate(refs)
-    ]
+    outcomes = []
+    for index, ref in enumerate(refs):
+        try:
+            outcome = _kill_one(
+                cfg,
+                ref,
+                yes,
+                force,
+                rows[index] if json_ else None,
+                sweep=sweep,
+            )
+        except jobs_mod.RegistryError as exc:
+            message = f"cannot read registry state for {ref!r}: {exc}"
+            err.print(f"[red]{escape(message)}[/red]")
+            if json_:
+                rows[index].update(
+                    {
+                        "ref": ref,
+                        "job_id": None,
+                        "outcome": "unverified",
+                        "status": None,
+                        "reason": None,
+                        "message": message,
+                        "exit_code": 1,
+                    }
+                )
+            outcome = "unverified"
+        outcomes.append(outcome)
     if json_:
         print(json.dumps(rows))
     if all(o == "ok" for o in outcomes):
@@ -13614,6 +14464,7 @@ def clean(
         eligible: int,
         failures: list[JsonDict],
         removed_deployment_trees: int,
+        removed_envs: int,
     ) -> JsonDict:
         return {
             "schema_version": "dt_clean_v1",
@@ -13622,6 +14473,7 @@ def clean(
             "projects": sorted(projects) if projects is not None else None,
             "eligible_jobs": eligible,
             "removed_jobs": removed_jobs,
+            "removed_envs": removed_envs if envs else None,
             "removed_results": removed_results if results else None,
             "removed_deployment_trees": (
                 removed_deployment_trees if deployments else None
@@ -13632,7 +14484,7 @@ def clean(
 
     if not n_victims and not envs and not deployments and not managed_results:
         if json_:
-            print(json.dumps(clean_apply_payload(0, 0, [], 0)))
+            print(json.dumps(clean_apply_payload(0, 0, [], 0, 0)))
         else:
             err.print("nothing to clean")
         return
@@ -13678,21 +14530,26 @@ def clean(
         log=lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
         projects=projects,
         before_registry_remove=remove_managed_results if results else None,
+        authorized=victims,
     )
     removed_deployments = 0
+    deployment_failures = []
     if deployments:
         from .maintenance import clean_deployments
 
-        removed_deployments = clean_deployments(
+        deployment_report = clean_deployments(
             cfg,
             cutoff,
             lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
             runner=run_on,
         )
+        removed_deployments = deployment_report.removed
+        deployment_failures = deployment_report.failures
     suffix = f" + {removed_results} managed results" if results else ""
     if deployments:
         suffix += f" + {removed_deployments} deployment trees"
     err.print(f"cleaned {report.removed}/{report.eligible} jobs{suffix}")
+    all_failures = [*report.failures, *deployment_failures]
     if json_:
         print(
             json.dumps(
@@ -13706,18 +14563,19 @@ def clean(
                             "kind": failure.kind,
                             "message": failure.message,
                         }
-                        for failure in report.failures
+                        for failure in all_failures
                     ],
                     removed_deployments,
+                    report.removed_envs,
                 )
             )
         )
-    if report.failures:
+    if all_failures:
         err.print(
-            f"[red]{len(report.failures)} job(s) retained after cleanup "
-            "failures; rerun after fixing the reported cause[/red]"
+            f"[red]{len(all_failures)} cleanup operation(s) incomplete; "
+            "rerun after fixing the reported cause[/red]"
         )
-        for failure in report.failures:
+        for failure in all_failures:
             err.print(
                 f"[red]{escape(failure.job_id)} · {escape(failure.kind)} · "
                 f"{escape(failure.message)}[/red]"
@@ -13770,8 +14628,12 @@ def events(
         raise typer.Exit(forward_call(head, argv))
     if isinstance(cfg, HeadConfig) and center is not None:
         operation_log_mod.mark_problem("invalid_argument")
-        err.print("[red]--center is available only in laptop mode[/red]")
-        raise typer.Exit(1)
+        _fail_submission(
+            kind="invalid_argument",
+            message="--center is available only in laptop mode",
+            exit_code=1,
+            json_=json_,
+        )
 
     try:
         result = operation_log_mod.query(
@@ -14096,6 +14958,13 @@ def compact(
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
     """Remove recoverable code copies from old terminal job workdirs."""
+    if json_ and not plan and not yes:
+        _fail_submission(
+            kind="confirmation_required",
+            message="compact --json requires -y (or --plan)",
+            exit_code=1,
+            json_=True,
+        )
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         head = cfg.centers[_laptop_center(cfg, center)]
@@ -14316,6 +15185,12 @@ agent_app = typer.Typer(
 )
 
 
+@_typed_cli_decorator(agent_app.command("protocol", hidden=True))
+def agent_protocol() -> None:
+    """Emit the durable dispatch protocol for supervisor compatibility."""
+    print(jobs_mod.DISPATCH_PROTOCOL_VERSION)
+
+
 def _agent_forward(argv: list[str], center: Optional[str]) -> None:
     """On a laptop, agent commands run on a center's head."""
     cfg = _cfg()
@@ -14487,10 +15362,28 @@ def _agent_status_table(
             f"{float(age):.0f}s old" if isinstance(age, (int, float)) else "missing"
         )
         table.add_row("heartbeat", f"[red]stale[/red]  ·  {age_text}")
+    elif st.get("scheduler_stalled"):
+        age = st.get("scheduler_tick_age_s")
+        age_text = (
+            f"{float(age):.0f}s since last tick"
+            if isinstance(age, (int, float))
+            else "tick evidence unavailable"
+        )
+        table.add_row("scheduler", f"[red]stalled[/red]  ·  {age_text}")
     elif verbose and st["alive"] and not st.get("heartbeat_available"):
         table.add_row(
             "heartbeat",
             "unavailable  ·  restart the agent after upgrading DT",
+        )
+    if st.get("runtime_command_stale"):
+        table.add_row(
+            "runtime",
+            "[red]stale executable[/red]  ·  restart the agent after activation",
+        )
+    if st.get("runtime_dispatch_protocol_compatible") is False:
+        table.add_row(
+            "runtime",
+            "[red]incompatible dispatcher[/red]  ·  activate DT and restart agent",
         )
     if verbose:
         table.add_row(
@@ -14535,6 +15428,21 @@ def agent_install(
     result = agent_mod.install_supervisor(cfg)
     from rich.markup import escape
 
+    if result["supervisor"] == "unavailable":
+        capabilities = result.get("capabilities")
+        missing = (
+            capabilities.get("missing") if isinstance(capabilities, dict) else None
+        )
+        missing_text = ", ".join(str(item) for item in missing or []) or "unknown"
+        err.print(
+            "[red]cannot install a persistent DT agent[/red]: "
+            f"missing {escape(missing_text)}"
+        )
+        err.print(
+            "[dim]install bash plus either a systemd user manager or crontab, "
+            "then retry[/dim]"
+        )
+        raise typer.Exit(3)
     if result["supervisor"] == "systemd-user":
         err.print(
             f"[green]systemd user service installed[/green]: "
@@ -15089,6 +15997,7 @@ def seed(
             err.print(f"[red]{escape(message)}[/red]")
         raise typer.Exit(1)
     names = list(dict.fromkeys(nodes))
+    cancel_event = Event()
 
     from .dispatch import _seed_cache_lock, transferred_bytes
 
@@ -15148,7 +16057,9 @@ def seed(
             "transferred_bytes": transferred,
             "components": component_rows,
             "error_kind": (
-                "unreachable" if code == EXIT_UNREACHABLE else "seed_failed"
+                "interrupted"
+                if code == 130
+                else ("unreachable" if code == EXIT_UNREACHABLE else "seed_failed")
             ),
             "message": message,
             "exit_code": code,
@@ -15159,6 +16070,12 @@ def seed(
     def seed_one_unlocked(name: str) -> JsonDict:
         node = by_name[name]
         retry_events: list[JsonDict] = []
+        if cancel_event.is_set():
+            return failure_row(
+                name,
+                message="seed interrupted; partial cache data were retained",
+                code=130,
+            )
         if node.local:
             return {
                 "node": name,
@@ -15207,7 +16124,13 @@ def seed(
             prepare_parts.append(f"chmod 700 {rendered_parent}")
         prepare_cmd = "; ".join(prepare_parts)
         try:
-            prepared = run_on(name, False, prepare_cmd, timeout=15)
+            prepared = run_on(
+                name,
+                False,
+                prepare_cmd,
+                timeout=15,
+                cancel_event=cancel_event,
+            )
         except Exception as exc:
             detail = " ".join(str(exc).split()) or type(exc).__name__
             return failure_row(
@@ -15247,6 +16170,7 @@ def seed(
                     ),
                     stats=True,
                     private_destination=True,
+                    cancel_event=cancel_event,
                 )
             except Exception as exc:
                 detail = " ".join(str(exc).split()) or type(exc).__name__
@@ -15319,27 +16243,46 @@ def seed(
         node = by_name[name]
         if node.local or not components or plan:
             return seed_one_unlocked(name)
-        with _seed_cache_lock(cfg, node):
+        with _seed_cache_lock(cfg, node, cancel_event=cancel_event):
             return seed_one_unlocked(name)
 
     def run_all() -> list[JsonDict]:
         if len(names) == 1:
             return [seed_one(names[0])]
-        with ThreadPoolExecutor(max_workers=min(8, len(names))) as pool:
-            return list(pool.map(seed_one, names))
+        pool = ThreadPoolExecutor(max_workers=min(8, len(names)))
+        futures = [pool.submit(seed_one, name) for name in names]
+        try:
+            rows = [future.result() for future in futures]
+        except BaseException:
+            cancel_event.set()
+            for future in futures:
+                future.cancel()
+            pool.shutdown(wait=True, cancel_futures=True)
+            raise
+        pool.shutdown(wait=True)
+        return rows
 
-    if json_:
-        rows = run_all()
-    elif plan:
-        rows = run_all()
-    else:
-        err.print(
-            "[dim]local source "
-            f"{_format_source_bytes(source_bytes)} per target; "
-            "rsync transfers only missing/changed data[/dim]"
-        )
-        with err.status(f"seeding caches -> {', '.join(names)}..."):
+    try:
+        if json_:
             rows = run_all()
+        elif plan:
+            rows = run_all()
+        else:
+            err.print(
+                "[dim]local source "
+                f"{_format_source_bytes(source_bytes)} per target; "
+                "rsync transfers only missing/changed data[/dim]"
+            )
+            with err.status(f"seeding caches -> {', '.join(names)}..."):
+                rows = run_all()
+    except KeyboardInterrupt:
+        cancel_event.set()
+        _fail_submission(
+            kind="seed_interrupted",
+            message="seed interrupted; partial cache data were retained and can resume",
+            exit_code=130,
+            json_=json_,
+        )
 
     failure_codes = []
     for row in rows:
@@ -15373,6 +16316,8 @@ def seed(
     elif plan:
         err.print("[dim]preview only; no remote access or writes[/dim]")
     if failure_codes:
+        if 130 in failure_codes:
+            raise typer.Exit(130)
         raise typer.Exit(1 if 1 in failure_codes else EXIT_UNREACHABLE)
 
 
@@ -15566,13 +16511,22 @@ def topology(
     # Control routes: how the head itself reaches each node. This is where a
     # low-bandwidth frp/jump tunnel hides; classify it from evidence and show
     # any measured throughput so operators know what bulk data would ride.
-    control_scope = (
-        [name for configured_site in selected for name in configured_site.nodes]
-        if site is not None
-        else [node.name for node in cfg.nodes]
-    )
+    if source is not None or destination is not None:
+        scoped_endpoints = {name for name in (source, destination) if name is not None}
+        control_scope = [
+            name
+            for configured_site in selected
+            for name in configured_site.nodes
+            if name in scoped_endpoints
+        ]
+    elif site is not None:
+        control_scope = [
+            name for configured_site in selected for name in configured_site.nodes
+        ]
+    else:
+        control_scope = [node.name for node in cfg.nodes]
     head_addresses = local_interface_addresses()
-    control_rows: list[JsonDict] = []
+    control_nodes: list[Node] = []
     seen_control: set[str] = set()
     for name in control_scope:
         if name in seen_control:
@@ -15581,6 +16535,9 @@ def topology(
         node = next((item for item in cfg.nodes if item.name == name), None)
         if node is None:
             continue
+        control_nodes.append(node)
+
+    def inspect_control_route(node: Node) -> tuple[JsonDict, str | None]:
         client_address = None
         server_address = None
         if not node.local:
@@ -15589,14 +16546,14 @@ def topology(
                 client_address = advertisement.ssh_client_address
                 server_address = advertisement.ssh_server_address
             except TopologyDiscoveryError as exc:
-                control_rows.append(
+                return (
                     {
                         "node": node.name,
                         "link_class": "unreachable",
                         "evidence": str(exc),
-                    }
+                    },
+                    None,
                 )
-                continue
         route_class = classify_control_route(
             node,
             client_address=client_address,
@@ -15609,6 +16566,7 @@ def topology(
             "link_class": route_class.label,
             "evidence": route_class.evidence,
         }
+        warning: str | None = None
         if measure and not node.local:
             from .topology_discovery import (
                 BANDWIDTH_PROBE_ESCALATE_UNDER_S,
@@ -15636,12 +16594,26 @@ def topology(
                     origin="probe",
                 )
             except (TopologyDiscoveryError, LinkMetricsError) as exc:
-                err.print(
-                    f"[yellow]measure head → {escape(node.name)}: "
-                    f"{escape(str(exc))}[/yellow]"
-                )
+                warning = str(exc)
         if not node.local:
             row.update(edge_sample(CONTROL_LINK_SCOPE, "head", node.name))
+        return row, warning
+
+    if len(control_nodes) <= 1:
+        inspected_controls = [inspect_control_route(node) for node in control_nodes]
+    else:
+        with ThreadPoolExecutor(max_workers=min(8, len(control_nodes))) as pool:
+            # pool.map preserves configured order while overlapping independent
+            # SSH deadlines; one slow tunnel must cost one timeout window, not
+            # one timeout window per node.
+            inspected_controls = list(pool.map(inspect_control_route, control_nodes))
+    control_rows: list[JsonDict] = []
+    for node, (row, warning) in zip(control_nodes, inspected_controls, strict=True):
+        if warning is not None:
+            err.print(
+                f"[yellow]measure head → {escape(node.name)}: "
+                f"{escape(warning)}[/yellow]"
+            )
         control_rows.append(row)
 
     payload: JsonDict = {
@@ -15733,12 +16705,20 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
         from . import agent as agent_mod
 
         n_queued = len(jobs_mod.queued_entries(cfg))
-        agent_ok = agent_mod.alive_pid(cfg) is not None
+        agent_state = agent_mod.status(cfg)
+        agent_ok = bool(agent_state["alive"])
         relay_status = relay_agent_status(cfg)
         agent_label = (
-            "ok" if agent_ok else (f"off ({n_queued} queued!)" if n_queued else "off")
+            "fail: scheduler stalled"
+            if agent_state.get("scheduler_stalled")
+            else "fail: runtime command stale"
+            if agent_state.get("runtime_command_stale")
+            else "ok"
+            if agent_ok
+            else (f"off ({n_queued} queued!)" if n_queued else "off")
         )
         registry_label = registry_growth_status(cfg)
+        capability_checks = head_capability_checks()
         local_names = {n.name for n in cfg.nodes if n.local}
         drained_names = {n.name for n in cfg.nodes if n.drained}
         attached = False
@@ -15748,6 +16728,7 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
             if r["node"] in local_names:
                 r["checks"]["agent"] = agent_label
                 r["checks"]["registry"] = registry_label
+                r["checks"].update(capability_checks)
                 if relay_status is not None:
                     r["checks"]["relay"] = relay_status
                 attached = True
@@ -15760,6 +16741,7 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
                 "ssh": "ok",
                 "agent": agent_label,
                 "registry": registry_label,
+                **capability_checks,
             }
             if relay_status is not None:
                 checks["relay"] = relay_status
@@ -15837,7 +16819,7 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
             )
     ssh_failures = [row for row in rows if row["checks"].get("ssh") != "ok"]
     dependency_failure = any(
-        row["checks"].get(key) == "missing"
+        str(row["checks"].get(key, "")).startswith("missing")
         for row in rows
         for key in (
             "gpu",
@@ -15848,6 +16830,8 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
             "python3",
             "timeout",
             "dt",
+            "bash",
+            "supervisor",
         )
     ) or any(
         # A present-but-broken driver reports "error: ..."; it must fail the
@@ -15862,6 +16846,9 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
     relay_failure = any(
         str(row["checks"].get("relay", "")).startswith("fail") for row in rows
     )
+    agent_failure = any(
+        str(row["checks"].get("agent", "")).startswith(("fail", "off")) for row in rows
+    )
     lan_stale_nodes = [
         str(row["node"])
         for row in rows
@@ -15870,6 +16857,7 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
     hard_fail = (
         bool(ssh_failures)
         or dependency_failure
+        or agent_failure
         or relay_failure
         or bool(lan_stale_nodes)
     )
@@ -15937,7 +16925,7 @@ def _find(ref: str) -> None:
             )
             raise typer.Exit(1)
         raise typer.Exit(EXIT_NOT_FOUND)
-    print(json.dumps(asdict(entry)))
+    print(json.dumps(jobs_mod.public_job_record(entry)))
 
 
 def request_status(
@@ -15963,16 +16951,20 @@ def request_status(
             exit_code=1,
             json_=json_,
         )
+    inspection_in_progress = False
     try:
-        with intent_mod.lock(cfg, request_id):
+        with intent_mod.lock(cfg, request_id, blocking=False) as acquired:
+            inspection_in_progress = not acquired
             group_record = group_mod.load(cfg, request_id)
             record = intent_mod.load(cfg, request_id)
             if group_record is not None and record is not None:
                 raise group_mod.GroupRequestError(
                     "request identity has both single- and multi-job records"
                 )
-            if record is not None:
+            if record is not None and acquired:
                 record, entry = reconcile_submission_request(cfg, record)
+            elif record is not None:
+                entry = jobs_mod.load(cfg, record.job_id)
             else:
                 entry = None
     except (
@@ -16020,6 +17012,7 @@ def request_status(
                     "job_found": child_entry is not None,
                 }
         group_payload: JsonDict = asdict(group_record)
+        group_payload["schema_version"] = group_payload.get("schema")
         group_payload["job_ids"] = [entry.job_id for entry in group_entries]
         group_payload["submitted"] = len(group_entries)
         group_payload["jobs"] = [
@@ -16037,13 +17030,18 @@ def request_status(
             next_index if next_index <= group_record.requested else None
         )
         group_payload["unresolved_child"] = unresolved
-        group_payload["retry_with_same_request_id"] = group_record.state != "confirmed"
+        group_payload["inspection_in_progress"] = inspection_in_progress
+        group_payload["retry_with_same_request_id"] = (
+            group_record.state not in group_mod.GROUP_TERMINAL_STATES
+        )
         if json_:
             print(json.dumps(group_payload))
             return
         state_style = {
             "confirmed": "green",
+            "prepared": "cyan",
             "preparing": "yellow",
+            "rejected": "red",
             "uncertain": "yellow",
         }[group_record.state]
         out.print(
@@ -16056,6 +17054,11 @@ def request_status(
                 "[yellow]next child outcome is unresolved; retry the exact "
                 "original command with the same request id[/yellow]"
             )
+        elif group_record.state == "rejected":
+            err.print(
+                "[red]this request was durably rejected; inspect the failure "
+                "and use a new request id[/red]"
+            )
         elif group_record.state != "confirmed":
             err.print(
                 "[yellow]retry the exact original command with the same "
@@ -16063,6 +17066,24 @@ def request_status(
             )
         return
     if record is None:
+        if inspection_in_progress:
+            submitting_payload = {
+                "schema_version": "dt_submission_request_probe_v1",
+                "request_id": request_id,
+                "state": "submitting",
+                "job_found": False,
+                "job": None,
+                "inspection_in_progress": True,
+                "retry_with_same_request_id": False,
+            }
+            if json_:
+                print(json.dumps(submitting_payload))
+            else:
+                out.print(
+                    f"[yellow]submitting[/yellow] {escape(request_id)} · "
+                    "durable claim is in progress"
+                )
+            return
         _fail_submission(
             kind="not_found",
             message=f"no submission request matching {request_id!r}",
@@ -16075,6 +17096,7 @@ def request_status(
     # convergence window so consumers can standardize on `schema_version`.
     payload["schema_version"] = payload.get("schema")
     payload["job_found"] = entry is not None
+    payload["inspection_in_progress"] = inspection_in_progress
     payload["job"] = (
         {
             "job_id": entry.job_id,

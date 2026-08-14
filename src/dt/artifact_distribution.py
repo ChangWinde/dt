@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from . import snapshot_hash as snapshot_hash_mod
 from .config import HeadConfig, Node, Site
+from .jobs import job_lock, load
 from .layout import node_path, node_path_expression, rsync_destination
 from .link_metrics import (
     CONTROL_LINK_SCOPE,
@@ -39,6 +40,7 @@ from .sshio import (
     diagnostic_excerpt,
     rsync,
     rsync_failure_retryable,
+    rsync_stat_total,
     run_on,
 )
 from .topology import TopologyRegistry, TransferPlan, TransferPlanner
@@ -50,19 +52,26 @@ from .topology_discovery import (
     TopologyDiscoveryError,
 )
 
-_TRANSFERRED_RE = re.compile(r"Total transferred file size: ([\d,.]+) bytes")
-_FILES_RE = re.compile(r"Number of regular files transferred: ([\d,]+)")
+_GROUPED_INTEGER = r"([0-9][0-9,. \u00a0\u202f]*)"
+_TRANSFERRED_RE = re.compile(rf"Total transferred file size: {_GROUPED_INTEGER} bytes")
+_FILES_RE = re.compile(
+    rf"Number of regular files transferred: {_GROUPED_INTEGER}(?:\r?$)",
+    re.MULTILINE,
+)
 _TRANSFER_LOG_MAX_BYTES = 16 * 1024 * 1024
+_CACHE_STAGING_GC_DAYS = 7
 
 
-def _route_order_key(route: DiscoveredRoute) -> tuple[int, float, float]:
-    """Measured capacity ranks first, the static score breaks ties.
+def _route_order_key(route: DiscoveredRoute) -> tuple[int, int, float, float]:
+    """Destination-local data wins; measured capacity ranks network edges.
 
     Half-decade throughput buckets stop near-equal edges from flapping, and
     an unmeasured edge ranks optimistically so it gets tried, measured, and
-    settled into its true bucket (ADR 0024).
+    settled into its true bucket (ADR 0024). A route with no endpoint is an
+    already-local replica and must never lose to a network measurement.
     """
     return (
+        0 if route.endpoint is None else 1,
         throughput_bucket(route.throughput_bps),
         route.score,
         -route.replica.recorded_at,
@@ -70,7 +79,14 @@ def _route_order_key(route: DiscoveredRoute) -> tuple[int, float, float]:
 
 
 class DistributionError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        failed_attempts: tuple["TransferFailure", ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.failed_attempts = failed_attempts
 
 
 class ArtifactIntegrityError(DistributionError):
@@ -83,6 +99,24 @@ class ArtifactRouteError(DistributionError):
     def __init__(self, message: str, failure_kind: str):
         super().__init__(message)
         self.failure_kind = failure_kind
+
+
+@dataclass(frozen=True)
+class TransferFailure:
+    """Redacted evidence for one source route rejected before failover."""
+
+    source: str
+    destination: str
+    source_kind: str
+    failure_kind: str
+
+    def event(self) -> dict[str, str]:
+        return {
+            "source": self.source,
+            "destination": self.destination,
+            "source_kind": self.source_kind,
+            "failure_kind": self.failure_kind,
+        }
 
 
 def _destination_prepare_rsync_path(destination_expression: str) -> str:
@@ -129,6 +163,7 @@ class DistributionResult:
     fallback_direct: bool = False
     replica_hit: bool = False
     discovery_seconds: float = 0.0
+    failed_attempts: tuple[TransferFailure, ...] = ()
 
     def event(self) -> dict[str, object]:
         return {
@@ -160,6 +195,7 @@ class DistributionResult:
             "fallback_direct": self.fallback_direct,
             "replica_hit": self.replica_hit,
             "discovery_seconds": round(self.discovery_seconds, 6),
+            "failed_attempts": [attempt.event() for attempt in self.failed_attempts],
         }
 
 
@@ -227,12 +263,7 @@ def _append_transfer_event(cfg: HeadConfig, event: dict[str, object]) -> str | N
 
 
 def _stat_total(pattern: re.Pattern[str], stdout: str) -> int | None:
-    found = False
-    total = 0
-    for match in pattern.finditer(stdout or ""):
-        found = True
-        total += int(float(match.group(1).replace(",", "")))
-    return total if found else None
+    return rsync_stat_total(pattern, stdout)
 
 
 def inner_lan_ssh(port: int) -> str:
@@ -259,11 +290,16 @@ def inner_lan_ssh(port: int) -> str:
             "-o",
             "ProxyJump=none",
             "-o",
+            "ForwardAgent=no",
+            "-o",
             "StrictHostKeyChecking=yes",
             "-o",
             "ControlMaster=auto",
             "-o",
-            "ControlPath=~/.ssh/dt/artifact/%C",
+            # Never share a master with host-key-pinned topology endpoints.
+            # %C omits HostKeyAlias/UserKnownHostsFile, so reuse across the
+            # two trust policies could bypass the pinned endpoint's key check.
+            "ControlPath=~/.ssh/dt/artifact/lan-%C",
             "-o",
             "ControlPersist=300",
             "-p",
@@ -373,7 +409,7 @@ class ArtifactVerifier:
         code_expression = node_path_expression(code_dir)
         command = (
             f"test -d {code_expression} && test ! -L {code_expression} && "
-            f"python3 -c {shlex.quote(script)} {code_expression}"
+            f"python3 -I -c {shlex.quote(script)} {code_expression}"
         )
         try:
             proc = run_on(node.name, node.local, command, timeout=120)
@@ -569,6 +605,7 @@ class TransferExecutor:
         marker_expression = node_path_expression(marker)
         prepare = (
             "set -eu; umask 077; "
+            "command -v sync >/dev/null 2>&1 || exit 76; "
             f"if test -e {base_expression} || test -L {base_expression}; then "
             f"test -d {base_expression} && test ! -L {base_expression} || exit 73; "
             f"else mkdir -p {base_expression}; fi; "
@@ -585,7 +622,15 @@ class TransferExecutor:
             f"test -f {marker_expression} && "
             f"test ! -L {marker_expression} || exit 73; fi; "
             f"chmod 700 {base_expression} {partial_expression} "
-            f"{partial_code_expression}"
+            f"{partial_code_expression}; "
+            f"touch {partial_expression}; "
+            # Bounded integrated GC: only abandoned DT staging/quarantine
+            # directories directly below this exact configured cache root.
+            f"find {base_expression} -mindepth 1 -maxdepth 1 -xdev -type d "
+            "\\( -name '.partial-*' -o -name '.corrupt-*' \\) "
+            f"! -name {shlex.quote(f'.partial-{digest}')} "
+            f"-mtime +{_CACHE_STAGING_GC_DAYS} -exec find {{}} "
+            "-xdev -depth -delete \\;"
         )
         try:
             prepared = run_on(
@@ -656,18 +701,26 @@ class TransferExecutor:
         quarantine = node_path(base, f".corrupt-{digest}-{uuid4().hex}")
         marker_tmp = node_path(partial, f".complete.tmp-{uuid4().hex}")
         publish = (
-            "set -eu; "
+            "set -eu; command -v sync >/dev/null 2>&1; "
             f"test -d {partial_expression} && test ! -L {partial_expression}; "
             f"test -d {partial_code_expression} && "
             f"test ! -L {partial_code_expression}; "
+            f"sync -f {partial_code_expression}; "
             f"printf '%s\\n' {shlex.quote(digest)} > "
             f"{node_path_expression(marker_tmp)}; "
             f"chmod 600 {node_path_expression(marker_tmp)}; "
+            f"sync -f {node_path_expression(marker_tmp)}; "
             f"mv -f {node_path_expression(marker_tmp)} {marker_expression}; "
-            f"if test -e {node_path_expression(final)}; then "
+            f"sync -f {partial_expression}; "
+            f"if test -e {node_path_expression(final)} || "
+            f"test -L {node_path_expression(final)}; then "
+            f"test -d {node_path_expression(final)} && "
+            f"test ! -L {node_path_expression(final)} || exit 73; "
             f"mv {node_path_expression(final)} {node_path_expression(quarantine)}; "
+            f"sync -f {base_expression}; "
             "fi; "
-            f"mv {node_path_expression(partial)} {node_path_expression(final)}"
+            f"mv {node_path_expression(partial)} {node_path_expression(final)}; "
+            f"sync -f {base_expression}"
         )
         try:
             published = run_on(
@@ -715,6 +768,7 @@ class TransferExecutor:
         argv = [
             "rsync",
             "-a",
+            "--protect-args",
             "--partial",
             "--timeout=60",
             "--delete",
@@ -731,7 +785,7 @@ class TransferExecutor:
                 "umask 077; "
                 f"mkdir -p {node_path_expression(destination_code)}; "
                 f"test -d {node_path_expression(destination_code)} && "
-                f"test ! -L {node_path_expression(destination_code)}; "
+                f"test ! -L {node_path_expression(destination_code)} || exit 73; "
                 f"chmod 700 {node_path_expression(destination_code)}; "
                 f"{shlex.join(argv)} -- {source} {target}"
             )
@@ -751,13 +805,9 @@ class TransferExecutor:
                 if destination_code.startswith("~/")
                 else destination_code
             )
-            # The path after ``host:`` is parsed again by the receiver's
-            # shell, so quote it once for that layer (the whole target is then
-            # quoted once more for the sending shell below).
-            target = (
-                f"{destination.lan_address}:"
-                f"{shlex.quote(target_path.rstrip('/') + '/')}"
-            )
+            # Keep the endpoint quote-free as an rsync argv value. shlex.join
+            # below adds exactly the one quoting layer required by this shell.
+            target = f"{destination.lan_address}:{target_path.rstrip('/')}/"
             source = f"{node_path_expression(cache_code)}/"
             command = (
                 'mkdir -p "$HOME/.ssh/dt/artifact"; '
@@ -868,6 +918,7 @@ class TransferExecutor:
         argv = [
             "rsync",
             "-a",
+            "--protect-args",
             "--partial",
             "--timeout=60",
             "--delete",
@@ -886,7 +937,7 @@ class TransferExecutor:
                 "umask 077; "
                 f"mkdir -p {node_path_expression(destination_code)}; "
                 f"test -d {node_path_expression(destination_code)} && "
-                f"test ! -L {node_path_expression(destination_code)}; "
+                f"test ! -L {node_path_expression(destination_code)} || exit 73; "
                 f"chmod 700 {node_path_expression(destination_code)}; "
                 f"{shlex.join(argv)} -- {source} {target}"
             )
@@ -904,11 +955,7 @@ class TransferExecutor:
                 if destination_code.startswith("~/")
                 else destination_code
             )
-            # Same two-layer quoting as the fan-out path: the receiver's
-            # shell re-parses everything after ``host:``.
-            target = (
-                f"{endpoint.destination}:{shlex.quote(target_path.rstrip('/') + '/')}"
-            )
+            target = f"{endpoint.destination}:{target_path.rstrip('/')}/"
             source = f"{node_path_expression(source_code)}/"
             command = f"{setup}{shlex.join(argv)} -- {source} {shlex.quote(target)}"
             workload = SSHWorkload.ARTIFACT_RELAY
@@ -1026,6 +1073,40 @@ class TransferExecutor:
                 verified.append(route)
         return verified, corrupt, unavailable
 
+    @contextmanager
+    def _retain_peer_source(
+        self,
+        route: DiscoveredRoute,
+        digest: str,
+    ) -> Iterator[None]:
+        """Hold a peer capsule against clean/compact for the whole transfer.
+
+        Replica discovery is only a hint. Revalidate the authoritative row and
+        source digest after acquiring the same per-job lock used by destructive
+        lifecycle operations, then retain that lock until destination
+        verification completes. Site-cache replicas have their own object lock.
+        """
+        replica = route.replica
+        if replica.kind != "peer" or replica.job_id is None:
+            yield
+            return
+        with job_lock(self.cfg, replica.job_id):
+            current = load(self.cfg, replica.job_id)
+            expected_code = (
+                f"{current.job_dir.rstrip('/')}/code" if current is not None else None
+            )
+            if (
+                current is None
+                or current.node != replica.node.name
+                or current.snapshot_sha256 != digest
+                or expected_code != replica.code_dir
+            ):
+                raise DistributionError(
+                    f"peer source {replica.node.name} changed after route discovery"
+                )
+            self.verifier.require(replica.node, replica.code_dir, digest)
+            yield
+
     def _transfer_verified_routes(
         self,
         routes: list[DiscoveredRoute],
@@ -1034,29 +1115,41 @@ class TransferExecutor:
         destination_code: str,
         copy_dest: str | None,
         log: Callable[[str], None],
+        attempt_events: list[TransferFailure] | None = None,
     ) -> tuple[DiscoveredRoute | None, int, int | None, list[str]]:
         failures: list[str] = []
         for route in routes:
             try:
-                transferred_bytes, transferred_files = self._verified_transfer(
-                    lambda checksum: self._p2p_transfer(
-                        route,
-                        destination,
-                        destination_code,
-                        copy_dest,
-                        checksum=checksum,
-                    ),
-                    lambda: self.verifier.require(
-                        destination,
-                        destination_code,
-                        digest,
-                    ),
-                    label=(
-                        f"P2P transfer {route.replica.node.name} -> {destination.name}"
-                    ),
-                    log=log,
-                )
+                with self._retain_peer_source(route, digest):
+                    transferred_bytes, transferred_files = self._verified_transfer(
+                        lambda checksum: self._p2p_transfer(
+                            route,
+                            destination,
+                            destination_code,
+                            copy_dest,
+                            checksum=checksum,
+                        ),
+                        lambda: self.verifier.require(
+                            destination,
+                            destination_code,
+                            digest,
+                        ),
+                        label=(
+                            f"P2P transfer {route.replica.node.name} -> "
+                            f"{destination.name}"
+                        ),
+                        log=log,
+                    )
             except ArtifactRouteError as exc:
+                if attempt_events is not None:
+                    attempt_events.append(
+                        TransferFailure(
+                            source=route.replica.node.name,
+                            destination=destination.name,
+                            source_kind=route.replica.kind,
+                            failure_kind=exc.failure_kind,
+                        )
+                    )
                 try:
                     self.discovery.record_transfer_failure(
                         route,
@@ -1072,6 +1165,15 @@ class TransferExecutor:
                 )
                 continue
             except DistributionError as exc:
+                if attempt_events is not None:
+                    attempt_events.append(
+                        TransferFailure(
+                            source=route.replica.node.name,
+                            destination=destination.name,
+                            source_kind=route.replica.kind,
+                            failure_kind="artifact",
+                        )
+                    )
                 try:
                     self.discovery.release_transfer_reservation(route, destination)
                 except TopologyDiscoveryError as state_exc:
@@ -1136,7 +1238,7 @@ class TransferExecutor:
         started: float,
     ) -> DistributionResult:
         cache_node = self.topology.cache_node(site)
-        discovery_started = time.monotonic()
+        discovery_phase_started = time.monotonic()
         routes, present_replicas = self._discover_routes(
             site,
             digest,
@@ -1146,6 +1248,11 @@ class TransferExecutor:
         verified_routes, _corrupt_replicas, unavailable_replicas = (
             self._verified_routes(routes, digest, log)
         )
+        discovery_seconds = max(
+            0.0,
+            time.monotonic() - discovery_phase_started,
+        )
+        failed_attempts: list[TransferFailure] = []
         selected, site_bytes, transferred_files, transfer_failures = (
             self._transfer_verified_routes(
                 verified_routes,
@@ -1154,6 +1261,7 @@ class TransferExecutor:
                 destination_code,
                 copy_dest,
                 log,
+                failed_attempts,
             )
         )
         queue_seconds = 0.0
@@ -1164,7 +1272,8 @@ class TransferExecutor:
             if verified_routes:
                 detail = transfer_failures[-1] if transfer_failures else "route failed"
                 raise DistributionError(
-                    f"all verified P2P routes to {destination.name} failed: {detail}"
+                    f"all verified P2P routes to {destination.name} failed: {detail}",
+                    failed_attempts=tuple(failed_attempts),
                 )
             if unavailable_replicas or (present_replicas and not routes):
                 detail = (
@@ -1182,6 +1291,7 @@ class TransferExecutor:
             # it is released before destination fan-out.
             post_lock_routes: list[DiscoveredRoute] = []
             with _site_transfer_lock(self.cfg, site, digest) as queue_seconds:
+                discovery_phase_started = time.monotonic()
                 routes, present_replicas = self._discover_routes(
                     site,
                     digest,
@@ -1190,6 +1300,10 @@ class TransferExecutor:
                 )
                 post_lock_routes, _corrupt_replicas, unavailable_replicas = (
                     self._verified_routes(routes, digest, log)
+                )
+                discovery_seconds += max(
+                    0.0,
+                    time.monotonic() - discovery_phase_started,
                 )
                 if unavailable_replicas or (present_replicas and not routes):
                     detail = (
@@ -1221,11 +1335,17 @@ class TransferExecutor:
                         recorded_at=time.time(),
                     )
                     try:
+                        discovery_phase_started = time.monotonic()
                         post_lock_routes = [
                             self.discovery.route(cache_replica, destination)
                         ]
                     except TopologyDiscoveryError as exc:
                         raise DistributionError(str(exc)) from exc
+                    finally:
+                        discovery_seconds += max(
+                            0.0,
+                            time.monotonic() - discovery_phase_started,
+                        )
 
             selected, site_bytes, site_files, transfer_failures = (
                 self._transfer_verified_routes(
@@ -1235,17 +1355,18 @@ class TransferExecutor:
                     destination_code,
                     copy_dest,
                     log,
+                    failed_attempts,
                 )
             )
             if selected is None:
                 detail = transfer_failures[-1] if transfer_failures else "route failed"
                 raise DistributionError(
-                    f"all verified P2P routes to {destination.name} failed: {detail}"
+                    f"all verified P2P routes to {destination.name} failed: {detail}",
+                    failed_attempts=tuple(failed_attempts),
                 )
             if transferred_files is None:
                 transferred_files = site_files
 
-        discovery_seconds = max(0.0, time.monotonic() - discovery_started)
         if selected is None:
             raise DistributionError("topology selected no verified artifact source")
         artifact_source = selected.artifact_source(site)
@@ -1271,6 +1392,7 @@ class TransferExecutor:
             duration_seconds=max(0.0, time.monotonic() - started),
             replica_hit=not cold_cache_upload,
             discovery_seconds=discovery_seconds,
+            failed_attempts=tuple(failed_attempts),
         )
 
     def _direct_fallback(
@@ -1491,6 +1613,7 @@ class TransferExecutor:
                     result = replace(
                         result,
                         queue_seconds=fallback_queue_seconds,
+                        failed_attempts=exc.failed_attempts,
                     )
                 except Exception as fallback_exc:
                     exc = fallback_exc
@@ -1518,6 +1641,10 @@ class TransferExecutor:
                     "destination_site": destination.site,
                     "status": "failed",
                     "failure_kind": type(exc).__name__,
+                    "failed_attempts": [
+                        attempt.event()
+                        for attempt in getattr(exc, "failed_attempts", ())
+                    ],
                     "duration_seconds": round(max(0.0, time.monotonic() - started), 6),
                 },
             )

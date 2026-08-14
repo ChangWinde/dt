@@ -1,6 +1,8 @@
 import random
 import re
 
+import pytest
+
 from dt import jobs
 from dt.config import HeadConfig
 from dt.jobs import (
@@ -64,6 +66,7 @@ def test_compress_indices():
     assert compress_indices([0, 1, 2, 3, 5, 7]) == "0-3 5 7"
     assert compress_indices([4]) == "4"
     assert compress_indices([1, 2]) == "1-2"
+    assert compress_indices([1, 1, 2, 2]) == "1-2"
 
 
 def test_absent_storage_layout_infers_legacy_not_registry_directory():
@@ -433,6 +436,33 @@ def test_decode_cache_reuses_rows_until_the_file_revision_changes(
     by_id = {e.job_id: e for e in refreshed}
     assert by_id[first.job_id].reason == "revision-changed"
     assert by_id[second.job_id].reason != "revision-changed"
+
+
+def test_decode_cache_is_not_poisoned_when_a_caller_mutates_then_save_fails(
+    tmp_path, monkeypatch
+):
+    """An unsaved in-memory transition must not replace durable registry truth."""
+    cfg = _cache_cfg(tmp_path)
+    queued = _cache_entry("20260812-0902_queued_24a3", "queued")
+    queued.status = "queued"
+    save(cfg, queued)
+    monkeypatch.setattr(jobs, "_DECODE_CACHE_ENABLED", True)
+    monkeypatch.setattr(jobs, "_DECODE_CACHE", {})
+
+    cached = jobs.list_all(cfg)[0]
+    cached.status = "failed"
+    cached.reason = "transient dispatch failure"
+
+    def fail_write(*_args, **_kwargs):
+        raise jobs.PrivateStateError("simulated ENOSPC")
+
+    monkeypatch.setattr(jobs, "atomic_write", fail_write)
+    with pytest.raises(jobs.RegistryError, match="cannot publish registry record"):
+        save(cfg, cached)
+
+    observed = jobs.list_all(cfg)[0]
+    assert observed.status == "queued"
+    assert observed.reason is None
 
 
 def test_decode_cache_forgets_deleted_rows(tmp_path, monkeypatch):

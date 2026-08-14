@@ -40,6 +40,7 @@ def validate_resources(
     *,
     gpus: int,
     max_hours: float | None,
+    min_vram_mib: int | None = None,
     max_vram_mib: int | None = None,
     max_job_memory_mib: int | None = None,
     require_disk_gib: int | None = None,
@@ -51,6 +52,15 @@ def validate_resources(
         raise SubmissionValidationError("--require-disk-gib must be a positive integer")
     if max_hours is not None and (not math.isfinite(max_hours) or max_hours <= 0):
         raise SubmissionValidationError("--max-hours must be a finite positive number")
+    if min_vram_mib is not None:
+        if (
+            isinstance(min_vram_mib, bool)
+            or not isinstance(min_vram_mib, int)
+            or min_vram_mib <= 0
+        ):
+            raise SubmissionValidationError("--min-vram-mib must be a positive integer")
+        if gpus == 0:
+            raise SubmissionValidationError("--min-vram-mib requires at least one GPU")
     if max_vram_mib is not None:
         if max_vram_mib <= 0:
             raise SubmissionValidationError("--max-vram-mib must be a positive integer")
@@ -141,6 +151,7 @@ class SubmissionRequest:
     require_path: str | None = None
     require_disk_gib: int | None = None
     max_hours: float | None = None
+    min_vram_mib: int | None = None
     max_vram_mib: int | None = None
     max_job_memory_mib: int | None = None
     artifact_manifest: str | None = None
@@ -149,6 +160,7 @@ class SubmissionRequest:
     after_result: str | None = None
     after_result_states: tuple[str, ...] = ()
     request_id: str | None = None
+    custom_env: tuple[tuple[str, str], ...] = ()
 
     def resolved(
         self,
@@ -182,6 +194,7 @@ class SubmissionRequest:
             require_path=self.require_path,
             require_disk_gib=self.require_disk_gib,
             max_hours=self.max_hours,
+            min_vram_mib=self.min_vram_mib,
             max_vram_mib=self.max_vram_mib,
             max_job_memory_mib=self.max_job_memory_mib,
             artifact_manifest=self.artifact_manifest,
@@ -190,4 +203,5 @@ class SubmissionRequest:
             after_result=self.after_result,
             after_result_states=list(self.after_result_states),
             request_id=self.request_id,
+            custom_env=dict(self.custom_env),
         )
