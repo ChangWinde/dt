@@ -599,6 +599,68 @@ def test_project_path_must_be_absolute_or_home_rooted():
     assert "p" in ok.projects
 
 
+@pytest.mark.parametrize(
+    "project_path",
+    ["/", "~/..", "~/../.ssh", "/srv/./project", "/srv/a/../project"],
+)
+def test_project_path_rejects_overbroad_or_noncanonical_roots(project_path):
+    with pytest.raises(ConfigError, match="filesystem root|components|home directory"):
+        parse({"center": "c", "nodes": ["n1"], "projects": {"p": project_path}})
+
+
+def test_project_path_rejects_symlink_drift(tmp_path):
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+
+    with pytest.raises(ConfigError, match="canonical.*symlink"):
+        parse(
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "projects": {"p": str(alias)},
+            }
+        )
+
+
+def test_revalidate_project_root_rejects_post_load_symlink_swap(tmp_path):
+    configured = tmp_path / "project"
+    configured.mkdir()
+    project = parse(
+        {
+            "center": "c",
+            "nodes": ["n1"],
+            "projects": {"p": str(configured)},
+        }
+    ).projects["p"]
+    configured.rmdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    configured.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ConfigError, match="canonical.*symlink"):
+        config_module.revalidate_project_root(project.path, "projects.p.path")
+
+
+def test_revalidate_project_root_requires_an_existing_directory(tmp_path):
+    missing = tmp_path / "missing"
+    with pytest.raises(ConfigError, match="unavailable"):
+        config_module.revalidate_project_root(missing)
+    regular = tmp_path / "regular"
+    regular.write_text("not a project\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="existing directory"):
+        config_module.revalidate_project_root(regular)
+
+
+@pytest.mark.parametrize(
+    "section", ["paths", "projects", "queue", "operations", "sites"]
+)
+def test_explicit_null_mapping_sections_are_rejected(section):
+    with pytest.raises(ConfigError, match=rf"`{section}` must be a mapping"):
+        parse({"center": "c", "nodes": ["n1"], section: None})
+
+
 def test_proxy_requires_a_scheme():
     with pytest.raises(ConfigError, match="proxy"):
         parse({"center": "c", "nodes": ["n1"], "proxy": "host:3128"})
@@ -614,6 +676,26 @@ def test_proxy_requires_an_http_scheme_and_hostname():
             parse({"center": "c", "nodes": ["n1"], "proxy": bad})
     ok = parse({"center": "c", "nodes": ["n1"], "proxy": "https://host:3128"})
     assert ok.proxy == "https://host:3128"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("webhook", "http://[broken"),
+        ("webhook", "https://host:not-a-port/path"),
+        ("webhook", "https://host:65536/path"),
+        ("webhook", "https://host:/path"),
+        ("webhook", "https://host:0/path"),
+        ("proxy", "http://[broken"),
+        ("proxy", "http://host:not-a-port"),
+        ("proxy", "http://host:65536"),
+        ("proxy", "http://[::1]:"),
+        ("proxy", "http://host:0"),
+    ],
+)
+def test_http_endpoints_reject_malformed_hosts_and_ports(field, value):
+    with pytest.raises(ConfigError, match=r"HTTP\(S\).*(hostname|port)"):
+        parse({"center": "c", "nodes": ["n1"], field: value})
 
 
 def test_lan_address_rejects_ports_brackets_and_bare_ipv6():
@@ -657,6 +739,57 @@ def test_load_rejects_duplicate_keys_in_nested_mappings(tmp_path, monkeypatch):
 
     with pytest.raises(ConfigError, match="duplicate key 'gpus'"):
         load()
+
+
+def test_load_rejects_duplicate_keys_hidden_inside_a_yaml_merge(tmp_path, monkeypatch):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "center: c\nnodes: [n1]\npaths:\n  <<: {root: /srv/dt-a, root: /srv/dt-b}\n",
+    )
+    monkeypatch.setenv("DT_CONFIG", str(path))
+
+    with pytest.raises(ConfigError, match="duplicate key 'root'"):
+        load()
+
+
+@pytest.mark.parametrize("project_path", ["~", "~definitely-no-such-user/project"])
+def test_project_path_rejects_ambiguous_tilde_forms(project_path):
+    with pytest.raises(ConfigError, match="absolute or start with ~/"):
+        parse(
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "projects": {"p": project_path},
+            }
+        )
+
+
+@pytest.mark.parametrize("section", ["centers", "projects", "sites"])
+def test_identifiers_cannot_collide_after_whitespace_normalization(section):
+    if section == "centers":
+        payload = {"centers": {" lab": "head-a", "lab": "head-b"}}
+    elif section == "projects":
+        payload = {
+            "center": "c",
+            "nodes": ["n1"],
+            "projects": {" p": "/srv/p1", "p": "/srv/p2"},
+        }
+    else:
+        site = {"gateway": "n1", "nodes": ["n1"]}
+        payload = {
+            "center": "c",
+            "nodes": ["n1"],
+            "sites": {" lab": site, "lab": site},
+        }
+
+    with pytest.raises(ConfigError, match="duplicate.*after normalization"):
+        parse(payload)
+
+
+@pytest.mark.parametrize("name", ["host:2222", "2001:db8::1", "[::1]"])
+def test_node_names_reject_rsync_path_separators(name):
+    with pytest.raises(ConfigError, match="node name.*colon|nodes.*colon"):
+        parse({"center": "c", "nodes": [name]})
 
 
 def test_load_wraps_deeply_nested_yaml_as_config_error(tmp_path, monkeypatch):
@@ -715,3 +848,81 @@ def test_load_reuses_unchanged_parse_and_invalidates_after_atomic_replace(
     assert isinstance(changed, HeadConfig)
     assert changed.center == "second"
     assert calls == 2
+
+
+def test_active_command_contract_prefers_valid_persisted_custom_bin(
+    tmp_path, monkeypatch
+):
+    command = tmp_path / "custom-bin" / "dt"
+    command.parent.mkdir()
+    command.write_text("#!/bin/sh\n", encoding="utf-8")
+    command.chmod(0o700)
+    data_home = tmp_path / "data"
+    record = data_home / "disttrainer" / "active-command"
+    record.parent.mkdir(parents=True)
+    record.write_text(f"{command}\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+
+    assert config_module.active_dt_command() == command
+
+
+def test_active_command_contract_ignores_nonabsolute_or_stale_records(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    legacy = home / ".local" / "bin" / "dt"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("#!/bin/sh\n", encoding="utf-8")
+    legacy.chmod(0o700)
+    data_home = tmp_path / "data"
+    record = data_home / "disttrainer" / "active-command"
+    record.parent.mkdir(parents=True)
+    record.write_text("relative/dt\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+
+    assert config_module.active_dt_command() == legacy
+
+
+def test_active_command_contract_ignores_a_non_executable_record(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    legacy = home / ".local" / "bin" / "dt"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("#!/bin/sh\n", encoding="utf-8")
+    legacy.chmod(0o700)
+    inactive = tmp_path / "custom" / "dt"
+    inactive.parent.mkdir()
+    inactive.write_text("#!/bin/sh\n", encoding="utf-8")
+    inactive.chmod(0o600)
+    data_home = tmp_path / "data"
+    record = data_home / "disttrainer" / "active-command"
+    record.parent.mkdir(parents=True)
+    record.write_text(f"{inactive}\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+
+    assert config_module.active_dt_command() == legacy
+
+
+def test_active_command_contract_does_not_follow_a_record_symlink(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    legacy = home / ".local" / "bin" / "dt"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("#!/bin/sh\n", encoding="utf-8")
+    legacy.chmod(0o700)
+    custom = tmp_path / "custom" / "dt"
+    custom.parent.mkdir()
+    custom.write_text("#!/bin/sh\n", encoding="utf-8")
+    custom.chmod(0o700)
+    outside = tmp_path / "outside-record"
+    outside.write_text(f"{custom}\n", encoding="utf-8")
+    data_home = tmp_path / "data"
+    record = data_home / "disttrainer" / "active-command"
+    record.parent.mkdir(parents=True)
+    record.symlink_to(outside)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
+
+    assert config_module.active_dt_command() == legacy

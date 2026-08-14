@@ -130,7 +130,9 @@ means the SSH route enters a local tunnel (frp/autossh) whose low bandwidth
 bulk transfers would inherit — join the node to a site or pin `lan_address`
 before moving large data. `dt topology --measure` additionally streams a
 bounded payload to record real MiB/s; completed transfers keep those numbers
-fresh, and route ranking prefers measured-faster edges automatically.
+fresh, and route ranking prefers measured-faster edges automatically. Use
+`--source`/`--destination` for a one-edge check; they also exclude unrelated
+control routes, whose independent measurements otherwise run concurrently.
 
 Run `dt doctor --json` after upgrades, host or driver changes, or repeated
 unexplained launch failures: it verifies SSH, GPU runtime, transfer tools,
@@ -142,12 +144,17 @@ Use guards for long or memory-sensitive jobs:
 
 ```bash
 dt run -n bounded \
+  --min-vram-mib 40000 \
   --max-hours 12 \
   --max-vram-mib 23500 \
   --max-job-memory-mib 60000 \
   --require-disk-gib 80 \
   -- python train.py
 ```
+
+`--min-vram-mib` is a placement constraint on every allocated card's total
+memory; if that inventory is unavailable, GPU placement fails closed. It is
+distinct from `--max-vram-mib`, the runtime memory-usage guard.
 
 Disable progress bars in training code when possible to keep logs readable.
 

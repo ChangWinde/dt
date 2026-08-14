@@ -157,7 +157,7 @@ def test_node_paths_have_shell_and_rsync_safe_renderings(tmp_path, monkeypatch):
         "'/data/dt/worker/jobs/a b'"
     )
     assert rsync_destination("n1", False, "~/dt/worker/jobs/a b", directory=True) == (
-        "n1:'dt/worker/jobs/a b/'"
+        "n1:dt/worker/jobs/a b/"
     )
     assert (
         rsync_destination(
@@ -322,6 +322,31 @@ def test_role_storage_inventory_covers_every_managed_worker_class(tmp_path):
     }
 
 
+def test_role_storage_does_not_count_explicit_results_root_as_legacy(tmp_path):
+    results = tmp_path / "shared results"
+    results.mkdir()
+    cfg = HeadConfig(
+        center="c",
+        nodes=[],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/worker/envs",
+        results_root=results,
+        layout=ROLE_LAYOUT,
+    )
+
+    payload = inventory(
+        cfg, runner=lambda *_args, **_kwargs: None, disk_bytes=lambda _: 7
+    )
+
+    head = {row["kind"]: row for row in payload["head"]}
+    assert head["results"]["path"] == str(results)
+    assert "legacy_results" not in head
+    assert payload["total_bytes"] == 7
+    assert payload["accounting"]["legacy_bytes"] == 0
+
+
 def test_role_storage_inventory_counts_dedicated_site_artifact_cache(tmp_path):
     cfg = parse(
         {
@@ -410,6 +435,50 @@ def test_head_scan_failure_keeps_storage_accounting_incomplete(tmp_path):
     assert payload["total_bytes"] == 0
     assert payload["accounting"]["complete"] is False
     assert "head:results" in payload["accounting"]["unknown_sections"]
+
+
+def test_worker_entry_scan_failure_is_unknown_not_zero(tmp_path):
+    cfg = parse(
+        {
+            "center": "c",
+            "nodes": ["n1"],
+            "paths": {"root": str(tmp_path / "dt")},
+        }
+    )
+    assert isinstance(cfg, HeadConfig)
+    commands = []
+
+    def runner(_node, _local, command, **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            "\n".join(
+                f"{kind}\t{10 if kind == 'jobs' else 0}\t{-1 if kind == 'jobs' else 0}"
+                for kind in (
+                    "jobs",
+                    "envs",
+                    "artifacts",
+                    "cache",
+                    "runtime",
+                    "legacy_jobs",
+                )
+            ),
+            "",
+        )
+
+    payload = inventory(cfg, runner=runner, disk_bytes=lambda _path: 0)
+
+    node = payload["nodes"][0]
+    assert node["jobs"]["bytes"] == 10
+    assert node["jobs"]["entries"] is None
+    assert "entry scan failed: jobs" in node["error"]
+    assert payload["accounting"]["complete"] is False
+    assert "worker:n1:jobs" in payload["accounting"]["unknown_sections"]
+    # The find status is captured directly; piping into wc would turn a
+    # permission/error exit into a successful zero count.
+    assert "find " in commands[0]
+    assert "2>/dev/null | wc -l" not in commands[0]
 
 
 def test_local_directory_scan_failure_is_unknown_not_zero(tmp_path):

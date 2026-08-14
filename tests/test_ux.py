@@ -209,6 +209,12 @@ def test_busy_owners_rendering():
     assert busy_owners(gpus) == "alice\u00d72 bob\u00d71 dt:train-policy\u00d71"
 
 
+def test_busy_owners_escapes_remote_rich_markup():
+    gpus = [{"free": False, "procs": 1, "users": ["[link=https://bad]alice[/link]"]}]
+
+    assert busy_owners(gpus) == r"\[link=https://bad]alice\[/link]×1"
+
+
 def test_free_table_stays_compact_without_owner_column():
     from dt.render import free_table
 
@@ -884,6 +890,18 @@ def test_free_human_explains_idle_gpu_and_keeps_public_json_unchanged(
         "next_job_id": None,
         "next_condition": None,
         "registry_damage": 0,
+        "capacity": {
+            "schema_version": "dt_schedulable_capacity_v1",
+            "nodes": [
+                {
+                    "node": "n1",
+                    "drained": False,
+                    "available": True,
+                    "physical_free_gpus": 1,
+                    "schedulable_free_gpus": 1,
+                }
+            ],
+        },
         "queue": [],
     }
 
@@ -1203,6 +1221,25 @@ def test_ps_watch_view_warns_when_running_center_has_no_successor():
     assert max(map(len, rendered.splitlines())) <= 80
     assert "queue ends after 1 running job" in normalized
     assert "queue next: dt task n1" in normalized
+
+
+def test_ps_watch_view_treats_center_errors_as_literal_text():
+    from rich.console import Console
+
+    from dt.cli import _ps_view
+
+    console = Console(width=100, record=True, color_system=None)
+    console.print(
+        _ps_view(
+            [],
+            {"east": "bad [/yellow] /tmp/[broken]"},
+            all_=False,
+            wide=False,
+            poll=2.0,
+        )
+    )
+
+    assert "bad [/yellow] /tmp/[broken]" in console.export_text()
 
 
 def test_ps_watch_view_laptop_runway_command_pins_the_center():
@@ -2474,7 +2511,7 @@ def test_fan_json_can_preserve_valid_health_rows_on_nonzero(monkeypatch):
     assert errors == {}
 
 
-def test_fan_json_preserves_complete_head_error(monkeypatch):
+def test_fan_json_bounds_shareable_head_error(monkeypatch):
     import subprocess
 
     import dt.remote as remote_mod
@@ -2497,7 +2534,7 @@ def test_fan_json_preserves_complete_head_error(monkeypatch):
     rows, errors = remote_mod.fan_json(cfg, ["free"])
 
     assert rows == []
-    assert errors == {"test": detail}
+    assert errors == {"test": detail[:160]}
 
 
 def test_laptop_doctor_preserves_remote_health_rows_and_exit_5(
@@ -2705,7 +2742,9 @@ def test_doctor_human_suggests_seed_for_remote_slow_network(tmp_path, monkeypatc
 
     result = CliRunner().invoke(cli.app, ["doctor"], env={"COLUMNS": "80"})
 
-    assert result.exit_code == 0, result.output
+    # The network hints remain visible, but a pure head with no resident
+    # scheduler is now a doctor failure instead of an invisible idle state.
+    assert result.exit_code == 1, result.output
     assert "network slow/blocked on 2 nodes" in result.output
     assert "dt seed slow-node-with-a-descriptive-name" in result.output
     assert "another-slow-node-with-a-long-name --plan" in result.output
@@ -3582,7 +3621,7 @@ def test_pinned_submit_probes_only_the_pin(tmp_path, monkeypatch):
     """A --node submit must not fan out to the whole center."""
     import dt.dispatch as dispatch
     from dt.config import HeadConfig, Node, QueueCfg
-    from dt.probe import NodeStatus
+    from dt.probe import Gpu, NodeStatus
 
     cfg = HeadConfig(
         center="t",
@@ -3598,7 +3637,20 @@ def test_pinned_submit_probes_only_the_pin(tmp_path, monkeypatch):
 
     def fake_probe_node(node, mem, timeout=10):
         probed.append(node.name)
-        return NodeStatus(node=node.name, gpus=[])
+        return NodeStatus(
+            node=node.name,
+            gpus=[
+                Gpu(
+                    index=0,
+                    uuid="busy",
+                    mem_used=1024,
+                    mem_total=24 * 1024,
+                    util=1,
+                    procs=1,
+                    free=False,
+                )
+            ],
+        )
 
     def fake_probe_center(cfg_, use_cache=True):
         raise AssertionError("pinned submit must not probe the whole center")
@@ -3624,9 +3676,13 @@ def test_pinned_submit_probes_only_the_pin(tmp_path, monkeypatch):
     entry = dispatch.submit(cfg, spec, tmp_path, logs.append)
     assert probed == ["n2"]
     assert entry.status == "queued"
-    assert entry.reason == "waiting: no free capacity (n2: 0 free < 1 wanted)"
+    assert entry.reason == (
+        "waiting: no free capacity "
+        "(n2: 0 free < 1 wanted; busy: gpu0 ? 1.0/24.0GiB util1%)"
+    )
     assert logs[-1] == (
-        "no free capacity (n2: 0 free < 1 wanted); "
+        "no free capacity "
+        "(n2: 0 free < 1 wanted; busy: gpu0 ? 1.0/24.0GiB util1%); "
         "queueing (agent retries automatically)"
     )
 
@@ -3974,16 +4030,13 @@ def test_pinned_submit_records_job_specific_block_before_agent_tick(
             meta.update(snapshot_sha256="a" * 64) or tmp_path
         ),
     )
-    monkeypatch.setattr(
-        dispatch,
-        "_try_nodes",
-        lambda *args, **kwargs: (
-            None,
-            {"n1": "path-missing: /data/libero"},
-            False,
-            {"retryable"},
-        ),
-    )
+
+    def block_queued_job(cfg_, entry, _log):
+        entry.reason = "blocked: n1: path-missing: /data/libero"
+        dispatch.save(cfg_, entry)
+        return "blocked", "path-missing: /data/libero"
+
+    monkeypatch.setattr(dispatch, "dispatch_queued", block_queued_job)
 
     entry = dispatch.submit(
         cfg,
@@ -4418,3 +4471,4 @@ def test_fmt_duration():
     assert _fmt_duration(42) == "42s"
     assert _fmt_duration(125) == "2m05s"
     assert _fmt_duration(3700) == "1h01m"
+    assert _fmt_duration(-20) == "-20s"

@@ -17,9 +17,11 @@ import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from threading import Event
 
 from .artifact_distribution import _TRANSFERRED_RE, _stat_total, inner_lan_ssh
 from .config import HeadConfig, Node, Site
+from .jobs import JOB_ID_RE
 from .link_metrics import PersistentLinkMetrics, site_link_scope
 from .sshio import (
     RemoteError,
@@ -76,6 +78,8 @@ def dial_is_tunnel(options: dict[str, str]) -> bool:
     if options.get("proxyjump", "none").strip() not in {"", "none"}:
         return True
     hostname = options.get("hostname", "").strip()
+    if hostname.rstrip(".").lower() == "localhost":
+        return True
     try:
         return ipaddress.ip_address(hostname).is_loopback
     except ValueError:
@@ -172,6 +176,8 @@ def decide_pull_route(
 
 def staging_relative(job_id: str) -> str:
     """The gateway-side staging capsule, relative to the gateway's home."""
+    if JOB_ID_RE.fullmatch(job_id) is None:
+        raise RelayError("unsafe job identity for gateway staging")
     return f".dt/pull-staging/{job_id}"
 
 
@@ -210,15 +216,17 @@ def stage_command(
     argv = [
         "rsync",
         "-a",
+        "--protect-args",
         "--partial",
         "--timeout=60",
+        "--delete",
         "--stats",
         "--safe-links",
     ]
     for pattern in excludes:
         argv += ["--exclude", pattern]
     argv += ["-e", inner_lan_ssh(node.lan_port)]
-    source = f"{node.lan_address}:{shlex.quote(_remote_source_path(job_dir))}"
+    source = f"{node.lan_address}:{_remote_source_path(job_dir)}"
     script = (
         "umask 077; "
         'root="$HOME/.dt/pull-staging"; '
@@ -226,10 +234,12 @@ def stage_command(
         # The whole staging chain must be real directories: a symlinked root
         # or capsule would silently redirect result bytes elsewhere. Check
         # before mkdir so nothing is ever created behind a planted link.
-        'test ! -L "$HOME/.dt" && test ! -L "$root" || exit 70; '
+        'test ! -L "$HOME/.dt" && test ! -L "$root" || '
+        '{ echo "DT_RELAY_UNSAFE_STAGING: symlinked root" >&2; exit 70; }; '
         'mkdir -p "$capsule"/outputs; '
         'test -d "$capsule"/outputs && test ! -L "$capsule" '
-        '&& test ! -L "$capsule"/outputs || exit 70; '
+        '&& test ! -L "$capsule"/outputs || '
+        '{ echo "DT_RELAY_UNSAFE_STAGING: unsafe capsule" >&2; exit 70; }; '
         'chmod 700 "$HOME/.dt" "$root" "$capsule"; '
         # A resumed pull refreshes the capsule mtime so the age sweep below
         # never reaps a capsule that is actively being retried.
@@ -238,7 +248,7 @@ def stage_command(
         # gateway disk forever; the active capsule is excluded by name.
         f'find "$root" -mindepth 1 -maxdepth 1 -type d '
         f"! -name {shlex.quote(job_id)} -mtime +{STAGING_GC_DAYS} "
-        "-exec rm -rf -- {} + 2>/dev/null; "
+        "-exec find {} -xdev -depth -delete \\; 2>/dev/null; "
         f"dt_need_kb={need_kb}; "
         "dt_avail_kb=$(df -Pk \"$root\" 2>/dev/null | awk 'NR == 2 {print $4}'); "
         'case "$dt_avail_kb" in ""|*[!0-9]*) dt_avail_kb=0;; esac; '
@@ -255,7 +265,16 @@ def stage_command(
 def cleanup_command(job_id: str) -> str:
     """Remove one staging capsule after a fully recovered pull."""
     capsule = shlex.quote(staging_relative(job_id))
-    script = f'rm -rf -- "$HOME"/{capsule}'
+    script = (
+        'root="$HOME/.dt/pull-staging"; '
+        f'capsule="$HOME"/{capsule}; '
+        'test ! -L "$HOME/.dt" && test -d "$root" && test ! -L "$root" '
+        "|| exit 70; "
+        '[ ! -e "$capsule" ] && [ ! -L "$capsule" ] && exit 0; '
+        'test -d "$capsule" && test ! -L "$capsule" || exit 70; '
+        'find "$capsule" -xdev -depth -delete >/dev/null 2>&1; '
+        '[ ! -e "$capsule" ] && [ ! -L "$capsule" ]'
+    )
     return f"bash -c {shlex.quote(script)}"
 
 
@@ -268,6 +287,7 @@ def stage_outputs(
     excludes: list[str],
     estimate_bytes: int | None,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
+    cancel_event: Event | None = None,
 ) -> int:
     """Execute leg A with bounded retries; returns transferred bytes.
 
@@ -287,6 +307,8 @@ def stage_outputs(
     )
     last = None
     for attempt in range(STAGE_ATTEMPTS):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RelayError("node -> gateway staging cancelled locally")
         started = time.monotonic()
         try:
             last = runner(
@@ -295,6 +317,7 @@ def stage_outputs(
                 command,
                 timeout=STAGE_TIMEOUT_S,
                 workload=SSHWorkload.ARTIFACT_RELAY,
+                cancel_event=cancel_event,
             )
         except (RemoteError, OSError) as exc:
             raise RelayError(
@@ -319,7 +342,12 @@ def stage_outputs(
             last.stdout or "",
             last.stderr or "",
         ):
-            time.sleep(min(5 * (attempt + 1), 15))
+            delay = min(5 * (attempt + 1), 15)
+            if cancel_event is not None:
+                if cancel_event.wait(delay):
+                    raise RelayError("node -> gateway staging cancelled locally")
+            else:
+                time.sleep(delay)
             continue
         break
     detail = diagnostic_excerpt(

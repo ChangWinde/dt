@@ -28,6 +28,7 @@ from typing import TextIO, TypedDict
 _active_gpu_probe: subprocess.Popen[str] | None = None
 _active_gpu_probe_lock = threading.RLock()
 _CLOCK_TICKS = int(os.sysconf("SC_CLK_TCK"))
+_VRAM_GUARD_MAX_CONSECUTIVE_UNAVAILABLE = 3
 _CounterMap = dict[tuple[int, int], int]
 
 
@@ -480,6 +481,54 @@ def _gpu_memory_violation(
     return None
 
 
+def _vram_observation_error(
+    gpus: list[dict[str, object]],
+    gpu_error: str | None,
+    selected: set[int] | None,
+    limit_mib: int | None,
+) -> str | None:
+    """Explain why a VRAM guard sample cannot prove its contract.
+
+    A guard that silently stops observing a selected device is not armed.
+    Require one finite memory reading for every selected index (or every row
+    in the standalone all-device mode) and let the caller fail closed only
+    after a short bounded grace window for transient driver resets.
+    """
+    if limit_mib is None:
+        return None
+    if gpu_error:
+        return gpu_error[-240:]
+    if selected == set():
+        return "no GPUs were selected for the VRAM guard"
+
+    observed: set[int] = set()
+    for gpu in gpus:
+        index = gpu.get("index")
+        memory = gpu.get("mem_used_mib")
+        if (
+            not isinstance(index, int)
+            or isinstance(index, bool)
+            or index in observed
+            or not isinstance(memory, (int, float))
+            or isinstance(memory, bool)
+            or not math.isfinite(memory)
+        ):
+            return "GPU telemetry returned a malformed or duplicate memory row"
+        observed.add(index)
+    if selected is None:
+        if not observed:
+            return "GPU telemetry returned no memory rows"
+        return None
+    missing = sorted(selected - observed)
+    unexpected = sorted(observed - selected)
+    if missing or unexpected:
+        return (
+            "GPU telemetry selection mismatch: "
+            f"missing={missing or 'none'}, unexpected={unexpected or 'none'}"
+        )
+    return None
+
+
 def _job_memory_violation(
     job: dict[str, int | float | None] | None,
     limit_mib: int | None,
@@ -554,8 +603,6 @@ def _trip_resource_guard(
     phase: str | None,
 ) -> bool:
     """Persist evidence, then terminate the complete tree and wrapper group."""
-    observed = violation["observed_mib"]
-    limit = violation["limit_mib"]
     descendants = _job_process_pids(root_pid) - {root_pid}
     record = {
         "schema_version": "dt_resource_guard_v1",
@@ -575,14 +622,24 @@ def _trip_resource_guard(
         _write_json_atomic(output, record)
     except OSError as exc:
         _guard_warn(f"[telemetry] resource guard could not persist evidence: {exc}")
-    if kind == "max_vram_mib":
+    if kind == "max_vram_mib_observation_failure":
+        _guard_warn(
+            "[telemetry] VRAM guard telemetry remained unavailable for "
+            f"{violation.get('consecutive_failures')} consecutive samples; "
+            f"terminating job process group {root_pid}"
+        )
+    elif kind == "max_vram_mib":
         subject = f"GPU {violation.get('gpu_index')} memory"
+        _guard_warn(
+            f"[telemetry] {subject} {violation['observed_mib']} MiB exceeded "
+            f"{violation['limit_mib']} MiB; terminating job process group {root_pid}"
+        )
     else:
         subject = f"job host memory ({violation.get('observed_metric')})"
-    _guard_warn(
-        f"[telemetry] {subject} {observed} MiB exceeded {limit} MiB; "
-        f"terminating job process group {root_pid}"
-    )
+        _guard_warn(
+            f"[telemetry] {subject} {violation['observed_mib']} MiB exceeded "
+            f"{violation['limit_mib']} MiB; terminating job process group {root_pid}"
+        )
     for pid in descendants:
         # PID reuse can point this at another user's process; a failed
         # per-descendant signal must not abort the authoritative group kill.
@@ -709,6 +766,7 @@ def main() -> int:
     selected = _selected_gpus(args.gpus)
 
     count = 0
+    vram_unavailable_samples = 0
     job_state: _JobUsageState | None = None
     next_sample_at = time.monotonic()
     with _sample_stream(args.output) as stream:
@@ -756,6 +814,32 @@ def main() -> int:
                 phase=phase,
             ):
                 break
+            vram_error = _vram_observation_error(
+                gpus,
+                gpu_error,
+                selected,
+                args.max_vram_mib,
+            )
+            if vram_error is None:
+                vram_unavailable_samples = 0
+            else:
+                vram_unavailable_samples += 1
+                if (
+                    vram_unavailable_samples >= _VRAM_GUARD_MAX_CONSECUTIVE_UNAVAILABLE
+                    and _trip_resource_guard(
+                        root_pid=args.root_pid,
+                        output=args.guard_output,
+                        kind="max_vram_mib_observation_failure",
+                        violation={
+                            "limit_mib": args.max_vram_mib,
+                            "consecutive_failures": vram_unavailable_samples,
+                            "reason": vram_error,
+                        },
+                        sampled_at=sampled_at,
+                        phase=phase,
+                    )
+                ):
+                    break
             violation = _job_memory_violation(job, args.max_job_memory_mib)
             if violation is not None and _trip_resource_guard(
                 root_pid=args.root_pid,

@@ -28,6 +28,17 @@ unit, while a first-time failure removes the candidate and reloads the user
 manager. An install error therefore must be investigated; it is never evidence
 that the new supervisor became authoritative.
 
+Submission and the resident agent share a versioned durable dispatch protocol.
+If a source checkout or newly installed CLI meets an older live agent, DT
+refuses the submission before creating artifacts or job state instead of
+letting two releases schedule the same row. Activate the intended release and
+restart the agent; `dt agent status --json` exposes
+`runtime_dispatch_protocol_compatible` for automation. Observation and
+recovery commands remain usable during this upgrade boundary. When no agent is
+alive, `dt` also verifies the active command's bounded protocol advertisement
+before starting the installed supervisor; an old stopped service is left
+stopped and queued work remains durable.
+
 Queue limits, nodes, projects, routes, and other operational settings reload on
 the next poll. `center`, `paths.root`, and the runtime layout are agent identity,
 not hot-reload knobs: changing one makes the old process exit before it can mix
@@ -173,7 +184,9 @@ A full site probe is capped at 256 directed edges by default. For a large site,
 scope the dry run with `dt topology --site SITE --source NODE --json` or
 `--destination NODE`; raise `--max-edges` only when that larger active probe is
 intentional. The hard ceiling is 4,096 edges, and discovery still performs no
-Artifact transfer or subnet scan.
+Artifact transfer or subnet scan. Endpoint filters also restrict control-route
+classification and measurement to the selected endpoints, so a one-edge dry
+run never waits for unrelated or offline members.
 
 `dt topology` also classifies every head-to-node control route: `relayed`
 means the operator SSH route enters a local tunnel endpoint (frp, autossh,
@@ -183,12 +196,14 @@ means NAT or an unknown middlebox. `dt doctor` repeats the warning per node.
 When a relayed node needs bulk traffic, join it to a site or pin
 `lan_address` so transfers leave the tunnel. `dt topology --measure` streams
 a bounded payload over every healthy site edge and control route and records
-MiB/s; completed transfers keep those numbers fresh automatically, and route
-ranking prefers measured-faster edges (half-decade buckets, unmeasured edges
-stay optimistic until first use). A slow measurement cannot pin a healthy
-edge permanently: below-optimistic evidence expires after 15 minutes, the
-edge ranks as unmeasured again and earns a retrial, and one congested
-transfer folds in at low weight while recovery folds in at high weight.
+MiB/s. Independent control routes are measured concurrently, so several slow
+tunnels consume one timeout window instead of one window per node. Completed
+transfers keep those numbers fresh automatically, and route ranking prefers
+measured-faster edges (half-decade buckets, unmeasured edges stay optimistic
+until first use). A slow measurement cannot pin a healthy edge permanently:
+below-optimistic evidence expires after 15 minutes, the edge ranks as
+unmeasured again and earns a retrial, and one congested transfer folds in at
+low weight while recovery folds in at high weight.
 
 Read-only topology and GPU telemetry probes may retry once through a fresh,
 non-multiplexed DT overlay when stderr proves a stale ControlMaster. The retry
@@ -254,6 +269,25 @@ dt pull JOB --exclude checkpoints/
 resumable and preserves partial data on interruption. `--force` can merge into
 a nonempty or differently owned directory and should be reserved for a
 reviewed recovery case.
+
+### Transfer bandwidth budget
+
+`dt pull --bwlimit KBPS` and `dt sync --bwlimit KBPS` cap the head-side
+transfer legs (rsync `--bwlimit`, KiB/s) so a checkpoint recovery cannot
+starve interactive sessions sharing the head's uplink.
+`sites.<name>.bwlimit_kbps` sets a per-site default; the flag overrides it.
+The budget deliberately never throttles intra-site LAN replays — those are
+the legs gateway staging exists to keep fast.
+
+### Draining a node for maintenance
+
+Set `nodes[].drained: true` and the agent (which reloads the config every
+tick) stops placing new jobs there — explicit `--node` pins included —
+while running jobs finish undisturbed. `dt free` marks the node
+`(drained)`, `dt doctor` reports a `drained` check, queued jobs explain
+`drained: maintenance` instead of a misleading capacity claim, and
+`dt free --explain` never promises a drained node. Lift the flag to
+return the node to service; no state file or restart is involved.
 
 ### Gateway-staged project sync
 

@@ -1,3 +1,4 @@
+import io
 import hashlib
 import os
 import shlex
@@ -5,6 +6,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -33,6 +35,8 @@ Host worker
 """
     )
     monkeypatch.setenv("DT_SSH_STATE_DIR", str(state))
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "runtime-without-agent"))
     monkeypatch.setenv("DT_SSH_CONFIG", str(user_config))
     system_config = tmp_path / "system-ssh-config"
     system_config.write_text("Host *\n    SendEnv LANG\n")
@@ -65,8 +69,8 @@ def test_control_and_artifact_pools_are_private_and_disjoint(tmp_path, monkeypat
     assert "ForwardAgent yes" not in artifact.read_text()
     assert "ForwardAgent no" in control.read_text()
     assert "ForwardAgent no" in artifact.read_text()
-    assert "ForwardAgent yes" in relay.read_text()
-    assert "ForwardAgent no" not in relay.read_text()
+    assert "ForwardAgent yes" not in relay.read_text()
+    assert "ForwardAgent no" in relay.read_text()
     assert "ConnectTimeout 10" in control.read_text()
     assert "ConnectTimeout 10" in artifact.read_text()
     assert "ConnectTimeout 10" in relay.read_text()
@@ -84,7 +88,8 @@ def test_included_forward_agent_cannot_leak_to_control_or_artifact(
 ):
     _state, user_config, _system_config = _transport_home(tmp_path, monkeypatch)
     # A user who enables agent forwarding globally must not have it applied to
-    # dt's control or bulk-data connections; only the trusted relay forwards.
+    # dt's control, bulk-data, or gateway relay connections. A relay uses
+    # gateway-local authentication rather than exposing the operator's agent.
     user_config.write_text("Host *\n    ForwardAgent yes\n")
 
     def effective_forward_agent(workload):
@@ -102,7 +107,33 @@ def test_included_forward_agent_cannot_leak_to_control_or_artifact(
 
     assert effective_forward_agent(sshio.SSHWorkload.CONTROL) == "no"
     assert effective_forward_agent(sshio.SSHWorkload.ARTIFACT) == "no"
-    assert effective_forward_agent(sshio.SSHWorkload.ARTIFACT_RELAY) == "yes"
+    assert effective_forward_agent(sshio.SSHWorkload.ARTIFACT_RELAY) == "no"
+
+
+def test_relay_subprocess_never_forwards_or_injects_an_agent(tmp_path, monkeypatch):
+    _transport_home(tmp_path, monkeypatch)
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "operator-agent.sock"))
+    seen = []
+
+    def fake_run(cmd, *, timeout, cwd=None, cancel_event=None, env=None):
+        seen.append(env)
+        return subprocess.CompletedProcess(cmd, 0, "ok\n", "")
+
+    monkeypatch.setattr(sshio, "_run_bounded_process", fake_run)
+    sshio.run_remote(
+        "worker",
+        "true",
+        workload=sshio.SSHWorkload.ARTIFACT_RELAY,
+    )
+    sshio.run_on(
+        "local",
+        True,
+        "true",
+        workload=sshio.SSHWorkload.ARTIFACT_RELAY,
+    )
+    sshio.run_remote("worker", "true")
+
+    assert seen == [None, None, None]
 
 
 def test_proxyjump_inherits_artifact_overlay_instead_of_global_socket(
@@ -165,6 +196,8 @@ def test_rsync_uses_artifact_pool_while_remote_commands_use_control_pool(
     monkeypatch.setattr(sshio, "_run_rsync_attempt", fake_run)
 
     sshio.rsync("source/", "worker:target/")
+    assert "--protect-args" in seen["cmd"]
+    assert "--secluded-args" not in seen["cmd"]
     remote_shell = shlex.split(seen["cmd"][seen["cmd"].index("-e") + 1])
     assert remote_shell == ["ssh", "-F", str(state / "artifact.conf")]
     # Option parsing must end before the transfer operands so a path beginning
@@ -393,6 +426,40 @@ def test_bounded_transport_replaces_non_utf8_diagnostics():
     assert proc.stderr == "\ufffddiagnostic"
 
 
+def test_bounded_transport_cancellation_reaps_the_process_group():
+    cancel = threading.Event()
+
+    def request_cancel():
+        time.sleep(0.1)
+        cancel.set()
+
+    thread = threading.Thread(target=request_cancel)
+    thread.start()
+    started = time.monotonic()
+    try:
+        proc = sshio._run_bounded_process(
+            ["/bin/sh", "-c", "sleep 30"],
+            timeout=10,
+            cancel_event=cancel,
+        )
+    finally:
+        thread.join(timeout=1)
+
+    assert proc.returncode == 130
+    assert "cancelled locally" in proc.stderr
+    assert time.monotonic() - started < 2
+
+
+def test_local_transport_timeout_uses_the_remote_error_contract(monkeypatch):
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(["bash"], 3)
+
+    monkeypatch.setattr(sshio, "_run_bounded_process", timeout)
+
+    with pytest.raises(sshio.RemoteError, match=r"\[local\] timed out after 3s"):
+        sshio.run_local("true", timeout=3)
+
+
 def test_transport_drains_both_streams_but_retains_bounded_head_and_tail(
     monkeypatch,
 ):
@@ -463,6 +530,53 @@ def test_capture_stdout_bounds_machine_response_while_inheriting_stderr(
     assert capfd.readouterr().err == "live-diagnostic"
 
 
+def test_capture_stdout_sends_private_bytes_outside_argv():
+    secret = b'{"TOKEN":"not-in-process-argv"}\n'
+    proc = sshio.run_capture_stdout(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())",
+        ],
+        timeout=2,
+        stdin_bytes=secret,
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout.encode() == secret
+    assert all("not-in-process-argv" not in arg for arg in proc.args)
+
+
+def test_capture_stdout_file_input_is_explicitly_bounded():
+    source = io.BytesIO(b"first-secret|must-not-cross")
+    proc = sshio.run_capture_stdout(
+        [sys.executable, "-c", "import sys; print(len(sys.stdin.buffer.read()))"],
+        timeout=2,
+        stdin_file=source,
+        stdin_length=len(b"first-secret"),
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == str(len(b"first-secret"))
+    assert source.tell() == len(b"first-secret")
+
+
+def test_capture_stdout_rejects_unbounded_or_oversized_stdin():
+    command = [sys.executable, "-c", "pass"]
+    with pytest.raises(ValueError, match="requires stdin_length"):
+        sshio.run_capture_stdout(
+            command,
+            timeout=2,
+            stdin_file=io.BytesIO(b"secret"),
+        )
+    with pytest.raises(ValueError, match="exceeds"):
+        sshio.run_capture_stdout(
+            command,
+            timeout=2,
+            stdin_bytes=b"x" * (sshio.MAX_STDIN_BYTES + 1),
+        )
+
+
 def test_diagnostic_excerpt_is_bounded_and_keeps_both_failure_boundaries():
     detail = sshio.diagnostic_excerpt(
         "BEGIN " + "secret-noise " * 1000 + "END",
@@ -521,7 +635,7 @@ def test_read_only_remote_probe_retries_stale_mux_once_without_mux(
     state, _user_config, _system_config = _transport_home(tmp_path, monkeypatch)
     calls = []
 
-    def fake_run(cmd, *, timeout, cwd=None):
+    def fake_run(cmd, *, timeout, cwd=None, cancel_event=None, env=None):
         calls.append((cmd, timeout, cwd))
         if len(calls) == 1:
             return subprocess.CompletedProcess(
@@ -552,7 +666,7 @@ def test_remote_mutation_never_retries_stale_mux_by_default(tmp_path, monkeypatc
     _transport_home(tmp_path, monkeypatch)
     calls = []
 
-    def fake_run(cmd, *, timeout, cwd=None):
+    def fake_run(cmd, *, timeout, cwd=None, cancel_event=None, env=None):
         calls.append((cmd, timeout, cwd))
         return subprocess.CompletedProcess(
             cmd,

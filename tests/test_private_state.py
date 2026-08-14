@@ -90,6 +90,28 @@ def test_generic_io_pins_directory_and_replaces_leaf_symlink(tmp_path):
     assert path.stat().st_mode & 0o777 == 0o600
 
 
+def test_atomic_write_regular_retries_spurious_openat_enoent(tmp_path, monkeypatch):
+    directory = tmp_path / "public"
+    directory.mkdir()
+    path = directory / "record"
+    real_open = private_state_mod.os.open
+    attempts = 0
+
+    def flaky_open(name, flags, mode=0o777, *, dir_fd=None):
+        nonlocal attempts
+        if dir_fd is not None and flags & os.O_CREAT and attempts == 0:
+            attempts += 1
+            raise FileNotFoundError(name)
+        return real_open(name, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(private_state_mod.os, "open", flaky_open)
+
+    atomic_write_regular(path, b"durable")
+
+    assert attempts == 1
+    assert path.read_bytes() == b"durable"
+
+
 def test_bounded_reader_rejects_a_file_mutated_during_read(tmp_path, monkeypatch):
     path = tmp_path / "state" / "record"
     atomic_write(path, b"initial")

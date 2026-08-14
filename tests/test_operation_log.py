@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 from typer.testing import CliRunner
 
-from dt import cli
+from dt import cli, operation_log
 from dt.config import ConfigError, HeadConfig, LaptopConfig, OperationsCfg, parse
 from dt.operation_log import (
     JOURNAL_NAME,
@@ -252,6 +252,21 @@ def test_append_is_atomic_across_concurrent_writers(tmp_path):
     }
 
 
+def test_append_repairs_a_torn_tail_before_acknowledging_the_next_event(tmp_path):
+    cfg = _head_config(tmp_path)
+    assert isinstance(cfg, HeadConfig)
+    target = resolve_target(cfg)
+    target.directory.mkdir(parents=True)
+    first = _finish_event("1" * 32)
+    target.current.write_bytes((json.dumps(first) + "\n").encode("utf-8") + b'{"torn":')
+
+    append_event(target, _finish_event("2" * 32))
+
+    rows = [json.loads(line) for line in target.current.read_text().splitlines()]
+    assert [row["operation_id"] for row in rows] == ["1" * 32, "2" * 32]
+    assert query(target).corrupt_records == 0
+
+
 def test_rotation_refuses_symlink_targets(tmp_path):
     cfg = _head_config(tmp_path)
     assert isinstance(cfg, HeadConfig)
@@ -267,8 +282,6 @@ def test_rotation_refuses_symlink_targets(tmp_path):
 
 
 def test_query_open_refuses_a_symlink_after_candidate_selection(tmp_path, monkeypatch):
-    from dt import operation_log
-
     cfg = _head_config(tmp_path)
     assert isinstance(cfg, HeadConfig)
     target = resolve_target(cfg)
@@ -287,6 +300,22 @@ def test_query_open_refuses_a_symlink_after_candidate_selection(tmp_path, monkey
 
     with pytest.raises(OperationJournalError):
         query(target)
+
+
+def test_events_head_rejects_center_with_json_error(tmp_path, monkeypatch):
+    cfg = _head_config(tmp_path)
+    assert isinstance(cfg, HeadConfig)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, ["events", "--center", "remote", "--json"])
+
+    assert result.exit_code == 1, result.output
+    assert json.loads(result.stdout) == {
+        "error": "invalid_argument",
+        "message": "--center is available only in laptop mode",
+        "reasons": {},
+        "exit_code": 1,
+    }
 
 
 def test_query_open_refuses_a_fifo_after_candidate_selection(tmp_path, monkeypatch):

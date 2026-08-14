@@ -1,4 +1,5 @@
 import json
+import threading
 
 from typer.testing import CliRunner
 
@@ -41,6 +42,31 @@ def _cfg(tmp_path):
             "lab": Site(
                 name="lab",
                 nodes=("head", "worker"),
+                gateway="head",
+                cache_node="head",
+                artifact_policy="topology-aware",
+            )
+        },
+    )
+
+
+def _cfg_with_unrelated_node(tmp_path):
+    nodes = [
+        Node(name="head", local=True, site="lab"),
+        Node(name="worker", site="lab"),
+        Node(name="unrelated", site="lab"),
+    ]
+    return HeadConfig(
+        center="research",
+        nodes=nodes,
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+        sites={
+            "lab": Site(
+                name="lab",
+                nodes=("head", "worker", "unrelated"),
                 gateway="head",
                 cache_node="head",
                 artifact_policy="topology-aware",
@@ -227,3 +253,107 @@ def test_topology_forwards_bounded_source_scope(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert seen == {"source": "head", "destination": None, "max_edges": 7}
+
+
+def test_topology_endpoint_scope_excludes_unrelated_control_routes(
+    tmp_path, monkeypatch
+):
+    import dt.topology_discovery as discovery_module
+
+    monkeypatch.setattr(cli, "_cfg", lambda: _cfg_with_unrelated_node(tmp_path))
+    monkeypatch.setattr(
+        discovery_module.TopologyDiscovery,
+        "discover_edges",
+        lambda self, site, **kwargs: _edges()[:1],
+    )
+    measured_edges = []
+    monkeypatch.setattr(
+        discovery_module.TopologyDiscovery,
+        "measure_route",
+        lambda self, source, destination: measured_edges.append(
+            (source.name, destination.name)
+        ),
+    )
+    measured_controls = []
+
+    def measure_control(node, *, probe_bytes):
+        measured_controls.append(node.name)
+        return probe_bytes, 10.0
+
+    monkeypatch.setattr(discovery_module, "measure_control_route", measure_control)
+    monkeypatch.setattr(
+        discovery_module,
+        "local_interface_addresses",
+        lambda: frozenset(),
+    )
+    monkeypatch.setattr(
+        discovery_module,
+        "resolved_ssh_options",
+        lambda node: {},
+    )
+    _patch_advertise(monkeypatch, client_address="203.0.113.9")
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "topology",
+            "--site",
+            "lab",
+            "--source",
+            "head",
+            "--destination",
+            "worker",
+            "--measure",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert measured_edges == [("head", "worker")]
+    assert measured_controls == ["worker"]
+    assert {row["node"] for row in payload["control_routes"]} == {
+        "head",
+        "worker",
+    }
+
+
+def test_topology_measures_independent_control_routes_concurrently(
+    tmp_path, monkeypatch
+):
+    import dt.topology_discovery as discovery_module
+
+    monkeypatch.setattr(cli, "_cfg", lambda: _cfg_with_unrelated_node(tmp_path))
+    monkeypatch.setattr(
+        discovery_module.TopologyDiscovery,
+        "discover_edges",
+        lambda self, site, **kwargs: [],
+    )
+    barrier = threading.Barrier(2)
+    measured_controls = []
+
+    def measure_control(node, *, probe_bytes):
+        measured_controls.append(node.name)
+        barrier.wait(timeout=1.0)
+        return probe_bytes, 10.0
+
+    monkeypatch.setattr(discovery_module, "measure_control_route", measure_control)
+    monkeypatch.setattr(
+        discovery_module,
+        "local_interface_addresses",
+        lambda: frozenset(),
+    )
+    monkeypatch.setattr(
+        discovery_module,
+        "resolved_ssh_options",
+        lambda node: {},
+    )
+    _patch_advertise(monkeypatch, client_address="203.0.113.9")
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["topology", "--site", "lab", "--measure", "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert set(measured_controls) == {"worker", "unrelated"}

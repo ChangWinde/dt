@@ -27,10 +27,11 @@ Required assumptions:
 discovery boundary. Nodes advertise only their own interfaces and public SSH
 host keys through an already-authenticated control session; DT does not scan
 address ranges or disable host-key checking. A direct peer connection pins
-those keys under a DT-private alias and explicitly disables ProxyJump. The
-short-lived artifact-relay session forwards the operator's SSH agent to the
-selected trusted source but never copies private keys to a worker. Do not place
-an untrusted host in a topology-enabled site.
+those keys under a DT-private alias and explicitly disables ProxyJump. Every
+DT-managed SSH pool disables agent forwarding. A gateway or peer source must
+authenticate to the destination with credentials already available on that
+source; DT never copies a head-side private key to a worker. Do not place an
+untrusted host in a topology-enabled site.
 
 DistTrainer provides collision-safe GPU leases, bounded remote operations,
 content identities, path validation, previewable destructive maintenance, and

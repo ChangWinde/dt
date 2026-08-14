@@ -119,6 +119,97 @@ def test_task_shortcut_builds_shell_command_and_meaningful_name(tmp_path, monkey
     assert payload["project"] == "p"
 
 
+def test_laptop_task_forwards_options_before_a_positional_boundary(monkeypatch):
+    cfg = LaptopConfig(centers={"test": "head"}, default_center="test")
+    calls = []
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    def capture(head, argv, **kwargs):
+        calls.append((head, argv, kwargs))
+        return (
+            0,
+            json.dumps(
+                {
+                    "job_id": "20260724-1500_dash-command_abcd",
+                    "status": "running",
+                }
+            )
+            + "\n",
+        )
+
+    monkeypatch.setattr(cli, "forward_capture_stdout", capture)
+    result = CliRunner().invoke(
+        cli.app,
+        ["task", "--json", "--", "n1", "-dash-leading-command"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls[0][1] == [
+        "task",
+        "-g",
+        "1",
+        "-n",
+        "-dash-leading-command",
+        "--json",
+        "--",
+        "n1",
+        "-dash-leading-command",
+    ]
+
+
+def test_submission_json_and_human_report_failed_agent_autostart(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = _entry(type("Spec", (), {"name": "blocked", "project": "p"})())
+    entry.status = "queued"
+    entry.node = "-"
+    entry.gpus = []
+    entry.pgid = None
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "_submit_entry",
+        lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, False),
+    )
+
+    machine = CliRunner().invoke(
+        cli.app,
+        ["task", "n1", "python train.py", "--json"],
+    )
+    human = CliRunner().invoke(
+        cli.app,
+        ["task", "n1", "python train.py"],
+    )
+
+    assert machine.exit_code == 0, machine.output
+    assert json.loads(machine.stdout)["agent_started"] is False
+    assert human.exit_code == 0, human.output
+    assert "agent failed" in human.output
+    assert "next: dt agent run" in human.output
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["rerun", "missing", "--json"],
+        ["exec", "missing", "--json", "--", "true"],
+        ["fork", "missing", "--json"],
+    ],
+)
+def test_replay_submission_missing_ref_is_machine_readable(tmp_path, monkeypatch, argv):
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, argv)
+
+    assert result.exit_code == cli.EXIT_NOT_FOUND
+    assert json.loads(result.stdout) == {
+        "error": "not_found",
+        "message": "no job matching 'missing'",
+        "reasons": {},
+        "exit_code": cli.EXIT_NOT_FOUND,
+    }
+
+
 @pytest.mark.parametrize("poll", ["nan", "inf", "-inf"])
 def test_run_rejects_non_finite_follow_poll_before_loading_config(monkeypatch, poll):
     monkeypatch.setattr(
@@ -425,7 +516,12 @@ def test_task_artifact_syncs_then_binds_manifest_in_one_command(
 ):
     cfg = _cfg(tmp_path)
     seen = {}
-    manifest = "c" * 64
+    artifact = cfg.projects["p"].path / "outputs" / "model.pt"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"weights")
+    manifest = dispatch.artifact_manifest_identity(
+        "p", cfg.projects["p"].path, ["outputs/model.pt"]
+    )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
 
     def fake_sync_artifacts(
@@ -457,7 +553,9 @@ def test_task_artifact_syncs_then_binds_manifest_in_one_command(
             "artifacts": [],
         }
 
-    def fake_submit(cfg_, spec, cwd, log, no_queue=False):
+    def fake_submit(cfg_, spec, cwd, log, no_queue=False, *, claimed_action=None):
+        assert claimed_action is not None
+        claimed_action()
         seen["spec"] = spec
         return _entry(spec)
 
@@ -599,7 +697,7 @@ def test_task_human_submission_shows_snapshot_and_environment_preparation(
     monkeypatch.setattr(
         cli,
         "_submit_entry",
-        lambda cfg_, spec, no_queue, json_: (entry, None),
+        lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, None),
     )
 
     result = CliRunner().invoke(
@@ -645,7 +743,7 @@ def test_task_surfaces_queued_block_reason_in_human_and_json_output(
     monkeypatch.setattr(
         cli,
         "_submit_entry",
-        lambda cfg_, spec, no_queue, json_: (entry, None),
+        lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, None),
     )
 
     json_result = CliRunner().invoke(
@@ -674,7 +772,7 @@ def test_submission_receipt_treats_registry_labels_as_text(tmp_path, monkeypatch
     monkeypatch.setattr(
         cli,
         "_submit_entry",
-        lambda cfg_, spec, no_queue, json_: (entry, None),
+        lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, None),
     )
 
     result = CliRunner().invoke(
@@ -820,7 +918,12 @@ def test_run_follow_uses_the_same_terminal_contract_as_task(tmp_path, monkeypatc
 def test_run_can_sync_explicit_artifacts_to_a_pinned_node(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     seen = {}
-    manifest = "c" * 64
+    artifact = cfg.projects["p"].path / "inputs" / "model.pt"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"weights")
+    manifest = dispatch.artifact_manifest_identity(
+        "p", cfg.projects["p"].path, ["inputs/model.pt"]
+    )
     sync_row = {
         "node": "n1",
         "project": "p",
@@ -830,15 +933,17 @@ def test_run_can_sync_explicit_artifacts_to_a_pinned_node(tmp_path, monkeypatch)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
         cli,
-        "_sync_task_artifacts",
-        lambda cfg_, *, server, project, artifacts, json_: (
+        "_sync_task_artifacts_raw",
+        lambda cfg_, *, server, project, artifacts, expected_manifest_sha256: (
             "p",
             manifest,
             sync_row,
         ),
     )
 
-    def fake_submit(cfg_, spec, no_queue, json_):
+    def fake_submit(cfg_, spec, no_queue, json_, claimed_action=None):
+        assert claimed_action is not None
+        claimed_action()
         seen["spec"] = spec
         return _entry(spec), None
 
@@ -971,7 +1076,7 @@ def test_task_follow_does_not_repeat_primary_failure_but_keeps_referenced_log(
     monkeypatch.setattr(
         cli,
         "_submit_entry",
-        lambda cfg_, spec, no_queue, json_: (entry, None),
+        lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, None),
     )
 
     def watched(ref, poll, lines, json_, completion_wake):
@@ -1085,14 +1190,15 @@ def test_laptop_task_follow_submits_once_then_uses_reconnecting_watch_and_wait(
         "head",
         [
             "task",
-            "n1",
-            "python train.py",
             "-g",
             "1",
             "-n",
             "train",
             "-p",
             "p",
+            "--",
+            "n1",
+            "python train.py",
         ],
         False,
     )
@@ -1274,13 +1380,14 @@ def test_laptop_task_follow_json_submits_once_then_streams_reconnecting_json(
             "head",
             [
                 "task",
-                "n1",
-                "python train.py",
                 "-g",
                 "1",
                 "-n",
                 "train",
                 "--json",
+                "--",
+                "n1",
+                "python train.py",
             ],
             False,
             {"emit_stdout": False},
@@ -1367,8 +1474,6 @@ def test_laptop_task_forwards_repeatable_artifacts(monkeypatch):
             "head",
             [
                 "task",
-                "n1",
-                "python train.py",
                 "-g",
                 "1",
                 "-n",
@@ -1382,6 +1487,9 @@ def test_laptop_task_forwards_repeatable_artifacts(monkeypatch):
                 "--artifact",
                 "outputs/config.yaml",
                 "--json",
+                "--",
+                "n1",
+                "python train.py",
             ],
             False,
             {"emit_stdout": False},
@@ -1984,7 +2092,7 @@ def test_rerun_env_failure_keeps_new_job_identity_and_env_log(tmp_path, monkeypa
     failed.pgid = None
     failed.reason = "n1: env-fail: invalid uv.lock, see logs/env.log"
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref: old)
+    monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref, **_kwargs: old)
     monkeypatch.setattr(
         cli,
         "submit",

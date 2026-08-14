@@ -14,12 +14,17 @@ command -v uv >/dev/null 2>&1 || {
 WORK_DIR="$(mktemp -d /tmp/disttrainer-security.XXXXXX)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 REQUIREMENTS="$WORK_DIR/runtime-requirements.txt"
+SECURITY_ENV="$WORK_DIR/environment"
 
 uv lock --check
 uv export --locked --no-dev --no-emit-project \
     --format requirements-txt --output-file "$REQUIREMENTS" >/dev/null
-uv run --no-sync bandit --quiet --recursive --severity-level medium src/dt scripts
-uv run --no-sync pip-audit --requirement "$REQUIREMENTS" \
+UV_PROJECT_ENVIRONMENT="$SECURITY_ENV" \
+    uv sync --locked --only-group security --no-install-project
+UV_PROJECT_ENVIRONMENT="$SECURITY_ENV" uv run --no-sync \
+    bandit --quiet --recursive --severity-level medium src/dt scripts
+UV_PROJECT_ENVIRONMENT="$SECURITY_ENV" uv run --no-sync \
+    pip-audit --requirement "$REQUIREMENTS" \
     --disable-pip
 
 echo "security-check: PASS"

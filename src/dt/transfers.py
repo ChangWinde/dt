@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict
+import os
+import stat
 from pathlib import Path, PurePosixPath
 
 from .config import HeadConfig
-from .jobs import JobEntry
+from .jobs import JobEntry, public_job_record
 from .layout import node_path_expression
 
 
@@ -38,6 +39,52 @@ def collection_root(cfg: HeadConfig, collection: str) -> Path:
     )
 
 
+def ensure_collection_root(cfg: HeadConfig, collection: str) -> Path:
+    """Create a managed collection without following a symlinked component."""
+    root = Path(cfg.results_dir()).absolute()
+    try:
+        if root.resolve(strict=False) != root:
+            raise ValueError("managed results root traverses a symbolic link")
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root_info = root.lstat()
+    except OSError as exc:
+        raise ValueError(f"managed results root is unavailable: {exc}") from None
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise ValueError("managed results root is not a safe directory")
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(root, flags)
+    try:
+        for part in ("collections", *collection_parts(collection)):
+            created = False
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                created = True
+            except FileExistsError:
+                pass
+            child = os.open(part, flags, dir_fd=descriptor)
+            try:
+                info = os.fstat(child)
+                if not stat.S_ISDIR(info.st_mode):
+                    raise ValueError(
+                        "managed collection contains a non-directory component"
+                    )
+                if created:
+                    os.fsync(descriptor)
+                if stat.S_IMODE(info.st_mode) != 0o700:
+                    os.fchmod(child, 0o700)
+            except Exception:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+    except OSError as exc:
+        raise ValueError(f"managed collection is unsafe: {exc}") from None
+    finally:
+        os.close(descriptor)
+    return collection_root(cfg, collection).absolute()
+
+
 def pull_outputs_probe_command(outputs_rel: str) -> str:
     """Return one best-effort existence + apparent-size remote probe."""
     quoted = node_path_expression(outputs_rel)
@@ -63,7 +110,7 @@ def pull_outputs_probe_bytes(stdout: str) -> int | None:
 
 def pull_job_record(entry: JobEntry) -> dict[str, object]:
     """Build the reserved pull record with terminal-only derived duration."""
-    record: dict[str, object] = asdict(entry)
+    record = public_job_record(entry)
     started = entry.started_at
     finished = entry.finished_at
     duration = (

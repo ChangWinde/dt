@@ -46,9 +46,9 @@ for compatibility.
 AI-native describes the execution contract, not autonomous experiment design.
 The project still owns its command, data, scientific logic, and outputs.
 
-This README describes the 0.9.0 line. Work merged since that tag is recorded
-under `Unreleased` in the [changelog](CHANGELOG.md). Promoting any release
-still requires a verified release bundle, a live upgrade/rollback canary, and
+The latest published release is 0.9.0. Current `Unreleased` work targets
+0.10.0 and is recorded in the [changelog](CHANGELOG.md). Promoting it still
+requires a verified release bundle, a live upgrade/rollback canary, and
 explicit release authority.
 
 ## Quick start

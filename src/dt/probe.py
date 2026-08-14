@@ -200,6 +200,16 @@ class Gpu:
     users: list[str] = field(default_factory=list)  # owners of compute procs
     temperature: int | None = None
 
+    @property
+    def mem_total_mib(self) -> int:
+        """Total device memory in MiB.
+
+        ``nvidia-smi`` reports this value in MiB.  Keep the historical
+        ``mem_total`` serialization key stable while giving scheduling policy
+        an explicitly unit-bearing API.
+        """
+        return self.mem_total
+
 
 @dataclass
 class SystemStats:

@@ -135,6 +135,33 @@ def test_active_discovery_proves_pinned_direct_shared_subnet(tmp_path, monkeypat
     assert "lyf@172.16.6.91" in probe
 
 
+def test_pinned_edge_masters_are_key_scoped_and_never_forward_agents():
+    first = DirectEndpoint(
+        destination="worker@172.16.6.91",
+        port=22,
+        host_key_alias="dt-node-first",
+        host_keys=("ssh-ed25519 AAAA-first",),
+        origin="configured-lan",
+        link_cost=1.0,
+    )
+    second = DirectEndpoint(
+        destination=first.destination,
+        port=first.port,
+        host_key_alias="dt-node-second",
+        host_keys=("ssh-ed25519 AAAA-second",),
+        origin=first.origin,
+        link_cost=first.link_cost,
+    )
+
+    _first_setup, first_command = TopologyDiscovery.inner_ssh(first)
+    _second_setup, second_command = TopologyDiscovery.inner_ssh(second)
+
+    assert "ForwardAgent=no" in first_command
+    assert "ControlPath=~/.ssh/dt/artifact/pinned-" in first_command
+    assert "ControlPath=~/.ssh/dt/artifact/lan-%C" not in first_command
+    assert first_command != second_command
+
+
 def test_active_discovery_probes_exact_private_overlay_endpoint(tmp_path, monkeypatch):
     import dt.topology_discovery as module
 
@@ -659,6 +686,87 @@ def test_deterministic_half_open_probe_releases_route_reservation(
     assert decision.last_kind == "probe.timeout"
 
 
+def test_endpoint_failure_releases_half_open_route_reservation(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    now = [100.0]
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    health = _tripped_transfer_circuit(cfg, site, source, destination, now)
+    discovery = TopologyDiscovery(
+        cfg,
+        TopologyRegistry(cfg),
+        route_health=health,
+    )
+    monkeypatch.setattr(
+        discovery,
+        "endpoint",
+        lambda *args: (_ for _ in ()).throw(
+            TopologyDiscoveryError("advertisement unavailable")
+        ),
+    )
+
+    with pytest.raises(TopologyDiscoveryError, match="advertisement unavailable"):
+        discovery.route(
+            ArtifactReplica(
+                kind="peer",
+                node=source,
+                code_dir="~/dt/worker/jobs/prior/code",
+                recorded_at=1.0,
+            ),
+            destination,
+        )
+
+    decision = health.decision(site, source.name, destination.name)
+    assert decision.is_open is False
+    assert decision.failures == 2
+
+
+def test_local_probe_spawn_failure_does_not_open_route_circuit(tmp_path, monkeypatch):
+    import dt.topology_discovery as module
+
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    health = PersistentRouteHealth(cfg)
+    endpoint = DirectEndpoint(
+        destination="worker@172.16.6.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-shared-subnet",
+        link_cost=0.0,
+    )
+    discovery = TopologyDiscovery(
+        cfg,
+        TopologyRegistry(cfg),
+        route_health=health,
+    )
+    monkeypatch.setattr(discovery, "endpoint", lambda *args: endpoint)
+    monkeypatch.setattr(
+        module,
+        "run_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("too many files")),
+    )
+
+    for _ in range(2):
+        with pytest.raises(TopologyDiscoveryError, match="local"):
+            discovery.route(
+                ArtifactReplica(
+                    kind="peer",
+                    node=source,
+                    code_dir="~/dt/worker/jobs/prior/code",
+                    recorded_at=1.0,
+                ),
+                destination,
+            )
+
+    decision = health.decision(site, source.name, destination.name)
+    assert decision.failures == 0
+    assert decision.is_open is False
+
+
 def _tripped_transfer_circuit(cfg, site, source, destination, now):
     health = PersistentRouteHealth(cfg, clock=lambda: now[0])
     health.record_failure(site, source.name, destination.name, "transfer.timeout")
@@ -998,6 +1106,33 @@ def test_classify_control_route_identifies_tunnels_and_direct_paths(tmp_path):
     )
 
 
+def test_local_interface_addresses_excludes_per_host_bridge_gateways():
+    from dt.topology_discovery import local_interface_addresses
+
+    payload = json.dumps(
+        [
+            {
+                "ifname": "docker0",
+                "addr_info": [{"local": "172.17.0.1"}],
+            },
+            {
+                "ifname": "virbr0",
+                "addr_info": [{"local": "192.168.122.1"}],
+            },
+            {
+                "ifname": "enp5s0",
+                "addr_info": [{"local": "172.16.17.100"}],
+            },
+        ]
+    )
+
+    addresses = local_interface_addresses(
+        runner=lambda *args, **kwargs: subprocess.CompletedProcess([], 0, payload, "")
+    )
+
+    assert addresses == frozenset({"172.16.17.100"})
+
+
 def test_route_attaches_measured_throughput(tmp_path, monkeypatch):
     # The ranking consumes the smoothed sample recorded for the exact edge.
     from dt.link_metrics import PersistentLinkMetrics, site_link_scope
@@ -1087,11 +1222,10 @@ def test_measure_route_streams_and_records_a_probe_sample(tmp_path, monkeypatch)
 def test_measure_control_route_uses_operator_ssh_route(tmp_path):
     from dt.topology_discovery import measure_control_route
 
-    calls = {}
+    calls = []
 
     def fake_runner(argv, **kwargs):
-        calls["argv"] = argv
-        calls["size"] = len(kwargs.get("input") or b"")
+        calls.append((argv, len(kwargs.get("input") or b"")))
         time.sleep(0.06)
         return subprocess.CompletedProcess(argv, 0, b"", b"")
 
@@ -1102,8 +1236,9 @@ def test_measure_control_route_uses_operator_ssh_route(tmp_path):
     )
 
     assert moved == 2 << 20
-    assert calls["size"] == 2 << 20
-    assert "worker-1" in calls["argv"]
+    assert [size for _argv, size in calls] == [0, 2 << 20]
+    assert "true" in calls[0][0]
+    assert "worker-1" in calls[1][0]
     assert elapsed >= 0.05
 
     with pytest.raises(TopologyDiscoveryError, match="no network|no\\s+network"):

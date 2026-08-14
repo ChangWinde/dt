@@ -19,6 +19,7 @@ DT_COMMAND_PATH="${DT_COMMAND_PATH:-$DT_JOB_DIR/cmd.sh}"
 DT_BIN_DIR="${DT_BIN_DIR:-$DT_JOB_DIR/.dt-bin}"
 DT_CACHE_ROOT="${DT_CACHE_ROOT:-$HOME/dt}"
 DT_GPU_LEASE_ROOT="${DT_GPU_LEASE_ROOT:-$HOME/dt/gpu-leases}"
+DT_GPUS="${DT_GPUS:-}"
 mkdir -p "$DT_STATE_DIR" "$DT_OUTPUT_DIR" "$DT_JOB_DIR/logs" "$DT_GPU_LEASE_ROOT" \
          "$DT_CONTROL_DIR/tmp" "$DT_CACHE_ROOT/tools/xdg" \
          "$DT_CACHE_ROOT/tools/uv" "$DT_CACHE_ROOT/tools/torch"
@@ -52,6 +53,36 @@ dt_mark_phase() {
     "$DT_PHASE" "$1" 2>/dev/null || true
 }
 
+# Publish state through a same-directory temporary file so readers observe a
+# complete marker or no marker at all. In particular, never preserve a
+# zero-byte final marker left by an earlier ENOSPC/interrupted redirection:
+# the head treats a missing terminal marker as lost, while an empty one can
+# otherwise pin a dead task in running forever.
+dt_publish_state_marker() {
+    local dt_marker=$1 dt_value=$2 dt_tmp="${1}.tmp.$$"
+    if [ -L "$dt_marker" ] || { [ -e "$dt_marker" ] && [ ! -f "$dt_marker" ]; }; then
+        echo "[wrapper] refusing unsafe state marker: $dt_marker" >&2
+        return 1
+    fi
+    if [ -e "$dt_marker" ] && [ ! -s "$dt_marker" ]; then
+        rm -f -- "$dt_marker" || {
+            echo "[wrapper] cannot remove empty state marker: $dt_marker" >&2
+            return 1
+        }
+    fi
+    rm -f -- "$dt_tmp" 2>/dev/null || true
+    if ! printf '%s\n' "$dt_value" >"$dt_tmp"; then
+        echo "[wrapper] cannot write state marker: $dt_marker" >&2
+        rm -f -- "$dt_tmp" 2>/dev/null || true
+        return 1
+    fi
+    if [ ! -s "$dt_tmp" ] || ! mv -f -- "$dt_tmp" "$dt_marker"; then
+        echo "[wrapper] cannot publish state marker: $dt_marker" >&2
+        rm -f -- "$dt_tmp" 2>/dev/null || true
+        return 1
+    fi
+}
+
 dt_telemetry_pid=""
 dt_stop_telemetry() {
     if [ -n "$dt_telemetry_pid" ]; then
@@ -64,6 +95,16 @@ dt_stop_telemetry() {
 dt_escape_cleanup_done=0
 dt_ancestor_pids=""
 dt_escape_pids=()
+dt_add_escape_pid() {
+    local candidate=$1 existing
+    case "$candidate" in *[!0-9]*|""|0) return;; esac
+    [ -e "/proc/$candidate" ] || return
+    case "$dt_ancestor_pids" in *" $candidate "*) return;; esac
+    for existing in "${dt_escape_pids[@]}"; do
+        [ "$existing" != "$candidate" ] || return
+    done
+    dt_escape_pids+=("$candidate")
+}
 dt_collect_escape_pids() {
     dt_escape_pids=()
     if command -v find >/dev/null 2>&1; then
@@ -71,8 +112,7 @@ dt_collect_escape_pids() {
         # `readlink` per PID on research hosts with thousands of processes.
         while IFS= read -r p; do
             pid="${p##*/}"
-            case "$dt_ancestor_pids" in *" $pid "*) continue;; esac
-            dt_escape_pids+=("$pid")
+            dt_add_escape_pid "$pid"
         done < <(
             # The wrapper itself runs inside $DT_JOB_DIR/code. Move the
             # collector out first, otherwise GNU find observes its own cwd,
@@ -85,11 +125,34 @@ dt_collect_escape_pids() {
     else
         for p in /proc/[0-9]*; do
             pid="${p#/proc/}"
-            case "$dt_ancestor_pids" in *" $pid "*) continue;; esac
             case "$(readlink "$p/cwd" 2>/dev/null)" in
-                "$DT_JOB_DIR"|"$DT_JOB_DIR"/*) dt_escape_pids+=("$pid");;
+                "$DT_JOB_DIR"|"$DT_JOB_DIR"/*) dt_add_escape_pid "$pid";;
             esac
         done
+    fi
+    # A process can escape both the wrapper's process group and cwd census via
+    # setsid()+chdir(). When launcher recorded an exact per-job systemd scope,
+    # its recursive cgroup membership remains the authoritative boundary.
+    # Never use this path for the portable fallback: that could be the agent's
+    # shared service cgroup and would make unrelated processes signal targets.
+    local scope_marker="$DT_STATE_DIR/runtime_scope" scope_value="" cgroup=""
+    if [ -n "${DT_RUNTIME_SCOPE:-}" ] \
+       && [ -f "$scope_marker" ] && [ ! -L "$scope_marker" ]; then
+        scope_value=$(head -c 64 -- "$scope_marker" 2>/dev/null) || scope_value=""
+        if [ "$scope_value" = "$DT_RUNTIME_SCOPE" ]; then
+            cgroup=$(awk -F: '$1 == "0" {print $3; exit}' /proc/self/cgroup 2>/dev/null) \
+                || cgroup=""
+            case "$cgroup" in
+                /*)
+                    while IFS= read -r pid; do
+                        dt_add_escape_pid "$pid"
+                    done < <(
+                        find "/sys/fs/cgroup$cgroup" -type f -name cgroup.procs \
+                            -exec cat -- {} + 2>/dev/null
+                    )
+                    ;;
+            esac
+        fi
     fi
 }
 dt_reap_escapees() {
@@ -135,18 +198,22 @@ dt_reap_escapees() {
 # catchable session teardown from an unobservable SIGKILL/node reset. The
 # normal completion path below writes the same files first, making this trap
 # a no-op there.
+dt_completion_recorded=0
 dt_record_completion() {
-    local dt_rc=$1
-    [ -f "$DT_STATE_DIR/exit_code" ] && return
-    dt_record_result_state "$dt_rc"
-    dt_timestamp > "$DT_STATE_DIR/finished_at"
-    printf '%s\n' "$dt_rc" > "$DT_STATE_DIR/exit_code.tmp.$$"
-    mv "$DT_STATE_DIR/exit_code.tmp.$$" "$DT_STATE_DIR/exit_code"
+    local dt_rc=$1 dt_finished
+    [ "$dt_completion_recorded" -eq 1 ] && return
+    dt_record_result_state "$dt_rc" || true
+    dt_finished=$(dt_timestamp)
+    dt_publish_state_marker "$DT_STATE_DIR/finished_at" "$dt_finished" || true
+    # Publish the authoritative terminal marker last. A failure leaves it
+    # absent, never empty, so refresh can classify the vanished task as lost.
+    if dt_publish_state_marker "$DT_STATE_DIR/exit_code" "$dt_rc"; then
+        dt_completion_recorded=1
+    fi
 }
 dt_result_override=""
 dt_record_result_state() {
     local dt_rc=$1 dt_state="" dt_result="$DT_OUTPUT_DIR/dt/result.json"
-    [ -f "$DT_STATE_DIR/result_state" ] && return
     if [ -s "$DT_OUTPUT_DIR/dt/resource-guard.json" ]; then
         dt_state="guard_terminated"
     elif [ -n "$dt_result_override" ]; then
@@ -158,7 +225,7 @@ dt_record_result_state() {
             dt_state="execution_failure"
         fi
     elif [ -f "$dt_result" ]; then
-        dt_state=$(python3 "$DT_PAYLOAD_DIR/result.py" \
+        dt_state=$(python3 -I "$DT_PAYLOAD_DIR/result.py" \
             --output "$dt_result" state 2>>"$DT_JOB_DIR/logs/env.log") || {
             echo "[wrapper] invalid explicit result; classifying execution failure" >&2
             dt_state="execution_failure"
@@ -166,8 +233,7 @@ dt_record_result_state() {
     else
         dt_state="success"
     fi
-    printf '%s\n' "$dt_state" >"$DT_STATE_DIR/result_state.tmp.$$"
-    mv "$DT_STATE_DIR/result_state.tmp.$$" "$DT_STATE_DIR/result_state"
+    dt_publish_state_marker "$DT_STATE_DIR/result_state" "$dt_state"
 }
 dt_signal_exit() {
     local dt_signal=$1 dt_rc=$2
@@ -212,15 +278,46 @@ fi
 # no-CUDA-context startup race atomically. Open file descriptors hold the
 # advisory locks for the lifetime of this shell (and escaped children).
 dt_gpu_lease_fds=()
+dt_validate_gpu_selection() {
+    local raw=$1 expected=$2 item existing count=0
+    local -a values=()
+    if [ -n "$expected" ] && ! [[ "$expected" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    if [ -n "$raw" ]; then
+        [[ "$raw" =~ ^[0-9]+(,[0-9]+)*$ ]] || return 1
+        IFS=',' read -ra values <<<"$raw"
+        for item in "${values[@]}"; do
+            for existing in "${values[@]:0:count}"; do
+                [ "$existing" != "$item" ] || return 1
+            done
+            count=$((count + 1))
+        done
+    fi
+    [ -z "$expected" ] || [ "$count" -eq "$expected" ]
+}
+if ! dt_validate_gpu_selection "${DT_GPU_IDS:-}" "$DT_GPUS"; then
+    echo "[wrapper] invalid GPU selection: expected ${DT_GPUS:-unknown}, got ${DT_GPU_IDS:-<empty>}" >&2
+    exit 76
+fi
 if [ -n "${DT_GPU_IDS:-}" ]; then
     mkdir -p "$DT_GPU_LEASE_ROOT"
     IFS=',' read -ra dt_gpu_indices <<<"$DT_GPU_IDS"
     for dt_gpu_index in "${dt_gpu_indices[@]}"; do
         dt_gpu_lock="$DT_GPU_LEASE_ROOT/gpu-$dt_gpu_index.lock"
-        exec {dt_gpu_lease_fd}>"$dt_gpu_lock"
+        # O_RDWR creates the lock without truncating it. A losing contender
+        # must not erase the live owner's diagnostic before flock rejects it.
+        exec {dt_gpu_lease_fd}<>"$dt_gpu_lock"
         if ! flock -n "$dt_gpu_lease_fd"; then
             echo "[wrapper] GPU $dt_gpu_index lease is already held" >&2
             exit 75
+        fi
+        # Truncate through the locked descriptor, not by reopening the path:
+        # same-UID tasks can rename pathname entries, while this fd remains
+        # bound to the inode whose lease we actually own.
+        if ! : >"/proc/self/fd/$dt_gpu_lease_fd"; then
+            echo "[wrapper] cannot initialize GPU $dt_gpu_index lease owner" >&2
+            exit 76
         fi
         printf '%s\n' "${DT_JOB_ID:-unknown}" >&"$dt_gpu_lease_fd"
         dt_gpu_lease_fds+=("$dt_gpu_lease_fd")
@@ -248,10 +345,21 @@ if ! mv -f -- "$dt_process_identity_tmp" "$DT_STATE_DIR/process_start_ticks"; th
     rm -f "$dt_process_identity_tmp"
     exit 76
 fi
-printf '%s\n' "$$" > "$DT_STATE_DIR/pgid"
-dt_timestamp > "$DT_STATE_DIR/started_at"
-
-cd "$DT_JOB_DIR/code"
+dt_boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null) || dt_boot_id=""
+case "$dt_boot_id" in
+    *[!A-Za-z0-9-]*|"")
+        echo "[wrapper] cannot establish node boot identity" >&2
+        exit 76
+        ;;
+esac
+if ! dt_publish_state_marker "$DT_STATE_DIR/boot_id" "$dt_boot_id"; then
+    echo "[wrapper] cannot publish node boot identity" >&2
+    exit 76
+fi
+if ! cd -- "$DT_JOB_DIR/code"; then
+    echo "[wrapper] cannot enter job code directory: $DT_JOB_DIR/code" >&2
+    exit 76
+fi
 
 # Immutable code snapshots intentionally omit .git. Give applications a
 # stable path to the dispatch metadata instead of making them infer it.
@@ -378,7 +486,7 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$DT_PAYLOAD_DIR/telemetry.py" ]; 
             --max-job-memory-mib "$DT_MAX_JOB_MEMORY_MIB"
         )
     fi
-    python3 "$DT_PAYLOAD_DIR/telemetry.py" "${dt_telemetry_args[@]}" \
+    python3 -I "$DT_PAYLOAD_DIR/telemetry.py" "${dt_telemetry_args[@]}" \
         >>"$DT_JOB_DIR/logs/telemetry.log" 2>&1 &
     dt_telemetry_pid=$!
 fi
@@ -450,10 +558,28 @@ fi
 dt_record_lifecycle_event "runner_starting"
 dt_mark_phase "runner"
 if [ -n "${DT_MAX_HOURS:-}" ]; then
-    timeout --signal=TERM --kill-after=60 "${DT_MAX_HOURS}h" "${runner[@]}"
+    timeout --signal=TERM --kill-after=60 "${DT_MAX_HOURS}h" "${runner[@]}" <&0 &
 else
-    "${runner[@]}"
+    "${runner[@]}" <&0 &
 fi
+dt_runner_pid=$!
+
+# Publish readiness only after the runner is an asynchronous child. Bash
+# defers trapped signals while waiting for a foreground command, which could
+# otherwise leave HUP/TERM pending for the complete training run. Waiting on
+# an asynchronous child is interruptible, so tmux/systemd teardown reaches
+# the trap immediately. Publish pgid last so launchers never accept a wrapper
+# whose timestamp or runner startup was not established.
+dt_started=$(dt_timestamp)
+if ! dt_publish_state_marker "$DT_STATE_DIR/started_at" "$dt_started"; then
+    echo "[wrapper] cannot publish start timestamp" >&2
+    exit 76
+fi
+if ! dt_publish_state_marker "$DT_STATE_DIR/pgid" "$$"; then
+    echo "[wrapper] cannot publish process group identity" >&2
+    exit 76
+fi
+wait "$dt_runner_pid"
 rc=$?
 dt_record_lifecycle_event "runner_returned"
 dt_mark_phase "runner_returned"

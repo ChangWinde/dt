@@ -50,6 +50,15 @@ therefore parsed the operator's real configuration; the recorded run uses the
 documented `DT_CONFIG` override and a missing isolated configuration, as the
 original benchmark contract requires.
 
+The 0.10.0 development-candidate recheck on 2026-08-15, after the complete
+reliability round, used the same host, missing `DT_CONFIG`, isolated
+`XDG_STATE_HOME`, three warmups, and 30 latency samples. It measured 39.349 ms
+median, 43.091 ms p95, 39.110 ms mean, and 1.996 ms standard deviation. The
+median remains 2.01x faster than the 79.177 ms full-CLI reference (50.3% less
+time), although it is slower than the 2026-08-11 sample. The comparison does
+not establish why that variance occurred and does not extend the 50% claim to
+SSH, scheduling, probing, or transfer commands.
+
 ## Interpretation
 
 The result supports lazy command loading as the next Python-side optimization.

@@ -12,6 +12,7 @@ from __future__ import annotations
 import codecs
 import hashlib
 import os
+import re
 import select
 import shlex
 import signal
@@ -20,12 +21,13 @@ import subprocess
 import tempfile
 import time
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from io import TextIOBase
 from pathlib import Path
 from threading import Event, Lock, Thread
-from typing import Callable
+from typing import BinaryIO, Callable
 
 from .operation_log import current_operation_id
 from .private_state import (
@@ -43,6 +45,27 @@ MAX_CAPTURE_CHARS = 16 * 1024 * 1024
 _CAPTURE_CHUNK_CHARS = 64 * 1024
 MAX_RETRY_MESSAGE_CHARS = 2048
 MAX_DIAGNOSTIC_CHARS = 4096
+MAX_STDIN_BYTES = 1024 * 1024
+_RSYNC_INTEGER_SEPARATORS = str.maketrans("", "", ",. \u00a0\u202f")
+
+
+def rsync_stat_total(pattern: re.Pattern[str], stdout: str) -> int | None:
+    """Sum integral counters from one or more localized rsync stat blocks.
+
+    rsync formats counters with the active locale's grouping separator. They
+    remain integers: parsing through ``float`` both rejects dot-grouped output
+    and rounds values above 2**53. Only patterns owned by dt call this helper;
+    each captures exactly the counter token as group 1.
+    """
+    found = False
+    total = 0
+    for match in pattern.finditer(stdout or ""):
+        digits = match.group(1).translate(_RSYNC_INTEGER_SEPARATORS)
+        if not digits or not digits.isascii() or not digits.isdigit():
+            continue
+        found = True
+        total += int(digits)
+    return total if found else None
 
 
 # keepalives bound every hung channel: NAT'd links (kyzs) can stall a live
@@ -52,8 +75,10 @@ class SSHWorkload(str, Enum):
 
     CONTROL = "control"
     ARTIFACT = "artifact"
-    # Gateway-executed LAN fan-out. This pool is separate because it briefly
-    # forwards the caller's agent; ordinary control and upload sessions never do.
+    # Gateway-executed LAN fan-out. This pool stays separate for head-of-line
+    # isolation, but authenticates with the gateway's own credentials. Forwarding
+    # the operator's general agent would expose every key it contains to another
+    # same-identity process on that gateway.
     ARTIFACT_RELAY = "artifact-relay"
 
 
@@ -241,9 +266,10 @@ def ssh_pool_config(
     if not isinstance(workload, SSHWorkload):
         workload = SSHWorkload(workload)
     root = _ssh_state_dir()
-    sockets, socket_chain, mux_capable = _control_socket_plan(root, workload.value)
+    pool_name = workload.value
+    sockets, socket_chain, mux_capable = _control_socket_plan(root, pool_name)
     use_mux = multiplex and mux_capable
-    config = root / f"{workload.value}{'' if multiplex else '-fresh'}.conf"
+    config = root / f"{pool_name}{'' if multiplex else '-fresh'}.conf"
     user_config = _ssh_user_config()
     system_config = _ssh_system_config()
     key = (
@@ -293,15 +319,11 @@ def ssh_pool_config(
             # cost instead. Because ProxyJump receives the same -F file, both
             # the final target and every implicit bastion follow suit.
             lines.extend(["    ControlMaster no", "    ControlPath none"])
-        # Only the trusted artifact relay may forward the agent. OpenSSH keeps
-        # the first value obtained for a keyword, so pinning ForwardAgent here
-        # -- above the user/system Include below -- prevents an included
-        # ``ForwardAgent yes`` from leaking the agent to ordinary control or
-        # bulk-data workers.
-        if workload is SSHWorkload.ARTIFACT_RELAY:
-            lines.append("    ForwardAgent yes")
-        else:
-            lines.append("    ForwardAgent no")
+        # Every pool authenticates only the head -> selected host hop. LAN
+        # relay commands run on the gateway and must use gateway-local keys.
+        # Pin this above user/system Includes because ssh_config uses the first
+        # value obtained for a keyword.
+        lines.append("    ForwardAgent no")
         # OpenSSH treats an Include with no matching file as empty. Always
         # include the configured paths so a long-lived dt process immediately
         # observes later edits or creation without regenerating this overlay.
@@ -487,6 +509,7 @@ def run_remote(
     check: bool = False,
     workload: SSHWorkload = SSHWorkload.CONTROL,
     retry_stale_mux: bool = False,
+    cancel_event: Event | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a shell string on host, capturing output."""
     started = time.monotonic()
@@ -494,6 +517,7 @@ def run_remote(
         proc = _run_bounded_process(
             ssh_cmd(host, remote, workload=workload),
             timeout=timeout,
+            cancel_event=cancel_event,
         )
     except subprocess.TimeoutExpired:
         # The remote command may contain credentials or arbitrary user data.
@@ -520,6 +544,7 @@ def run_remote(
                         multiplex=False,
                     ),
                     timeout=remaining,
+                    cancel_event=cancel_event,
                 )
             except subprocess.TimeoutExpired:
                 raise RemoteError(host, f"timed out after {timeout}s")
@@ -533,14 +558,22 @@ def run_remote(
 
 
 def run_local(
-    command: str, timeout: float = 15, check: bool = False
+    command: str,
+    timeout: float = 15,
+    check: bool = False,
+    cancel_event: Event | None = None,
+    workload: SSHWorkload = SSHWorkload.CONTROL,
 ) -> subprocess.CompletedProcess[str]:
     # cwd=home so relative paths behave exactly like an ssh login would.
-    proc = _run_bounded_process(
-        ["bash", "-c", command],
-        timeout=timeout,
-        cwd=os.path.expanduser("~"),
-    )
+    try:
+        proc = _run_bounded_process(
+            ["bash", "-c", command],
+            timeout=timeout,
+            cwd=os.path.expanduser("~"),
+            cancel_event=cancel_event,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RemoteError("local", f"timed out after {timeout}s") from exc
     if check and proc.returncode != 0:
         raise RemoteError(
             "local",
@@ -558,9 +591,16 @@ def run_on(
     check: bool = False,
     workload: SSHWorkload = SSHWorkload.CONTROL,
     retry_stale_mux: bool = False,
+    cancel_event: Event | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if is_local:
-        return run_local(command, timeout=timeout, check=check)
+        return run_local(
+            command,
+            timeout=timeout,
+            check=check,
+            cancel_event=cancel_event,
+            workload=workload,
+        )
     return run_remote(
         node_name,
         command,
@@ -568,6 +608,7 @@ def run_on(
         check=check,
         workload=workload,
         retry_stale_mux=retry_stale_mux,
+        cancel_event=cancel_event,
     )
 
 
@@ -830,6 +871,11 @@ def _run_bounded_process(
     timeout: float,
     cwd: str | None = None,
     inherit_stderr: bool = False,
+    cancel_event: Event | None = None,
+    env: Mapping[str, str] | None = None,
+    stdin_bytes: bytes | None = None,
+    stdin_file: BinaryIO | None = None,
+    stdin_length: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run one bounded command and reap its complete local process group.
 
@@ -837,42 +883,141 @@ def _run_bounded_process(
     only kills the immediate child when its deadline expires, which can leave
     that transport helper occupying a relay after DT reports a timeout.
     """
-    child = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=None if inherit_stderr else subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        cwd=cwd,
-        start_new_session=True,
-    )
-    capture = _start_process_capture(child, stderr_inherited=inherit_stderr)
+    if stdin_bytes is not None and stdin_file is not None:
+        raise ValueError("provide only one stdin source")
+    if stdin_bytes is not None and stdin_length is not None:
+        raise ValueError("stdin_length applies only to stdin_file")
+    if stdin_file is None and stdin_bytes is None and stdin_length is not None:
+        raise ValueError("stdin_length requires stdin_file")
+    if stdin_file is not None and (
+        isinstance(stdin_length, bool)
+        or not isinstance(stdin_length, int)
+        or not 0 <= stdin_length <= MAX_STDIN_BYTES
+    ):
+        raise ValueError(
+            f"stdin_file requires stdin_length between 0 and {MAX_STDIN_BYTES}"
+        )
+    if stdin_bytes is not None and len(stdin_bytes) > MAX_STDIN_BYTES:
+        raise ValueError(f"stdin payload exceeds {MAX_STDIN_BYTES} bytes")
+    if cancel_event is not None and cancel_event.is_set():
+        return subprocess.CompletedProcess(cmd, 130, "", "command cancelled locally")
+
+    # Spooling before Popen avoids a writer thread that can remain blocked on
+    # a child which never reads stdin. The anonymous file is owner-only,
+    # unlinked by the OS, bounded above, and absent from argv/process listings.
+    stdin_spool: BinaryIO | None = None
+    if stdin_bytes is not None or stdin_file is not None:
+        stdin_spool = tempfile.TemporaryFile(mode="w+b")
+        try:
+            if stdin_bytes is not None:
+                stdin_spool.write(stdin_bytes)
+            else:
+                assert stdin_file is not None and stdin_length is not None
+                remaining_input = stdin_length
+                while remaining_input:
+                    if cancel_event is not None and cancel_event.is_set():
+                        stdin_spool.close()
+                        return subprocess.CompletedProcess(
+                            cmd,
+                            130,
+                            "",
+                            "command cancelled locally",
+                        )
+                    chunk = stdin_file.read(min(64 * 1024, remaining_input))
+                    if not isinstance(chunk, bytes):
+                        raise TypeError("stdin_file must be opened in binary mode")
+                    if not chunk:
+                        raise ValueError("stdin_file ended before stdin_length")
+                    if len(chunk) > remaining_input:
+                        raise ValueError("stdin_file returned more than requested")
+                    stdin_spool.write(chunk)
+                    remaining_input -= len(chunk)
+            stdin_spool.flush()
+            stdin_spool.seek(0)
+        except BaseException:
+            stdin_spool.close()
+            raise
+
     try:
-        stdout, stderr = _wait_process(child, capture, timeout)
-    except KeyboardInterrupt:
-        _stop_process_group(child, capture)
-        raise
-    except subprocess.TimeoutExpired as exc:
-        stdout, stderr, interrupted = _stop_process_group(child, capture)
-        if interrupted:
-            raise KeyboardInterrupt from exc
-        raise subprocess.TimeoutExpired(
+        child = subprocess.Popen(
             cmd,
-            timeout,
-            output=stdout,
-            stderr=stderr,
-        ) from exc
-    return subprocess.CompletedProcess(cmd, child.returncode, stdout, stderr)
+            stdin=stdin_spool,
+            stdout=subprocess.PIPE,
+            stderr=None if inherit_stderr else subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            cwd=cwd,
+            start_new_session=True,
+            env=env,
+        )
+    finally:
+        if stdin_spool is not None:
+            stdin_spool.close()
+    capture = _start_process_capture(child, stderr_inherited=inherit_stderr)
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = max(0.0, deadline - time.monotonic())
+        wait_s = min(0.2, remaining) if cancel_event is not None else remaining
+        try:
+            stdout, stderr = _wait_process(child, capture, wait_s)
+            return subprocess.CompletedProcess(cmd, child.returncode, stdout, stderr)
+        except KeyboardInterrupt:
+            _stop_process_group(child, capture)
+            raise
+        except subprocess.TimeoutExpired as exc:
+            cancelled = cancel_event is not None and cancel_event.is_set()
+            # Without a cancellation event, _wait_process waited for the
+            # complete remaining deadline.  TimeoutExpired is therefore
+            # authoritative even for narrow test doubles or a monotonic clock
+            # with coarse resolution.  With cancellation enabled we poll and
+            # must distinguish an ordinary poll expiry from the final bound.
+            timed_out = cancel_event is None or time.monotonic() >= deadline
+            if not cancelled and not timed_out:
+                continue
+            stdout, stderr, interrupted = _stop_process_group(child, capture)
+            if interrupted:
+                raise KeyboardInterrupt from exc
+            if cancelled:
+                detail = "command cancelled locally"
+                return subprocess.CompletedProcess(
+                    cmd,
+                    130,
+                    stdout,
+                    detail if not stderr else f"{stderr.rstrip()}\n{detail}",
+                )
+            raise subprocess.TimeoutExpired(
+                cmd,
+                timeout,
+                output=stdout,
+                stderr=stderr,
+            ) from exc
 
 
 def run_capture_stdout(
     cmd: list[str],
     *,
     timeout: float,
+    cancel_event: Event | None = None,
+    stdin_bytes: bytes | None = None,
+    stdin_file: BinaryIO | None = None,
+    stdin_length: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Retain bounded stdout while streaming stderr to the calling terminal."""
-    return _run_bounded_process(cmd, timeout=timeout, inherit_stderr=True)
+    """Retain bounded stdout while streaming stderr to the calling terminal.
+
+    A bounded stdin source carries private envelopes without placing their
+    contents in argv. ``stdin_file`` requires an explicit byte count and sends
+    exactly that many bytes from its current position.
+    """
+    return _run_bounded_process(
+        cmd,
+        timeout=timeout,
+        inherit_stderr=True,
+        cancel_event=cancel_event,
+        stdin_bytes=stdin_bytes,
+        stdin_file=stdin_file,
+        stdin_length=stdin_length,
+    )
 
 
 def _run_rsync_attempt(
@@ -948,6 +1093,7 @@ def rsync(
     itemize: bool = False,
     private_destination: bool = False,
     safe_links: bool = False,
+    bwlimit_kbps: int | None = None,
     cancel_event: Event | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -956,12 +1102,19 @@ def rsync(
     checkpoint pulls over flaky links)."""
     if isinstance(retries, bool) or not 0 <= retries <= MAX_TRANSFER_RETRIES:
         raise ValueError(f"rsync retries must be between 0 and {MAX_TRANSFER_RETRIES}")
+    if bwlimit_kbps is not None and (
+        isinstance(bwlimit_kbps, bool) or bwlimit_kbps <= 0
+    ):
+        raise ValueError("rsync bwlimit_kbps must be a positive integer")
     # --timeout is rsync's own io-stall detector: a NAT link that freezes
     # mid-stream aborts in 60s instead of hanging the dispatcher forever
     # (--partial + retries then resumes where it stopped)
     cmd = [
         "rsync",
         "-a",
+        # Keep the pre-3.2.6 long name: rsync 3.2.6 renamed this option to
+        # --secluded-args, but older supported nodes only know --protect-args.
+        "--protect-args",
         "--partial",
         "--timeout=60",
         "-e",
@@ -969,6 +1122,10 @@ def rsync(
     ]
     if stats:
         cmd.append("--stats")
+    if bwlimit_kbps is not None:
+        # The caller's uplink budget: dt applies it to legs that touch the
+        # head (the constrained WAN hop), never to intra-site LAN replays.
+        cmd.append(f"--bwlimit={bwlimit_kbps}")
     if checksum:
         cmd.append("--checksum")
     if dry_run:

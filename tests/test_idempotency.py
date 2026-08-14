@@ -1,17 +1,25 @@
 import json
 import os
+import stat
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from dt import cli, dispatch
 from dt.config import HeadConfig, LaptopConfig, Node, Project
-from dt.dispatch import RequestConflict, RequestOutcomeUnknown, RunSpec, StoredSnapshot
-from dt.jobs import MAX_JOB_ID_LENGTH, JobEntry, save
+from dt.dispatch import (
+    RequestConflict,
+    RequestOutcomeUnknown,
+    RequestRejected,
+    RunSpec,
+    StoredSnapshot,
+)
+from dt.jobs import MAX_JOB_ID_LENGTH, JobEntry, remove_record, save
 from dt import submission_group as group_mod
 from dt import submission_intent as intent_mod
 
@@ -143,6 +151,327 @@ def test_equal_request_with_different_intent_conflicts(tmp_path, monkeypatch):
     _submit(cfg, first, source)
     with pytest.raises(RequestConflict, match="different intent"):
         _submit(cfg, changed, source)
+
+
+def test_claimed_action_runs_after_claim_and_not_on_replay(tmp_path, monkeypatch):
+    """Remote-visible preparation belongs inside the request transaction."""
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    request_id = "agent-artifact-once"
+    actions: list[str] = []
+
+    def claimed_action() -> None:
+        record = intent_mod.load(cfg, request_id)
+        assert record is not None
+        assert record.state == "preparing"
+        actions.append(record.job_id)
+
+    def fake_submit_once(cfg_, spec, **kwargs):
+        return _entry(cfg_, spec, kwargs["allocated_job_id"], kwargs["submitted_at"])
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", fake_submit_once)
+    spec = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        artifact_manifest="a" * 64,
+        request_id=request_id,
+    )
+
+    first = dispatch._submit_prepared(
+        cfg,
+        spec,
+        source_factory=lambda: source,
+        git_sha=None,
+        git_dirty=False,
+        git_diff=None,
+        log=lambda _message: None,
+        no_queue=False,
+        claimed_action=claimed_action,
+    )
+    replay = dispatch._submit_prepared(
+        cfg,
+        spec,
+        source_factory=lambda: source,
+        git_sha=None,
+        git_dirty=False,
+        git_diff=None,
+        log=lambda _message: None,
+        no_queue=False,
+        claimed_action=claimed_action,
+    )
+
+    assert actions == [first.job_id]
+    assert replay.job_id == first.job_id
+
+
+def test_cli_artifact_publish_is_inside_single_request_claim(tmp_path, monkeypatch):
+    """A replay or conflict may hash locally but must never publish remotely."""
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    artifact = cfg.projects["p"].path / "dataset.bin"
+    artifact.write_bytes(b"version one")
+    publishes: list[str] = []
+
+    monkeypatch.setattr(dispatch, "capture_snapshot", lambda *_args, **_kwargs: source)
+    monkeypatch.setattr(dispatch, "git_info", lambda _path: (None, False, None))
+
+    def fake_submit_once(cfg_, spec, **kwargs):
+        return _entry(cfg_, spec, kwargs["allocated_job_id"], kwargs["submitted_at"])
+
+    def fake_sync(
+        cfg_,
+        *,
+        server,
+        project,
+        artifacts,
+        expected_manifest_sha256=None,
+    ):
+        del cfg_, server, artifacts
+        record = intent_mod.load(cfg, "agent-cli-artifact:1")
+        assert record is not None and record.state == "preparing"
+        assert expected_manifest_sha256 is not None
+        publishes.append(expected_manifest_sha256)
+        return (
+            project,
+            expected_manifest_sha256,
+            {"artifact_manifest_sha256": expected_manifest_sha256},
+        )
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", fake_submit_once)
+    monkeypatch.setattr(cli, "_sync_task_artifacts_raw", fake_sync)
+    request = cli.SubmissionRequest(
+        name="train",
+        gpus=1,
+        command=("true",),
+        project="p",
+        node="n1",
+        request_id="agent-cli-artifact:1",
+    )
+
+    first = cli._submit_request(
+        cfg,
+        request,
+        artifacts=[artifact.name],
+        no_queue=False,
+        json_=True,
+    )
+    replay = cli._submit_request(
+        cfg,
+        request,
+        artifacts=[artifact.name],
+        no_queue=False,
+        json_=True,
+    )
+    artifact.write_bytes(b"version two")
+    with pytest.raises(typer.Exit):
+        cli._submit_request(
+            cfg,
+            request,
+            artifacts=[artifact.name],
+            no_queue=False,
+            json_=True,
+        )
+
+    assert len(publishes) == 1
+    assert first[2] is not None
+    assert replay[0].job_id == first[0].job_id
+    assert replay[2] is None
+
+
+def test_conflicting_request_never_runs_claimed_action(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    actions: list[str] = []
+
+    def fake_submit_once(cfg_, spec, **kwargs):
+        return _entry(cfg_, spec, kwargs["allocated_job_id"], kwargs["submitted_at"])
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", fake_submit_once)
+    first = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        artifact_manifest="a" * 64,
+        request_id="agent-artifact-conflict",
+    )
+    changed = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        artifact_manifest="b" * 64,
+        request_id="agent-artifact-conflict",
+    )
+    _submit(cfg, first, source)
+
+    with pytest.raises(RequestConflict):
+        dispatch._submit_prepared(
+            cfg,
+            changed,
+            source_factory=lambda: source,
+            git_sha=None,
+            git_dirty=False,
+            git_diff=None,
+            log=lambda _message: None,
+            no_queue=False,
+            claimed_action=lambda: actions.append("mutated"),
+        )
+
+    assert actions == []
+
+
+def test_claimed_action_failure_is_durably_rejected_without_launch(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    actions = 0
+    launches = 0
+
+    def fail_action() -> None:
+        nonlocal actions
+        actions += 1
+        raise dispatch.DispatchError("artifact verification failed")
+
+    def forbidden_launch(*_args, **_kwargs):
+        nonlocal launches
+        launches += 1
+        raise AssertionError("launch boundary must not be crossed")
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", forbidden_launch)
+    spec = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        artifact_manifest="a" * 64,
+        request_id="agent-artifact-failed",
+    )
+
+    with pytest.raises(dispatch.DispatchError, match="artifact verification failed"):
+        dispatch._submit_prepared(
+            cfg,
+            spec,
+            source_factory=lambda: source,
+            git_sha=None,
+            git_dirty=False,
+            git_diff=None,
+            log=lambda _message: None,
+            no_queue=False,
+            claimed_action=fail_action,
+        )
+    with pytest.raises(RequestRejected, match="already rejected"):
+        dispatch._submit_prepared(
+            cfg,
+            spec,
+            source_factory=lambda: source,
+            git_sha=None,
+            git_dirty=False,
+            git_diff=None,
+            log=lambda _message: None,
+            no_queue=False,
+            claimed_action=fail_action,
+        )
+
+    assert actions == 1
+    assert launches == 0
+
+
+def test_post_publish_claim_fsync_failure_is_outcome_unknown_and_fail_closed(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    actions = 0
+    launches = 0
+    original_fsync = intent_mod.os.fsync
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("directory fsync unavailable")
+        original_fsync(descriptor)
+
+    def forbidden_action() -> None:
+        nonlocal actions
+        actions += 1
+
+    def forbidden_launch(*_args, **_kwargs):
+        nonlocal launches
+        launches += 1
+        raise AssertionError("launch boundary must not be crossed")
+
+    monkeypatch.setattr(intent_mod.os, "fsync", fail_directory_fsync)
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", forbidden_launch)
+    spec = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        artifact_manifest="a" * 64,
+        request_id="agent-claim-durability-unknown",
+    )
+
+    with pytest.raises(RequestOutcomeUnknown, match="durability is unknown"):
+        dispatch._submit_prepared(
+            cfg,
+            spec,
+            source_factory=lambda: source,
+            git_sha=None,
+            git_dirty=False,
+            git_diff=None,
+            log=lambda _message: None,
+            no_queue=False,
+            claimed_action=forbidden_action,
+        )
+
+    assert actions == 0
+    assert launches == 0
+    assert intent_mod.load(cfg, spec.request_id or "") is not None
+    monkeypatch.setattr(intent_mod.os, "fsync", original_fsync)
+    with pytest.raises(RequestOutcomeUnknown, match="before retrying"):
+        dispatch._submit_prepared(
+            cfg,
+            spec,
+            source_factory=lambda: source,
+            git_sha=None,
+            git_dirty=False,
+            git_diff=None,
+            log=lambda _message: None,
+            no_queue=False,
+            claimed_action=forbidden_action,
+        )
+    assert actions == 0
+    assert launches == 0
+
+
+def test_artifact_intent_drift_fails_before_remote_mutation(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    project = cfg.projects["p"].path
+    artifact = project / "dataset.bin"
+    artifact.write_bytes(b"version one")
+    expected = dispatch.artifact_manifest_identity("p", project, [artifact.name])
+    artifact.write_bytes(b"version two")
+
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("remote boundary must not be crossed")
+        ),
+    )
+    with pytest.raises(dispatch.DispatchError, match="source changed"):
+        dispatch.sync_artifacts(
+            cfg,
+            "p",
+            project,
+            cfg.nodes[0],
+            [artifact.name],
+            lambda _message: None,
+            expected_manifest_sha256=expected,
+        )
 
 
 def test_git_metadata_is_not_part_of_request_intent(tmp_path, monkeypatch):
@@ -369,6 +698,67 @@ def test_uncertain_receipt_replays_a_recovered_completion(tmp_path, monkeypatch)
     assert record.error_kind is None
 
 
+def test_uncertain_receipt_does_not_call_a_post_start_failure_prestart(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    request_id = "agent-uncertain-ran-then-failed"
+    job_id = _uncertain_launch_request(cfg, source, monkeypatch, request_id)
+
+    row = dispatch.load(cfg, job_id)
+    assert row is not None
+    row.status = "failed"
+    row.started_at = 1000.0
+    row.pgid = 4242
+    row.finished_at = 2000.0
+    row.reason = "exit 1 after application startup"
+    save(cfg, row)
+
+    replayed = _submit(
+        cfg,
+        RunSpec(
+            name="train",
+            gpus=1,
+            cmd=["true"],
+            project="p",
+            request_id=request_id,
+        ),
+        source,
+    )
+
+    assert replayed.job_id == job_id
+    assert replayed.status == "failed"
+    record = intent_mod.load(cfg, request_id)
+    assert record is not None
+    assert record.state == "confirmed"
+    assert record.error_kind is None
+
+
+def test_confirmed_request_with_cleaned_history_is_known_not_uncertain(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+
+    def fake_submit_once(cfg_, spec, **kwargs):
+        return _entry(cfg_, spec, kwargs["allocated_job_id"], kwargs["submitted_at"])
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", fake_submit_once)
+    spec = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        request_id="agent-confirmed-cleaned",
+    )
+    submitted = _submit(cfg, spec, source)
+    remove_record(cfg, submitted.job_id)
+
+    with pytest.raises(RequestRejected, match="already confirmed.*history was cleaned"):
+        _submit(cfg, spec, source)
+
+
 def test_uncertain_receipt_stays_closed_while_the_row_is_unresolved(
     tmp_path, monkeypatch
 ):
@@ -536,6 +926,28 @@ def test_request_lock_rejects_symlink_target(tmp_path):
     assert os.stat(outside).st_size == len("do-not-touch")
 
 
+def test_request_status_never_blocks_behind_a_long_submission(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    request_id = "agent-in-flight-status"
+    record = intent_mod.create(request_id, "a" * 64, "pending-job", now=1.0)
+    intent_mod.save(cfg, record)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    with intent_mod.lock(cfg, request_id):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            queried = pool.submit(
+                CliRunner().invoke,
+                cli.app,
+                ["request", request_id, "--json"],
+            ).result(timeout=1)
+
+    assert queried.exit_code == 0, queried.output
+    payload = json.loads(queried.stdout)
+    assert payload["state"] == "preparing"
+    assert payload["inspection_in_progress"] is True
+    assert payload["job_found"] is False
+
+
 def test_confirmation_write_failure_is_unknown_but_replay_recovers(
     tmp_path,
     monkeypatch,
@@ -601,8 +1013,9 @@ def test_task_request_id_reaches_receipt_and_query(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
 
-    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False):
+    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False, *, claimed_action=None):
         assert no_queue is False
+        assert claimed_action is None
         entry = _entry(cfg, spec, "job_45", time.time())
         record = intent_mod.create(spec.request_id, "c" * 64, entry.job_id)
         intent_mod.save(cfg, intent_mod.transition(record, "confirmed"))
@@ -681,10 +1094,11 @@ def test_rerun_and_fork_propagate_single_request_identity(tmp_path, monkeypatch)
     old.snapshot_sha256 = "a" * 64
     save(cfg, old)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_find_or_die", lambda _cfg, _ref: old)
+    monkeypatch.setattr(cli, "_find_or_die", lambda _cfg, _ref, **_kwargs: old)
     seen: list[tuple[str, str | None]] = []
 
-    def fake_rerun(_cfg, spec, _cwd, _log, no_queue=False):
+    def fake_rerun(_cfg, spec, _cwd, _log, no_queue=False, *, claimed_action=None):
+        assert claimed_action is None
         seen.append(("rerun", spec.request_id))
         return _entry(cfg, spec, "rerun_job", time.time())
 
@@ -763,8 +1177,9 @@ def test_batch_request_replays_complete_parent_receipt(tmp_path, monkeypatch):
         intent_mod.save(cfg, intent_mod.transition(child, "confirmed"))
         return entry
 
-    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False):
+    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False, *, claimed_action=None):
         assert no_queue is False
+        assert claimed_action is None
         return make_entry(spec, 1)
 
     def fake_fork(
@@ -816,8 +1231,77 @@ def test_batch_request_replays_complete_parent_receipt(tmp_path, monkeypatch):
     assert queried.exit_code == 0, queried.output
     request_payload = json.loads(queried.stdout)
     assert request_payload["schema"] == "dt_submission_group_request_v1"
+    assert request_payload["schema_version"] == "dt_submission_group_request_v1"
     assert request_payload["state"] == "confirmed"
     assert request_payload["submitted"] == request_payload["requested"] == 2
+
+
+def test_batch_artifact_publish_is_claimed_once_before_children(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    artifact = cfg.projects["p"].path / "dataset.bin"
+    artifact.write_bytes(b"version one")
+    publishes: list[str] = []
+
+    def fake_sync(
+        cfg_,
+        *,
+        server,
+        project,
+        artifacts,
+        expected_manifest_sha256=None,
+    ):
+        del cfg_, server, artifacts
+        parent = group_mod.load(cfg, "agent-batch-artifact:cli")
+        assert parent is not None and parent.state == "preparing"
+        assert expected_manifest_sha256 is not None
+        publishes.append(expected_manifest_sha256)
+        return (
+            project,
+            expected_manifest_sha256,
+            {"artifact_manifest_sha256": expected_manifest_sha256},
+        )
+
+    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False, *, claimed_action=None):
+        assert no_queue is False and claimed_action is None
+        existing = intent_mod.load(cfg, spec.request_id)
+        if existing is not None:
+            replay = cli.jobs_mod.load(cfg, existing.job_id)
+            assert replay is not None
+            setattr(replay, "_request_replayed", True)
+            return replay
+        entry = _entry(cfg, spec, "job_batch_artifact", time.time())
+        child = intent_mod.create(spec.request_id, "d" * 64, entry.job_id)
+        intent_mod.save(cfg, intent_mod.transition(child, "confirmed"))
+        return entry
+
+    monkeypatch.setattr(cli, "_sync_task_artifacts_raw", fake_sync)
+    monkeypatch.setattr(cli, "submit", fake_submit)
+    argv = [
+        "batch",
+        "n1",
+        "-p",
+        "p",
+        "--artifact",
+        artifact.name,
+        "--request-id",
+        "agent-batch-artifact:cli",
+        "--json",
+        "echo one",
+    ]
+    runner = CliRunner()
+
+    first = runner.invoke(cli.app, argv)
+    replay = runner.invoke(cli.app, argv)
+    artifact.write_bytes(b"version two")
+    conflict = runner.invoke(cli.app, argv)
+
+    assert first.exit_code == replay.exit_code == 0
+    assert conflict.exit_code == 1
+    assert len(publishes) == 1
+    assert json.loads(first.stdout)["artifact_sync"] is not None
+    assert json.loads(replay.stdout).get("artifact_sync") is None
+    assert json.loads(conflict.stdout)["error"]["kind"] == "idempotency_conflict"
 
 
 def test_batch_request_rejects_changed_inventory_without_launch(tmp_path, monkeypatch):
@@ -825,8 +1309,9 @@ def test_batch_request_rejects_changed_inventory_without_launch(tmp_path, monkey
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     calls = 0
 
-    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False):
+    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False, *, claimed_action=None):
         nonlocal calls
+        assert claimed_action is None
         calls += 1
         entry = _entry(cfg, spec, "job_original", time.time())
         child = intent_mod.create(spec.request_id, "2" * 64, entry.job_id)
@@ -862,7 +1347,8 @@ def test_batch_request_resumes_prefix_when_interruption_precedes_child_claim(
         launches.append(spec.request_id)
         return entry
 
-    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False):
+    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False, *, claimed_action=None):
+        assert claimed_action is None
         return persist(spec, "job_resume_1")
 
     def fake_fork(
@@ -925,7 +1411,8 @@ def test_batch_request_fails_closed_when_interrupted_child_is_uncertain(
         intent_mod.save(cfg, intent_mod.transition(child, "confirmed"))
         return entry
 
-    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False):
+    def fake_submit(_cfg, spec, _cwd, _log, no_queue=False, *, claimed_action=None):
+        assert claimed_action is None
         return persist_confirmed(spec, "job_uncertain_1")
 
     def fake_fork(

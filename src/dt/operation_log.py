@@ -335,6 +335,37 @@ def _rotate(target: JournalTarget) -> None:
     _fsync_directory(current.parent)
 
 
+def _repair_torn_tail(path: Path) -> None:
+    """Drop only an unterminated final record left by an interrupted write.
+
+    Complete-but-invalid lines remain visible to ``query`` as corruption.
+    Without this boundary repair, the next valid append glues itself to a
+    partial JSON fragment and is acknowledged even though no reader can ever
+    recover it.
+    """
+    if not _checked_regular(path):
+        return
+    descriptor = _open_private(path, os.O_RDWR)
+    try:
+        size = os.fstat(descriptor).st_size
+        if size == 0 or os.pread(descriptor, 1, size - 1) == b"\n":
+            return
+        cursor = size
+        boundary = 0
+        while cursor > 0:
+            width = min(8192, cursor)
+            cursor -= width
+            chunk = os.pread(descriptor, width, cursor)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                boundary = cursor + newline + 1
+                break
+        os.ftruncate(descriptor, boundary)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def append_event(target: JournalTarget, event: dict[str, Any]) -> None:
     encoded = (
         json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -355,6 +386,12 @@ def append_event(target: JournalTarget, event: dict[str, Any]) -> None:
                 limit = target.settings.max_file_mib * 1024 * 1024
                 if current.stat().st_size + len(encoded) > limit:
                     _rotate(target)
+            # Repair only the file that will receive this append.  An
+            # oversized current generation is rotated intact first: silently
+            # truncating its final fragment before archival would both change
+            # the bounded-rotation contract and erase useful crash evidence.
+            _repair_torn_tail(current)
+            journal_existed = _checked_regular(current)
             data_fd = _open_private(current, os.O_CREAT | os.O_APPEND | os.O_WRONLY)
             try:
                 view = memoryview(encoded)
@@ -367,6 +404,8 @@ def append_event(target: JournalTarget, event: dict[str, Any]) -> None:
                 # command; an unsynced append is exactly the record that a
                 # power loss erases.
                 os.fsync(data_fd)
+                if not journal_existed:
+                    _fsync_directory(target.directory)
             finally:
                 os.close(data_fd)
         finally:

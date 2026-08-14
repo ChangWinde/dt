@@ -66,7 +66,7 @@ def test_resource_telemetry_query_owns_path_tail_and_identity_contract():
 
     assert query.command(require_file=True) == (
         "test -f dt/jobs/query/outputs/dt/resources.jsonl && "
-        "tail -n 12 -- dt/jobs/query/outputs/dt/resources.jsonl"
+        "tail -c 262144 -- dt/jobs/query/outputs/dt/resources.jsonl | tail -n 12"
     )
     assert summary is not None
     assert summary["job_id"] == "query"
@@ -773,6 +773,7 @@ _PAYLOAD_TOOLS = (
     "python3",
     "rm",
     "sed",
+    "sha256sum",
     "sleep",
     "timeout",
     "tmux",
@@ -1309,6 +1310,57 @@ def test_telemetry_vram_guard_persists_evidence_and_terminates_job_group(tmp_pat
     }
 
 
+def test_telemetry_vram_guard_fails_closed_after_bounded_probe_failures(tmp_path):
+    output = tmp_path / "resources.jsonl"
+    guard = tmp_path / "resource-guard.json"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    nvidia_smi = fake_bin / "nvidia-smi"
+    nvidia_smi.write_text(
+        "#!/usr/bin/env bash\necho 'driver unavailable' >&2\nexit 1\n"
+    )
+    nvidia_smi.chmod(0o755)
+    worker = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(PAYLOAD_DIR / "telemetry.py"),
+                "--output",
+                str(output),
+                "--gpus",
+                "0",
+                "--root-pid",
+                str(worker.pid),
+                "--max-vram-mib",
+                "128",
+                "--guard-output",
+                str(guard),
+                "--interval",
+                "0.01",
+            ],
+            env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        worker_rc = worker.wait(timeout=2)
+    finally:
+        if worker.poll() is None:
+            os.killpg(worker.pid, signal.SIGKILL)
+            worker.wait(timeout=2)
+
+    assert proc.returncode == 0, proc.stderr
+    assert worker_rc == -signal.SIGTERM
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert len(rows) == 3
+    record = json.loads(guard.read_text())
+    assert record["kind"] == "max_vram_mib_observation_failure"
+    assert record["consecutive_failures"] == 3
+    assert record["limit_mib"] == 128
+    assert "driver unavailable" in record["reason"]
+
+
 def test_telemetry_sigterm_interrupts_slow_gpu_probe(tmp_path):
     output = tmp_path / "resources.jsonl"
     marker = tmp_path / "probe-started"
@@ -1587,6 +1639,18 @@ def test_resource_summary_bounds_hostile_job_written_numbers():
     summary = _summarize_resources(rows)
     json.dumps(summary, allow_nan=False)  # must not raise
     assert summary["gpus"]["0"]["util_busy_mean_pct"] == 50.0
+
+
+def test_resource_summary_rejects_huge_finite_floats_before_they_overflow():
+    summary = _summarize_resources(
+        [
+            {"timestamp": 1.0, "host": {"cpu_load1": 1e308}},
+            {"timestamp": 2.0, "host": {"cpu_load1": 1e308}},
+        ]
+    )
+
+    assert summary["host"]["cpu_load1_mean"] is None
+    json.dumps(summary, allow_nan=False)
 
 
 def test_resource_summary_and_ui_surface_job_attributed_usage():
@@ -1926,7 +1990,12 @@ def _oracle_numbers(values):
 
 def _oracle_summarize(rows, *, include_phases=True):
     """Historical whole-list aggregation kept verbatim as the oracle."""
-    timestamps = sorted(_oracle_numbers([row.get("timestamp") for row in rows]))
+    timestamp_values = _oracle_numbers([row.get("timestamp") for row in rows])
+    timestamps_monotonic = all(
+        later >= earlier
+        for earlier, later in zip(timestamp_values, timestamp_values[1:])
+    )
+    timestamps = sorted(timestamp_values)
     sample_intervals = [
         later - earlier
         for earlier, later in zip(timestamps, timestamps[1:])
@@ -2043,7 +2112,9 @@ def _oracle_summarize(rows, *, include_phases=True):
             max(timestamps) - min(timestamps) if len(timestamps) >= 2 else 0.0
         ),
         "sample_interval_s": (
-            sum(sample_intervals) / len(sample_intervals) if sample_intervals else None
+            sum(sample_intervals) / len(sample_intervals)
+            if sample_intervals and timestamps_monotonic
+            else None
         ),
         "gpus": gpu_summary,
         "gpu_error_samples": len(gpu_errors),
@@ -2059,6 +2130,8 @@ def _oracle_summarize(rows, *, include_phases=True):
             "io_pressure_peak": max(io) if io else None,
         },
     }
+    if not timestamps_monotonic:
+        summary["sample_interval_status"] = "non_monotonic_timestamps"
     if include_phases:
         summary["phases"] = _oracle_phase_spans(rows)
     return summary
@@ -2187,6 +2260,50 @@ def test_streaming_summary_matches_the_whole_list_oracle():
         assert streamed_summary == expected, trial
         assert summarize_resources(rows) == expected, trial
         assert phase_resource_spans(rows) == _oracle_phase_spans(rows), trial
+
+
+def test_resource_accumulator_has_bounded_state_for_hostile_cardinality():
+    from dt.monitoring import _MAX_RETAINED_PHASE_SPANS, _ResourceAccumulator
+
+    accumulator = _ResourceAccumulator()
+    for index in range(10_000):
+        accumulator.add(
+            {
+                "timestamp": float(index),
+                "phase": "even" if index % 2 == 0 else "odd",
+                "gpus": [{"index": index, "utilization_pct": index % 100}],
+            }
+        )
+
+    summary = accumulator.summary()
+    assert summary["sample_interval_s"] == 1.0
+    assert len(summary["gpus"]) == 256
+    assert summary["ignored_gpu_samples"] == 10_000 - 256
+    assert len(summary["phases"]) == _MAX_RETAINED_PHASE_SPANS
+    assert summary["phase_spans_omitted"] == 10_000 - _MAX_RETAINED_PHASE_SPANS
+    assert summary["phase_spans_head_count"] == _MAX_RETAINED_PHASE_SPANS // 2
+    assert summary["phases"][0]["sampled_started_at"] == 0.0
+    assert summary["phases"][-1]["sampled_started_at"] == 9_999.0
+
+
+def test_resource_summary_marks_non_monotonic_interval_unavailable():
+    from dt.monitoring import summarize_resources
+
+    summary = summarize_resources(
+        [{"timestamp": 3}, {"timestamp": 1}, {"timestamp": 2}]
+    )
+
+    assert summary["sample_interval_s"] is None
+    assert summary["sample_interval_status"] == "non_monotonic_timestamps"
+
+
+def test_resource_summary_bounds_last_gpu_error():
+    from dt.monitoring import _MAX_GPU_ERROR_CHARS, summarize_resources
+
+    summary = summarize_resources([{"gpu_error": "x" * (_MAX_GPU_ERROR_CHARS + 1)}])
+
+    assert summary["gpu_error_last"] == "x" * _MAX_GPU_ERROR_CHARS
+    assert summary["gpu_error_last_truncated"] is True
 
 
 def test_summary_skips_a_boolean_gpu_index_instead_of_crashing():

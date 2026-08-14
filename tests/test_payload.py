@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -49,23 +51,53 @@ def test_launcher_prechecks_busy_before_env_sync():
     assert 0 < pre < sync
 
 
-def test_launcher_uses_dedicated_tmux_server():
-    # user tmux servers can be systemd-managed (kill-server on stop):
-    # jobs must live on dt's own socket
-    assert "run_tmux_new_session -L dt new-session" in LAUNCHER
-    assert "tmux -L dt kill-session" in LAUNCHER
-    assert "set-option -g exit-empty off" in LAUNCHER
+def test_launcher_uses_one_tmux_server_and_scope_per_job():
+    # A shared dt server can predate the current user service and therefore
+    # remain in that service's cgroup. Merely wrapping a client connection in
+    # systemd-run does not move the existing server. Every new job must create
+    # its own deterministic server inside its own deterministic scope.
+    assert 'DT_TMUX_SOCKET="dt-job-${DT_RUNTIME_ID}"' in LAUNCHER
+    assert 'DT_RUNTIME_SCOPE="dt-runtime-${DT_RUNTIME_ID}.scope"' in LAUNCHER
+    assert 'run_tmux_new_session -L "$DT_TMUX_SOCKET" new-session' in LAUNCHER
+    assert 'tmux -L "$DT_TMUX_SOCKET" kill-session' in LAUNCHER
+    assert "run_tmux_new_session -L dt" not in LAUNCHER
+    assert "set-option -g exit-empty on" in LAUNCHER
     assert "systemd-run --user --scope --quiet" in LAUNCHER
     assert "systemctl --user show-environment" in LAUNCHER
+    assert '--unit="${DT_RUNTIME_SCOPE%.scope}"' in LAUNCHER
+    assert "dt-runtime-${unit_hash}-$$" not in LAUNCHER
+    assert '"$DT_STATE_DIR/runtime_scope"' in LAUNCHER
+    assert '"$DT_STATE_DIR/tmux_socket"' in LAUNCHER
 
 
 def test_launcher_does_not_leak_node_launch_lock_into_tmux():
     # A fresh tmux server inherits open descriptors from its client. If fd 9
     # leaks, the server holds the node launch flock until the whole GPU job
     # exits and concurrent CPU submissions stall at "launching".
-    start = LAUNCHER.index("run_tmux_new_session -L dt new-session")
+    start = LAUNCHER.index('run_tmux_new_session -L "$DT_TMUX_SOCKET" new-session')
     end = LAUNCHER.index("\n}", start)
     assert "9>&-" in LAUNCHER[start:end]
+
+
+def test_launcher_starts_each_job_with_a_clean_tmux_environment():
+    """The persistent dt tmux server must not leak proxy/library state."""
+    assert 'DT_SESSION_COMMAND="cd $DT_SHELL_QUOTED && env -i"' in LAUNCHER
+    names = _tmux_session_env_names()
+    assert {"HOME", "PATH", "USER", "LOGNAME"} <= names
+    assert "HTTP_PROXY" not in names
+    assert "PYTHONPATH" not in names
+    assert "LD_LIBRARY_PATH" not in names
+    assert {"DT_TMUX_SOCKET", "DT_RUNTIME_SCOPE"} <= names
+
+
+def test_wrapper_reaps_setsid_chdir_escapees_from_its_job_scope():
+    # Cwd and PGID are useful compatibility fallbacks, but neither can find a
+    # daemon that called both setsid() and chdir('/'). A scoped job must also
+    # enumerate its recursive cgroup membership.
+    assert '"$DT_STATE_DIR/runtime_scope"' in WRAPPER
+    assert "/proc/self/cgroup" in WRAPPER
+    assert 'find "/sys/fs/cgroup$cgroup" -type f -name cgroup.procs' in WRAPPER
+    assert "dt_add_escape_pid" in WRAPPER
 
 
 def test_launcher_clears_result_state_on_reattempt():
@@ -88,7 +120,9 @@ def test_wrapper_sets_job_owned_tmpdir_unconditionally():
 
 
 def test_launcher_clears_stale_attempt_markers_before_new_session():
-    session_check = LAUNCHER.index('tmux -L dt has-session -t "$DT_SESSION"')
+    session_check = LAUNCHER.index(
+        'tmux -L "$DT_TMUX_SOCKET" has-session -t "$DT_SESSION"'
+    )
     marker_clear = LAUNCHER.index('rm -f "$DT_STATE_DIR/pgid"')
     session_start = LAUNCHER.index('start_session "$ids"')
 
@@ -96,8 +130,72 @@ def test_launcher_clears_stale_attempt_markers_before_new_session():
     assert '"$DT_STATE_DIR/process_start_ticks"' in LAUNCHER[marker_clear:session_start]
 
 
+def test_launcher_clears_stale_terminal_markers_before_environment_sync():
+    """A second dropped ssh must not mistake a prior cancelled run for EXITED."""
+    session_check = LAUNCHER.index(
+        'tmux -L "$DT_TMUX_SOCKET" has-session -t "$DT_SESSION"'
+    )
+    marker_clear = LAUNCHER.index('rm -f "$DT_STATE_DIR/pgid"')
+    environment_sync = LAUNCHER.index('log "syncing env $lockhash"')
+
+    assert session_check < marker_clear < environment_sync
+    cleared = LAUNCHER[marker_clear:environment_sync]
+    assert '"$DT_STATE_DIR/exit_code"' in cleared
+    assert '"$DT_STATE_DIR/result_state"' in cleared
+
+
+def test_launcher_enters_capsule_before_slow_environment_work():
+    """Crash recovery must be able to census an in-progress launcher."""
+    enter = LAUNCHER.index('if ! cd "$DT_JOB_DIR"')
+    custom_env = LAUNCHER.index("dt_load_custom_env || exit 14")
+    environment_sync = LAUNCHER.index('log "syncing env $lockhash"')
+
+    assert enter < custom_env < environment_sync
+
+
+def test_dispatch_remote_command_enters_capsule_before_launcher_exec(
+    tmp_path,
+    monkeypatch,
+):
+    import dt.dispatch as dispatch
+    from dt.config import HeadConfig, Node
+
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    seen = {}
+
+    def fake_run_on(name, local, command, timeout):
+        seen["command"] = command
+        return subprocess.CompletedProcess(
+            [name],
+            0,
+            '{"gpus": [], "pgid": 123}\n',
+            "",
+        )
+
+    monkeypatch.setattr(dispatch, "run_on", fake_run_on)
+
+    code, _result = dispatch.launch(
+        cfg,
+        cfg.nodes[0],
+        "job1",
+        "~/dt/jobs/job1",
+        "dt_job1",
+        dispatch.RunSpec(name="job", gpus=0, cmd=["true"]),
+    )
+
+    assert code == 0
+    assert seen["command"].startswith('cd "$HOME"/dt/jobs/job1 && ')
+
+
 def _cancel_supersede_block() -> str:
-    start = LAUNCHER.index("DT_CANCEL_STAMP=")
+    start = LAUNCHER.index('mkdir -p -- "$(dirname -- "$DT_CANCEL_PATH")"')
     end = LAUNCHER.index("cancelled() {")
     return LAUNCHER[start:end]
 
@@ -116,7 +214,11 @@ def test_launcher_supersedes_only_cancel_sentinels_from_before_launch(tmp_path):
     past = time_mod.time() - 10
     os.utime(cancel, (past, past))
     subprocess.run(
-        ["bash", "-uc", f'DT_CANCEL_PATH="{cancel}"\n' + block],
+        [
+            "bash",
+            "-uc",
+            f'DT_CANCEL_PATH="{cancel}"\nDT_LAUNCH_TOKEN=""\n' + block,
+        ],
         check=True,
         timeout=10,
     )
@@ -127,12 +229,57 @@ def test_launcher_supersedes_only_cancel_sentinels_from_before_launch(tmp_path):
     future = time_mod.time() + 10
     os.utime(cancel, (future, future))
     subprocess.run(
-        ["bash", "-uc", f'DT_CANCEL_PATH="{cancel}"\n' + block],
+        [
+            "bash",
+            "-uc",
+            f'DT_CANCEL_PATH="{cancel}"\nDT_LAUNCH_TOKEN=""\n' + block,
+        ],
         check=True,
         timeout=10,
     )
     assert cancel.exists()
     assert not Path(f"{cancel}.launch").exists()
+
+
+def test_launcher_attempt_token_does_not_release_an_older_attempt(tmp_path):
+    old_token = "a" * 32
+    new_token = "b" * 32
+    job = tmp_path / "job"
+    job.mkdir()
+    cancel = job / "cancel"
+    cancel.write_text(f"{old_token}\n")
+
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={
+            "DT_CANCEL_PATH": str(cancel),
+            "DT_LAUNCH_TOKEN": new_token,
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert cancel.read_text().strip() == old_token
+
+
+def test_launcher_attempt_token_honors_its_targeted_cancellation(tmp_path):
+    token = "c" * 32
+    job = tmp_path / "job"
+    job.mkdir()
+    cancel = job / "cancel"
+    cancel.write_text(f"{token}\n")
+
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={
+            "DT_CANCEL_PATH": str(cancel),
+            "DT_LAUNCH_TOKEN": token,
+        },
+    )
+
+    assert proc.returncode == 14
+    assert "cancelled by dispatcher" in proc.stderr
 
 
 def test_launcher_rechecks_cancel_sentinel_after_session_start():
@@ -142,12 +289,15 @@ def test_launcher_rechecks_cancel_sentinel_after_session_start():
         session_start,
     )
     gpu_marker = LAUNCHER.index(
-        'echo "$ids" > "$DT_STATE_DIR/gpus"',
+        'printf \'%s\\n\' "$ids" >"$DT_STATE_DIR/gpus"',
         session_start,
     )
 
     assert session_start < post_start < gpu_marker
-    assert 'tmux -L dt kill-session -t "$DT_SESSION"' in LAUNCHER[post_start:gpu_marker]
+    assert (
+        'tmux -L "$DT_TMUX_SOCKET" kill-session -t "$DT_SESSION"'
+        in LAUNCHER[post_start:gpu_marker]
+    )
 
 
 def test_launcher_reports_node_boot_identity():
@@ -183,12 +333,23 @@ def _run_launcher_with_fake_uv(
     mode: str,
     cache_mode: str | None = None,
     env_overrides: dict[str, str] | None = None,
+    custom_env: dict[str, str] | None = None,
+    gpu_rows: str | None = None,
 ) -> subprocess.CompletedProcess:
     job = tmp_path / "job"
     code = job / "code"
     code.mkdir(parents=True)
     (code / "uv.lock").write_text("version = 1\n")
     (job / "env-key").write_text("0123456789ab\n")
+    if custom_env:
+        custom_path = job / "custom-env"
+        custom_path.write_bytes(
+            b"".join(
+                key.encode() + b"\0" + value.encode() + b"\0"
+                for key, value in custom_env.items()
+            )
+        )
+        custom_path.chmod(0o600)
     if mode == "setup":
         (job / "setup.sh").write_text("true\n")
     elif mode == "setup_failure":
@@ -211,6 +372,16 @@ def _run_launcher_with_fake_uv(
         hint.write_text("https://mirrors.aliyun.com/pypi/simple/\n")
     fake_bin.mkdir()
     state.mkdir()
+    if gpu_rows is not None:
+        nvidia_smi = fake_bin / "nvidia-smi"
+        nvidia_smi.write_text(
+            "#!/usr/bin/env bash\n"
+            'case " $* " in\n'
+            '  *" --query-compute-apps=gpu_uuid "*) exit 0 ;;\n'
+            "esac\n"
+            f"printf '%s\\n' {shlex.quote(gpu_rows)}\n"
+        )
+        nvidia_smi.chmod(0o755)
     uv = fake_bin / "uv"
     uv.write_text(
         "#!/usr/bin/env bash\n"
@@ -283,18 +454,24 @@ def _run_launcher_with_fake_uv(
         "exit 99\n"
     )
     tmux.chmod(0o755)
+    test_runtime_id = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]
     env = {
         **os.environ,
         "HOME": str(fake_home),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "DT_JOB_DIR": str(job),
         "DT_GPUS": "0",
-        "DT_SESSION": f"dt_uv_{mode}",
+        # The launcher deliberately maps a job session to a host-global
+        # systemd scope. Keep independent pytest processes from impersonating
+        # the same job when Python matrix legs run concurrently on one host.
+        "DT_SESSION": f"dt_uv_{mode}_{test_runtime_id}",
         "DT_ENVS_DIR": str(tmp_path / "envs"),
         "DT_DISK_GIB": "0",
         "DT_TEST_STATE": str(state),
         "DT_TEST_UV_MODE": mode,
     }
+    if custom_env:
+        env["DT_CUSTOM_ENV_PATH"] = str(job / "custom-env")
     if mode in {"reuse", "reuse_missing"}:
         env["DT_ENV_MODE"] = "reuse"
     if mode == "reuse":
@@ -336,6 +513,47 @@ def _run_launcher_with_fake_uv(
         text=True,
         timeout=10,
     )
+
+
+def test_launcher_selects_only_cards_that_meet_minimum_total_memory(tmp_path):
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        gpu_rows="0, GPU-small, 0, 24576\n1, GPU-fit, 0, 81920",
+        env_overrides={
+            "DT_GPUS": "1",
+            "DT_MIN_VRAM_MIB": "65536",
+            # The undersized but idle card still satisfies the node reserve.
+            "DT_RESERVE": "1",
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["gpus"] == [1]
+
+
+@pytest.mark.parametrize(
+    "gpu_rows",
+    [
+        "0, , 0, 81920",
+        "0, GPU-bad, 0, N/A",
+        "0, GPU-duplicate, 0, 81920\n0, GPU-other, 0, 81920",
+        "0, GPU-impossible, 90000, 81920",
+    ],
+)
+def test_launcher_fails_closed_on_malformed_gpu_memory_inventory(
+    tmp_path,
+    gpu_rows,
+):
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        gpu_rows=gpu_rows,
+        env_overrides={"DT_GPUS": "1", "DT_MIN_VRAM_MIB": "65536"},
+    )
+
+    assert proc.returncode == 15
+    assert "malformed GPU memory inventory" in proc.stderr
 
 
 def test_launcher_repairs_one_invalid_cached_wheel_then_retries(tmp_path):
@@ -577,6 +795,49 @@ def test_launcher_shell_quotes_tmux_environment_values(tmp_path):
     assert executed.returncode == 0, executed.stderr
     assert (tmp_path / "job" / "received-name").read_text() == hostile_name
     assert not sentinel.exists()
+
+
+def test_launcher_injects_custom_environment_without_shell_interpretation(tmp_path):
+    sentinel = tmp_path / "injected"
+    secret = f"line one'; touch {sentinel}; printf '\nline two"
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={"DT_TEST_TMUX_CAPTURE": "1"},
+        custom_env={"HF_TOKEN": secret, "DATASET_SPLIT": "validation"},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert not (tmp_path / "job" / "custom-env").exists()
+    command = (tmp_path / "state" / "session-command").read_text()
+    wrapper = tmp_path / "job" / "wrapper.sh"
+    wrapper.write_text(
+        'printf "%s" "$HF_TOKEN" > received-token\n'
+        'printf "%s" "$DATASET_SPLIT" > received-split\n'
+    )
+    executed = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert executed.returncode == 0, executed.stderr
+    assert (tmp_path / "job" / "received-token").read_text() == secret
+    assert (tmp_path / "job" / "received-split").read_text() == "validation"
+    assert not sentinel.exists()
+
+
+def test_launcher_rejects_shell_special_variable_from_forged_handoff(tmp_path):
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        custom_env={"RANDOM": "123"},
+    )
+
+    assert proc.returncode == 14
+    assert "variable RANDOM is reserved" in proc.stderr
+    assert not (tmp_path / "job" / "custom-env").exists()
 
 
 def test_launch_propagates_configured_node_identity_to_telemetry(tmp_path, monkeypatch):
@@ -1289,11 +1550,13 @@ def test_payload_clears_caller_virtualenv_before_managed_uv(tmp_path):
 
 
 def test_wrapper_reaps_group_escapees():
-    # setpgrp callers (omnistack-train) leave the pane group; membership
-    # test is cwd-inside-job-dir
+    # setpgrp callers (omnistack-train) leave the pane group. The shared PID
+    # collector de-duplicates both cwd and cgroup candidates while excluding
+    # the wrapper/tmux ancestor chain.
     assert 'readlink "$p/cwd"' in WRAPPER
     assert "dt_ancestor_pids" in WRAPPER
-    assert 'case "$dt_ancestor_pids" in *" $pid "*) continue' in WRAPPER
+    assert 'case "$dt_ancestor_pids" in *" $candidate "*) return' in WRAPPER
+    assert 'dt_add_escape_pid "$pid"' in WRAPPER
 
 
 def test_gpu_lease_closes_pre_cuda_startup_race():
@@ -1305,9 +1568,108 @@ def test_gpu_lease_closes_pre_cuda_startup_race():
     assert "attempt < 100" in LAUNCHER
     assert "sleep 0.1" in LAUNCHER
     assert WRAPPER.find("flock -n") < WRAPPER.find(
-        'printf \'%s\\n\' "$$" > "$DT_STATE_DIR/pgid"'
+        'dt_publish_state_marker "$DT_STATE_DIR/pgid" "$$"'
     )
     assert "gpu-$dt_gpu_index.lock" in WRAPPER
+
+
+def test_gpu_lease_contender_cannot_truncate_the_live_owner():
+    """Opening a lease must not mutate its diagnostic before flock wins."""
+    assert 'exec {dt_gpu_lease_fd}<>"$dt_gpu_lock"' in WRAPPER
+    assert 'exec {dt_gpu_lease_fd}>"$dt_gpu_lock"' not in WRAPPER
+
+
+def test_gpu_lease_content_survives_a_rejected_wrapper_contender(tmp_path):
+    lease_root = tmp_path / "leases"
+    lease_root.mkdir()
+    lease = lease_root / "gpu-0.lock"
+    ready = tmp_path / "owner-ready"
+    owner = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl,sys,time; from pathlib import Path; "
+                "stream=open(sys.argv[1],'w+'); "
+                "fcntl.flock(stream,fcntl.LOCK_EX); "
+                "stream.write('live-owner\\n'); stream.flush(); "
+                "Path(sys.argv[2]).touch(); time.sleep(30)"
+            ),
+            str(lease),
+            str(ready),
+        ]
+    )
+    try:
+        deadline = time.monotonic() + 3
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "lease owner did not acquire its lock"
+        (tmp_path / "code").mkdir()
+        (tmp_path / "cmd.sh").write_text("true\n")
+        proc = subprocess.run(
+            ["bash", str(PAYLOAD / "wrapper.sh")],
+            env={
+                **os.environ,
+                "DT_JOB_DIR": str(tmp_path),
+                "DT_GPU_LEASE_ROOT": str(lease_root),
+                "DT_GPU_IDS": "0",
+                "DT_GPUS": "1",
+                "DT_MAX_HOURS": "",
+                "DT_UV": "",
+                "DT_UV_ENV": "",
+                "DT_WEBHOOK": "",
+                "DT_PROXY": "",
+            },
+            capture_output=True,
+            text=True,
+            timeout=WRAPPER_TIMEOUT_SECONDS,
+        )
+
+        assert proc.returncode == 75
+        assert lease.read_text() == "live-owner\n"
+    finally:
+        owner.terminate()
+        owner.wait(timeout=2)
+
+
+def test_wrapper_rejects_duplicate_or_count_mismatched_gpu_selection(tmp_path):
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text("true\n")
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "0,0",
+        "DT_GPUS": "2",
+        "DT_MAX_HOURS": "",
+        "DT_UV": "",
+        "DT_UV_ENV": "",
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 76
+    assert "invalid GPU selection" in proc.stderr
+    assert not (tmp_path / "code" / "ran").exists()
+
+
+def test_dt_owned_payload_helpers_use_isolated_python():
+    assert 'python3 -I "$payload_dir/cuda_probe.py"' in LAUNCHER
+    assert 'python3 -I "$DT_PAYLOAD_DIR/telemetry.py"' in WRAPPER
+    assert 'python3 -I "$DT_PAYLOAD_DIR/result.py"' in WRAPPER
+
+
+def test_launcher_receipt_uses_in_memory_gpu_selection():
+    assert "LAUNCHED_GPU_IDS=$ids" in LAUNCHER
+    assert "ids=$LAUNCHED_GPU_IDS" in LAUNCHER
+    assert 'ids=$(cat "$DT_STATE_DIR/gpus"' not in LAUNCHER
 
 
 def test_wrapper_publishes_process_identity_before_pgid():
@@ -1407,7 +1769,95 @@ def test_wrapper_records_catchable_session_teardown():
     assert "trap 'dt_on_exit $?' EXIT" in WRAPPER
     assert "trap 'dt_signal_exit HUP 129' HUP" in WRAPPER
     assert "trap 'dt_signal_exit TERM 143' TERM" in WRAPPER
-    assert 'mv "$DT_STATE_DIR/exit_code.tmp.$$" "$DT_STATE_DIR/exit_code"' in WRAPPER
+    assert 'dt_publish_state_marker "$DT_STATE_DIR/exit_code" "$dt_rc"' in WRAPPER
+
+
+def test_wrapper_replaces_an_empty_terminal_marker(tmp_path):
+    """A failed prior publish must not pin a finished task as running forever."""
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text("true\n")
+    (tmp_path / "exit_code").touch()
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "",
+        "DT_MAX_HOURS": "",
+        "DT_UV": "",
+        "DT_UV_ENV": "",
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "exit_code").read_text() == "0\n"
+    assert (tmp_path / "result_state").read_text() == "success\n"
+
+
+def test_wrapper_overwrites_task_forged_terminal_markers(tmp_path):
+    """Only the supervisor's post-run observation may publish completion."""
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text(
+        'printf "0\\n" > "$DT_STATE_DIR/exit_code"\n'
+        'printf "success\\n" > "$DT_STATE_DIR/result_state"\n'
+        "exit 9\n"
+    )
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "",
+        "DT_GPUS": "0",
+        "DT_MAX_HOURS": "",
+        "DT_UV": "",
+        "DT_UV_ENV": "",
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 9, proc.stderr
+    assert (tmp_path / "exit_code").read_text() == "9\n"
+    assert (tmp_path / "result_state").read_text() == "execution_failure\n"
+
+
+def test_wrapper_fails_closed_when_the_code_directory_is_missing(tmp_path):
+    (tmp_path / "cmd.sh").write_text("true\n")
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "",
+        "DT_MAX_HOURS": "",
+        "DT_UV": "",
+        "DT_UV_ENV": "",
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 76
+    assert "cannot enter job code directory" in proc.stderr
+    assert (tmp_path / "exit_code").read_text() == "76\n"
 
 
 def test_wrapper_records_subsecond_start_and_finish_timestamps(tmp_path):
@@ -1723,6 +2173,36 @@ def test_wrapper_hup_writes_exit_marker(tmp_path):
     assert proc.wait(timeout=WRAPPER_TIMEOUT_SECONDS) == 129
     assert (tmp_path / "exit_code").read_text().strip() == "129"
     assert (tmp_path / "finished_at").is_file()
+
+
+def test_wrapper_async_runner_preserves_tmux_stdin(tmp_path):
+    """The interruptible wait must not turn an attached pane into /dev/null."""
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text(
+        'IFS= read -r value\nprintf "%s\\n" "$value" > "$DT_JOB_DIR/stdin.txt"\n'
+    )
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "",
+        "DT_MAX_HOURS": "",
+        "DT_UV": "",
+        "DT_UV_ENV": "",
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        input="from-attach\n",
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "stdin.txt").read_text() == "from-attach\n"
 
 
 def test_wrapper_hup_reaps_group_escapee(tmp_path):

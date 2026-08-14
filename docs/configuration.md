@@ -115,6 +115,7 @@ proxy: http://proxy.example.invalid:8080
 | `nodes[].lan_port` | Site-LAN SSH port, defaults to 22 and requires `lan_address` when explicitly set |
 | `nodes[].artifact_seed` | Whether the node may host a trusted artifact cache; defaults to true |
 | `nodes[].transfer_cost` | Non-negative route cost recorded by transfer plans; defaults to 1 |
+| `nodes[].drained` | Maintenance switch: no new placements (pins included) while running jobs finish; defaults to false |
 
 Node order does not grant a permanent placement preference. `dt` probes
 eligible nodes and selects fitting capacity while respecting explicit pins and
@@ -141,19 +142,17 @@ configuration loading fail. DT never infers a site from a hostname.
 | `sites.NAME.route_circuit_failures` | `2` | Consecutive direct-edge transport failures before the route circuit opens; range 1–10 |
 | `sites.NAME.route_circuit_cooldown_s` | `60` | Initial cooldown before one half-open route probe; range 1–3600 seconds |
 | `sites.NAME.route_circuit_max_cooldown_s` | `900` | Maximum exponential cooldown; at least the initial cooldown and at most 86400 seconds |
+| `sites.NAME.bwlimit_kbps` | unset | Head-side transfer budget (KiB/s) for pull/sync legs touching the head; intra-site LAN replays stay unthrottled; `--bwlimit` overrides |
 
-Both `site-cache-first` and `topology-aware` authenticate their site-internal
-SSH hops by forwarding the head operator's ssh-agent to the selected trusted
-source; DT never copies a private key to a worker. The head therefore needs a
-reachable agent that holds every key able to log in to the site's nodes.
-Export `SSH_AUTH_SOCK` for interactive submissions, and inject the same
-socket into the queue agent service (for example a systemd user drop-in with
-`Environment=SSH_AUTH_SOCK=%t/dt-ssh-agent.sock`). `dt doctor` reports this
-contract as `relay` on the head row: it checks `SSH_AUTH_SOCK` first, falls
-back to `$XDG_RUNTIME_DIR/dt-ssh-agent.sock`, and fails when no reachable
-agent holds keys. A pinned `nodes[].lan_address` that the node no longer
-reports (for example a recreated container Pod) is flagged as `lan: stale`
-and fails `dt doctor` before a transfer can fail at use time.
+Both `site-cache-first` and `topology-aware` authenticate site-internal SSH
+hops with credentials already available on the gateway or selected peer
+source. Every DT-managed SSH pool sets `ForwardAgent=no`; the head does not
+lend an agent socket or copy a private key to a worker. Provision the trusted
+site account so each permitted source can log in to its destination over the
+site LAN. Route probes fail closed when that local authentication is missing.
+A pinned `nodes[].lan_address` that the node no longer reports (for example a
+recreated container Pod) is flagged as `lan: stale` and fails `dt doctor`
+before a transfer can fail at use time.
 
 Under `site-cache-first`, a snapshot digest is verified before atomic cache
 publication. Concurrent deliveries of the same `(site, digest)` share one
@@ -200,11 +199,13 @@ only on nodes with `artifact_seed: true`; their full tree hash is checked again
 before every reuse because application code may have modified its worktree.
 
 For `site-cache-first`, the cache node must be able to route to every LAN
-address. For either relay mode,
-the head's SSH agent must hold the worker key and the gateway must already
-trust the worker's LAN host key. DT forwards the agent only through a private,
-short-lived artifact-relay pool; it never copies private keys and never disables
-host-key verification. Missing authentication or host trust fails explicitly.
+address and authenticate with gateway-local credentials. Under
+`topology-aware`, each eligible peer source needs the equivalent local
+credential. The source must already trust an operator-pinned LAN address;
+automatically discovered endpoints use the destination keys learned through
+the authenticated control route and a DT-private known-hosts file. DT never
+forwards an agent, copies private keys, or disables host-key verification.
+Missing authentication or host trust fails explicitly.
 `fallback_direct: true` is an explicit availability tradeoff: DT logs the route
 change and makes only one fallback attempt, which can resend WAN bytes. The
 default remains fail-closed so bad topology cannot silently become a slow
@@ -215,7 +216,7 @@ SSH multiplexing is separated end to end:
 - control operations use `~/.ssh/dt/control/%C`;
 - head-to-node bulk data uses `~/.ssh/dt/artifact/%C`;
 - gateway-executed LAN fan-out uses `~/.ssh/dt/artifact-relay/%C` with a
-  30-second persist window.
+  30-second persist window and gateway-local credentials.
 
 Unix sockets cap the whole path at ~104 bytes, so when the state directory is
 too deep for that budget (long home paths, containerized state roots) DT

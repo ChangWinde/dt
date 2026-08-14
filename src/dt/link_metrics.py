@@ -51,6 +51,7 @@ SMOOTHING_UP = 0.5
 SLOW_EVIDENCE_TTL_S = 900.0
 _ORIGINS = frozenset({"transfer", "probe"})
 _MAX_BPS = 1e12  # nothing DT talks to moves a terabyte per second
+_MAX_SAMPLE_BYTES = 1 << 100  # bounded well above any plausible transfer
 
 
 class LinkMetricsError(RuntimeError):
@@ -109,6 +110,7 @@ def _validate_sample(raw: object, expected_key: str) -> LinkSample:
         not isinstance(last_bytes, int)
         or isinstance(last_bytes, bool)
         or last_bytes < 0
+        or last_bytes > _MAX_SAMPLE_BYTES
     ):
         raise LinkMetricsError("link metrics byte count is invalid")
     values: dict[str, float] = {}
@@ -183,19 +185,31 @@ class PersistentLinkMetrics:
                 )
             except OSError as exc:
                 raise LinkMetricsError("link metrics lock is unsafe") from exc
-            lock_info = os.fstat(lock_fd)
-            if not stat.S_ISREG(lock_info.st_mode):
-                raise LinkMetricsError("link metrics lock is not a regular file")
-            os.fchmod(lock_fd, 0o600)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                lock_info = os.fstat(lock_fd)
+                if not stat.S_ISREG(lock_info.st_mode):
+                    raise LinkMetricsError("link metrics lock is not a regular file")
+                os.fchmod(lock_fd, 0o600)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                raise LinkMetricsError("link metrics lock is unsafe") from exc
             yield directory_fd, f"{key}.json"
         finally:
             if lock_fd >= 0:
                 try:
                     fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                finally:
+                except OSError:
+                    # close() releases the lock even when an explicit unlock
+                    # syscall is unavailable; never mask the body exception.
+                    pass
+                try:
                     os.close(lock_fd)
-            os.close(directory_fd)
+                except OSError:
+                    pass
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
 
     @staticmethod
     def _read(directory_fd: int, name: str, key: str) -> LinkSample | None:
@@ -222,8 +236,13 @@ class PersistentLinkMetrics:
                 payload.extend(chunk)
             if len(payload) > MAX_STATE_BYTES:
                 raise LinkMetricsError("link metrics state exceeds its size limit")
+        except OSError as exc:
+            raise LinkMetricsError("link metrics state cannot be read") from exc
         finally:
-            os.close(descriptor)
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
             raw = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -299,6 +318,7 @@ class PersistentLinkMetrics:
             not isinstance(transferred_bytes, int)
             or isinstance(transferred_bytes, bool)
             or transferred_bytes < MIN_SAMPLE_BYTES
+            or transferred_bytes > _MAX_SAMPLE_BYTES
             or not isinstance(elapsed_seconds, (int, float))
             or isinstance(elapsed_seconds, bool)
             or not math.isfinite(float(elapsed_seconds))
@@ -385,9 +405,14 @@ def effective_throughput_bps(
     """
     if sample is None:
         return None
+    current = time.time() if now is None else now
+    # A head clock step backwards must not make slow evidence immortal. Treat
+    # any future-dated sample as unknown until a new observation replaces it.
+    if sample.sampled_at > current:
+        return None
     if (
         throughput_bucket(sample.smoothed_bps) > UNMEASURED_BUCKET
-        and sample.age_s(now=now) > SLOW_EVIDENCE_TTL_S
+        and sample.age_s(now=current) > SLOW_EVIDENCE_TTL_S
     ):
         return None
     return sample.smoothed_bps

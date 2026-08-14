@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -17,7 +18,10 @@ from .config import HeadConfig
 from .jobs import JobEntry, load as load_job
 
 GROUP_REQUEST_SCHEMA = "dt_submission_group_request_v1"
-GROUP_REQUEST_STATES = frozenset({"preparing", "confirmed", "uncertain"})
+GROUP_REQUEST_STATES = frozenset(
+    {"preparing", "prepared", "confirmed", "rejected", "uncertain"}
+)
+GROUP_TERMINAL_STATES = frozenset({"confirmed", "rejected"})
 GROUP_OPERATIONS = frozenset({"batch", "chain", "fork_repeat"})
 _RECORD_FIELDS = frozenset(
     {
@@ -43,6 +47,32 @@ class GroupRequestError(RuntimeError):
 
 class GroupRequestConflict(GroupRequestError):
     """A request identity already belongs to another durable intent."""
+
+
+class GroupRequestRejected(GroupRequestError):
+    """A group was proven not to have crossed its first child launch."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        record: GroupRequestRecord | None = None,
+    ) -> None:
+        self.record = record
+        super().__init__(detail)
+
+
+class GroupRequestOutcomeUnknown(GroupRequestError):
+    """A group preparation may have run and must not be repeated."""
+
+    def __init__(
+        self,
+        detail: str,
+        *,
+        record: GroupRequestRecord | None = None,
+    ) -> None:
+        self.record = record
+        super().__init__(detail)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +196,16 @@ def _decode(raw: object, *, expected_request_id: str) -> GroupRequestRecord:
             raise GroupRequestError("failed submission group has a success exit code")
         if record.error_kind is None and record.submitted != record.requested:
             raise GroupRequestError("successful submission group is incomplete")
+    if record.state == "rejected" and (
+        record.submitted != 0 or record.error_kind is None
+    ):
+        raise GroupRequestError(
+            "rejected submission group has invalid progress or no failure kind"
+        )
+    if record.state == "prepared" and (
+        record.error_kind is not None or record.error_message is not None
+    ):
+        raise GroupRequestError("prepared submission group has failure details")
     if record.error_kind is not None and (
         len(record.error_kind) > 64
         or re.fullmatch(r"[A-Za-z0-9_.:-]+", record.error_kind) is None
@@ -240,11 +280,16 @@ def save(cfg: HeadConfig, record: GroupRequestRecord) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as exc:
+            raise intent_mod.RequestDurabilityUnknown(
+                "submission group record was published but its durability is unknown"
+            ) from exc
     finally:
         try:
             os.unlink(temporary)
@@ -252,15 +297,15 @@ def save(cfg: HeadConfig, record: GroupRequestRecord) -> None:
             pass
 
 
-def claim(
+def _claim(
     cfg: HeadConfig,
     request_id: str,
     intent_sha256: str,
     *,
     operation: str,
     requested: int,
-) -> GroupRequestRecord:
-    """Create or return a same-intent parent claim while its lock is held."""
+) -> tuple[GroupRequestRecord, bool]:
+    """Create or return a same-intent parent claim and creation verdict."""
     if intent_mod.load(cfg, request_id) is not None:
         raise GroupRequestConflict(
             f"request {request_id!r} already belongs to a single-job intent"
@@ -275,7 +320,7 @@ def claim(
             raise GroupRequestConflict(
                 f"request {request_id!r} already belongs to a different intent"
             )
-        return existing
+        return existing, False
     if operation not in GROUP_OPERATIONS:
         raise ValueError(f"unsupported submission group operation {operation!r}")
     if requested < 1 or requested > 10_000:
@@ -293,6 +338,25 @@ def claim(
         updated_at=timestamp,
     )
     save(cfg, record)
+    return record, True
+
+
+def claim(
+    cfg: HeadConfig,
+    request_id: str,
+    intent_sha256: str,
+    *,
+    operation: str,
+    requested: int,
+) -> GroupRequestRecord:
+    """Create or return a same-intent parent claim while its lock is held."""
+    record, _created = _claim(
+        cfg,
+        request_id,
+        intent_sha256,
+        operation=operation,
+        requested=requested,
+    )
     return record
 
 
@@ -304,6 +368,8 @@ def record_job(
     job_id: str,
 ) -> GroupRequestRecord:
     """Persist one confirmed child in strict prefix order."""
+    if record.state in GROUP_TERMINAL_STATES:
+        raise GroupRequestError("terminal submission group cannot record more jobs")
     if index < 1 or index > record.requested:
         raise GroupRequestError("submission group child index is out of range")
     if index > record.submitted + 1:
@@ -327,7 +393,7 @@ def record_job(
         operation=record.operation,
         requested=record.requested,
         submitted=index,
-        state="preparing",
+        state="prepared" if record.state == "prepared" else "preparing",
         created_at=record.created_at,
         updated_at=time.time(),
     )
@@ -374,16 +440,88 @@ def locked_claim(
     *,
     operation: str,
     requested: int,
+    claimed_action: Callable[[], None] | None = None,
 ) -> GroupRequestRecord:
-    """Atomically claim a parent identity without holding its lock for I/O."""
+    """Claim a parent and optionally run remote preparation exactly once.
+
+    The callback runs under the request lock only after the new claim is
+    durable.  Its successful completion is durably marked ``prepared`` before
+    the caller may create child jobs.  An existing ``preparing`` or
+    ``uncertain`` record cannot prove whether a previous callback ran, so a
+    retry with a callback fails closed instead of repeating remote mutation.
+    """
     with intent_mod.lock(cfg, request_id):
-        return claim(
-            cfg,
-            request_id,
-            intent_sha256,
-            operation=operation,
-            requested=requested,
-        )
+        try:
+            record, created = _claim(
+                cfg,
+                request_id,
+                intent_sha256,
+                operation=operation,
+                requested=requested,
+            )
+        except intent_mod.RequestDurabilityUnknown as exc:
+            raise GroupRequestOutcomeUnknown(
+                f"request {request_id!r} claim durability is unknown; inspect "
+                f"`dt request {request_id} --json` before retrying"
+            ) from exc
+        except OSError as exc:
+            raise GroupRequestRejected(
+                f"request {request_id!r} was not prepared because its durable "
+                f"claim could not be persisted: {exc}"
+            ) from exc
+        if not created:
+            if record.state == "rejected":
+                detail = record.error_message or "group preparation failed"
+                raise GroupRequestRejected(
+                    f"request {request_id!r} was already rejected: {detail}",
+                    record=record,
+                )
+            if claimed_action is None or record.state in {"prepared", "confirmed"}:
+                return record
+            raise GroupRequestOutcomeUnknown(
+                f"request {request_id!r} preparation outcome is unknown; "
+                f"inspect `dt request {request_id} --json` before retrying",
+                record=record,
+            )
+        if claimed_action is None:
+            return record
+        try:
+            claimed_action()
+        except BaseException as exc:
+            try:
+                transition(
+                    cfg,
+                    record,
+                    "rejected",
+                    error_kind="claimed_action_failed",
+                    error_message=str(exc) or type(exc).__name__,
+                )
+            except (
+                OSError,
+                ValueError,
+                intent_mod.RequestRecordError,
+                GroupRequestError,
+            ) as persistence_exc:
+                raise GroupRequestOutcomeUnknown(
+                    f"request {request_id!r} preparation failed but its durable "
+                    "receipt could not be written; outcome unknown"
+                ) from persistence_exc
+            # Preserve the caller's structured failure (for example the
+            # CLI's artifact transport kind/exit code or KeyboardInterrupt).
+            # The durable rejected record governs every later retry.
+            raise
+        try:
+            return transition(cfg, record, "prepared")
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            GroupRequestError,
+        ) as exc:
+            raise GroupRequestOutcomeUnknown(
+                f"request {request_id!r} preparation completed but its durable "
+                "receipt could not be written; outcome unknown"
+            ) from exc
 
 
 def locked_record_job(
@@ -403,7 +541,7 @@ def locked_record_job(
             raise GroupRequestConflict(
                 f"request {request_id!r} already belongs to a different intent"
             )
-        if record.state == "confirmed":
+        if record.state in GROUP_TERMINAL_STATES:
             if index > record.submitted:
                 raise GroupRequestError("terminal submission group progress changed")
             child = intent_mod.load(cfg, item_request_id(request_id, index))
@@ -432,7 +570,7 @@ def locked_transition(
             raise GroupRequestConflict(
                 f"request {request_id!r} already belongs to a different intent"
             )
-        if record.state == "confirmed":
+        if record.state in GROUP_TERMINAL_STATES:
             return record
         return transition(
             cfg,

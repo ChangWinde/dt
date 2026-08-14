@@ -2,11 +2,13 @@
 # DistTrainer launcher: runs on the compute node, delivered with the snapshot.
 # Contract (env in):  DT_JOB_DIR DT_GPUS DT_SESSION DT_ENVS_DIR DT_MEM_MIB
 #                     DT_DISK_GIB [DT_RESERVE] [DT_REQUIRE_PATH] [DT_MAX_HOURS]
-#                     [DT_MAX_VRAM_MIB] [DT_MAX_JOB_MEMORY_MIB]
+#                     [DT_MIN_VRAM_MIB] [DT_MAX_VRAM_MIB]
+#                     [DT_MAX_JOB_MEMORY_MIB]
 #                     [DT_WEBHOOK DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME]
 #                     [DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST]
 #                     [DT_ENV_MODE=sync|reuse]
 #                     [DT_GPU_ISOLATION=advisory]
+#                     [DT_CUSTOM_ENV_PATH]
 #                     [DT_PAYLOAD_ATTEST_MS]
 #                     [DT_PREDECESSOR_JOB_ID DT_PREDECESSOR_JOB_DIR]
 #                     [DT_CACHE_SOURCE_JOB_ID DT_CACHE_SOURCE_JOB_DIR
@@ -39,6 +41,8 @@ DT_DISK_GIB="${DT_DISK_GIB:-10}"
 DT_RESERVE="${DT_RESERVE:-0}"
 DT_ENV_MODE="${DT_ENV_MODE:-sync}"
 DT_GPU_ISOLATION="${DT_GPU_ISOLATION:-advisory}"
+DT_MIN_VRAM_MIB="${DT_MIN_VRAM_MIB:-0}"
+DT_LAUNCH_TOKEN="${DT_LAUNCH_TOKEN:-}"
 case "$DT_ENV_MODE" in
     sync|reuse) : ;;
     *) log "invalid environment mode: $DT_ENV_MODE"; exit 13 ;;
@@ -47,6 +51,18 @@ case "$DT_GPU_ISOLATION" in
     advisory) : ;;
     *) log "unsupported GPU isolation mode: $DT_GPU_ISOLATION"; exit 15 ;;
 esac
+case "$DT_MIN_VRAM_MIB" in
+    *[!0-9]*|"") log "invalid minimum GPU memory requirement"; exit 15 ;;
+esac
+if [ "$DT_GPUS" -eq 0 ] && [ "$DT_MIN_VRAM_MIB" -ne 0 ]; then
+    log "minimum GPU memory requires at least one GPU"
+    exit 15
+fi
+if [ -n "$DT_LAUNCH_TOKEN" ] \
+   && ! [[ "$DT_LAUNCH_TOKEN" =~ ^[0-9a-f]{32}$ ]]; then
+    log "invalid launch attempt token"
+    exit 14
+fi
 
 # Values arrive shell-quoted, so `~` never expanded; job_dir may be
 # home-relative. Absolutize everything here, on the node they refer to.
@@ -102,6 +118,7 @@ DT_CACHE_CLONE_FILES=0
 DT_CACHE_CLONE_BYTES=0
 DT_CACHE_CLONE_DURATION_MS=0
 ARTIFACT_VERIFY_DURATION_MS=0
+DT_CUSTOM_ENV_NAMES=()
 case "$DT_ARTIFACT_ROOT" in
     "") : ;;
     "~/"*) DT_ARTIFACT_ROOT="$HOME/${DT_ARTIFACT_ROOT#\~/}" ;;
@@ -129,6 +146,113 @@ export TMPDIR="$DT_CONTROL_DIR/tmp"
 export XDG_CACHE_HOME="$DT_CACHE_ROOT/tools/xdg"
 export UV_CACHE_DIR="$DT_CACHE_ROOT/tools/uv"
 export TORCH_HOME="$DT_CACHE_ROOT/tools/torch"
+
+# Keep the launcher's own cwd inside the private capsule for its complete
+# lifetime. If the head dies before receiving the launch receipt, the shared
+# lifecycle census can then find and terminate an in-progress environment
+# setup before a retry removes the cancellation sentinel.
+if ! cd "$DT_JOB_DIR"; then
+    log "cannot enter job directory: $DT_JOB_DIR"
+    exit 14
+fi
+
+dt_custom_env_reject() {
+    local path=$1 reason=$2
+    # Scope stderr suppression to the close operation. A redirection attached
+    # directly to the `exec` builtin would permanently silence every later
+    # launcher diagnostic, including the rejection reason itself.
+    { exec 8<&-; } 2>/dev/null || true
+    rm -f -- "$path" 2>/dev/null || true
+    unset DT_CUSTOM_ENV_PATH
+    log "custom environment rejected: $reason"
+}
+
+dt_load_custom_env() {
+    local raw_path=${DT_CUSTOM_ENV_PATH:-} path owner mode size
+    local name value existing value_bytes rc count=0
+    [ -n "$raw_path" ] || return 0
+    path=$(dt_absolutize "$raw_path")
+    if [ -L "$path" ] || [ ! -f "$path" ]; then
+        dt_custom_env_reject "$path" "handoff is not a regular file"
+        return 1
+    fi
+    if ! read -r owner mode < <(stat -c '%u %a' -- "$path" 2>/dev/null); then
+        dt_custom_env_reject "$path" "handoff metadata is unavailable"
+        return 1
+    fi
+    if [ "$owner" != "$(id -u)" ] || (( (8#$mode & 077) != 0 )); then
+        dt_custom_env_reject "$path" "handoff ownership or permissions are unsafe"
+        return 1
+    fi
+    size=$(stat -c '%s' -- "$path" 2>/dev/null) || size=-1
+    if ! [[ "$size" =~ ^[0-9]+$ ]] || [ "$size" -gt 65536 ]; then
+        dt_custom_env_reject "$path" "handoff exceeds the 64 KiB limit"
+        return 1
+    fi
+    if ! exec 8<"$path"; then
+        dt_custom_env_reject "$path" "handoff cannot be opened"
+        return 1
+    fi
+    while true; do
+        name=""
+        IFS= read -r -d '' name <&8
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            if [ -n "$name" ]; then
+                dt_custom_env_reject "$path" "handoff has a truncated variable name"
+                return 1
+            fi
+            break
+        fi
+        value=""
+        if ! IFS= read -r -d '' value <&8; then
+            dt_custom_env_reject "$path" "handoff has a truncated variable value"
+            return 1
+        fi
+        count=$((count + 1))
+        if [ "$count" -gt 64 ]; then
+            dt_custom_env_reject "$path" "handoff exceeds 64 variables"
+            return 1
+        fi
+        if ! [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]{0,127}$ ]]; then
+            dt_custom_env_reject "$path" "invalid variable name"
+            return 1
+        fi
+        case "$name" in
+            DT_*|BASH*|HOME|PATH|USER|LOGNAME|SHELL|TMPDIR|ENV|SHELLOPTS|CDPATH|GLOBIGNORE|IFS|LD_PRELOAD|LD_AUDIT|LD_LIBRARY_PATH|TMUX|TMUX_TMPDIR|PWD|OLDPWD|SHLVL|UID|EUID|PPID|RANDOM|SRANDOM|SECONDS|LINENO|OPTARG|OPTIND|FUNCNAME|GROUPS|DIRSTACK|PIPESTATUS|HOSTNAME|HOSTTYPE|MACHTYPE|OSTYPE|PROMPT_COMMAND|PS0|PS1|PS2|PS3|PS4|CUDA_VISIBLE_DEVICES|NVIDIA_VISIBLE_DEVICES|ROCR_VISIBLE_DEVICES|VIRTUAL_ENV|UV_PROJECT_ENVIRONMENT)
+                dt_custom_env_reject "$path" "variable $name is reserved"
+                return 1
+                ;;
+        esac
+        for existing in "${DT_CUSTOM_ENV_NAMES[@]}"; do
+            if [ "$existing" = "$name" ]; then
+                dt_custom_env_reject "$path" "duplicate variable $name"
+                return 1
+            fi
+        done
+        value_bytes=$(LC_ALL=C printf '%s' "$value" | wc -c)
+        if [ "$value_bytes" -gt 16384 ]; then
+            dt_custom_env_reject "$path" "variable $name exceeds the value size limit"
+            return 1
+        fi
+        if ! printf -v "$name" '%s' "$value"; then
+            dt_custom_env_reject "$path" "variable $name cannot be assigned"
+            return 1
+        fi
+        export -n "$name" 2>/dev/null || true
+        DT_CUSTOM_ENV_NAMES+=("$name")
+    done
+    exec 8<&-
+    if ! rm -f -- "$path"; then
+        unset DT_CUSTOM_ENV_PATH
+        log "custom environment rejected: handoff could not be removed"
+        return 1
+    fi
+    unset DT_CUSTOM_ENV_PATH
+    return 0
+}
+
+dt_load_custom_env || exit 14
 
 lease_available() {
     local idx=$1 lock="$DT_GPU_LEASE_ROOT/gpu-$1.lock"
@@ -158,23 +282,85 @@ if [ -n "${DT_PROXY:-}" ]; then
            NO_PROXY="localhost,127.0.0.1" no_proxy="localhost,127.0.0.1"
 fi
 
-# A fresh launcher run supersedes a cancel sentinel left by an earlier
-# dispatch attempt (same-request replays reuse this job dir). Only remove a
-# sentinel strictly older than this launch: one racing in now targets this
-# very run and must survive to the next cancelled() checkpoint, otherwise
-# the dispatcher believes the node is clean and fails over to a duplicate.
-DT_CANCEL_STAMP="${DT_CANCEL_PATH}.launch"
 mkdir -p -- "$(dirname -- "$DT_CANCEL_PATH")" 2>/dev/null || true
-: > "$DT_CANCEL_STAMP"
-if [ -e "$DT_CANCEL_PATH" ] && [ "$DT_CANCEL_PATH" -ot "$DT_CANCEL_STAMP" ]; then
-    rm -f "$DT_CANCEL_PATH"
+if [ -z "$DT_LAUNCH_TOKEN" ]; then
+    # Compatibility path for direct/older launches. A fresh run supersedes a
+    # strictly older sentinel; a sentinel racing in now must survive.
+    DT_CANCEL_STAMP="${DT_CANCEL_PATH}.launch"
+    : > "$DT_CANCEL_STAMP"
+    if [ -e "$DT_CANCEL_PATH" ] && [ "$DT_CANCEL_PATH" -ot "$DT_CANCEL_STAMP" ]; then
+        rm -f "$DT_CANCEL_PATH"
+    fi
+    rm -f "$DT_CANCEL_STAMP"
 fi
-rm -f "$DT_CANCEL_STAMP"
 
-cancelled() { [ -e "$DT_CANCEL_PATH" ]; }
+cancelled() {
+    local value size
+    [ -e "$DT_CANCEL_PATH" ] || return 1
+    # Unsafe or oversized state fails toward cancelled. The dispatcher owns
+    # this file; a job must not redirect or forge an unbounded control read.
+    [ -f "$DT_CANCEL_PATH" ] && [ ! -L "$DT_CANCEL_PATH" ] || return 0
+    size=$(stat -c '%s' -- "$DT_CANCEL_PATH" 2>/dev/null) || return 0
+    case "$size" in *[!0-9]*|"") return 0;; esac
+    [ "$size" -le 64 ] || return 0
+    value=$(head -c 64 -- "$DT_CANCEL_PATH" 2>/dev/null) || return 0
+    # `*` and the historical empty file cancel every attempt. A token cancels
+    # only the attempt whose recovery probe wrote it, so the next retry cannot
+    # accidentally release a still-running older launcher.
+    case "$value" in ""|"*") return 0;; esac
+    [ -n "$DT_LAUNCH_TOKEN" ] && [ "$value" = "$DT_LAUNCH_TOKEN" ]
+}
+
+# A tmux client cannot move an already-running server into a new cgroup. Use a
+# deterministic per-job socket so the server created below is necessarily new
+# and can be born inside this job's transient scope.
+for tool in tmux flock sha256sum; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        log "node-unfit: $tool not installed"
+        exit 15
+    fi
+done
+DT_RUNTIME_ID=$(printf '%s' "$DT_SESSION" | sha256sum | cut -c1-20)
+case "$DT_RUNTIME_ID" in
+    *[!0-9a-f]*|"") log "cannot derive runtime identity"; exit 14 ;;
+esac
+[ "${#DT_RUNTIME_ID}" -eq 20 ] || {
+    log "cannot derive runtime identity"
+    exit 14
+}
+DT_TMUX_SOCKET="dt-job-${DT_RUNTIME_ID}"
+DT_RUNTIME_SCOPE="dt-runtime-${DT_RUNTIME_ID}.scope"
+
+dt_publish_runtime_marker() {
+    local marker=$1 value=$2 tmp="${1}.tmp.$$"
+    rm -f -- "$tmp" 2>/dev/null || true
+    if ! printf '%s\n' "$value" >"$tmp" \
+       || ! chmod 600 -- "$tmp" \
+       || ! mv -f -- "$tmp" "$marker"; then
+        rm -f -- "$tmp" 2>/dev/null || true
+        log "cannot publish runtime marker: $marker"
+        return 1
+    fi
+}
+
+# Clear terminal state from a verified-absent prior session before any slow
+# environment work. If this launch's ssh drops during that work, the
+# dispatcher's cancellation probe must not mistake stale exit markers for a
+# newly completed job. Repeat the clear under the launch lock below to close
+# a prior-session-exit race during environment setup.
+if ! tmux -L "$DT_TMUX_SOCKET" has-session -t "$DT_SESSION" 2>/dev/null \
+   && ! tmux -L dt has-session -t "$DT_SESSION" 2>/dev/null; then
+    rm -f "$DT_STATE_DIR/pgid" "$DT_STATE_DIR/gpus" \
+          "$DT_STATE_DIR/boot_id" \
+          "$DT_STATE_DIR/process_start_ticks" \
+          "$DT_STATE_DIR/started_at" "$DT_STATE_DIR/finished_at" \
+          "$DT_STATE_DIR/exit_code" "$DT_STATE_DIR"/exit_code.tmp.* \
+          "$DT_STATE_DIR/result_state" "$DT_STATE_DIR"/result_state.tmp.* \
+          "$DT_STATE_DIR"/process_start_ticks.tmp.*
+fi
 
 cache_metadata_manifest() {
-    python3 - "$1" <<'PY'
+    python3 -I - "$1" <<'PY'
 import hashlib
 import pathlib
 import sys
@@ -204,18 +390,12 @@ PY
 }
 
 # -- 0. node prerequisites (missing tool = this node is unfit, try another) --
-for tool in tmux flock; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        log "node-unfit: $tool not installed"
-        exit 15
-    fi
-done
 if command -v python3 >/dev/null 2>&1 \
    && [ -f "$DT_PAYLOAD_DIR/result.py" ]; then
     mkdir -p "$DT_BIN_DIR"
     cat >"$DT_BIN_DIR/dt-result" <<'DT_RESULT_HELPER'
 #!/usr/bin/env bash
-exec python3 "$DT_PAYLOAD_DIR/result.py" \
+exec python3 -I "$DT_PAYLOAD_DIR/result.py" \
     --output "$DT_OUTPUT_DIR/dt/result.json" "$@"
 DT_RESULT_HELPER
     chmod 700 "$DT_BIN_DIR/dt-result"
@@ -298,7 +478,7 @@ if [ -n "$DT_CACHE_SOURCE_JOB_ID" ]; then
             exit 13
             ;;
     esac
-    if ! python3 -c \
+    if ! python3 -I -c \
         'import json,sys; d=json.load(open(sys.argv[1])); raise SystemExit(0 if d.get("snapshot_sha256")==sys.argv[2] else 1)' \
         "$cache_source_control/meta.json" "$DT_CACHE_SOURCE_SNAPSHOT" \
         >/dev/null 2>&1; then
@@ -391,7 +571,7 @@ if [ -n "$DT_ARTIFACT_MANIFEST" ]; then
     artifact_manifest_path="$DT_ARTIFACT_ROOT/.dt/manifests/$DT_ARTIFACT_MANIFEST.json"
     log "verifying artifact manifest ${DT_ARTIFACT_MANIFEST:0:12}"
     artifact_verify_started_ms=$(now_ms)
-    if ! python3 "$DT_PAYLOAD_DIR/artifact_verify.py" \
+    if ! python3 -I "$DT_PAYLOAD_DIR/artifact_verify.py" \
         --root "$DT_ARTIFACT_ROOT" \
         --manifest "$artifact_manifest_path" \
         --expected-sha256 "$DT_ARTIFACT_MANIFEST" \
@@ -407,15 +587,17 @@ fi
 # otherwise hold it almost continuously and a "busy" verdict could take
 # minutes. Advisory only - the authoritative recheck stays inside the
 # launch lock below.
-quick_free_count() {
-    local busy rows detail
+quick_gpu_counts() {
+    local busy rows detail idx uuid used total
+    local free_count=0 fitting_free_count=0 capable_count=0
+    local seen_indices="" seen_uuids=""
     busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>&1)
     if [ $? -ne 0 ]; then
         detail=${busy##*$'\n'}
         log "node-unfit: GPU process query failed: ${detail:-unknown nvidia-smi error}"
         return 15
     fi
-    rows=$(nvidia-smi --query-gpu=index,uuid,memory.used \
+    rows=$(nvidia-smi --query-gpu=index,uuid,memory.used,memory.total \
         --format=csv,noheader,nounits 2>&1)
     if [ $? -ne 0 ]; then
         detail=${rows##*$'\n'}
@@ -423,22 +605,53 @@ quick_free_count() {
         return 15
     fi
     busy=${busy// /}
-    printf '%s\n' "$rows" | while IFS=, read -r idx uuid used; do
-        idx=${idx// /}; uuid=${uuid// /}; used=${used// /}
+    while IFS=, read -r idx uuid used total; do
+        idx=${idx// /}; uuid=${uuid// /}; used=${used// /}; total=${total// /}
+        if [ -z "$uuid" ]; then
+            log "node-unfit: malformed GPU memory inventory"
+            return 15
+        fi
+        case "$idx:$used:$total" in
+            *[!0-9:]*|:*|*::*|*:)
+                log "node-unfit: malformed GPU memory inventory"
+                return 15
+                ;;
+        esac
+        if [ "$total" -le 0 ] || [ "$used" -gt "$total" ] \
+           || grep -qxF "$idx" <<<"$seen_indices" \
+           || grep -qxF "$uuid" <<<"$seen_uuids"; then
+            log "node-unfit: malformed GPU memory inventory"
+            return 15
+        fi
+        seen_indices+="${idx}"$'\n'
+        seen_uuids+="${uuid}"$'\n'
+        if [ "$total" -ge "$DT_MIN_VRAM_MIB" ]; then
+            capable_count=$((capable_count + 1))
+        fi
         if [ "$used" -lt "$DT_MEM_MIB" ] && ! grep -qF "$uuid" <<<"$busy" \
            && lease_available "$idx"; then
-            echo x
+            free_count=$((free_count + 1))
+            if [ "$total" -ge "$DT_MIN_VRAM_MIB" ]; then
+                fitting_free_count=$((fitting_free_count + 1))
+            fi
         fi
-    done | wc -l
+    done <<<"$rows"
+    printf '%s %s %s\n' "$free_count" "$fitting_free_count" "$capable_count"
 }
 if [ "$DT_GPUS" -gt 0 ]; then
-    nfree=$(quick_free_count)
+    counts=$(quick_gpu_counts)
     query_rc=$?
     if [ "$query_rc" -ne 0 ]; then
         exit "$query_rc"
     fi
-    if [ "${nfree:-0}" -lt $((DT_GPUS + DT_RESERVE)) ]; then
-        log "busy (pre-check): need $DT_GPUS free GPUs (+$DT_RESERVE reserved), found ${nfree:-0}"
+    read -r nfree fitting_free capable <<<"$counts"
+    if [ "${capable:-0}" -lt "$DT_GPUS" ]; then
+        log "node-unfit: need $DT_GPUS GPUs with at least ${DT_MIN_VRAM_MIB} MiB, found ${capable:-0}"
+        exit 15
+    fi
+    if [ "${nfree:-0}" -lt $((DT_GPUS + DT_RESERVE)) ] \
+       || [ "${fitting_free:-0}" -lt "$DT_GPUS" ]; then
+        log "busy (pre-check): need $DT_GPUS fitting free GPUs (+$DT_RESERVE total free reserved), found ${fitting_free:-0} fitting / ${nfree:-0} total"
         exit 10
     fi
 fi
@@ -671,14 +884,15 @@ ENV_DURATION_MS=$(($(now_ms) - ENV_STARTED_MS))
 
 # -- helpers ----------------------------------------------------------------
 free_gpu_indices() {
-    local busy rows detail
+    local busy rows detail idx uuid used total
+    local seen_indices="" seen_uuids=""
     busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>&1)
     if [ $? -ne 0 ]; then
         detail=${busy##*$'\n'}
         log "node-unfit: GPU process query failed: ${detail:-unknown nvidia-smi error}"
         return 15
     fi
-    rows=$(nvidia-smi --query-gpu=index,uuid,memory.used \
+    rows=$(nvidia-smi --query-gpu=index,uuid,memory.used,memory.total \
         --format=csv,noheader,nounits 2>&1)
     if [ $? -ne 0 ]; then
         detail=${rows##*$'\n'}
@@ -686,13 +900,31 @@ free_gpu_indices() {
         return 15
     fi
     busy=${busy// /}
-    printf '%s\n' "$rows" | while IFS=, read -r idx uuid used; do
-        idx=${idx// /}; uuid=${uuid// /}; used=${used// /}
+    while IFS=, read -r idx uuid used total; do
+        idx=${idx// /}; uuid=${uuid// /}; used=${used// /}; total=${total// /}
+        if [ -z "$uuid" ]; then
+            log "node-unfit: malformed GPU memory inventory"
+            return 15
+        fi
+        case "$idx:$used:$total" in
+            *[!0-9:]*|:*|*::*|*:)
+                log "node-unfit: malformed GPU memory inventory"
+                return 15
+                ;;
+        esac
+        if [ "$total" -le 0 ] || [ "$used" -gt "$total" ] \
+           || grep -qxF "$idx" <<<"$seen_indices" \
+           || grep -qxF "$uuid" <<<"$seen_uuids"; then
+            log "node-unfit: malformed GPU memory inventory"
+            return 15
+        fi
+        seen_indices+="${idx}"$'\n'
+        seen_uuids+="${uuid}"$'\n'
         if [ "$used" -lt "$DT_MEM_MIB" ] && ! grep -qF "$uuid" <<<"$busy" \
            && lease_available "$idx"; then
-            echo "$idx"
+            printf '%s %s\n' "$idx" "$total"
         fi
-    done
+    done <<<"$rows"
 }
 
 GPU_PROBE_ERROR=""
@@ -708,7 +940,7 @@ probe_ok() {
     # Use the CUDA Driver API directly. Importing the full project PyTorch
     # stack just to test one allocation dominated warm FIFO handoffs.
     detail=$(CUDA_VISIBLE_DEVICES=$idx timeout 120 \
-        python3 "$payload_dir/cuda_probe.py" --bytes 268435456 \
+        python3 -I "$payload_dir/cuda_probe.py" --bytes 268435456 \
         2>&1)
     rc=$?
     # Old/non-CUDA nodes can still run CPU jobs; the two nvidia-smi checks stay
@@ -732,16 +964,25 @@ run_tmux_new_session() {
     # an invoking systemd service.  A transient user scope gives the dedicated
     # tmux server an independent lifetime.  Hosts without a usable user manager
     # retain the portable direct-tmux behavior.
-    local unit_hash
     if command -v systemd-run >/dev/null 2>&1 \
        && command -v systemctl >/dev/null 2>&1 \
        && timeout 3s systemctl --user show-environment >/dev/null 2>&1; then
-        unit_hash=$(printf '%s' "${DT_JOB_ID:-$DT_SESSION}" \
-            | sha256sum | cut -c1-16)
+        # Publish before asking systemd to start: an SSH cancellation racing
+        # the start can then fail closed if the manager becomes unreachable.
+        dt_publish_runtime_marker \
+            "$DT_STATE_DIR/runtime_scope" "$DT_RUNTIME_SCOPE" || return 14
         systemd-run --user --scope --quiet \
-            --unit="dt-runtime-${unit_hash}-$$" -- tmux "$@"
-        return $?
+            --unit="${DT_RUNTIME_SCOPE%.scope}" -- tmux "$@"
+        local rc=$?
+        if [ "$rc" -ne 0 ]; then
+            rm -f -- "$DT_STATE_DIR/runtime_scope"
+        fi
+        return "$rc"
     fi
+    # Portable fallback remains isolated from every other tmux server, but it
+    # intentionally has no scope marker: lifecycle probes then use the legacy
+    # process-group/capsule census rather than pretending cgroup coverage.
+    rm -f -- "$DT_STATE_DIR/runtime_scope"
     tmux "$@"
 }
 
@@ -765,19 +1006,16 @@ dt_append_session_env() {
 
 start_session() {
     local ids=$1
-    # -L dt: dedicated socket = dedicated tmux server. Never join the user's
-    # own server: on some nodes it is managed by a systemd user unit
+    # The per-job socket is also the server identity. Never join the user's or
+    # another DT job's server: on some nodes it is managed by a systemd user unit
     # (Type=forking + kill-server on stop, Linger=no) and every job inside
     # it gets SIGKILLed when the unit stops (observed on a production node).
     # fd 9 owns the node launch lock in this launcher. A newly-created tmux
     # server otherwise inherits it and keeps every later launcher blocked for
     # the lifetime of the job. Close only tmux's copy; this shell keeps the
     # lock until wrapper.sh publishes pgid after acquiring the GPU leases.
-    # Keep dt's tiny dedicated server alive after the session ends. Creating a
-    # fresh tmux server for every FIFO item costs most of a second and leaves
-    # the GPU idle between otherwise back-to-back experiments. Runtime env is
-    # still passed explicitly below, and fd 9 is closed before the server can
-    # inherit the node launch lock.
+    # The server exits with its sole session. This bounds idle resources and
+    # lets the transient scope disappear once every job descendant is gone.
     CUDA_VISIBLE_DEVICES=$ids
     DT_GPU_IDS=$ids
     DT_REUSE_CACHE_ENV=$DT_CACHE_ENV
@@ -785,13 +1023,19 @@ start_session() {
     DT_UV_ENV=$UV_ENV
     DT_SHELL_QUOTED=""
     dt_shell_quote "$DT_JOB_DIR"
-    DT_SESSION_COMMAND="cd $DT_SHELL_QUOTED && env"
+    # The dt tmux server is deliberately persistent. Start from an empty
+    # environment so the first job cannot leak proxy/PYTHONPATH/LD_* state
+    # into every later session; append only the explicit runtime contract.
+    DT_SESSION_COMMAND="cd $DT_SHELL_QUOTED && env -i"
     local name
     local -a session_env_names=(
+        HOME PATH USER LOGNAME SHELL LANG LC_ALL LC_CTYPE TZ \
+        SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE \
         TMPDIR \
         DT_ROOT DT_WORKER_ROOT DT_JOB_DIR DT_OUTPUT_DIR DT_CONTROL_DIR \
         DT_PAYLOAD_DIR DT_STATE_DIR DT_META_PATH DT_COMMAND_PATH \
         DT_CANCEL_PATH DT_BIN_DIR DT_CACHE_ROOT DT_RUNTIME_ROOT \
+        DT_TMUX_SOCKET DT_RUNTIME_SCOPE \
         DT_GPU_LEASE_ROOT DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST \
         DT_PREDECESSOR_JOB_ID DT_PREDECESSOR_JOB_DIR \
         DT_PREDECESSOR_OUTPUTS DT_PREDECESSOR_META_PATH \
@@ -800,45 +1044,59 @@ start_session() {
         DT_CACHE_SOURCE_SNAPSHOT DT_CACHE_MODE DT_CACHE_RUNTIME_RELPATH \
         DT_CACHE_SOURCE_MANIFEST_SHA256 DT_CACHE_CLONE_FILES \
         DT_CACHE_CLONE_BYTES DT_CACHE_CLONE_DURATION_MS \
-        CUDA_VISIBLE_DEVICES DT_GPU_IDS DT_GPU_ISOLATION DT_MAX_HOURS \
+        CUDA_VISIBLE_DEVICES DT_GPU_IDS DT_GPUS DT_GPU_ISOLATION DT_MAX_HOURS \
+        DT_MIN_VRAM_MIB \
         DT_MAX_VRAM_MIB DT_MAX_JOB_MEMORY_MIB DT_ENV_MODE DT_UV DT_UV_ENV \
         DT_WEBHOOK DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME DT_PROXY
     )
     for name in "${session_env_names[@]}"; do
         dt_append_session_env "$name"
     done
+    for name in "${DT_CUSTOM_ENV_NAMES[@]}"; do
+        dt_append_session_env "$name"
+    done
     dt_shell_quote "$DT_PAYLOAD_DIR/wrapper.sh"
     DT_SESSION_COMMAND+=" bash $DT_SHELL_QUOTED"
     DT_SESSION_COMMAND+=" >> logs/stdout.log 2>&1"
-    run_tmux_new_session -L dt new-session -d -s "$DT_SESSION" \
+    dt_publish_runtime_marker \
+        "$DT_STATE_DIR/tmux_socket" "$DT_TMUX_SOCKET" || return 14
+    run_tmux_new_session -L "$DT_TMUX_SOCKET" new-session -d -s "$DT_SESSION" \
         "$DT_SESSION_COMMAND" \
-        \; set-option -g exit-empty off \
+        \; set-option -g exit-empty on \
         9>&-
 }
 
 # -- 3-6. pick GPUs + launch, atomically per node ----------------------------
 pgid=""
+LAUNCHED_GPU_IDS=""
 GPU_PROBE_DURATION_MS=0
 SESSION_START_DURATION_MS=0
 launch_locked() {
     local chosen=()
-    local gpu_probe_started_ms session_start_started_ms attempt
+    local gpu_probe_started_ms session_start_started_ms attempt idx prior
     gpu_probe_started_ms=$(now_ms)
     if [ "$DT_GPUS" -gt 0 ]; then
-        local candidates candidate_rows query_rc
+        local candidates candidate_rows query_rc row total free_count
         candidate_rows=$(free_gpu_indices)
         query_rc=$?
         if [ "$query_rc" -ne 0 ]; then
             return "$query_rc"
         fi
         candidates=()
+        free_count=0
         if [ -n "$candidate_rows" ]; then
-            mapfile -t candidates <<<"$candidate_rows"
+            while read -r idx total; do
+                free_count=$((free_count + 1))
+                if [ "$total" -ge "$DT_MIN_VRAM_MIB" ]; then
+                    candidates+=("$idx")
+                fi
+            done <<<"$candidate_rows"
         fi
         # DT_RESERVE (7.4 knob): after taking DT_GPUS, at least DT_RESERVE
         # cards must remain free on this node
-        if [ "${#candidates[@]}" -lt $((DT_GPUS + DT_RESERVE)) ]; then
-            log "need $DT_GPUS free GPUs (+$DT_RESERVE reserved), found ${#candidates[@]}"
+        if [ "${#candidates[@]}" -lt "$DT_GPUS" ] \
+           || [ "$free_count" -lt $((DT_GPUS + DT_RESERVE)) ]; then
+            log "need $DT_GPUS fitting free GPUs (+$DT_RESERVE total free reserved), found ${#candidates[@]} fitting / $free_count total"
             return 10
         fi
         for idx in "${candidates[@]}"; do
@@ -857,6 +1115,26 @@ launch_locked() {
     GPU_PROBE_DURATION_MS=$(($(now_ms) - gpu_probe_started_ms))
     local ids
     ids=$(IFS=,; echo "${chosen[*]:-}")
+    # Keep placement identity in launcher memory. The task can write its state
+    # directory, so the success receipt must never reconstruct GPU ownership
+    # from the on-disk marker.
+    if [ "${#chosen[@]}" -ne "$DT_GPUS" ]; then
+        log "internal GPU selection count mismatch"
+        return 14
+    fi
+    for ((idx = 0; idx < ${#chosen[@]}; idx++)); do
+        [[ "${chosen[idx]}" =~ ^[0-9]+$ ]] || {
+            log "internal GPU selection contains a non-numeric index"
+            return 14
+        }
+        for ((prior = 0; prior < idx; prior++)); do
+            [ "${chosen[prior]}" != "${chosen[idx]}" ] || {
+                log "internal GPU selection contains duplicate index ${chosen[idx]}"
+                return 14
+            }
+        done
+    done
+    LAUNCHED_GPU_IDS=$ids
     # last call: if the dispatcher gave up on us (its ssh dropped), it left
     # a cancel sentinel - do not start a job nobody tracks
     if cancelled; then
@@ -867,11 +1145,13 @@ launch_locked() {
     # cancelled. Never accept an old pgid as proof that this new wrapper owns
     # the leases. If the old session still exists, refuse this attempt instead
     # of overlapping two wrappers with the same job identity.
-    if tmux -L dt has-session -t "$DT_SESSION" 2>/dev/null; then
+    if tmux -L "$DT_TMUX_SOCKET" has-session -t "$DT_SESSION" 2>/dev/null \
+       || tmux -L dt has-session -t "$DT_SESSION" 2>/dev/null; then
         log "session $DT_SESSION already exists from a prior launch attempt"
         return 14
     fi
     rm -f "$DT_STATE_DIR/pgid" "$DT_STATE_DIR/gpus" \
+          "$DT_STATE_DIR/boot_id" \
           "$DT_STATE_DIR/process_start_ticks" \
           "$DT_STATE_DIR/started_at" "$DT_STATE_DIR/finished_at" \
           "$DT_STATE_DIR/exit_code" "$DT_STATE_DIR"/exit_code.tmp.* \
@@ -883,10 +1163,11 @@ launch_locked() {
     # check but before tmux becomes visible to the dispatcher's kill command.
     if cancelled; then
         log "cancelled by dispatcher during session start"
+        tmux -L "$DT_TMUX_SOCKET" kill-session -t "$DT_SESSION" 2>/dev/null
         tmux -L dt kill-session -t "$DT_SESSION" 2>/dev/null
         return 14
     fi
-    echo "$ids" > "$DT_STATE_DIR/gpus"
+    printf '%s\n' "$ids" >"$DT_STATE_DIR/gpus"
     # Keep the node launch lock until wrapper.sh owns every selected GPU
     # lease and records its pgid. Otherwise a second launcher can observe an
     # idle card during CPU-only dataset initialization and double-assign it.
@@ -896,6 +1177,7 @@ launch_locked() {
     done
     if [ -z "$pgid" ]; then
         log "wrapper did not acquire GPU lease/start (no pgid file); check logs/stdout.log"
+        tmux -L "$DT_TMUX_SOCKET" kill-session -t "$DT_SESSION" 2>/dev/null
         tmux -L dt kill-session -t "$DT_SESSION" 2>/dev/null
         return 14
     fi
@@ -917,7 +1199,7 @@ rc=$?
 exec 9>&-
 [ $rc -ne 0 ] && exit $rc
 
-ids=$(cat "$DT_STATE_DIR/gpus" 2>/dev/null || echo "")
+ids=$LAUNCHED_GPU_IDS
 boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo "")
 REMOTE_TOTAL_DURATION_MS=$(($(now_ms) - LAUNCHER_STARTED_MS))
 printf '{"gpus": [%s], "pgid": %s, "env": "%s", "env_preexisting": %s, "setup_ran": %s, "boot_id": "%s", "launch_phases_ms": {"payload_attestation": %s, "preflight": %s, "artifact_verification": %s, "environment": %s, "launch_lock_wait": %s, "gpu_probe": %s, "session_start": %s, "remote_total": %s}}\n' \

@@ -49,11 +49,13 @@ This page helps operators choose a command and handle its result. Run
 `dt topology [--site SITE] --json` actively verifies configured directed data edges.
 Use `--source NODE` and/or `--destination NODE` to scope a large site. The
 default `--max-edges 256` prevents accidental quadratic probing; callers may
-raise it explicitly up to 4,096. Every head-to-node control route is also
+raise it explicitly up to 4,096. Endpoint filters also restrict control-route
+work to those endpoints. Every selected head-to-node control route is
 classified (`relayed`/`proxied`/`direct`/`opaque`), and `--measure` streams a
-bounded payload over each healthy edge and control route to record real
-MiB/s for capacity-aware route ranking. Without `--measure` this command
-discovers and probes routes but does not transfer an Artifact.
+bounded payload over each healthy edge and control route to record real MiB/s
+for capacity-aware route ranking. Independent control-route measurements run
+concurrently. Without `--measure` this command discovers and probes routes but
+does not transfer an Artifact.
 
 ## Submission shape
 
@@ -70,18 +72,52 @@ characters keeps a readable prefix plus a stable digest, so registry and tmux
 identities remain below filesystem component limits without collapsing two
 distinct long names.
 
+Use `--min-vram-mib N` when every allocated GPU must have at least `N` MiB of
+total memory. DT applies the constraint to plan, auto-placement, pinned launch,
+queue forecasting, replay, `rerun`, and `fork`. A GPU job fails closed when the
+node cannot provide trustworthy per-card memory inventory; `-g 0` is unaffected.
+This is a placement requirement, not the `--max-vram-mib` runtime usage guard.
+
 For automated callers, add a stable `--request-id`. A retry with the same
 normalized intent returns the original job; a changed intent conflicts. If the
 client loses the response, query `dt request REQUEST_ID --json` instead of
 submitting a new job.
 
-The option is available on `run`, `rerun`, `fork`, `exec`, `batch`, and
-`chain`. On `batch`, `chain`, and `fork --repeat`, it identifies the complete
-group. DT durably records the confirmed prefix and uses a deterministic child
-request per item: retrying can resume a child that was never claimed, but an
-`uncertain` child fails closed and blocks later items. Group receipts add
-`request_id` and `idempotent_replay`; `dt request REQUEST_ID --json` returns
-the parent state, submitted jobs, next index, and first unresolved child.
+Preview a submission without writing a snapshot, registry row, receipt, or
+remote state:
+
+```bash
+dt run --plan --json -- python train.py
+```
+
+The `dt_run_plan_v1` result reports current placement or queue outlook,
+per-node reasons, included source bytes, and the selected node's environment
+cache status. It is a point-in-time forecast, not a capacity reservation.
+
+Export a value locally, then import it with repeatable `--env NAME`:
+
+```bash
+export DATASET_SPLIT=validation
+dt run --env DATASET_SPLIT -- python evaluate.py
+```
+
+dt validates the name, reads the value from the caller, forwards it through
+private stdin, and records it so `rerun` and `fork` reproduce it. Values never
+enter DT or SSH argv. Public JSON, pulled records, tables, and operation events
+expose names only. Values remain readable to the trusted Unix identity in dt's
+owner-only registry and remote job capsule, so this is not an external secret
+manager. Runtime-control variables such as `PATH`, `LD_PRELOAD`, `DT_*`, and
+GPU visibility are reserved.
+
+`run` accepts the option. Its recorded overlay is inherited by `rerun`, exact
+`fork`, and `exec`; those recovery commands do not require the caller to expose
+the value again. For `batch`, `chain`, and `fork --repeat`, a request ID
+identifies the complete group. dt durably records the confirmed prefix and uses
+a deterministic child request per item: retrying can resume a child that was
+never claimed, but an `uncertain` child fails closed and blocks later items.
+Group receipts add `request_id` and `idempotent_replay`; `dt request
+REQUEST_ID --json` returns the parent state, submitted jobs, next index, and
+first unresolved child.
 
 The non-follow human contract writes progress to stderr and the bare job ID as
 the last stdout line:

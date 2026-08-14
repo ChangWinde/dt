@@ -2,6 +2,7 @@
 
 import subprocess
 import threading
+from contextlib import contextmanager
 
 import pytest
 
@@ -156,6 +157,54 @@ def test_prepare_mirror_translates_failures(tmp_path):
         return subprocess.CompletedProcess([], 0, "", "")
 
     prepare_mirror(route, "omni", runner=ok)
+
+
+def test_gateway_prepare_and_push_forward_local_cancellation(tmp_path):
+    cfg = _cfg(tmp_path)
+    route = _gateway_route(cfg)
+    cancel = threading.Event()
+
+    def observe(node, local, command, timeout=15, check=False, **kwargs):
+        assert kwargs["cancel_event"] is cancel
+        return subprocess.CompletedProcess([], 0, _stats(), "")
+
+    prepare_mirror(route, "omni", runner=observe, cancel_event=cancel)
+    pushed = push_mirror(
+        cfg,
+        route,
+        "omni",
+        "dt/sync/omni/code",
+        runner=observe,
+        cancel_event=cancel,
+    )
+
+    assert pushed.returncode == 0
+
+
+def test_gateway_push_cancels_before_retry_backoff(tmp_path):
+    cfg = _cfg(tmp_path)
+    route = _gateway_route(cfg)
+    cancel = threading.Event()
+    attempts = 0
+
+    def cancelled(node, local, command, timeout=15, check=False, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        assert kwargs["cancel_event"] is cancel
+        cancel.set()
+        return subprocess.CompletedProcess([], 30, "", "timeout in data send")
+
+    with pytest.raises(RelayError, match="cancelled locally"):
+        push_mirror(
+            cfg,
+            route,
+            "omni",
+            "dt/sync/omni/code",
+            runner=cancelled,
+            cancel_event=cancel,
+        )
+
+    assert attempts == 1
 
 
 def test_push_mirror_retries_then_succeeds_and_records_a_sample(tmp_path, monkeypatch):
@@ -438,6 +487,54 @@ def test_sync_artifacts_stages_each_artifact_through_the_gateway(tmp_path, monke
     assert row["route"] == "gateway"
     assert row["route_gateway"] == "gw"
     assert "relay_error" not in row
+
+
+def test_gateway_mirror_lock_spans_staging_and_lan_replay(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    project = _artifact_project(tmp_path)
+    active: set[str] = set()
+
+    @contextmanager
+    def tracked_lock(_cfg, identity, node, **_kwargs):
+        key = f"{identity}:{node.name}"
+        active.add(key)
+        try:
+            yield True
+        finally:
+            active.remove(key)
+
+    monkeypatch.setattr(dispatch, "_sync_cache_lock", tracked_lock)
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "rsync",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, _stats(files=1), ""),
+    )
+    monkeypatch.setattr(
+        sync_relay,
+        "prepare_artifact_mirror",
+        lambda *args, **kwargs: None,
+    )
+
+    def push(*args, **kwargs):
+        assert any("gateway-artifacts:gw" in key for key in active)
+        return subprocess.CompletedProcess([], 0, _stats(files=1), "")
+
+    monkeypatch.setattr(sync_relay, "push_artifact", push)
+
+    dispatch.sync_artifacts(
+        cfg,
+        "omni",
+        project,
+        cfg.nodes[0],
+        ["data", "model.pt"],
+        lambda _message: None,
+        route="gateway",
+    )
 
 
 def test_sync_artifacts_falls_back_when_a_leg_fails(tmp_path, monkeypatch):

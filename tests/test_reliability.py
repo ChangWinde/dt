@@ -4,9 +4,11 @@ and rsync retries must resume."""
 import json
 import math
 import os
+import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import threading
 from contextlib import contextmanager
@@ -48,6 +50,169 @@ def _proc_start_ticks(pid: int) -> str:
     return stat_line[stat_line.rfind(") ") + 2 :].split()[19]
 
 
+def test_launch_recovery_probe_proves_live_wrapper_identity(tmp_path):
+    job_dir = tmp_path / "jobs" / "recover-live"
+    state_dir = job_dir / ".dt" / "state"
+    control_dir = job_dir / ".dt"
+    state_dir.mkdir(parents=True)
+    wrapper = subprocess.Popen(
+        ["sleep", "30"],
+        cwd=job_dir,
+        start_new_session=True,
+    )
+    try:
+        (state_dir / "pgid").write_text(f"{wrapper.pid}\n")
+        (state_dir / "gpus").write_text("0\n")
+        (state_dir / "started_at").write_text("1770000000.25\n")
+        (state_dir / "process_start_ticks").write_text(
+            f"{_proc_start_ticks(wrapper.pid)}\n"
+        )
+        (state_dir / "boot_id").write_text(
+            Path("/proc/sys/kernel/random/boot_id").read_text()
+        )
+        (control_dir / "env-key").write_text("0123456789ab\n")
+
+        command = lifecycle.launch_recovery_probe(
+            str(job_dir),
+            "dt_recover_live",
+            layout="role-v1",
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        parsed = dispatch._parse_launch_recovery(result.stdout)
+        assert parsed.state == "RUNNING"
+        assert parsed.pgid == wrapper.pid
+        assert parsed.gpus == (0,)
+        assert parsed.started_at == 1770000000.25
+        assert parsed.env_hash == "0123456789ab"
+    finally:
+        wrapper.terminate()
+        wrapper.wait(timeout=2)
+
+
+def test_launch_recovery_ignores_task_written_exit_marker_while_wrapper_is_live(
+    tmp_path,
+):
+    """A task can write state files, so liveness must precede completion."""
+    job_dir = tmp_path / "jobs" / "recover-forged-finish"
+    state_dir = job_dir / ".dt" / "state"
+    state_dir.mkdir(parents=True)
+    wrapper = subprocess.Popen(
+        ["sleep", "30"],
+        cwd=job_dir,
+        start_new_session=True,
+    )
+    try:
+        (state_dir / "pgid").write_text(f"{wrapper.pid}\n")
+        (state_dir / "gpus").write_text("0\n")
+        (state_dir / "started_at").write_text("1770000000.25\n")
+        (state_dir / "process_start_ticks").write_text(
+            f"{_proc_start_ticks(wrapper.pid)}\n"
+        )
+        (state_dir / "boot_id").write_text(
+            Path("/proc/sys/kernel/random/boot_id").read_text()
+        )
+        # The command running under the wrapper has the same Unix identity
+        # and can forge this file before it actually exits.
+        (state_dir / "exit_code").write_text("0\n")
+        (state_dir / "result_state").write_text("success\n")
+
+        command = lifecycle.launch_recovery_probe(
+            str(job_dir),
+            "dt_recover_forged_finish",
+            layout="role-v1",
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        parsed = dispatch._parse_launch_recovery(result.stdout)
+        assert parsed.state == "RUNNING"
+        assert parsed.pgid == wrapper.pid
+    finally:
+        wrapper.terminate()
+        wrapper.wait(timeout=2)
+
+
+def test_launch_recovery_accepts_completion_only_after_dead_census(tmp_path):
+    job_dir = tmp_path / "jobs" / "recover-finished"
+    state_dir = job_dir / ".dt" / "state"
+    control_dir = job_dir / ".dt"
+    state_dir.mkdir(parents=True)
+    (state_dir / "pgid").write_text("99999999\n")
+    (state_dir / "gpus").write_text("0,1\n")
+    (state_dir / "started_at").write_text("1770000000.25\n")
+    (state_dir / "finished_at").write_text("1770000010.5\n")
+    (state_dir / "exit_code").write_text("0\n")
+    (state_dir / "result_state").write_text("success\n")
+    (state_dir / "boot_id").write_text(
+        Path("/proc/sys/kernel/random/boot_id").read_text()
+    )
+    (control_dir / "env-key").write_text("0123456789ab\n")
+
+    command = lifecycle.launch_recovery_probe(
+        str(job_dir),
+        "dt_recover_finished",
+        layout="role-v1",
+    )
+    result = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    parsed = dispatch._parse_launch_recovery(result.stdout)
+    assert parsed.state == "FINISHED"
+    assert parsed.exit_code == 0
+    assert parsed.gpus == (0, 1)
+    assert parsed.started_at == 1770000000.25
+    assert parsed.finished_at == 1770000010.5
+    assert parsed.result_state == "success"
+
+
+def test_termination_probe_publishes_attempt_scoped_cancel_atomically(tmp_path):
+    job_dir = tmp_path / "jobs" / "attempt-cancel"
+    job_dir.mkdir(parents=True)
+    token = "d" * 32
+    command = lifecycle.termination_probe(
+        str(job_dir),
+        None,
+        "TERM",
+        session="dt_attempt_cancel",
+        cancel_sentinel=True,
+        cancel_token=token,
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert lifecycle.termination_verdict(
+        result.returncode, result.stdout, result.stderr
+    ) == ("DEAD", None)
+    assert (job_dir / ".dt-cancel").read_text() == f"{token}\n"
+    assert list(job_dir.glob(".dt-cancel.tmp.*")) == []
+
+
 def test_refresh_status_records_and_clears_lost_diagnostic(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     entry = JobEntry(
@@ -64,9 +229,9 @@ def test_refresh_status_records_and_clears_lost_diagnostic(tmp_path, monkeypatch
     )
     tokens = iter(
         [
-            "boot-a\nLOST\n",
-            "boot-a\nRUNNING\n",
-            "boot-a\n137\n",
+            f"boot-a\n{jobs.STATUS_MARK}\nLOST\nUNKNOWN\nUNKNOWN\n",
+            f"boot-a\n{jobs.STATUS_MARK}\nRUNNING\nUNKNOWN\nUNKNOWN\n",
+            f"boot-a\n{jobs.STATUS_MARK}\n137\nUNKNOWN\nUNKNOWN\n",
         ]
     )
     monkeypatch.setattr(
@@ -341,7 +506,10 @@ def test_refresh_status_rejects_out_of_range_exit_code_with_observation(
         jobs,
         "run_on",
         lambda *args, **kwargs: subprocess.CompletedProcess(
-            args, 0, "boot-1\n99999999\n", ""
+            args,
+            0,
+            f"boot-1\n{jobs.STATUS_MARK}\n99999999\nUNKNOWN\nUNKNOWN\n",
+            "",
         ),
     )
 
@@ -407,7 +575,10 @@ def test_refresh_status_identifies_node_reboot_before_pid_reuse(tmp_path, monkey
         jobs,
         "run_on",
         lambda *args, **kwargs: subprocess.CompletedProcess(
-            args, 0, "boot-after\nRUNNING\n", ""
+            args,
+            0,
+            f"boot-after\n{jobs.STATUS_MARK}\nRUNNING\nUNKNOWN\nUNKNOWN\n",
+            "",
         ),
     )
 
@@ -418,6 +589,37 @@ def test_refresh_status_identifies_node_reboot_before_pid_reuse(tmp_path, monkey
         "node rebooted since launch (boot_id boot-before -> boot-after); "
         "exit_code is missing"
     )
+
+
+def test_refresh_status_rejects_unframed_legacy_probe_output(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="unframed",
+        name="unframed",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/unframed",
+        session="dt_unframed",
+        cmd="sleep 30",
+        pgid=1234,
+        status="running",
+    )
+    monkeypatch.setattr(
+        jobs,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, "boot-after\n0\n", ""
+        ),
+    )
+    observation: dict[str, object] = {}
+
+    refreshed = jobs.refresh_status(cfg, entry, observation=observation)
+
+    assert refreshed.status == "running"
+    assert refreshed.exit_code is None
+    assert "missing trusted protocol marker" in str(observation["status_probe_error"])
 
 
 def test_refresh_status_rejects_live_pid_with_mismatched_start_time(tmp_path):
@@ -439,13 +641,12 @@ def test_refresh_status_rejects_live_pid_with_mismatched_start_time(tmp_path):
             pgid=wrapper.pid,
         )
 
-        refreshed = jobs.refresh_status(_cfg(tmp_path), entry)
+        observation: dict[str, object] = {}
+        refreshed = jobs.refresh_status(_cfg(tmp_path), entry, observation=observation)
 
-        assert refreshed.status == "lost"
-        assert refreshed.reason == (
-            f"wrapper pid {wrapper.pid} is alive but its process identity "
-            "does not match this job; refusing to adopt a reused process"
-        )
+        assert refreshed.status == "running"
+        assert "unverified" in str(observation["status_probe_error"])
+        assert refreshed.reason is None
         assert wrapper.poll() is None
     finally:
         wrapper.terminate()
@@ -487,7 +688,16 @@ def test_refresh_status_legacy_pid_requires_cwd_inside_job(tmp_path):
             pgid=inside.pid,
         )
 
-        assert jobs.refresh_status(_cfg(tmp_path), outside_entry).status == "lost"
+        outside_observation: dict[str, object] = {}
+        assert (
+            jobs.refresh_status(
+                _cfg(tmp_path),
+                outside_entry,
+                observation=outside_observation,
+            ).status
+            == "running"
+        )
+        assert "unverified" in str(outside_observation["status_probe_error"])
         assert jobs.refresh_status(_cfg(tmp_path), inside_entry).status == "running"
     finally:
         outside.terminate()
@@ -714,7 +924,7 @@ def test_launch_drop_fails_over_to_next_node(tmp_path, monkeypatch):
     monkeypatch.setattr(
         dispatch,
         "_cancel_orphan",
-        lambda node, job_dir, session: cancelled.append(node.name),
+        lambda node, job_dir, session, **kwargs: cancelled.append(node.name),
     )
 
     def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0):
@@ -875,7 +1085,7 @@ def test_launch_drop_stops_failover_when_orphan_cancel_is_unverified(
     monkeypatch.setattr(
         dispatch,
         "_cancel_orphan",
-        lambda node, job_dir, session: "ssh: No route to host",
+        lambda node, job_dir, session, **kwargs: "ssh: No route to host",
     )
 
     entry, reasons, fatal, failure_kinds = _try_nodes(
@@ -905,7 +1115,7 @@ def test_unknown_launcher_exit_cancels_orphan_then_fails_over(tmp_path, monkeypa
     monkeypatch.setattr(
         dispatch,
         "_cancel_orphan",
-        lambda node, job_dir, session: cancelled.append(node.name),
+        lambda node, job_dir, session, **kwargs: cancelled.append(node.name),
     )
 
     def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
@@ -946,7 +1156,7 @@ def test_unknown_launcher_exit_stops_failover_when_cancel_unverified(
     monkeypatch.setattr(
         dispatch,
         "_cancel_orphan",
-        lambda node, job_dir, session: "ssh: No route to host",
+        lambda node, job_dir, session, **kwargs: "ssh: No route to host",
     )
 
     entry, reasons, fatal, failure_kinds = _try_nodes(
@@ -975,7 +1185,7 @@ def test_zero_exit_with_unparsable_output_cancels_before_failover(
     monkeypatch.setattr(
         dispatch,
         "_cancel_orphan",
-        lambda node, job_dir, session: cancelled.append(node.name),
+        lambda node, job_dir, session, **kwargs: cancelled.append(node.name),
     )
 
     def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
@@ -1001,13 +1211,43 @@ def test_zero_exit_with_unparsable_output_cancels_before_failover(
     assert "cancelled on node" in reasons["n1"]
 
 
+def test_launch_preserves_zero_exit_with_unparsable_output_as_unknown(
+    tmp_path, monkeypatch
+):
+    """The candidate loop must verify-cancel a session after a bad receipt."""
+    cfg = _cfg(tmp_path)
+    node = cfg.nodes[0]
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="launcher stdout was not json\n",
+            stderr="",
+        ),
+    )
+
+    code, detail = dispatch.launch(
+        cfg,
+        node,
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        _spec(),
+    )
+
+    assert code == 0
+    assert detail == "unparseable launcher output: 'launcher stdout was not json'"
+
+
 def test_invalid_pgid_cancels_running_session_before_abort(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     cancelled: list[str] = []
     monkeypatch.setattr(
         dispatch,
         "_cancel_orphan",
-        lambda node, job_dir, session: cancelled.append(node.name),
+        lambda node, job_dir, session, **kwargs: cancelled.append(node.name),
     )
     monkeypatch.setattr(
         dispatch,
@@ -1078,7 +1318,8 @@ def test_cancel_orphan_requires_verified_death_without_a_known_pgid(
     assert dispatch._cancel_orphan(node, "dt/jobs/jid", "dt_jid") is None
     assert "DT_KPG=0" in probes[0]
     assert ".dt-cancel" in probes[0]
-    assert "tmux -L dt kill-session" in probes[0]
+    assert "dt-job-" in probes[0]
+    assert 'tmux -L "$DT_KSOCKET" kill-session' in probes[0]
 
     monkeypatch.setattr(
         dispatch,
@@ -1098,6 +1339,32 @@ def test_cancel_orphan_requires_verified_death_without_a_known_pgid(
         )
         == "unexpected response 'UNKNOWN'"
     )
+
+
+def test_role_layout_cancel_creates_the_state_directory_before_launcher(tmp_path):
+    """A dropped ssh may be cancelled before launcher.sh creates .dt/state."""
+    job_dir = "dt/worker/jobs/jid"
+    (tmp_path / job_dir / ".dt").mkdir(parents=True)
+    command = lifecycle.termination_probe(
+        job_dir,
+        None,
+        "TERM",
+        session="dt_jid",
+        cancel_sentinel=True,
+        layout="role-v1",
+    )
+
+    proc = subprocess.run(
+        ["bash", "-c", command],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "DEAD"
+    assert (tmp_path / job_dir / ".dt" / "state" / "cancel").is_file()
 
 
 def test_uncertain_direct_launch_is_registered_and_classified_unreachable(
@@ -1138,14 +1405,16 @@ def test_uncertain_direct_launch_is_registered_and_classified_unreachable(
     )
     failure_times = iter([100.0, 200.0])
     monkeypatch.setattr(dispatch.time, "time", lambda: next(failure_times))
+    source = tmp_path / "source-uncertain"
+    source.mkdir()
+    (source / "main.py").write_text("pass\n")
+    stored_source = dispatch.StoredSnapshot(dispatch.tree_sha256(source), source)
 
     with pytest.raises(dispatch.NoReachableNode) as raised:
         dispatch._submit_prepared(
             cfg,
             spec,
-            source_factory=lambda: (_ for _ in ()).throw(
-                AssertionError("mocked candidate loop must not request source")
-            ),
+            source_factory=lambda: stored_source,
             git_sha="abc123",
             git_dirty=True,
             git_diff=None,
@@ -1160,7 +1429,7 @@ def test_uncertain_direct_launch_is_registered_and_classified_unreachable(
     assert stored.node == "n1"
     assert stored.created_at == 100.0
     assert stored.finished_at == 200.0
-    assert stored.reason == f"launch outcome uncertain: {reason}"
+    assert stored.reason == f"launch outcome uncertain: n1: {reason}"
 
 
 def test_kill_retries_uncertain_launch_cleanup_after_node_recovers(
@@ -1201,7 +1470,8 @@ def test_kill_retries_uncertain_launch_cleanup_after_node_recovers(
     assert len(probes) == 1
     assert "DT_KPG=0" in probes[0]
     assert ".dt-cancel" in probes[0]
-    assert "tmux -L dt kill-session" in probes[0]
+    assert "dt-job-" in probes[0]
+    assert 'tmux -L "$DT_KSOCKET" kill-session' in probes[0]
     killed = jobs.load(cfg, entry.job_id)
     assert killed is not None
     assert killed.status == "killed"
@@ -1385,14 +1655,16 @@ def test_direct_env_fail_persists_placed_failed_entry(tmp_path, monkeypatch):
     )
     failure_times = iter([100.0, 200.0])
     monkeypatch.setattr(dispatch.time, "time", lambda: next(failure_times))
+    source = tmp_path / "source-env-fail"
+    source.mkdir()
+    (source / "main.py").write_text("pass\n")
+    stored_source = dispatch.StoredSnapshot(dispatch.tree_sha256(source), source)
 
     with pytest.raises(dispatch.FailedBeforeStart) as raised:
         dispatch._submit_prepared(
             cfg,
             spec,
-            source_factory=lambda: (_ for _ in ()).throw(
-                AssertionError("fake fatal path must not need a source")
-            ),
+            source_factory=lambda: stored_source,
             git_sha="a" * 40,
             git_dirty=True,
             git_diff=None,
@@ -1928,6 +2200,61 @@ def test_pull_multiple_isolates_failures_and_uses_first_nonzero_in_ref_order(
     assert (batch / "ok-id" / "dt" / "job.json").is_file()
 
 
+def test_pull_multiple_classifies_outputs_probe_timeout_as_unreachable(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    entries = {
+        name: JobEntry(
+            job_id=f"{name}-id",
+            name=name,
+            center="test",
+            project="p",
+            node="n1",
+            node_local=False,
+            job_dir=f"dt/jobs/{name}-id",
+            session=f"dt_{name}",
+            cmd="true",
+            status="finished",
+            exit_code=0,
+        )
+        for name in ("one", "two")
+    }
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli.jobs_mod,
+        "find",
+        lambda _cfg, ref: (
+            entries.get(ref)
+            or next((entry for entry in entries.values() if entry.job_id == ref), None)
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(["ssh", "n1"], 10)
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["pull", "one", "two", "--to", str(tmp_path / "batch"), "--json"],
+    )
+
+    assert result.exit_code == cli.EXIT_UNREACHABLE
+    payload = json.loads(result.stdout)
+    assert payload["summary"]["aggregate_exit_code"] == cli.EXIT_UNREACHABLE
+    assert [job["error"] for job in payload["jobs"]] == [
+        "unreachable",
+        "unreachable",
+    ]
+    assert [job["exit_code"] for job in payload["jobs"]] == [
+        cli.EXIT_UNREACHABLE,
+        cli.EXIT_UNREACHABLE,
+    ]
+
+
 def test_pull_multiple_isolates_missing_refs_and_recovers_valid_jobs(
     tmp_path, monkeypatch
 ):
@@ -2046,10 +2373,12 @@ def test_pull_multiple_ctrl_c_cancels_workers_and_prints_exact_resume(
         force,
         retries,
         route,
+        bwlimit,
         cancel_event,
     ):
         assert retries == 0
         assert route == "auto"
+        assert bwlimit is None
         if ref == "one":
             assert second_started.wait(timeout=1)
             raise KeyboardInterrupt
@@ -2127,6 +2456,7 @@ def test_pull_collection_uses_managed_root_and_job_subdirectories(
         _force,
         _retries,
         _route,
+        _bwlimit,
         _cancel_event,
     ):
         destinations[ref] = destination
@@ -2181,6 +2511,43 @@ def test_pull_collection_rejects_paths_outside_managed_root(
     assert payload["error"] == "invalid_argument"
     assert "collection" in payload["message"]
     assert not cfg.results_dir().joinpath("collections").exists()
+
+
+def test_pull_collection_refuses_symlinked_managed_ancestor(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    results = cfg.results_dir()
+    results.mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (results / "collections").symlink_to(outside, target_is_directory=True)
+    entries = {
+        name: JobEntry(
+            job_id=f"{name}-id",
+            name=name,
+            center="test",
+            project="p",
+            node="n1",
+            node_local=False,
+            job_dir=f"dt/jobs/{name}-id",
+            session=f"dt_{name}",
+            cmd="true",
+            status="finished",
+            exit_code=0,
+        )
+        for name in ("one", "two")
+    }
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, ref: entries.get(ref))
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["pull", "one", "two", "--collection", "campaign", "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "destination_unusable"
+    assert not (outside / "campaign").exists()
 
 
 def test_pull_rejects_collection_with_explicit_destination(tmp_path, monkeypatch):
@@ -2788,6 +3155,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
                 "retries": 2,
                 "safe_links": True,
                 "stats": False,
+                "bwlimit_kbps": None,
             },
         ),
         (
@@ -2798,6 +3166,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
                 "timeout": 4 * 3600,
                 "retries": 2,
                 "safe_links": True,
+                "bwlimit_kbps": None,
             },
         ),
     ]
@@ -2883,6 +3252,7 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
                 "timeout": 4 * 3600,
                 "retries": 2,
                 "safe_links": True,
+                "bwlimit_kbps": None,
             },
         )
     ]
@@ -2998,6 +3368,94 @@ def test_pull_json_success_contract(tmp_path, monkeypatch):
         "records_scope": "dt_reserved",
         "records": ["dt/job.json", "dt/stdout.log"],
     }
+
+
+def test_single_pull_absolutizes_a_relative_destination(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+        status="running",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, "0\toutputs\n", ""
+        ),
+    )
+    destinations = []
+
+    def transfer(_src, dst, **_kwargs):
+        destinations.append(dst)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(cli, "rsync", transfer)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["pull", "jid", "--to", "relative-result", "--json"],
+    )
+
+    expected = tmp_path / "relative-result"
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["destination"] == str(expected)
+    assert all(str(expected) in destination for destination in destinations)
+
+
+def test_pull_reports_local_directory_creation_failure_as_json(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+        status="running",
+    )
+    destination = tmp_path / "result"
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, "0\toutputs\n", ""
+        ),
+    )
+    original_mkdir = Path.mkdir
+
+    def fail_destination_mkdir(path, *args, **kwargs):
+        if path == destination:
+            raise OSError("simulated disk full")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_destination_mkdir)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["pull", "jid", "--to", str(destination), "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "destination_unusable"
+    assert payload["destination"] == str(destination)
+    assert "simulated disk full" in payload["message"]
 
 
 def test_pull_outputs_cannot_overwrite_authoritative_job_record(tmp_path, monkeypatch):
@@ -3158,6 +3616,52 @@ def test_pull_json_unreachable_preflight_contract(tmp_path, monkeypatch):
         "message": "cannot inspect outputs on n1: ssh: No route to host",
         "exit_code": cli.EXIT_UNREACHABLE,
     }
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        cli.RemoteError("n1", "ssh probe timed out", 255),
+        subprocess.TimeoutExpired(["ssh", "n1"], 10),
+        OSError("cannot spawn ssh"),
+    ],
+)
+def test_pull_json_maps_outputs_probe_exceptions_to_unreachable(
+    tmp_path, monkeypatch, failure
+):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+    )
+    destination = tmp_path / "result"
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["pull", "jid", "--to", str(destination), "--json"],
+    )
+
+    assert result.exit_code == cli.EXIT_UNREACHABLE
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "unreachable"
+    assert payload["exit_code"] == cli.EXIT_UNREACHABLE
+    assert payload["job_id"] == "jid"
+    assert payload["node"] == "n1"
     assert not destination.exists()
 
 
@@ -4056,6 +4560,73 @@ def test_kill_json_mixed_terminal_and_not_found_contract(tmp_path, monkeypatch):
     ]
 
 
+def test_kill_json_keeps_ordered_results_when_one_registry_row_is_unreadable(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="done-json",
+        name="done-json",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/done-json",
+        session="dt_done_json",
+        cmd="true",
+        status="finished",
+        exit_code=0,
+    )
+    jobs.save(cfg, entry)
+    real_find = jobs.find
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(jobs, "refresh_status", lambda cfg_, entry_: entry_)
+
+    def damaged_find(cfg_, ref):
+        if ref == "damaged":
+            raise jobs.RegistryError("record changed while being read")
+        return real_find(cfg_, ref)
+
+    monkeypatch.setattr(jobs, "find", damaged_find)
+
+    result = CliRunner().invoke(
+        cli.app, ["kill", "done-json", "damaged", "-y", "--json"]
+    )
+
+    assert result.exit_code == 1, result.output
+    rows = json.loads(result.stdout)
+    assert [row["ref"] for row in rows] == ["done-json", "damaged"]
+    assert rows[0]["outcome"] == "already_terminal"
+    assert rows[1]["outcome"] == "unverified"
+    assert rows[1]["exit_code"] == 1
+
+
+def test_laptop_human_kill_continues_after_unknown_ref(monkeypatch):
+    cfg = LaptopConfig(centers={"test": "head"}, default_center="test")
+    forwarded = []
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "find_center",
+        lambda _cfg, ref, **_kwargs: (
+            None
+            if ref == "missing"
+            else ("test", "head", {"job_id": ref, "status": "running"})
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "forward_call",
+        lambda head, argv, tty=False: forwarded.append((head, argv, tty)) or 0,
+    )
+
+    result = CliRunner().invoke(cli.app, ["kill", "first", "missing", "last", "-y"])
+
+    assert result.exit_code == 1, result.output
+    assert [item[1][1] for item in forwarded] == ["first", "last"]
+    assert "no center's registry knows job missing" in result.stderr
+
+
 def test_kill_json_requires_noninteractive_confirmation(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
@@ -4753,6 +5324,157 @@ def test_kill_uses_single_procfs_scan_instead_of_one_readlink_per_pid():
     assert "find /proc -mindepth 2 -maxdepth 2" in source
 
 
+def test_runtime_identity_is_deterministic_bounded_and_namespaced():
+    socket, scope = lifecycle.runtime_identity("dt_20260814-example")
+
+    assert socket == lifecycle.runtime_identity("dt_20260814-example")[0]
+    assert re.fullmatch(r"dt-job-[0-9a-f]{20}", socket)
+    assert re.fullmatch(r"dt-runtime-[0-9a-f]{20}\.scope", scope)
+    assert lifecycle.runtime_identity("dt_other") != (socket, scope)
+
+
+def test_attach_prefers_per_job_socket_with_explicit_legacy_fallback(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="attach-job",
+        name="attach",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/attach-job",
+        session="dt_attach-job",
+        cmd="true",
+    )
+    calls = []
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "_find_or_die", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(cli, "ssh_base", lambda: ["ssh"])
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda argv, check: calls.append(argv) or subprocess.CompletedProcess(argv, 0),
+    )
+
+    result = CliRunner().invoke(cli.app, ["attach", entry.job_id])
+
+    assert result.exit_code == 0, result.output
+    socket, _scope = lifecycle.runtime_identity(entry.session)
+    command = calls[0][-1]
+    assert f"tmux -L {socket} has-session" in command
+    assert f"exec tmux -L {socket} attach" in command
+    assert "elif tmux -L dt has-session" in command
+
+
+@pytest.mark.parametrize("session", ["", "bad\nname", "x" * 257, "\ud800"])
+def test_runtime_identity_rejects_unsafe_session(session):
+    with pytest.raises(ValueError, match="session"):
+        lifecycle.runtime_identity(session)
+
+
+def test_liveness_fails_closed_when_recorded_scope_cannot_be_inspected(
+    tmp_path,
+):
+    job_dir = tmp_path / "jobs" / "scoped-job"
+    job_dir.mkdir(parents=True)
+    (_socket, scope) = lifecycle.runtime_identity("dt_scoped-job")
+    (job_dir / "runtime_scope").write_text(f"{scope}\n")
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "systemctl").write_text("#!/bin/sh\nexit 1\n")
+    (stub / "systemctl").chmod(0o755)
+    script = (
+        lifecycle.liveness_shell()
+        + f"dt_job_live_state {shlex.quote(str(job_dir))} 0 '' "
+        + shlex.quote(str(job_dir / "process_start_ticks"))
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "UNPROVEN"
+
+
+def test_liveness_finds_setsid_chdir_survivor_through_scope_cgroup(tmp_path):
+    job_dir = tmp_path / "jobs" / "scoped-survivor"
+    job_dir.mkdir(parents=True)
+    (_socket, scope) = lifecycle.runtime_identity("dt_scoped-survivor")
+    (job_dir / "runtime_scope").write_text(f"{scope}\n")
+    cgroup = next(
+        line.split(":", 2)[2]
+        for line in Path("/proc/self/cgroup").read_text().splitlines()
+        if line.startswith("0::")
+    )
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "systemctl").write_text(
+        "#!/bin/sh\n"
+        'case "$*" in\n'
+        '  *LoadState*) printf "loaded\\n";;\n'
+        '  *ActiveState*) printf "active\\n";;\n'
+        f'  *ControlGroup*) printf "%s\\n" {shlex.quote(cgroup)};;\n'
+        "  *) exit 1;;\n"
+        "esac\n"
+    )
+    (stub / "systemctl").chmod(0o755)
+    script = (
+        lifecycle.liveness_shell()
+        + f"dt_job_live_state {shlex.quote(str(job_dir))} 0 '' "
+        + shlex.quote(str(job_dir / "process_start_ticks"))
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "LIVE"
+
+
+def test_termination_fails_closed_when_expected_scope_cannot_be_inspected(
+    tmp_path,
+):
+    job_dir = tmp_path / "jobs" / "scoped-kill"
+    job_dir.mkdir(parents=True)
+    (_socket, scope) = lifecycle.runtime_identity("dt_scoped-kill")
+    (job_dir / "runtime_scope").write_text(f"{scope}\n")
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    (stub / "systemctl").write_text("#!/bin/sh\nexit 1\n")
+    (stub / "systemctl").chmod(0o755)
+    command = lifecycle.termination_probe(
+        str(job_dir),
+        None,
+        "TERM",
+        job_id="scoped-kill",
+        session="dt_scoped-kill",
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env={**os.environ, "PATH": f"{stub}:{os.environ['PATH']}"},
+    )
+
+    assert lifecycle.termination_verdict(
+        result.returncode, result.stdout, result.stderr
+    ) == ("UNVERIFIED", "UNPROVEN")
+
+
 def test_corrupt_identity_with_capsule_cwd_is_alive_not_dead(tmp_path):
     # A live process whose cwd is inside our private capsule but whose
     # identity file is corrupt (rc=2, unproven leader) is indistinguishable
@@ -4806,7 +5528,7 @@ def test_foreign_group_reuse_outside_capsule_is_dead(tmp_path):
 
         assert lifecycle.termination_verdict(
             result.returncode, result.stdout, result.stderr
-        ) == ("DEAD", None)
+        ) == ("UNVERIFIED", "UNPROVEN")
         assert unrelated.poll() is None
     finally:
         unrelated.terminate()
@@ -5012,6 +5734,50 @@ def _wait_for_zombie(pid: int, timeout: float = 5.0) -> None:
         time.sleep(0.02)
 
 
+def test_liveness_census_keeps_thread_group_with_zombie_leader_live(tmp_path):
+    """A dead main thread is not a dead multithreaded process."""
+    job_dir = tmp_path / "jobs" / "threaded-job"
+    job_dir.mkdir(parents=True)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import ctypes, threading, time; "
+                "threading.Thread(target=lambda: time.sleep(30)).start(); "
+                "ctypes.CDLL(None).pthread_exit(None)"
+            ),
+        ],
+        cwd=job_dir,
+        start_new_session=True,
+    )
+    try:
+        _wait_for_zombie(process.pid)
+        tasks = list(Path(f"/proc/{process.pid}/task").iterdir())
+        assert len(tasks) > 1
+        identity = job_dir / "process_start_ticks"
+        identity.write_text(f"{_proc_start_ticks(process.pid)}\n")
+        script = (
+            lifecycle.liveness_shell()
+            + f"dt_job_live_state {shlex.quote(str(job_dir))} {process.pid} '' "
+            + shlex.quote(str(identity))
+        )
+
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "LIVE"
+        assert process.poll() is None
+    finally:
+        process.kill()
+        process.wait(timeout=2)
+
+
 def test_zombie_leader_with_matching_identity_is_dead(tmp_path):
     # An exited-but-unreaped leader passes kill -0 and keeps matching start
     # ticks forever, so the census used to count it via pgrep -g: `dt kill`
@@ -5126,14 +5892,11 @@ def test_identity_shell_reports_zombie_wrapper_as_gone(tmp_path):
         wrapper.wait(timeout=2)
 
 
-def test_termination_probe_reports_pre_signal_exit_marker_without_signalling(
+def test_termination_probe_does_not_trust_exit_marker_while_a_survivor_is_live(
     tmp_path,
 ):
-    # An exit marker that already exists when the probe starts proves the
-    # job completed on its own; the probe must report EXITED with the
-    # recorded code and must not signal leftover capsule processes (their
-    # cleanup is an explicit sweep, not a silent side effect of a kill that
-    # arrived too late).
+    # State is task-writable. A forged marker must not turn a live process
+    # into a completed job or shield it from an explicit kill.
     job_dir = tmp_path / "jobs" / "exited-job"
     job_dir.mkdir(parents=True)
     (job_dir / "exit_code").write_text("7\n")
@@ -5155,11 +5918,33 @@ def test_termination_probe_reports_pre_signal_exit_marker_without_signalling(
 
         assert lifecycle.termination_verdict(
             result.returncode, result.stdout, result.stderr
-        ) == ("EXITED", "7")
-        assert straggler.poll() is None
+        ) == ("DEAD", None)
+        assert straggler.wait(timeout=5) != 0
     finally:
-        straggler.terminate()
-        straggler.wait(timeout=2)
+        if straggler.poll() is None:
+            straggler.terminate()
+            straggler.wait(timeout=2)
+
+
+def test_termination_probe_preserves_valid_marker_after_dead_census(tmp_path):
+    job_dir = tmp_path / "jobs" / "completed-job"
+    job_dir.mkdir(parents=True)
+    (job_dir / "exit_code").write_text("7\n")
+
+    command = lifecycle.termination_probe(
+        str(job_dir), None, "TERM", job_id="completed-job"
+    )
+    result = subprocess.run(
+        ["bash", "-c", command],
+        cwd=Path.home(),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert lifecycle.termination_verdict(
+        result.returncode, result.stdout, result.stderr
+    ) == ("EXITED", "7")
 
 
 def test_liveness_census_sees_survivor_inside_glob_metachar_capsule(tmp_path):
@@ -5224,6 +6009,17 @@ def test_termination_probe_signals_orphan_inside_glob_metachar_capsule(tmp_path)
             orphan.wait(timeout=2)
 
 
+def test_termination_probe_never_opens_an_empty_reapable_group():
+    command = lifecycle.termination_probe(
+        "dt/jobs/empty-group",
+        99999999,
+        "TERM",
+        job_id="empty-group",
+    )
+
+    assert 'pgrep -g "$DT_KPG" >/dev/null' in command
+
+
 def test_termination_probe_sanitizes_forged_exit_marker_content(tmp_path):
     # The exit marker lives in a job-writable directory. Multi-line or
     # non-numeric content must collapse to a bare EXITED token instead of
@@ -5244,7 +6040,7 @@ def test_termination_probe_sanitizes_forged_exit_marker_content(tmp_path):
 
     assert lifecycle.termination_verdict(
         result.returncode, result.stdout, result.stderr
-    ) == ("EXITED", None)
+    ) == ("DEAD", None)
 
 
 def test_kill_preserves_natural_completion_that_beat_the_signal(tmp_path, monkeypatch):

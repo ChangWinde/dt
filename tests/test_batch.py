@@ -5,11 +5,22 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from dt import agent, cli, dispatch
 from dt.config import HeadConfig, LaptopConfig, Node, Project
 from dt.jobs import JobEntry, save
+
+
+@pytest.fixture(autouse=True)
+def _compatible_resident_agent(monkeypatch):
+    """Batch tests mock submission below the real protocol boundary."""
+    monkeypatch.setattr(
+        cli,
+        "require_compatible_resident_agent",
+        lambda _cfg: None,
+    )
 
 
 def _cfg(tmp_path: Path) -> HeadConfig:
@@ -67,8 +78,15 @@ def test_batch_submits_one_snapshot_then_force_queues_exact_forks(
     monkeypatch,
 ):
     cfg = _cfg(tmp_path)
+    artifact = cfg.projects["p"].path / "outputs" / "model.pt"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"model")
     seen = {"forks": []}
-    manifest = "b" * 64
+    manifest = dispatch.artifact_manifest_identity(
+        "p",
+        cfg.projects["p"].path,
+        ["outputs/model.pt"],
+    )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(agent, "alive_pid", lambda cfg_: 123)
     monkeypatch.setattr(
@@ -158,6 +176,36 @@ def test_batch_submits_one_snapshot_then_force_queues_exact_forks(
         "compare": ["dt", "compare", *job_ids],
         "kill": ["dt", "kill", *job_ids],
     }
+
+
+def test_batch_refuses_an_incompatible_agent_before_group_or_artifact_mutation(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "require_compatible_resident_agent",
+        lambda _cfg: (_ for _ in ()).throw(
+            cli.ConfigError("resident dt agent uses an incompatible dispatch protocol")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("submission must stop before creating a group job")
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["batch", "n1", "--json", "python train.py"],
+    )
+
+    assert result.exit_code == cli.EXIT_ENV
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "agent_incompatible"
 
 
 def test_chain_submits_linear_success_dependencies(tmp_path, monkeypatch):
@@ -555,6 +603,9 @@ def test_batch_artifact_failure_emits_batch_receipt_without_submitting(
     monkeypatch,
 ):
     cfg = _cfg(tmp_path)
+    artifact = cfg.projects["p"].path / "outputs" / "missing.pt"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"local artifact")
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
         cli,
@@ -562,7 +613,7 @@ def test_batch_artifact_failure_emits_batch_receipt_without_submitting(
         lambda *args, **kwargs: (_ for _ in ()).throw(
             cli._OperationFailure(
                 "artifact_sync_failed",
-                "artifact path does not exist",
+                "artifact transfer failed",
                 1,
             )
         ),
@@ -917,6 +968,9 @@ def test_batch_json_artifact_interrupt_confirms_no_jobs_were_submitted(
     tmp_path, monkeypatch
 ):
     cfg = _cfg(tmp_path)
+    artifact = cfg.projects["p"].path / "outputs" / "model.pt"
+    artifact.parent.mkdir()
+    artifact.write_bytes(b"model")
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
         cli,

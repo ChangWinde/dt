@@ -1,7 +1,9 @@
 """Gateway-staged result recovery (ADR 0025)."""
 
 import json
+import os
 import subprocess
+import threading
 
 import pytest
 from typer.testing import CliRunner
@@ -66,6 +68,8 @@ def test_dial_is_tunnel_recognizes_proxies_and_loopback():
     assert dial_is_tunnel({"proxycommand": "ssh -W %h:%p jump"})
     assert dial_is_tunnel({"hostname": "127.0.0.1"})
     assert dial_is_tunnel({"hostname": "::1"})
+    assert dial_is_tunnel({"hostname": "localhost"})
+    assert dial_is_tunnel({"hostname": "LOCALHOST."})
     assert not dial_is_tunnel({"hostname": "203.0.113.9"})
     assert not dial_is_tunnel({"hostname": "gpu-7.internal"})
     # An empty ssh -G resolution proves nothing and must not trigger a relay.
@@ -201,6 +205,8 @@ def test_stage_command_builds_a_private_guarded_lan_pull(tmp_path):
     assert "~/dt/jobs" not in command.split("10.0.0.7:")[1]
     assert "--exclude checkpoints/" in command
     assert "--safe-links" in command
+    assert "--delete" in command
+    assert "DT_RELAY_UNSAFE_STAGING" in command
     # 1 GiB * 1.1 headroom in KiB.
     assert "dt_need_kb=1153434" in command
     assert "DT_RELAY_NO_SPACE" in command
@@ -255,6 +261,28 @@ def test_stage_outputs_records_a_site_sample_on_success(tmp_path):
     )
     assert sample is not None
     assert sample.smoothed_bps > 0
+
+
+def test_stage_outputs_forwards_local_cancellation(tmp_path):
+    cfg = _cfg(tmp_path)
+    route = _gateway_route(cfg)
+    cancel = threading.Event()
+
+    def runner(node, local, command, timeout=15, check=False, **kwargs):
+        assert kwargs["cancel_event"] is cancel
+        return subprocess.CompletedProcess([], 130, "", "cancelled locally")
+
+    with pytest.raises(RelayError, match="cancelled locally"):
+        stage_outputs(
+            cfg,
+            route,
+            "jid",
+            "~/dt/jobs/jid",
+            excludes=[],
+            estimate_bytes=BIG,
+            runner=runner,
+            cancel_event=cancel,
+        )
 
 
 def test_stage_outputs_translates_failures_into_relay_errors(tmp_path):
@@ -327,7 +355,9 @@ def test_cleanup_command_targets_only_the_job_capsule(tmp_path):
 
     assert command.startswith("bash -c ")
     assert staging_relative("20260813-1200_train_abcd") in command
-    assert "rm -rf -- " in command
+    assert "rm -rf" not in command
+    assert 'test ! -L "$HOME/.dt"' in command
+    assert 'find "$capsule" -xdev -depth -delete' in command
 
     cfg = _cfg(tmp_path)
     route = _gateway_route(cfg)
@@ -336,6 +366,34 @@ def test_cleanup_command_targets_only_the_job_capsule(tmp_path):
         raise cli.RemoteError("gw", "gone")
 
     assert cleanup_staging(route, "jid", runner=failing) is False
+
+
+def test_cleanup_refuses_a_symlinked_staging_ancestor(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    outside = tmp_path / "outside"
+    capsule = outside / "pull-staging" / "jid"
+    capsule.mkdir(parents=True)
+    (capsule / "keep.bin").write_bytes(b"keep")
+    (home / ".dt").symlink_to(outside, target_is_directory=True)
+
+    proc = subprocess.run(
+        ["bash", "-c", cleanup_command("jid")],
+        env={**os.environ, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 70
+    assert (capsule / "keep.bin").read_bytes() == b"keep"
+
+
+@pytest.mark.parametrize("job_id", ["../escape", "a/b", "bad\nname", ""])
+def test_staging_paths_reject_unsafe_job_identities(job_id):
+    with pytest.raises(RelayError, match="unsafe job identity"):
+        staging_relative(job_id)
+    with pytest.raises(RelayError, match="unsafe job identity"):
+        cleanup_command(job_id)
 
 
 def _entry() -> JobEntry:
@@ -417,7 +475,7 @@ def test_pull_relays_via_gateway_and_cleans_up(tmp_path, monkeypatch):
     assert stage_targets[0] == "gw"
     assert rsync_calls[0][0] == "gw:.dt/pull-staging/jid/outputs/"
     # The staging capsule is removed after success.
-    assert any("rm -rf" in cmd for _node, cmd in staged)
+    assert any('find "$capsule" -xdev -depth -delete' in cmd for _node, cmd in staged)
 
 
 def test_pull_falls_back_to_direct_when_staging_fails(tmp_path, monkeypatch):

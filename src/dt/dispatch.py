@@ -24,16 +24,30 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
-from dataclasses import asdict, dataclass, field
+from collections.abc import Iterator, Sequence
+from contextlib import ExitStack, contextmanager, nullcontext
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from threading import Event
 from typing import Callable, Mapping, cast
 
-from .config import ConfigError, HeadConfig, Node, Project
+from . import custom_env as custom_env_mod
+from .config import (
+    ConfigError,
+    HeadConfig,
+    Node,
+    Project,
+    active_dt_command,
+    head_bwlimit_kbps,
+    revalidate_project_root,
+)
 from .artifact_distribution import DistributionError, TransferExecutor
-from .lifecycle import termination_probe, termination_verdict
+from .lifecycle import (
+    LAUNCH_RECOVERY_MARK,
+    launch_recovery_probe,
+    termination_probe,
+    termination_verdict,
+)
 from .layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
@@ -46,6 +60,7 @@ from .layout import (
     job_state_dir,
     node_path,
     node_path_expression,
+    normalize_node_root,
     rsync_destination,
 )
 from .maintenance import (
@@ -53,23 +68,29 @@ from .maintenance import (
     CleanReport,
     clean_job_victims as _clean_job_victims,
     clean_jobs as _clean_jobs,
+    environment_retention_lock,
 )
 from .jobs import (
+    DISPATCH_PROTOCOL_VERSION,
     LOST_RECHECK_S,
     CANCEL_UNVERIFIED_PREFIX,
     UNCERTAIN_LAUNCH_PREFIX,
     RESULT_STATES,
     JobEntry,
     RegistryError,
+    dependency_settled,
     effective_result_state,
     is_uncertain_launch,
     job_lock,
     load,
     new_job_id,
+    remove_record,
     request_agent_wake,
     running_count,
     sanitize_name,
     save,
+    transition_terminal,
+    queued_entries,
 )
 from . import git_provenance as git_provenance_mod
 from . import payload_hash as payload_hash_mod
@@ -80,7 +101,7 @@ from .payload_hash import (
     payload_files_from_dir as _payload_files_from_dir,
     payload_sha256 as _payload_sha256,
 )
-from .probe import NodeStatus, probe_center, probe_node
+from .probe import Gpu, NodeStatus, probe_center, probe_node
 from .private_state import (
     PrivateStateError,
     atomic_write,
@@ -106,6 +127,7 @@ from .sshio import (
     RsyncRetryEvent,
     diagnostic_excerpt,
     rsync,
+    rsync_stat_total,
     run_on,
 )
 
@@ -173,9 +195,16 @@ LAUNCH_PHASE_KEYS = (
     "remote_total",
 )
 
-_TRANSFERRED_RE = re.compile(r"Total transferred file size: ([\d,.]+) bytes")
-_DELETED_FILES_RE = re.compile(r"Number of deleted files: ([\d,]+)")
-_TRANSFERRED_FILES_RE = re.compile(r"Number of regular files transferred: ([\d,]+)")
+_GROUPED_INTEGER = r"([0-9][0-9,. \u00a0\u202f]*)"
+_TRANSFERRED_RE = re.compile(rf"Total transferred file size: {_GROUPED_INTEGER} bytes")
+_DELETED_FILES_RE = re.compile(
+    rf"Number of deleted files: {_GROUPED_INTEGER}(?: \([^\r\n]*\))?(?:\r?$)",
+    re.MULTILINE,
+)
+_TRANSFERRED_FILES_RE = re.compile(
+    rf"Number of regular files transferred: {_GROUPED_INTEGER}(?:\r?$)",
+    re.MULTILINE,
+)
 
 
 def _launch_phases_s(result: dict[str, object]) -> dict[str, float]:
@@ -240,10 +269,7 @@ def _excludes(cfg: HeadConfig) -> list[str]:
 
 def transferred_bytes(rsync_stdout: str) -> int | None:
     """Exact bytes copied, from `rsync --stats` output (None if absent)."""
-    matches = list(_TRANSFERRED_RE.finditer(rsync_stdout or ""))
-    if not matches:
-        return None
-    return sum(int(float(match.group(1).replace(",", ""))) for match in matches)
+    return rsync_stat_total(_TRANSFERRED_RE, rsync_stdout)
 
 
 def transferred_gib(rsync_stdout: str) -> float | None:
@@ -254,18 +280,12 @@ def transferred_gib(rsync_stdout: str) -> float | None:
 
 def deleted_files(rsync_stdout: str) -> int | None:
     """Items removed by an exact-mirror rsync (None when stats are absent)."""
-    matches = list(_DELETED_FILES_RE.finditer(rsync_stdout or ""))
-    if not matches:
-        return None
-    return sum(int(match.group(1).replace(",", "")) for match in matches)
+    return rsync_stat_total(_DELETED_FILES_RE, rsync_stdout)
 
 
 def transferred_files(rsync_stdout: str) -> int | None:
     """Regular files copied by rsync (None when stats are absent)."""
-    matches = list(_TRANSFERRED_FILES_RE.finditer(rsync_stdout or ""))
-    if not matches:
-        return None
-    return sum(int(match.group(1).replace(",", "")) for match in matches)
+    return rsync_stat_total(_TRANSFERRED_FILES_RE, rsync_stdout)
 
 
 def _warn_snapshot_size(
@@ -522,6 +542,24 @@ def _artifact_manifest(
     return content, hashlib.sha256(content).hexdigest()
 
 
+def artifact_manifest_identity(
+    project_name: str,
+    project_dir: Path,
+    artifacts: list[str],
+) -> str:
+    """Return the immutable identity that a later artifact sync must publish.
+
+    This performs local validation and hashing only.  Idempotent submission
+    callers use the result in ``RunSpec.artifact_manifest`` before acquiring
+    the request claim, then pass it back to :func:`sync_artifacts` as
+    ``expected_manifest_sha256`` from the claimed action.  That split keeps
+    the intent deterministic without allowing pre-claim remote mutation.
+    """
+    sources = _artifact_sources(project_dir, artifacts)
+    _manifest, manifest_sha256 = _artifact_manifest(project_name, sources)
+    return manifest_sha256
+
+
 def _artifact_remote_check(
     root_rel: str,
     relative: str,
@@ -570,14 +608,28 @@ def _private_remote_directories(*paths: str) -> str:
 
 
 @contextmanager
-def _seed_cache_lock(cfg: HeadConfig, node: Node) -> Iterator[None]:
+def _seed_cache_lock(
+    cfg: HeadConfig,
+    node: Node,
+    *,
+    cancel_event: Event | None = None,
+) -> Iterator[None]:
     """Serialize writers to one node's shared uv/HF cache trees."""
     identity = hashlib.sha256(node.name.encode()).hexdigest()[:20]
     path = cfg.state_dir() / f"seed-cache-{identity}.lock"
-    with private_lock(path) as acquired:
-        if not acquired:
-            raise DispatchError("seed cache lock was not acquired")
-        yield
+    if cancel_event is None:
+        with private_lock(path) as acquired:
+            if not acquired:
+                raise DispatchError("seed cache lock was not acquired")
+            yield
+        return
+    while not cancel_event.is_set():
+        with private_lock(path, blocking=False) as acquired:
+            if acquired:
+                yield
+                return
+        cancel_event.wait(0.1)
+    raise InterruptedError("seed cancelled while waiting for the cache lock")
 
 
 @contextmanager
@@ -614,6 +666,7 @@ def sync_project(
     plan: bool = False,
     retries: int = 2,
     route: str = "auto",
+    bwlimit_kbps: int | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
     cancel_event: Event | None = None,
 ) -> dict[str, object]:
@@ -637,6 +690,7 @@ def sync_project(
             plan=plan,
             retries=retries,
             route=route,
+            bwlimit_kbps=bwlimit_kbps,
             on_retry=on_retry,
             cancel_event=cancel_event,
         )
@@ -652,6 +706,7 @@ def _sync_project_locked(
     plan: bool,
     retries: int,
     route: str = "auto",
+    bwlimit_kbps: int | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None,
     cancel_event: Event | None,
 ) -> dict[str, object]:
@@ -723,6 +778,7 @@ def _sync_project_locked(
     relay_route = None
     relay_error: str | None = None
     relayed_proc: subprocess.CompletedProcess[str] | None = None
+    effective_bwlimit = head_bwlimit_kbps(cfg, node.name, bwlimit_kbps)
     if not plan:
         relay_route = sync_relay.decide_sync_route(cfg, node.name, mode=route)
     if (
@@ -738,7 +794,11 @@ def _sync_project_locked(
                 gateway,
                 exclusive=True,
             ):
-                sync_relay.prepare_mirror(relay_route, project_name)
+                sync_relay.prepare_mirror(
+                    relay_route,
+                    project_name,
+                    cancel_event=cancel_event,
+                )
                 leg_a = rsync(
                     f"{project_dir}/",
                     rsync_destination(
@@ -752,6 +812,7 @@ def _sync_project_locked(
                     delete_excluded=True,
                     timeout=BULK_TRANSFER_TIMEOUT_S,
                     retries=retries,
+                    bwlimit_kbps=effective_bwlimit,
                     on_retry=on_retry,
                     stats=True,
                     checksum=True,
@@ -766,12 +827,16 @@ def _sync_project_locked(
                             fallback=f"rsync exited {leg_a.returncode}",
                         )
                     )
-            relayed_proc = sync_relay.push_mirror(
-                cfg,
-                relay_route,
-                project_name,
-                rel,
-            )
+                # Keep the shared mirror locked while the LAN reader consumes
+                # it. A second target must not start an rsync --delete into
+                # this tree between staging and replay.
+                relayed_proc = sync_relay.push_mirror(
+                    cfg,
+                    relay_route,
+                    project_name,
+                    rel,
+                    cancel_event=cancel_event,
+                )
         except sync_relay.RelayError as exc:
             relay_error = str(exc)
             log(
@@ -790,6 +855,7 @@ def _sync_project_locked(
             delete_excluded=True,
             timeout=BULK_TRANSFER_TIMEOUT_S,
             retries=retries,
+            bwlimit_kbps=effective_bwlimit,
             on_retry=on_retry,
             stats=True,
             checksum=True,
@@ -855,10 +921,22 @@ def sync_artifacts(
     plan: bool = False,
     retries: int = 2,
     route: str = "auto",
+    bwlimit_kbps: int | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
     cancel_event: Event | None = None,
+    expected_manifest_sha256: str | None = None,
 ) -> dict[str, object]:
-    """Sync explicit reusable inputs outside immutable job code snapshots."""
+    """Sync explicit reusable inputs outside immutable job code snapshots.
+
+    When ``expected_manifest_sha256`` is supplied, source drift is rejected
+    before any remote connection or mutation.  The expected identity should
+    be frozen into the durable submission intent first.
+    """
+    if (
+        expected_manifest_sha256 is not None
+        and re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha256) is None
+    ):
+        raise DispatchError("expected artifact manifest identity is invalid")
     sources = _artifact_sources(project_dir, artifacts)
     transient_files = _artifact_transient_files(sources)
     if transient_files:
@@ -874,6 +952,14 @@ def sync_artifacts(
             "transient files or select individual inputs if unintended"
         )
     manifest_bytes, manifest_sha256 = _artifact_manifest(project_name, sources)
+    if (
+        expected_manifest_sha256 is not None
+        and manifest_sha256 != expected_manifest_sha256
+    ):
+        raise DispatchError(
+            "artifact source changed after submission intent was prepared; "
+            "use a new request id for the new content"
+        )
     root_rel = artifact_root_rel(project_name, cfg, node)
     rows: list[dict[str, object]] = []
     total_bytes = 0
@@ -888,21 +974,9 @@ def sync_artifacts(
     # any relay failure keep the operator route.
     relay_route = None
     relay_error: str | None = None
+    effective_bwlimit = head_bwlimit_kbps(cfg, node.name, bwlimit_kbps)
     if not plan:
         relay_route = sync_relay.decide_sync_route(cfg, node.name, mode=route)
-        if relay_route.route == "gateway":
-            try:
-                sync_relay.prepare_artifact_mirror(
-                    relay_route,
-                    project_name,
-                    [relative for relative, *_rest in sources],
-                )
-            except sync_relay.RelayError as exc:
-                relay_error = str(exc)
-                log(
-                    f"gateway relay unavailable: {relay_error}; "
-                    "falling back to the direct route"
-                )
     relaying = (
         relay_route is not None
         and relay_route.route == "gateway"
@@ -910,12 +984,38 @@ def sync_artifacts(
     )
     relayed_any = False
 
-    with _sync_cache_lock(
-        cfg,
-        f"{project_name}\0artifacts",
-        node,
-        exclusive=not plan,
-    ):
+    with ExitStack() as sync_locks:
+        sync_locks.enter_context(
+            _sync_cache_lock(
+                cfg,
+                f"{project_name}\0artifacts",
+                node,
+                exclusive=not plan,
+            )
+        )
+        if relaying and relay_route is not None and relay_route.gateway is not None:
+            sync_locks.enter_context(
+                _sync_cache_lock(
+                    cfg,
+                    f"{project_name}\0gateway-artifacts",
+                    relay_route.gateway,
+                    exclusive=True,
+                )
+            )
+            try:
+                sync_relay.prepare_artifact_mirror(
+                    relay_route,
+                    project_name,
+                    [relative for relative, *_rest in sources],
+                    cancel_event=cancel_event,
+                )
+            except sync_relay.RelayError as exc:
+                relay_error = str(exc)
+                relaying = False
+                log(
+                    f"gateway relay unavailable: {relay_error}; "
+                    "falling back to the direct route"
+                )
         for index, (
             relative,
             source,
@@ -1000,6 +1100,7 @@ def sync_artifacts(
                         delete=is_dir,
                         timeout=BULK_TRANSFER_TIMEOUT_S,
                         retries=retries,
+                        bwlimit_kbps=effective_bwlimit,
                         on_retry=on_retry,
                         stats=True,
                         checksum=True,
@@ -1021,6 +1122,7 @@ def sync_artifacts(
                         relative,
                         target_rel if is_dir else parent_rel,
                         is_dir=is_dir,
+                        cancel_event=cancel_event,
                     )
                     relayed_any = True
                 except sync_relay.RelayError as exc:
@@ -1038,6 +1140,7 @@ def sync_artifacts(
                     delete=is_dir,
                     timeout=BULK_TRANSFER_TIMEOUT_S,
                     retries=retries,
+                    bwlimit_kbps=effective_bwlimit,
                     on_retry=on_retry,
                     stats=True,
                     checksum=True,
@@ -1153,6 +1256,7 @@ def sync_artifacts(
                     manifest_destination,
                     timeout=60,
                     retries=retries,
+                    bwlimit_kbps=effective_bwlimit,
                     on_retry=on_retry,
                     checksum=True,
                     cancel_event=cancel_event,
@@ -1254,6 +1358,67 @@ class RequestRejected(DispatchError):
     """A request reached a known rejection before any remote launch."""
 
 
+def _active_command_dispatch_protocol() -> str | None:
+    """Return the protocol advertised by the command an idle agent would run."""
+    # Lazy import avoids the module cycle: agent imports ``dispatch_queued``.
+    from . import agent as agent_mod
+
+    return agent_mod.active_command_dispatch_protocol(active_dt_command())
+
+
+def require_compatible_resident_agent(cfg: HeadConfig) -> None:
+    """Refuse a mixed-release scheduling authority before any mutation.
+
+    Immediate submission and the resident queue agent intentionally share one
+    durable dispatch protocol. An older alive agent cannot understand a new
+    compare-and-swap field and could launch the same queued row concurrently,
+    so missing, corrupt, or different runtime evidence fails closed.
+    """
+    # Lazy import avoids the module cycle: agent imports ``dispatch_queued``.
+    from . import agent as agent_mod
+
+    if agent_mod.alive_pid(cfg) is None:
+        observed = _active_command_dispatch_protocol()
+        if observed != DISPATCH_PROTOCOL_VERSION:
+            raise ConfigError(
+                "the active dt command does not advertise this CLI's dispatch "
+                "protocol; activate this DT build before submitting or starting "
+                "the queue agent"
+            )
+        return
+    try:
+        result = read_bounded(
+            agent_mod.runtime_command_path(cfg),
+            max_bytes=4096,
+        )
+        if result is None:
+            raise ValueError("runtime record is missing")
+        payload = json.loads(result[0].decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("runtime record is not an object")
+        observed = payload.get("dispatch_protocol")
+    except (
+        OSError,
+        PrivateStateError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
+        detail = str(exc) or type(exc).__name__
+        raise ConfigError(
+            "resident dt agent compatibility is unproven "
+            f"({detail}); activate this DT build and restart the agent before "
+            "submitting"
+        ) from exc
+    if observed != DISPATCH_PROTOCOL_VERSION:
+        label = observed if isinstance(observed, str) else "missing"
+        raise ConfigError(
+            "resident dt agent uses an incompatible dispatch protocol "
+            f"({label}); activate this DT build and restart the agent before "
+            "submitting"
+        )
+
+
 def reconcile_submission_request(
     cfg: HeadConfig,
     record: intent_mod.RequestRecord,
@@ -1279,7 +1444,11 @@ def reconcile_submission_request(
                 error_kind="launch_outcome_unknown",
                 error_message=existing.reason,
             )
-        elif existing.status == "failed":
+        elif (
+            existing.status == "failed"
+            and existing.started_at is None
+            and existing.pgid is None
+        ):
             updated = intent_mod.transition(
                 record,
                 "confirmed",
@@ -1293,7 +1462,11 @@ def reconcile_submission_request(
             # Still unresolved (or inside the lost recovery window): the
             # receipt keeps refusing duplicate submissions.
             return record, existing
-        if existing.status in {"killed", "failed", "skipped"}:
+        if (
+            existing.status in {"killed", "failed", "skipped"}
+            and existing.started_at is None
+            and existing.pgid is None
+        ):
             updated = intent_mod.transition(
                 record,
                 "confirmed",
@@ -1314,37 +1487,21 @@ def reconcile_submission_request(
 # Launcher-reported reasons that are about *this job* rather than about GPU
 # capacity. A queued job stuck on these must not block the jobs behind it
 # (strict FIFO only protects capacity waits from starvation).
-_JOB_SPECIFIC = ("path-missing", "disk-full", "node-unfit", "cache-missing")
-_TERMINAL_JOB_STATUSES = frozenset({"finished", "killed", "lost", "failed", "skipped"})
-# A job seen "lost" can still recover to running/finished within the shared
-# rescue window when a late exit marker appears. The constant lives in jobs.py
-# so the agent recheck, this settled gate, and the scheduler explanation can
-# never drift apart.
+_JOB_SPECIFIC = (
+    "path-missing",
+    "disk-full",
+    "node-unfit",
+    "cache-missing",
+    "resource-mismatch",
+)
+# Backward-compatible public name; the authoritative predicate and duration
+# live in jobs.py.
 LOST_RECOVERY_WINDOW_S = LOST_RECHECK_S
 
 
 def _dependency_settled(entry: JobEntry, now: float | None = None) -> bool:
-    """Whether a predecessor's terminal state is safe to act on irreversibly.
-
-    A ``lost`` predecessor inside its recovery window is not yet settled: it can
-    recover to a success. Acting on it early would permanently skip an
-    after_success/after_result dependent or release an after_complete dependent
-    against an outcome that then changes. Treat it as pending until the window
-    closes, matching the agent's own recheck window.
-    """
-    if entry.status not in _TERMINAL_JOB_STATUSES:
-        return False
-    if is_uncertain_launch(entry):
-        # A failed-but-unproven launch may still own live remote processes.
-        # Releasing an after_complete dependent or permanently skipping an
-        # after_success one before a verified `dt kill` resolves the outcome
-        # would violate fail-closed; treat it as pending until then.
-        return False
-    if entry.status == "lost" and entry.finished_at is not None:
-        elapsed = (time.time() if now is None else now) - entry.finished_at
-        if elapsed <= LOST_RECOVERY_WINDOW_S:
-            return False
-    return True
+    """Compatibility wrapper around the shared state-machine predicate."""
+    return dependency_settled(entry, now=now)
 
 
 def _job_succeeded(entry: JobEntry) -> bool:
@@ -1394,6 +1551,7 @@ class RunSpec:
     require_path: str | None = None
     require_disk_gib: int | None = None
     max_hours: float | None = None
+    min_vram_mib: int | None = None
     max_vram_mib: int | None = None
     max_job_memory_mib: int | None = None
     setup: str | None = None  # project post-sync hook, runs inside the job env
@@ -1402,6 +1560,8 @@ class RunSpec:
     env_mode: str = "sync"  # sync or reuse an explicitly inherited environment
     env_hash_override: str | None = None
     env_source_job: str | None = None
+    custom_env: dict[str, str] = field(default_factory=dict)
+    dispatch_token: str | None = None  # private queued-attempt cancellation nonce
     forked_from: str | None = None  # exact-snapshot lineage
     after_success: str | None = None  # queued dependency; predecessor must exit 0
     after_complete: str | None = None  # queued dependency; any terminal result
@@ -1426,8 +1586,17 @@ def _validate_run_spec(spec: RunSpec) -> None:
     """Enforce submission invariants before probing, snapshotting, or launching."""
     if not spec.cmd or not any(part.strip() for part in spec.cmd):
         raise ConfigError("command must not be empty")
+    try:
+        spec.custom_env = custom_env_mod.validate(spec.custom_env)
+    except custom_env_mod.CustomEnvironmentError as exc:
+        raise ConfigError(str(exc)) from exc
     if spec.gpus < 0:
         raise ConfigError("gpus must be non-negative")
+    if (
+        spec.dispatch_token is not None
+        and re.fullmatch(r"[0-9a-f]{32}", spec.dispatch_token) is None
+    ):
+        raise ConfigError("dispatch token is unsafe")
     if spec.gpu_isolation != "advisory":
         raise ConfigError(
             "gpu_isolation must be advisory; this DT build has no physical "
@@ -1443,6 +1612,15 @@ def _validate_run_spec(spec: RunSpec) -> None:
         not math.isfinite(spec.max_hours) or spec.max_hours <= 0
     ):
         raise ConfigError("max_hours must be a finite positive number")
+    if spec.min_vram_mib is not None:
+        if (
+            isinstance(spec.min_vram_mib, bool)
+            or not isinstance(spec.min_vram_mib, int)
+            or spec.min_vram_mib <= 0
+        ):
+            raise ConfigError("min_vram_mib must be a positive integer")
+        if spec.gpus == 0:
+            raise ConfigError("min_vram_mib requires at least one GPU")
     if spec.max_vram_mib is not None:
         if (
             isinstance(spec.max_vram_mib, bool)
@@ -1560,14 +1738,22 @@ def _validate_run_spec(spec: RunSpec) -> None:
             raise ConfigError("cache reuse requires safe fork provenance")
         if re.fullmatch(r"[A-Za-z0-9_-]+", spec.cache_source_job or "") is None:
             raise ConfigError("cache source job identity is unsafe")
-        source_dir = PurePosixPath(spec.cache_source_job_dir or "")
-        if (
-            source_dir.is_absolute()
-            or ".." in source_dir.parts
-            or not source_dir.parts
-            or re.fullmatch(r"[A-Za-z0-9._/-]+", source_dir.as_posix()) is None
-        ):
-            raise ConfigError("cache source job directory is unsafe")
+        source_value = spec.cache_source_job_dir or ""
+        if source_value.startswith(("~/", "/")):
+            try:
+                normalized_source_dir = normalize_node_root(source_value)
+            except ValueError as exc:
+                raise ConfigError("cache source job directory is unsafe") from exc
+        else:
+            source_dir = PurePosixPath(source_value)
+            if (
+                source_dir.is_absolute()
+                or ".." in source_dir.parts
+                or not source_dir.parts
+                or re.fullmatch(r"[A-Za-z0-9._/-]+", source_dir.as_posix()) is None
+            ):
+                raise ConfigError("cache source job directory is unsafe")
+            normalized_source_dir = source_dir.as_posix()
         relative = PurePosixPath(spec.cache_source_path or "")
         if (
             relative.is_absolute()
@@ -1608,7 +1794,7 @@ def _validate_run_spec(spec: RunSpec) -> None:
             spec.cache_mode = "shared"
         elif spec.cache_mode not in {"shared", "clone"}:
             raise ConfigError("cache mode must be shared or clone")
-        spec.cache_source_job_dir = source_dir.as_posix()
+        spec.cache_source_job_dir = normalized_source_dir
         spec.cache_source_path = relative.as_posix()
     elif spec.cache_mode is not None:
         raise ConfigError("cache mode requires a complete cache source contract")
@@ -1641,6 +1827,7 @@ def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
         require_path=entry.require_path,
         require_disk_gib=entry.require_disk_gib or None,
         max_hours=entry.max_hours,
+        min_vram_mib=entry.min_vram_mib,
         max_vram_mib=entry.max_vram_mib,
         max_job_memory_mib=entry.max_job_memory_mib,
         setup=entry.setup,
@@ -1648,7 +1835,11 @@ def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
             list(entry.setup_inputs) if entry.setup_inputs is not None else None
         ),
         extras=list(entry.extras) if entry.extras else None,
-        forked_from=entry.forked_from,
+        custom_env=dict(entry.custom_env),
+        # A rerun snapshots today's project code. Carrying exact-snapshot
+        # fork provenance would both lie about that source identity and keep
+        # the fresh run coupled to a source row that normal cleanup may remove.
+        forked_from=None,
         after_success=entry.after_success,
         after_complete=entry.after_complete,
         after_result=entry.after_result,
@@ -1719,6 +1910,7 @@ def fork_spec_from_entry(
         require_path=entry.require_path,
         require_disk_gib=entry.require_disk_gib or None,
         max_hours=entry.max_hours,
+        min_vram_mib=entry.min_vram_mib,
         max_vram_mib=entry.max_vram_mib,
         max_job_memory_mib=entry.max_job_memory_mib,
         setup=entry.setup,
@@ -1726,6 +1918,7 @@ def fork_spec_from_entry(
             list(entry.setup_inputs) if entry.setup_inputs is not None else None
         ),
         extras=list(entry.extras) if entry.extras else None,
+        custom_env=dict(entry.custom_env),
         artifact_manifest=artifact_manifest or entry.artifact_manifest,
         forked_from=entry.job_id,
         cache_source_job=entry.job_id if requested_cache else None,
@@ -1764,6 +1957,7 @@ def environment_reuse_spec_from_entry(
         raise ConfigError("environment source job has no exact snapshot identity")
     spec = fork_spec_from_entry(entry, name=name or f"{entry.name}-exec", cmd=cmd)
     spec.gpus = gpus
+    spec.min_vram_mib = None if gpus == 0 else spec.min_vram_mib
     spec.max_vram_mib = None if gpus == 0 else spec.max_vram_mib
     spec.env_mode = "reuse"
     spec.env_hash_override = entry.env_hash
@@ -1867,7 +2061,17 @@ def pin_is_busy(statuses: list[NodeStatus], spec: RunSpec) -> bool:
     st = next((s for s in statuses if s.node == spec.node), None)
     if st is None or st.error is not None:
         return False  # unknown state: let the launcher decide
-    return len(st.free_gpus) < spec.gpus
+    return len(eligible_free_gpus(st, spec)) < spec.gpus
+
+
+def eligible_free_gpus(status: NodeStatus, spec: RunSpec) -> list[Gpu]:
+    """Return free cards that satisfy the immutable GPU shape contract."""
+    if spec.gpus > 0 and status.gpu_inventory_error is not None:
+        return []
+    minimum = spec.min_vram_mib
+    if minimum is None:
+        return list(status.free_gpus)
+    return [gpu for gpu in status.free_gpus if gpu.mem_total_mib >= minimum]
 
 
 def disk_rejection_reason(status: NodeStatus, spec: RunSpec) -> str | None:
@@ -1895,11 +2099,51 @@ def probe_rejection_reason(status: NodeStatus, spec: RunSpec) -> str:
     return (
         status.error
         or disk_rejection_reason(status, spec)
-        or capacity_reason(status, spec.gpus)
+        or inventory_rejection_reason(status, spec)
+        or minimum_vram_rejection_reason(status, spec)
+        or capacity_reason(status, spec.gpus, spec.min_vram_mib)
     )
 
 
-def capacity_reason(status: NodeStatus, wanted: int) -> str:
+def inventory_rejection_reason(status: NodeStatus, spec: RunSpec) -> str | None:
+    """Return a stable blocker when waiting cannot satisfy the GPU shape.
+
+    An incomplete inventory is not proof of a mismatch, so it remains a
+    capacity wait and the next healthy probe can recover it.
+    """
+    total = len(status.gpus)
+    if status.gpu_inventory_error is not None or spec.gpus <= total:
+        return None
+    return f"resource-mismatch: requests {spec.gpus} GPUs but node exposes {total}"
+
+
+def minimum_vram_rejection_reason(
+    status: NodeStatus,
+    spec: RunSpec,
+) -> str | None:
+    """Prove a permanent per-card memory mismatch from complete inventory."""
+    minimum = spec.min_vram_mib
+    if (
+        minimum is None
+        or spec.gpus == 0
+        or status.error is not None
+        or status.gpu_inventory_error is not None
+    ):
+        return None
+    capable = sum(gpu.mem_total_mib >= minimum for gpu in status.gpus)
+    if capable >= spec.gpus:
+        return None
+    return (
+        f"resource-mismatch: requests {spec.gpus} GPUs with at least "
+        f"{minimum} MiB each but node exposes {capable}"
+    )
+
+
+def capacity_reason(
+    status: NodeStatus,
+    wanted: int,
+    min_vram_mib: int | None = None,
+) -> str:
     """Compact, actionable explanation for a capacity rejection.
 
     Keep the historical free/wanted prefix for callers that display or match
@@ -1907,8 +2151,15 @@ def capacity_reason(status: NodeStatus, wanted: int) -> str:
     card.  No second probe is needed, so this also describes the exact state
     that drove placement.
     """
-    base = f"{len(status.free_gpus)} free < {wanted} wanted"
+    fitting_free = (
+        status.free_gpus
+        if min_vram_mib is None
+        else [gpu for gpu in status.free_gpus if gpu.mem_total_mib >= min_vram_mib]
+    )
+    base = f"{len(fitting_free)} free < {wanted} wanted"
     reasons: list[str] = []
+    if min_vram_mib is not None:
+        reasons.append(f"minimum: {min_vram_mib} MiB/GPU")
     if status.gpu_inventory_error:
         reasons.append(
             "inventory: "
@@ -1940,7 +2191,31 @@ def capacity_reason(status: NodeStatus, wanted: int) -> str:
         )
     if details:
         reasons.append(f"busy: {', '.join(details)}")
+    if min_vram_mib is not None:
+        undersized = [
+            f"gpu{gpu.index}={gpu.mem_total_mib}MiB"
+            for gpu in status.gpus
+            if gpu.mem_total_mib < min_vram_mib
+        ]
+        if undersized:
+            reasons.append(f"undersized: {', '.join(undersized)}")
     return "; ".join([base, *reasons])
+
+
+def drained_probe_reasons(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    probe_reasons: dict[str, str],
+) -> None:
+    """Overwrite capacity reasons with the drain verdict for drained nodes.
+
+    A drained node usually probes as free, so its capacity reason would
+    claim availability that placement will never use; the drain reason is
+    the truthful one for queues, --no-queue failures, and free --explain.
+    """
+    for node in cfg.nodes:
+        if node.drained and (spec.node is None or spec.node == node.name):
+            probe_reasons[node.name] = "drained: maintenance (nodes[].drained)"
 
 
 def pick_candidates(
@@ -1954,6 +2229,10 @@ def pick_candidates(
             raise ConfigError(
                 f"unknown node {spec.node!r}; configured: {list(by_name)}"
             )
+        # Drain wins over an explicit pin: the whole point of draining is
+        # that no new work starts, including deliberately targeted work.
+        if by_name[spec.node].drained:
+            return []
         status = next((item for item in statuses if item.node == spec.node), None)
         if status is not None and disk_rejection_reason(status, spec) is not None:
             return []
@@ -1964,15 +2243,22 @@ def pick_candidates(
             for s in statuses
             if s.error is None and disk_rejection_reason(s, spec) is None
         ),
-        key=lambda s: len(s.free_gpus),
+        key=lambda s: (len(eligible_free_gpus(s, spec)), len(s.free_gpus)),
         reverse=True,
     )
     if spec.gpus == 0:
-        return [by_name[s.node] for s in ranked if s.node in by_name]
+        return [
+            by_name[s.node]
+            for s in ranked
+            if s.node in by_name and not by_name[s.node].drained
+        ]
     return [
         by_name[s.node]
         for s in ranked
-        if len(s.free_gpus) - reserve >= spec.gpus and s.node in by_name
+        if len(eligible_free_gpus(s, spec)) >= spec.gpus
+        and len(s.free_gpus) - spec.gpus >= reserve
+        and s.node in by_name
+        and not by_name[s.node].drained
     ]
 
 
@@ -2013,6 +2299,40 @@ def _validate_stored_snapshot(cfg: HeadConfig, digest: str) -> StoredSnapshot:
             f"exact snapshot store is corrupt: expected {digest}, observed {observed}"
         )
     return StoredSnapshot(digest, code)
+
+
+def _publish_durable_object_directory(
+    temporary: Path,
+    final: Path,
+    *,
+    label: str,
+) -> None:
+    """Publish a fully durable directory, replacing one proven-bad object.
+
+    Tree contents are synced before rename, closing the crash window where a
+    digest name was visible but its files were not durable. If an older build
+    left a corrupt object, quarantine it and install the verified replacement;
+    a failed replacement restores the prior path when possible.
+    """
+    parent = final.parent
+    quarantine: Path | None = None
+    try:
+        fsync_tree(temporary)
+        if final.exists() or final.is_symlink():
+            quarantine = parent / f".corrupt-{final.name}-{uuid.uuid4().hex}"
+            os.replace(final, quarantine)
+        try:
+            os.replace(temporary, final)
+        except OSError:
+            if quarantine is not None and not final.exists() and not final.is_symlink():
+                os.replace(quarantine, final)
+                fsync_dir(parent)
+            raise
+        fsync_dir(parent)
+    except OSError as exc:
+        raise DispatchError(f"{label} cannot be published durably: {exc}") from exc
+    if quarantine is not None:
+        shutil.rmtree(quarantine, ignore_errors=True)
 
 
 def _repair_queued_snapshot(
@@ -2106,14 +2426,18 @@ def _commit_snapshot_dir(
     copy is discarded.
     """
     final_root = cfg.snapshots_dir() / digest
-    final_code = final_root / "code"
-    if final_root.exists():
-        stored = _validate_stored_snapshot(cfg, digest)
-        # A concurrent/new submission may be using this store before its
-        # registry entry exists.  Refresh the root timestamp so age-based
-        # cleanup cannot collect that in-flight source.
-        os.utime(final_root)
-    else:
+    replace_existing = False
+    if final_root.exists() or final_root.is_symlink():
+        try:
+            stored = _validate_stored_snapshot(cfg, digest)
+        except DispatchError:
+            replace_existing = True
+        else:
+            # A concurrent/new submission may be using this store before its
+            # registry entry exists. Refresh the root timestamp so age-based
+            # cleanup cannot collect that in-flight source.
+            os.utime(final_root)
+    if not final_root.exists() or final_root.is_symlink() or replace_existing:
         (temp_root / "meta.json").write_text(
             json.dumps(
                 {
@@ -2122,16 +2446,15 @@ def _commit_snapshot_dir(
                     "created_at": time.time(),
                 },
                 indent=1,
-            )
+            ),
+            encoding="utf-8",
         )
-        os.replace(temp_root, final_root)
-        # Make the "immutable" snapshot durable before any job record can
-        # reference it: sync the published tree contents and the rename itself
-        # so a crash cannot leave a registry row pointing at a missing or
-        # partially written source.
-        fsync_tree(final_root)
-        fsync_dir(cfg.snapshots_dir())
-        stored = StoredSnapshot(digest, final_code)
+        _publish_durable_object_directory(
+            temp_root,
+            final_root,
+            label=f"exact snapshot {digest}",
+        )
+        stored = _validate_stored_snapshot(cfg, digest)
 
     state = _load_snapshot_store_state(cfg)
     state[project_name] = digest
@@ -2191,19 +2514,29 @@ def capture_snapshot(
             if baseline_digest and _snapshot_path(cfg, baseline_digest).is_dir()
             else None
         )
+        baseline_stored: StoredSnapshot | None = None
+        if baseline is not None and baseline_digest is not None:
+            try:
+                baseline_stored = _validate_stored_snapshot(cfg, baseline_digest)
+            except DispatchError:
+                # A historical rename-before-fsync crash can leave the digest
+                # path present but invalid. Rebuild from the authoritative
+                # project tree instead of permanently poisoning that digest.
+                log(f"snapshot baseline {baseline_digest[:12]} is invalid; rebuilding")
+                baseline = None
         if (
             baseline is not None
             and baseline_digest is not None
+            and baseline_stored is not None
             and _source_matches_baseline(cfg, project_dir, baseline)
         ):
-            stored = _validate_stored_snapshot(cfg, baseline_digest)
             # Same in-flight protection and bookkeeping as a rebuilt capture
             # that resolves to an already-archived digest.
-            os.utime(stored.code_dir.parent)
+            os.utime(baseline_stored.code_dir.parent)
             state[project_name] = baseline_digest
             _save_snapshot_store_state(cfg, state)
             log(f"source unchanged; reusing verified snapshot {baseline_digest[:12]}")
-            return stored
+            return baseline_stored
         temp_root = Path(tempfile.mkdtemp(prefix=".capture-", dir=stores))
         code = temp_root / "code"
         code.mkdir()
@@ -2226,7 +2559,10 @@ def capture_snapshot(
                     f"head snapshot capture failed: {proc.stderr.strip()}"
                 )
             _warn_snapshot_size(cfg, proc.stdout, log)
-            digest = tree_sha256(code)
+            try:
+                digest = tree_sha256(code)
+            except (OSError, ValueError) as exc:
+                raise DispatchError(f"head snapshot cannot be hashed: {exc}") from exc
             stored = _commit_snapshot_dir(cfg, project_name, temp_root, digest)
             return stored
         finally:
@@ -2509,11 +2845,13 @@ def _remember_snapshot(
 def _runtime_payload_files() -> dict[str, str]:
     """Static node-side runtime frozen independently from project code."""
     files = {
-        name: (PAYLOAD_DIR / name).read_text()
+        name: (PAYLOAD_DIR / name).read_text(encoding="utf-8")
         for name in RUNTIME_PAYLOAD_NAMES
         if name != "snapshot_hash.py"
     }
-    files["snapshot_hash.py"] = Path(snapshot_hash_mod.__file__).read_text()
+    files["snapshot_hash.py"] = Path(snapshot_hash_mod.__file__).read_text(
+        encoding="utf-8"
+    )
     return files
 
 
@@ -2558,8 +2896,14 @@ def _stored_payload_dir(
     with private_lock(lock_path) as acquired:
         if not acquired:
             raise DispatchError("runtime payload store lock was not acquired")
-        if root.exists():
-            return validate()
+        replace_existing = False
+        if root.exists() or root.is_symlink():
+            try:
+                return validate()
+            except DispatchError:
+                if runtime_files is None:
+                    raise
+                replace_existing = True
         if runtime_files is None:
             raise DispatchError(
                 f"runtime payload {digest} is not archived on this head"
@@ -2573,13 +2917,15 @@ def _stored_payload_dir(
         temp = Path(tempfile.mkdtemp(prefix=".payload-", dir=cfg.payloads_dir()))
         try:
             _write_support_files(temp, runtime_files)
-            os.replace(temp, root)
-            # Make the published payload durable before any job record can
-            # reference it, matching the snapshot store: sync the tree contents
-            # and the rename so a crash cannot leave the dequeue path unable to
-            # find the payload and terminate every queued job that needs it.
-            fsync_tree(root)
-            fsync_dir(cfg.payloads_dir())
+            _publish_durable_object_directory(
+                temp,
+                root,
+                label=(
+                    f"runtime payload {digest} replacement"
+                    if replace_existing
+                    else f"runtime payload {digest}"
+                ),
+            )
         finally:
             shutil.rmtree(temp, ignore_errors=True)
         return validate()
@@ -2591,6 +2937,7 @@ def _support_files(
     setup: str | None = None,
     env_key: str | None = None,
     *,
+    custom_env: Mapping[str, str] | None = None,
     runtime_files: Mapping[str, str] | None = None,
     layout: str | None = None,
 ) -> dict[str, str]:
@@ -2607,6 +2954,10 @@ def _support_files(
         files[f"{control_prefix}setup.sh"] = setup + "\n"
     if env_key:
         files[f"{control_prefix}env-key"] = env_key + "\n"
+    if custom_env:
+        files[f"{control_prefix}custom-env"] = custom_env_mod.encode_nul_pairs(
+            custom_env
+        )
     meta = dict(meta)
     diff = meta.pop("_diff", None)
     if meta.get("git_dirty") and isinstance(diff, str) and diff:
@@ -2676,6 +3027,297 @@ def environment_key(
     return hashlib.sha256(canonical).hexdigest()[:12]
 
 
+def _preview_snapshot_bytes(cfg: HeadConfig, project_dir: Path) -> int:
+    """Return the exact filtered source bytes without publishing a snapshot."""
+    with tempfile.TemporaryDirectory(prefix="dt-run-plan-") as empty:
+        proc = rsync(
+            f"{project_dir}/",
+            f"{empty}/",
+            excludes=_excludes(cfg),
+            timeout=BULK_TRANSFER_TIMEOUT_S,
+            stats=True,
+            checksum=True,
+            dry_run=True,
+        )
+    if proc.returncode != 0:
+        detail = diagnostic_excerpt(
+            proc.stderr,
+            proc.stdout,
+            fallback=f"rsync exited {proc.returncode}",
+        )
+        raise DispatchError(f"snapshot preview failed: {detail}")
+    source_bytes = transferred_bytes(proc.stdout)
+    if source_bytes is None:
+        raise DispatchError("snapshot preview returned no exact byte count")
+    return source_bytes
+
+
+def _preview_environment(
+    cfg: HeadConfig,
+    project_dir: Path,
+    spec: RunSpec,
+    node: Node | None,
+) -> dict[str, object]:
+    """Probe one selected node's environment cache without creating it."""
+    identity = spec.env_hash_override
+    if identity is None:
+        if not (project_dir / "uv.lock").is_file():
+            return {
+                "identity": None,
+                "node": node.name if node is not None else None,
+                "status": "not_applicable",
+                "cache_hit": None,
+                "reason": None,
+            }
+        if spec.setup:
+            # An arbitrary setup hook binds the environment to the exact
+            # filtered snapshot. Computing that digest would require copying
+            # the source tree, defeating a fast preview. State the uncertainty
+            # instead of reporting a guessed cache result.
+            return {
+                "identity": None,
+                "node": node.name if node is not None else None,
+                "status": "unknown",
+                "cache_hit": None,
+                "reason": "setup environment identity requires snapshot creation",
+            }
+        identity = environment_key(
+            project_dir,
+            spec.extras,
+            None,
+            "",
+            spec.setup_inputs,
+        )
+    if identity is None:
+        return {
+            "identity": None,
+            "node": node.name if node is not None else None,
+            "status": "not_applicable",
+            "cache_hit": None,
+            "reason": None,
+        }
+    if node is None:
+        return {
+            "identity": identity,
+            "node": None,
+            "status": "unknown",
+            "cache_hit": None,
+            "reason": "placement is unresolved",
+        }
+    env_dir = node_path(cfg.envs_for(node), identity)
+    expression = node_path_expression(env_dir)
+    try:
+        probe = run_on(
+            node.name,
+            node.local,
+            f"test -d {expression} && test ! -L {expression}",
+            timeout=min(node.probe_timeout_s, 15),
+            retry_stale_mux=True,
+        )
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        return {
+            "identity": identity,
+            "node": node.name,
+            "status": "unreachable",
+            "cache_hit": None,
+            "reason": diagnostic_excerpt(str(exc), fallback=type(exc).__name__),
+        }
+    if probe.returncode == 0:
+        status = "hit"
+        cache_hit: bool | None = True
+        reason = None
+    elif probe.returncode == 1:
+        status = "miss"
+        cache_hit = False
+        reason = None
+    else:
+        status = "unknown"
+        cache_hit = None
+        reason = f"cache probe exited {probe.returncode}"
+    return {
+        "identity": identity,
+        "node": node.name,
+        "status": status,
+        "cache_hit": cache_hit,
+        "reason": reason,
+    }
+
+
+def preview_submission(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    cwd: Path,
+    *,
+    no_queue: bool = False,
+) -> dict[str, object]:
+    """Describe a run using live scheduler state without submitting it.
+
+    The preview may read the project, registry, and worker telemetry. It never
+    creates a job id, durable request receipt, snapshot, queue entry, remote
+    directory, lease, or environment.
+    """
+    project_name, project = resolve_project(cfg, spec.project, cwd)
+    project_dir = revalidate_project_root(
+        project.path,
+        f"projects.{project_name}.path",
+    )
+    spec.project = project_name
+    if spec.setup is None:
+        spec.setup = project.setup
+    if spec.setup_inputs is None:
+        spec.setup_inputs = (
+            list(project.setup_inputs) if project.setup_inputs is not None else None
+        )
+    if spec.extras is None:
+        spec.extras = list(project.extras)
+    floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    spec.require_disk_gib = floor or None
+    spec.name = sanitize_name(spec.name)
+    _validate_run_spec(spec)
+    _require_submission_references(cfg, spec)
+
+    queue_depth = len(queued_entries(cfg))
+    outcome: str | None = None
+    outcome_reason: str | None = None
+    reasons: dict[str, str] = {}
+    candidates: list[Node] = []
+    statuses: list[NodeStatus] = []
+
+    if spec.after_success:
+        predecessor = load(cfg, spec.after_success)
+        if predecessor is not None and _dependency_settled(predecessor):
+            if not _job_succeeded(predecessor):
+                result = effective_result_state(predecessor) or predecessor.status
+                outcome = "skip"
+                outcome_reason = (
+                    f"dependency {spec.after_success} completed as {result}; "
+                    "required success"
+                )
+        else:
+            outcome = "queue"
+            outcome_reason = f"waiting: dependency {spec.after_success}"
+    elif spec.after_complete:
+        predecessor = load(cfg, spec.after_complete)
+        if predecessor is None or not _dependency_settled(predecessor):
+            outcome = "queue"
+            outcome_reason = f"waiting: completion dependency {spec.after_complete}"
+    elif spec.after_result:
+        predecessor = load(cfg, spec.after_result)
+        if predecessor is None or not _dependency_settled(predecessor):
+            expected = ",".join(spec.after_result_states)
+            outcome = "queue"
+            outcome_reason = (
+                f"waiting: result dependency {spec.after_result} in [{expected}]"
+            )
+        else:
+            result = effective_result_state(predecessor) or predecessor.status
+            if result not in spec.after_result_states:
+                expected = ",".join(spec.after_result_states)
+                outcome = "skip"
+                outcome_reason = (
+                    f"dependency {spec.after_result} completed as {result}; "
+                    f"expected one of {expected}"
+                )
+
+    cap = cfg.queue.max_my_jobs
+    if outcome is None and cap is not None and running_count(cfg) >= cap:
+        outcome = "reject" if no_queue else "queue"
+        outcome_reason = f"waiting: max_my_jobs={cap} reached"
+
+    if outcome is None:
+        if spec.node:
+            by_name = {node.name: node for node in cfg.nodes}
+            pinned = by_name.get(spec.node)
+            if pinned is None:
+                raise ConfigError(
+                    f"unknown node {spec.node!r}; configured: {list(by_name)}"
+                )
+            status = (
+                probe_node(
+                    pinned,
+                    cfg.mem_threshold_mib,
+                    lease_root=cfg.lease_root_for(pinned),
+                )
+                if cfg.layout == ROLE_LAYOUT
+                else probe_node(pinned, cfg.mem_threshold_mib)
+            )
+            statuses = [status]
+        else:
+            statuses = probe_center(cfg, use_cache=False)
+        reasons = {
+            status.node: probe_rejection_reason(status, spec) for status in statuses
+        }
+        drained_probe_reasons(cfg, spec, reasons)
+        candidates = pick_candidates(
+            statuses,
+            cfg.nodes,
+            spec,
+            _reserve_for(cfg, spec),
+        )
+        if pin_is_busy(statuses, spec):
+            candidates = []
+        candidate_names = {candidate.name for candidate in candidates}
+        for name in candidate_names:
+            reasons[name] = "available"
+        if candidates:
+            outcome = "start_now"
+        else:
+            outcome = "reject" if no_queue else "queue"
+            if statuses and all(status.unreachable for status in statuses):
+                outcome_reason = waiting_unreachable_reason(reasons)
+            elif blocked_not_busy(reasons):
+                detail = "; ".join(
+                    f"{node}: {reason}" for node, reason in reasons.items()
+                )
+                outcome_reason = f"blocked: {detail}"
+            else:
+                outcome_reason = waiting_capacity_reason(reasons)
+
+    selected = candidates[0] if outcome == "start_now" and candidates else None
+    selected_status = next(
+        (
+            status
+            for status in statuses
+            if selected is not None and status.node == selected.name
+        ),
+        None,
+    )
+    selected_gpus = (
+        [gpu.index for gpu in eligible_free_gpus(selected_status, spec)[: spec.gpus]]
+        if selected_status is not None and spec.gpus > 0
+        else []
+    )
+    snapshot_bytes = _preview_snapshot_bytes(cfg, project_dir)
+    environment = _preview_environment(cfg, project_dir, spec, selected)
+    return {
+        "schema_version": "dt_run_plan_v1",
+        "read_only": True,
+        "submission": {
+            "name": spec.name,
+            "project": project_name,
+            "gpus": spec.gpus,
+            "min_vram_mib": spec.min_vram_mib,
+            "pinned_node": spec.node,
+            "request_id": spec.request_id,
+        },
+        "placement": {
+            "outcome": outcome,
+            "selected_node": selected.name if selected is not None else None,
+            "selected_gpus": selected_gpus,
+            "candidates": [candidate.name for candidate in candidates],
+            "reasons": reasons,
+            "queue_depth": queue_depth,
+            "queue_position": queue_depth + 1 if outcome == "queue" else None,
+            "reason": outcome_reason,
+        },
+        "snapshot": {
+            "source_bytes": snapshot_bytes,
+            "persistent_snapshot_created": False,
+        },
+        "environment": environment,
+    }
+
+
 def _setup_input_identities(
     code_dir: Path,
     inputs: list[str],
@@ -2732,7 +3374,9 @@ def _job_dst(node: Node, job_dir: str) -> str:
 
 def _remote_tree_sha256(node: Node, code_dir: str) -> str:
     hash_script = Path(snapshot_hash_mod.__file__).read_text()
-    hash_cmd = f"python3 -c {shlex.quote(hash_script)} {node_path_expression(code_dir)}"
+    hash_cmd = (
+        f"python3 -I -c {shlex.quote(hash_script)} {node_path_expression(code_dir)}"
+    )
     hash_proc = run_on(node.name, node.local, hash_cmd, timeout=120)
     lines = (hash_proc.stdout or "").strip().splitlines()
     digest = lines[-1] if lines else ""
@@ -2889,6 +3533,7 @@ def snapshot(
                 meta,
                 spec.setup,
                 env_key,
+                custom_env=spec.custom_env,
                 runtime_files=runtime_files,
                 layout=cfg.layout,
             ),
@@ -3018,6 +3663,7 @@ def _stage(
         meta,
         spec.setup,
         env_key,
+        custom_env=spec.custom_env,
         runtime_files=({} if cfg.layout == ROLE_LAYOUT else runtime_files),
         layout=cfg.layout,
     )
@@ -3082,6 +3728,10 @@ def launch(
         "DT_NODE": node.name,
         "DT_ENV_MODE": spec.env_mode,
     }
+    if spec.dispatch_token is not None:
+        envs["DT_LAUNCH_TOKEN"] = spec.dispatch_token
+    if spec.custom_env:
+        envs["DT_CUSTOM_ENV_PATH"] = f"{control_dir}/custom-env"
     if spec.project:
         envs["DT_ARTIFACT_ROOT"] = artifact_root_rel(spec.project, cfg, node)
     if spec.artifact_manifest:
@@ -3122,6 +3772,8 @@ def launch(
         )
     if spec.max_hours:
         envs["DT_MAX_HOURS"] = str(spec.max_hours)
+    if spec.min_vram_mib:
+        envs["DT_MIN_VRAM_MIB"] = str(spec.min_vram_mib)
     if spec.max_vram_mib:
         envs["DT_MAX_VRAM_MIB"] = str(spec.max_vram_mib)
     if spec.max_job_memory_mib:
@@ -3131,7 +3783,7 @@ def launch(
     if spec.payload_sha256:
         verifier = Path(payload_hash_mod.__file__).read_text(encoding="utf-8")
         verify_cmd = (
-            f"python3 -c {shlex.quote(verifier)} "
+            f"python3 -I -c {shlex.quote(verifier)} "
             f"{node_path_expression(payload_dir)} "
             f"{shlex.quote(spec.payload_sha256)}"
         )
@@ -3149,6 +3801,7 @@ def launch(
             'exit "$DT_PAYLOAD_ATTEST_RC"; fi; '
         )
     cmd = (
+        f"cd {node_path_expression(job_dir)} && "
         f"{attestation}exec env {env_str} bash "
         f"{node_path_expression(f'{payload_dir}/launcher.sh')}"
     )
@@ -3160,10 +3813,15 @@ def launch(
         try:
             parsed: object = json.loads(last)
         except json.JSONDecodeError:
-            return 14, f"unparseable launcher output: {last!r}"
+            # Exit zero means the launcher passed preflight and may already
+            # have started the tmux session. Preserve that outcome so
+            # _try_nodes performs verified orphan cancellation; rewriting it
+            # to the fatal internal code would skip cancellation and lose the
+            # live process from DT's registry.
+            return 0, f"unparseable launcher output: {last!r}"
         if isinstance(parsed, dict):
             return 0, cast(dict[str, object], parsed)
-        return 14, f"unparseable launcher output: {last!r}"
+        return 0, f"unparseable launcher output: {last!r}"
     detail = (proc.stderr or "").strip().splitlines()
     return proc.returncode, (detail[-1] if detail else f"exit {proc.returncode}")
 
@@ -3183,6 +3841,7 @@ def _cancel_orphan(
     session: str,
     *,
     layout: str | None = None,
+    dispatch_token: str | None = None,
 ) -> str | None:
     """The launch ssh timed out or dropped: we cannot know how far the
     launcher got, and it may still start the tmux session later (it outlives
@@ -3195,6 +3854,7 @@ def _cancel_orphan(
             "TERM",
             session=session,
             cancel_sentinel=True,
+            cancel_token=dispatch_token,
             layout=layout,
         )
     except ValueError as exc:
@@ -3217,6 +3877,215 @@ def _cancel_orphan(
         # result.  Failing over would run the same work twice.
         return "launch already ran to completion on the node"
     return detail or "orphan cancellation could not be verified"
+
+
+@dataclass(frozen=True)
+class _RecoveredLaunch:
+    state: str
+    boot_id: str | None = None
+    pgid: int | None = None
+    gpus: tuple[int, ...] = ()
+    started_at: float | None = None
+    finished_at: float | None = None
+    exit_code: int | None = None
+    result_state: str | None = None
+    env_hash: str | None = None
+
+
+def _parse_launch_recovery(stdout: str) -> _RecoveredLaunch:
+    """Parse the anchored, bounded worker recovery protocol."""
+    lines = (stdout or "").splitlines()
+    try:
+        marker = lines.index(LAUNCH_RECOVERY_MARK)
+    except ValueError as exc:
+        raise DispatchError(
+            "queued launch recovery returned no protocol marker"
+        ) from exc
+    boot_id = lines[marker - 1] if marker > 0 else "UNKNOWN"
+    state = lines[marker + 1] if len(lines) > marker + 1 else ""
+    fields = lines[marker + 2 :]
+    if boot_id == "UNKNOWN":
+        boot_value = None
+    elif re.fullmatch(r"[A-Za-z0-9-]{1,64}", boot_id):
+        boot_value = boot_id
+    else:
+        raise DispatchError("queued launch recovery returned an invalid boot identity")
+    if state in {"NONE", "UNPROVEN"}:
+        return _RecoveredLaunch(state=state, boot_id=boot_value)
+
+    def field(index: int) -> str:
+        return fields[index] if index < len(fields) else "UNKNOWN"
+
+    def integer(value: str, *, required: bool, label: str) -> int | None:
+        if value == "UNKNOWN" and not required:
+            return None
+        if re.fullmatch(r"[0-9]+", value) is None:
+            raise DispatchError(f"queued launch recovery returned an invalid {label}")
+        parsed = int(value)
+        if parsed <= 0:
+            raise DispatchError(f"queued launch recovery returned an invalid {label}")
+        return parsed
+
+    def timestamp(value: str, *, label: str) -> float:
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise DispatchError(
+                f"queued launch recovery returned an invalid {label}"
+            ) from exc
+        if not math.isfinite(parsed) or parsed <= 0:
+            raise DispatchError(f"queued launch recovery returned an invalid {label}")
+        return parsed
+
+    def gpu_list(value: str) -> tuple[int, ...]:
+        if value in {"", "UNKNOWN"}:
+            return ()
+        if re.fullmatch(r"[0-9]+(?:,[0-9]+)*", value) is None:
+            raise DispatchError("queued launch recovery returned invalid GPUs")
+        values = tuple(int(item) for item in value.split(","))
+        if len(values) > 1024 or len(set(values)) != len(values):
+            raise DispatchError("queued launch recovery returned invalid GPUs")
+        return values
+
+    def environment(value: str) -> str | None:
+        if value in {"", "UNKNOWN"}:
+            return None
+        if re.fullmatch(r"[0-9a-f]{12}", value) is None:
+            raise DispatchError(
+                "queued launch recovery returned an invalid environment identity"
+            )
+        return value
+
+    if state == "RUNNING":
+        pgid = integer(field(0), required=True, label="process group")
+        return _RecoveredLaunch(
+            state=state,
+            boot_id=boot_value,
+            pgid=pgid,
+            gpus=gpu_list(field(1)),
+            started_at=timestamp(field(2), label="start time"),
+            env_hash=environment(field(3)),
+        )
+    if state == "FINISHED":
+        raw_exit = field(0)
+        if re.fullmatch(r"[0-9]{1,3}", raw_exit) is None:
+            raise DispatchError("queued launch recovery returned an invalid exit code")
+        exit_code = int(raw_exit)
+        if exit_code > 255:
+            raise DispatchError("queued launch recovery returned an invalid exit code")
+        result_state = field(5)
+        if result_state not in RESULT_STATES:
+            result_state = "success" if exit_code == 0 else "execution_failure"
+        return _RecoveredLaunch(
+            state=state,
+            boot_id=boot_value,
+            exit_code=exit_code,
+            pgid=integer(field(1), required=False, label="process group"),
+            gpus=gpu_list(field(2)),
+            started_at=timestamp(field(3), label="start time"),
+            finished_at=timestamp(field(4), label="finish time"),
+            result_state=result_state,
+            env_hash=environment(field(6)),
+        )
+    raise DispatchError(f"queued launch recovery returned unknown state {state!r}")
+
+
+def _probe_interrupted_queued_launch(
+    entry: JobEntry,
+    node: Node,
+    node_job_dir: str,
+) -> _RecoveredLaunch:
+    try:
+        command = launch_recovery_probe(
+            node_job_dir,
+            entry.session,
+            layout=entry.storage_layout,
+        )
+        proc = run_on(node.name, node.local, command, timeout=20)
+    except (RemoteError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        detail = " ".join(str(exc).split()) or type(exc).__name__
+        raise DispatchError(f"queued launch recovery probe failed: {detail}") from exc
+    if proc.returncode != 0:
+        detail = diagnostic_excerpt(
+            proc.stderr,
+            proc.stdout,
+            fallback=f"exit {proc.returncode}",
+        )
+        raise DispatchError(f"queued launch recovery probe failed: {detail}")
+    return _parse_launch_recovery(proc.stdout)
+
+
+def _adopt_interrupted_queued_launch(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    node: Node,
+    node_job_dir: str,
+) -> tuple[JobEntry | None, str | None]:
+    """Adopt a proven launch, or prove an incomplete attempt absent.
+
+    ``(None, None)`` is the only safe-to-retry result. A diagnostic in the
+    second element is an unproven state that must remain queued and must not
+    be synchronized over.
+    """
+    try:
+        recovered = _probe_interrupted_queued_launch(entry, node, node_job_dir)
+    except DispatchError as exc:
+        return None, str(exc)
+    if recovered.state == "NONE":
+        cancel_error = _cancel_orphan(
+            node,
+            node_job_dir,
+            entry.session,
+            layout=entry.storage_layout,
+            dispatch_token=entry.dispatch_token,
+        )
+        if cancel_error is None:
+            return None, None
+        if cancel_error == "launch already ran to completion on the node":
+            try:
+                recovered = _probe_interrupted_queued_launch(
+                    entry,
+                    node,
+                    node_job_dir,
+                )
+            except DispatchError as exc:
+                return None, str(exc)
+        else:
+            return None, cancel_error
+    if recovered.state == "UNPROVEN":
+        return None, "remote launch has state but its ownership is unproven"
+    if recovered.state not in {"RUNNING", "FINISHED"}:
+        return None, "remote launch recovery did not reach a stable state"
+    if len(recovered.gpus) != entry.gpus_requested:
+        return None, (
+            "remote launch GPU assignment does not match the queued request: "
+            f"expected {entry.gpus_requested}, observed {len(recovered.gpus)}"
+        )
+    now = time.time()
+    finished = recovered.state == "FINISHED"
+    adopted = replace(
+        entry,
+        node=node.name,
+        node_local=node.local,
+        job_dir=node_job_dir,
+        gpus=list(recovered.gpus),
+        pgid=recovered.pgid,
+        status="finished" if finished else "running",
+        exit_code=recovered.exit_code if finished else None,
+        reason=None,
+        dispatch_node=None,
+        dispatch_token=None,
+        env_hash=recovered.env_hash or entry.env_hash,
+        boot_id=recovered.boot_id,
+        started_at=recovered.started_at,
+        finished_at=recovered.finished_at if finished else None,
+        result_state=recovered.result_state if finished else None,
+        storage_layout=entry.storage_layout,
+        worker_root=cfg.worker_root_for(node),
+        job_relpath=f"jobs/{entry.job_id}",
+        recovered_at=now,
+    )
+    return adopted, None
 
 
 def _cancel_placed_launch(entry: JobEntry) -> str | None:
@@ -3275,6 +4144,19 @@ def _restore_running_after_cancel_failure(
         return current
 
 
+def _restore_finished_after_raced_dequeue(
+    cfg: HeadConfig,
+    placed: JobEntry,
+) -> JobEntry:
+    """Preserve a proven natural completion that beat a queued dequeue."""
+    with job_lock(cfg, placed.job_id):
+        current = load(cfg, placed.job_id)
+        if current is None or current.status == "killed":
+            save(cfg, placed)
+            return placed
+        return current
+
+
 def _record_cancelled_inflight_launch(
     cfg: HeadConfig,
     killed: JobEntry,
@@ -3321,6 +4203,7 @@ def _try_nodes(
     *,
     created_at: float | None = None,
     payload_sha256: str | None = None,
+    before_attempt: Callable[[Node, str], bool] | None = None,
 ) -> tuple[JobEntry | None, dict[str, str], bool, set[str]]:
     """Shared candidate loop. Returns (entry, reasons, fatal, failure_kinds).
 
@@ -3336,11 +4219,25 @@ def _try_nodes(
 
     def cancel_launch_orphan(node: Node, node_job_dir: str) -> str | None:
         if cfg.layout == ROLE_LAYOUT:
-            return _cancel_orphan(node, node_job_dir, session, layout=cfg.layout)
-        return _cancel_orphan(node, node_job_dir, session)
+            return _cancel_orphan(
+                node,
+                node_job_dir,
+                session,
+                layout=cfg.layout,
+                dispatch_token=spec.dispatch_token,
+            )
+        return _cancel_orphan(
+            node,
+            node_job_dir,
+            session,
+            dispatch_token=spec.dispatch_token,
+        )
 
     for node in candidates:
         node_job_dir = job_dir(node) if callable(job_dir) else job_dir
+        if before_attempt is not None and not before_attempt(node, node_job_dir):
+            failure_kinds.add("interrupted")
+            return None, reasons, True, failure_kinds
         log(f"snapshot -> {node.name}")
         snapshot_started = time.perf_counter()
         try:
@@ -3428,6 +4325,7 @@ def _try_nodes(
                 require_disk_gib=spec.require_disk_gib,
                 pin_node=spec.node,
                 max_hours=spec.max_hours,
+                min_vram_mib=spec.min_vram_mib,
                 max_vram_mib=spec.max_vram_mib,
                 max_job_memory_mib=spec.max_job_memory_mib,
                 env_hash=env_value if isinstance(env_value, str) else None,
@@ -3440,6 +4338,7 @@ def _try_nodes(
                 setup_ran=(setup_ran if isinstance(setup_ran, bool) else None),
                 env_mode=spec.env_mode,
                 env_source_job=spec.env_source_job,
+                custom_env=dict(spec.custom_env),
                 boot_id=boot_id_value if isinstance(boot_id_value, str) else None,
                 snapshot_sha256=snapshot_sha256,
                 payload_sha256=payload_sha256,
@@ -3510,13 +4409,23 @@ def submit(
     cwd: Path,
     log: Callable[[str], None],
     no_queue: bool = False,
+    *,
+    claimed_action: Callable[[], None] | None = None,
 ) -> JobEntry:
     """log: callable(str) writing progress to stderr.
-    Returns an entry with status "running" (placed now) or "queued"."""
+    Returns an entry with status "running" (placed now) or "queued".
+
+    A remote-visible preparation callback must be supplied as
+    ``claimed_action`` rather than run by the caller before this function.
+    For requests with an idempotency key, the callback then executes only
+    after the request has a durable claim and never executes on replay or
+    conflict.
+    """
     project_name, project = resolve_project(cfg, spec.project, cwd)
-    project_dir = project.path
-    if not project_dir.is_dir():
-        raise ConfigError(f"project dir does not exist: {project_dir}")
+    project_dir = revalidate_project_root(
+        project.path,
+        f"projects.{project_name}.path",
+    )
     spec.project = project_name
     if spec.setup is None:
         spec.setup = project.setup
@@ -3537,6 +4446,7 @@ def submit(
         git_diff=diff,
         log=log,
         no_queue=no_queue,
+        claimed_action=claimed_action,
     )
 
 
@@ -3552,22 +4462,29 @@ def submit_fork(
     """Submit from a source whose cleanup/migration identity stays locked."""
     _validate_run_spec(spec)
     spec.forked_from = spec.forked_from or source.job_id
-    with _job_reference_locks(cfg, spec, extra=(source.job_id,)):
-        current = load(cfg, source.job_id)
-        if current is None:
-            raise ConfigError("fork source job disappeared; resolve it and retry")
-        if _fork_source_identity(current) != _fork_source_identity(source):
-            raise ConfigError("fork source identity changed; resolve it and retry")
-        return _submit_fork_locked(
-            cfg,
-            current,
-            spec,
-            log,
-            no_queue=no_queue,
-            force_queue=force_queue,
-            force_queue_label=force_queue_label,
-            references_locked=True,
-        )
+    retains_environment = (
+        spec.env_mode == "reuse" or spec.cache_source_env_hash is not None
+    )
+    retention_context = (
+        environment_retention_lock(cfg) if retains_environment else nullcontext()
+    )
+    with retention_context:
+        with _job_reference_locks(cfg, spec, extra=(source.job_id,)):
+            current = load(cfg, source.job_id)
+            if current is None:
+                raise ConfigError("fork source job disappeared; resolve it and retry")
+            if _fork_source_identity(current) != _fork_source_identity(source):
+                raise ConfigError("fork source identity changed; resolve it and retry")
+            return _submit_fork_locked(
+                cfg,
+                current,
+                spec,
+                log,
+                no_queue=no_queue,
+                force_queue=force_queue,
+                force_queue_label=force_queue_label,
+                references_locked=True,
+            )
 
 
 def _fork_source_identity(entry: JobEntry) -> tuple[object, ...]:
@@ -3705,8 +4622,16 @@ def _submit_prepared(
     force_queue: bool = False,
     force_queue_label: str = "batch",
     references_locked: bool = False,
+    claimed_action: Callable[[], None] | None = None,
 ) -> JobEntry:
-    """Submit once, or replay one durable request without launching twice."""
+    """Submit once, or replay one durable request without launching twice.
+
+    ``claimed_action`` is the transaction boundary for remote-visible
+    preparation such as publishing shared artifacts.  For an idempotent
+    request it runs while the request lock is held, after the durable claim
+    exists and only for the first attempt.  Replays and conflicts return or
+    fail before this callback is reached.
+    """
     # Validate before deriving lock paths from externally influenced IDs.
     _validate_run_spec(spec)
     if not references_locked:
@@ -3723,6 +4648,7 @@ def _submit_prepared(
                 force_queue=force_queue,
                 force_queue_label=force_queue_label,
                 references_locked=True,
+                claimed_action=claimed_action,
             )
     if no_queue:
         dependency = next(
@@ -3748,6 +4674,9 @@ def _submit_prepared(
     spec.require_disk_gib = _frozen_floor if _frozen_floor > 0 else None
     spec.name = sanitize_name(spec.name)
     if spec.request_id is None:
+        require_compatible_resident_agent(cfg)
+        if claimed_action is not None:
+            claimed_action()
         return _submit_prepared_once(
             cfg,
             spec,
@@ -3760,6 +4689,12 @@ def _submit_prepared(
             force_queue=force_queue,
             force_queue_label=force_queue_label,
         )
+
+    # Compatibility is checked before source capture because capture may
+    # publish a new immutable snapshot. Replays are intentionally unavailable
+    # through a mixed-version writer; read-only ``dt request`` remains the
+    # recovery surface until the active agent is upgraded.
+    require_compatible_resident_agent(cfg)
 
     # The exact source and node payload are identities, not mutable work.  They
     # are resolved before the durable claim so changing either between retries
@@ -3821,7 +4756,12 @@ def _submit_prepared(
         if record is not None:
             try:
                 record, existing = reconcile_submission_request(cfg, record)
-            except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+            except (
+                OSError,
+                RegistryError,
+                intent_mod.RequestRecordError,
+                ValueError,
+            ) as exc:
                 raise RequestOutcomeUnknown(
                     request_id,
                     record.job_id,
@@ -3834,6 +4774,12 @@ def _submit_prepared(
                     raise FailedBeforeStart(existing)
                 setattr(existing, "_request_replayed", True)
                 return existing
+            if record.state == "confirmed" and existing is None:
+                raise RequestRejected(
+                    f"request {request_id!r} was already confirmed as job "
+                    f"{record.job_id}, but its job history was cleaned; "
+                    "refusing a duplicate submission"
+                )
             if record.state == "rejected":
                 detail = record.error_message or "submission was rejected"
                 raise RequestRejected(
@@ -3847,10 +4793,21 @@ def _submit_prepared(
                 "before retrying",
             )
 
+        # Close the small race in which an incompatible supervisor starts
+        # after the first check but before the durable request claim.
+        require_compatible_resident_agent(cfg)
         job_id = new_job_id(spec.name)
         record = intent_mod.create(request_id, intent_sha256, job_id)
         try:
             intent_mod.save(cfg, record)
+        except intent_mod.RequestDurabilityUnknown as exc:
+            raise RequestOutcomeUnknown(
+                request_id,
+                job_id,
+                f"request {request_id!r} was not launched because its durable "
+                "claim durability is unknown; inspect "
+                f"`dt request {request_id} --json` before retrying",
+            ) from exc
         except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
             # The launch boundary has not been crossed. Report a known safe
             # rejection instead of leaking an OSError/traceback or inviting a
@@ -3859,7 +4816,11 @@ def _submit_prepared(
                 f"request {request_id!r} was not launched because its durable "
                 f"claim could not be persisted: {exc}"
             ) from exc
+        claimed_action_in_progress = claimed_action is not None
         try:
+            if claimed_action is not None:
+                claimed_action()
+            claimed_action_in_progress = False
             entry = _submit_prepared_once(
                 cfg,
                 spec,
@@ -3875,8 +4836,17 @@ def _submit_prepared(
                 submitted_at=record.created_at,
             )
         except BaseException as exc:
-            existing = load(cfg, job_id)
-            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            try:
+                existing = load(cfg, job_id)
+            except (RegistryError, ValueError):
+                existing = None
+            if claimed_action_in_progress:
+                # The compute launch boundary has not been crossed. The
+                # callback may have partially changed its remote destination,
+                # so reject this identity durably and never run it again.
+                state = "rejected"
+                error_kind = "claimed_action_failed"
+            elif isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 state = "uncertain"
                 error_kind = "interrupted"
             elif existing is not None and (existing.reason or "").startswith(
@@ -3955,7 +4925,9 @@ def _submit_prepared_once(
 ) -> JobEntry:
     """Shared placement path after any durable request claim is established."""
     _validate_run_spec(spec)
-    spec.require_disk_gib = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    require_compatible_resident_agent(cfg)
+    effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    spec.require_disk_gib = effective_disk_floor or None
     spec.name = sanitize_name(spec.name)
     submitted_at = time.time() if submitted_at is None else submitted_at
     job_id = allocated_job_id or new_job_id(spec.name)
@@ -3997,6 +4969,7 @@ def _submit_prepared_once(
         "git_dirty": git_dirty,
         "payload_sha256": runtime_sha256,
         "max_hours": spec.max_hours,
+        "min_vram_mib": spec.min_vram_mib,
         "max_vram_mib": spec.max_vram_mib,
         "max_job_memory_mib": spec.max_job_memory_mib,
         "artifact_manifest": spec.artifact_manifest,
@@ -4010,6 +4983,7 @@ def _submit_prepared_once(
             "mode": spec.env_mode,
             "identity": spec.env_hash_override,
             "source_job_id": spec.env_source_job,
+            "variables": sorted(spec.custom_env),
         },
         "rerun_of": spec.rerun_of,
         "rerun_source_snapshot_sha256": spec.rerun_source_snapshot_sha256,
@@ -4068,6 +5042,7 @@ def _submit_prepared_once(
             git_sha=git_sha,
             git_dirty=git_dirty,
             max_hours=spec.max_hours,
+            min_vram_mib=spec.min_vram_mib,
             max_vram_mib=spec.max_vram_mib,
             max_job_memory_mib=spec.max_job_memory_mib,
             snapshot_sha256=staged_snapshot_sha256,
@@ -4088,6 +5063,7 @@ def _submit_prepared_once(
             env_hash=spec.env_hash_override,
             env_mode=spec.env_mode,
             env_source_job=spec.env_source_job,
+            custom_env=dict(spec.custom_env),
             forked_from=spec.forked_from,
             after_success=spec.after_success,
             after_complete=spec.after_complete,
@@ -4135,6 +5111,7 @@ def _submit_prepared_once(
             payload_sha256=runtime_sha256,
             artifact_manifest=spec.artifact_manifest,
             max_hours=spec.max_hours,
+            min_vram_mib=spec.min_vram_mib,
             max_vram_mib=spec.max_vram_mib,
             max_job_memory_mib=spec.max_job_memory_mib,
             created_at=submitted_at,
@@ -4153,6 +5130,7 @@ def _submit_prepared_once(
             env_hash=spec.env_hash_override,
             env_mode=spec.env_mode,
             env_source_job=spec.env_source_job,
+            custom_env=dict(spec.custom_env),
             forked_from=spec.forked_from,
             after_success=spec.after_success,
             after_complete=spec.after_complete,
@@ -4289,6 +5267,7 @@ def _submit_prepared_once(
         for s in statuses
         if spec.node is None or s.node == spec.node  # pinned: others not tried
     }
+    drained_probe_reasons(cfg, spec, probe_reasons)
     if statuses and all(status.unreachable for status in statuses):
         if no_queue:
             raise NoReachableNode(probe_reasons)
@@ -4317,192 +5296,56 @@ def _submit_prepared_once(
         why = f"no free capacity ({detail})" if detail else "no free capacity"
         return enqueue(why, reason=waiting_capacity_reason(probe_reasons))
 
-    def sync_to_node(node: Node) -> str:
-        source = exact_source()
-        node_job_dir = job_dir_for_node(node)
-        return snapshot(
-            cfg,
-            project_name,
-            source.code_dir,
-            node,
-            job_id,
-            node_job_dir,
-            spec,
-            dict(meta),
-            log,
-            expected_sha256=source.sha256,
-            pre_filtered=True,
-            runtime_files=runtime_files,
-        )
-
-    entry, reasons, fatal, failure_kinds = _try_nodes(
-        cfg,
-        candidates,
-        spec,
-        job_id,
-        job_dir_for_node,
-        session,
-        sync_to_node,
-        log,
-        created_at=submitted_at,
-        payload_sha256=runtime_sha256,
-    )
-    if entry:
-        entry.git_sha, entry.git_dirty = git_sha, git_dirty
-        save(cfg, entry)
-        return entry
-    if fatal:
-        node_name, why = list(reasons.items())[-1]  # fatal is always the last entry
-        if "cancel-unverified" in failure_kinds:
-            node = next(
-                (candidate for candidate in cfg.nodes if candidate.name == node_name),
-                Node(name=node_name),
+    # Cross the launch boundary only after the complete source/runtime contract
+    # and a queued row are durable.  Immediate submission then invokes the same
+    # dispatcher used by the resident agent.  A head crash releases the job
+    # lock and leaves enough node/session/token state for that path to adopt or
+    # conservatively refuse the in-flight launch; there is no registry-less
+    # process window and no second placement authority.
+    pending = enqueue("capacity available", reason=None)
+    outcome, _detail = dispatch_queued(cfg, pending, log)
+    if pending.status in {"running", "finished"}:
+        return pending
+    if pending.status == "failed":
+        if is_uncertain_launch(pending):
+            raise NoReachableNode(
+                {pending.node: f"job {pending.job_id}: {pending.reason}"}
             )
-            uncertain_reason = f"{UNCERTAIN_LAUNCH_PREFIX}{why}"
-            failed_at = time.time()
-            failed_job_dir = job_dir_for_node(node)
-            uncertain = JobEntry(
-                job_id=job_id,
-                name=spec.name,
-                center=cfg.center,
-                project=project_name,
-                node=node_name,
-                node_local=node.local,
-                job_dir=failed_job_dir,
-                session=session,
-                cmd=shlex.join(spec.cmd),
-                gpus=[],
-                pgid=None,
-                status="failed",
-                git_sha=git_sha,
-                git_dirty=git_dirty,
-                snapshot_sha256=stored.sha256 if stored is not None else None,
-                payload_sha256=runtime_sha256,
-                artifact_manifest=spec.artifact_manifest,
-                max_hours=spec.max_hours,
-                max_vram_mib=spec.max_vram_mib,
-                max_job_memory_mib=spec.max_job_memory_mib,
-                created_at=submitted_at,
-                finished_at=failed_at,
-                gpus_requested=spec.gpus,
-                gpu_isolation=spec.gpu_isolation,
-                require_path=spec.require_path,
-                require_disk_gib=spec.require_disk_gib,
-                pin_node=spec.node,
-                reason=uncertain_reason,
-                setup=spec.setup,
-                setup_inputs=(
-                    list(spec.setup_inputs) if spec.setup_inputs is not None else None
-                ),
-                extras=list(spec.extras or []),
-                env_hash=spec.env_hash_override,
-                env_mode=spec.env_mode,
-                env_source_job=spec.env_source_job,
-                forked_from=spec.forked_from,
-                after_success=spec.after_success,
-                after_complete=spec.after_complete,
-                after_result=spec.after_result,
-                after_result_states=list(spec.after_result_states),
-                request_id=spec.request_id,
-                rerun_of=spec.rerun_of,
-                rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
-                rerun_snapshot_changed=_rerun_snapshot_changed(
-                    spec,
-                    stored.sha256 if stored is not None else None,
-                ),
-                cache_source_job=spec.cache_source_job,
-                cache_source_job_dir=spec.cache_source_job_dir,
-                cache_source_path=spec.cache_source_path,
-                cache_env=spec.cache_env,
-                cache_source_env_hash=spec.cache_source_env_hash,
-                cache_mode=spec.cache_mode,
-                storage_layout=cfg.layout,
-                worker_root=cfg.worker_root_for(node),
-                job_relpath=job_relpath,
-            )
-            save(cfg, uncertain)
-            raise NoReachableNode({node_name: (f"job {job_id}: {uncertain_reason}")})
-        node = next(
-            (candidate for candidate in cfg.nodes if candidate.name == node_name),
-            Node(name=node_name),
-        )
-        failed_at = time.time()
-        failed_job_dir = job_dir_for_node(node)
-        failed = JobEntry(
-            job_id=job_id,
-            name=spec.name,
-            center=cfg.center,
-            project=project_name,
-            node=node_name,
-            node_local=node.local,
-            job_dir=failed_job_dir,
-            session=session,
-            cmd=shlex.join(spec.cmd),
-            gpus=[],
-            pgid=None,
-            status="failed",
-            git_sha=git_sha,
-            git_dirty=git_dirty,
-            snapshot_sha256=stored.sha256 if stored is not None else None,
-            payload_sha256=runtime_sha256,
-            artifact_manifest=spec.artifact_manifest,
-            max_hours=spec.max_hours,
-            max_vram_mib=spec.max_vram_mib,
-            max_job_memory_mib=spec.max_job_memory_mib,
-            created_at=submitted_at,
-            finished_at=failed_at,
-            gpus_requested=spec.gpus,
-            gpu_isolation=spec.gpu_isolation,
-            require_path=spec.require_path,
-            require_disk_gib=spec.require_disk_gib,
-            pin_node=spec.node,
-            reason=f"{node_name}: {why}",
-            setup=spec.setup,
-            setup_inputs=(
-                list(spec.setup_inputs) if spec.setup_inputs is not None else None
-            ),
-            extras=list(spec.extras or []),
-            env_hash=spec.env_hash_override,
-            env_mode=spec.env_mode,
-            env_source_job=spec.env_source_job,
-            forked_from=spec.forked_from,
-            after_success=spec.after_success,
-            after_complete=spec.after_complete,
-            after_result=spec.after_result,
-            after_result_states=list(spec.after_result_states),
-            request_id=spec.request_id,
-            rerun_of=spec.rerun_of,
-            rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
-            rerun_snapshot_changed=_rerun_snapshot_changed(
-                spec,
-                stored.sha256 if stored is not None else None,
-            ),
-            cache_source_job=spec.cache_source_job,
-            cache_source_job_dir=spec.cache_source_job_dir,
-            cache_source_path=spec.cache_source_path,
-            cache_env=spec.cache_env,
-            cache_source_env_hash=spec.cache_source_env_hash,
-            cache_mode=spec.cache_mode,
-            storage_layout=cfg.layout,
-            worker_root=cfg.worker_root_for(node),
-            job_relpath=job_relpath,
-        )
-        save(cfg, failed)
-        raise FailedBeforeStart(failed)
-    if no_queue:
-        if failure_kinds == {"unreachable"}:
-            raise NoReachableNode({**probe_reasons, **reasons})
-        raise NoCapacity({**probe_reasons, **reasons})
-    if blocked_not_busy(reasons):
-        detail = "; ".join(f"{n}: {r}" for n, r in reasons.items())
-        return enqueue(
-            "all candidates blocked",
-            reason=f"blocked: {detail}",
-        )
-    return enqueue(
-        "all candidates busy",
-        reason=waiting_capacity_reason({**probe_reasons, **reasons}),
-    )
+        raise FailedBeforeStart(pending)
+    if no_queue and pending.status == "queued":
+        # Capacity changed between forecast and the serialized launch attempt.
+        # No launch is live (otherwise the dispatcher would have adopted it),
+        # so restore the fail-fast contract without leaving an agent-visible
+        # queued row behind.
+        with job_lock(cfg, pending.job_id):
+            current = load(cfg, pending.job_id)
+            if (
+                current is not None
+                and current.status == "queued"
+                and current.dispatch_node is None
+                and current.dispatch_token is None
+            ):
+                remove_staging(cfg, pending.job_id)
+                remove_record(cfg, pending.job_id)
+            elif (
+                current is not None
+                and current.status == "queued"
+                and current.dispatch_node is not None
+                and current.dispatch_token is not None
+            ):
+                # Another dispatcher already crossed the durable attempt
+                # boundary.  Removing this row would make a live task
+                # invisible; preserve it even though the original caller
+                # requested fail-fast placement.
+                pending.__dict__.update(current.__dict__)
+                return pending
+            elif current is not None:
+                pending.__dict__.update(current.__dict__)
+                return pending
+        raise NoCapacity(probe_reasons)
+    if outcome in {"busy", "waiting", "blocked"}:
+        return pending
+    return pending
 
 
 def _load_predecessor(
@@ -4527,7 +5370,8 @@ def dispatch_queued(
     log: Callable[[str], None],
 ) -> tuple[str, str | None]:
     """Try to place a queued job now. Returns (outcome, detail) with outcome in:
-    started | busy | waiting | blocked | failed | killed | cancel-failed.
+    started | finished | busy | waiting | blocked | failed | skipped | killed |
+    cancel-failed.
     ``waiting`` is a cheap local dependency wait; ``blocked`` is a
     job-specific placement blocker whose retry re-probes nodes, so the agent
     may back it off. Called by the agent (and tests)."""
@@ -4720,6 +5564,8 @@ def _existing_dispatch_outcome(entry: JobEntry) -> tuple[str, str | None]:
         return "killed", None
     if entry.status == "running":
         return "started", entry.node
+    if entry.status == "finished":
+        return "finished", entry.node
     if entry.status == "failed":
         return "failed", entry.reason or "dispatch failed"
     if entry.status == "skipped":
@@ -4732,19 +5578,104 @@ def _commit_queued_transition(
     candidate: JobEntry,
     *,
     persist: bool = True,
+    expected_attempt: tuple[str | None, str | None] | None = None,
 ) -> JobEntry | None:
     """Atomically commit only if the registry still says ``queued``.
 
     Returns the newer non-queued entry when a concurrent lifecycle action won.
     Remote probe/sync/setup stays outside the lock so a dequeue remains fast.
     """
+    if candidate.status == "failed" and (
+        candidate.finished_at is None or candidate.result_state is None
+    ):
+        transition_terminal(
+            candidate,
+            status="failed",
+            result_state="infra_failure",
+            reason=candidate.reason,
+            finished_at=candidate.finished_at,
+        )
+    elif candidate.status == "skipped" and (
+        candidate.finished_at is None or candidate.result_state is None
+    ):
+        transition_terminal(
+            candidate,
+            status="skipped",
+            result_state="dependency_skipped",
+            reason=candidate.reason,
+            finished_at=candidate.finished_at,
+        )
     with job_lock(cfg, candidate.job_id):
         current = load(cfg, candidate.job_id)
-        if current is not None and current.status != "queued":
+        if current is None:
+            # A concurrent lifecycle action removed the registry row.  Never
+            # recreate it from a stale dispatcher snapshot; represent the
+            # interruption as a killed row so a launch that already crossed
+            # the remote boundary is cancelled and truthfully reconciled by
+            # ``finish_placement``.
+            return replace(
+                candidate,
+                status="killed",
+                result_state="cancelled",
+                reason="registry row removed during dispatch",
+                finished_at=time.time(),
+                dispatch_node=None,
+                dispatch_token=None,
+            )
+        if current.status != "queued":
+            return current
+        current_attempt = (current.dispatch_node, current.dispatch_token)
+        candidate_attempt = (candidate.dispatch_node, candidate.dispatch_token)
+        authorized_attempt = (
+            candidate_attempt if expected_attempt is None else expected_attempt
+        )
+        if current_attempt != authorized_attempt:
+            # Remote work is deliberately performed outside the job lock.
+            # An entry object can therefore become stale while another
+            # dispatcher claims the queued attempt.  Only that claim owner may
+            # persist further queued-state changes; otherwise a stale writer
+            # could clear/replace the recovery token and launch the job twice.
             return current
         if persist:
             save(cfg, candidate)
     return None
+
+
+def _claim_queued_dispatch_attempt(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    spec: RunSpec,
+    node: Node,
+) -> bool:
+    """Compare-and-swap ownership of one queued remote launch attempt.
+
+    ``spec.dispatch_token`` is the caller's expected token.  It is ``None``
+    for the first candidate and the token of the caller's previous, safely
+    cancelled candidate during failover.  This permits one dispatcher to
+    advance through candidates while making every concurrent dispatcher stop
+    before synchronization or launch.
+    """
+    expected_token = spec.dispatch_token
+    expected_node = entry.dispatch_node if expected_token is not None else None
+    token = uuid.uuid4().hex
+    with job_lock(cfg, entry.job_id):
+        current = load(cfg, entry.job_id)
+        if (
+            current is None
+            or current.status != "queued"
+            or current.dispatch_node != expected_node
+            or current.dispatch_token != expected_token
+        ):
+            if current is not None:
+                entry.__dict__.update(current.__dict__)
+            return False
+        current.dispatch_node = node.name
+        current.dispatch_token = token
+        current.reason = f"dispatching: {node.name}"
+        save(cfg, current)
+        entry.__dict__.update(current.__dict__)
+    spec.dispatch_token = token
+    return True
 
 
 def _queued_node(cfg: HeadConfig, entry: JobEntry, node: Node) -> Node:
@@ -4867,6 +5798,7 @@ def _dispatch_queued_active(
         require_path=entry.require_path,
         require_disk_gib=entry.require_disk_gib or None,
         max_hours=entry.max_hours,
+        min_vram_mib=entry.min_vram_mib,
         max_vram_mib=entry.max_vram_mib,
         max_job_memory_mib=entry.max_job_memory_mib,
         setup=entry.setup,
@@ -4877,6 +5809,7 @@ def _dispatch_queued_active(
         env_mode=entry.env_mode or "sync",
         env_hash_override=(entry.env_hash if entry.env_mode == "reuse" else None),
         env_source_job=entry.env_source_job,
+        custom_env=dict(entry.custom_env),
         forked_from=entry.forked_from,
         after_success=entry.after_success,
         after_complete=entry.after_complete,
@@ -4896,7 +5829,8 @@ def _dispatch_queued_active(
         cache_mode=entry.cache_mode,
         payload_sha256=entry.payload_sha256,
     )
-    spec.require_disk_gib = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    spec.require_disk_gib = effective_disk_floor or None
     try:
         _validate_run_spec(spec)
     except ConfigError as exc:
@@ -4906,6 +5840,108 @@ def _dispatch_queued_active(
         if interrupted is not None:
             return interrupted
         return "failed", entry.reason
+
+    def job_dir_for_node(node: Node) -> str:
+        if entry.storage_layout == ROLE_LAYOUT:
+            return cfg.worker_job_dir(node, entry.job_id)
+        return entry.job_dir
+
+    def finish_placement(placed: JobEntry) -> tuple[str, str | None]:
+        placed.git_sha, placed.git_dirty = entry.git_sha, entry.git_dirty
+        current = _commit_queued_transition(
+            cfg,
+            placed,
+            expected_attempt=(entry.dispatch_node, entry.dispatch_token),
+        )
+        if current is not None and current.status == "killed":
+            if placed.status == "finished":
+                restored = _restore_finished_after_raced_dequeue(cfg, placed)
+                entry.__dict__.update(restored.__dict__)
+                remove_staging(cfg, entry.job_id)
+                return _existing_dispatch_outcome(restored)
+            # User dequeued mid-dispatch. Keep the fast CLI response, but only
+            # retain killed after a positive remote death verdict.
+            cancel_error = _cancel_placed_launch(placed)
+            if cancel_error is not None:
+                restored = _restore_running_after_cancel_failure(
+                    cfg,
+                    placed,
+                    cancel_error,
+                )
+                entry.__dict__.update(restored.__dict__)
+                remove_staging(cfg, entry.job_id)
+                if restored.status == "running":
+                    return "cancel-failed", f"{placed.node}: {cancel_error}"
+                return _existing_dispatch_outcome(restored)
+            recorded = _record_cancelled_inflight_launch(
+                cfg,
+                current,
+                placed,
+            )
+            entry.__dict__.update(recorded.__dict__)
+            remove_staging(cfg, entry.job_id)
+            if recorded.status == "killed":
+                return "killed", placed.node
+            return _existing_dispatch_outcome(recorded)
+        if current is not None:
+            entry.__dict__.update(current.__dict__)
+            remove_staging(cfg, entry.job_id)
+            return _existing_dispatch_outcome(current)
+        entry.__dict__.update(placed.__dict__)
+        remove_staging(cfg, entry.job_id)
+        return _existing_dispatch_outcome(placed)
+
+    if entry.dispatch_node is not None:
+        configured = next(
+            (node for node in cfg.nodes if node.name == entry.dispatch_node),
+            None,
+        )
+        if configured is None:
+            detail = (
+                f"previous dispatch node {entry.dispatch_node!r} is no longer "
+                "configured; recovery cannot prove the remote attempt absent"
+            )
+            entry.reason = f"blocked: {detail}"
+            interrupted = commit()
+            if interrupted is not None:
+                return interrupted
+            return "blocked", detail
+        attempted_node = _queued_node(cfg, entry, configured)
+        attempted_job_dir = job_dir_for_node(attempted_node)
+        adopted, recovery_error = _adopt_interrupted_queued_launch(
+            cfg,
+            entry,
+            attempted_node,
+            attempted_job_dir,
+        )
+        if adopted is not None:
+            log(
+                f"recovered {adopted.status} launch on {attempted_node.name} "
+                "before resynchronizing"
+            )
+            return finish_placement(adopted)
+        if recovery_error is not None:
+            detail = f"dispatch recovery unverified on {attempted_node.name}: {recovery_error}"
+            entry.reason = f"blocked: {detail}"
+            interrupted = commit()
+            if interrupted is not None:
+                return interrupted
+            return "blocked", detail
+        # The cancellation sentinel closed any in-progress launch race and a
+        # complete survivor census proved the old attempt absent. Only now may
+        # a retry overwrite support files or the immutable code projection.
+        recovered_attempt = (entry.dispatch_node, entry.dispatch_token)
+        entry.dispatch_node = None
+        entry.dispatch_token = None
+        entry.reason = None
+        current = _commit_queued_transition(
+            cfg,
+            entry,
+            expected_attempt=recovered_attempt,
+        )
+        if current is not None:
+            entry.__dict__.update(current.__dict__)
+            return _existing_dispatch_outcome(current)
     if spec.node:
         by_name = {node.name: node for node in cfg.nodes}
         pinned = by_name.get(spec.node)
@@ -4933,6 +5969,7 @@ def _dispatch_queued_active(
     probe_reasons = {
         status.node: probe_rejection_reason(status, spec) for status in statuses
     }
+    drained_probe_reasons(cfg, spec, probe_reasons)
     try:
         candidates = pick_candidates(statuses, cfg.nodes, spec, _reserve_for(cfg, spec))
     except ConfigError as e:
@@ -4950,6 +5987,11 @@ def _dispatch_queued_active(
         interrupted = commit(persist=changed)
         if interrupted is not None:
             return interrupted
+        if spec.node is not None:
+            detail = "; ".join(
+                f"{node}: {reason}" for node, reason in probe_reasons.items()
+            )
+            return "blocked", detail
         return "busy", None
     if pin_is_busy(statuses, spec):
         candidates = []
@@ -4976,11 +6018,6 @@ def _dispatch_queued_active(
         return "busy", None
 
     candidates = [_queued_node(cfg, entry, node) for node in candidates]
-
-    def job_dir_for_node(node: Node) -> str:
-        if entry.storage_layout == ROLE_LAYOUT:
-            return cfg.worker_job_dir(node, entry.job_id)
-        return entry.job_dir
 
     def sync_to_node(node: Node) -> str:
         node_job_dir = job_dir_for_node(node)
@@ -5143,6 +6180,9 @@ def _dispatch_queued_active(
         _remember_snapshot(cfg, entry.project, node, entry.job_id)
         return observed
 
+    def record_attempt(node: Node, _node_job_dir: str) -> bool:
+        return _claim_queued_dispatch_attempt(cfg, entry, spec, node)
+
     try:
         placed, reasons, fatal, failure_kinds = _try_nodes(
             cfg,
@@ -5155,6 +6195,7 @@ def _dispatch_queued_active(
             log,
             created_at=entry.created_at,
             payload_sha256=entry.payload_sha256,
+            before_attempt=record_attempt,
         )
     except DispatchError as e:
         entry.status, entry.reason = "failed", str(e)
@@ -5165,41 +6206,15 @@ def _dispatch_queued_active(
         return "failed", entry.reason
 
     if placed:
-        placed.git_sha, placed.git_dirty = entry.git_sha, entry.git_dirty
-        current = _commit_queued_transition(cfg, placed)
-        if current is not None and current.status == "killed":
-            # User dequeued mid-dispatch.  Keep the fast CLI response, but only
-            # retain killed after a positive remote death verdict.
-            cancel_error = _cancel_placed_launch(placed)
-            if cancel_error is not None:
-                restored = _restore_running_after_cancel_failure(
-                    cfg,
-                    placed,
-                    cancel_error,
-                )
-                entry.__dict__.update(restored.__dict__)
-                remove_staging(cfg, entry.job_id)
-                if restored.status == "running":
-                    return "cancel-failed", f"{placed.node}: {cancel_error}"
-                return _existing_dispatch_outcome(restored)
-            recorded = _record_cancelled_inflight_launch(
-                cfg,
-                current,
-                placed,
-            )
-            entry.__dict__.update(recorded.__dict__)
-            remove_staging(cfg, entry.job_id)
-            if recorded.status == "killed":
-                return "killed", placed.node
-            return _existing_dispatch_outcome(recorded)
-        if current is not None:
-            entry.__dict__.update(current.__dict__)
-            remove_staging(cfg, entry.job_id)
-            return _existing_dispatch_outcome(current)
-        # sync the caller's view so the agent logs the right node
-        entry.__dict__.update(placed.__dict__)
-        remove_staging(cfg, entry.job_id)
-        return "started", placed.node
+        return finish_placement(placed)
+    if "interrupted" in failure_kinds:
+        if entry.status == "queued" and entry.dispatch_node is not None:
+            return "waiting", f"dispatch already active on {entry.dispatch_node}"
+        return _existing_dispatch_outcome(entry)
+    owned_attempt = (entry.dispatch_node, entry.dispatch_token)
+    entry.dispatch_node = None
+    entry.dispatch_token = None
+    spec.dispatch_token = None
     if fatal:
         bad = "; ".join(f"{n}: {r}" for n, r in reasons.items())
         entry.status = "failed"
@@ -5218,19 +6233,30 @@ def _dispatch_queued_active(
             entry.reason = f"{UNCERTAIN_LAUNCH_PREFIX}{bad}"
         else:
             entry.reason = bad
-        interrupted = commit()
+        current = _commit_queued_transition(
+            cfg,
+            entry,
+            expected_attempt=owned_attempt,
+        )
         remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
+        if current is not None:
+            entry.__dict__.update(current.__dict__)
+            return _existing_dispatch_outcome(current)
         return "failed", entry.reason
     if failure_kinds == {"unreachable"}:
         waiting_reason = waiting_unreachable_reason(reasons)
         changed = entry.reason != waiting_reason
         if changed:
             entry.reason = waiting_reason
-        interrupted = commit(persist=changed)
-        if interrupted is not None:
-            return interrupted
+        current = _commit_queued_transition(
+            cfg,
+            entry,
+            persist=changed,
+            expected_attempt=owned_attempt,
+        )
+        if current is not None:
+            entry.__dict__.update(current.__dict__)
+            return _existing_dispatch_outcome(current)
         return "busy", None
     if blocked_not_busy(reasons):
         detail = "; ".join(f"{n}: {r}" for n, r in reasons.items())
@@ -5238,17 +6264,29 @@ def _dispatch_queued_active(
         changed = entry.reason != blocked_reason
         if changed:
             entry.reason = blocked_reason
-        interrupted = commit(persist=changed)
-        if interrupted is not None:
-            return interrupted
+        current = _commit_queued_transition(
+            cfg,
+            entry,
+            persist=changed,
+            expected_attempt=owned_attempt,
+        )
+        if current is not None:
+            entry.__dict__.update(current.__dict__)
+            return _existing_dispatch_outcome(current)
         return "blocked", detail
     waiting_reason = waiting_capacity_reason({**probe_reasons, **reasons})
     changed = entry.reason != waiting_reason
     if changed:
         entry.reason = waiting_reason
-    interrupted = commit(persist=changed)
-    if interrupted is not None:
-        return interrupted
+    current = _commit_queued_transition(
+        cfg,
+        entry,
+        persist=changed,
+        expected_attempt=owned_attempt,
+    )
+    if current is not None:
+        entry.__dict__.update(current.__dict__)
+        return _existing_dispatch_outcome(current)
     return "busy", None
 
 
@@ -5275,6 +6313,7 @@ def clean_jobs(
     *,
     projects: set[str] | None = None,
     before_registry_remove: BeforeRegistryRemove | None = None,
+    authorized: Sequence[JobEntry] | None = None,
 ) -> CleanReport:
     """Compatibility wrapper preserving dispatch's injectable SSH seam."""
     return _clean_jobs(
@@ -5285,4 +6324,5 @@ def clean_jobs(
         projects=projects,
         runner=run_on,
         before_registry_remove=before_registry_remove,
+        authorized=authorized,
     )

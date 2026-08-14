@@ -8,6 +8,33 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Added
 
+- GPU submissions accept `--min-vram-mib N`: every selected card must expose
+  at least `N` MiB of total memory. The constraint persists through queueing,
+  replay, `rerun`, and `fork`, appears in plans and JSON explanations, and
+  fails closed when a GPU's memory inventory is unavailable; CPU jobs are
+  unaffected.
+
+- `dt run --plan [--json]` previews current placement or queue outlook,
+  per-node reasons, included snapshot bytes, and environment-cache status
+  without creating a snapshot, receipt, registry row, or remote state.
+
+- `dt run --env NAME` imports a bounded, validated variable from the caller's
+  environment through private stdin and preserves it across `rerun` and
+  exact-snapshot `fork`. Values never enter a DT or SSH command line; public
+  JSON and pulled records expose names only, and runtime-control variables
+  remain reserved.
+
+- `dt pull --bwlimit KBPS` and `dt sync --bwlimit KBPS` cap head-side
+  transfer legs, with `sites.<name>.bwlimit_kbps` as the per-site default,
+  so bulk recovery cannot starve interactive sessions on a shared uplink.
+  Intra-site LAN replays deliberately stay unthrottled.
+
+- `nodes[].drained: true` drains a node for maintenance: no new placements
+  (explicit pins included) while running jobs finish undisturbed. The drain
+  is visible everywhere capacity is discussed — `dt free` marks the node,
+  `dt doctor` reports a check, and queue explanations say `drained:
+  maintenance` instead of claiming free GPUs that placement will refuse.
+
 - Bulk data prefers real capacity instead of the operator's SSH route. The
   head classifies every control route as `direct`, `relayed` (an frp/autossh
   tunnel), `proxied` (a jump host), `local`, or `opaque`, learns per-edge
@@ -52,6 +79,17 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Changed
 
+- An alive queue agent must advertise the same durable dispatch protocol as
+  the submitting CLI, and a stopped supervisor is restarted only when its
+  active command advertises that protocol. Mixed-release submission now fails
+  before snapshot, artifact, receipt, or registry mutation; read-only commands
+  remain available while the operator activates the candidate.
+
+- Site-LAN artifact hops now use credentials already available on the gateway
+  or selected peer and explicitly disable SSH agent forwarding on every DT
+  connection pool. This removes the head agent socket from the remote trust
+  chain; deployments must provision gateway/peer-to-worker authentication.
+
 - Every JSON payload carries `schema_version`: `dt init`, `dt logs`,
   `dt info`, `dt pull`, `dt clean`, and `dt agent status` join the surfaces
   that already declared one. `dt pull` additionally reports `outcome`
@@ -80,6 +118,35 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   paths are rejected.
 
 ### Fixed
+
+- Concurrent immediate and resident dispatchers now acquire one durable
+  compare-and-swap attempt owner. A contender cannot replace the recovery
+  token or launch a second process, and `--no-queue` never deletes a row while
+  another dispatcher owns an in-flight launch.
+
+- Formal release qualification confines bootstrap activation metadata to its
+  temporary workspace. Testing a wheel no longer rewrites the operator's
+  user-level `active-command` record to a path removed when the gate exits.
+
+- Endpoint-scoped `dt topology --measure` no longer probes unrelated control
+  routes, and independent control-route measurements run concurrently. A slow
+  tunnel now costs one bounded timeout window instead of one per selected node.
+
+- Remote paths with whitespace or shell metacharacters use rsync's protected
+  argument protocol without requiring the rsync 3.2.6 option spelling, so
+  older workers and gateways do not fail before transfer starts.
+
+- Local package qualification now uses its own temporary project environment;
+  a Python-version matrix leg no longer replaces the checkout's active
+  `.venv` while tests or CLI diagnostics are running beside it.
+
+- A queue-agent crash after remote session start but before the `running`
+  registry commit no longer leaves an invisible live job behind a `queued`
+  row. DT persists an attempt-scoped node/token before any remote side effect,
+  adopts a process only after boot/PID-start/capsule identity verification,
+  and refuses to resynchronize when ownership is unproven. Attempt-scoped
+  cancellation also closes the race between a delayed old launcher and its
+  replacement without cancelling the replacement.
 
 - Destructive maintenance can no longer delete a running job's data. The
   `clean`/`compact` liveness census is a full identity check on every

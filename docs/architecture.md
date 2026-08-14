@@ -202,10 +202,11 @@ artifact digest verification remain mandatory.
 SSH workload overlays separate `control`, `artifact`, and short-lived
 `artifact-relay` multiplexers. OpenSSH receives the overlay through `-F`, so
 its implicit ProxyJump process uses the same private pool instead of falling
-back to a user's global bastion socket. Relay sessions alone forward the local
-SSH agent so a trusted gateway can authenticate to a LAN worker without copied
-private keys. Host-key verification remains enabled and missing trust fails
-closed.
+back to a user's global bastion socket. Every pool disables agent forwarding.
+Gateway and peer data sources authenticate with credentials already available
+on that trusted source; DT neither lends the head's agent socket nor copies a
+private key. Host-key verification remains enabled and missing credentials or
+trust fail closed.
 
 Every completed site delivery writes a private `dt_artifact_transfer_v1` event
 under head control state (`transfers/events.jsonl`) and emits a concise human log
