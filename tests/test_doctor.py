@@ -275,8 +275,12 @@ def test_doctor_reports_relay_failure_and_exits_nonzero(tmp_path, monkeypatch):
 
     assert result.exit_code == 1, result.output
     payload = json.loads(result.stdout)
-    head_row = next(row for row in payload if row["node"] == "head")
+    assert payload["schema_version"] == "dt_doctor_v2"
+    head_row = next(row for row in payload["nodes"] if row["node"] == "head")
     assert head_row["checks"]["relay"] == "fail: no agent socket"
+    assert any(
+        issue["kind"] == "relay_authentication_failure" for issue in payload["issues"]
+    )
 
 
 def test_check_snippet_reports_gpu_error_and_both_address_families(tmp_path):
@@ -348,6 +352,36 @@ def test_doctor_fails_on_gpu_driver_error_text(tmp_path, monkeypatch):
     assert result.exit_code == 1, result.output
 
 
+def test_doctor_fails_gpu_runtime_without_linger_and_returns_remediation(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path, nodes=[Node(name="head", local=True)])
+    rows = [
+        {
+            "node": "head",
+            "checks": {"ssh": "ok", "gpu": "570.1", "linger": "no"},
+            "unreachable": False,
+        }
+    ]
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "doctor_center", lambda cfg_arg: rows)
+    monkeypatch.setattr(cli, "relay_agent_status", lambda cfg_arg: None)
+    monkeypatch.setattr(agent_mod, "alive_pid", lambda cfg_arg: 1234)
+    monkeypatch.setattr(cli.jobs_mod, "queued_entries", lambda cfg_arg: [])
+
+    result = CliRunner().invoke(cli.app, ["doctor", "--json"])
+
+    assert result.exit_code == 1, result.output
+    payload = json.loads(result.stdout)
+    issue = next(
+        item
+        for item in payload["issues"]
+        if item["kind"] == "gpu_runtime_not_persistent"
+    )
+    assert issue["facts"] == {"check": "linger", "observed": "no"}
+    assert any(action["type"] == "enable_linger" for action in payload["actions"])
+
+
 def test_orchestrator_head_without_local_node_still_reports_relay(
     tmp_path, monkeypatch
 ):
@@ -374,7 +408,7 @@ def test_orchestrator_head_without_local_node_still_reports_relay(
 
     assert result.exit_code == 1, result.output
     payload = json.loads(result.stdout)
-    head_row = next(row for row in payload if row["node"] == "(head)")
+    head_row = next(row for row in payload["nodes"] if row["node"] == "(head)")
     assert head_row["checks"]["relay"] == "fail: no agent socket"
     assert head_row["checks"]["agent"] == "off"
 

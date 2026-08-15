@@ -11,12 +11,23 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 from uuid import uuid4
 
 from .config import HeadConfig, Node
-from .jobs import MAX_JOB_RECORD_BYTES, JobEntry, job_lock, list_all, load, save
+from .jobs import (
+    MAX_JOB_RECORD_BYTES,
+    JobEntry,
+    RegistryError,
+    decode_registry_document,
+    encode_registry_entry,
+    job_lock,
+    list_all,
+    load,
+    save,
+)
 from .layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
@@ -27,6 +38,7 @@ from .lifecycle import liveness_shell
 from .payload_hash import RUNTIME_PAYLOAD_NAMES
 from .private_state import (
     PrivateStateError,
+    decode_strict_json,
     fsync_dir,
     fsync_tree,
     read_bounded_regular,
@@ -110,6 +122,44 @@ def _same_file(source: Path, destination: Path) -> bool:
         return False
 
 
+def _registry_entry(path: Path, *, layout: str, job_id: str) -> JobEntry:
+    result = read_bounded_regular(path, max_bytes=MAX_JOB_RECORD_BYTES)
+    if result is None:
+        raise ValueError("registry record disappeared during inspection")
+    payload, info = result
+    try:
+        raw = decode_strict_json(payload)
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise ValueError("registry record is malformed") from exc
+    try:
+        return decode_registry_document(
+            raw,
+            layout=layout,
+            registry_updated_at=info.st_mtime,
+            expected_job_id=job_id,
+        )
+    except RegistryError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _same_registry_entry(
+    source: Path,
+    destination: Path,
+    *,
+    job_id: str,
+) -> bool:
+    try:
+        source_entry = _registry_entry(source, layout=LEGACY_LAYOUT, job_id=job_id)
+        destination_entry = _registry_entry(
+            destination,
+            layout=ROLE_LAYOUT,
+            job_id=job_id,
+        )
+    except (OSError, ValueError, PrivateStateError):
+        return False
+    return asdict(source_entry) == asdict(destination_entry)
+
+
 def _registry_rows(cfg: HeadConfig) -> list[dict[str, object]]:
     source_root = cfg.legacy_registry_dir()
     destination_root = cfg.registry_dir()
@@ -132,13 +182,11 @@ def _registry_rows(cfg: HeadConfig) -> list[dict[str, object]]:
             if source_result is None:
                 raise ValueError("source disappeared during inspection")
             source_bytes = source_result[1].st_size
-            raw = json.loads(source_result[0])
-            if not isinstance(raw, dict) or raw.get("job_id") != job_id:
-                raise ValueError("registry identity does not match filename")
+            _registry_entry(source, layout=LEGACY_LAYOUT, job_id=job_id)
             if destination.exists() or destination.is_symlink():
                 if destination.is_symlink() or not destination.is_file():
                     raise ValueError("destination is not a regular file")
-                if _same_file(source, destination):
+                if _same_registry_entry(source, destination, job_id=job_id):
                     status = "duplicate_verified"
                 else:
                     raise ValueError("destination contains a different record")
@@ -351,10 +399,21 @@ def _active_source_consumers(entries: list[JobEntry]) -> dict[str, list[str]]:
 def _bounded_json_check(expression: str, *, max_bytes: int) -> str:
     """Build one bounded remote JSON identity check."""
     return shlex.quote(
-        "import json,sys; "
-        f"b=open(sys.argv[1], 'rb').read({max_bytes + 1}); "
-        f"d=json.loads(b) if len(b) <= {max_bytes} else {{}}; "
-        f"raise SystemExit(0 if {expression} else 1)"
+        "import json\n"
+        "import sys\n"
+        "def reject_constant(value):\n"
+        "    raise ValueError('non-finite JSON number')\n"
+        "def unique_object(pairs):\n"
+        "    result = {}\n"
+        "    for key, value in pairs:\n"
+        "        if key in result:\n"
+        "            raise ValueError('duplicate JSON field')\n"
+        "        result[key] = value\n"
+        "    return result\n"
+        f"b = open(sys.argv[1], 'rb').read({max_bytes + 1})\n"
+        f"d = json.loads(b, parse_constant=reject_constant, "
+        f"object_pairs_hook=unique_object) if len(b) <= {max_bytes} else {{}}\n"
+        f"raise SystemExit(0 if {expression} else 1)\n"
     )
 
 
@@ -401,12 +460,6 @@ def _worker_row(
         "status": "blocked",
         "blocker": None,
     }
-    if entry.status not in _TERMINAL_MIGRATABLE:
-        row["status"] = "blocked"
-        row["blocker"] = (
-            f"job is {entry.status}; pending cleanup waits for terminal state"
-        )
-        return row
     if entry.status not in _TERMINAL_MIGRATABLE:
         row["blocker"] = (
             f"job is {entry.status}; active or uncertain jobs stay in place"
@@ -600,10 +653,12 @@ def _copy_registry_row(row: dict[str, object]) -> None:
     )
     if source_result is None:
         raise OSError("registry source disappeared")
-    source_payload = source_result[0]
+    job_id = str(row["identity"])
+    source_entry = _registry_entry(source, layout=LEGACY_LAYOUT, job_id=job_id)
+    destination_payload = encode_registry_entry(source_entry)
     destination.parent.mkdir(parents=True, exist_ok=True)
     if row["status"] == "duplicate_verified":
-        if not _same_file(source, destination):
+        if not _same_registry_entry(source, destination, job_id=job_id):
             raise OSError("registry duplicate changed after migration plan")
         source.unlink()
         fsync_dir(source.parent)
@@ -618,7 +673,7 @@ def _copy_registry_row(row: dict[str, object]) -> None:
     completed = False
     try:
         os.fchmod(descriptor, 0o600)
-        view = memoryview(source_payload)
+        view = memoryview(destination_payload)
         while view:
             written = os.write(descriptor, view)
             if written <= 0:
@@ -627,14 +682,13 @@ def _copy_registry_row(row: dict[str, object]) -> None:
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
-        if not _same_file(source, temporary):
-            raise OSError("registry copy verification failed")
+        _registry_entry(temporary, layout=ROLE_LAYOUT, job_id=job_id)
         try:
             os.link(temporary, destination, follow_symlinks=False)
         except FileExistsError:
             raise OSError("registry destination appeared during migration") from None
         published = True
-        if not _same_file(source, destination):
+        if not _same_registry_entry(source, destination, job_id=job_id):
             raise OSError("published registry verification failed")
         directory = os.open(
             destination.parent,

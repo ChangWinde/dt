@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sys
 
+import pytest
+
 from dt import __version__
 from dt import entrypoint
 
@@ -65,3 +67,96 @@ def test_non_exact_version_arguments_delegate_to_full_cli(monkeypatch):
     entrypoint.main()
 
     assert calls == [True]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["dt", "not-a-command"],
+        ["dt", "info"],
+        ["dt", "run", "--gpus", "not-an-int", "--", "true"],
+        ["dt", "free", "--not-an-option"],
+    ],
+)
+def test_usage_errors_have_validation_exit_code(argv, monkeypatch, capsys):
+    from dt import cli
+
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as raised:
+        cli.main()
+
+    output = capsys.readouterr()
+    assert raised.value.code == 1
+    assert output.out == ""
+    assert "Usage:" in output.err or "usage:" in output.err.lower()
+
+
+def test_usage_error_is_machine_readable_when_json_precedes_separator(
+    monkeypatch, capsys
+):
+    from dt import cli
+
+    monkeypatch.setattr(sys, "argv", ["dt", "free", "--json", "--not-an-option"])
+    with pytest.raises(SystemExit) as raised:
+        cli.main()
+
+    output = capsys.readouterr()
+    assert raised.value.code == 1
+    assert output.err == ""
+    assert json.loads(output.out) == {
+        "schema_version": "dt_cli_error_v1",
+        "error": "usage",
+        "message": "No such option: --not-an-option",
+        "exit_code": 1,
+    }
+
+
+def test_payload_json_flag_does_not_change_dt_usage_error_contract(monkeypatch, capsys):
+    from dt import cli
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dt", "run", "--unknown", "--", "python", "app.py", "--json"],
+    )
+    with pytest.raises(SystemExit) as raised:
+        cli.main()
+
+    output = capsys.readouterr()
+    assert raised.value.code == 1
+    assert output.out == ""
+    assert "unknown" in output.err.lower()
+
+
+def test_no_args_prints_help_and_succeeds(monkeypatch, capsys):
+    from dt import cli
+
+    monkeypatch.setattr(sys, "argv", ["dt"])
+    cli.main()
+
+    output = capsys.readouterr()
+    assert "Usage:" in output.out
+    assert output.err == ""
+
+
+@pytest.mark.parametrize("command", [["free", "--json"], ["info", "x", "--json"]])
+def test_configuration_error_is_machine_readable(
+    command, tmp_path, monkeypatch, capsys
+):
+    from dt import cli
+
+    missing = tmp_path / "missing.yaml"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("DT_CONFIG", str(missing))
+    monkeypatch.setattr(sys, "argv", ["dt", *command])
+    with pytest.raises(SystemExit) as raised:
+        cli.main()
+
+    output = capsys.readouterr()
+    assert raised.value.code == 1
+    assert output.err == ""
+    payload = json.loads(output.out)
+    assert payload["schema_version"] == "dt_cli_error_v1"
+    assert payload["error"] == "configuration"
+    assert payload["exit_code"] == 1
+    assert str(tmp_path) not in payload["message"]

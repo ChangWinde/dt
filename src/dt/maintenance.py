@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
+import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from .config import HeadConfig
 from .jobs import (
     JobEntry,
+    JOB_ID_RE,
     RegistryDamage,
     RegistryError,
     is_uncertain_launch,
@@ -34,7 +38,13 @@ from .layout import (
     normalize_node_root,
 )
 from .lifecycle import liveness_shell
-from .private_state import PrivateStateError, private_lock
+from .private_state import (
+    PrivateStateError,
+    atomic_write,
+    decode_strict_json,
+    private_lock,
+    read_bounded,
+)
 from .snapshot_store import load_state, lock, save_state
 from .sshio import diagnostic_excerpt
 
@@ -44,6 +54,97 @@ Runner = Callable[
     [str, bool, str, float, bool],
     subprocess.CompletedProcess[str],
 ]
+
+CLEAN_PLAN_SCHEMA_VERSION = "dt_clean_plan_v1"
+CLEAN_PLAN_TTL_S = 24 * 60 * 60
+# Durable authorization and observation have deliberately separate bounds.  A
+# large cleanup remains exactly authorized in one immutable plan while CLI
+# consumers page through a small read-only projection of that plan.
+MAX_CLEAN_PLAN_BYTES = 64 * 1024 * 1024
+MAX_CLEAN_PLAN_ITEMS = 200_000
+DEFAULT_CLEAN_PLAN_PAGE_ITEMS = 100
+MAX_CLEAN_PLAN_PAGE_ITEMS = 1_000
+MAX_CLEAN_PLAN_PAGE_BYTES = 1024 * 1024
+# Keep room for the stable response envelope even when item strings need JSON
+# escaping; CLI verifies the final serialized size as a second boundary.
+_CLEAN_PLAN_PAGE_ITEMS_BUDGET = 768 * 1024
+_MAX_CLEAN_PLAN_IDENTITY_BYTES = 64 * 1024
+CLEAN_PLAN_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+class CleanPlanError(RuntimeError):
+    """A durable cleanup authorization cannot be trusted or applied."""
+
+
+@dataclass(frozen=True)
+class CleanAuthorization:
+    """The exact mutable job identity authorized by one cleanup preview."""
+
+    job_id: str
+    node: str
+    node_local: bool
+    job_dir: str
+    storage_layout: str | None
+    updated_at: float | None
+
+    @classmethod
+    def from_entry(cls, entry: JobEntry) -> CleanAuthorization:
+        return cls(
+            job_id=entry.job_id,
+            node=entry.node,
+            node_local=entry.node_local,
+            job_dir=entry.job_dir,
+            storage_layout=entry.storage_layout,
+            updated_at=entry.updated_at,
+        )
+
+
+@dataclass(frozen=True)
+class CleanManagedResultAuthorization:
+    """The exact filesystem identity of one managed pull result.
+
+    Directory contents may change after planning; authorization names the
+    directory object by path/device/inode plus job ID, and apply revalidates
+    that identity while holding the destination lock immediately before delete.
+    """
+
+    job_id: str
+    path: str
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class CleanPlan:
+    """One bounded, expiring, cross-command cleanup authorization."""
+
+    plan_id: str
+    center: str
+    created_at: float
+    expires_at: float
+    jobs: tuple[CleanAuthorization, ...]
+    managed_results: tuple[CleanManagedResultAuthorization, ...]
+    managed_identity: dict[str, object]
+
+
+@dataclass(frozen=True)
+class CleanPlanPageItem:
+    """One immutable authorization identity in a read-only plan page."""
+
+    index: int
+    kind: str
+    identity: dict[str, object]
+
+
+@dataclass(frozen=True)
+class CleanPlanPage:
+    """A bounded projection over jobs followed by managed-result identities."""
+
+    offset: int
+    limit: int
+    total: int
+    items: tuple[CleanPlanPageItem, ...]
+    next_offset: int | None
 
 
 @dataclass(frozen=True)
@@ -66,6 +167,362 @@ class CleanReport:
 class SweepReport:
     removed: int
     failures: list[CleanFailure]
+
+
+def _clean_plan_path(cfg: HeadConfig, plan_id: str) -> Path:
+    if CLEAN_PLAN_ID_RE.fullmatch(plan_id) is None:
+        raise CleanPlanError("cleanup plan identity is invalid")
+    return cfg.control_state_dir() / "clean-plans" / f"{plan_id}.json"
+
+
+def _clean_authorization(
+    selected: JobEntry | CleanAuthorization,
+) -> CleanAuthorization:
+    authorization = (
+        selected
+        if isinstance(selected, CleanAuthorization)
+        else CleanAuthorization.from_entry(selected)
+    )
+    if JOB_ID_RE.fullmatch(authorization.job_id) is None:
+        raise CleanPlanError("cleanup authorization has an invalid job identity")
+    if (
+        not isinstance(authorization.node, str)
+        or not authorization.node
+        or not isinstance(authorization.node_local, bool)
+        or not isinstance(authorization.job_dir, str)
+        or not authorization.job_dir
+        or authorization.storage_layout not in {None, LEGACY_LAYOUT, ROLE_LAYOUT}
+        or (
+            authorization.updated_at is not None
+            and (
+                isinstance(authorization.updated_at, bool)
+                or not isinstance(authorization.updated_at, (int, float))
+                or not math.isfinite(float(authorization.updated_at))
+                or authorization.updated_at < 0
+            )
+        )
+    ):
+        raise CleanPlanError("cleanup authorization has an invalid job identity")
+    return authorization
+
+
+def _canonical_managed_identity(value: object) -> dict[str, object]:
+    """Validate that a caller-supplied identity is lossless bounded JSON."""
+    if not isinstance(value, dict):
+        raise CleanPlanError("cleanup managed identity must be a JSON object")
+    try:
+        encoded = json.dumps(
+            value,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise CleanPlanError("cleanup managed identity is not valid JSON") from exc
+    if not isinstance(decoded, dict) or decoded != value:
+        raise CleanPlanError("cleanup managed identity is not lossless JSON")
+    return decoded
+
+
+def _managed_result_identities(
+    managed_identity: dict[str, object],
+) -> tuple[CleanManagedResultAuthorization, ...]:
+    """Return validated result identities embedded in a cleanup plan.
+
+    Older callers may omit ``managed_results`` entirely.  When present it is
+    part of the destructive authority, so malformed or duplicate identities
+    fail closed instead of becoming invisible to inspection.
+    """
+    raw_results = managed_identity.get("managed_results", [])
+    if not isinstance(raw_results, list):
+        raise CleanPlanError("cleanup plan managed results are invalid")
+    if len(raw_results) > MAX_CLEAN_PLAN_ITEMS:
+        raise CleanPlanError("cleanup plan exceeds its item limit")
+    results: list[CleanManagedResultAuthorization] = []
+    seen: set[tuple[str, str, int, int]] = set()
+    expected_fields = {"job_id", "path", "device", "inode"}
+    for raw in raw_results:
+        if not isinstance(raw, dict) or set(raw) != expected_fields:
+            raise CleanPlanError("cleanup plan managed result identity is invalid")
+        job_id = raw.get("job_id")
+        path = raw.get("path")
+        device = raw.get("device")
+        inode = raw.get("inode")
+        if (
+            not isinstance(job_id, str)
+            or JOB_ID_RE.fullmatch(job_id) is None
+            or not isinstance(path, str)
+            or not path
+            or isinstance(device, bool)
+            or not isinstance(device, int)
+            or device < 0
+            or isinstance(inode, bool)
+            or not isinstance(inode, int)
+            or inode <= 0
+        ):
+            raise CleanPlanError("cleanup plan managed result identity is invalid")
+        key = (job_id, path, device, inode)
+        if key in seen:
+            raise CleanPlanError("cleanup plan contains duplicate managed results")
+        seen.add(key)
+        results.append(CleanManagedResultAuthorization(job_id, path, device, inode))
+    return tuple(results)
+
+
+def _page_item_size(item: CleanPlanPageItem) -> int:
+    return len(
+        json.dumps(
+            {
+                "index": item.index,
+                "kind": item.kind,
+                **item.identity,
+            },
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+
+
+def _require_pageable_identity(item: CleanPlanPageItem) -> None:
+    if _page_item_size(item) > _MAX_CLEAN_PLAN_IDENTITY_BYTES:
+        raise CleanPlanError("cleanup plan identity exceeds its size limit")
+
+
+def _require_pageable_plan_identities(
+    jobs: Sequence[CleanAuthorization],
+    managed_results: Sequence[CleanManagedResultAuthorization],
+) -> None:
+    for index, authorization in enumerate(jobs):
+        _require_pageable_identity(
+            CleanPlanPageItem(index, "job", asdict(authorization))
+        )
+    for index, result in enumerate(managed_results, start=len(jobs)):
+        _require_pageable_identity(
+            CleanPlanPageItem(index, "managed_result", asdict(result))
+        )
+
+
+def clean_plan_page(
+    plan: CleanPlan,
+    *,
+    offset: int = 0,
+    limit: int = DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
+) -> CleanPlanPage:
+    """Return a stable bounded page without changing cleanup authority.
+
+    The immutable sequence is all job authorizations in persisted order,
+    followed by all managed-result authorizations in persisted order.  The
+    global ``index`` and ``next_offset`` let callers enumerate it without
+    overlap or omission even when the byte budget shortens a requested page.
+    """
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise CleanPlanError("cleanup plan page offset is invalid")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or limit < 1
+        or limit > MAX_CLEAN_PLAN_PAGE_ITEMS
+    ):
+        raise CleanPlanError(
+            f"cleanup plan page limit must be between 1 and {MAX_CLEAN_PLAN_PAGE_ITEMS}"
+        )
+    total = len(plan.jobs) + len(plan.managed_results)
+    if offset > total:
+        raise CleanPlanError("cleanup plan page offset exceeds its item count")
+
+    items: list[CleanPlanPageItem] = []
+    encoded_bytes = 2  # JSON list delimiters.
+    stop = min(total, offset + limit)
+    for index in range(offset, stop):
+        if index < len(plan.jobs):
+            item = CleanPlanPageItem(
+                index=index,
+                kind="job",
+                identity=asdict(plan.jobs[index]),
+            )
+        else:
+            item = CleanPlanPageItem(
+                index=index,
+                kind="managed_result",
+                identity=asdict(plan.managed_results[index - len(plan.jobs)]),
+            )
+        item_bytes = _page_item_size(item) + (1 if items else 0)
+        if encoded_bytes + item_bytes > _CLEAN_PLAN_PAGE_ITEMS_BUDGET:
+            if not items:
+                raise CleanPlanError("cleanup plan identity exceeds page size limit")
+            break
+        items.append(item)
+        encoded_bytes += item_bytes
+    consumed = offset + len(items)
+    return CleanPlanPage(
+        offset=offset,
+        limit=limit,
+        total=total,
+        items=tuple(items),
+        next_offset=consumed if consumed < total else None,
+    )
+
+
+def create_clean_plan(
+    cfg: HeadConfig,
+    jobs: Sequence[JobEntry | CleanAuthorization],
+    *,
+    managed_identity: dict[str, object] | None = None,
+    now: float | None = None,
+) -> CleanPlan:
+    """Persist one exact cleanup authorization for a later CLI invocation."""
+    created_at = time.time() if now is None else now
+    if (
+        isinstance(created_at, bool)
+        or not isinstance(created_at, (int, float))
+        or not math.isfinite(float(created_at))
+        or created_at < 0
+    ):
+        raise CleanPlanError("cleanup plan timestamp is invalid")
+    if len(jobs) > MAX_CLEAN_PLAN_ITEMS:
+        raise CleanPlanError("cleanup plan exceeds its item limit")
+    authorizations = tuple(_clean_authorization(entry) for entry in jobs)
+    if len({entry.job_id for entry in authorizations}) != len(authorizations):
+        raise CleanPlanError("cleanup plan contains duplicate jobs")
+    managed = _canonical_managed_identity(
+        {} if managed_identity is None else managed_identity
+    )
+    managed_results = _managed_result_identities(managed)
+    if len(authorizations) + len(managed_results) > MAX_CLEAN_PLAN_ITEMS:
+        raise CleanPlanError("cleanup plan exceeds its item limit")
+    _require_pageable_plan_identities(authorizations, managed_results)
+    plan_id = secrets.token_hex(16)
+    plan = CleanPlan(
+        plan_id=plan_id,
+        center=cfg.center,
+        created_at=float(created_at),
+        expires_at=float(created_at) + CLEAN_PLAN_TTL_S,
+        jobs=authorizations,
+        managed_results=managed_results,
+        managed_identity=managed,
+    )
+    document = {
+        "schema_version": CLEAN_PLAN_SCHEMA_VERSION,
+        "plan_id": plan.plan_id,
+        "center": plan.center,
+        "created_at": plan.created_at,
+        "expires_at": plan.expires_at,
+        "jobs": [asdict(entry) for entry in plan.jobs],
+        "managed_identity": plan.managed_identity,
+    }
+    try:
+        encoded = (
+            json.dumps(
+                document,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        raise CleanPlanError("cleanup plan cannot be encoded") from exc
+    if len(encoded) > MAX_CLEAN_PLAN_BYTES:
+        raise CleanPlanError("cleanup plan exceeds its size limit")
+    try:
+        atomic_write(_clean_plan_path(cfg, plan.plan_id), encoded)
+    except PrivateStateError as exc:
+        raise CleanPlanError("cleanup plan cannot be persisted durably") from exc
+    return plan
+
+
+def load_clean_plan(
+    cfg: HeadConfig,
+    plan_id: str,
+    *,
+    now: float | None = None,
+) -> CleanPlan:
+    """Load and validate one unexpired cleanup authorization."""
+    path = _clean_plan_path(cfg, plan_id)
+    try:
+        result = read_bounded(path, max_bytes=MAX_CLEAN_PLAN_BYTES)
+    except PrivateStateError as exc:
+        raise CleanPlanError("cleanup plan cannot be read safely") from exc
+    if result is None:
+        raise CleanPlanError("cleanup plan does not exist")
+    try:
+        raw = decode_strict_json(result[0])
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise CleanPlanError("cleanup plan is malformed") from exc
+    expected_fields = {
+        "schema_version",
+        "plan_id",
+        "center",
+        "created_at",
+        "expires_at",
+        "jobs",
+        "managed_identity",
+    }
+    if not isinstance(raw, dict) or set(raw) != expected_fields:
+        raise CleanPlanError("cleanup plan envelope is invalid")
+    if raw.get("schema_version") != CLEAN_PLAN_SCHEMA_VERSION:
+        raise CleanPlanError("cleanup plan schema is unsupported")
+    if raw.get("plan_id") != plan_id or raw.get("center") != cfg.center:
+        raise CleanPlanError("cleanup plan authority does not match this center")
+    created_at = raw.get("created_at")
+    expires_at = raw.get("expires_at")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or value < 0
+        for value in (created_at, expires_at)
+    ):
+        raise CleanPlanError("cleanup plan timestamps are invalid")
+    assert isinstance(created_at, (int, float))
+    assert isinstance(expires_at, (int, float))
+    if not created_at < expires_at <= created_at + CLEAN_PLAN_TTL_S:
+        raise CleanPlanError("cleanup plan lifetime is invalid")
+    observed_now = time.time() if now is None else now
+    if (
+        isinstance(observed_now, bool)
+        or not isinstance(observed_now, (int, float))
+        or not math.isfinite(float(observed_now))
+        or observed_now < 0
+    ):
+        raise CleanPlanError("cleanup plan validation time is invalid")
+    if observed_now < created_at:
+        raise CleanPlanError("cleanup plan validation time precedes its creation")
+    if observed_now >= expires_at:
+        raise CleanPlanError("cleanup plan has expired")
+    raw_jobs = raw.get("jobs")
+    if not isinstance(raw_jobs, list):
+        raise CleanPlanError("cleanup plan job authorizations are invalid")
+    if len(raw_jobs) > MAX_CLEAN_PLAN_ITEMS:
+        raise CleanPlanError("cleanup plan exceeds its item limit")
+    authorizations: list[CleanAuthorization] = []
+    authorization_fields = set(CleanAuthorization.__dataclass_fields__)
+    for item in raw_jobs:
+        if not isinstance(item, dict) or set(item) != authorization_fields:
+            raise CleanPlanError("cleanup plan job authorization is invalid")
+        try:
+            authorization = CleanAuthorization(**item)
+        except TypeError as exc:
+            raise CleanPlanError("cleanup plan job authorization is invalid") from exc
+        authorizations.append(_clean_authorization(authorization))
+    if len({entry.job_id for entry in authorizations}) != len(authorizations):
+        raise CleanPlanError("cleanup plan contains duplicate jobs")
+    managed = _canonical_managed_identity(raw.get("managed_identity"))
+    managed_results = _managed_result_identities(managed)
+    if len(authorizations) + len(managed_results) > MAX_CLEAN_PLAN_ITEMS:
+        raise CleanPlanError("cleanup plan exceeds its item limit")
+    _require_pageable_plan_identities(authorizations, managed_results)
+    return CleanPlan(
+        plan_id=plan_id,
+        center=cfg.center,
+        created_at=float(created_at),
+        expires_at=float(expires_at),
+        jobs=tuple(authorizations),
+        managed_results=managed_results,
+        managed_identity=managed,
+    )
 
 
 @contextmanager
@@ -542,7 +999,7 @@ def clean_jobs(
     projects: set[str] | None = None,
     runner: Runner,
     before_registry_remove: BeforeRegistryRemove | None = None,
-    authorized: Sequence[JobEntry] | None = None,
+    authorized: Sequence[JobEntry | CleanAuthorization] | None = None,
 ) -> CleanReport:
     """Delete only the preview-authorized set, shrinking on revalidation.
 
@@ -558,30 +1015,31 @@ def clean_jobs(
     removed_entries: list[JobEntry] = []
     failures: list[CleanFailure] = []
     for selected in victims:
-        with job_lock(cfg, selected.job_id):
+        authorization = _clean_authorization(selected)
+        with job_lock(cfg, authorization.job_id):
             try:
-                entry = load(cfg, selected.job_id)
+                entry = load(cfg, authorization.job_id)
             except (RegistryError, ValueError) as exc:
                 # A row that turned unreadable after the cleanup plan must
                 # not abort the whole sweep; report it and keep going.
                 message = f"registry row became unreadable: {exc}"
-                log(f"{selected.job_id}: {message}; registry retained")
+                log(f"{authorization.job_id}: {message}; registry retained")
                 failures.append(
                     CleanFailure(
-                        job_id=selected.job_id,
-                        node=selected.node,
+                        job_id=authorization.job_id,
+                        node=authorization.node,
                         kind="registry_row_unreadable",
                         message=message,
                     )
                 )
                 continue
             authorized_identity = (
-                selected.job_id,
-                selected.node,
-                selected.node_local,
-                selected.job_dir,
-                selected.storage_layout,
-                selected.updated_at,
+                authorization.job_id,
+                authorization.node,
+                authorization.node_local,
+                authorization.job_dir,
+                authorization.storage_layout,
+                authorization.updated_at,
             )
             current_identity = (
                 (
@@ -606,11 +1064,11 @@ def clean_jobs(
                 )
             ):
                 message = "job state or active references changed after cleanup plan"
-                log(f"{selected.job_id}: {message}; registry retained")
+                log(f"{authorization.job_id}: {message}; registry retained")
                 failures.append(
                     CleanFailure(
-                        job_id=selected.job_id,
-                        node=selected.node,
+                        job_id=authorization.job_id,
+                        node=authorization.node,
                         kind="state_changed",
                         message=message,
                     )

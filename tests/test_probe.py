@@ -1,7 +1,9 @@
 import json
 import os
+import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -9,6 +11,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import dt.probe as probe_mod
+import pytest
 from dt.config import HeadConfig, Node
 from dt.probe import (
     GPU_ERROR,
@@ -602,7 +605,10 @@ def test_probe_node_types_remote_probe_timeout_as_reachable_error(monkeypatch):
         timeout,
         check=False,
         retry_stale_mux=False,
+        cancel_event=None,
+        capture_limit_bytes=None,
     ):
+        assert capture_limit_bytes == probe_mod.CONTROL_CAPTURE_BYTES
         captured.update(command=command, timeout=timeout)
         assert retry_stale_mux is True
         return subprocess.CompletedProcess([], 124, "", "")
@@ -633,7 +639,10 @@ def test_probe_node_uses_node_specific_timeout_by_default(monkeypatch):
         timeout,
         check=False,
         retry_stale_mux=False,
+        cancel_event=None,
+        capture_limit_bytes=None,
     ):
+        assert capture_limit_bytes == probe_mod.CONTROL_CAPTURE_BYTES
         captured.update(command=command, timeout=timeout)
         assert retry_stale_mux is True
         return subprocess.CompletedProcess(
@@ -729,13 +738,13 @@ def test_concurrent_fresh_probes_share_one_inflight_refresh(tmp_path, monkeypatc
     lock_attempts = 0
     attempts_guard = threading.Lock()
 
-    def observed_lock(path):
+    def observed_lock(path, **kwargs):
         nonlocal lock_attempts
         with attempts_guard:
             lock_attempts += 1
             if lock_attempts == 2:
                 second_lock_attempted.set()
-        return original_lock(path)
+        return original_lock(path, **kwargs)
 
     monkeypatch.setattr(probe_mod, "probe_node", probe)
     monkeypatch.setattr(probe_mod, "_probe_refresh_lock", observed_lock)
@@ -829,7 +838,42 @@ def test_oversized_probe_cache_is_ignored_and_replaced_by_live_data(
 
     assert calls == ["n1"]
     assert [status.node for status in statuses] == ["n1"]
-    assert cache.stat().st_size <= 120
+    assert not cache.exists() or cache.stat().st_size <= 120
+
+
+def test_probe_cache_fifo_is_ignored_without_blocking(tmp_path):
+    cache = tmp_path / "probe.json"
+    os.mkfifo(cache)
+
+    started = time.monotonic()
+    assert probe_mod._read_probe_cache(cache) is None
+    assert time.monotonic() - started < 0.5
+
+
+def test_probe_cache_removes_an_old_generation_when_live_json_cannot_fit(
+    tmp_path, monkeypatch
+):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    cache = cfg.cache_dir() / "probe.json"
+    cache.write_bytes(b"oversized")
+    monkeypatch.setattr(probe_mod, "PROBE_CACHE_MAX_BYTES", 1)
+    monkeypatch.setattr(
+        probe_mod,
+        "probe_node",
+        lambda node, threshold: NodeStatus(node=node.name),
+    )
+
+    statuses = probe_mod.probe_center(cfg, use_cache=True)
+
+    assert [status.node for status in statuses] == ["n1"]
+    assert not cache.exists()
 
 
 def test_probe_cache_with_wrong_node_set_is_ignored(tmp_path, monkeypatch):
@@ -946,3 +990,199 @@ def test_probe_cache_preserves_gpu_inventory_error(tmp_path, monkeypatch):
 
     assert fresh[0].gpu_inventory_error == expected
     assert cached[0].gpu_inventory_error == expected
+
+
+def test_interactive_probe_budget_returns_stale_capacity_fail_closed(
+    tmp_path, monkeypatch
+):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="fast", local=True), Node(name="slow")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    old_gpu = Gpu(
+        index=0,
+        uuid="GPU-old",
+        mem_used=0,
+        mem_total=24576,
+        util=0,
+        free=True,
+    )
+    fallback = [NodeStatus(node="slow", gpus=[old_gpu])]
+
+    def probe(_cfg, node, *, cancel_event=None):
+        if node.name == "fast":
+            return NodeStatus(node="fast")
+        assert cancel_event is not None
+        cancel_event.wait(5)
+        return NodeStatus(node="slow")
+
+    monkeypatch.setattr(probe_mod, "_probe_configured_node", probe)
+    started = time.monotonic()
+    statuses = probe_mod._collect_center(
+        cfg,
+        soft_deadline_s=0.02,
+        fallback=fallback,
+    )
+
+    assert time.monotonic() - started < 0.5
+    assert [status.node for status in statuses] == ["fast", "slow"]
+    assert statuses[0].stale is False
+    assert statuses[1].stale is True
+    assert statuses[1].error and statuses[1].error.startswith("stale:")
+    assert statuses[1].gpus[0].free is False
+
+
+def test_interactive_probe_budget_reaps_term_ignoring_transport(
+    tmp_path,
+    monkeypatch,
+):
+    import dt.sshio as sshio
+
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="slow")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    pid_file = tmp_path / "probe.pid"
+    observed_graces: list[float | None] = []
+
+    def ignore_term(
+        _node_name,
+        _is_local,
+        _command,
+        timeout,
+        check=False,
+        retry_stale_mux=False,
+        cancel_event=None,
+        cancel_grace_s=None,
+        capture_limit_bytes=None,
+    ):
+        assert retry_stale_mux is True
+        assert capture_limit_bytes == probe_mod.CONTROL_CAPTURE_BYTES
+        observed_graces.append(cancel_grace_s)
+        return sshio._run_bounded_process(
+            [
+                "/bin/sh",
+                "-c",
+                f"trap '' TERM; echo $$ > {shlex.quote(str(pid_file))}; sleep 30",
+            ],
+            timeout=timeout,
+            cancel_event=cancel_event,
+            cancel_grace_s=cancel_grace_s,
+        )
+
+    monkeypatch.setattr(probe_mod, "run_on", ignore_term)
+    budget = 0.1
+    started = time.monotonic()
+    statuses = probe_mod._collect_center(cfg, soft_deadline_s=budget)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < budget + 0.35
+    assert observed_graces == [probe_mod.INTERACTIVE_PROBE_CANCEL_GRACE_S]
+    assert statuses[0].stale is True
+    assert pid_file.is_file()
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
+def test_interactive_probe_does_not_wait_behind_another_process_refresh(
+    tmp_path, monkeypatch
+):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    old_gpu = Gpu(
+        index=0,
+        uuid="GPU-old",
+        mem_used=0,
+        mem_total=24576,
+        util=0,
+        free=True,
+    )
+    cache_file = cfg.cache_dir() / "probe.json"
+    probe_mod._write_probe_cache(
+        cache_file,
+        [NodeStatus(node="n1", gpus=[old_gpu])],
+    )
+    expired = time.time() - probe_mod.CACHE_TTL_S - 10
+    os.utime(cache_file, (expired, expired))
+    lock_file = cfg.cache_dir() / "probe.lock"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import fcntl, os, sys, time; "
+                "fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT, 0o600); "
+                "fcntl.flock(fd, fcntl.LOCK_EX); print('ready', flush=True); "
+                "time.sleep(30)"
+            ),
+            str(lock_file),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+        monkeypatch.setattr(
+            probe_mod,
+            "_collect_center",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("a lock-busy interactive read must not start probes")
+            ),
+        )
+
+        started = time.monotonic()
+        statuses = probe_mod.probe_center(
+            cfg,
+            use_cache=True,
+            soft_deadline_s=0.02,
+        )
+
+        assert time.monotonic() - started < 0.5
+        assert len(statuses) == 1
+        assert statuses[0].stale is True
+        assert (
+            statuses[0].error == "stale: another probe refresh is already in progress"
+        )
+        assert statuses[0].gpus[0].free is False
+    finally:
+        holder.terminate()
+        holder.wait(timeout=5)
+
+
+def test_future_dated_probe_cache_is_never_fresh(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    cache = cfg.cache_dir() / "probe.json"
+    cache.write_text(json.dumps([asdict(NodeStatus(node="n1"))]))
+    future = time.time() + 3600
+    os.utime(cache, (future, future))
+    monkeypatch.setattr(
+        probe_mod,
+        "_collect_center",
+        lambda *_args, **_kwargs: [NodeStatus(node="n1", error="live")],
+    )
+
+    status = probe_mod.probe_center(cfg, use_cache=True)
+
+    assert status[0].error == "live"

@@ -9,8 +9,8 @@ Rules baked in (DistTrainer.md appendix B):
 
 from __future__ import annotations
 
-import codecs
 import hashlib
+import math
 import os
 import re
 import select
@@ -41,11 +41,16 @@ BULK_TRANSFER_TIMEOUT_S = 4 * 3600
 GENERATED_SSH_CONFIG_MAX_BYTES = 1024 * 1024
 MAX_TRANSFER_RETRIES = 10
 PRIVATE_RSYNC_CHMOD = "Du=rwx,Dgo=,Fu+rw,Fgo="
-MAX_CAPTURE_CHARS = 16 * 1024 * 1024
-_CAPTURE_CHUNK_CHARS = 64 * 1024
+MAX_CAPTURE_BYTES = 16 * 1024 * 1024
+CONTROL_CAPTURE_BYTES = 256 * 1024
+ARTIFACT_CAPTURE_BYTES = 4 * 1024 * 1024
+REMOTE_DT_CAPTURE_BYTES = 5 * 1024 * 1024
+_CAPTURE_CHUNK_BYTES = 64 * 1024
 MAX_RETRY_MESSAGE_CHARS = 2048
 MAX_DIAGNOSTIC_CHARS = 4096
 MAX_STDIN_BYTES = 1024 * 1024
+DEFAULT_TERMINATION_GRACE_S = 2.0
+CANCEL_POLL_INTERVAL_S = 0.2
 _RSYNC_INTEGER_SEPARATORS = str.maketrans("", "", ",. \u00a0\u202f")
 
 
@@ -80,6 +85,12 @@ class SSHWorkload(str, Enum):
     # the operator's general agent would expose every key it contains to another
     # same-identity process on that gateway.
     ARTIFACT_RELAY = "artifact-relay"
+
+
+def _capture_limit_for_workload(workload: SSHWorkload) -> int:
+    if workload in {SSHWorkload.CONTROL, SSHWorkload.ARTIFACT_RELAY}:
+        return CONTROL_CAPTURE_BYTES
+    return ARTIFACT_CAPTURE_BYTES
 
 
 @dataclass(frozen=True)
@@ -378,7 +389,16 @@ RSYNC_UNREACHABLE_EXIT_CODES = frozenset({10, 12, 30, 35, 255})
 # immediately instead of adding 5s/10s backoff to an actionable error.
 RSYNC_RETRYABLE_EXIT_CODES = RSYNC_UNREACHABLE_EXIT_CODES | {24}
 _RSYNC_NONRETRYABLE_FAILURES = frozenset(
-    {"authentication", "deadline", "destination", "host_key", "permission", "space"}
+    {
+        "authentication",
+        "configuration",
+        "deadline",
+        "destination",
+        "host_key",
+        "negotiation",
+        "permission",
+        "space",
+    }
 )
 # Only these failures are evidence that a selected network edge is unhealthy.
 # Authentication, trust, permissions, capacity, and artifact-data failures are
@@ -419,6 +439,27 @@ def classify_rsync_failure(returncode: int, stdout: str, stderr: str) -> str:
         or "remote host identification" in detail
     ):
         return "host_key"
+    if any(
+        marker in detail
+        for marker in (
+            "bad configuration option",
+            "terminating, 1 bad configuration options",
+            "percent_expand: unknown key",
+            "configuration file line ",
+        )
+    ):
+        return "configuration"
+    if any(
+        marker in detail
+        for marker in (
+            "unable to negotiate",
+            "no matching host key type found",
+            "no matching key exchange method found",
+            "no matching cipher found",
+            "no matching mac found",
+        )
+    ):
+        return "negotiation"
     if (
         "permission denied (publickey" in detail
         or "authentication failed" in detail
@@ -510,14 +551,30 @@ def run_remote(
     workload: SSHWorkload = SSHWorkload.CONTROL,
     retry_stale_mux: bool = False,
     cancel_event: Event | None = None,
+    cancel_grace_s: float | None = None,
+    stdin_bytes: bytes | None = None,
+    capture_limit_bytes: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a shell string on host, capturing output."""
+    """Run a shell string on host, capturing output.
+
+    ``stdin_bytes`` is an explicitly bounded private channel.  It is spooled
+    outside argv by :func:`_run_bounded_process`; callers must not use it for
+    an interactive/TTY command.
+    """
     started = time.monotonic()
+    capture_limit = (
+        _capture_limit_for_workload(workload)
+        if capture_limit_bytes is None
+        else capture_limit_bytes
+    )
     try:
         proc = _run_bounded_process(
             ssh_cmd(host, remote, workload=workload),
             timeout=timeout,
+            capture_limit_bytes=capture_limit,
             cancel_event=cancel_event,
+            cancel_grace_s=cancel_grace_s,
+            stdin_bytes=stdin_bytes,
         )
     except subprocess.TimeoutExpired:
         # The remote command may contain credentials or arbitrary user data.
@@ -544,7 +601,10 @@ def run_remote(
                         multiplex=False,
                     ),
                     timeout=remaining,
+                    capture_limit_bytes=capture_limit,
                     cancel_event=cancel_event,
+                    cancel_grace_s=cancel_grace_s,
+                    stdin_bytes=stdin_bytes,
                 )
             except subprocess.TimeoutExpired:
                 raise RemoteError(host, f"timed out after {timeout}s")
@@ -562,15 +622,26 @@ def run_local(
     timeout: float = 15,
     check: bool = False,
     cancel_event: Event | None = None,
+    cancel_grace_s: float | None = None,
     workload: SSHWorkload = SSHWorkload.CONTROL,
+    stdin_bytes: bytes | None = None,
+    capture_limit_bytes: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     # cwd=home so relative paths behave exactly like an ssh login would.
+    capture_limit = (
+        _capture_limit_for_workload(workload)
+        if capture_limit_bytes is None
+        else capture_limit_bytes
+    )
     try:
         proc = _run_bounded_process(
             ["bash", "-c", command],
             timeout=timeout,
             cwd=os.path.expanduser("~"),
+            capture_limit_bytes=capture_limit,
             cancel_event=cancel_event,
+            cancel_grace_s=cancel_grace_s,
+            stdin_bytes=stdin_bytes,
         )
     except subprocess.TimeoutExpired as exc:
         raise RemoteError("local", f"timed out after {timeout}s") from exc
@@ -592,6 +663,9 @@ def run_on(
     workload: SSHWorkload = SSHWorkload.CONTROL,
     retry_stale_mux: bool = False,
     cancel_event: Event | None = None,
+    cancel_grace_s: float | None = None,
+    stdin_bytes: bytes | None = None,
+    capture_limit_bytes: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if is_local:
         return run_local(
@@ -599,7 +673,10 @@ def run_on(
             timeout=timeout,
             check=check,
             cancel_event=cancel_event,
+            cancel_grace_s=cancel_grace_s,
             workload=workload,
+            stdin_bytes=stdin_bytes,
+            capture_limit_bytes=capture_limit_bytes,
         )
     return run_remote(
         node_name,
@@ -609,6 +686,9 @@ def run_on(
         workload=workload,
         retry_stale_mux=retry_stale_mux,
         cancel_event=cancel_event,
+        cancel_grace_s=cancel_grace_s,
+        stdin_bytes=stdin_bytes,
+        capture_limit_bytes=capture_limit_bytes,
     )
 
 
@@ -633,7 +713,12 @@ def remote_dt(
     host: str, argv: list[str], timeout: float = 30
 ) -> subprocess.CompletedProcess[str]:
     """Invoke dt on a head node (absolute path; PATH is not set over ssh)."""
-    return run_remote(host, remote_dt_cmd(argv), timeout=timeout)
+    return run_remote(
+        host,
+        remote_dt_cmd(argv),
+        timeout=timeout,
+        capture_limit_bytes=REMOTE_DT_CAPTURE_BYTES,
+    )
 
 
 def _signal_process_group(
@@ -657,45 +742,60 @@ def _signal_process_group(
         pass
 
 
-class _BoundedTextCapture:
-    """Drain a text pipe completely while retaining only a bounded head/tail."""
+class _BoundedByteCapture:
+    """Drain a pipe completely while retaining a byte-bounded head and tail."""
 
     def __init__(self, limit: int) -> None:
         self.limit = limit
         self.head_limit = limit // 2
         self.tail_limit = limit - self.head_limit
-        self.head = ""
-        self.tail: deque[str] = deque()
-        self.tail_chars = 0
-        self.total_chars = 0
+        self.head = bytearray()
+        self.tail: deque[bytes] = deque()
+        self.tail_bytes = 0
+        self.total_bytes = 0
 
-    def append(self, chunk: str) -> None:
-        self.total_chars += len(chunk)
+    def append(self, chunk: bytes | str) -> None:
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", errors="replace")
+        self.total_bytes += len(chunk)
         if len(self.head) < self.head_limit:
             needed = self.head_limit - len(self.head)
-            self.head += chunk[:needed]
+            self.head.extend(chunk[:needed])
             chunk = chunk[needed:]
         if not chunk:
             return
         self.tail.append(chunk)
-        self.tail_chars += len(chunk)
-        while self.tail_chars > self.tail_limit and self.tail:
-            excess = self.tail_chars - self.tail_limit
+        self.tail_bytes += len(chunk)
+        while self.tail_bytes > self.tail_limit and self.tail:
+            excess = self.tail_bytes - self.tail_limit
             oldest = self.tail[0]
             if len(oldest) <= excess:
                 self.tail.popleft()
-                self.tail_chars -= len(oldest)
+                self.tail_bytes -= len(oldest)
             else:
                 self.tail[0] = oldest[excess:]
-                self.tail_chars -= excess
+                self.tail_bytes -= excess
 
     def render(self) -> str:
-        tail = "".join(self.tail)
-        if self.total_chars <= self.limit:
-            return self.head + tail
-        omitted = self.total_chars - self.limit
-        marker = f"\n[dt: {omitted} output characters omitted]\n"
-        return self.head + marker + tail
+        tail = b"".join(self.tail)
+        if self.total_bytes <= self.limit:
+            return (bytes(self.head) + tail).decode("utf-8", errors="replace")
+        omitted = max(0, self.total_bytes - self.limit)
+        marker = b""
+        payload_budget = self.limit
+        for _ in range(4):
+            marker = f"\n[dt: {omitted} output bytes omitted]\n".encode()
+            payload_budget = max(0, self.limit - len(marker))
+            updated_omitted = self.total_bytes - payload_budget
+            if updated_omitted == omitted:
+                break
+            omitted = updated_omitted
+        head_budget = payload_budget // 2
+        tail_budget = payload_budget - head_budget
+        retained = bytes(self.head[:head_budget]) + marker
+        if tail_budget:
+            retained += tail[-tail_budget:]
+        return retained.decode("utf-8", errors="replace")
 
 
 @dataclass
@@ -727,23 +827,20 @@ class _ProcessCapture:
 @dataclass
 class _PipeDrain:
     stream: TextIOBase
-    capture: _BoundedTextCapture
+    capture: _BoundedByteCapture
     eof: bool = False
 
 
 def _drain_text_pipe(state: _PipeDrain, stop: Event) -> None:
     """Drain without an EOF dependency on escaped/inherited pipe writers."""
     stream = state.stream
-    encoding = stream.encoding or "utf-8"
-    errors = stream.errors or "replace"
-    decoder = codecs.getincrementaldecoder(encoding)(errors=errors)
     descriptor = stream.fileno()
     reads_after_stop = 0
     try:
         os.set_blocking(descriptor, False)
         while True:
             try:
-                block = os.read(descriptor, _CAPTURE_CHUNK_CHARS)
+                block = os.read(descriptor, _CAPTURE_CHUNK_BYTES)
             except BlockingIOError:
                 if stop.is_set():
                     # child.wait() and a reader can observe completion in
@@ -761,7 +858,7 @@ def _drain_text_pipe(state: _PipeDrain, stop: Event) -> None:
             if not block:
                 state.eof = True
                 break
-            state.capture.append(decoder.decode(block))
+            state.capture.append(block)
             if stop.is_set():
                 reads_after_stop += 1
                 # A descendant that escaped the transport process group must
@@ -770,7 +867,6 @@ def _drain_text_pipe(state: _PipeDrain, stop: Event) -> None:
                 if reads_after_stop >= 64:
                     break
     finally:
-        state.capture.append(decoder.decode(b"", final=True))
         stream.close()
 
 
@@ -778,6 +874,7 @@ def _start_process_capture(
     child: subprocess.Popen[str],
     *,
     stderr_inherited: bool = False,
+    capture_limit_bytes: int = MAX_CAPTURE_BYTES,
 ) -> _ProcessCapture:
     """Start bounded readers, retaining compatibility with narrow test doubles."""
     stdout = getattr(child, "stdout", None)
@@ -787,11 +884,11 @@ def _start_process_capture(
     ):
         return _ProcessCapture(None, None, (), Event(), communicate_fallback=True)
     stop = Event()
-    stdout_state = _PipeDrain(stdout, _BoundedTextCapture(MAX_CAPTURE_CHARS))
+    stdout_state = _PipeDrain(stdout, _BoundedByteCapture(capture_limit_bytes))
     stderr_state: _PipeDrain | None = None
     if not stderr_inherited:
         assert isinstance(stderr, TextIOBase)
-        stderr_state = _PipeDrain(stderr, _BoundedTextCapture(MAX_CAPTURE_CHARS))
+        stderr_state = _PipeDrain(stderr, _BoundedByteCapture(capture_limit_bytes))
     thread_list = [
         Thread(
             target=_drain_text_pipe,
@@ -836,6 +933,8 @@ def _wait_process(
 def _stop_process_group(
     child: subprocess.Popen[str],
     capture: _ProcessCapture | None = None,
+    *,
+    term_grace_s: float = DEFAULT_TERMINATION_GRACE_S,
 ) -> tuple[str, str, bool]:
     """Terminate and reap one process group despite repeated user interrupts."""
     capture = capture or _ProcessCapture(
@@ -848,7 +947,7 @@ def _stop_process_group(
     interrupted = False
     _signal_process_group(child, signal.SIGTERM)
     try:
-        stdout, stderr = _wait_process(child, capture, 2)
+        stdout, stderr = _wait_process(child, capture, term_grace_s)
         return stdout, stderr, interrupted
     except KeyboardInterrupt:
         interrupted = True
@@ -871,7 +970,9 @@ def _run_bounded_process(
     timeout: float,
     cwd: str | None = None,
     inherit_stderr: bool = False,
+    capture_limit_bytes: int = MAX_CAPTURE_BYTES,
     cancel_event: Event | None = None,
+    cancel_grace_s: float | None = None,
     env: Mapping[str, str] | None = None,
     stdin_bytes: bytes | None = None,
     stdin_file: BinaryIO | None = None,
@@ -899,6 +1000,21 @@ def _run_bounded_process(
         )
     if stdin_bytes is not None and len(stdin_bytes) > MAX_STDIN_BYTES:
         raise ValueError(f"stdin payload exceeds {MAX_STDIN_BYTES} bytes")
+    if (
+        isinstance(capture_limit_bytes, bool)
+        or not isinstance(capture_limit_bytes, int)
+        or not 1 <= capture_limit_bytes <= MAX_CAPTURE_BYTES
+    ):
+        raise ValueError(
+            f"capture limit must be between 1 and {MAX_CAPTURE_BYTES} bytes"
+        )
+    if cancel_grace_s is not None and (
+        isinstance(cancel_grace_s, bool)
+        or not isinstance(cancel_grace_s, (int, float))
+        or not math.isfinite(float(cancel_grace_s))
+        or cancel_grace_s < 0
+    ):
+        raise ValueError("cancel grace must be a finite non-negative duration")
     if cancel_event is not None and cancel_event.is_set():
         return subprocess.CompletedProcess(cmd, 130, "", "command cancelled locally")
 
@@ -954,11 +1070,20 @@ def _run_bounded_process(
     finally:
         if stdin_spool is not None:
             stdin_spool.close()
-    capture = _start_process_capture(child, stderr_inherited=inherit_stderr)
+    capture = _start_process_capture(
+        child,
+        stderr_inherited=inherit_stderr,
+        capture_limit_bytes=capture_limit_bytes,
+    )
     deadline = time.monotonic() + timeout
     while True:
         remaining = max(0.0, deadline - time.monotonic())
-        wait_s = min(0.2, remaining) if cancel_event is not None else remaining
+        cancel_poll_s = CANCEL_POLL_INTERVAL_S
+        if cancel_grace_s is not None:
+            cancel_poll_s = min(cancel_poll_s, max(0.01, cancel_grace_s))
+        wait_s = (
+            min(cancel_poll_s, remaining) if cancel_event is not None else remaining
+        )
         try:
             stdout, stderr = _wait_process(child, capture, wait_s)
             return subprocess.CompletedProcess(cmd, child.returncode, stdout, stderr)
@@ -975,7 +1100,16 @@ def _run_bounded_process(
             timed_out = cancel_event is None or time.monotonic() >= deadline
             if not cancelled and not timed_out:
                 continue
-            stdout, stderr, interrupted = _stop_process_group(child, capture)
+            term_grace_s = (
+                float(cancel_grace_s)
+                if cancelled and cancel_grace_s is not None
+                else DEFAULT_TERMINATION_GRACE_S
+            )
+            stdout, stderr, interrupted = _stop_process_group(
+                child,
+                capture,
+                term_grace_s=term_grace_s,
+            )
             if interrupted:
                 raise KeyboardInterrupt from exc
             if cancelled:
@@ -998,6 +1132,7 @@ def run_capture_stdout(
     cmd: list[str],
     *,
     timeout: float,
+    capture_limit_bytes: int = MAX_CAPTURE_BYTES,
     cancel_event: Event | None = None,
     stdin_bytes: bytes | None = None,
     stdin_file: BinaryIO | None = None,
@@ -1013,6 +1148,7 @@ def run_capture_stdout(
         cmd,
         timeout=timeout,
         inherit_stderr=True,
+        capture_limit_bytes=capture_limit_bytes,
         cancel_event=cancel_event,
         stdin_bytes=stdin_bytes,
         stdin_file=stdin_file,
@@ -1040,7 +1176,10 @@ def _run_rsync_attempt(
         errors="replace",
         start_new_session=True,
     )
-    capture = _start_process_capture(child)
+    capture = _start_process_capture(
+        child,
+        capture_limit_bytes=ARTIFACT_CAPTURE_BYTES,
+    )
     deadline = time.monotonic() + timeout
     while True:
         remaining = max(0.0, deadline - time.monotonic())
@@ -1141,8 +1280,10 @@ def rsync(
     if safe_links:
         # Pull direction materializes trees written by a zero-trust remote;
         # -a would otherwise recreate symlinks pointing outside the
-        # transferred tree on the operator's machine.
-        cmd.append("--safe-links")
+        # transferred tree on the operator's machine. Archive mode also asks
+        # rsync to recreate device nodes and special files; explicitly turn
+        # those off at the same zero-trust boundary.
+        cmd.extend(["--safe-links", "--no-devices", "--no-specials"])
     if delete:
         cmd.append("--delete")
     if delete_excluded:
@@ -1160,7 +1301,7 @@ def rsync(
     # local or remote command.
     cmd += ["--", src, dst]
     attempt = 0
-    attempt_stdout = _BoundedTextCapture(MAX_CAPTURE_CHARS)
+    attempt_stdout = _BoundedByteCapture(ARTIFACT_CAPTURE_BYTES)
     captured_attempts = 0
     while True:
         if cancel_event is not None and cancel_event.is_set():

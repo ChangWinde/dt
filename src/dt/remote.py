@@ -20,6 +20,7 @@ from .redaction import redact_remote_detail
 from .terminal import sanitize_terminal_text
 from .sshio import (
     BULK_TRANSFER_TIMEOUT_S,
+    REMOTE_DT_CAPTURE_BYTES,
     RemoteError,
     run_capture_stdout,
     run_remote,
@@ -100,7 +101,12 @@ def remote_dt(
     timeout: float = 30,
 ) -> subprocess.CompletedProcess[str]:
     """Invoke the head's persisted active DT command over SSH."""
-    return run_remote(host, _head_dt_command(argv), timeout=timeout)
+    return run_remote(
+        host,
+        _head_dt_command(argv),
+        timeout=timeout,
+        capture_limit_bytes=REMOTE_DT_CAPTURE_BYTES,
+    )
 
 
 def _fan_error(detail: object, *, default: str) -> str:

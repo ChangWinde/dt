@@ -205,6 +205,9 @@ def test_stage_command_builds_a_private_guarded_lan_pull(tmp_path):
     assert "~/dt/jobs" not in command.split("10.0.0.7:")[1]
     assert "--exclude checkpoints/" in command
     assert "--safe-links" in command
+    assert "--no-devices" in command
+    assert "--no-specials" in command
+    assert "--exclude /dt/" in command
     assert "--delete" in command
     assert "DT_RELAY_UNSAFE_STAGING" in command
     # 1 GiB * 1.1 headroom in KiB.
@@ -320,6 +323,32 @@ def test_stage_outputs_translates_failures_into_relay_errors(tmp_path):
         )
 
 
+@pytest.mark.parametrize("stream", ["stdout", "stderr"])
+def test_stage_outputs_refuses_rsync_special_file_omissions(tmp_path, stream):
+    cfg = _cfg(tmp_path)
+    route = _gateway_route(cfg)
+
+    def skipped_special(node, local, command, timeout=15, check=False, **kw):
+        diagnostic = 'skipping non-regular file "blocked.pipe"\n'
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            diagnostic if stream == "stdout" else "",
+            diagnostic if stream == "stderr" else "",
+        )
+
+    with pytest.raises(RelayError, match="unsupported special file"):
+        stage_outputs(
+            cfg,
+            route,
+            "jid",
+            "~/dt/jobs/jid",
+            excludes=[],
+            estimate_bytes=BIG,
+            runner=skipped_special,
+        )
+
+
 def test_stage_outputs_retries_transport_failures_once_then_succeeds(
     tmp_path, monkeypatch
 ):
@@ -425,6 +454,8 @@ def _invoke_pull(cfg, monkeypatch, *, rsync_results, stage_results, argv=()):
     rsync_calls = []
 
     def fake_run_on(node, local, command, timeout=15, check=False, **kw):
+        if cli.PULL_EVIDENCE_MARK in command:
+            return subprocess.CompletedProcess([], 0, "", "")
         if "pull-staging" in command and "rsync" in command:
             staged.append((node, command))
             outcome = stage_results[min(len(staged) - 1, len(stage_results) - 1)]

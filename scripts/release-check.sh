@@ -73,7 +73,8 @@ VIRTUAL_ENV="$QUALITY_ENV" uv sync --project "$SOURCE_TREE" \
 (
     cd "$SOURCE_TREE"
     export DT_REPO_HYGIENE_MANIFEST="$TRACKED_MANIFEST"
-    "$QUALITY_ENV/bin/pytest" -q -p no:cacheprovider
+    "$QUALITY_ENV/bin/pytest" -q -p no:cacheprovider \
+        -W error::pytest.PytestUnhandledThreadExceptionWarning
     "$QUALITY_ENV/bin/python" scripts/docs.py
     "$QUALITY_ENV/bin/ruff" check .
     "$QUALITY_ENV/bin/ruff" format --check .
@@ -169,7 +170,7 @@ for release_python in 3.10 3.11; do
     "$INSTALL_ENV/bin/dt" --help >/dev/null
     for command in init free run ps logs wait info request pull batch chain compare \
         watch metrics rerun exec fork attach kill clean events storage compact sync \
-        seed topology doctor agent migrate; do
+        seed topology doctor diagnose agent migrate; do
         "$INSTALL_ENV/bin/dt" "$command" --help >/dev/null
     done
     "$INSTALL_ENV/bin/dt" agent install --help >/dev/null

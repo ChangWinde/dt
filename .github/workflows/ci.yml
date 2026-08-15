@@ -31,10 +31,11 @@ jobs:
       - name: Install Python
         run: uv python install "${{ matrix.python-version }}"
 
-      - name: Install shell compatibility test dependency
+      - name: Install integration and shell test dependencies
         run: |
           sudo apt-get update --quiet
-          sudo apt-get install --yes --no-install-recommends zsh
+          sudo apt-get install --yes --no-install-recommends \
+            openssh-server rsync zsh
 
       - name: Sync locked development environment
         env:
@@ -43,12 +44,14 @@ jobs:
 
       - name: Test
         env:
+          DT_REQUIRE_RELAY_E2E: "1"
           TZ: UTC
           UV_PYTHON: ${{ matrix.python-version }}
         run: |
           set +e
           env -u FORCE_COLOR uv run --no-sync pytest -q --tb=short \
             -p no:cacheprovider \
+            -W error::pytest.PytestUnhandledThreadExceptionWarning \
             2>&1 | tee "$RUNNER_TEMP/dt-pytest.log"
           test_status=${PIPESTATUS[0]}
           set -e

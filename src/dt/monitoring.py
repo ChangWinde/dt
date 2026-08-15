@@ -10,10 +10,35 @@ from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
 from .jobs import JobEntry
-from .layout import display_node_path, node_path_expression
+from .layout import (
+    ROLE_LAYOUT,
+    display_node_path,
+    job_control_dir,
+    job_payload_dir,
+    node_path_expression,
+)
 
 JsonDict = dict[str, Any]
+TELEMETRY_ENVELOPE_MAX_BYTES = 1024 * 1024
+# Transport framing and a final newline sit outside the validated envelope.
+# Keep enough headroom that a legal maximum-size summary is never replaced by
+# sshio's truncation marker before the protocol validator can inspect it.
+TELEMETRY_TRANSPORT_CAPTURE_BYTES = TELEMETRY_ENVELOPE_MAX_BYTES + 64 * 1024
+# Compatibility bound used by unrelated automatic text tails in the CLI.
 AUTOMATIC_TAIL_MAX_BYTES = 256 * 1024
+LEGACY_TELEMETRY_READ_MAX_BYTES = 256 * 1024
+TELEMETRY_ENVELOPE_SCHEMA = "dt_telemetry_summary_envelope_v2"
+LEGACY_TELEMETRY_ENVELOPE_SCHEMA = "dt_telemetry_summary_envelope_v1"
+TELEMETRY_SUMMARY_SCHEMA = "dt_resource_summary_v1"
+_LEGACY_TELEMETRY_PREFIX = "DT_LEGACY_TELEMETRY_V1"
+_TELEMETRY_OMISSION_REASONS = frozenset(
+    {
+        "source_changed_during_read",
+        "source_unavailable",
+        "summary_output_limit",
+        "tail_scan_byte_limit",
+    }
+)
 
 
 class ResourceRunner(Protocol):
@@ -26,6 +51,8 @@ class ResourceRunner(Protocol):
         command: str,
         timeout: float = 15,
         check: bool = False,
+        *,
+        capture_limit_bytes: int,
     ) -> subprocess.CompletedProcess[str]: ...
 
 
@@ -51,6 +78,13 @@ class ResourceTelemetryQuery:
 
     @property
     def path(self) -> str:
+        control = job_control_dir(self.entry.job_dir, self.entry.storage_layout)
+        return f"{control}/evidence/resources.jsonl"
+
+    @property
+    def legacy_path(self) -> str | None:
+        if self.entry.storage_layout == ROLE_LAYOUT:
+            return None
         return f"{self.entry.job_dir}/outputs/dt/resources.jsonl"
 
     @property
@@ -63,14 +97,35 @@ class ResourceTelemetryQuery:
 
     def command(self, *, require_file: bool) -> str:
         path = node_path_expression(self.path)
-        reader = (
-            f"tail -c {AUTOMATIC_TAIL_MAX_BYTES} -- {path} | tail -n {self.tail}"
-            if self.tail
-            else f"cat -- {path}"
+        helper = node_path_expression(
+            f"{job_payload_dir(self.entry.job_dir, self.entry.storage_layout)}"
+            "/telemetry_summary.py"
         )
+        reader = f"python3 -I {helper} --path {path} --tail {self.tail}"
+        fallback = _legacy_telemetry_reader(path, tail=self.tail)
+        primary = (
+            f"if test -f {helper} && test ! -L {helper}; then {reader}; "
+            f"elif test -f {path} && test ! -L {path}; then {fallback}; "
+            "else false; fi"
+        )
+        legacy_path = self.legacy_path
+        if legacy_path is not None:
+            legacy = node_path_expression(legacy_path)
+            legacy_reader = f"python3 -I {helper} --path {legacy} --tail {self.tail}"
+            legacy_fallback = _legacy_telemetry_reader(legacy, tail=self.tail)
+            conditional = (
+                f"if test -f {helper} && test ! -L {helper}; then "
+                f"if test -f {path}; then {reader}; "
+                f"elif test -f {legacy}; then {legacy_reader}; else false; fi; "
+                f"elif test -f {path} && test ! -L {path}; then {fallback}; "
+                f"elif test -f {legacy} && test ! -L {legacy}; then "
+                f"{legacy_fallback}; "
+                "else false; fi"
+            )
+            return conditional if require_file else f"{conditional} 2>/dev/null || true"
         if require_file:
-            return f"test -f {path} && {reader}"
-        return f"{reader} 2>/dev/null || true"
+            return primary
+        return f"{primary} 2>/dev/null || true"
 
     def read(
         self,
@@ -84,6 +139,7 @@ class ResourceTelemetryQuery:
             self.entry.node_local,
             self.command(require_file=require_file),
             timeout=timeout,
+            capture_limit_bytes=TELEMETRY_TRANSPORT_CAPTURE_BYTES,
         )
         detail = (
             proc.stderr or proc.stdout or f"telemetry probe exited {proc.returncode}"
@@ -100,14 +156,57 @@ class ResourceTelemetryQuery:
         *,
         include_identity: bool,
     ) -> dict[str, object] | None:
-        summary, invalid = summarize_resource_text(text)
-        if summary is None:
+        if not text.strip():
             return None
+        legacy = _legacy_telemetry_summary(text)
+        if legacy is not None:
+            summary, counts, source_size = legacy
+            if summary is None:
+                return None
+            summary.update(
+                {
+                    "invalid_lines": counts["invalid_lines"],
+                    "tail_limit": self.tail_limit,
+                    "path": self.display_path,
+                    "complete": False,
+                    "omission_reason": "legacy_bounded_fallback",
+                    "telemetry_counts": counts,
+                    "source_size_bytes": source_size,
+                    "evidence_provenance": (
+                        "control_path"
+                        if self.entry.storage_layout == ROLE_LAYOUT
+                        else "legacy_unisolated"
+                    ),
+                }
+            )
+            if include_identity:
+                summary.update(
+                    {
+                        "job_id": self.entry.job_id,
+                        "name": self.entry.name,
+                        "node": self.entry.node,
+                    }
+                )
+            return summary
+        envelope = _telemetry_envelope(text, requested_tail=self.tail)
+        summary_value = envelope["summary"]
+        if not isinstance(summary_value, dict):
+            return None
+        summary = dict(summary_value)
+        telemetry_counts = cast(dict[str, object], envelope["counts"])
         summary.update(
             {
-                "invalid_lines": invalid,
+                "invalid_lines": telemetry_counts["invalid_lines"],
                 "tail_limit": self.tail_limit,
                 "path": self.display_path,
+                "complete": envelope["complete"],
+                "omission_reason": envelope["omission_reason"],
+                "telemetry_counts": telemetry_counts,
+                "evidence_provenance": (
+                    "control_path"
+                    if self.entry.storage_layout == ROLE_LAYOUT
+                    else "legacy_unisolated"
+                ),
             }
         )
         if include_identity:
@@ -119,6 +218,184 @@ class ResourceTelemetryQuery:
                 }
             )
         return summary
+
+
+def _legacy_telemetry_reader(path: str, *, tail: int) -> str:
+    """Render a bounded raw reader for capsules predating the summary helper.
+
+    Old job payloads are immutable, so an upgraded head cannot retrofit the
+    node-side streaming helper into them.  The compatibility reader never
+    executes a task-owned replacement: it reads only the expected regular
+    evidence file, caps stdout, and labels the result for conservative
+    head-side aggregation.
+    """
+    bounded = f"tail -c {LEGACY_TELEMETRY_READ_MAX_BYTES} {path}"
+    if tail:
+        bounded = f"{bounded} | tail -n {tail}"
+    return (
+        f"dt_legacy_size=$(LC_ALL=C wc -c < {path}) || exit 1; "
+        f"printf '{_LEGACY_TELEMETRY_PREFIX} %s\\n' \"$dt_legacy_size\"; "
+        f"{bounded}"
+    )
+
+
+def _legacy_telemetry_summary(
+    text: str,
+) -> tuple[dict[str, object] | None, dict[str, int], int] | None:
+    """Decode the explicitly incomplete legacy compatibility transport."""
+    header, separator, body = text.partition("\n")
+    prefix = f"{_LEGACY_TELEMETRY_PREFIX} "
+    if not header.startswith(prefix):
+        return None
+    if (
+        not separator
+        or len(text.encode("utf-8")) > LEGACY_TELEMETRY_READ_MAX_BYTES + 128
+    ):
+        raise ValueError("invalid legacy telemetry fallback")
+    size_text = header[len(prefix) :]
+    if not size_text.isascii() or not size_text.isdigit():
+        raise ValueError("invalid legacy telemetry source size")
+    source_size = int(size_text)
+    if source_size > 2**53 - 1:
+        raise ValueError("legacy telemetry source is too large")
+    summary, invalid = summarize_resource_text(body)
+    lines_selected = len(body.splitlines())
+    valid_rows = lines_selected - invalid
+    counts = {
+        # The full historical line count is unknowable without the helper.
+        # Keep this internally consistent view scoped to the bounded suffix;
+        # `complete=false` prevents consumers treating it as the whole source.
+        "lines_total": lines_selected,
+        "lines_selected": lines_selected,
+        "valid_rows": valid_rows,
+        "invalid_lines": invalid,
+        "bytes_read": len(body.encode("utf-8")),
+    }
+    return summary, counts, source_size
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate telemetry envelope field: {key}")
+        result[key] = value
+    return result
+
+
+def _bounded_count(value: object, field: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 <= value <= 2**53 - 1
+    ):
+        raise ValueError(f"invalid telemetry envelope count: {field}")
+    return value
+
+
+def _telemetry_envelope(text: str, *, requested_tail: int) -> dict[str, object]:
+    """Validate the bounded node-side aggregation contract."""
+    if len(text.encode("utf-8")) > TELEMETRY_ENVELOPE_MAX_BYTES:
+        raise ValueError("telemetry summary envelope exceeds 1 MiB")
+    try:
+        raw = json.loads(
+            text,
+            parse_constant=_reject_non_finite,
+            object_pairs_hook=_unique_object,
+        )
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("invalid telemetry summary envelope") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("telemetry summary envelope must be an object")
+    schema = raw.get("schema_version")
+    required = {
+        "schema_version",
+        "requested_tail",
+        "lines_total",
+        "lines_selected",
+        "valid_rows",
+        "invalid_lines",
+        "bytes_read",
+        "counts",
+        "complete",
+        "omission_reason",
+        "summary",
+    }
+    if schema == TELEMETRY_ENVELOPE_SCHEMA:
+        required.add("lines_total_complete")
+    if not required.issubset(raw) or set(raw) - (required | {"error"}):
+        raise ValueError("telemetry summary envelope fields are incompatible")
+    if schema not in {
+        TELEMETRY_ENVELOPE_SCHEMA,
+        LEGACY_TELEMETRY_ENVELOPE_SCHEMA,
+    }:
+        raise ValueError("unsupported telemetry summary envelope")
+    if _bounded_count(raw["requested_tail"], "requested_tail") != requested_tail:
+        raise ValueError("telemetry summary tail does not match the request")
+    lines_selected = _bounded_count(raw["lines_selected"], "lines_selected")
+    valid_rows = _bounded_count(raw["valid_rows"], "valid_rows")
+    invalid_lines = _bounded_count(raw["invalid_lines"], "invalid_lines")
+    bytes_read = _bounded_count(raw["bytes_read"], "bytes_read")
+    counts: dict[str, object] = {
+        "lines_selected": lines_selected,
+        "valid_rows": valid_rows,
+        "invalid_lines": invalid_lines,
+        "bytes_read": bytes_read,
+    }
+    if schema == TELEMETRY_ENVELOPE_SCHEMA:
+        total_complete = raw["lines_total_complete"]
+        if not isinstance(total_complete, bool):
+            raise ValueError("telemetry total-line completeness is not boolean")
+        total_value = raw["lines_total"]
+        if total_complete:
+            lines_total: int | None = _bounded_count(total_value, "lines_total")
+        elif total_value is not None:
+            raise ValueError("incomplete telemetry total-line count is not null")
+        else:
+            lines_total = None
+        counts["lines_total"] = lines_total
+        counts["lines_total_complete"] = total_complete
+    else:
+        lines_total = _bounded_count(raw["lines_total"], "lines_total")
+        counts["lines_total"] = lines_total
+    if raw["counts"] != counts:
+        raise ValueError("telemetry summary count views disagree")
+    if valid_rows + invalid_lines != lines_selected:
+        raise ValueError("telemetry summary selected-row accounting is inconsistent")
+    if lines_total is not None and lines_selected > lines_total:
+        raise ValueError("telemetry summary selected rows exceed the source")
+    complete = raw["complete"]
+    reason = raw["omission_reason"]
+    if not isinstance(complete, bool):
+        raise ValueError("telemetry summary completeness is not boolean")
+    if complete:
+        if reason is not None:
+            raise ValueError("complete telemetry summary carries an omission")
+        if requested_tail == 0:
+            if lines_total is None:
+                raise ValueError("complete all-history telemetry lacks a total")
+            expected_selected = lines_total
+        elif lines_total is None:
+            expected_selected = requested_tail
+        else:
+            expected_selected = min(requested_tail, lines_total)
+        if lines_selected != expected_selected:
+            raise ValueError("complete telemetry summary did not cover its window")
+    elif reason not in _TELEMETRY_OMISSION_REASONS:
+        raise ValueError("incomplete telemetry summary has no typed reason")
+    summary = raw["summary"]
+    if summary is not None and (
+        not isinstance(summary, dict)
+        or summary.get("schema_version") != TELEMETRY_SUMMARY_SCHEMA
+    ):
+        raise ValueError("telemetry summary payload is incompatible")
+    if (summary is None) != (valid_rows == 0):
+        raise ValueError("telemetry summary payload and row count disagree")
+    error = raw.get("error")
+    if error is not None and (not isinstance(error, str) or len(error) > 1024):
+        raise ValueError("telemetry summary error is invalid")
+    raw["counts"] = counts
+    return cast(dict[str, object], raw)
 
 
 def safe_phase_name(value: object) -> bool:

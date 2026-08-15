@@ -17,16 +17,18 @@ import stat
 import subprocess
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import fcntl
 from pathlib import Path
+from threading import Event
 from typing import Iterator, TypeAlias
 
 from .config import HeadConfig, Node
 from .layout import ROLE_LAYOUT, node_path_expression
-from .sshio import RemoteError, run_on
+from .private_state import PrivateStateError, decode_strict_json, read_bounded_regular
+from .sshio import CONTROL_CAPTURE_BYTES, RemoteError, run_on
 
 GPU_ERROR = "---DT-GPU-ERROR---"
 APP_ERROR = "---DT-APP-ERROR---"
@@ -80,6 +82,10 @@ SEP = "---DT---"
 SYS_SEP = "---DT-SYS---"
 PROBE_CACHE_MAX_BYTES = 8 * 1024 * 1024
 PROBE_MAX_WORKERS = 32
+INTERACTIVE_PROBE_BUDGET_S = 0.65
+# Interactive status is a read path: once its shared budget expires, a long
+# TERM grace is strictly worse than returning stale fail-closed capacity.
+INTERACTIVE_PROBE_CANCEL_GRACE_S = 0.05
 SYSTEM_Q = r"""
 cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 0)
 load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
@@ -230,6 +236,7 @@ class NodeStatus:
     error: str | None = None
     gpu_inventory_error: str | None = None
     unreachable: bool = False
+    stale: bool = False
 
     @property
     def free_gpus(self) -> list[Gpu]:
@@ -430,16 +437,30 @@ def probe_node(
     timeout: float | None = None,
     *,
     lease_root: str | None = None,
+    cancel_event: Event | None = None,
 ) -> NodeStatus:
     probe_timeout = node.probe_timeout_s if timeout is None else timeout
     try:
-        proc = run_on(
-            node.name,
-            node.local,
-            bounded_probe_command(probe_timeout, lease_root),
-            timeout=probe_timeout + PROBE_TRANSPORT_GRACE_S,
-            retry_stale_mux=True,
-        )
+        if cancel_event is None:
+            proc = run_on(
+                node.name,
+                node.local,
+                bounded_probe_command(probe_timeout, lease_root),
+                timeout=probe_timeout + PROBE_TRANSPORT_GRACE_S,
+                retry_stale_mux=True,
+                capture_limit_bytes=CONTROL_CAPTURE_BYTES,
+            )
+        else:
+            proc = run_on(
+                node.name,
+                node.local,
+                bounded_probe_command(probe_timeout, lease_root),
+                timeout=probe_timeout + PROBE_TRANSPORT_GRACE_S,
+                retry_stale_mux=True,
+                cancel_event=cancel_event,
+                cancel_grace_s=INTERACTIVE_PROBE_CANCEL_GRACE_S,
+                capture_limit_bytes=CONTROL_CAPTURE_BYTES,
+            )
     except Exception as e:  # RemoteError / TimeoutExpired
         return NodeStatus(
             node=node.name,
@@ -487,14 +508,28 @@ def probe_node(
     )
 
 
-def _probe_configured_node(cfg: HeadConfig, node: Node) -> NodeStatus:
+def _probe_configured_node(
+    cfg: HeadConfig,
+    node: Node,
+    *,
+    cancel_event: Event | None = None,
+) -> NodeStatus:
     if cfg.layout == ROLE_LAYOUT:
+        if cancel_event is None:
+            return probe_node(
+                node,
+                cfg.mem_threshold_mib,
+                lease_root=cfg.lease_root_for(node),
+            )
         return probe_node(
             node,
             cfg.mem_threshold_mib,
             lease_root=cfg.lease_root_for(node),
+            cancel_event=cancel_event,
         )
-    return probe_node(node, cfg.mem_threshold_mib)
+    if cancel_event is None:
+        return probe_node(node, cfg.mem_threshold_mib)
+    return probe_node(node, cfg.mem_threshold_mib, cancel_event=cancel_event)
 
 
 def _probe_cache_signature(cache_file: Path) -> CacheSignature | None:
@@ -518,34 +553,21 @@ def _read_probe_cache(
     max_age_s: float | None = None,
     expected_nodes: tuple[str, ...] | None = None,
 ) -> list[NodeStatus] | None:
-    descriptor = -1
     try:
-        descriptor = os.open(
+        result = read_bounded_regular(
             cache_file,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            max_bytes=PROBE_CACHE_MAX_BYTES,
         )
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_size > PROBE_CACHE_MAX_BYTES
-        ):
+        if result is None:
             return None
+        payload, metadata = result
         if max_age_s is not None:
             age = time.time() - metadata.st_mtime
-            if age >= max_age_s:
+            if age < 0 or age >= max_age_s:
                 return None
-        payload = bytearray()
-        while len(payload) <= PROBE_CACHE_MAX_BYTES:
-            block = os.read(
-                descriptor,
-                min(64 * 1024, PROBE_CACHE_MAX_BYTES + 1 - len(payload)),
-            )
-            if not block:
-                break
-            payload.extend(block)
-        if len(payload) > PROBE_CACHE_MAX_BYTES:
+        elif metadata.st_mtime > time.time():
             return None
-        raw = json.loads(payload)
+        raw = decode_strict_json(payload)
         if not isinstance(raw, list):
             return None
         statuses = [
@@ -562,11 +584,16 @@ def _read_probe_cache(
         if not _valid_cached_statuses(statuses, expected_nodes):
             return None
         return statuses
-    except (OSError, TypeError, ValueError, KeyError):
+    except (
+        OSError,
+        PrivateStateError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        KeyError,
+    ):
         return None
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
 
 
 def _valid_cached_statuses(
@@ -672,7 +699,7 @@ def _valid_cached_statuses(
 
 
 @contextmanager
-def _probe_refresh_lock(lock_file: Path) -> Iterator[bool]:
+def _probe_refresh_lock(lock_file: Path, *, blocking: bool = True) -> Iterator[bool]:
     """Serialize cache refreshes across threads and independent dt processes.
 
     The cache remains an optional latency optimization: if the coordination
@@ -681,7 +708,11 @@ def _probe_refresh_lock(lock_file: Path) -> Iterator[bool]:
     try:
         descriptor = os.open(
             lock_file,
-            os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            os.O_WRONLY
+            | os.O_APPEND
+            | os.O_CREAT
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
             0o600,
         )
         metadata = os.fstat(descriptor)
@@ -695,8 +726,9 @@ def _probe_refresh_lock(lock_file: Path) -> Iterator[bool]:
         return
     with stream:
         try:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        except OSError:
+            operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+            fcntl.flock(stream.fileno(), operation)
+        except (BlockingIOError, OSError):
             yield False
             return
         try:
@@ -708,23 +740,94 @@ def _probe_refresh_lock(lock_file: Path) -> Iterator[bool]:
                 pass
 
 
-def _collect_center(cfg: HeadConfig) -> list[NodeStatus]:
-    with ThreadPoolExecutor(
+def _stale_probe_status(
+    node: Node,
+    previous: NodeStatus | None,
+    *,
+    reason: str | None = None,
+) -> NodeStatus:
+    message = reason or (
+        f"stale: live probe exceeded {INTERACTIVE_PROBE_BUDGET_S:g}s interactive budget"
+    )
+    if previous is None:
+        return NodeStatus(
+            node=node.name, error=message, unreachable=not node.local, stale=True
+        )
+    # Stale measurements remain useful for diagnosis, but never advertise
+    # schedulable capacity.  Preserve all other bounded facts explicitly.
+    gpus = [replace(gpu, free=False) for gpu in previous.gpus]
+    return replace(previous, gpus=gpus, error=message, stale=True)
+
+
+def _collect_center(
+    cfg: HeadConfig,
+    *,
+    soft_deadline_s: float | None = None,
+    fallback: list[NodeStatus] | None = None,
+) -> list[NodeStatus]:
+    if soft_deadline_s is None:
+        with ThreadPoolExecutor(
+            max_workers=min(PROBE_MAX_WORKERS, max(len(cfg.nodes), 1))
+        ) as pool:
+            return list(pool.map(lambda n: _probe_configured_node(cfg, n), cfg.nodes))
+
+    cancel = Event()
+    pool = ThreadPoolExecutor(
         max_workers=min(PROBE_MAX_WORKERS, max(len(cfg.nodes), 1))
-    ) as pool:
-        return list(pool.map(lambda n: _probe_configured_node(cfg, n), cfg.nodes))
+    )
+    futures = {
+        pool.submit(_probe_configured_node, cfg, node, cancel_event=cancel): node
+        for node in cfg.nodes
+    }
+    completed, pending = wait(futures, timeout=soft_deadline_s)
+    cancel.set()
+    # run_on observes cancellation at 200 ms cadence and reaps its complete
+    # local SSH process group.  Always join before returning so no probe helper
+    # outlives the command or steals the next invocation's ControlMaster.
+    pool.shutdown(wait=True, cancel_futures=True)
+    previous = {status.node: status for status in (fallback or [])}
+    results: dict[str, NodeStatus] = {}
+    for future in completed:
+        node = futures[future]
+        try:
+            results[node.name] = future.result()
+        except Exception as exc:
+            results[node.name] = NodeStatus(
+                node=node.name,
+                error=f"probe failed: {type(exc).__name__}",
+                unreachable=not node.local,
+            )
+    for future in pending:
+        node = futures[future]
+        results[node.name] = _stale_probe_status(node, previous.get(node.name))
+    return [results[node.name] for node in cfg.nodes]
 
 
 def _write_probe_cache(cache_file: Path, statuses: list[NodeStatus]) -> None:
     tmp_name: str | None = None
     try:
+        encoded = json.dumps(
+            [asdict(status) for status in statuses],
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > PROBE_CACHE_MAX_BYTES:
+            # Never retain an oversized generation that every future reader
+            # must reject. Fresh probe data remains the authoritative result.
+            try:
+                cache_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            return
         fd, tmp_name = tempfile.mkstemp(
             dir=cache_file.parent,
             prefix=f".{cache_file.name}.",
             suffix=".tmp",
         )
-        with os.fdopen(fd, "w") as stream:
-            json.dump([asdict(status) for status in statuses], stream)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(encoded)
         os.replace(tmp_name, cache_file)
         tmp_name = None
     except OSError:
@@ -739,7 +842,12 @@ def _write_probe_cache(cache_file: Path, statuses: list[NodeStatus]) -> None:
                 pass
 
 
-def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
+def probe_center(
+    cfg: HeadConfig,
+    use_cache: bool = True,
+    *,
+    soft_deadline_s: float | None = None,
+) -> list[NodeStatus]:
     cache_file = cfg.cache_dir() / "probe.json"
     expected_nodes = tuple(node.name for node in cfg.nodes)
     initial_signature = _probe_cache_signature(cache_file)
@@ -752,7 +860,29 @@ def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
         if cached is not None:
             return cached
 
-    with _probe_refresh_lock(cfg.cache_dir() / "probe.lock") as coordinated:
+    with _probe_refresh_lock(
+        cfg.cache_dir() / "probe.lock",
+        blocking=soft_deadline_s is None,
+    ) as coordinated:
+        if soft_deadline_s is not None and not coordinated:
+            # An interactive observer must not spend its entire latency budget
+            # behind another process's full refresh.  Reuse bounded stale facts
+            # for diagnosis, but fail every GPU closed; without a cache, return
+            # explicit stale/unknown rows.  The lock owner remains the only
+            # probe producer, so this path starts no background work.
+            fallback = _read_probe_cache(
+                cache_file,
+                expected_nodes=expected_nodes,
+            )
+            previous = {status.node: status for status in (fallback or [])}
+            return [
+                _stale_probe_status(
+                    node,
+                    previous.get(node.name),
+                    reason="stale: another probe refresh is already in progress",
+                )
+                for node in cfg.nodes
+            ]
         # A caller ahead of us may have completed while we waited. Normal
         # callers accept the refreshed TTL; --fresh callers accept it only if
         # the atomic cache generation changed after this invocation began.
@@ -777,8 +907,14 @@ def probe_center(cfg: HeadConfig, use_cache: bool = True) -> list[NodeStatus]:
         ):
             return cached
 
-        statuses = _collect_center(cfg)
-        _write_probe_cache(cache_file, statuses)
+        fallback = _read_probe_cache(cache_file, expected_nodes=expected_nodes)
+        statuses = _collect_center(
+            cfg,
+            soft_deadline_s=soft_deadline_s,
+            fallback=fallback,
+        )
+        if not any(status.stale for status in statuses):
+            _write_probe_cache(cache_file, statuses)
         return statuses
 
 

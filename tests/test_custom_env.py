@@ -243,10 +243,11 @@ def test_support_files_and_launch_transport_values_only_in_private_handoff(
     assert files["custom-env"] == f"HF_TOKEN\0{SECRET}\0"
     assert SECRET not in files["meta.json"]
 
-    seen: dict[str, str] = {}
+    seen: dict[str, object] = {}
 
-    def fake_run_on(name, local, command, timeout):
+    def fake_run_on(name, local, command, timeout, *, stdin_bytes=None):
         seen["command"] = command
+        seen["stdin_bytes"] = stdin_bytes
         return subprocess.CompletedProcess(
             [name],
             0,
@@ -266,8 +267,53 @@ def test_support_files_and_launch_transport_values_only_in_private_handoff(
 
     assert code == 0
     assert isinstance(result, dict)
-    assert "DT_CUSTOM_ENV_PATH=" in seen["command"]
-    assert SECRET not in seen["command"]
+    command = str(seen["command"])
+    assert "DT_PRIVATE_ENV_STDIN=1" in command
+    assert "DT_CUSTOM_ENV_PATH=" not in command
+    assert SECRET not in command
+    assert dispatch.private_env_mod.decode(seen["stdin_bytes"]) == {
+        "HF_TOKEN": SECRET,
+    }
+
+
+def test_launch_keeps_every_private_value_out_of_argv(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    cfg.proxy = "http://operator:proxy-secret@proxy.invalid:8080"
+    cfg.webhook = "https://hooks.invalid/webhook-secret"
+    node = cfg.nodes[0]
+    spec = RunSpec(
+        name="train",
+        gpus=0,
+        cmd=["true"],
+        dispatch_token="a" * 32,
+        custom_env={"HF_TOKEN": SECRET},
+    )
+    seen: dict[str, object] = {}
+
+    def fake_run_on(name, local, command, timeout, *, stdin_bytes=None):
+        seen["command"] = command
+        seen["stdin_bytes"] = stdin_bytes
+        return subprocess.CompletedProcess([name], 0, '{"gpus": [], "pgid": 123}\n', "")
+
+    monkeypatch.setattr(dispatch, "run_on", fake_run_on)
+    code, result = dispatch.launch(cfg, node, "job1", "~/dt/jobs/job1", "dt_job1", spec)
+
+    assert code == 0
+    assert isinstance(result, dict)
+    command = str(seen["command"])
+    for private_value in (
+        SECRET,
+        spec.dispatch_token,
+        cfg.proxy,
+        cfg.webhook,
+    ):
+        assert private_value not in command
+    assert dispatch.private_env_mod.decode(seen["stdin_bytes"]) == {
+        "DT_LAUNCH_TOKEN": spec.dispatch_token,
+        "DT_PROXY": cfg.proxy,
+        "DT_WEBHOOK": cfg.webhook,
+        "HF_TOKEN": SECRET,
+    }
 
 
 def test_ps_rows_and_info_never_expose_private_environment_values(

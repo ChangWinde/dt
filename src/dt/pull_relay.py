@@ -39,6 +39,8 @@ DISK_HEADROOM_DENOMINATOR = 10
 STAGE_TIMEOUT_S = 4 * 3600
 STAGE_ATTEMPTS = 3
 ROUTE_MODES = ("auto", "direct", "gateway")
+APPLICATION_CONTROL_EXCLUDE = "/dt/"
+_RSYNC_SKIPPED_SPECIAL = "skipping non-regular file"
 
 
 class RelayError(RuntimeError):
@@ -222,6 +224,10 @@ def stage_command(
         "--delete",
         "--stats",
         "--safe-links",
+        "--no-devices",
+        "--no-specials",
+        "--exclude",
+        APPLICATION_CONTROL_EXCLUDE,
     ]
     for pattern in excludes:
         argv += ["--exclude", pattern]
@@ -324,6 +330,22 @@ def stage_outputs(
                 f"gateway {route.gateway.name} is unreachable ({type(exc).__name__})"
             ) from exc
         if last.returncode == 0:
+            # ``--no-devices --no-specials`` prevents materialization, but
+            # rsync deliberately reports a skipped FIFO/socket/device as a
+            # successful transfer.  Treat that diagnostic as an incomplete
+            # staging leg: otherwise the gateway path could claim complete
+            # recovery after silently omitting application output.
+            diagnostic = "\n".join((last.stdout or "", last.stderr or ""))
+            if _RSYNC_SKIPPED_SPECIAL in diagnostic:
+                detail = diagnostic_excerpt(
+                    last.stderr,
+                    last.stdout,
+                    fallback="unsupported special file",
+                )
+                raise RelayError(
+                    "node -> gateway staging refused an unsupported special "
+                    f"file: {detail}"
+                )
             moved = _stat_total(_TRANSFERRED_RE, last.stdout or "") or 0
             _record_stage_sample(
                 cfg,

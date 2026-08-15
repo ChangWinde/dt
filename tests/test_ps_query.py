@@ -40,6 +40,51 @@ def test_projection_defaults_exclude_expensive_detail():
     assert "job_dir" not in selected
 
 
+def test_projected_page_is_limited_by_serialized_bytes_without_truncating_rows():
+    rows = []
+    for index in range(500):
+        row = _row(f"job-{index:04d}", created_at=float(index))
+        row["cmd"] = "x" * 40_000
+        rows.append(row)
+
+    payload = ps_query.build_payload(
+        rows,
+        center="c",
+        status=None,
+        active_only=False,
+        issues_only=False,
+        since=None,
+        selected_fields=("job_id", "center", "created_at", "cmd"),
+        limit=500,
+        cursor=None,
+        summary_only=False,
+    )
+
+    assert ps_query.serialized_size(payload) <= ps_query.MAX_RESPONSE_BYTES
+    assert 0 < payload["page"]["returned"] < 500
+    assert payload["page"]["next_cursor"]
+    assert all(len(row["cmd"]) == 40_000 for row in payload["jobs"])
+
+
+def test_single_projected_row_larger_than_page_budget_is_rejected():
+    row = _row("huge", created_at=1)
+    row["cmd"] = "x" * (ps_query.MAX_RESPONSE_BYTES + 1)
+
+    with pytest.raises(ps_query.QueryError, match="request fewer fields"):
+        ps_query.build_payload(
+            [row],
+            center="c",
+            status=None,
+            active_only=False,
+            issues_only=False,
+            since=None,
+            selected_fields=("job_id", "center", "created_at", "cmd"),
+            limit=1,
+            cursor=None,
+            summary_only=False,
+        )
+
+
 def test_projection_rejects_unknown_or_empty_fields():
     with pytest.raises(ps_query.QueryError, match="unknown ps field"):
         ps_query.parse_fields("job_id,secret_future_field")

@@ -16,6 +16,9 @@ from typing import Any
 
 SCHEMA = "dt_result_v1"
 APPLICATION_STATES = frozenset({"success", "scientific_reject"})
+RESULT_FIELDS = frozenset(
+    {"schema_version", "state", "reason", "metadata", "emitted_at"}
+)
 MAX_REASON_BYTES = 4096
 MAX_METADATA_BYTES = 64 * 1024
 MAX_DEPTH = 8
@@ -24,6 +27,15 @@ MAX_RESULT_BYTES = MAX_METADATA_BYTES + MAX_REASON_BYTES + 4096
 
 def _reject_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON number {value!r} is not allowed")
+
+
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON field {key!r} is not allowed")
+        value[key] = item
+    return value
 
 
 def _validate_json(value: Any, depth: int = 0) -> None:
@@ -53,7 +65,11 @@ def _read_metadata(raw: str | None) -> dict[str, Any]:
         return {}
     if len(raw.encode("utf-8")) > MAX_METADATA_BYTES:
         raise ValueError("metadata JSON exceeds 64 KiB")
-    value = json.loads(raw, parse_constant=_reject_constant)
+    value = json.loads(
+        raw,
+        parse_constant=_reject_constant,
+        object_pairs_hook=_unique_object,
+    )
     if not isinstance(value, dict):
         raise ValueError("metadata JSON must be an object")
     _validate_json(value)
@@ -86,7 +102,12 @@ def emit(path: Path, state: str, reason: str | None, metadata: str | None) -> No
         "emitted_at": time.time(),
     }
     encoded = _canonical(payload)
+    if len(encoded) > MAX_RESULT_BYTES:
+        raise ValueError("result document exceeds encoded size limit")
     path.parent.mkdir(parents=True, exist_ok=True)
+    parent = path.parent.lstat()
+    if stat.S_ISLNK(parent.st_mode) or not stat.S_ISDIR(parent.st_mode):
+        raise OSError("result output directory is unsafe")
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
@@ -146,8 +167,16 @@ def read(path: Path) -> dict[str, Any]:
             raise ValueError("result document is too large")
     finally:
         os.close(descriptor)
-    raw = json.loads(payload, parse_constant=_reject_constant)
-    if not isinstance(raw, dict) or raw.get("schema_version") != SCHEMA:
+    raw = json.loads(
+        payload,
+        parse_constant=_reject_constant,
+        object_pairs_hook=_unique_object,
+    )
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != RESULT_FIELDS
+        or raw.get("schema_version") != SCHEMA
+    ):
         raise ValueError("invalid result schema")
     state = raw.get("state")
     if state not in APPLICATION_STATES:
@@ -157,7 +186,7 @@ def read(path: Path) -> dict[str, Any]:
         not isinstance(reason, str) or len(reason.encode("utf-8")) > MAX_REASON_BYTES
     ):
         raise ValueError("invalid result reason")
-    metadata = raw.get("metadata", {})
+    metadata = raw.get("metadata")
     if not isinstance(metadata, dict):
         raise ValueError("invalid result metadata")
     _validate_json(metadata)

@@ -23,7 +23,12 @@ from typing import Callable, Iterator
 from uuid import uuid4
 
 from .config import HeadConfig
-from .private_state import openat_create_retry
+from .private_state import (
+    PrivateStateError,
+    decode_strict_json,
+    openat_create_retry,
+    read_bounded_at,
+)
 
 SCHEMA_VERSION = "dt_link_metrics_v1"
 MAX_STATE_BYTES = 4096
@@ -213,39 +218,23 @@ class PersistentLinkMetrics:
 
     @staticmethod
     def _read(directory_fd: int, name: str, key: str) -> LinkSample | None:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
         try:
-            descriptor = os.open(name, flags, dir_fd=directory_fd)
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
+            result = read_bounded_at(
+                directory_fd,
+                name,
+                max_bytes=MAX_STATE_BYTES,
+            )
+        except PrivateStateError as exc:
+            if "exceeds its size limit" in str(exc):
+                raise LinkMetricsError(
+                    "link metrics state is not a bounded file"
+                ) from exc
             raise LinkMetricsError("link metrics state is unsafe") from exc
+        if result is None:
+            return None
         try:
-            info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STATE_BYTES:
-                raise LinkMetricsError("link metrics state is not a bounded file")
-            payload = bytearray()
-            while len(payload) <= MAX_STATE_BYTES:
-                chunk = os.read(
-                    descriptor, min(4096, MAX_STATE_BYTES + 1 - len(payload))
-                )
-                if not chunk:
-                    break
-                payload.extend(chunk)
-            if len(payload) > MAX_STATE_BYTES:
-                raise LinkMetricsError("link metrics state exceeds its size limit")
-        except OSError as exc:
-            raise LinkMetricsError("link metrics state cannot be read") from exc
-        finally:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        try:
-            raw = json.loads(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raw = decode_strict_json(result[0])
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise LinkMetricsError("link metrics state is malformed") from exc
         return _validate_sample(raw, key)
 

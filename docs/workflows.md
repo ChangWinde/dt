@@ -40,7 +40,10 @@ CPU-only jobs do not depend on GPU inventory. This placement constraint is
 separate from the `--max-vram-mib` runtime usage guard.
 
 A guard violation terminates the complete managed process tree and leaves
-structured evidence under `outputs/dt/`.
+structured evidence in the control capsule's `.dt/evidence/` directory. The
+application owns `outputs/`; an `outputs/dt/` tree is never selected or
+recovered as DT control evidence. DT does not claim attestation against a
+hostile process running as the same Unix identity.
 
 Export a value locally, then import its name with repeatable `--env NAME`:
 

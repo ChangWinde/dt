@@ -11,7 +11,6 @@ import shlex
 import stat
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -117,6 +116,19 @@ class TransferFailure:
             "source_kind": self.source_kind,
             "failure_kind": self.failure_kind,
         }
+
+
+@dataclass(frozen=True)
+class _LazyTransferOutcome:
+    """Result of evaluating ordered replicas only until one succeeds."""
+
+    selected: DiscoveredRoute | None
+    transferred_bytes: int
+    transferred_files: int | None
+    present_replicas: int
+    corrupt_replicas: int
+    unavailable_replicas: tuple[str, ...]
+    transfer_failures: tuple[str, ...]
 
 
 def _destination_prepare_rsync_path(destination_expression: str) -> str:
@@ -867,41 +879,6 @@ class TransferExecutor:
             f"failed ({kind}): {detail}"
         )
 
-    def _discover_routes(
-        self,
-        site: Site,
-        digest: str,
-        destination: Node,
-        log: Callable[[str], None],
-    ) -> tuple[list[DiscoveredRoute], int]:
-        replicas = self.discovery.replicas(site, digest)
-
-        def evaluate(
-            replica: ArtifactReplica,
-        ) -> tuple[DiscoveredRoute | None, bool, str | None]:
-            try:
-                if not self.discovery.replica_present(replica):
-                    return None, False, None
-                return self.discovery.route(replica, destination), True, None
-            except (TopologyDiscoveryError, OSError) as exc:
-                return None, True, str(exc)
-
-        routes: list[DiscoveredRoute] = []
-        present = 0
-        workers = max(1, min(4, len(replicas)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(evaluate, replica): replica for replica in replicas}
-            for future in as_completed(futures):
-                route, exists, issue = future.result()
-                present += int(exists)
-                if route is not None:
-                    routes.append(route)
-                elif issue is not None:
-                    replica = futures[future]
-                    log(f"topology candidate {replica.node.name} unavailable: {issue}")
-        routes.sort(key=_route_order_key)
-        return routes, present
-
     def _p2p_transfer(
         self,
         route: DiscoveredRoute,
@@ -1046,32 +1023,150 @@ class TransferExecutor:
             raise ArtifactRouteError(message, kind)
         raise DistributionError(message)
 
-    def _verified_routes(
+    def _ordered_replicas(
         self,
-        routes: list[DiscoveredRoute],
+        site: Site,
         digest: str,
+        destination: Node,
+    ) -> list[ArtifactReplica]:
+        """Rank candidates from immutable metadata, without remote probes.
+
+        A candidate becomes selected before DT probes or hashes it. Later
+        candidates remain untouched unless the selected one is absent,
+        corrupt, unreachable, or fails its transfer.
+        """
+        return sorted(
+            self.discovery.replicas(site, digest),
+            key=lambda replica: (
+                0 if replica.node.name == destination.name else 1,
+                0 if replica.kind == "peer" else 1,
+                replica.node.transfer_cost,
+                -replica.recorded_at,
+                replica.node.name,
+                replica.code_dir,
+            ),
+        )
+
+    def _transfer_lazy_replicas(
+        self,
+        site: Site,
+        digest: str,
+        destination: Node,
+        destination_code: str,
+        copy_dest: str | None,
         log: Callable[[str], None],
-    ) -> tuple[list[DiscoveredRoute], int, list[str]]:
-        """Separate corrupt replicas from routes whose health is uncertain."""
-        verified: list[DiscoveredRoute] = []
+        attempt_events: list[TransferFailure],
+    ) -> _LazyTransferOutcome:
+        """Probe, verify, and transfer one ordered candidate at a time."""
+        present = 0
         corrupt = 0
         unavailable: list[str] = []
-        for route in routes:
+        transfer_failures: list[str] = []
+        for replica in self._ordered_replicas(site, digest, destination):
             try:
-                self.verifier.require(
-                    route.replica.node,
-                    route.replica.code_dir,
-                    digest,
-                )
+                exists = self.discovery.replica_present(replica)
+            except (TopologyDiscoveryError, OSError) as exc:
+                # An inconclusive presence check must block a cold WAN upload:
+                # the digest may already be inside the site.
+                present += 1
+                unavailable.append(str(exc))
+                log(f"topology candidate {replica.node.name} unavailable: {exc}")
+                continue
+            if not exists:
+                continue
+            present += 1
+            try:
+                route = self.discovery.route(replica, destination)
+            except (TopologyDiscoveryError, OSError) as exc:
+                unavailable.append(str(exc))
+                log(f"topology candidate {replica.node.name} unavailable: {exc}")
+                continue
+            try:
+                self.verifier.require(replica.node, replica.code_dir, digest)
             except ArtifactIntegrityError as exc:
                 corrupt += 1
-                log(f"topology candidate {route.replica.node.name} rejected: {exc}")
+                log(f"topology candidate {replica.node.name} rejected: {exc}")
+                continue
             except DistributionError as exc:
                 unavailable.append(str(exc))
-                log(f"topology candidate {route.replica.node.name} unavailable: {exc}")
-            else:
-                verified.append(route)
-        return verified, corrupt, unavailable
+                log(f"topology candidate {replica.node.name} unavailable: {exc}")
+                continue
+            selected, moved, files, failures = self._transfer_verified_routes(
+                [route],
+                digest,
+                destination,
+                destination_code,
+                copy_dest,
+                log,
+                attempt_events,
+            )
+            transfer_failures.extend(failures)
+            if selected is not None:
+                return _LazyTransferOutcome(
+                    selected,
+                    moved,
+                    files,
+                    present,
+                    corrupt,
+                    tuple(unavailable),
+                    tuple(transfer_failures),
+                )
+        return _LazyTransferOutcome(
+            None,
+            0,
+            None,
+            present,
+            corrupt,
+            tuple(unavailable),
+            tuple(transfer_failures),
+        )
+
+    def _destination_local_hit(
+        self,
+        digest: str,
+        site: Site,
+        destination: Node,
+        destination_code: str,
+        started: float,
+    ) -> DistributionResult | None:
+        """Return without source discovery when destination already matches."""
+        try:
+            observed = self.verifier.remote_digest(destination, destination_code)
+        except DistributionError:
+            # Absence and an incomplete prior staging directory are normal on
+            # first delivery. Final destination verification still fails
+            # closed if access is genuinely broken.
+            return None
+        if observed != digest:
+            return None
+        replica = ArtifactReplica(
+            kind="destination",
+            node=destination,
+            code_dir=destination_code,
+            recorded_at=time.time(),
+        )
+        route = DiscoveredRoute(
+            replica=replica,
+            endpoint=None,
+            probe_latency_ms=0.0,
+            score=0.0,
+        )
+        plan = self.planner.plan_replica(
+            digest,
+            destination,
+            route.artifact_source(site),
+            endpoint_origin="local",
+        )
+        return DistributionResult(
+            plan=plan,
+            cache_hit=False,
+            cross_site_bytes=0,
+            site_bytes=0,
+            transferred_files=0,
+            queue_seconds=0.0,
+            duration_seconds=max(0.0, time.monotonic() - started),
+            replica_hit=True,
+        )
 
     @contextmanager
     def _retain_peer_source(
@@ -1237,85 +1332,59 @@ class TransferExecutor:
         log: Callable[[str], None],
         started: float,
     ) -> DistributionResult:
+        destination_hit = self._destination_local_hit(
+            digest,
+            site,
+            destination,
+            destination_code,
+            started,
+        )
+        if destination_hit is not None:
+            return destination_hit
+
         cache_node = self.topology.cache_node(site)
         discovery_phase_started = time.monotonic()
-        routes, present_replicas = self._discover_routes(
+        failed_attempts: list[TransferFailure] = []
+        outcome = self._transfer_lazy_replicas(
             site,
             digest,
             destination,
+            destination_code,
+            copy_dest,
             log,
-        )
-        verified_routes, _corrupt_replicas, unavailable_replicas = (
-            self._verified_routes(routes, digest, log)
+            failed_attempts,
         )
         discovery_seconds = max(
             0.0,
             time.monotonic() - discovery_phase_started,
         )
-        failed_attempts: list[TransferFailure] = []
-        selected, site_bytes, transferred_files, transfer_failures = (
-            self._transfer_verified_routes(
-                verified_routes,
-                digest,
-                destination,
-                destination_code,
-                copy_dest,
-                log,
-                failed_attempts,
-            )
-        )
+        selected = outcome.selected
+        site_bytes = outcome.transferred_bytes
+        transferred_files = outcome.transferred_files
         queue_seconds = 0.0
         cold_cache_upload = False
         cross_site_bytes = 0
 
         if selected is None:
-            if verified_routes:
-                detail = transfer_failures[-1] if transfer_failures else "route failed"
+            if outcome.transfer_failures:
+                detail = outcome.transfer_failures[-1]
                 raise DistributionError(
                     f"all verified P2P routes to {destination.name} failed: {detail}",
                     failed_attempts=tuple(failed_attempts),
                 )
-            if unavailable_replicas or (present_replicas and not routes):
-                detail = (
-                    unavailable_replicas[-1]
-                    if unavailable_replicas
-                    else ("no direct route is healthy")
-                )
+            if outcome.unavailable_replicas:
+                detail = outcome.unavailable_replicas[-1]
                 raise DistributionError(
                     f"artifact {digest[:12]} exists inside site {site.name}, "
                     f"but its P2P state is uncertain: {detail}"
                 )
 
             # Another destination may already be uploading this digest. The
-            # site lock covers only the recheck and atomic cache publication;
-            # it is released before destination fan-out.
-            post_lock_routes: list[DiscoveredRoute] = []
+            # site lock covers only a cache recheck and atomic publication; it
+            # is released before destination fan-out.
             with _site_transfer_lock(self.cfg, site, digest) as queue_seconds:
-                discovery_phase_started = time.monotonic()
-                routes, present_replicas = self._discover_routes(
-                    site,
-                    digest,
-                    destination,
-                    log,
-                )
-                post_lock_routes, _corrupt_replicas, unavailable_replicas = (
-                    self._verified_routes(routes, digest, log)
-                )
-                discovery_seconds += max(
-                    0.0,
-                    time.monotonic() - discovery_phase_started,
-                )
-                if unavailable_replicas or (present_replicas and not routes):
-                    detail = (
-                        unavailable_replicas[-1]
-                        if unavailable_replicas
-                        else "no direct route is healthy"
-                    )
-                    raise DistributionError(
-                        f"artifact {digest[:12]} exists inside site {site.name}, "
-                        f"but its P2P state is uncertain: {detail}"
-                    )
-                if not post_lock_routes:
+                cache_hit = self._cache_available(site, cache_node, digest)
+                if not cache_hit:
                     cross_site_bytes, transferred_files = self._populate_cache(
                         source,
                         site,
@@ -1325,31 +1394,28 @@ class TransferExecutor:
                         log,
                     )
                     cold_cache_upload = True
-                    cache_replica = ArtifactReplica(
-                        kind="site-cache",
-                        node=cache_node,
-                        code_dir=node_path(
-                            _cache_object_root(self.cfg, site, cache_node, digest),
-                            "code",
-                        ),
-                        recorded_at=time.time(),
-                    )
-                    try:
-                        discovery_phase_started = time.monotonic()
-                        post_lock_routes = [
-                            self.discovery.route(cache_replica, destination)
-                        ]
-                    except TopologyDiscoveryError as exc:
-                        raise DistributionError(str(exc)) from exc
-                    finally:
-                        discovery_seconds += max(
-                            0.0,
-                            time.monotonic() - discovery_phase_started,
-                        )
-
+            cache_replica = ArtifactReplica(
+                kind="site-cache",
+                node=cache_node,
+                code_dir=node_path(
+                    _cache_object_root(self.cfg, site, cache_node, digest),
+                    "code",
+                ),
+                recorded_at=time.time(),
+            )
+            try:
+                discovery_phase_started = time.monotonic()
+                cache_route = self.discovery.route(cache_replica, destination)
+            except TopologyDiscoveryError as exc:
+                raise DistributionError(str(exc)) from exc
+            finally:
+                discovery_seconds += max(
+                    0.0,
+                    time.monotonic() - discovery_phase_started,
+                )
             selected, site_bytes, site_files, transfer_failures = (
                 self._transfer_verified_routes(
-                    post_lock_routes,
+                    [cache_route],
                     digest,
                     destination,
                     destination_code,

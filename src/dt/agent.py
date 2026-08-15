@@ -44,20 +44,28 @@ from . import completion as completion_mod
 from .config import HeadConfig, active_dt_command
 from .dispatch import clean_jobs, dispatch_queued
 from .jobs import (
+    AGENT_PROTOCOL_SCHEMA_VERSION,
     DISPATCH_PROTOCOL_VERSION,
     LOST_RECHECK_S as jobs_lost_recheck_s,
+    REGISTRY_AUTHORITY_STATES,
+    REGISTRY_SCHEMA_VERSION,
     JobEntry,
     RegistryDamage,
+    active_entries,
     agent_wake_path,
     effective_result_state,
     enable_registry_decode_cache,
     list_all,
+    occupies_quota,
+    quota_occupancy,
     refresh_status,
+    registry_row_count,
 )
 from .private_state import (
     PrivateStateError,
     atomic_write,
     atomic_write_regular,
+    decode_strict_json,
     open_private_regular,
     read_bounded,
     read_bounded_regular,
@@ -80,6 +88,10 @@ AGENT_CONFIG_INVALID_ROLE_EXIT = 78
 # so a transient failure (load, disk hiccup) cannot permanently pin an old
 # agent to stale code.
 PREFLIGHT_RETRY_S = 300.0
+
+
+def _bounded_exception(exc: BaseException, *, limit: int = 512) -> str:
+    return " ".join(str(exc).split())[:limit] or type(exc).__name__
 
 
 def _runtime_identity(cfg: HeadConfig) -> tuple[str, str, str]:
@@ -371,7 +383,9 @@ def install_systemd_service(cfg: HeadConfig) -> Path:
             if rollback_errors
             else "; previous unit restored"
         )
-        raise RuntimeError(f"systemd service install failed: {exc}{suffix}") from exc
+        raise RuntimeError(
+            f"systemd service install failed: {_bounded_exception(exc)}{suffix}"
+        ) from exc
     return path
 
 
@@ -474,13 +488,51 @@ def _heartbeat_pulse(
         stop.wait(interval_s)
 
 
-def _write_scheduler_tick(cfg: HeadConfig, *, next_poll_s: float) -> None:
-    """Publish scheduler progress independently from process liveness."""
-    completed_at = time.time()
+def _write_scheduler_tick(
+    cfg: HeadConfig,
+    *,
+    next_poll_s: float,
+    success: bool = True,
+    failure_kind: str | None = None,
+) -> None:
+    """Publish one scheduler attempt without turning failure into success."""
+    attempted_at = time.time()
+    previous: dict[str, object] = {}
+    try:
+        decoded = json.loads(
+            _read_private_text(scheduler_tick_path(cfg), max_bytes=1024).strip()
+        )
+        if isinstance(decoded, dict):
+            previous = decoded
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
+        pass
+
+    prior_success = previous.get("last_success_at", previous.get("completed_at"))
+    last_success_at = attempted_at if success else prior_success
+    prior_due = previous.get("next_due_at")
+    next_due_at = (
+        attempted_at + max(0.0, next_poll_s)
+        if success or not isinstance(prior_due, int | float)
+        else float(prior_due)
+    )
+    prior_failure_at = previous.get("last_failure_at")
+    prior_failure_kind = previous.get("last_failure_kind")
+    normalized_failure_kind = (
+        " ".join((failure_kind or "scheduler_error").split())[:128]
+        if not success
+        else prior_failure_kind
+    )
     payload = json.dumps(
         {
-            "completed_at": completed_at,
-            "next_due_at": completed_at + max(0.0, next_poll_s),
+            "schema_version": "dt_agent_scheduler_tick_v2",
+            # Compatibility key for readers predating the success/failure split.
+            "completed_at": last_success_at,
+            "last_success_at": last_success_at,
+            "last_attempt_at": attempted_at,
+            "last_attempt_succeeded": success,
+            "last_failure_at": attempted_at if not success else prior_failure_at,
+            "last_failure_kind": normalized_failure_kind,
+            "next_due_at": next_due_at,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -553,6 +605,40 @@ def alive_pid(cfg: HeadConfig) -> int | None:
     fcntl.flock(fd, fcntl.LOCK_UN)
     os.close(fd)
     return None
+
+
+def legacy_agent_lock_blocks_role_layout(cfg: HeadConfig) -> bool:
+    """Whether a legacy-layout scheduler may still own this role root.
+
+    A role-layout agent uses ``head/state/agent/agent.lock``.  An older
+    process can still be alive on ``root/agent.lock`` and would otherwise
+    become a second scheduling authority.  Missing and unlocked legacy files
+    are harmless migration residue; an unsafe/unreadable file is unprovable
+    and therefore blocks mutation.
+    """
+    from .layout import ROLE_LAYOUT
+
+    if cfg.layout != ROLE_LAYOUT:
+        return False
+    try:
+        descriptor = _open_private_regular(
+            cfg.root / "agent.lock",
+            os.O_RDWR,
+            create_parent=False,
+        )
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(descriptor)
 
 
 def notify(
@@ -628,7 +714,7 @@ def _reconcile_jobs(
     by_job_id = {entry.job_id: index for index, entry in enumerate(entries)}
     for before, entry, error in transitions:
         if error is not None:
-            detail = " ".join(str(error).split()) or type(error).__name__
+            detail = " ".join(str(error).split())[:512] or type(error).__name__
             log(f"{entry.job_id} status refresh failed: {detail}")
             continue
         entries[by_job_id[entry.job_id]] = entry
@@ -711,7 +797,7 @@ def _process_once_with_snapshot(
     loop can make watcher/sleep decisions without another historical scan.
     """
     damage: list[RegistryDamage] = []
-    entries = _reconcile_jobs(cfg, log, list_all(cfg, damage=damage))
+    entries = _reconcile_jobs(cfg, log, active_entries(cfg, damage=damage))
     for item in damage:
         log(
             f"registry entry {item.path} is unreadable ({item.detail}); "
@@ -721,14 +807,15 @@ def _process_once_with_snapshot(
         (entry for entry in entries if entry.status == "queued"),
         key=lambda entry: entry.created_at,
     )
-    # Same conservative rule as running_count(): an entry we cannot read may
-    # still hold GPUs, so it consumes the max_my_jobs budget.
-    running = sum(entry.status == "running" for entry in entries) + len(damage)
+    # Reservations, uncertain launches, and unreadable authority rows all may
+    # still own a slot. Use the same contract as CLI admission and status.
+    running = quota_occupancy(cfg, entries=entries, damage=damage)
     results: list[tuple[str, str]] = []
     busy_pins: set[str] = set()
     for entry in queue:
         cap = cfg.queue.max_my_jobs
-        if cap is not None and running >= cap:
+        entry_owns_slot = occupies_quota(entry)
+        if cap is not None and running - int(entry_owns_slot) >= cap:
             results.append((entry.job_id, "capped"))
             break
         if busy_pins and entry.gpus_requested > 0:
@@ -759,7 +846,7 @@ def _process_once_with_snapshot(
             # One job's unexpected failure must never abort the tick and starve
             # every queued job behind it. Treat it as a transient block, log it
             # visibly, and move on; the next tick retries.
-            detail = " ".join(str(exc).split()) or type(exc).__name__
+            detail = " ".join(str(exc).split())[:512] or type(exc).__name__
             log(
                 f"{entry.job_id} dispatch raised ({detail}); "
                 "treating as blocked and trying jobs behind it"
@@ -774,8 +861,22 @@ def _process_once_with_snapshot(
             blocked_log_state.pop(entry.job_id, None)
         if blocked_backoff is not None and outcome != "blocked":
             blocked_backoff.pop(entry.job_id, None)
+        if outcome in {
+            "started",
+            "finished",
+            "failed",
+            "skipped",
+            "killed",
+            "cancel-failed",
+        }:
+            # dispatch_queued mutates this entry inside the one tick snapshot.
+            # Recompute from that same snapshot whenever the transition may
+            # acquire or release quota, so a recovered terminal attempt does
+            # not leave later runnable work capped until the next tick.
+            running = quota_occupancy(cfg, entries=entries, damage=damage)
         if outcome == "started":
-            running += 1
+            # The durable reservation was already included in occupancy; a
+            # successful transition to running must not consume a second slot.
             log(f"{entry.job_id} -> {detail}")
             notify(
                 cfg,
@@ -850,7 +951,6 @@ def _process_once_with_snapshot(
         elif outcome == "cancel-failed":
             # Cancellation failure restores the remote launch to running, so
             # it consumes the same max_my_jobs budget as a normal start.
-            running += 1
             reason = entry.reason or detail or "launch cancellation unverified"
             log(f"{entry.job_id} CANCEL FAILED: {reason}")
             notify(
@@ -966,7 +1066,9 @@ def _restart_preflight(
             timeout=5,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"package syntax {type(exc).__name__}: {exc}"
+        return False, (
+            f"package syntax {type(exc).__name__}: {_bounded_exception(exc, limit=240)}"
+        )
     if syntax_probe.returncode != 0:
         lines = (syntax_probe.stderr or syntax_probe.stdout or "").strip().splitlines()
         detail = lines[-1] if lines else f"exit {syntax_probe.returncode}"
@@ -981,7 +1083,7 @@ def _restart_preflight(
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"{type(exc).__name__}: {exc}"
+        return False, f"{type(exc).__name__}: {_bounded_exception(exc, limit=240)}"
     if probe.returncode == 0:
         return True, None
     lines = (probe.stderr or "").strip().splitlines()
@@ -1077,7 +1179,7 @@ def _sync_completion_watchers(
             watchers[job_id] = _spawn_completion_watcher(entry)
         except (OSError, ValueError) as exc:
             disabled.add(job_id)
-            detail = " ".join(str(exc).split()) or type(exc).__name__
+            detail = " ".join(str(exc).split())[:512] or type(exc).__name__
             log(f"{job_id} completion watch unavailable ({detail}); polling fallback")
             continue
         log(f"{job_id} completion watch started on {entry.node}")
@@ -1191,7 +1293,7 @@ def run_loop(cfg: HeadConfig) -> int:
         try:
             rotated = _rotate_agent_log(cfg)
         except OSError as exc:
-            log(f"agent log rotation skipped: {exc}")
+            log(f"agent log rotation skipped: {_bounded_exception(exc)}")
             return
         if rotated:
             log(
@@ -1225,6 +1327,7 @@ def run_loop(cfg: HeadConfig) -> int:
     try:
         while not stop["flag"]:
             queue_active: bool | None = None
+            tick_failure: Exception | None = None
             try:
                 # reload config every tick so knob edits apply within a poll
                 from .config import HeadConfig as _HC, load as _load
@@ -1263,14 +1366,22 @@ def run_loop(cfg: HeadConfig) -> int:
                 _maybe_autoclean(cfg, log)
                 rotate_log()
             except Exception as e:  # keep the loop alive, always
-                log(f"poll error: {e}")
+                tick_failure = e
+                detail = " ".join(str(e).split())[:512] or type(e).__name__
+                log(f"poll error ({type(e).__name__}): {detail}")
             try:
                 _write_scheduler_tick(
                     cfg,
                     next_poll_s=_next_poll_delay(cfg, queue_active=queue_active),
+                    success=tick_failure is None,
+                    failure_kind=(
+                        type(tick_failure).__name__
+                        if tick_failure is not None
+                        else None
+                    ),
                 )
             except OSError as exc:
-                log(f"scheduler progress stamp unavailable: {exc}")
+                log(f"scheduler progress stamp unavailable: {_bounded_exception(exc)}")
             dt_bin: Path | None
             try:
                 current_command_identity = _active_command_identity()
@@ -1279,7 +1390,7 @@ def run_loop(cfg: HeadConfig) -> int:
                 # A supervisor with a stripped environment (no resolvable
                 # home) must not kill the queue loop; self-upgrade simply
                 # stays off until the environment is coherent again.
-                log(f"self-upgrade check skipped: {exc}")
+                log(f"self-upgrade check skipped: {_bounded_exception(exc)}")
                 dt_bin = None
                 current_command_identity = born_command_identity
             current_fingerprint = _code_fingerprint()
@@ -1298,9 +1409,12 @@ def run_loop(cfg: HeadConfig) -> int:
                 # deploy/git pull happened: exec ourselves to run the new
                 # code (the exec drops our lock fd, the fresh image retakes it)
                 try:
-                    ready, detail = _restart_preflight(dt_bin)
+                    ready, preflight_detail = _restart_preflight(dt_bin)
                 except Exception as exc:  # keep the loop alive, always
-                    ready, detail = False, f"preflight crashed: {exc}"
+                    ready, preflight_detail = (
+                        False,
+                        f"preflight crashed: {_bounded_exception(exc)}",
+                    )
                 if not ready:
                     rejected_restart = (
                         replacement_token,
@@ -1309,7 +1423,7 @@ def run_loop(cfg: HeadConfig) -> int:
                     log(
                         "dt code changed but replacement preflight failed; "
                         "keeping current agent alive, retrying within "
-                        f"{PREFLIGHT_RETRY_S:g}s ({detail})"
+                        f"{PREFLIGHT_RETRY_S:g}s ({preflight_detail})"
                     )
                     continue
                 reason = "active command changed" if command_changed else "code changed"
@@ -1318,7 +1432,10 @@ def run_loop(cfg: HeadConfig) -> int:
                     _stop_completion_watchers(completion_watchers)
                     _pid_path(cfg).unlink(missing_ok=True)
                 except OSError as exc:
-                    log(f"agent restart deferred; teardown failed ({exc})")
+                    log(
+                        "agent restart deferred; teardown failed "
+                        f"({_bounded_exception(exc)})"
+                    )
                 else:
                     fcntl.flock(fd, fcntl.LOCK_UN)
                     os.close(fd)
@@ -1336,7 +1453,8 @@ def run_loop(cfg: HeadConfig) -> int:
                         # fresh agent instead of dying with a traceback and
                         # leaving the queue driverless.
                         log(
-                            f"agent restart exec failed ({exc}); exiting so "
+                            "agent restart exec failed "
+                            f"({_bounded_exception(exc)}); exiting so "
                             "the supervisor can start a fresh agent"
                         )
                         return AGENT_CONFIG_RESTART_EXIT
@@ -1363,6 +1481,8 @@ def run_loop(cfg: HeadConfig) -> int:
 
 def start_detached(cfg: HeadConfig) -> bool:
     """Start the installed supervisor or a detached compatibility process."""
+    if legacy_agent_lock_blocks_role_layout(cfg):
+        return False
     if alive_pid(cfg) is not None:
         return False
     dt_command = active_dt_command()
@@ -1479,6 +1599,11 @@ def remove_agent_crontab() -> bool:
 
 def install_supervisor(cfg: HeadConfig) -> dict[str, object]:
     """Install the strongest available rootless lifetime supervisor."""
+    if legacy_agent_lock_blocks_role_layout(cfg):
+        raise RuntimeError(
+            "legacy DT agent ownership is active or unprovable; stop the old "
+            "agent before installing the role-layout supervisor"
+        )
     capabilities = supervisor_capabilities()
     if not capabilities["available"]:
         missing = capabilities["missing"]
@@ -1536,7 +1661,7 @@ def install_supervisor(cfg: HeadConfig) -> dict[str, object]:
             )
             raise RuntimeError(
                 "systemd service rolled back: legacy crontab cleanup failed: "
-                f"{exc}{detail}"
+                f"{_bounded_exception(exc)}{detail}"
             ) from exc
         return {
             "supervisor": "systemd-user",
@@ -1635,6 +1760,10 @@ def heartbeat_health(cfg: HeadConfig, *, alive: bool) -> dict[str, object]:
     scheduler_tick_at: float | None = None
     scheduler_tick_age_s: float | None = None
     scheduler_next_due_at: float | None = None
+    scheduler_last_attempt_at: float | None = None
+    scheduler_last_attempt_succeeded: bool | None = None
+    scheduler_last_failure_at: float | None = None
+    scheduler_last_failure_kind: str | None = None
     try:
         scheduler_payload = _read_private_text(
             scheduler_tick_path(cfg), max_bytes=1024
@@ -1642,16 +1771,61 @@ def heartbeat_health(cfg: HeadConfig, *, alive: bool) -> dict[str, object]:
         decoded = json.loads(scheduler_payload)
         if not isinstance(decoded, dict):
             raise ValueError
-        scheduler_tick_at = float(decoded["completed_at"])
+        raw_success = decoded.get("last_success_at", decoded.get("completed_at"))
+        scheduler_tick_at = float(raw_success) if raw_success is not None else None
         scheduler_next_due_at = float(decoded["next_due_at"])
+        raw_attempt = decoded.get("last_attempt_at", raw_success)
+        scheduler_last_attempt_at = (
+            float(raw_attempt) if raw_attempt is not None else None
+        )
+        raw_attempt_succeeded = decoded.get("last_attempt_succeeded")
+        scheduler_last_attempt_succeeded = (
+            raw_attempt_succeeded
+            if isinstance(raw_attempt_succeeded, bool)
+            else True
+            if scheduler_tick_at is not None
+            else None
+        )
+        raw_failure = decoded.get("last_failure_at")
+        scheduler_last_failure_at = (
+            float(raw_failure) if raw_failure is not None else None
+        )
+        raw_failure_kind = decoded.get("last_failure_kind")
+        scheduler_last_failure_kind = (
+            raw_failure_kind if isinstance(raw_failure_kind, str) else None
+        )
         if (
-            not math.isfinite(scheduler_tick_at)
+            (
+                scheduler_tick_at is not None
+                and (not math.isfinite(scheduler_tick_at) or scheduler_tick_at <= 0)
+            )
             or not math.isfinite(scheduler_next_due_at)
-            or scheduler_tick_at <= 0
-            or scheduler_next_due_at < scheduler_tick_at
+            or scheduler_next_due_at <= 0
+            or (
+                scheduler_tick_at is not None
+                and scheduler_next_due_at < scheduler_tick_at
+            )
+            or (
+                scheduler_last_attempt_at is not None
+                and (
+                    not math.isfinite(scheduler_last_attempt_at)
+                    or scheduler_last_attempt_at <= 0
+                )
+            )
+            or (
+                scheduler_last_failure_at is not None
+                and (
+                    not math.isfinite(scheduler_last_failure_at)
+                    or scheduler_last_failure_at <= 0
+                )
+            )
         ):
             raise ValueError
-        scheduler_tick_age_s = max(0.0, time.time() - scheduler_tick_at)
+        scheduler_tick_age_s = (
+            max(0.0, time.time() - scheduler_tick_at)
+            if scheduler_tick_at is not None
+            else None
+        )
     except (
         OSError,
         UnicodeError,
@@ -1675,7 +1849,7 @@ def heartbeat_health(cfg: HeadConfig, *, alive: bool) -> dict[str, object]:
     )
     scheduler_stalled = (
         alive
-        and scheduler_tick_age_s is not None
+        and (scheduler_next_due_at is not None or scheduler_tick_at is not None)
         and (
             time.time()
             > (
@@ -1700,6 +1874,10 @@ def heartbeat_health(cfg: HeadConfig, *, alive: bool) -> dict[str, object]:
         "scheduler_tick_at": scheduler_tick_at,
         "scheduler_tick_age_s": scheduler_tick_age_s,
         "scheduler_next_due_at": scheduler_next_due_at,
+        "scheduler_last_attempt_at": scheduler_last_attempt_at,
+        "scheduler_last_attempt_succeeded": scheduler_last_attempt_succeeded,
+        "scheduler_last_failure_at": scheduler_last_failure_at,
+        "scheduler_last_failure_kind": scheduler_last_failure_kind,
         "scheduler_tick_available": scheduler_tick_age_s is not None,
         "scheduler_stall_grace_s": 120.0,
         "scheduler_stall_after_s": (
@@ -1753,6 +1931,26 @@ def _runtime_command_status(cfg: HeadConfig, *, alive: bool) -> dict[str, object
         "runtime_dispatch_protocol_available": protocol_available,
         "runtime_dispatch_protocol_compatible": protocol_compatible,
     }
+
+
+def _public_path(value: object) -> object:
+    """Render local filesystem identity without exposing the account path.
+
+    Agent status is routinely forwarded through a laptop or gateway.  Exact
+    inode/device fields remain authoritative for stale detection, while the
+    human-facing path is home-relative when possible and otherwise reduced to
+    its basename.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    path = Path(value)
+    if not path.is_absolute():
+        return value
+    try:
+        relative = path.relative_to(Path.home())
+    except ValueError:
+        return f"<external>/{path.name}"
+    return "~" if not relative.parts else f"~/{relative.as_posix()}"
 
 
 def active_command_dispatch_protocol(command: Path) -> str | None:
@@ -1812,10 +2010,25 @@ def active_command_dispatch_protocol(command: Path) -> str | None:
     if process.returncode != 0:
         return None
     try:
-        value = payload.decode("ascii").strip()
-    except UnicodeError:
+        value = decode_strict_json(bytes(payload))
+    except (UnicodeError, ValueError, RecursionError):
         return None
-    return value if value == DISPATCH_PROTOCOL_VERSION else None
+    if (
+        not isinstance(value, dict)
+        or set(value)
+        != {
+            "schema_version",
+            "dispatch_protocol",
+            "registry_schema",
+            "registry_authority_state",
+        }
+        or value.get("schema_version") != AGENT_PROTOCOL_SCHEMA_VERSION
+        or value.get("dispatch_protocol") != DISPATCH_PROTOCOL_VERSION
+        or value.get("registry_schema") != REGISTRY_SCHEMA_VERSION
+        or value.get("registry_authority_state") not in REGISTRY_AUTHORITY_STATES
+    ):
+        return None
+    return DISPATCH_PROTOCOL_VERSION
 
 
 def _terminate_protocol_probe(process: subprocess.Popen[bytes]) -> None:
@@ -1863,7 +2076,8 @@ def _adaptive_handoff_state(
 def status(cfg: HeadConfig) -> dict[str, object]:
     pid = alive_pid(cfg)
     damage: list[RegistryDamage] = []
-    entries = list_all(cfg, damage=damage)
+    entries = active_entries(cfg, damage=damage)
+    registry_entries = registry_row_count(cfg)
     q = sorted(
         (entry for entry in entries if entry.status == "queued"),
         key=lambda entry: entry.created_at,
@@ -1891,18 +2105,25 @@ def status(cfg: HeadConfig) -> dict[str, object]:
         ),
         registry_damage=len(damage),
     )
+    runtime_status = _runtime_command_status(cfg, alive=pid is not None)
+    for key in (
+        "active_command",
+        "active_command_target",
+        "runtime_command_target",
+    ):
+        runtime_status[key] = _public_path(runtime_status.get(key))
     return {
         "center": cfg.center,
         "alive": pid is not None,
         "pid": pid,
         **_supervisor_status(),
         **health,
-        **_runtime_command_status(cfg, alive=pid is not None),
+        **runtime_status,
         "scheduler": scheduler,
         "queued": len(q),
         "queue_head": q[0].job_id if q else None,
         "running": running,
-        "registry_entries": len(entries),
+        "registry_entries": registry_entries,
         "registry_damage": len(damage),
         "handoff_state": handoff_state,
         "handoff_reason": handoff_reason,
@@ -1913,7 +2134,7 @@ def status(cfg: HeadConfig) -> dict[str, object]:
         "reserve_free_per_node": cfg.queue.reserve_free_per_node,
         "auto_clean_days": cfg.queue.auto_clean_days,
         "webhook": bool(cfg.webhook),
-        "log": str(log_path(cfg)),
+        "log": _public_path(str(log_path(cfg))),
         "log_bytes": log_bytes,
         "log_max_bytes": AGENT_LOG_MAX_BYTES,
         "log_backups": AGENT_LOG_BACKUPS,

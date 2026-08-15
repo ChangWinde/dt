@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -23,7 +24,7 @@ import dt.sshio as sshio
 from typer.testing import CliRunner
 
 from dt import cli
-from dt.config import HeadConfig, LaptopConfig, Node, QueueCfg
+from dt.config import HeadConfig, LaptopConfig, Node, Project, QueueCfg
 from dt.dispatch import RunSpec, _try_nodes
 from dt.jobs import JobEntry
 from dt.sshio import RemoteError
@@ -48,6 +49,73 @@ def _spec() -> RunSpec:
 def _proc_start_ticks(pid: int) -> str:
     stat_line = Path(f"/proc/{pid}/stat").read_text()
     return stat_line[stat_line.rfind(") ") + 2 :].split()[19]
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
+def test_instant_local_cpu_submit_finishes_without_killing_launcher(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "README.txt").write_text("instant local CPU canary\n")
+    cfg = HeadConfig(
+        center="test",
+        nodes=[Node(name="local", local=True)],
+        projects={"p": Project(path=project)},
+        default_project="p",
+        root=tmp_path / "dt",
+        worker_root=str(tmp_path / "node"),
+        envs=str(tmp_path / "node" / "envs"),
+        disk_min_gib=0,
+        queue=QueueCfg(),
+        layout="role-v1",
+    )
+    spec = RunSpec(
+        name="instant-local-cpu",
+        gpus=0,
+        cmd=[
+            "bash",
+            "-c",
+            'mkdir -p "$DT_OUTPUT_DIR"; printf "ok\\n" >> "$DT_OUTPUT_DIR/canary.txt"',
+        ],
+        project="p",
+        node="local",
+    )
+
+    entry = dispatch.submit(cfg, spec, project, lambda _message: None, no_queue=True)
+    deadline = time.monotonic() + 10
+    while entry.status in {"running", "lost"} and time.monotonic() < deadline:
+        entry = jobs.refresh_status(cfg, entry)
+        if entry.status in {"running", "lost"}:
+            time.sleep(0.05)
+
+    job_dir = Path(entry.job_dir)
+    state_dir = job_dir / ".dt" / "state"
+    assert entry.status == "finished"
+    assert entry.exit_code == 0
+    assert entry.result_state == "success"
+    assert entry.reason is None
+    assert (job_dir / "outputs" / "canary.txt").read_text() == "ok\n"
+    assert not (state_dir / "cancel").exists()
+
+    socket = (state_dir / "tmux_socket").read_text().strip()
+    session = subprocess.run(
+        ["tmux", "-L", socket, "has-session", "-t", entry.session],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    assert session.returncode != 0
+    scope_path = state_dir / "runtime_scope"
+    if scope_path.exists() and shutil.which("systemctl") is not None:
+        scope = scope_path.read_text().strip()
+        active = subprocess.run(
+            ["systemctl", "--user", "is-active", scope],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        assert active.stdout.strip() not in {"active", "activating", "deactivating"}
 
 
 def test_launch_recovery_probe_proves_live_wrapper_identity(tmp_path):
@@ -1722,6 +1790,11 @@ def test_rsync_rejects_unbounded_retry_policies(retries):
         ("Permission denied (publickey,password).", "authentication"),
         ("Host key verification failed.", "host_key"),
         ("rsync: write failed: No space left on device", "space"),
+        (
+            "/home/user/.ssh/config line 8: Bad configuration option: typo",
+            "configuration",
+        ),
+        ("Unable to negotiate: no matching host key type found", "negotiation"),
         # Emitted by the --rsync-path prepare chain: a deterministic
         # destination problem, not a network-edge failure worth retrying.
         ("dt: destination prepare failed", "destination"),
@@ -1761,7 +1834,11 @@ def test_rsync_safe_links_is_opt_in_for_zero_trust_pulls(monkeypatch):
     sshio.rsync("a/", "b/")
 
     assert "--safe-links" in commands[0]
+    assert "--no-devices" in commands[0]
+    assert "--no-specials" in commands[0]
     assert "--safe-links" not in commands[1]
+    assert "--no-devices" not in commands[1]
+    assert "--no-specials" not in commands[1]
 
 
 def test_rsync_retry_preserves_all_attempt_stats_for_command_accounting(monkeypatch):
@@ -2702,8 +2779,7 @@ def test_pull_forwards_repeatable_excludes(tmp_path, monkeypatch):
     )
 
     assert seen["excludes"] == [
-        "dt/job.json",
-        "dt/*.log",
+        "/dt/",
         "checkpoints/",
         "*.mp4",
     ]
@@ -2905,8 +2981,7 @@ def test_pull_lite_adds_small_evidence_excludes(tmp_path, monkeypatch):
     )
 
     assert seen["excludes"] == [
-        "dt/job.json",
-        "dt/*.log",
+        "/dt/",
         "checkpoints/",
         "expert_cache/",
         ".cache/",
@@ -3009,13 +3084,16 @@ def test_pull_large_outputs_warns_before_transfer(
     destination = tmp_path / "result"
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli, "_find_or_die", lambda _cfg, _ref: entry)
-    monkeypatch.setattr(
-        cli,
-        "run_on",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args, 0, "16106127360\tdt/jobs/jid/outputs\n", ""
-        ),
-    )
+
+    def fake_run_on(_node, _local, command, **_kwargs):
+        stdout = (
+            ""
+            if cli.PULL_EVIDENCE_MARK in command
+            else "16106127360\tdt/jobs/jid/outputs\n"
+        )
+        return subprocess.CompletedProcess([], 0, stdout, "")
+
+    monkeypatch.setattr(cli, "run_on", fake_run_on)
     monkeypatch.setattr(
         cli,
         "rsync",
@@ -3102,7 +3180,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
     def fake_rsync(src, dst, **kwargs):
         retry_observers.append(kwargs.pop("on_retry"))
         calls.append((src, dst, kwargs))
-        if src.endswith("/outputs/"):
+        if src.endswith("/outputs/") and "/dt/" not in kwargs.get("excludes", []):
             telemetry = Path(dst) / "dt" / "resources.jsonl"
             telemetry.parent.mkdir(parents=True, exist_ok=True)
             telemetry.write_text('{"timestamp": 1}\n')
@@ -3139,8 +3217,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
             f"{destination}/",
             {
                 "excludes": [
-                    "dt/job.json",
-                    "dt/*.log",
+                    "/dt/",
                     "checkpoints/",
                     "expert_cache/",
                     ".cache/",
@@ -3177,17 +3254,14 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
     assert record["duration_s"] == 12.5
     payload = json.loads(result.stdout)
     assert payload["application_outputs_recovered"] is True
-    assert payload["records_scope"] == "dt_reserved"
+    assert payload["records_scope"] == "dt_control_allowlist"
     assert payload["records"] == [
         "dt/job.json",
-        "dt/stdout.log",
         "dt/env.log",
-        "dt/resources.jsonl",
+        "dt/stdout.log",
         "dt/telemetry.log",
     ]
-    assert (destination / "dt" / "resources.jsonl").read_text() == (
-        '{"timestamp": 1}\n'
-    )
+    assert not (destination / "dt" / "resources.jsonl").exists()
     assert (destination / "dt" / "env.log").read_text() == "uv sync complete\n"
     assert (destination / "dt" / "telemetry.log").read_text() == "telemetry complete\n"
 
@@ -3214,11 +3288,13 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
     retry_observers = []
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
-    monkeypatch.setattr(
-        cli,
-        "run_on",
-        lambda *args, **kwargs: subprocess.CompletedProcess(args, 1, "", ""),
-    )
+
+    def fake_run_on(_node, _local, command, **_kwargs):
+        return subprocess.CompletedProcess(
+            [], 0 if cli.PULL_EVIDENCE_MARK in command else 1, "", ""
+        )
+
+    monkeypatch.setattr(cli, "run_on", fake_run_on)
 
     def fake_rsync(src, dst, **kwargs):
         retry_observers.append(kwargs.pop("on_retry"))
@@ -3281,7 +3357,8 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
         "route_gateway": None,
         "route_reason": "node belongs to no configured site",
         "application_outputs_recovered": False,
-        "records_scope": "dt_reserved",
+        "records_scope": "dt_control_allowlist",
+        "evidence_provenance": None,
         "outputs_present": False,
         "records": ["dt/job.json", "dt/env.log"],
     }
@@ -3311,13 +3388,16 @@ def test_pull_json_success_contract(tmp_path, monkeypatch):
     destination = tmp_path / "result"
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
-    monkeypatch.setattr(
-        cli,
-        "run_on",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args, 0, "16106127360\tdt/jobs/jid/outputs\n", ""
-        ),
-    )
+
+    def fake_run_on(_node, _local, command, **_kwargs):
+        stdout = (
+            ""
+            if cli.PULL_EVIDENCE_MARK in command
+            else "16106127360\tdt/jobs/jid/outputs\n"
+        )
+        return subprocess.CompletedProcess([], 0, stdout, "")
+
+    monkeypatch.setattr(cli, "run_on", fake_run_on)
     monkeypatch.setattr(
         cli,
         "rsync",
@@ -3365,8 +3445,9 @@ def test_pull_json_success_contract(tmp_path, monkeypatch):
         "route_gateway": None,
         "route_reason": "node belongs to no configured site",
         "application_outputs_recovered": True,
-        "records_scope": "dt_reserved",
-        "records": ["dt/job.json", "dt/stdout.log"],
+        "records_scope": "dt_control_allowlist",
+        "evidence_provenance": None,
+        "records": ["dt/job.json"],
     }
 
 
@@ -3387,13 +3468,12 @@ def test_single_pull_absolutizes_a_relative_destination(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
-    monkeypatch.setattr(
-        cli,
-        "run_on",
-        lambda *args, **kwargs: subprocess.CompletedProcess(
-            args, 0, "0\toutputs\n", ""
-        ),
-    )
+
+    def fake_run_on(_node, _local, command, **_kwargs):
+        stdout = "" if cli.PULL_EVIDENCE_MARK in command else "0\toutputs\n"
+        return subprocess.CompletedProcess([], 0, stdout, "")
+
+    monkeypatch.setattr(cli, "run_on", fake_run_on)
     destinations = []
 
     def transfer(_src, dst, **_kwargs):
@@ -3486,10 +3566,17 @@ def test_pull_outputs_cannot_overwrite_authoritative_job_record(tmp_path, monkey
         target = Path(dst)
         if src.endswith("/outputs/"):
             (target / "report.txt").write_text("valid artifact\n")
-            if "dt/job.json" not in kwargs.get("excludes", []):
+            if "/dt/" not in kwargs.get("excludes", []):
                 records = target / "dt"
                 records.mkdir(parents=True, exist_ok=True)
                 (records / "job.json").write_text('{"job_id": "artifact-owned"}\n')
+                (records / "resources.jsonl").write_text(
+                    '{"schema_version":"dt_resource_v1"}\n'
+                )
+                (records / "resource-guard.json").write_text(
+                    '{"schema_version":"dt_resource_guard_v1"}\n'
+                )
+                (records / "attestation.json").write_text("forged\n")
         elif src.endswith("/logs/"):
             target.mkdir(parents=True, exist_ok=True)
             (target / "stdout.log").write_text("complete\n")
@@ -3505,6 +3592,271 @@ def test_pull_outputs_cannot_overwrite_authoritative_job_record(tmp_path, monkey
     assert result.exit_code == 0, result.output
     assert (destination / "report.txt").read_text() == "valid artifact\n"
     assert json.loads((destination / "dt" / "job.json").read_text())["job_id"] == "jid"
+    assert not (destination / "dt" / "resources.jsonl").exists()
+    assert not (destination / "dt" / "resource-guard.json").exists()
+    assert not (destination / "dt" / "attestation.json").exists()
+
+
+def test_pull_recovers_only_validated_control_path_evidence(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+        status="finished",
+        exit_code=0,
+    )
+    destination = tmp_path / "result"
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+
+    def fake_run_on(_node, _local, command, **_kwargs):
+        stdout = (
+            f"{cli.PULL_EVIDENCE_MARK}\tcontrol\nresult.json\nresources.jsonl\n"
+            if cli.PULL_EVIDENCE_MARK in command
+            else "0\tdt/jobs/jid/outputs\n"
+        )
+        return subprocess.CompletedProcess([], 0, stdout, "")
+
+    def fake_rsync(src, dst, **_kwargs):
+        target = Path(dst)
+        if src.endswith("/evidence/result.json"):
+            target.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "dt_result_v1",
+                        "state": "success",
+                        "reason": None,
+                        "metadata": {},
+                        "emitted_at": 1.0,
+                    }
+                )
+                + "\n"
+            )
+        elif src.endswith("/evidence/resources.jsonl"):
+            target.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "dt_resource_v1",
+                        "timestamp": 1.0,
+                        "node": "n1",
+                        "gpus": [],
+                        "job": None,
+                        "phase": None,
+                        "host": {
+                            "cpu_cores": 32,
+                            "cpu_load1": 1.0,
+                            "mem_used_mib": 1024,
+                            "mem_total_mib": 65536,
+                            "disk_free_gib": 100,
+                            "disk_total_gib": 1000,
+                            "io_pressure": 0.0,
+                        },
+                        "gpu_error": None,
+                    }
+                )
+                + "\n"
+            )
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(cli, "run_on", fake_run_on)
+    monkeypatch.setattr(cli, "rsync", fake_rsync)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["pull", "jid", "--to", str(destination), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["evidence_provenance"] == "control_path"
+    assert payload["records"] == [
+        "dt/job.json",
+        "dt/result.json",
+        "dt/resources.jsonl",
+    ]
+
+
+def _cache_reuse_v1_receipt() -> dict[str, object]:
+    return {
+        "schema_version": "dt_cache_reuse_v1",
+        "source_job_id": "source",
+        "source_path": "outputs/.cache/torchinductor",
+        "env_var": "TORCHINDUCTOR_CACHE_DIR",
+        "source_env_hash": "6fb61a247969",
+        "source_snapshot_sha256": "a" * 64,
+    }
+
+
+def _cache_reuse_v2_clone_receipt(tmp_path: Path) -> dict[str, object]:
+    return {
+        "schema_version": "dt_cache_reuse_v2",
+        "source_job_id": "source",
+        "source_path": "outputs/.cache/torchinductor",
+        "env_var": "TORCHINDUCTOR_CACHE_DIR",
+        "source_env_hash": "6fb61a247969",
+        "source_snapshot_sha256": "a" * 64,
+        "mode": "clone",
+        "runtime_path": "outputs/.cache/dt-clone",
+        "source_metadata_sha256": "b" * 64,
+        "isolation": {
+            "kind": "private_mount_namespace",
+            "source_path": str(tmp_path / "source" / "outputs" / ".cache"),
+        },
+        "clone": {"files": 7, "bytes": 4096, "duration_ms": 23},
+    }
+
+
+def test_pull_accepts_the_real_v2_clone_cache_receipt(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+        status="finished",
+        exit_code=0,
+    )
+    destination = tmp_path / "result"
+    receipt = _cache_reuse_v2_clone_receipt(tmp_path)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+
+    def fake_run_on(_node, _local, command, **_kwargs):
+        stdout = (
+            f"{cli.PULL_EVIDENCE_MARK}\tcontrol\ncache-reuse.json\n"
+            if cli.PULL_EVIDENCE_MARK in command
+            else "0\tdt/jobs/jid/outputs\n"
+        )
+        return subprocess.CompletedProcess([], 0, stdout, "")
+
+    def fake_rsync(src, dst, **_kwargs):
+        if src.endswith("/evidence/cache-reuse.json"):
+            Path(dst).write_text(json.dumps(receipt) + "\n")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(cli, "run_on", fake_run_on)
+    monkeypatch.setattr(cli, "rsync", fake_rsync)
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["pull", "jid", "--to", str(destination), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["records"] == ["dt/job.json", "dt/cache-reuse.json"]
+    assert json.loads((destination / "dt" / "cache-reuse.json").read_text()) == (
+        receipt
+    )
+
+
+@pytest.mark.parametrize(
+    ("version", "mutate"),
+    [
+        ("v1", lambda value: value.pop("source_path")),
+        ("v1", lambda value: value.update({"unexpected": True})),
+        ("v1", lambda value: value.update({"source_env_hash": 123})),
+        ("v1", lambda value: value.update({"source_path": "outputs/" + "x" * 4097})),
+        ("v2", lambda value: value.pop("clone")),
+        ("v2", lambda value: value["clone"].update({"unexpected": 1})),
+        ("v2", lambda value: value["clone"].update({"files": True})),
+        ("v2", lambda value: value.update({"source_metadata_sha256": "B" * 64})),
+        ("v2", lambda value: value.update({"mode": "shared"})),
+    ],
+)
+def test_pull_cache_reuse_receipts_fail_closed_on_incomplete_or_wrong_types(
+    tmp_path, version, mutate
+):
+    receipt = (
+        _cache_reuse_v1_receipt()
+        if version == "v1"
+        else _cache_reuse_v2_clone_receipt(tmp_path)
+    )
+    mutate(receipt)
+    path = tmp_path / "cache-reuse.json"
+    path.write_text(json.dumps(receipt) + "\n")
+
+    with pytest.raises(ValueError, match="cache-reuse.json"):
+        cli._validate_pulled_evidence(path, "cache-reuse.json")
+
+
+def test_pull_cache_reuse_v1_and_v2_receipts_both_validate(tmp_path):
+    path = tmp_path / "cache-reuse.json"
+    for receipt in (
+        _cache_reuse_v1_receipt(),
+        _cache_reuse_v2_clone_receipt(tmp_path),
+    ):
+        path.write_text(json.dumps(receipt) + "\n")
+        cli._validate_pulled_evidence(path, "cache-reuse.json")
+
+
+def test_pull_cache_reuse_receipt_rejects_duplicate_json_fields(tmp_path):
+    path = tmp_path / "cache-reuse.json"
+    path.write_text(
+        json.dumps(_cache_reuse_v1_receipt()).replace(
+            '"source_job_id": "source"',
+            '"source_job_id": "source", "source_job_id": "forged"',
+        )
+        + "\n"
+    )
+
+    with pytest.raises(ValueError, match="duplicate JSON field"):
+        cli._validate_pulled_evidence(path, "cache-reuse.json")
+
+
+def test_pull_reports_skipped_special_output_as_incomplete(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+        status="finished",
+        exit_code=0,
+    )
+    destination = tmp_path / "result"
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    monkeypatch.setattr(
+        cli,
+        "rsync",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, 'skipping non-regular file "blocked.pipe"\n', ""
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["pull", "jid", "--to", str(destination), "--json"],
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "unsafe_output"
+    assert payload["partial"] is True
+    assert not (destination / "blocked.pipe").exists()
 
 
 def test_pull_json_run_log_failure_keeps_outputs_and_job_record(tmp_path, monkeypatch):
@@ -3535,10 +3887,10 @@ def test_pull_json_run_log_failure_keeps_outputs_and_job_record(tmp_path, monkey
         nonlocal calls
         calls += 1
         if calls == 1:
-            telemetry = Path(args[1]) / "dt" / "resources.jsonl"
-            telemetry.parent.mkdir(parents=True, exist_ok=True)
-            telemetry.write_text('{"timestamp": 1}\n')
-            if "dt/*.log" not in kwargs.get("excludes", []):
+            if "/dt/" not in kwargs.get("excludes", []):
+                telemetry = Path(args[1]) / "dt" / "resources.jsonl"
+                telemetry.parent.mkdir(parents=True, exist_ok=True)
+                telemetry.write_text('{"timestamp": 1}\n')
                 (telemetry.parent / "stdout.log").write_text("poisoned output record\n")
             return subprocess.CompletedProcess(args, 0, "", "")
         records = Path(args[1])
@@ -3562,7 +3914,7 @@ def test_pull_json_run_log_failure_keeps_outputs_and_job_record(tmp_path, monkey
         "job_status": "finished",
         "node": "n1",
         "destination": str(destination),
-        "records": ["dt/job.json", "dt/resources.jsonl"],
+        "records": ["dt/job.json"],
         "partial": True,
         "status": "error",
         "error": "unreachable",
@@ -3571,9 +3923,7 @@ def test_pull_json_run_log_failure_keeps_outputs_and_job_record(tmp_path, monkey
     }
     assert json.loads((destination / "dt" / "job.json").read_text())["job_id"] == "jid"
     assert not (destination / "dt" / "stdout.log").exists()
-    assert (destination / "dt" / "resources.jsonl").read_text() == (
-        '{"timestamp": 1}\n'
-    )
+    assert not (destination / "dt" / "resources.jsonl").exists()
 
 
 def test_pull_json_unreachable_preflight_contract(tmp_path, monkeypatch):
@@ -3742,7 +4092,7 @@ def test_pull_json_transfer_failure_keeps_partial_contract(tmp_path, monkeypatch
     def fail_after_conflicting_output(*args, **kwargs):
         target = Path(args[1]) / "dt"
         target.mkdir(parents=True, exist_ok=True)
-        if "dt/job.json" not in kwargs.get("excludes", []):
+        if "/dt/" not in kwargs.get("excludes", []):
             (target / "job.json").write_text('{"job_id": "artifact-owned"}\n')
         return subprocess.CompletedProcess([], 255, "", "ssh: connection lost")
 
@@ -4967,23 +5317,9 @@ def test_registry_atomic_save_uses_unique_temp_files_for_concurrent_writers(
     import threading
 
     cfg = _cfg(tmp_path)
-    entries = [
-        JobEntry(
-            job_id="shared",
-            name="shared",
-            center="test",
-            project="p",
-            node="n1",
-            node_local=False,
-            job_dir="dt/jobs/shared",
-            session="dt_shared",
-            cmd="true",
-            status="running",
-            reason=reason,
-        )
-        for reason in ("writer-a", "writer-b")
-    ]
-    rendezvous = threading.Barrier(2, timeout=1)
+    target = cfg.registry_dir() / "shared.json"
+    payloads = (b'{"writer":"a"}\n', b'{"writer":"b"}\n')
+    rendezvous = threading.Barrier(2, timeout=5)
     original_replace = os.replace
     replace_sources = []
     sources_lock = threading.Lock()
@@ -4995,25 +5331,16 @@ def test_registry_atomic_save_uses_unique_temp_files_for_concurrent_writers(
         return original_replace(source, target, **kwargs)
 
     monkeypatch.setattr(jobs.os, "replace", racing_replace)
-    errors = []
 
-    def writer(entry):
-        try:
-            jobs.save(cfg, entry)
-        except Exception as exc:
-            errors.append(exc)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(jobs.atomic_write, target, payload) for payload in payloads
+        ]
+        for future in futures:
+            future.result(timeout=10)
 
-    threads = [threading.Thread(target=writer, args=(entry,)) for entry in entries]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=2)
-
-    assert errors == []
     assert len(set(replace_sources)) == 2
-    stored = jobs.load(cfg, "shared")
-    assert stored is not None
-    assert stored.reason in {"writer-a", "writer-b"}
+    assert target.read_bytes() in payloads
 
 
 def test_queued_kill_cannot_be_overwritten_by_concurrent_dispatch(
@@ -5441,6 +5768,31 @@ def test_liveness_finds_setsid_chdir_survivor_through_scope_cgroup(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "LIVE"
+
+
+def test_portable_gpu_runtime_cannot_be_terminal_confirmed(tmp_path):
+    job_dir = tmp_path / "jobs" / "portable-gpu"
+    job_dir.mkdir(parents=True)
+    (job_dir / "runtime_containment").write_text("portable_unproven\n")
+    (job_dir / "runtime_gpus_requested").write_text("1\n")
+    (job_dir / "exit_code").write_text("7\n")
+    command = lifecycle.termination_probe(
+        str(job_dir),
+        None,
+        "TERM",
+        job_id="portable-gpu",
+    )
+
+    result = subprocess.run(
+        ["bash", "-c", command],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert lifecycle.termination_verdict(
+        result.returncode, result.stdout, result.stderr
+    ) == ("UNVERIFIED", "UNPROVEN")
 
 
 def test_termination_fails_closed_when_expected_scope_cannot_be_inspected(

@@ -3,13 +3,15 @@ import os
 import subprocess
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from threading import Lock
+import tracemalloc
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import replace
+from threading import Barrier, Event, Lock
 
 import pytest
 
 from dt.config import HeadConfig, Node, Site
-from dt.jobs import JobEntry
+from dt.jobs import ArtifactReplicaRecord, JobEntry
 from dt.route_health import PersistentRouteHealth
 from dt.topology import TopologyRegistry
 from dt.topology_discovery import (
@@ -181,6 +183,407 @@ def test_active_discovery_probes_exact_private_overlay_endpoint(tmp_path, monkey
     assert endpoint.link_cost >= 50
 
 
+@pytest.mark.parametrize(
+    ("interface", "accepted"),
+    [("tailscale0", True), ("wg0", True), ("eth0", False)],
+)
+def test_rfc6598_host_route_requires_an_authenticated_overlay_interface(
+    tmp_path, monkeypatch, interface, accepted
+):
+    import dt.topology_discovery as module
+
+    cfg = _cfg(tmp_path)
+
+    def advertisement(user, address, prefixlen, iface):
+        return json.dumps(
+            {
+                "schema_version": "dt_topology_advertisement_v1",
+                "user": user,
+                "ssh_port": 22,
+                "addresses": [
+                    {
+                        "address": address,
+                        "prefixlen": prefixlen,
+                        "interface": iface,
+                    }
+                ],
+                "host_keys": ["ssh-ed25519 AAAA"],
+            }
+        )
+
+    def fake_run_on(node, local, command, **kwargs):
+        payload = (
+            advertisement("source", "172.16.6.111", 24, "enp5s0")
+            if node == "psibot-ys"
+            else advertisement("worker", "100.100.0.91", 32, interface)
+        )
+        return subprocess.CompletedProcess([], 0, payload, "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
+    discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
+
+    if accepted:
+        endpoint = discovery.endpoint(cfg.nodes[2], cfg.nodes[3])
+        assert endpoint.destination == "worker@100.100.0.91"
+        assert endpoint.origin == "advertised-overlay-endpoint"
+    else:
+        with pytest.raises(TopologyDiscoveryError, match="private direct endpoint"):
+            discovery.endpoint(cfg.nodes[2], cfg.nodes[3])
+
+
+def test_ordered_endpoints_fall_back_and_open_only_the_failed_endpoint_circuit(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    health = PersistentRouteHealth(cfg)
+    lan = DirectEndpoint(
+        destination="worker@172.16.6.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-shared-subnet",
+        link_cost=0.0,
+    )
+    overlay = DirectEndpoint(
+        destination="worker@100.100.0.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-overlay-endpoint",
+        link_cost=70.0,
+    )
+    attempts: list[str] = []
+
+    def probe(_source, endpoint):
+        attempts.append(endpoint.destination)
+        if endpoint == lan:
+            return False, 5.0, "timeout"
+        return True, 8.0, "ok"
+
+    replica = ArtifactReplica(
+        kind="peer",
+        node=source,
+        code_dir="~/dt/worker/jobs/prior/code",
+        recorded_at=1.0,
+    )
+    for _ in range(2):
+        discovery = TopologyDiscovery(
+            cfg,
+            TopologyRegistry(cfg),
+            route_health=health,
+        )
+        monkeypatch.setattr(discovery, "endpoints", lambda *args: (lan, overlay))
+        monkeypatch.setattr(discovery, "probe_route", probe)
+        assert discovery.route(replica, destination).endpoint == overlay
+
+    discovery = TopologyDiscovery(
+        cfg,
+        TopologyRegistry(cfg),
+        route_health=health,
+    )
+    monkeypatch.setattr(discovery, "endpoints", lambda *args: (lan, overlay))
+    monkeypatch.setattr(discovery, "probe_route", probe)
+    assert discovery.route(replica, destination).endpoint == overlay
+    assert attempts == [lan.destination, overlay.destination] * 2 + [
+        overlay.destination
+    ]
+
+
+def test_bulk_failure_keeps_exact_endpoint_open_and_falls_back(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    now = [100.0]
+    health = PersistentRouteHealth(cfg, clock=lambda: now[0])
+    lan = DirectEndpoint(
+        destination="worker@172.16.6.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-shared-subnet",
+        link_cost=0.0,
+    )
+    overlay = DirectEndpoint(
+        destination="worker@100.100.0.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-overlay-endpoint",
+        link_cost=70.0,
+    )
+    endpoint_key = TopologyDiscovery._endpoint_circuit_destination(destination, lan)
+    health.record_failure(site, source.name, endpoint_key, "transfer.timeout")
+    opened = health.record_failure(
+        site,
+        source.name,
+        endpoint_key,
+        "transfer.timeout",
+    )
+    now[0] += opened.retry_after_s + 1
+    attempts: list[str] = []
+
+    def probe(_source, endpoint):
+        attempts.append(endpoint.destination)
+        return True, 5.0, "ok"
+
+    replica = ArtifactReplica(
+        kind="peer",
+        node=source,
+        code_dir="~/dt/worker/jobs/prior/code",
+        recorded_at=1.0,
+    )
+    first = TopologyDiscovery(cfg, TopologyRegistry(cfg), route_health=health)
+    monkeypatch.setattr(first, "endpoints", lambda *args: (lan, overlay))
+    monkeypatch.setattr(first, "probe_route", probe)
+    route = first.route(replica, destination)
+    assert route.endpoint == lan
+    assert route.endpoint_circuit_destination == endpoint_key
+    assert route.endpoint_reservation_token is not None
+    first.record_transfer_failure(route, destination, "timeout")
+
+    second = TopologyDiscovery(cfg, TopologyRegistry(cfg), route_health=health)
+    monkeypatch.setattr(second, "endpoints", lambda *args: (lan, overlay))
+    monkeypatch.setattr(second, "probe_route", probe)
+    fallback = second.route(replica, destination)
+
+    assert fallback.endpoint == overlay
+    assert attempts == [lan.destination, overlay.destination]
+
+    # Once this exact endpoint later proves a real bulk success, its own
+    # circuit and the aggregate edge memory are both closed.
+    now[0] += site.route_circuit_max_cooldown_s + 1
+    recovered = TopologyDiscovery(cfg, TopologyRegistry(cfg), route_health=health)
+    monkeypatch.setattr(recovered, "endpoints", lambda *args: (lan, overlay))
+    monkeypatch.setattr(recovered, "probe_route", probe)
+    recovered_route = recovered.route(replica, destination)
+    assert recovered_route.endpoint == lan
+    assert recovered_route.endpoint_reservation_token is not None
+    recovered.record_transfer_success(recovered_route, destination)
+    exact = health.decision(site, source.name, endpoint_key)
+    aggregate = health.decision(site, source.name, destination.name)
+    assert (exact.failures, exact.last_kind) == (0, "success")
+    assert (aggregate.failures, aggregate.last_kind) == (0, "success")
+
+
+def test_repeated_bulk_failures_from_zero_skip_exact_endpoint_despite_aggregate_open(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    health = PersistentRouteHealth(cfg, clock=lambda: 100.0)
+    lan = DirectEndpoint(
+        destination="worker@172.16.6.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-shared-subnet",
+        link_cost=0.0,
+    )
+    overlay = DirectEndpoint(
+        destination="worker@100.100.0.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-overlay-endpoint",
+        link_cost=70.0,
+    )
+    endpoint_key = TopologyDiscovery._endpoint_circuit_destination(destination, lan)
+    replica = ArtifactReplica(
+        kind="peer",
+        node=source,
+        code_dir="~/dt/worker/jobs/prior/code",
+        recorded_at=1.0,
+    )
+    attempts: list[str] = []
+
+    def probe(_source, endpoint):
+        attempts.append(endpoint.destination)
+        return True, 5.0, "ok"
+
+    for _ in range(2):
+        failed = TopologyDiscovery(cfg, TopologyRegistry(cfg), route_health=health)
+        monkeypatch.setattr(failed, "endpoints", lambda *args: (lan, overlay))
+        monkeypatch.setattr(failed, "probe_route", probe)
+        route = failed.route(replica, destination)
+        assert route.endpoint == lan
+        failed.record_transfer_failure(route, destination, "timeout")
+
+    aggregate_open = health.decision(site, source.name, destination.name)
+    assert aggregate_open.is_open is True
+    exact_open = health.decision(site, source.name, endpoint_key)
+    assert exact_open.is_open is True
+
+    recovered = TopologyDiscovery(cfg, TopologyRegistry(cfg), route_health=health)
+    monkeypatch.setattr(recovered, "endpoints", lambda *args: (lan, overlay))
+    monkeypatch.setattr(recovered, "probe_route", probe)
+    fallback = recovered.route(replica, destination)
+    assert fallback.endpoint == overlay
+    recovered.record_transfer_success(fallback, destination)
+
+    aggregate = health.decision(site, source.name, destination.name)
+    exact = health.decision(site, source.name, endpoint_key)
+    assert (aggregate.failures, aggregate.last_kind) == (0, "success")
+    assert exact.is_open is True
+    assert exact.last_kind == "transfer.timeout"
+    assert attempts == [lan.destination, lan.destination, overlay.destination]
+
+
+def test_bulk_failure_invalidates_cached_probe_before_same_node_fallback(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    health = PersistentRouteHealth(cfg, clock=lambda: 100.0)
+    lan = DirectEndpoint(
+        destination="worker@172.16.6.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-shared-subnet",
+        link_cost=0.0,
+    )
+    overlay = DirectEndpoint(
+        destination="worker@100.100.0.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-overlay-endpoint",
+        link_cost=70.0,
+    )
+    endpoint_key = TopologyDiscovery._endpoint_circuit_destination(destination, lan)
+    health.record_failure(site, source.name, endpoint_key, "transfer.timeout")
+    health.record_failure(site, source.name, destination.name, "transfer.timeout")
+
+    attempts: list[str] = []
+
+    def probe(_source, endpoint):
+        attempts.append(endpoint.destination)
+        return True, 5.0, "ok"
+
+    discovery = TopologyDiscovery(
+        cfg,
+        TopologyRegistry(cfg),
+        route_health=health,
+    )
+    monkeypatch.setattr(discovery, "endpoints", lambda *args: (lan, overlay))
+    monkeypatch.setattr(discovery, "probe_route", probe)
+    peer = ArtifactReplica(
+        kind="peer",
+        node=source,
+        code_dir="~/dt/worker/jobs/prior/code",
+        recorded_at=2.0,
+    )
+    cache = ArtifactReplica(
+        kind="site-cache",
+        node=source,
+        code_dir="~/dt/worker/cache/site-artifacts/a/code",
+        recorded_at=1.0,
+    )
+
+    failed_route = discovery.route(peer, destination)
+    assert failed_route.endpoint == lan
+    discovery.record_transfer_failure(failed_route, destination, "timeout")
+
+    fallback = discovery.route(cache, destination)
+
+    assert fallback.endpoint == overlay
+    assert attempts == [lan.destination, overlay.destination]
+
+
+def test_route_probe_invalidation_preserves_waiters_then_evicts(tmp_path):
+    cfg = _cfg(tmp_path)
+    discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    key = (source.name, destination.name)
+    pending: Future[tuple[DirectEndpoint, bool, float, str]] = Future()
+    endpoint = DirectEndpoint(
+        destination="worker@172.16.6.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-shared-subnet",
+        link_cost=0.0,
+    )
+    with discovery._route_lock:
+        discovery._route_probes[key] = pending
+
+    discovery._invalidate_completed_route_probe(*key)
+    with discovery._route_lock:
+        assert discovery._route_probes[key] is pending
+
+    result = (endpoint, True, 5.0, "ok")
+    pending.set_result(result)
+
+    assert pending.result() == result
+    with discovery._route_lock:
+        assert key not in discovery._route_probes
+
+
+def test_cancelled_endpoint_probe_releases_half_open_reservation(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _cfg(tmp_path)
+    site = cfg.sites["psibot"]
+    source = cfg.nodes[2]
+    destination = cfg.nodes[3]
+    now = [100.0]
+    health = PersistentRouteHealth(cfg, clock=lambda: now[0])
+    endpoint = DirectEndpoint(
+        destination="worker@172.16.6.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-shared-subnet",
+        link_cost=0.0,
+    )
+    endpoint_key = TopologyDiscovery._endpoint_circuit_destination(
+        destination,
+        endpoint,
+    )
+    health.record_failure(site, source.name, endpoint_key, "transfer.timeout")
+    opened = health.record_failure(
+        site,
+        source.name,
+        endpoint_key,
+        "transfer.timeout",
+    )
+    now[0] += opened.retry_after_s + 1
+    discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg), route_health=health)
+    monkeypatch.setattr(discovery, "endpoints", lambda *args: (endpoint,))
+    monkeypatch.setattr(
+        discovery,
+        "probe_route",
+        lambda *args: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        discovery.route(
+            ArtifactReplica(
+                kind="peer",
+                node=source,
+                code_dir="~/dt/worker/jobs/prior/code",
+                recorded_at=1.0,
+            ),
+            destination,
+        )
+
+    retry = health.decision(site, source.name, endpoint_key)
+    assert retry.is_open is False
+    assert retry.failures == 2
+    assert retry.last_kind == "transfer.timeout"
+
+
 def test_endpoint_excludes_bridge_gateway_and_selects_pod(tmp_path, monkeypatch):
     import dt.topology_discovery as module
 
@@ -344,7 +747,22 @@ def test_registry_replica_discovery_is_bounded_to_newest_job_per_seed(
             (4, "psibot-hm", "dt/jobs/hm", 4.0),
         )
     ]
-    monkeypatch.setattr(module, "list_all", lambda cfg: entries)
+    records = tuple(
+        ArtifactReplicaRecord(
+            digest=digest,
+            site="psibot",
+            node=entry.node,
+            job_id=entry.job_id,
+            job_dir=entry.job_dir,
+            recorded_at=entry.created_at,
+        )
+        for entry in (entries[1], entries[2], entries[3])
+    )
+    monkeypatch.setattr(
+        module,
+        "artifact_replica_records",
+        lambda cfg, requested_digest, site: records,
+    )
 
     replicas = TopologyDiscovery(cfg, TopologyRegistry(cfg)).replicas(
         cfg.sites["psibot"], digest
@@ -375,13 +793,284 @@ def test_registry_replica_rejects_unsafe_legacy_job_directory(tmp_path, monkeypa
         cmd="true",
         snapshot_sha256=digest,
     )
-    monkeypatch.setattr(module, "list_all", lambda cfg: [unsafe])
+    monkeypatch.setattr(
+        module,
+        "artifact_replica_records",
+        lambda cfg, requested_digest, site: (
+            ArtifactReplicaRecord(
+                digest=digest,
+                site="psibot",
+                node=unsafe.node,
+                job_id=unsafe.job_id,
+                job_dir=unsafe.job_dir,
+                recorded_at=unsafe.created_at,
+            ),
+        ),
+    )
 
     replicas = TopologyDiscovery(cfg, TopologyRegistry(cfg)).replicas(
         cfg.sites["psibot"], digest
     )
 
     assert all(replica.kind != "peer" for replica in replicas)
+
+
+def test_registry_replica_scan_streams_six_figure_history(tmp_path, monkeypatch):
+    import dt.jobs as jobs
+
+    cfg = _cfg(tmp_path)
+    digest = f"{99_999:064x}"
+    seed_nodes = ("psibot-hm", "psibot-ys", "psibot-ds")
+
+    def history(_cfg):
+        for index in range(100_000):
+            yield JobEntry(
+                job_id=f"history-{index}",
+                name="proof",
+                center="headstar",
+                project="p",
+                node=seed_nodes[index % len(seed_nodes)],
+                node_local=False,
+                job_dir=f"~/jobs/{index}",
+                session="s",
+                cmd="true",
+                snapshot_sha256=f"{index:064x}",
+                created_at=float(index),
+            )
+
+    def materialized_history_forbidden(*args, **kwargs):
+        raise AssertionError("replica discovery must not materialize list_all")
+
+    scans = 0
+
+    def counted_history(_cfg):
+        nonlocal scans
+        scans += 1
+        yield from history(_cfg)
+
+    monkeypatch.setattr(jobs, "iter_all", counted_history)
+    monkeypatch.setattr(jobs, "list_all", materialized_history_forbidden)
+    tracemalloc.start()
+    started = time.perf_counter()
+    try:
+        discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
+        replicas = discovery.replicas(cfg.sites["psibot"], digest)
+        cold_elapsed = time.perf_counter() - started
+        warm_started = time.perf_counter()
+        warm_replicas = discovery.replicas(cfg.sites["psibot"], digest)
+        warm_elapsed = time.perf_counter() - warm_started
+        elapsed = time.perf_counter() - started
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert elapsed < 30.0
+    assert cold_elapsed < 30.0
+    assert warm_elapsed < 0.2
+    assert peak < 192 * 1024 * 1024
+    assert scans == 1
+    assert warm_replicas == replicas
+    peers = [replica for replica in replicas if replica.kind == "peer"]
+    assert {replica.node.name for replica in peers} == {
+        seed_nodes[99_999 % len(seed_nodes)]
+    }
+    assert len(peers) == 1
+    generation_root = cfg.control_state_dir() / "artifact-replicas"
+    generations = list(generation_root.iterdir())
+    assert len(generations) == 1
+    assert len(list(generations[0].glob("*.json"))) <= 256
+
+
+def test_replica_index_missing_expected_bucket_rebuilds(tmp_path, monkeypatch):
+    import dt.jobs as jobs
+
+    cfg = _cfg(tmp_path)
+    digest = "d" * 64
+    entry = JobEntry(
+        job_id="seed",
+        name="seed",
+        center=cfg.center,
+        project="p",
+        node="psibot-ys",
+        node_local=False,
+        job_dir="~/jobs/seed",
+        session="s",
+        cmd="true",
+        snapshot_sha256=digest,
+        created_at=1.0,
+    )
+    scans = 0
+
+    def history(_cfg):
+        nonlocal scans
+        scans += 1
+        yield entry
+
+    monkeypatch.setattr(jobs, "iter_all", history)
+    assert jobs.artifact_replica_records(cfg, digest, "psibot")
+    manifest = jobs._read_replica_manifest(cfg)
+    assert manifest is not None
+    bucket = jobs._replica_bucket_key(digest)
+    bucket_path = (
+        jobs._replica_generation_root(cfg, manifest.generation) / f"{bucket}.json"
+    )
+    bucket_path.unlink()
+
+    assert jobs.artifact_replica_records(cfg, digest, "psibot")
+    assert scans == 2
+
+
+def test_concurrent_replica_cold_builders_publish_only_complete_generation(
+    tmp_path, monkeypatch
+):
+    import dt.jobs as jobs
+
+    cfg = _cfg(tmp_path)
+    digest = "e" * 64
+    entry = JobEntry(
+        job_id="seed",
+        name="seed",
+        center=cfg.center,
+        project="p",
+        node="psibot-ys",
+        node_local=False,
+        job_dir="~/jobs/seed",
+        session="s",
+        cmd="true",
+        snapshot_sha256=digest,
+        created_at=1.0,
+    )
+    scans = 0
+    scan_lock = Lock()
+
+    def history(_cfg):
+        nonlocal scans
+        with scan_lock:
+            scans += 1
+        yield entry
+
+    barrier = Barrier(2)
+    publish = jobs._publish_replica_rebuild
+
+    def synchronized_publish(*args, **kwargs):
+        barrier.wait(timeout=5)
+        return publish(*args, **kwargs)
+
+    monkeypatch.setattr(jobs, "iter_all", history)
+    monkeypatch.setattr(jobs, "_publish_replica_rebuild", synchronized_publish)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda _index: jobs.artifact_replica_records(cfg, digest, "psibot"),
+                range(2),
+            )
+        )
+
+    assert all(result and result[0].job_id == "seed" for result in results)
+    assert scans == 2
+    monkeypatch.setattr(
+        jobs,
+        "iter_all",
+        lambda _cfg: (_ for _ in ()).throw(AssertionError("unexpected rescan")),
+    )
+    assert jobs.artifact_replica_records(cfg, digest, "psibot")
+    generations = list((cfg.control_state_dir() / "artifact-replicas").iterdir())
+    assert len(generations) == 1
+    assert generations[0].name.startswith("g-")
+
+
+def test_replica_cold_build_retries_registry_mutation_fence(tmp_path, monkeypatch):
+    import dt.jobs as jobs
+
+    cfg = _cfg(tmp_path)
+    digest = "9" * 64
+    seed = JobEntry(
+        job_id="seed",
+        name="seed",
+        center=cfg.center,
+        project="p",
+        node="psibot-ys",
+        node_local=False,
+        job_dir="~/jobs/seed",
+        session="s",
+        cmd="true",
+        snapshot_sha256=digest,
+        created_at=1.0,
+    )
+    scan_ready = Event()
+    mutation_done = Event()
+    scans = 0
+
+    def history(_cfg):
+        nonlocal scans
+        scans += 1
+        yield seed
+        if scans == 1:
+            scan_ready.set()
+            assert mutation_done.wait(timeout=5)
+
+    monkeypatch.setattr(jobs, "iter_all", history)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(jobs.artifact_replica_records, cfg, digest, "psibot")
+        assert scan_ready.wait(timeout=5)
+        jobs.save(
+            cfg,
+            JobEntry(
+                job_id="unrelated",
+                name="unrelated",
+                center=cfg.center,
+                project="p",
+                node="-",
+                node_local=False,
+                job_dir="",
+                session="s",
+                cmd="true",
+            ),
+        )
+        mutation_done.set()
+        result = pending.result(timeout=5)
+
+    assert result and result[0].job_id == "seed"
+    assert scans == 2
+    monkeypatch.setattr(
+        jobs,
+        "iter_all",
+        lambda _cfg: (_ for _ in ()).throw(AssertionError("unexpected rescan")),
+    )
+    assert jobs.artifact_replica_records(cfg, digest, "psibot") == result
+
+
+def test_replica_index_never_returns_removed_or_split_brain_seed(tmp_path):
+    import dt.jobs as jobs
+    from dt.layout import ROLE_LAYOUT
+
+    cfg = replace(_cfg(tmp_path), layout=ROLE_LAYOUT)
+    digest = "f" * 64
+    entry = JobEntry(
+        job_id="seed",
+        name="seed",
+        center=cfg.center,
+        project="p",
+        node="psibot-ys",
+        node_local=False,
+        job_dir="~/jobs/seed",
+        session="s",
+        cmd="true",
+        status="finished",
+        snapshot_sha256=digest,
+        created_at=1.0,
+    )
+    jobs.save(cfg, entry)
+    assert jobs.artifact_replica_records(cfg, digest, "psibot")
+
+    jobs.remove_record(cfg, entry.job_id)
+    assert jobs.artifact_replica_records(cfg, digest, "psibot") == ()
+
+    jobs.save(cfg, entry)
+    current = cfg.registry_path() / "seed.json"
+    cfg.legacy_registry_dir().mkdir(parents=True, exist_ok=True)
+    (cfg.legacy_registry_dir() / "seed.json").write_bytes(current.read_bytes())
+    assert jobs.artifact_replica_records(cfg, digest, "psibot") == ()
 
 
 def test_unreadable_host_keys_fail_closed_before_direct_probe(tmp_path, monkeypatch):
@@ -497,7 +1186,7 @@ def test_concurrent_routes_from_one_seed_share_one_direct_edge_probe(
         origin="advertised-shared-subnet",
         link_cost=0.0,
     )
-    monkeypatch.setattr(discovery, "endpoint", lambda *args: endpoint)
+    monkeypatch.setattr(discovery, "endpoints", lambda *args: (endpoint,))
     calls = 0
     calls_lock = Lock()
 
@@ -550,7 +1239,7 @@ def test_persistent_route_circuit_skips_known_bad_edge(tmp_path, monkeypatch):
 
     for _attempt in range(2):
         discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
-        monkeypatch.setattr(discovery, "endpoint", lambda *args: endpoint)
+        monkeypatch.setattr(discovery, "endpoints", lambda *args: (endpoint,))
         monkeypatch.setattr(discovery, "probe_route", failed_probe)
         with pytest.raises(TopologyDiscoveryError, match="failed.*timeout"):
             discovery.route(
@@ -566,7 +1255,7 @@ def test_persistent_route_circuit_skips_known_bad_edge(tmp_path, monkeypatch):
     discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
     monkeypatch.setattr(
         discovery,
-        "endpoint",
+        "endpoints",
         lambda *args: (_ for _ in ()).throw(
             AssertionError("open circuit must skip endpoint discovery")
         ),
@@ -604,7 +1293,7 @@ def test_deterministic_probe_failure_does_not_open_route_circuit(
 
     for _attempt in range(3):
         discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
-        monkeypatch.setattr(discovery, "endpoint", lambda *args: endpoint)
+        monkeypatch.setattr(discovery, "endpoints", lambda *args: (endpoint,))
         monkeypatch.setattr(
             discovery,
             "probe_route",
@@ -662,7 +1351,7 @@ def test_deterministic_half_open_probe_releases_route_reservation(
         TopologyRegistry(cfg),
         route_health=health,
     )
-    monkeypatch.setattr(discovery, "endpoint", lambda *args: endpoint)
+    monkeypatch.setattr(discovery, "endpoints", lambda *args: (endpoint,))
     monkeypatch.setattr(
         discovery,
         "probe_route",
@@ -700,7 +1389,7 @@ def test_endpoint_failure_releases_half_open_route_reservation(tmp_path, monkeyp
     )
     monkeypatch.setattr(
         discovery,
-        "endpoint",
+        "endpoints",
         lambda *args: (_ for _ in ()).throw(
             TopologyDiscoveryError("advertisement unavailable")
         ),
@@ -743,7 +1432,7 @@ def test_local_probe_spawn_failure_does_not_open_route_circuit(tmp_path, monkeyp
         TopologyRegistry(cfg),
         route_health=health,
     )
-    monkeypatch.setattr(discovery, "endpoint", lambda *args: endpoint)
+    monkeypatch.setattr(discovery, "endpoints", lambda *args: (endpoint,))
     monkeypatch.setattr(
         module,
         "run_on",
@@ -795,7 +1484,7 @@ def _healthy_probe_discovery(cfg, health, monkeypatch):
         TopologyRegistry(cfg),
         route_health=health,
     )
-    monkeypatch.setattr(discovery, "endpoint", lambda *args: endpoint)
+    monkeypatch.setattr(discovery, "endpoints", lambda *args: (endpoint,))
     monkeypatch.setattr(
         discovery,
         "probe_route",
@@ -839,9 +1528,29 @@ def test_unconsumed_route_reservation_is_released_at_scope_end(tmp_path, monkeyp
     source = cfg.nodes[2]
     destination = cfg.nodes[3]
     health = _tripped_transfer_circuit(cfg, site, source, destination, now)
+    endpoint = DirectEndpoint(
+        destination="worker@172.16.6.91",
+        port=22,
+        host_key_alias="dt-node-proof",
+        host_keys=("ssh-ed25519 AAAA",),
+        origin="advertised-shared-subnet",
+        link_cost=0.0,
+    )
+    endpoint_key = TopologyDiscovery._endpoint_circuit_destination(
+        destination,
+        endpoint,
+    )
+    health.record_failure(site, source.name, endpoint_key, "transfer.timeout")
+    endpoint_open = health.record_failure(
+        site,
+        source.name,
+        endpoint_key,
+        "transfer.timeout",
+    )
+    now[0] += endpoint_open.retry_after_s + 1
     discovery = _healthy_probe_discovery(cfg, health, monkeypatch)
 
-    discovery.route(
+    route = discovery.route(
         ArtifactReplica(
             kind="peer",
             node=source,
@@ -850,6 +1559,8 @@ def test_unconsumed_route_reservation_is_released_at_scope_end(tmp_path, monkeyp
         ),
         destination,
     )
+    assert route.endpoint_circuit_destination == endpoint_key
+    assert route.endpoint_reservation_token is not None
     claimed = health.decision(site, source.name, destination.name)
     assert claimed.is_open is True
 
@@ -858,6 +1569,10 @@ def test_unconsumed_route_reservation_is_released_at_scope_end(tmp_path, monkeyp
     decision = health.decision(site, source.name, destination.name)
     assert decision.is_open is False
     assert decision.failures == 2
+    endpoint_decision = health.decision(site, source.name, endpoint_key)
+    assert endpoint_decision.is_open is False
+    assert endpoint_decision.failures == 2
+    assert endpoint_decision.last_kind == "transfer.timeout"
 
 
 def test_transfer_resolution_consumes_carried_reservation(tmp_path, monkeypatch):

@@ -1,8 +1,10 @@
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import signal
+import stat
 import statistics
 import subprocess
 import sys
@@ -23,7 +25,12 @@ from dt.cli import (
 )
 from dt.dispatch import PAYLOAD_DIR, _support_files
 from dt.jobs import JobEntry
-from dt.monitoring import ResourceTelemetryQuery
+from dt.layout import LEGACY_LAYOUT, ROLE_LAYOUT
+from dt.monitoring import (
+    TELEMETRY_ENVELOPE_MAX_BYTES,
+    TELEMETRY_TRANSPORT_CAPTURE_BYTES,
+    ResourceTelemetryQuery,
+)
 
 
 def _load_telemetry_payload():
@@ -35,7 +42,187 @@ def _load_telemetry_payload():
     return module
 
 
+def _load_telemetry_summary_payload():
+    path = PAYLOAD_DIR / "telemetry_summary.py"
+    spec = importlib.util.spec_from_file_location("dt_telemetry_summary_payload", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_node_telemetry_summary_streams_all_or_exact_tail(tmp_path):
+    from dt.monitoring import _telemetry_envelope, summarize_resource_text
+
+    source = tmp_path / "resources.jsonl"
+    lines = [
+        json.dumps(
+            {
+                "schema_version": "dt_resource_v1",
+                "timestamp": stamp,
+                "gpus": [{"index": 0, "utilization_pct": stamp}],
+                "host": {"cpu_load1": stamp},
+                "phase": "train",
+            }
+        )
+        for stamp in (1, 2, 3, 4)
+    ]
+    lines.insert(2, "interrupted-json")
+    source.write_text("\n".join(lines) + "\n")
+    helper = PAYLOAD_DIR / "telemetry_summary.py"
+
+    complete = subprocess.run(
+        [sys.executable, "-I", str(helper), "--path", str(source), "--tail", "0"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tailed = subprocess.run(
+        [sys.executable, "-I", str(helper), "--path", str(source), "--tail", "2"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    complete_payload = json.loads(complete.stdout)
+    tail_payload = json.loads(tailed.stdout)
+
+    expected_all, invalid_all = summarize_resource_text("\n".join(lines))
+    expected_tail, invalid_tail = summarize_resource_text("\n".join(lines[-2:]))
+    assert complete_payload["complete"] is True
+    assert complete_payload["lines_total"] == len(lines)
+    assert complete_payload["lines_selected"] == len(lines)
+    assert complete_payload["invalid_lines"] == invalid_all == 1
+    assert complete_payload["summary"] == expected_all
+    assert tail_payload["complete"] is True
+    assert tail_payload["requested_tail"] == 2
+    assert tail_payload["schema_version"] == "dt_telemetry_summary_envelope_v2"
+    assert tail_payload["lines_total"] is None
+    assert tail_payload["lines_total_complete"] is False
+    assert tail_payload["lines_selected"] == 2
+    assert tail_payload["invalid_lines"] == invalid_tail == 0
+    assert tail_payload["summary"] == expected_tail
+    assert _telemetry_envelope(tailed.stdout, requested_tail=2)["complete"] is True
+
+
+def test_node_telemetry_summary_refuses_symlink_and_bounds_a_line(tmp_path):
+    helper = PAYLOAD_DIR / "telemetry_summary.py"
+    source = tmp_path / "resources.jsonl"
+    source.write_bytes(b"x" * (1024 * 1024 + 1) + b"\n")
+
+    proc = subprocess.run(
+        [sys.executable, "-I", str(helper), "--path", str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(proc.stdout)
+    assert payload["complete"] is True
+    assert payload["invalid_lines"] == 1
+    assert payload["valid_rows"] == 0
+    assert len(proc.stdout.encode()) <= 1024 * 1024
+
+    alias = tmp_path / "alias.jsonl"
+    alias.symlink_to(source)
+    refused = subprocess.run(
+        [sys.executable, "-I", str(helper), "--path", str(alias)],
+        capture_output=True,
+        text=True,
+    )
+    refused_payload = json.loads(refused.stdout)
+    assert refused.returncode == 1
+    assert refused_payload["complete"] is False
+    assert refused_payload["omission_reason"] == "source_unavailable"
+
+
+def test_node_telemetry_summary_does_not_truncate_above_ssh_capture_limit(tmp_path):
+    helper = PAYLOAD_DIR / "telemetry_summary.py"
+    source = tmp_path / "resources.jsonl"
+    padding = "x" * (900 * 1024)
+    with source.open("w", encoding="utf-8") as stream:
+        for stamp in range(20):
+            stream.write(
+                json.dumps(
+                    {
+                        "schema_version": "dt_resource_v1",
+                        "timestamp": stamp,
+                        "padding": padding,
+                    }
+                )
+                + "\n"
+            )
+    assert source.stat().st_size > 16 * 1024 * 1024
+
+    complete = subprocess.run(
+        [sys.executable, "-I", str(helper), "--path", str(source), "--tail", "0"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tailed = subprocess.run(
+        [sys.executable, "-I", str(helper), "--path", str(source), "--tail", "3"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    all_payload = json.loads(complete.stdout)
+    tail_payload = json.loads(tailed.stdout)
+    assert all_payload["complete"] is True
+    assert all_payload["lines_total"] == all_payload["valid_rows"] == 20
+    assert all_payload["summary"]["samples"] == 20
+    assert tail_payload["complete"] is True
+    assert tail_payload["lines_total"] is None
+    assert tail_payload["lines_total_complete"] is False
+    assert tail_payload["lines_selected"] == tail_payload["valid_rows"] == 3
+    assert tail_payload["summary"]["samples"] == 3
+
+
+def test_node_telemetry_positive_tail_reads_only_a_bounded_suffix(tmp_path):
+    helper = _load_telemetry_summary_payload()
+    source = tmp_path / "resources.jsonl"
+    prefix = b'{"schema_version":"dt_resource_v1","timestamp":0}\n' * 100_000
+    suffix = b"".join(
+        json.dumps({"schema_version": "dt_resource_v1", "timestamp": stamp}).encode()
+        + b"\n"
+        for stamp in range(100_000, 103_600)
+    )
+    source.write_bytes(prefix + suffix)
+
+    payload, status = helper.summarize_path(source, 3_600)
+
+    assert status == 0
+    assert payload["complete"] is True
+    assert payload["lines_selected"] == payload["valid_rows"] == 3_600
+    assert payload["lines_total"] is None
+    assert payload["lines_total_complete"] is False
+    assert payload["summary"]["started_at"] == 100_000
+    assert payload["summary"]["finished_at"] == 103_599
+    # One reverse scan plus one forward pass over the requested suffix.  The
+    # large historical prefix must not influence the amount of telemetry I/O.
+    assert payload["bytes_read"] < len(suffix) * 3
+    assert payload["bytes_read"] < source.stat().st_size // 4
+
+
+def test_node_telemetry_tail_scan_has_a_hard_corruption_budget(tmp_path):
+    helper = _load_telemetry_summary_payload()
+    source = tmp_path / "unterminated.jsonl"
+    with source.open("wb") as stream:
+        stream.truncate(helper.MAX_TAIL_SCAN_BYTES + 1024 * 1024)
+
+    payload, status = helper.summarize_path(source, 3_600)
+
+    assert status == 0
+    assert payload["complete"] is False
+    assert payload["omission_reason"] == "tail_scan_byte_limit"
+    assert payload["lines_total"] is None
+    assert payload["lines_total_complete"] is False
+    assert payload["bytes_read"] <= helper.MAX_TAIL_SCAN_BYTES
+    assert payload["lines_selected"] == 0
+
+
 def test_resource_telemetry_query_owns_path_tail_and_identity_contract():
+    from dt.monitoring import summarize_resource_text
+
     entry = JobEntry(
         job_id="query",
         name="query-name",
@@ -48,32 +235,203 @@ def test_resource_telemetry_query_owns_path_tail_and_identity_contract():
         cmd="true",
     )
     query = ResourceTelemetryQuery(entry, 12)
-    text = "\n".join(
-        [
-            json.dumps(
-                {
-                    "schema_version": "dt_resource_v1",
-                    "timestamp": 100.0,
-                    "gpus": [],
-                    "host": {},
-                }
-            ),
-            "incomplete",
-        ]
+    resource_line = json.dumps(
+        {
+            "schema_version": "dt_resource_v1",
+            "timestamp": 100.0,
+            "gpus": [],
+            "host": {},
+        }
+    )
+    resource_summary, invalid = summarize_resource_text(f"{resource_line}\nincomplete")
+    counts = {
+        "lines_total": 2,
+        "lines_selected": 2,
+        "valid_rows": 1,
+        "invalid_lines": invalid,
+        "bytes_read": len(resource_line) + len("incomplete") + 2,
+    }
+    text = json.dumps(
+        {
+            "schema_version": "dt_telemetry_summary_envelope_v1",
+            "requested_tail": 12,
+            **counts,
+            "counts": counts,
+            "complete": True,
+            "omission_reason": None,
+            "summary": resource_summary,
+        }
     )
 
     summary = query.summarize(text, include_identity=True)
 
-    assert query.command(require_file=True) == (
-        "test -f dt/jobs/query/outputs/dt/resources.jsonl && "
-        "tail -c 262144 -- dt/jobs/query/outputs/dt/resources.jsonl | tail -n 12"
-    )
+    command = query.command(require_file=True)
+    assert "dt/jobs/query/evidence/resources.jsonl" in command
+    assert "dt/jobs/query/outputs/dt/resources.jsonl" in command
+    assert "python3 -I dt/jobs/query/telemetry_summary.py" in command
+    assert command.endswith("else false; fi")
     assert summary is not None
     assert summary["job_id"] == "query"
     assert summary["name"] == "query-name"
     assert summary["node"] == "n1"
     assert summary["tail_limit"] == 12
     assert summary["invalid_lines"] == 1
+    assert summary["complete"] is True
+    assert summary["evidence_provenance"] == "legacy_unisolated"
+
+
+def test_resource_telemetry_transport_preserves_maximum_legal_envelope():
+    from dt.monitoring import _telemetry_envelope
+
+    entry = JobEntry(
+        job_id="large-query",
+        name="large-query",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/large-query",
+        session="dt_large_query",
+        cmd="true",
+    )
+    counts = {
+        "lines_total": 0,
+        "lines_total_complete": True,
+        "lines_selected": 0,
+        "valid_rows": 0,
+        "invalid_lines": 0,
+        "bytes_read": 0,
+    }
+    document = json.dumps(
+        {
+            "schema_version": "dt_telemetry_summary_envelope_v2",
+            "requested_tail": 0,
+            **counts,
+            "counts": counts,
+            "complete": True,
+            "omission_reason": None,
+            "summary": None,
+        },
+        separators=(",", ":"),
+    )
+    text = document + " " * (TELEMETRY_ENVELOPE_MAX_BYTES - len(document))
+
+    def runner(
+        _node,
+        _local,
+        _command,
+        timeout=15,
+        check=False,
+        *,
+        capture_limit_bytes,
+    ):
+        del timeout, check
+        assert capture_limit_bytes == TELEMETRY_TRANSPORT_CAPTURE_BYTES
+        assert capture_limit_bytes > len(text.encode())
+        return subprocess.CompletedProcess([], 0, text, "")
+
+    reading = ResourceTelemetryQuery(entry, 0).read(
+        runner,
+        timeout=5,
+        require_file=False,
+    )
+
+    assert reading.text == text
+    assert _telemetry_envelope(reading.text, requested_tail=0)["complete"] is True
+
+
+def test_old_capsules_without_summary_helper_remain_bounded_and_readable(
+    tmp_path, monkeypatch
+):
+    from dt import cli, diagnose
+
+    resource_line = json.dumps(
+        {
+            "schema_version": "dt_resource_v1",
+            "timestamp": 100.0,
+            "gpus": [{"index": 0, "utilization_pct": 25}],
+            "host": {},
+        }
+    )
+    sentinel = tmp_path / "application-helper-ran"
+
+    def local_runner(
+        node,
+        is_local,
+        command,
+        timeout=15,
+        check=False,
+        *,
+        capture_limit_bytes,
+    ):
+        del node, is_local
+        assert capture_limit_bytes >= 1024 * 1024
+        return subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=check,
+        )
+
+    entries = []
+    for layout in (LEGACY_LAYOUT, ROLE_LAYOUT):
+        job_dir = tmp_path / layout
+        if layout == ROLE_LAYOUT:
+            evidence = job_dir / ".dt" / "evidence"
+        else:
+            evidence = job_dir / "outputs" / "dt"
+        evidence.mkdir(parents=True)
+        resource_path = evidence / "resources.jsonl"
+        resource_path.write_text(f"{resource_line}\n", encoding="utf-8")
+
+        # An application-writable lookalike is never selected as the helper.
+        application_helper = job_dir / "outputs" / "dt" / "telemetry_summary.py"
+        application_helper.parent.mkdir(parents=True, exist_ok=True)
+        application_helper.write_text(
+            f"#!/bin/sh\ntouch {sentinel!s}\n", encoding="utf-8"
+        )
+        application_helper.chmod(0o700)
+
+        entries.append(
+            JobEntry(
+                job_id=f"old-{layout}",
+                name=f"old-{layout}",
+                center="c",
+                project="p",
+                node="local",
+                node_local=True,
+                job_dir=str(job_dir),
+                session=f"dt-old-{layout}",
+                cmd="true",
+                storage_layout=layout,
+            )
+        )
+
+    monkeypatch.setattr(cli, "run_on", local_runner)
+    for entry in entries:
+        query = ResourceTelemetryQuery(entry, 0)
+
+        # This is the exact read/summarize path used by `dt metrics`.
+        reading = query.read(local_runner, timeout=5, require_file=True)
+        assert reading.returncode == 0
+        summary = query.summarize(reading.text, include_identity=True)
+        assert summary is not None
+        assert summary["samples"] == 1
+        assert summary["complete"] is False
+        assert summary["omission_reason"] == "legacy_bounded_fallback"
+        assert summary["source_size_bytes"] == len(resource_line.encode()) + 1
+        assert summary["job_id"] == entry.job_id
+
+        # Info and diagnose consume the same compatibility contract.
+        info_summary = cli._job_resource_summary(entry)
+        assert info_summary is not None and info_summary["samples"] == 1
+        diagnosis = diagnose._telemetry_evidence(entry, local_runner)
+        assert diagnosis.data["samples"] == 1
+        assert diagnosis.complete is False
+        assert diagnosis.omission_reason == "legacy_bounded_fallback"
+
+    assert not sentinel.exists()
 
 
 def test_guard_still_terminates_when_evidence_write_fails(tmp_path, monkeypatch):
@@ -140,6 +498,7 @@ def test_parse_resource_jsonl_rejects_non_finite_rows():
 
 def test_telemetry_payload_emits_one_host_sample(tmp_path):
     output = tmp_path / "resources.jsonl"
+    ready = tmp_path / "telemetry-ready.json"
     script = PAYLOAD_DIR / "telemetry.py"
 
     proc = subprocess.run(
@@ -150,6 +509,8 @@ def test_telemetry_payload_emits_one_host_sample(tmp_path):
             str(output),
             "--samples",
             "1",
+            "--ready-file",
+            str(ready),
             "--interval",
             "0.01",
         ],
@@ -168,6 +529,37 @@ def test_telemetry_payload_emits_one_host_sample(tmp_path):
     assert row["host"]["mem_total_mib"] > 0
     assert isinstance(row["gpus"], list)
     assert row["phase"] is None
+    readiness = json.loads(ready.read_text())
+    assert readiness["schema_version"] == "dt_telemetry_ready_v1"
+    assert readiness["pid"] > 1
+    assert readiness["selected_gpus"] is None
+    assert stat.S_IMODE(ready.stat().st_mode) == 0o600
+
+
+def test_wrapper_waits_for_guard_telemetry_readiness_before_user_code(tmp_path):
+    job = tmp_path / "job"
+    (job / "code").mkdir(parents=True)
+    ready = job / "evidence" / "telemetry-ready.json"
+    (job / "cmd.sh").write_text(f"test -s {shlex.quote(str(ready))}\n")
+    (job / "telemetry.py").write_text((PAYLOAD_DIR / "telemetry.py").read_text())
+    # The wrapper must be the process-group leader whenever a guard is active.
+    proc = subprocess.run(
+        ["setsid", "bash", str(PAYLOAD_DIR / "wrapper.sh")],
+        env={
+            **os.environ,
+            "DT_JOB_DIR": str(job),
+            "DT_GPU_IDS": "",
+            "DT_GPUS": "0",
+            "DT_MAX_JOB_MEMORY_MIB": "1000000",
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (job / "result_state").read_text().strip() == "success"
+    assert ready.is_file()
 
 
 def test_telemetry_copies_only_safe_current_phase(tmp_path):
@@ -470,6 +862,10 @@ def test_telemetry_pss_does_not_double_count_fork_shared_memory(tmp_path):
 def test_job_support_files_ship_telemetry_and_phase_helpers():
     files = _support_files(["true"], {"job_id": "j"})
     assert files["telemetry.py"] == (PAYLOAD_DIR / "telemetry.py").read_text()
+    assert (
+        files["telemetry_summary.py"]
+        == (PAYLOAD_DIR / "telemetry_summary.py").read_text()
+    )
     assert files["phase.sh"] == (PAYLOAD_DIR / "phase.sh").read_text()
 
 
@@ -679,12 +1075,12 @@ def test_resource_summary_partitions_ordered_phase_spans_and_renders_metrics():
 
 def test_wrapper_persists_and_stops_telemetry_sidecar():
     wrapper = (PAYLOAD_DIR / "wrapper.sh").read_text()
-    assert "outputs/dt/resources.jsonl" in wrapper
+    assert '"$DT_EVIDENCE_DIR/resources.jsonl"' in wrapper
     assert '--root-pid "$$"' in wrapper
     assert 'kill -TERM "$dt_telemetry_pid"' in wrapper
     assert '--max-vram-mib "$DT_MAX_VRAM_MIB"' in wrapper
     assert '--max-job-memory-mib "$DT_MAX_JOB_MEMORY_MIB"' in wrapper
-    assert "outputs/dt/resource-guard.json" in wrapper
+    assert '"$DT_EVIDENCE_DIR/resource-guard.json"' in wrapper
 
 
 def test_sample_write_failure_never_disarms_the_guard():
@@ -930,7 +1326,7 @@ def test_launcher_refuses_node_that_cannot_arm_a_requested_guard(tmp_path):
     )
 
     assert proc.returncode == 15, proc.stdout + proc.stderr
-    assert "node-unfit: python3 required for resource guards" in proc.stderr
+    assert "node-unfit: Python 3.10 or newer is required" in proc.stderr
 
 
 def test_wrapper_refuses_to_start_when_a_requested_guard_cannot_arm(tmp_path):

@@ -181,6 +181,126 @@ print("running" if row["alive"] else "stopped")
 PY
 }
 
+probe_release_authority_capability() {
+    local release_wheel="$1"
+    python3 - "$release_wheel" <<'PY'
+import ast
+import pathlib
+import stat
+import sys
+import zipfile
+
+wheel = pathlib.Path(sys.argv[1])
+info = wheel.lstat()
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+    raise SystemExit(1)
+with zipfile.ZipFile(wheel) as archive:
+    matches = [item for item in archive.infolist() if item.filename == "dt/jobs.py"]
+    if len(matches) != 1 or matches[0].file_size > 2 * 1024 * 1024:
+        raise SystemExit(1)
+    with archive.open(matches[0]) as stream:
+        source = stream.read(2 * 1024 * 1024 + 1)
+if len(source) > 2 * 1024 * 1024:
+    raise SystemExit(1)
+tree = ast.parse(source.decode("utf-8"), filename="dt/jobs.py")
+expected = {"DISPATCH_PROTOCOL_VERSION", "REGISTRY_SCHEMA_VERSION"}
+values = {}
+for node in tree.body:
+    if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+        continue
+    target = node.targets[0]
+    if not isinstance(target, ast.Name) or target.id not in expected:
+        continue
+    if target.id in values or not isinstance(node.value, ast.Constant):
+        raise SystemExit(1)
+    value = node.value.value
+    if not isinstance(value, str) or not value.isascii() or len(value) > 128:
+        raise SystemExit(1)
+    values[target.id] = value
+if "DISPATCH_PROTOCOL_VERSION" not in values:
+    raise SystemExit(1)
+print(
+    values["DISPATCH_PROTOCOL_VERSION"]
+    + "\t"
+    + values.get("REGISTRY_SCHEMA_VERSION", "-")
+)
+PY
+}
+
+probe_registry_authority_state() {
+    local command="$1"
+    local command_dir protocol_json
+    command_dir="$(dirname "$command")"
+    protocol_json="$(
+        timeout -k 1 5 env PATH="$command_dir${PATH:+:$PATH}" \
+            "$command" agent protocol 2>/dev/null | head -c 4097
+    )" || return 1
+    [[ "${#protocol_json}" -le 4096 ]] || return 1
+    python3 - "$protocol_json" <<'PY'
+import json
+import sys
+
+def reject_constant(value):
+    raise ValueError(value)
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(key)
+        result[key] = value
+    return result
+
+row = json.loads(
+    sys.argv[1],
+    parse_constant=reject_constant,
+    object_pairs_hook=unique_object,
+)
+if not isinstance(row, dict) or set(row) != {
+    "schema_version",
+    "dispatch_protocol",
+    "registry_schema",
+    "registry_authority_state",
+}:
+    raise SystemExit(1)
+if (
+    row["schema_version"] != "dt_agent_protocol_v1"
+    or row["dispatch_protocol"] != "dt_dispatch_attempt_v2"
+    or row["registry_schema"] != "dt_job_registry_v1"
+    or row["registry_authority_state"] not in {"absent", "present", "unproven"}
+):
+    raise SystemExit(1)
+print(row["registry_authority_state"])
+PY
+}
+
+require_release_authority_compatible() {
+    local release="$1"
+    local release_version="$2"
+    local wheel="$release/disttrainer-$release_version-py3-none-any.whl"
+    local capability dispatch_protocol registry_schema authority_state
+    capability="$(probe_release_authority_capability "$wheel")" || {
+        echo 'deploy: target release authority capability is invalid' >&2
+        return 1
+    }
+    IFS=$'\t' read -r dispatch_protocol registry_schema <<< "$capability"
+    if [[ "$dispatch_protocol" == "dt_dispatch_attempt_v2" \
+          && "$registry_schema" == "dt_job_registry_v1" ]]; then
+        return 0
+    fi
+    authority_state="unproven"
+    if [[ -x "$active_command" ]]; then
+        authority_state="$(probe_registry_authority_state "$active_command")" \
+            || authority_state="unproven"
+    fi
+    if [[ "$authority_state" != "absent" ]]; then
+        echo 'deploy: target release cannot read existing versioned registry authority' >&2
+    else
+        echo 'deploy: target release lacks the current registry/dispatch authority capability' >&2
+    fi
+    return 1
+}
+
 agent_was_running=0
 if [[ -x "$active_command" ]]; then
     agent_state="$(probe_agent_state "$active_command")" || {
@@ -243,6 +363,7 @@ activation_bootstrap="$final/bootstrap.sh"
 activate_release() {
     local release="$1"
     local release_version="$2"
+    require_release_authority_compatible "$release" "$release_version" || return 1
     local release_wheel="disttrainer-$release_version-py3-none-any.whl"
     local release_digest
     release_digest="$(sha256sum "$release/$release_wheel" | cut -d' ' -f1)"
@@ -511,6 +632,126 @@ print("running" if row["alive"] else "stopped")
 PY
 }
 
+probe_release_authority_capability() {
+    local release_wheel="$1"
+    python3 - "$release_wheel" <<'PY'
+import ast
+import pathlib
+import stat
+import sys
+import zipfile
+
+wheel = pathlib.Path(sys.argv[1])
+info = wheel.lstat()
+if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+    raise SystemExit(1)
+with zipfile.ZipFile(wheel) as archive:
+    matches = [item for item in archive.infolist() if item.filename == "dt/jobs.py"]
+    if len(matches) != 1 or matches[0].file_size > 2 * 1024 * 1024:
+        raise SystemExit(1)
+    with archive.open(matches[0]) as stream:
+        source = stream.read(2 * 1024 * 1024 + 1)
+if len(source) > 2 * 1024 * 1024:
+    raise SystemExit(1)
+tree = ast.parse(source.decode("utf-8"), filename="dt/jobs.py")
+expected = {"DISPATCH_PROTOCOL_VERSION", "REGISTRY_SCHEMA_VERSION"}
+values = {}
+for node in tree.body:
+    if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+        continue
+    target = node.targets[0]
+    if not isinstance(target, ast.Name) or target.id not in expected:
+        continue
+    if target.id in values or not isinstance(node.value, ast.Constant):
+        raise SystemExit(1)
+    value = node.value.value
+    if not isinstance(value, str) or not value.isascii() or len(value) > 128:
+        raise SystemExit(1)
+    values[target.id] = value
+if "DISPATCH_PROTOCOL_VERSION" not in values:
+    raise SystemExit(1)
+print(
+    values["DISPATCH_PROTOCOL_VERSION"]
+    + "\t"
+    + values.get("REGISTRY_SCHEMA_VERSION", "-")
+)
+PY
+}
+
+probe_registry_authority_state() {
+    local command="$1"
+    local command_dir protocol_json
+    command_dir="$(dirname "$command")"
+    protocol_json="$(
+        timeout -k 1 5 env PATH="$command_dir${PATH:+:$PATH}" \
+            "$command" agent protocol 2>/dev/null | head -c 4097
+    )" || return 1
+    [[ "${#protocol_json}" -le 4096 ]] || return 1
+    python3 - "$protocol_json" <<'PY'
+import json
+import sys
+
+def reject_constant(value):
+    raise ValueError(value)
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(key)
+        result[key] = value
+    return result
+
+row = json.loads(
+    sys.argv[1],
+    parse_constant=reject_constant,
+    object_pairs_hook=unique_object,
+)
+if not isinstance(row, dict) or set(row) != {
+    "schema_version",
+    "dispatch_protocol",
+    "registry_schema",
+    "registry_authority_state",
+}:
+    raise SystemExit(1)
+if (
+    row["schema_version"] != "dt_agent_protocol_v1"
+    or row["dispatch_protocol"] != "dt_dispatch_attempt_v2"
+    or row["registry_schema"] != "dt_job_registry_v1"
+    or row["registry_authority_state"] not in {"absent", "present", "unproven"}
+):
+    raise SystemExit(1)
+print(row["registry_authority_state"])
+PY
+}
+
+require_release_authority_compatible() {
+    local release="$1"
+    local release_version="$2"
+    local wheel="$release/disttrainer-$release_version-py3-none-any.whl"
+    local capability dispatch_protocol registry_schema authority_state
+    capability="$(probe_release_authority_capability "$wheel")" || {
+        echo 'deploy: target release authority capability is invalid' >&2
+        return 1
+    }
+    IFS=$'\t' read -r dispatch_protocol registry_schema <<< "$capability"
+    if [[ "$dispatch_protocol" == "dt_dispatch_attempt_v2" \
+          && "$registry_schema" == "dt_job_registry_v1" ]]; then
+        return 0
+    fi
+    authority_state="unproven"
+    if [[ -x "$active_before" ]]; then
+        authority_state="$(probe_registry_authority_state "$active_before")" \
+            || authority_state="unproven"
+    fi
+    if [[ "$authority_state" != "absent" ]]; then
+        echo 'deploy: target release cannot read existing versioned registry authority' >&2
+    else
+        echo 'deploy: target release lacks the current registry/dispatch authority capability' >&2
+    fi
+    return 1
+}
+
 agent_was_running=0
 if [[ -x "$active_before" ]]; then
     agent_state="$(probe_agent_state "$active_before")" || {
@@ -530,6 +771,7 @@ fi
 activate_release() {
     local release="$1"
     local release_version="$2"
+    require_release_authority_compatible "$release" "$release_version" || return 1
     local wheel="disttrainer-$release_version-py3-none-any.whl"
     local digest
     digest="$(sha256sum "$release/$wheel" | cut -d' ' -f1)"
@@ -544,6 +786,7 @@ activate_release() {
             bash "$activation_bootstrap" "$wheel" runtime-constraints.txt
     )
     IFS= read -r active < "$base/active-command"
+    active_before="$active"
     installed_version="$("$active" --version)"
     [[ "$installed_version" == "dt $release_version" \
           || "$installed_version" == "dt $release_version ("* ]]

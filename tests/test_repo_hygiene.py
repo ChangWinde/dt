@@ -64,3 +64,18 @@ def test_ambient_git_configuration_is_neutralized_for_fixtures():
     """conftest must isolate fixture git calls from user/system git policy."""
     assert os.environ["GIT_CONFIG_GLOBAL"] == os.devnull
     assert os.environ["GIT_CONFIG_SYSTEM"] == os.devnull
+
+
+def test_ci_fails_on_thread_exceptions_and_requires_relay_e2e_dependencies():
+    workflow = (
+        Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml"
+    ).read_text()
+
+    assert "error::pytest.PytestUnhandledThreadExceptionWarning" in workflow
+    assert 'DT_REQUIRE_RELAY_E2E: "1"' in workflow
+    assert "openssh-server rsync zsh" in workflow.replace("\\\n", " ")
+
+    release_gate = (
+        Path(__file__).parents[1] / "scripts" / "release-check.sh"
+    ).read_text()
+    assert "error::pytest.PytestUnhandledThreadExceptionWarning" in release_gate

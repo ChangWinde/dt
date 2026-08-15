@@ -43,6 +43,7 @@ REQUIRED_PAYLOADS = {
     "dt/payload/phase.sh",
     "dt/payload/result.py",
     "dt/payload/telemetry.py",
+    "dt/payload/telemetry_summary.py",
     "dt/payload/wrapper.sh",
 }
 ALLOWED_SDIST_PATHS = {

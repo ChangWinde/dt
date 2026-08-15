@@ -1,6 +1,8 @@
 import json
 import os
+import socket
 import stat
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -870,10 +872,87 @@ def test_request_record_rejects_symlink_and_oversized_input(tmp_path):
         intent_mod.load(cfg, request_id)
 
 
+@pytest.mark.parametrize("kind", ["fifo", "socket"])
+def test_request_record_rejects_special_files_without_blocking(kind):
+    # Linux limits AF_UNIX paths to 108 bytes; use an intentionally short
+    # temporary root rather than making the socket case environment-dependent.
+    with tempfile.TemporaryDirectory(prefix="dts-", dir="/tmp") as raw_root:
+        cfg = _cfg(Path(raw_root))
+        request_id = f"agent-special-record-{kind}"
+        path = intent_mod.record_path(cfg, request_id)
+        listener = None
+        if kind == "fifo":
+            os.mkfifo(path)
+        else:
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(str(path))
+        started = time.monotonic()
+        try:
+            with pytest.raises(intent_mod.RequestRecordError, match="regular file"):
+                intent_mod.load(cfg, request_id)
+        finally:
+            if listener is not None:
+                listener.close()
+        assert time.monotonic() - started < 0.5
+
+
+def test_request_lock_rejects_fifo_without_blocking(tmp_path):
+    cfg = _cfg(tmp_path)
+    request_id = "agent-fifo-lock"
+    lock_path = cfg.state_dir() / (
+        f"request-{intent_mod.request_digest(request_id)}.lock"
+    )
+    os.mkfifo(lock_path)
+    started = time.monotonic()
+
+    with pytest.raises(intent_mod.RequestLockError, match="regular file"):
+        with intent_mod.lock(cfg, request_id):
+            pass
+
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '{"schema":"one","schema":"two"}',
+        '{"updated_at":NaN}',
+        '{"updated_at":Infinity}',
+    ],
+)
+def test_request_record_rejects_duplicate_and_nonfinite_json(tmp_path, payload):
+    cfg = _cfg(tmp_path)
+    request_id = "agent-strict-json"
+    intent_mod.record_path(cfg, request_id).write_text(payload)
+
+    with pytest.raises(intent_mod.RequestRecordError, match="invalid JSON"):
+        intent_mod.load(cfg, request_id)
+
+
+def test_request_record_rejects_path_replacement_during_read(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    request_id = "agent-replaced-record"
+    record = intent_mod.create(request_id, "a" * 64, "job_1", now=1.0)
+    intent_mod.save(cfg, record)
+    original_read = intent_mod.read_bounded_regular
+
+    def replace_after_read(path_, *, max_bytes):
+        result = original_read(path_, max_bytes=max_bytes)
+        replacement = path_.with_suffix(".replacement")
+        replacement.write_bytes(path_.read_bytes())
+        os.replace(replacement, path_)
+        return result
+
+    monkeypatch.setattr(intent_mod, "read_bounded_regular", replace_after_read)
+
+    with pytest.raises(intent_mod.RequestRecordError, match="changed while"):
+        intent_mod.load(cfg, request_id)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("created_at", float("nan"), "timestamps"),
+        ("created_at", float("nan"), "invalid JSON"),
         ("updated_at", True, "timestamps"),
         ("error_kind", {"nested": "value"}, "error kind"),
         ("error_message", "x" * 513, "error message"),
@@ -901,6 +980,18 @@ def test_request_record_rejects_unknown_schema_fields(tmp_path):
     intent_mod.record_path(cfg, request_id).write_text(json.dumps(document))
 
     with pytest.raises(intent_mod.RequestRecordError, match="schema"):
+        intent_mod.load(cfg, request_id)
+
+
+def test_legacy_schema_cannot_forge_replay_authorization(tmp_path):
+    cfg = _cfg(tmp_path)
+    request_id = "agent-legacy-replay-state"
+    document = asdict(intent_mod.create(request_id, "a" * 64, "job_1", now=1.0))
+    document["schema"] = intent_mod.REQUEST_SCHEMA_V2
+    document["state"] = "replay_authorized"
+    intent_mod.record_path(cfg, request_id).write_text(json.dumps(document))
+
+    with pytest.raises(intent_mod.RequestRecordError, match="v3 schema"):
         intent_mod.load(cfg, request_id)
 
 
@@ -946,6 +1037,205 @@ def test_request_status_never_blocks_behind_a_long_submission(tmp_path, monkeypa
     assert payload["state"] == "preparing"
     assert payload["inspection_in_progress"] is True
     assert payload["job_found"] is False
+    assert payload["disposition"]["disposition"] == "in_progress"
+    assert payload["disposition"]["retry_safe"] is False
+
+
+def test_request_status_converges_proven_prelaunch_crash(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    request_id = "agent-proven-prelaunch"
+    record = intent_mod.create(request_id, "a" * 64, "pending-job", now=1.0)
+    intent_mod.save(cfg, record)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    queried = CliRunner().invoke(cli.app, ["request", request_id, "--json"])
+
+    assert queried.exit_code == 0, queried.output
+    payload = json.loads(queried.stdout)
+    assert payload["state"] == "replay_authorized"
+    assert payload["disposition"]["disposition"] == "safe_replay"
+    assert payload["disposition"]["retry_safe"] is True
+    assert payload["next_commands"]["events"] == [
+        "dt",
+        "events",
+        "--request-id",
+        request_id,
+        "--json",
+    ]
+    saved = intent_mod.load(cfg, request_id)
+    assert saved is not None and saved.state == "replay_authorized"
+
+
+def test_proven_remote_absence_authorizes_same_request_replay_once(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    request_id = "agent-proven-remote-absence"
+    successful_launches: list[str] = []
+    first_attempt = True
+
+    def submit_once(cfg_, spec, **kwargs):
+        nonlocal first_attempt
+        job_id = kwargs["allocated_job_id"]
+        if first_attempt:
+            first_attempt = False
+            dispatch._bind_request_remote_attempt(
+                cfg_,
+                request_id,
+                job_id,
+                node="n1",
+                job_dir=cfg_.worker_job_dir(cfg_.nodes[0], job_id),
+                launch_token="b" * 32,
+            )
+            raise KeyboardInterrupt
+        successful_launches.append(job_id)
+        return _entry(cfg_, spec, job_id, kwargs["submitted_at"])
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", submit_once)
+    spec = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        request_id=request_id,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        _submit(cfg, spec, source)
+
+    interrupted = intent_mod.load(cfg, request_id)
+    assert interrupted is not None
+    assert interrupted.state == "uncertain"
+    original_job_id = interrupted.job_id
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "inspect_request_remote_proof",
+        lambda _cfg, current: intent_mod.RemoteLaunchProof(
+            outcome="absent",
+            node=current.proof_node or "",
+            job_dir=current.proof_job_dir or "",
+            launch_identity_sha256=current.launch_identity_sha256 or "",
+        ),
+    )
+
+    queried = CliRunner().invoke(cli.app, ["request", request_id, "--json"])
+
+    assert queried.exit_code == 0, queried.output
+    payload = json.loads(queried.stdout)
+    assert payload["state"] == "replay_authorized"
+    assert payload["disposition"]["retry_safe"] is True
+
+    changed = RunSpec(
+        name="train",
+        gpus=2,
+        cmd=["true"],
+        project="p",
+        request_id=request_id,
+    )
+    with pytest.raises(RequestConflict, match="different intent"):
+        _submit(cfg, changed, source)
+
+    launched = _submit(cfg, spec, source)
+
+    assert launched.job_id == original_job_id
+    assert successful_launches == [original_job_id]
+    saved = intent_mod.load(cfg, request_id)
+    assert saved is not None and saved.state == "confirmed"
+
+
+def test_concurrent_retries_single_flight_replay_authorized_request(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    request_id = "agent-concurrent-authorized-replay"
+    initial = True
+
+    def interrupt_before_launch(*_args, **_kwargs):
+        nonlocal initial
+        if initial:
+            initial = False
+            raise KeyboardInterrupt
+        raise AssertionError("retry implementation was not installed")
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", interrupt_before_launch)
+    initial_spec = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        request_id=request_id,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        _submit(cfg, initial_spec, source)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    queried = CliRunner().invoke(cli.app, ["request", request_id, "--json"])
+    assert queried.exit_code == 0, queried.output
+    assert json.loads(queried.stdout)["state"] == "replay_authorized"
+
+    launches: list[str] = []
+
+    def launch_once(cfg_, spec, **kwargs):
+        job_id = kwargs["allocated_job_id"]
+        launches.append(job_id)
+        time.sleep(0.05)
+        return _entry(cfg_, spec, job_id, kwargs["submitted_at"])
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", launch_once)
+    specs = [
+        RunSpec(
+            name="train",
+            gpus=1,
+            cmd=["true"],
+            project="p",
+            request_id=request_id,
+        )
+        for _ in range(2)
+    ]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        entries = list(pool.map(lambda item: _submit(cfg, item, source), specs))
+
+    assert len(launches) == 1
+    assert entries[0].job_id == entries[1].job_id == launches[0]
+    assert sorted(
+        bool(getattr(entry, "_request_replayed", False)) for entry in entries
+    ) == [False, True]
+
+
+def test_request_status_inspects_bound_remote_proof_without_exposing_hash(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    request_id = "agent-proof-inspection"
+    record = intent_mod.bind_remote_attempt(
+        intent_mod.create(request_id, "a" * 64, "pending-job", now=1.0),
+        node="n1",
+        job_dir=cfg.worker_job_dir(cfg.nodes[0], "pending-job"),
+        launch_token="b" * 32,
+        now=2.0,
+    )
+    intent_mod.save(cfg, record)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "inspect_request_remote_proof",
+        lambda _cfg, current: intent_mod.RemoteLaunchProof(
+            outcome="unavailable",
+            node=current.proof_node or "",
+            job_dir=current.proof_job_dir or "",
+            launch_identity_sha256=current.launch_identity_sha256 or "",
+        ),
+    )
+
+    queried = CliRunner().invoke(cli.app, ["request", request_id, "--json"])
+
+    assert queried.exit_code == 0, queried.output
+    payload = json.loads(queried.stdout)
+    assert payload["state"] == "preparing"
+    assert payload["disposition"]["disposition"] == "inspect_remote"
+    assert payload["remote_proof"] == {"outcome": "unavailable", "node": "n1"}
+    assert record.launch_identity_sha256 not in queried.stdout
 
 
 def test_confirmation_write_failure_is_unknown_but_replay_recovers(
@@ -1009,6 +1299,213 @@ def test_request_identity_is_bounded_and_never_used_as_a_filename(tmp_path):
         intent_mod.record_path(cfg, "../../outside")
 
 
+def test_request_v2_disposition_converges_each_submission_crash_boundary():
+    record = intent_mod.create("agent:crash-boundaries", "a" * 64, "job_44", now=1.0)
+
+    safe = intent_mod.resolve_disposition(record, registry_job_present=False)
+    assert safe.disposition == "safe_replay"
+    assert safe.retry_safe is True
+    assert (
+        intent_mod.resolve_disposition(record, registry_job_present=True).disposition
+        == "confirmed"
+    )
+
+    bound = intent_mod.bind_remote_attempt(
+        record,
+        node="n1",
+        job_dir="~/dt/worker/jobs/job_44",
+        launch_token="b" * 32,
+        now=2.0,
+    )
+    assert "b" * 32 not in json.dumps(asdict(bound))
+    unresolved = intent_mod.resolve_disposition(bound, registry_job_present=False)
+    assert unresolved.disposition == "inspect_remote"
+    assert unresolved.retry_safe is False
+
+    absent = intent_mod.RemoteLaunchProof(
+        outcome="absent",
+        node=bound.proof_node or "",
+        job_dir=bound.proof_job_dir or "",
+        launch_identity_sha256=bound.launch_identity_sha256 or "",
+    )
+    proven_absent = intent_mod.resolve_disposition(
+        bound,
+        registry_job_present=False,
+        remote_proof=absent,
+    )
+    assert proven_absent.disposition == "safe_replay"
+    converged = intent_mod.converge_disposition(bound, proven_absent)
+    assert converged.state == "replay_authorized"
+    assert converged.error_kind == "proven_absent"
+
+    running = intent_mod.resolve_disposition(
+        bound,
+        registry_job_present=False,
+        remote_proof=intent_mod.RemoteLaunchProof(
+            outcome="running",
+            node=absent.node,
+            job_dir=absent.job_dir,
+            launch_identity_sha256=absent.launch_identity_sha256,
+        ),
+    )
+    assert running.disposition == "inspect_remote"
+    final = intent_mod.transition(bound, "confirmed")
+    assert (
+        intent_mod.resolve_disposition(final, registry_job_present=False).disposition
+        == "confirmed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("marker_state", "recovery", "expected"),
+    [
+        ("ABSENT", "NONE\n", "absent"),
+        ("MATCH", "RUNNING\n123\n0\n2.0\nUNKNOWN\n", "running"),
+        (
+            "MATCH",
+            "FINISHED\n0\n123\n0\n2.0\n3.0\nsuccess\nUNKNOWN\n",
+            "finished",
+        ),
+        ("MATCH", "NONE\n", "invalid"),
+        ("ABSENT", "RUNNING\n123\n0\n2.0\nUNKNOWN\n", "invalid"),
+        ("INVALID", "NONE\n", "invalid"),
+    ],
+)
+def test_request_remote_proof_combines_exact_marker_and_runtime_state(
+    tmp_path,
+    monkeypatch,
+    marker_state,
+    recovery,
+    expected,
+):
+    cfg = _cfg(tmp_path)
+    token = "b" * 32
+    record = intent_mod.bind_remote_attempt(
+        intent_mod.create("agent-proof", "a" * 64, "job_44", now=1.0),
+        node="n1",
+        job_dir="~/dt/jobs/job_44",
+        launch_token=token,
+        now=2.0,
+    )
+    stdout = (
+        f"{dispatch.REQUEST_REMOTE_PROOF_MARK}\n{marker_state}\n"
+        f"boot-1\n{dispatch.LAUNCH_RECOVERY_MARK}\n{recovery}"
+    )
+
+    def fake_run_on(node, local, command, **kwargs):
+        assert (node, local) == ("n1", False)
+        assert kwargs["retry_stale_mux"] is True
+        assert record.launch_identity_sha256 in command
+        assert token not in command
+        return dispatch.subprocess.CompletedProcess([], 0, stdout, "")
+
+    monkeypatch.setattr(dispatch, "run_on", fake_run_on)
+
+    proof = dispatch.inspect_request_remote_proof(cfg, record)
+
+    assert proof.outcome == expected
+    assert proof.node == "n1"
+    assert proof.job_dir == "~/dt/jobs/job_44"
+    assert proof.launch_identity_sha256 == record.launch_identity_sha256
+
+
+def test_request_remote_proof_refuses_unconfigured_or_inexact_target(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _cfg(tmp_path)
+    record = intent_mod.bind_remote_attempt(
+        intent_mod.create("agent-proof-target", "a" * 64, "job_44", now=1.0),
+        node="n1",
+        job_dir="~/other/jobs/job_44",
+        launch_token="b" * 32,
+        now=2.0,
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *_args, **_kwargs: pytest.fail("inexact target reached transport"),
+    )
+
+    assert dispatch.inspect_request_remote_proof(cfg, record).outcome == "invalid"
+
+    missing = intent_mod.bind_remote_attempt(
+        intent_mod.create("agent-proof-missing", "a" * 64, "job_44", now=1.0),
+        node="removed-node",
+        job_dir="~/dt/jobs/job_44",
+        launch_token="b" * 32,
+        now=2.0,
+    )
+    assert dispatch.inspect_request_remote_proof(cfg, missing).outcome == "unavailable"
+
+
+def test_request_remote_proof_transport_failure_is_unavailable(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    record = intent_mod.bind_remote_attempt(
+        intent_mod.create("agent-proof-offline", "a" * 64, "job_44", now=1.0),
+        node="n1",
+        job_dir="~/dt/jobs/job_44",
+        launch_token="b" * 32,
+        now=2.0,
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise dispatch.RemoteError("n1", "timed out")
+
+    monkeypatch.setattr(dispatch, "run_on", unavailable)
+
+    assert dispatch.inspect_request_remote_proof(cfg, record).outcome == "unavailable"
+
+
+def test_legacy_request_receipt_requires_remote_inspection(tmp_path):
+    cfg = _cfg(tmp_path)
+    request_id = "legacy-request"
+    record = intent_mod.create(request_id, "a" * 64, "job_legacy", now=1.0)
+    document = asdict(record)
+    document["schema"] = intent_mod.REQUEST_SCHEMA_V1
+    for field in (
+        "proof_requirement",
+        "proof_node",
+        "proof_job_dir",
+        "launch_identity_sha256",
+    ):
+        document.pop(field)
+    intent_mod.record_path(cfg, request_id).write_text(json.dumps(document))
+
+    loaded = intent_mod.load(cfg, request_id)
+
+    assert loaded is not None
+    assert loaded.proof_requirement == "legacy_unknown"
+    disposition = intent_mod.resolve_disposition(loaded, registry_job_present=False)
+    assert disposition.disposition == "inspect_remote"
+    assert disposition.retry_safe is False
+    intent_mod.save(cfg, loaded)
+    upgraded = intent_mod.load(cfg, request_id)
+    assert upgraded is not None
+    assert upgraded.schema == intent_mod.REQUEST_SCHEMA
+    assert upgraded.proof_requirement == "legacy_unknown"
+
+
+def test_v2_request_receipt_upgrades_without_losing_identity(tmp_path):
+    cfg = _cfg(tmp_path)
+    request_id = "v2-request"
+    original = intent_mod.create(request_id, "a" * 64, "job_v2", now=1.0)
+    document = asdict(original)
+    document["schema"] = intent_mod.REQUEST_SCHEMA_V2
+    intent_mod.record_path(cfg, request_id).write_text(json.dumps(document))
+
+    loaded = intent_mod.load(cfg, request_id)
+
+    assert loaded is not None and loaded.schema == intent_mod.REQUEST_SCHEMA_V2
+    intent_mod.save(cfg, loaded)
+    upgraded = intent_mod.load(cfg, request_id)
+    assert upgraded is not None
+    assert upgraded.schema == intent_mod.REQUEST_SCHEMA
+    assert upgraded.request_id == original.request_id
+    assert upgraded.job_id == original.job_id
+    assert upgraded.intent_sha256 == original.intent_sha256
+
+
 def test_task_request_id_reaches_receipt_and_query(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
@@ -1036,7 +1533,7 @@ def test_task_request_id_reaches_receipt_and_query(tmp_path, monkeypatch):
     queried = runner.invoke(cli.app, ["request", "agent-run-45", "--json"])
     assert queried.exit_code == 0, queried.output
     payload = json.loads(queried.stdout)
-    assert payload["schema"] == "dt_submission_request_v1"
+    assert payload["schema"] == "dt_submission_request_v3"
     assert payload["state"] == "confirmed"
     assert payload["job"]["job_id"] == "job_45"
 

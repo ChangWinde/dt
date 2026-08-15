@@ -2,7 +2,7 @@ from pathlib import Path
 
 from dt.config import HeadConfig, Node
 from dt.jobs import JobEntry
-from dt.scheduler import scheduler_snapshot
+from dt.scheduler import admission_decision, scheduler_snapshot
 
 
 def _cfg(tmp_path: Path) -> HeadConfig:
@@ -81,6 +81,31 @@ def test_scheduler_snapshot_explains_every_queue_item(tmp_path):
     }
 
 
+def test_scheduler_reports_reserved_row_without_blocking_it_on_its_own_quota(
+    tmp_path,
+):
+    cfg = _cfg(tmp_path)
+    cfg.queue.max_my_jobs = 1
+    reserved = _entry(
+        "reserved",
+        1,
+        dispatch_node="n1",
+        dispatch_token="a" * 32,
+    )
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [reserved],
+        resources=_resources(),
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+
+    assert snapshot["running"] == 1
+    assert snapshot["queue"][0]["state"] == "dispatch_reserved"
+    assert snapshot["queue"][0]["selected_node"] == "n1"
+
+
 def test_scheduler_snapshot_exposes_dependency_and_agent_stall(tmp_path):
     cfg = _cfg(tmp_path)
     predecessor = _entry("parent", 1, status="running", node="n1")
@@ -119,7 +144,7 @@ def test_lost_predecessor_in_rescue_window_is_waiting_not_skipped(tmp_path):
     )
     child = next(row for row in snapshot["queue"] if row["job_id"] == "child")
     assert child["state"] == "waiting_dependency"
-    assert "rescue window" in child["reason"]
+    assert "pending durable terminal finalization" in child["reason"]
 
 
 def test_legacy_lost_without_finished_time_uses_update_rescue_window(tmp_path):
@@ -202,7 +227,7 @@ def test_unreachable_large_node_prevents_false_permanent_mismatch(tmp_path):
     assert snapshot["queue"][0]["state"] == "waiting_node"
 
 
-def test_lost_predecessor_past_rescue_window_is_blocked_skipped(tmp_path):
+def test_unfenced_lost_predecessor_past_rescue_window_still_waits(tmp_path):
     import time
 
     from dt.jobs import LOST_RECHECK_S
@@ -225,7 +250,21 @@ def test_lost_predecessor_past_rescue_window_is_blocked_skipped(tmp_path):
         agent_heartbeat_stale=False,
     )
     child = next(row for row in snapshot["queue"] if row["job_id"] == "child")
-    assert child["state"] == "blocked_dependency_false"
+    assert child["state"] == "waiting_dependency"
+    assert "pending durable terminal finalization" in child["reason"]
+
+    predecessor.terminal_finalized_at = time.time()
+    finalized = scheduler_snapshot(
+        cfg,
+        [predecessor, dependent],
+        resources=_resources(),
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    finalized_child = next(
+        row for row in finalized["queue"] if row["job_id"] == "child"
+    )
+    assert finalized_child["state"] == "blocked_dependency_false"
 
 
 def test_scheduler_snapshot_explains_false_typed_result_predicate(tmp_path):
@@ -519,6 +558,91 @@ def test_fresh_resources_supersede_stale_unreachable_reason(tmp_path):
     assert fresh["queue"][0]["state"] == "runnable"
     assert fresh["next_job_id"] == "recovered"
     assert without_probe["queue"][0]["state"] == "waiting_node"
+
+
+def test_admission_fresh_candidate_supersedes_only_stale_reachability(tmp_path):
+    cfg = _cfg(tmp_path)
+    recovered = _entry(
+        "recovered",
+        1,
+        reason="waiting: no reachable node (n1: unreachable: timeout)",
+    )
+
+    stale = admission_decision(
+        cfg,
+        recovered,
+        [recovered],
+        candidate_node="n1",
+    )
+    fresh = admission_decision(
+        cfg,
+        recovered,
+        [recovered],
+        candidate_node="n1",
+        has_fresh_candidate=True,
+    )
+
+    assert stale.state == "waiting_node"
+    assert fresh.allowed is True
+    assert fresh.state == "admit"
+
+
+def test_admission_fresh_candidate_preserves_durable_blockers(tmp_path):
+    cfg = _cfg(tmp_path)
+    constrained = _entry(
+        "constrained",
+        1,
+        reason="blocked: n1: path-missing: /data/libero",
+    )
+    missing_dependency = _entry(
+        "dependent",
+        2,
+        after_success="missing",
+    )
+
+    constraint = admission_decision(
+        cfg,
+        constrained,
+        [constrained],
+        candidate_node="n1",
+        has_fresh_candidate=True,
+    )
+    dependency = admission_decision(
+        cfg,
+        missing_dependency,
+        [missing_dependency],
+        candidate_node="n1",
+        has_fresh_candidate=True,
+    )
+
+    assert constraint.allowed is False
+    assert constraint.state == "blocked_constraint"
+    assert dependency.allowed is False
+    assert dependency.state == "blocked_dependency_missing"
+
+
+def test_admission_fresh_candidate_does_not_clear_another_rows_node_evidence(
+    tmp_path,
+):
+    cfg = _cfg(tmp_path)
+    older = _entry(
+        "older-offline",
+        1,
+        reason="waiting: n2 unreachable: ssh timeout",
+        pin_node="n2",
+    )
+    candidate = _entry("candidate", 2)
+
+    decision = admission_decision(
+        cfg,
+        candidate,
+        [older, candidate],
+        candidate_node="n1",
+        has_fresh_candidate=True,
+    )
+
+    assert decision.allowed is True
+    assert older.reason == "waiting: n2 unreachable: ssh timeout"
 
 
 def test_current_quota_supersedes_stale_quota_reason(tmp_path):

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -604,7 +605,7 @@ def test_registry_rejects_unimplemented_physical_gpu_isolation(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="unsupported physical GPU isolation"):
+    with pytest.raises(RegistryError, match="unsupported physical GPU isolation"):
         load(cfg, "physical")
     damage = []
     assert list_all(cfg, damage=damage) == []
@@ -875,6 +876,112 @@ def test_dependency_waits_before_capacity_or_staging_probe(tmp_path, monkeypatch
     assert persisted is not None
     assert persisted.status == "queued"
     assert persisted.reason == "waiting: dependency pred is running"
+
+
+def test_concurrent_admission_preserves_fifo_and_one_durable_quota_reservation(
+    tmp_path,
+):
+    cfg = _cfg(tmp_path, max_my_jobs=1)
+    older = _entry(
+        "older",
+        "queued",
+        created_at=1.0,
+        gpus_requested=1,
+    )
+    newer = _entry(
+        "newer",
+        "queued",
+        created_at=2.0,
+        gpus_requested=1,
+    )
+    save(cfg, older)
+    save(cfg, newer)
+    barrier = threading.Barrier(2)
+    outcomes: dict[str, bool] = {}
+
+    def claim(entry: JobEntry) -> None:
+        barrier.wait()
+        outcomes[entry.job_id] = dispatch_mod._claim_queued_dispatch_attempt(
+            cfg,
+            entry,
+            RunSpec(name=entry.job_id, gpus=1, cmd=["true"]),
+            cfg.nodes[0],
+            f"dt/jobs/{entry.job_id}",
+        )
+
+    threads = [
+        threading.Thread(target=claim, args=(entry,)) for entry in (older, newer)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert outcomes == {"older": True, "newer": False}
+    persisted_older = load(cfg, "older")
+    persisted_newer = load(cfg, "newer")
+    assert persisted_older is not None and persisted_older.dispatch_token is not None
+    assert persisted_newer is not None and persisted_newer.dispatch_token is None
+    assert jobs_mod.quota_occupancy(cfg) == 1
+
+
+def test_agent_recovers_its_own_reserved_row_at_quota_limit(tmp_path, monkeypatch):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path, max_my_jobs=1)
+    reserved = _entry(
+        "reserved",
+        "queued",
+        created_at=1.0,
+        gpus_requested=1,
+        dispatch_node="n1",
+        dispatch_token="a" * 32,
+    )
+    save(cfg, reserved)
+    called: list[str] = []
+
+    def recover(_cfg, entry, _log):
+        called.append(entry.job_id)
+        entry.status = "running"
+        entry.node = "n1"
+        entry.dispatch_node = None
+        entry.dispatch_token = None
+        save(_cfg, entry)
+        return "started", "n1"
+
+    monkeypatch.setattr(agent, "dispatch_queued", recover)
+
+    assert agent.process_once(cfg, lambda _message: None) == [("reserved", "started")]
+    assert called == ["reserved"]
+
+
+def test_dispatch_fences_expired_lost_dependency_before_skipping(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    predecessor = _entry(
+        "pred",
+        "lost",
+        created_at=1.0,
+        finished_at=1.0,
+        reason="remote evidence temporarily unavailable",
+    )
+    successor = _entry(
+        "next",
+        "queued",
+        created_at=2.0,
+        after_success="pred",
+    )
+    save(cfg, predecessor)
+    save(cfg, successor)
+    monkeypatch.setattr(jobs_mod.time, "time", lambda: LOST_RECHECK_S + 2.0)
+
+    outcome, detail = dispatch_queued(cfg, successor, lambda _message: None)
+
+    assert outcome == "skipped"
+    assert "did not succeed" in str(detail)
+    fenced = load(cfg, "pred")
+    assert fenced is not None
+    assert fenced.terminal_finalized_at == LOST_RECHECK_S + 2.0
 
 
 def test_successful_dependency_releases_normal_dispatch(tmp_path, monkeypatch):
@@ -1506,7 +1613,7 @@ def test_agent_idle_tick_reads_registry_once(tmp_path, monkeypatch):
                 created_at=float(index),
             ),
         )
-    original = agent.list_all
+    original = agent.active_entries
     calls = 0
 
     def counted(cfg_, **kwargs):
@@ -1514,7 +1621,7 @@ def test_agent_idle_tick_reads_registry_once(tmp_path, monkeypatch):
         calls += 1
         return original(cfg_, **kwargs)
 
-    monkeypatch.setattr(agent, "list_all", counted)
+    monkeypatch.setattr(agent, "active_entries", counted)
 
     outcomes, entries = agent._process_once_with_snapshot(
         cfg,
@@ -1522,7 +1629,7 @@ def test_agent_idle_tick_reads_registry_once(tmp_path, monkeypatch):
     )
 
     assert outcomes == []
-    assert len(entries) == 3
+    assert entries == []
     assert calls == 1
 
 
@@ -1582,6 +1689,34 @@ def test_agent_status_exposes_machine_readable_adaptive_handoff(
 
     assert st["handoff_state"] == "registry_degraded"
     assert st["registry_damage"] == 1
+
+
+def test_agent_status_uses_the_active_index_without_materializing_history(
+    tmp_path,
+    monkeypatch,
+):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    for index in range(50):
+        save(cfg, _entry(f"done-{index}", "finished", created_at=float(index)))
+    save(cfg, _entry("active", "queued", created_at=100.0))
+    monkeypatch.setattr(agent, "alive_pid", lambda _cfg: 1234)
+    monkeypatch.setattr(
+        agent,
+        "list_all",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("agent status decoded terminal history")
+        ),
+    )
+
+    status = agent.status(cfg)
+
+    assert status["registry_entries"] == 51
+    assert status["queued"] == 1
+    assert status["queue_head"] == "active"
+    assert status["running"] == 0
+    assert status["scheduler"]["queue_depth"] == 1
 
 
 def test_agent_systemd_unit_has_restart_and_cgroup_contract(tmp_path):
@@ -1746,8 +1881,18 @@ def test_active_command_protocol_probe_is_bounded_and_exact(tmp_path):
     import dt.agent as agent
 
     compatible = tmp_path / "compatible-dt"
+    advertisement = json.dumps(
+        {
+            "schema_version": jobs_mod.AGENT_PROTOCOL_SCHEMA_VERSION,
+            "dispatch_protocol": jobs_mod.DISPATCH_PROTOCOL_VERSION,
+            "registry_schema": jobs_mod.REGISTRY_SCHEMA_VERSION,
+            "registry_authority_state": "absent",
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
     compatible.write_text(
-        "#!/bin/sh\nprintf '%s\\n' 'dt_dispatch_attempt_v1'\n",
+        f"#!/bin/sh\nprintf '%s\\n' '{advertisement}'\n",
         encoding="utf-8",
     )
     compatible.chmod(0o755)
@@ -2119,6 +2264,41 @@ def test_scheduler_health_respects_persisted_idle_deadline(tmp_path, monkeypatch
     assert stalled["scheduler_stalled"] is True
 
 
+def test_failed_agent_tick_does_not_advance_last_success_or_stall_deadline(
+    tmp_path, monkeypatch
+):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(agent.time, "time", lambda: clock["now"])
+    agent._write_scheduler_tick(cfg, next_poll_s=10.0, success=True)
+
+    clock["now"] = 1_100.0
+    agent._write_scheduler_tick(
+        cfg,
+        next_poll_s=10.0,
+        success=False,
+        failure_kind="RuntimeError",
+    )
+
+    payload = json.loads(agent.scheduler_tick_path(cfg).read_text())
+    assert payload["last_success_at"] == 1_000.0
+    assert payload["completed_at"] == 1_000.0
+    assert payload["next_due_at"] == 1_010.0
+    assert payload["last_attempt_at"] == 1_100.0
+    assert payload["last_attempt_succeeded"] is False
+    assert payload["last_failure_at"] == 1_100.0
+    assert payload["last_failure_kind"] == "RuntimeError"
+
+    clock["now"] = 1_131.0
+    health = agent.heartbeat_health(cfg, alive=True)
+    assert health["scheduler_tick_at"] == 1_000.0
+    assert health["scheduler_last_failure_at"] == 1_100.0
+    assert health["scheduler_last_attempt_succeeded"] is False
+    assert health["scheduler_stalled"] is True
+
+
 def test_agent_runtime_command_status_detects_stale_resident_identity(
     tmp_path, monkeypatch
 ):
@@ -2136,6 +2316,54 @@ def test_agent_runtime_command_status_detects_stale_resident_identity(
     assert result["active_command_target"] == new[1]
     assert result["runtime_command_stale"] is True
     assert result["runtime_dispatch_protocol_compatible"] is True
+
+
+def test_public_agent_status_does_not_expose_absolute_account_paths(
+    tmp_path,
+    monkeypatch,
+):
+    import dt.agent as agent
+
+    monkeypatch.setenv("HOME", "/home/remote-operator")
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    monkeypatch.setattr(agent, "alive_pid", lambda _cfg: None)
+    monkeypatch.setattr(
+        agent,
+        "heartbeat_health",
+        lambda _cfg, *, alive: {
+            "heartbeat_stale": False,
+            "scheduler_stalled": False,
+        },
+    )
+    monkeypatch.setattr(
+        agent, "log_path", lambda _cfg: Path("/home/remote-operator/dt/agent/agent.log")
+    )
+    monkeypatch.setattr(
+        agent,
+        "_runtime_command_status",
+        lambda _cfg, *, alive: {
+            "active_command": "/home/remote-operator/.local/bin/dt",
+            "active_command_target": "/opt/dt/releases/0.9.0/bin/dt",
+            "runtime_command_target": "/home/remote-operator/.local/bin/dt",
+            "runtime_command_available": True,
+            "runtime_command_stale": False,
+        },
+    )
+
+    result = agent.status(cfg)
+
+    assert result["active_command"] == "~/.local/bin/dt"
+    assert result["runtime_command_target"] == "~/.local/bin/dt"
+    assert result["active_command_target"] == "<external>/dt"
+    assert result["log"] == "~/dt/agent/agent.log"
+    assert "/home/remote-operator" not in json.dumps(result)
 
 
 def test_submission_refuses_an_alive_agent_without_the_dispatch_protocol(
@@ -2160,6 +2388,49 @@ def test_submission_refuses_an_alive_agent_without_the_dispatch_protocol(
     runtime.chmod(0o600)
     with pytest.raises(ConfigError, match="incompatible dispatch protocol"):
         dispatch.require_compatible_resident_agent(cfg)
+
+    current_protocol = dispatch.DISPATCH_PROTOCOL_VERSION
+    runtime.write_text(
+        '{"dispatch_protocol":"legacy-dispatch",'
+        f'"dispatch_protocol":"{current_protocol}"}}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="compatibility is unproven"):
+        dispatch.require_compatible_resident_agent(cfg)
+
+
+def test_role_layout_mutations_fail_closed_while_legacy_agent_lock_is_held(
+    tmp_path, monkeypatch
+):
+    import dt.agent as agent
+    import dt.dispatch as dispatch
+
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+        layout="role-v1",
+    )
+    cfg.root.mkdir()
+    descriptor = os.open(cfg.root / "agent.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    agent.fcntl.flock(descriptor, agent.fcntl.LOCK_EX | agent.fcntl.LOCK_NB)
+    monkeypatch.setattr(
+        dispatch,
+        "_active_command_dispatch_protocol",
+        lambda: jobs_mod.DISPATCH_PROTOCOL_VERSION,
+    )
+    try:
+        with pytest.raises(ConfigError, match="legacy DT agent ownership"):
+            dispatch.require_compatible_resident_agent(cfg)
+        assert agent.start_detached(cfg) is False
+        with pytest.raises(RuntimeError, match="legacy DT agent ownership"):
+            agent.install_supervisor(cfg)
+    finally:
+        agent.fcntl.flock(descriptor, agent.fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def test_idempotent_submission_checks_agent_before_source_capture(
@@ -2318,7 +2589,7 @@ def test_registry_filename_must_match_embedded_job_identity(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="does not match its filename"):
+    with pytest.raises(RegistryError, match="does not match its filename"):
         load(cfg, "claimed")
     damage = []
     assert list_all(cfg, damage=damage) == []
@@ -2335,7 +2606,7 @@ def test_registry_null_created_at_surfaces_as_damage(tmp_path):
         json.dumps(record), encoding="utf-8"
     )
 
-    with pytest.raises(ValueError, match="invalid lifecycle timestamps"):
+    with pytest.raises(RegistryError, match="invalid lifecycle timestamps"):
         load(cfg, "poison")
     damage = []
     assert list_all(cfg, damage=damage) == []
@@ -2359,7 +2630,7 @@ def test_registry_writer_rejects_unsafe_historical_project_extra(tmp_path):
     entry = _entry("unsafe-extra", "queued", created_at=1.0)
     entry.extras = ["--no-project"]
 
-    with pytest.raises(ValueError, match="invalid project extras"):
+    with pytest.raises(RegistryError, match="invalid project extras"):
         save(cfg, entry)
 
 
@@ -2385,7 +2656,7 @@ def test_registry_writer_rejects_malformed_optional_contracts(
     entry = _entry("invalid-contract", "queued", created_at=1.0)
     setattr(entry, field, value)
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(RegistryError, match=message):
         save(cfg, entry)
 
 
@@ -2449,7 +2720,7 @@ def test_agent_cap_uses_one_snapshot_across_queue_walk(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path, max_my_jobs=1)
     save(cfg, _entry("first", "queued", created_at=1.0))
     save(cfg, _entry("second", "queued", created_at=2.0))
-    original = agent.list_all
+    original = agent.active_entries
     calls = 0
 
     def counted(cfg_, **kwargs):
@@ -2462,7 +2733,7 @@ def test_agent_cap_uses_one_snapshot_across_queue_walk(tmp_path, monkeypatch):
         entry.node = "n1"
         return "started", "n1"
 
-    monkeypatch.setattr(agent, "list_all", counted)
+    monkeypatch.setattr(agent, "active_entries", counted)
     monkeypatch.setattr(agent, "dispatch_queued", start)
 
     assert process_once(cfg, lambda message: None) == [
@@ -2470,6 +2741,43 @@ def test_agent_cap_uses_one_snapshot_across_queue_walk(tmp_path, monkeypatch):
         ("second", "capped"),
     ]
     assert calls == 1
+
+
+def test_agent_recovered_completion_releases_quota_within_the_same_tick(
+    tmp_path, monkeypatch
+):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path, max_my_jobs=1)
+    save(
+        cfg,
+        _entry(
+            "first",
+            "queued",
+            created_at=1.0,
+            dispatch_node="n1",
+            dispatch_token="a" * 32,
+        ),
+    )
+    save(cfg, _entry("second", "queued", created_at=2.0))
+
+    def recover_then_start(cfg_, entry, log):
+        if entry.job_id == "first":
+            entry.status = "finished"
+            entry.node = "n1"
+            entry.exit_code = 0
+            entry.result_state = "success"
+            return "finished", "n1"
+        entry.status = "running"
+        entry.node = "n1"
+        return "started", "n1"
+
+    monkeypatch.setattr(agent, "dispatch_queued", recover_then_start)
+
+    assert process_once(cfg, lambda message: None) == [
+        ("first", "finished"),
+        ("second", "started"),
+    ]
 
 
 def test_agent_uses_fast_poll_only_while_queue_is_nonempty(tmp_path):
@@ -2820,6 +3128,10 @@ def test_dispatch_queued_replays_setup_extras_and_fork_lineage(tmp_path, monkeyp
     )
     (dispatch.stage_dir(cfg, entry.job_id) / "code").mkdir(parents=True)
     save(cfg, entry)
+    request = dispatch.intent_mod.create(
+        entry.request_id or "", "a" * 64, entry.job_id, now=1.0
+    )
+    dispatch.intent_mod.save(cfg, dispatch.intent_mod.transition(request, "confirmed"))
     seen = {}
     monkeypatch.setattr(dispatch, "probe_center", lambda *args, **kwargs: [])
     monkeypatch.setattr(
@@ -2844,12 +3156,21 @@ def test_dispatch_queued_replays_setup_extras_and_fork_lineage(tmp_path, monkeyp
         seen["created_at"] = created_at
         seen["payload_sha256"] = payload_sha256
         assert before_attempt is not None
-        assert before_attempt(candidates[0], job_dir) is True
+        assert before_attempt(candidates[0], job_dir(candidates[0])) is True
         during_attempt = load(cfg, entry.job_id)
         assert during_attempt is not None
         assert during_attempt.dispatch_node == candidates[0].name
         assert during_attempt.dispatch_token is not None
         assert spec.dispatch_token == during_attempt.dispatch_token
+        receipt = dispatch.intent_mod.load(cfg, entry.request_id or "")
+        assert receipt is not None
+        assert receipt.proof_requirement == "remote_launch_marker"
+        assert receipt.proof_node == candidates[0].name
+        assert receipt.proof_job_dir == job_dir(candidates[0])
+        assert (
+            receipt.launch_identity_sha256
+            == hashlib.sha256(during_attempt.dispatch_token.encode("ascii")).hexdigest()
+        )
         return None, {}, False, set()
 
     monkeypatch.setattr(dispatch, "_try_nodes", fake_try_nodes)
@@ -3016,6 +3337,61 @@ def test_no_queue_preserves_a_concurrently_claimed_attempt(tmp_path, monkeypatch
     assert dispatch.stage_dir(cfg, result.job_id).is_dir()
 
 
+def test_no_queue_reports_bounded_launch_failure_instead_of_cpu_capacity(
+    tmp_path,
+    monkeypatch,
+):
+    import dt.dispatch as dispatch
+
+    cfg = _cfg(tmp_path)
+    source = tmp_path / "source-launch-failure"
+    source.mkdir()
+    (source / "main.py").write_text("pass\n")
+    stored = dispatch.StoredSnapshot(dispatch.tree_sha256(source), source)
+    spec = RunSpec(
+        name="launch-failure",
+        gpus=0,
+        cmd=["true"],
+        project="p",
+        node="n1",
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "probe_node",
+        lambda *args, **kwargs: NodeStatus(node="n1"),
+    )
+    raw_failure = "exit -15: launcher terminated; cancelled on node " + "x" * 8192
+
+    def failed_dispatch(cfg_, pending, _log):
+        with job_lock(cfg_, pending.job_id):
+            current = load(cfg_, pending.job_id)
+            assert current is not None
+            current.reason = "waiting: placement attempt failed"
+            current.placement_failures = {"n1": raw_failure}
+            save(cfg_, current)
+            pending.__dict__.update(current.__dict__)
+        return "busy", None
+
+    monkeypatch.setattr(dispatch, "dispatch_queued", failed_dispatch)
+
+    with pytest.raises(dispatch.NoCapacity) as caught:
+        dispatch._submit_prepared(
+            cfg,
+            spec,
+            source_factory=lambda: stored,
+            git_sha=None,
+            git_dirty=False,
+            git_diff=None,
+            log=lambda _message: None,
+            no_queue=True,
+        )
+
+    failure = caught.value.reasons["n1"]
+    assert failure.startswith("exit -15: launcher terminated; cancelled on node")
+    assert len(failure) <= jobs_mod.MAX_JOB_DIAGNOSTIC_CHARS
+    assert "free < 0 wanted" not in str(caught.value)
+
+
 def test_dispatch_queued_adopts_interrupted_running_launch_before_capacity_probe(
     tmp_path,
     monkeypatch,
@@ -3036,6 +3412,8 @@ def test_dispatch_queued_adopts_interrupted_running_launch_before_capacity_probe
     boot_id = "01234567-89ab-cdef-0123-456789abcdef"
     recovery = "\n".join(
         [
+            dispatch.REQUEST_REMOTE_PROOF_MARK,
+            "MATCH",
             boot_id,
             dispatch.LAUNCH_RECOVERY_MARK,
             "RUNNING",
@@ -3093,6 +3471,8 @@ def test_dispatch_queued_keeps_unproven_interrupted_launch_fail_closed(
     save(cfg, entry)
     recovery = "\n".join(
         [
+            dispatch.REQUEST_REMOTE_PROOF_MARK,
+            "MATCH",
             "01234567-89ab-cdef-0123-456789abcdef",
             dispatch.LAUNCH_RECOVERY_MARK,
             "UNPROVEN",
@@ -3122,6 +3502,56 @@ def test_dispatch_queued_keeps_unproven_interrupted_launch_fail_closed(
     assert current.dispatch_node == "n1"
     assert current.dispatch_token == "b" * 32
     assert current.reason == f"blocked: {detail}"
+
+
+def test_dispatch_queued_never_replays_after_identity_marker_without_runtime_state(
+    tmp_path,
+    monkeypatch,
+):
+    import dt.dispatch as dispatch
+
+    cfg = _cfg(tmp_path)
+    entry = _entry(
+        "q-recover-marker-only",
+        "queued",
+        created_at=1.0,
+        dispatch_node="n1",
+        dispatch_token="b" * 32,
+    )
+    (dispatch.stage_dir(cfg, entry.job_id) / "code").mkdir(parents=True)
+    save(cfg, entry)
+    recovery = "\n".join(
+        [
+            dispatch.REQUEST_REMOTE_PROOF_MARK,
+            "MATCH",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            dispatch.LAUNCH_RECOVERY_MARK,
+            "NONE",
+            "",
+        ]
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, recovery, ""),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "probe_center",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("a crossed launch boundary must not be replayed")
+        ),
+    )
+
+    outcome, detail = dispatch.dispatch_queued(cfg, entry, lambda _message: None)
+
+    assert outcome == "blocked"
+    assert detail is not None and "runtime state is unproven" in detail
+    current = load(cfg, entry.job_id)
+    assert current is not None
+    assert current.status == "queued"
+    assert current.dispatch_node == "n1"
+    assert current.dispatch_token == "b" * 32
 
 
 def test_dispatch_queued_treats_zero_effective_disk_floor_as_unset(
@@ -3394,6 +3824,51 @@ def test_dispatch_queued_persists_blocked_reason(tmp_path, monkeypatch):
     assert current.reason == "blocked: n1: path-missing: /data/libero"
 
 
+def test_dispatch_queued_persists_actual_launch_failure_reason(tmp_path, monkeypatch):
+    import dt.dispatch as dispatch
+
+    cfg = _cfg(tmp_path)
+    entry = _entry(
+        "q-launch-failure",
+        "queued",
+        created_at=1.0,
+        gpus_requested=0,
+    )
+    (dispatch.stage_dir(cfg, entry.job_id) / "code").mkdir(parents=True)
+    save(cfg, entry)
+    monkeypatch.setattr(
+        dispatch,
+        "probe_center",
+        lambda *args, **kwargs: [_status("n1", free=1)],
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "pick_candidates",
+        lambda statuses, nodes, spec, reserve: [nodes[0]],
+    )
+    failure = "exit -15: launcher terminated; cancelled on node"
+    monkeypatch.setattr(
+        dispatch,
+        "_try_nodes",
+        lambda *args, **kwargs: (
+            None,
+            {"n1": failure},
+            False,
+            {"retryable"},
+        ),
+    )
+
+    outcome, detail = dispatch.dispatch_queued(cfg, entry, lambda _message: None)
+
+    assert (outcome, detail) == ("busy", None)
+    current = load(cfg, entry.job_id)
+    assert current is not None
+    assert current.status == "queued"
+    assert current.reason == f"waiting: placement attempt failed (n1: {failure})"
+    assert current.placement_failures == {"n1": failure}
+    assert "free < 0 wanted" not in current.reason
+
+
 def test_dispatch_queued_known_low_disk_is_blocked_before_snapshot(
     tmp_path, monkeypatch
 ):
@@ -3457,6 +3932,72 @@ def test_dispatch_queued_replaces_stale_blocked_reason_with_capacity_wait(
     assert current is not None
     assert current.status == "queued"
     assert current.reason == "waiting: no free capacity"
+
+
+def test_dispatch_queued_claims_once_after_fresh_probe_supersedes_stale_unreachable(
+    tmp_path, monkeypatch
+):
+    import dt.dispatch as dispatch
+
+    cfg = _cfg(tmp_path)
+    entry = _entry(
+        "q-reachable-again",
+        "queued",
+        created_at=1.0,
+        reason="waiting: no reachable node (n1: unreachable: ssh timeout)",
+    )
+    (dispatch.stage_dir(cfg, entry.job_id) / "code").mkdir(parents=True)
+    save(cfg, entry)
+    monkeypatch.setattr(
+        dispatch,
+        "probe_center",
+        lambda *args, **kwargs: [_status("n1", free=1, total=1)],
+    )
+    attempts = []
+
+    def fake_try_nodes(
+        cfg_,
+        candidates,
+        spec,
+        job_id,
+        job_dir,
+        session,
+        sync_to_node,
+        log,
+        **kwargs,
+    ):
+        before_attempt = kwargs["before_attempt"]
+        node = candidates[0]
+        assert before_attempt(node, job_dir(node)) is True
+        attempts.append(node.name)
+        placed = load(cfg, entry.job_id)
+        assert placed is not None
+        placed.status = "running"
+        placed.node = node.name
+        placed.node_local = node.local
+        placed.started_at = 2.0
+        placed.pgid = 123
+        placed.reason = None
+        placed.dispatch_node = None
+        placed.dispatch_token = None
+        return placed, {}, False, set()
+
+    monkeypatch.setattr(dispatch, "_try_nodes", fake_try_nodes)
+
+    outcome = dispatch.dispatch_queued(cfg, entry, lambda _message: None)
+    persisted = load(cfg, entry.job_id)
+    assert persisted is not None
+    replay = dispatch.dispatch_queued(cfg, persisted, lambda _message: None)
+
+    assert outcome == ("started", "n1")
+    assert replay == ("started", "n1")
+    assert attempts == ["n1"]
+    current = load(cfg, entry.job_id)
+    assert current is not None
+    assert current.status == "running"
+    assert current.node == "n1"
+    assert current.dispatch_node is None
+    assert current.dispatch_token is None
 
 
 def test_pinned_queued_unreachable_stops_before_snapshot(tmp_path, monkeypatch):

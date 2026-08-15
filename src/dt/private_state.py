@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import fcntl
+import errno
+import json
 import os
 import stat
 from collections.abc import Callable, Iterator
@@ -12,6 +14,27 @@ from pathlib import Path
 
 class PrivateStateError(RuntimeError):
     """A state path cannot be accessed without crossing an unsafe boundary."""
+
+
+def decode_strict_json(payload: bytes | str) -> object:
+    """Decode standards-compliant JSON with unique keys at every depth."""
+
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-finite JSON number: {value}")
+
+    def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON object key: {key}")
+            result[key] = value
+        return result
+
+    return json.loads(
+        payload,
+        parse_constant=reject_constant,
+        object_pairs_hook=unique_object,
+    )
 
 
 def ensure_private_directory(path: Path, *, create: bool = True) -> bool:
@@ -167,11 +190,48 @@ def read_bounded_regular(
             return None
         except OSError as exc:
             raise PrivateStateError(f"cannot safely open regular file: {path}") from exc
-        return _read_descriptor_bounded(descriptor, path=path, max_bytes=max_bytes)
+        result = _read_descriptor_bounded(
+            descriptor,
+            path=path,
+            max_bytes=max_bytes,
+        )
+        _attest_current_name(directory, path.name, result[1], path=path)
+        return result
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         os.close(directory)
+
+
+def read_bounded_at(
+    directory_fd: int,
+    name: str,
+    *,
+    max_bytes: int,
+) -> tuple[bytes, os.stat_result] | None:
+    """Read one bounded regular child and attest its directory identity."""
+    if max_bytes < 1:
+        raise ValueError("max_bytes must be positive")
+    if not name or "/" in name or name in {".", ".."}:
+        raise PrivateStateError(f"unsafe private state name: {name!r}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PrivateStateError(f"cannot safely open private file: {name}") from exc
+    try:
+        result = _read_descriptor_bounded(
+            descriptor,
+            path=Path(name),
+            max_bytes=max_bytes,
+        )
+        _attest_current_name(directory_fd, name, result[1], path=Path(name))
+        return result
+    finally:
+        os.close(descriptor)
 
 
 @contextmanager
@@ -278,25 +338,65 @@ def _read_descriptor_bounded(
     return bytes(payload), after
 
 
-def fsync_dir(path: Path) -> None:
-    """Best-effort fsync of a directory so a rename/unlink survives a crash.
+def _attest_current_name(
+    directory_fd: int,
+    name: str,
+    opened: os.stat_result,
+    *,
+    path: Path,
+) -> None:
+    """Reject a name replaced while its previously opened inode was read."""
+    try:
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as exc:
+        raise PrivateStateError(
+            f"private state changed while being read: {path}"
+        ) from exc
+    opened_signature = (
+        opened.st_dev,
+        opened.st_ino,
+        opened.st_mode,
+        opened.st_size,
+        opened.st_mtime_ns,
+        opened.st_ctime_ns,
+    )
+    current_signature = (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_size,
+        current.st_mtime_ns,
+        current.st_ctime_ns,
+    )
+    if opened_signature != current_signature:
+        raise PrivateStateError(f"private state changed while being read: {path}")
 
-    Durability of a directory entry (a published rename or a completed unlink)
-    requires syncing the directory itself, not just the file. Failures are
-    swallowed: a real EIO here means larger trouble, and this must never add a
-    new crash path to cleanup or publication.
-    """
+
+def fsync_dir(path: Path) -> None:
+    """Strictly persist directory entries or report unknown durability."""
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
-        return
+    except OSError as exc:
+        raise PrivateStateError(
+            f"cannot open directory durability barrier: {path}"
+        ) from exc
     try:
         os.fsync(descriptor)
-    except OSError:
-        pass
+    except OSError as exc:
+        raise PrivateStateError(f"cannot persist directory entries: {path}") from exc
     finally:
         os.close(descriptor)
+
+
+def best_effort_fsync_dir(path: Path) -> bool:
+    """Attempt a non-authoritative cleanup barrier without masking its outcome."""
+    try:
+        fsync_dir(path)
+    except PrivateStateError:
+        return False
+    return True
 
 
 def _syncfs_tree(root: Path) -> bool:
@@ -305,8 +405,9 @@ def _syncfs_tree(root: Path) -> bool:
     ``syncfs`` is a strict superset of fsyncing each file of the tree on the
     same filesystem, at a measured ~300x lower cost for large snapshots
     (one syscall instead of one fsync per file). Python does not expose it,
-    so it is resolved from libc; any failure reports False and the caller
-    falls back to the portable per-file walk.
+    so it is resolved from libc. A missing/unsupported ``syncfs`` reports
+    ``False`` so the caller can use the portable per-file walk; an actual
+    open or durability failure raises and remains fail-closed.
     """
     try:
         import ctypes
@@ -316,20 +417,31 @@ def _syncfs_tree(root: Path) -> bool:
     except (OSError, AttributeError):
         return False
     directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(root, directory_flags)
-    except OSError:
-        return False
+    except OSError as exc:
+        raise PrivateStateError(
+            f"cannot open directory tree durability barrier: {root}"
+        ) from exc
     try:
-        return bool(syncfs(descriptor) == 0)
-    except Exception:
-        return False
+        try:
+            result = syncfs(descriptor)
+        except OSError as exc:
+            raise PrivateStateError(f"cannot persist directory tree: {root}") from exc
+        if result == 0:
+            return True
+        error_number = ctypes.get_errno()
+        if error_number == errno.ENOSYS:
+            return False
+        error = OSError(error_number, os.strerror(error_number))
+        raise PrivateStateError(f"cannot persist directory tree: {root}") from error
     finally:
         os.close(descriptor)
 
 
 def fsync_tree(root: Path) -> None:
-    """Best-effort durability barrier for a just-published directory tree.
+    """Strict durability barrier for a tree before publishing its identity.
 
     Renaming a freshly copied tree into place does not by itself make the
     file contents durable; the tree must be flushed so a content-addressed
@@ -340,19 +452,61 @@ def fsync_tree(root: Path) -> None:
     """
     if _syncfs_tree(root):
         return
-    for current, _dirs, files in os.walk(root):
-        for name in files:
-            try:
-                descriptor = os.open(os.path.join(current, name), os.O_RDONLY)
-            except OSError:
-                continue
-            try:
-                os.fsync(descriptor)
-            except OSError:
-                pass
-            finally:
-                os.close(descriptor)
-        fsync_dir(Path(current))
+
+    def abort(error: OSError) -> None:
+        raise error
+
+    try:
+        rows = os.walk(root, topdown=False, onerror=abort, followlinks=False)
+        for current, directories, files in rows:
+            for name in files:
+                path = Path(current) / name
+                info = path.lstat()
+                if stat.S_ISLNK(info.st_mode):
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    raise PrivateStateError(
+                        f"durable tree contains a non-regular entry: {path}"
+                    )
+                flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_NONBLOCK", 0)
+                descriptor = os.open(path, flags)
+                try:
+                    opened = os.fstat(descriptor)
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or opened.st_dev != info.st_dev
+                        or opened.st_ino != info.st_ino
+                    ):
+                        raise PrivateStateError(
+                            f"durable tree entry changed during sync: {path}"
+                        )
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            for name in directories:
+                child = Path(current) / name
+                if child.is_symlink():
+                    continue
+                child_info = child.lstat()
+                if not stat.S_ISDIR(child_info.st_mode):
+                    raise PrivateStateError(
+                        f"durable tree contains an unsafe directory: {child}"
+                    )
+            fsync_dir(Path(current))
+    except PrivateStateError:
+        raise
+    except OSError as exc:
+        raise PrivateStateError(f"cannot persist directory tree: {root}") from exc
+
+
+def best_effort_fsync_tree(root: Path) -> bool:
+    """Attempt a non-authoritative tree barrier and expose whether it worked."""
+    try:
+        fsync_tree(root)
+    except PrivateStateError:
+        return False
+    return True
 
 
 def atomic_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:

@@ -732,6 +732,7 @@ def main() -> int:
     parser.add_argument("--max-vram-mib", type=int, default=None)
     parser.add_argument("--max-job-memory-mib", type=int, default=None)
     parser.add_argument("--guard-output", type=Path, default=None)
+    parser.add_argument("--ready-file", type=Path, default=None)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--samples", type=int, default=0, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -766,6 +767,7 @@ def main() -> int:
     selected = _selected_gpus(args.gpus)
 
     count = 0
+    ready_published = False
     vram_unavailable_samples = 0
     job_state: _JobUsageState | None = None
     next_sample_at = time.monotonic()
@@ -803,6 +805,33 @@ def main() -> int:
                         file=sys.stderr,
                         flush=True,
                     )
+            if args.ready_file is not None and not ready_published:
+                try:
+                    _write_json_atomic(
+                        args.ready_file,
+                        {
+                            "schema_version": "dt_telemetry_ready_v1",
+                            "timestamp": sampled_at,
+                            "pid": os.getpid(),
+                            "selected_gpus": (
+                                None if selected is None else len(selected)
+                            ),
+                            "guards": {
+                                "max_vram_mib": args.max_vram_mib is not None,
+                                "max_job_memory_mib": (
+                                    args.max_job_memory_mib is not None
+                                ),
+                            },
+                        },
+                    )
+                except OSError as exc:
+                    print(
+                        f"[telemetry] readiness evidence unavailable: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    return 3
+                ready_published = True
             count += 1
             violation = _gpu_memory_violation(gpus, args.max_vram_mib)
             if violation is not None and _trip_resource_guard(

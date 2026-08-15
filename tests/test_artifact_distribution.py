@@ -488,7 +488,11 @@ def test_same_digest_fans_out_to_different_destinations_concurrently(
     )
     cache_ready = False
     uploads = 0
-    fanout_started = threading.Barrier(2)
+    # This is a positive rendezvous, not a throughput assertion.  A one-second
+    # timeout flakes under the full, parallel qualification load before the
+    # second executor is scheduled; five seconds still fails promptly if the
+    # site lock is incorrectly held across fan-out.
+    fanout_started = threading.Barrier(2, timeout=5)
 
     def cache_available(*args):
         return cache_ready
@@ -500,7 +504,7 @@ def test_same_digest_fans_out_to_different_destinations_concurrently(
         return 100, 4
 
     def fanout(*args, **kwargs):
-        fanout_started.wait(timeout=1)
+        fanout_started.wait()
         return 20, 2
 
     monkeypatch.setattr(module.TransferExecutor, "_cache_available", cache_available)
@@ -1113,11 +1117,110 @@ def test_topology_aware_uses_verified_peer_without_cross_site_upload(
     assert "172.16.6.91" not in json.dumps(event)
 
 
-def test_topology_aware_cold_miss_uploads_once_then_uses_discovered_lan(
+def test_topology_destination_digest_hit_skips_all_source_discovery(
     tmp_path, monkeypatch
 ):
     cfg = _topology_cfg(tmp_path)
     executor = TransferExecutor(cfg)
+    digest = "9" * 64
+    monkeypatch.setattr(executor.verifier, "remote_digest", lambda *args: digest)
+    monkeypatch.setattr(
+        executor.discovery,
+        "replicas",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("destination hit must not enumerate sources")
+        ),
+    )
+
+    result = executor.ensure(
+        tmp_path / "snapshot",
+        digest,
+        cfg.nodes[2],
+        "~/dt/worker/jobs/new/code",
+    )
+
+    assert result.plan.source.kind == "destination"
+    assert result.replica_hit is True
+    assert result.cross_site_bytes == 0
+    assert result.site_bytes == 0
+
+
+def test_topology_lazy_selection_does_not_probe_or_hash_later_candidates(
+    tmp_path, monkeypatch
+):
+    cfg = _topology_cfg(tmp_path)
+    executor = TransferExecutor(cfg)
+    peer = ArtifactReplica(
+        kind="peer",
+        node=cfg.nodes[1],
+        code_dir="~/dt/worker/jobs/prior/code",
+        recorded_at=10.0,
+    )
+    later_cache = ArtifactReplica(
+        kind="site-cache",
+        node=cfg.nodes[1],
+        code_dir="~/dt/worker/cache/site-artifacts/8/code",
+        recorded_at=float("inf"),
+    )
+    touched: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        executor.verifier,
+        "remote_digest",
+        lambda *args: (_ for _ in ()).throw(DistributionError("destination absent")),
+    )
+    monkeypatch.setattr(
+        executor.discovery, "replicas", lambda *args: [later_cache, peer]
+    )
+    monkeypatch.setattr(
+        executor.discovery,
+        "replica_present",
+        lambda replica: touched.append(("probe", replica.code_dir)) or True,
+    )
+    monkeypatch.setattr(
+        executor.discovery,
+        "route",
+        lambda replica, destination: (
+            touched.append(("route", replica.code_dir))
+            or _direct_route(replica, destination)
+        ),
+    )
+    monkeypatch.setattr(
+        executor.verifier,
+        "require",
+        lambda node, path, digest: touched.append(("hash", path)),
+    )
+    monkeypatch.setattr(executor, "_p2p_transfer", lambda *args, **kwargs: (20, 2))
+
+    result = executor.ensure(
+        tmp_path / "snapshot",
+        "8" * 64,
+        cfg.nodes[2],
+        "~/dt/worker/jobs/new/code",
+    )
+
+    assert result.plan.source.kind == "peer"
+    assert all(path != later_cache.code_dir for _operation, path in touched)
+    assert touched[:3] == [
+        ("probe", peer.code_dir),
+        ("route", peer.code_dir),
+        ("hash", peer.code_dir),
+    ]
+
+
+def test_topology_aware_cold_miss_uploads_once_then_uses_discovered_lan(
+    tmp_path, monkeypatch
+):
+    import dt.artifact_distribution as module
+
+    cfg = _topology_cfg(tmp_path)
+    executor = TransferExecutor(cfg)
+
+    def fake_run_on(node, local, command, **kwargs):
+        if "DT_CACHE" in command:
+            return subprocess.CompletedProcess([], 0, "DT_CACHE=absent\n", "")
+        return subprocess.CompletedProcess([], 1, "", "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
     monkeypatch.setattr(executor.discovery, "replicas", lambda *args: [])
     monkeypatch.setattr(executor.verifier, "require", lambda *args: None)
     monkeypatch.setattr(executor, "_populate_cache", lambda *args: (1_200, 12))
@@ -1197,11 +1300,9 @@ def test_topology_aware_does_not_upload_when_replica_verification_is_uncertain(
         recorded_at=10.0,
     )
     route = _direct_route(peer, cfg.nodes[2])
-    monkeypatch.setattr(
-        executor,
-        "_discover_routes",
-        lambda *args: ([route], 1),
-    )
+    monkeypatch.setattr(executor.discovery, "replicas", lambda *args: [peer])
+    monkeypatch.setattr(executor.discovery, "replica_present", lambda *args: True)
+    monkeypatch.setattr(executor.discovery, "route", lambda *args: route)
     monkeypatch.setattr(
         executor.verifier,
         "require",
@@ -1250,16 +1351,17 @@ def test_topology_cold_upload_unlocks_parallel_destination_fanout(
     uploads = 0
     fanout_started = threading.Barrier(2)
 
-    def discover(self, site, digest, destination, log):
+    def replicas(self, site, digest):
         if not cache_ready:
-            return [], 0
-        replica = ArtifactReplica(
-            kind="site-cache",
-            node=cfg.nodes[1],
-            code_dir="~/dt/worker/cache/site-artifacts/d/code",
-            recorded_at=10.0,
-        )
-        return [_direct_route(replica, destination)], 1
+            return []
+        return [
+            ArtifactReplica(
+                kind="site-cache",
+                node=cfg.nodes[1],
+                code_dir="~/dt/worker/cache/site-artifacts/d/code",
+                recorded_at=10.0,
+            )
+        ]
 
     def populate(self, *args):
         nonlocal cache_ready, uploads
@@ -1271,7 +1373,17 @@ def test_topology_cold_upload_unlocks_parallel_destination_fanout(
         fanout_started.wait(timeout=1)
         return 20, 2
 
-    monkeypatch.setattr(module.TransferExecutor, "_discover_routes", discover)
+    monkeypatch.setattr(module.TopologyDiscovery, "replicas", replicas)
+    monkeypatch.setattr(
+        module.TopologyDiscovery,
+        "replica_present",
+        lambda self, replica: cache_ready,
+    )
+    monkeypatch.setattr(
+        module.TransferExecutor,
+        "_cache_available",
+        lambda self, site, node, digest: cache_ready,
+    )
     monkeypatch.setattr(module.TransferExecutor, "_populate_cache", populate)
     monkeypatch.setattr(module.TransferExecutor, "_p2p_transfer", transfer)
     monkeypatch.setattr(module.ArtifactVerifier, "require", lambda *args: None)
@@ -1761,6 +1873,40 @@ def test_bulk_route_failures_open_persistent_edge_circuit(tmp_path, monkeypatch)
     assert decision.is_open is True
     assert decision.failures == 2
     assert decision.last_kind == "transfer.timeout"
+
+
+def test_cancelled_bulk_transfer_releases_carried_route_reservations(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _topology_cfg(tmp_path)
+    executor = TransferExecutor(cfg)
+    released: list[bool] = []
+    monkeypatch.setattr(
+        executor,
+        "_topology_aware_transfer",
+        lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(
+        executor.discovery,
+        "release_carried_reservations",
+        lambda: released.append(True) or [],
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        executor._ensure_topology_aware(
+            tmp_path / "source",
+            "4" * 64,
+            cfg.sites["psibot"],
+            cfg.nodes[2],
+            "~/dt/worker/jobs/new/code",
+            None,
+            None,
+            lambda _message: None,
+            0.0,
+        )
+
+    assert released == [True]
 
 
 def test_deterministic_artifact_failure_does_not_open_route_circuit(

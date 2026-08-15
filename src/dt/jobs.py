@@ -23,13 +23,14 @@ import secrets
 import shlex
 import stat
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from pathlib import PurePosixPath
+from typing import Protocol
 
 from .config import (
     MAX_PROJECT_EXTRAS,
@@ -49,12 +50,13 @@ from .private_state import (
     PrivateStateError,
     atomic_write,
     bounded_directory_reader,
+    decode_strict_json,
     ensure_private_directory,
     fsync_dir,
     open_private_regular,
     read_bounded,
 )
-from .sshio import run_on
+from .sshio import diagnostic_excerpt, run_on
 from . import custom_env as custom_env_mod
 
 NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
@@ -82,7 +84,8 @@ RESULT_STATES = frozenset(
 # submitting CLI refuses an alive agent that does not advertise this exact
 # value, preventing mixed-release duplicate launches during upgrades or source
 # development.
-DISPATCH_PROTOCOL_VERSION = "dt_dispatch_attempt_v1"
+DISPATCH_PROTOCOL_VERSION = "dt_dispatch_attempt_v2"
+AGENT_PROTOCOL_SCHEMA_VERSION = "dt_agent_protocol_v1"
 JOB_STATUSES = frozenset(
     {"queued", "running", "finished", "killed", "lost", "failed", "skipped"}
 )
@@ -90,12 +93,39 @@ MAX_JOB_ID_LENGTH = 240
 JOB_ID_RE = re.compile(rf"[A-Za-z0-9_-]{{1,{MAX_JOB_ID_LENGTH}}}")
 MAX_JOB_RECORD_BYTES = 8 * 1024 * 1024
 MAX_JOB_COLLECTION_ITEMS = 1024
+MAX_JOB_DIAGNOSTIC_CHARS = 4096
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 ENV_HASH_RE = re.compile(r"[0-9a-f]{12}")
+REGISTRY_SCHEMA_VERSION = "dt_job_registry_v1"
+REGISTRY_AUTHORITY_STATES = frozenset({"absent", "present", "unproven"})
+MAX_REGISTRY_AUTHORITY_PROBE_ROWS = 4096
+ACTIVE_INDEX_SCHEMA_VERSION = "dt_job_active_index_v1"
+MAX_ACTIVE_INDEX_BYTES = 8 * 1024 * 1024
+MAX_ACTIVE_INDEX_ITEMS = 200_000
+REPLICA_INDEX_SCHEMA_VERSION = "dt_artifact_replica_index_v1"
+REPLICA_SHARD_SCHEMA_VERSION = "dt_artifact_replica_shard_v1"
+MAX_REPLICA_MANIFEST_BYTES = 64 * 1024
+MAX_REPLICA_SHARD_BYTES = 16 * 1024 * 1024
+MAX_REPLICA_INDEX_ITEMS = 200_000
+_REPLICA_GENERATION_RE = re.compile(r"g-[0-9a-f]{32}")
 
 
 class RegistryError(RuntimeError):
     """A registry path or record cannot be used without violating safety."""
+
+
+class RegistryLockCancelled(RegistryError):
+    """Waiting for an internal registry lock was cooperatively cancelled."""
+
+
+class CancelEvent(Protocol):
+    def is_set(self) -> bool: ...
+
+
+_HELD_LOCK_IDS: ContextVar[frozenset[str]] = ContextVar(
+    "dt_held_lock_ids",
+    default=frozenset(),
+)
 
 
 def _valid_job_id(job_id: object) -> bool:
@@ -248,6 +278,9 @@ class JobEntry:
     worker_roots: dict[str, str] = field(default_factory=dict)
     job_relpath: str | None = None
     recovered_at: float | None = None
+    # Once a provisional lost result has released or skipped a dependent, late
+    # worker evidence must not rewrite that irreversible history.
+    terminal_finalized_at: float | None = None
     # A role-layout migration publishes the registry destination before it
     # removes the legacy capsule.  Persist this bit in the same transaction so
     # an interrupted/unwritable cleanup is discoverable and safely retryable.
@@ -288,10 +321,10 @@ def is_uncertain_launch(entry: JobEntry) -> bool:
 def dependency_settled(entry: JobEntry, *, now: float | None = None) -> bool:
     """Whether an irreversible dependent transition may observe ``entry``.
 
-    A legacy lost row may not have ``finished_at``.  Treat its last durable
-    registry update (or creation time as the final compatibility fallback) as
-    the start of the rescue window; missing data must delay, never accelerate,
-    an irreversible skip/release decision.
+    ``lost`` is provisional until :func:`finalize_dependency_terminal` writes
+    an explicit fence after its rescue window.  The ``now`` parameter remains
+    for compatibility with pure scheduler callers; elapsed wall time alone can
+    never authorize an irreversible transition.
     """
     if entry.status not in {"finished", "killed", "lost", "failed", "skipped"}:
         return False
@@ -299,8 +332,61 @@ def dependency_settled(entry: JobEntry, *, now: float | None = None) -> bool:
         return False
     if entry.status != "lost":
         return True
+    return entry.terminal_finalized_at is not None
+
+
+def finalize_dependency_terminal(
+    cfg: HeadConfig,
+    job_id: str,
+    *,
+    now: float | None = None,
+) -> JobEntry | None:
+    """Durably fence an expired provisional lost result before dependents act."""
+    with job_lock(cfg, job_id):
+        entry = load(cfg, job_id)
+        if entry is None:
+            return None
+        return _finalize_dependency_terminal_entry(cfg, entry, now=now)
+
+
+def finalize_dependency_terminal_locked(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    *,
+    now: float | None = None,
+) -> JobEntry | None:
+    """Fence a lost result while the caller already owns ``job_lock``.
+
+    Submission holds all referenced-job locks as one ordered transaction.  It
+    must use this variant to avoid recursively acquiring a process-scoped
+    ``flock``; ordinary callers should use :func:`finalize_dependency_terminal`.
+    """
+    current = load(cfg, entry.job_id)
+    if current is None:
+        return None
+    return _finalize_dependency_terminal_entry(cfg, current, now=now)
+
+
+def _finalize_dependency_terminal_entry(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    *,
+    now: float | None,
+) -> JobEntry:
+    """Apply finality to one row loaded while its job lock is held."""
+    observed_now = time.time() if now is None else now
+    if not math.isfinite(observed_now) or observed_now < 0:
+        raise ValueError("dependency finalization time must be finite and non-negative")
+    if entry.status != "lost":
+        return entry
+    if entry.terminal_finalized_at is not None:
+        return entry
     observed_at = entry.finished_at or entry.updated_at or entry.created_at
-    return (time.time() if now is None else now) - observed_at > LOST_RECHECK_S
+    if observed_now - observed_at <= LOST_RECHECK_S:
+        return entry
+    entry.terminal_finalized_at = observed_now
+    save(cfg, entry)
+    return entry
 
 
 def transition_terminal(
@@ -320,6 +406,7 @@ def transition_terminal(
     entry.result_state = result_state
     entry.reason = reason
     entry.finished_at = time.time() if finished_at is None else finished_at
+    entry.terminal_finalized_at = None
 
 
 _INTERNAL_JOB_FIELDS = frozenset({"custom_env_keys", "custom_env_loaded"})
@@ -347,6 +434,88 @@ def public_job_record(entry: JobEntry) -> dict[str, object]:
         else list(entry.custom_env_keys)
     )
     return record
+
+
+def _bound_entry_diagnostics(entry: JobEntry) -> None:
+    """Keep untrusted launcher/probe diagnostics out of authoritative growth.
+
+    A transport can return megabytes on stderr.  The registry is lifecycle
+    authority, not a log store, so retain a useful head/tail excerpt and leave
+    complete evidence in the job logs.
+    """
+    if isinstance(entry.reason, str):
+        entry.reason = diagnostic_excerpt(
+            entry.reason,
+            limit=MAX_JOB_DIAGNOSTIC_CHARS,
+        )
+    if isinstance(entry.placement_failures, dict):
+        entry.placement_failures = {
+            node: (
+                diagnostic_excerpt(reason, limit=MAX_JOB_DIAGNOSTIC_CHARS)
+                if isinstance(reason, str)
+                else reason
+            )
+            for node, reason in entry.placement_failures.items()
+        }
+
+
+def decode_registry_document(
+    raw: object,
+    *,
+    layout: str | None = None,
+    registry_updated_at: float | None = None,
+    expected_job_id: str | None = None,
+    include_private: bool = True,
+) -> JobEntry:
+    """Decode a versioned registry envelope or one explicit legacy flat row."""
+    try:
+        document = raw
+        if isinstance(raw, dict) and "schema_version" in raw:
+            schema = raw.get("schema_version")
+            if schema != REGISTRY_SCHEMA_VERSION:
+                rendered = diagnostic_excerpt(
+                    repr(schema),
+                    limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                )
+                raise RegistryError(f"unsupported job registry schema {rendered}")
+            if set(raw) != {"schema_version", "job"}:
+                raise RegistryError("job registry envelope has unknown fields")
+            document = raw.get("job")
+            if not isinstance(document, dict):
+                raise RegistryError("job registry envelope has an invalid job record")
+        entry = _decode_entry(
+            document,
+            layout=layout,
+            registry_updated_at=registry_updated_at,
+            expected_job_id=expected_job_id,
+            include_private=include_private,
+        )
+    except RegistryError:
+        raise
+    except (TypeError, ValueError, KeyError, OverflowError, RecursionError) as exc:
+        detail = diagnostic_excerpt(
+            " ".join(str(exc).split()) or type(exc).__name__,
+            limit=MAX_JOB_DIAGNOSTIC_CHARS,
+        )
+        raise RegistryError(f"invalid job registry record: {detail}") from exc
+    return entry
+
+
+def encode_registry_entry(entry: JobEntry) -> bytes:
+    """Return the bounded canonical v1 envelope for one validated entry."""
+    _bound_entry_diagnostics(entry)
+    document = asdict(entry)
+    for name in _INTERNAL_JOB_FIELDS:
+        document.pop(name, None)
+    decode_registry_document(document, expected_job_id=entry.job_id)
+    envelope = {
+        "schema_version": REGISTRY_SCHEMA_VERSION,
+        "job": document,
+    }
+    encoded = (json.dumps(envelope, indent=1) + "\n").encode("utf-8")
+    if len(encoded) > MAX_JOB_RECORD_BYTES:
+        raise RegistryError("job registry record exceeds its size limit")
+    return encoded
 
 
 def _count_starting_with(sorted_values: list[str], prefix: str) -> int:
@@ -431,6 +600,7 @@ def _decode_entry(
         raise ValueError(str(exc)) from exc
     payload["custom_env"] = normalized_custom_env if include_private else {}
     entry = JobEntry(**payload)
+    _bound_entry_diagnostics(entry)
     entry.custom_env_keys = sorted(normalized_custom_env)
     entry.custom_env_loaded = include_private
     # Early launchers persisted an empty string when no uv environment existed.
@@ -500,6 +670,7 @@ def _decode_entry(
         entry.started_at,
         entry.finished_at,
         entry.updated_at,
+        entry.terminal_finalized_at,
     )
     if entry.created_at is None or any(
         value is not None
@@ -574,6 +745,8 @@ def _decode_entry(
         or entry.job_relpath != f"jobs/{entry.job_id}"
     ):
         raise ValueError("job registry has an invalid pending legacy cleanup")
+    if entry.terminal_finalized_at is not None and entry.status != "lost":
+        raise ValueError("only a lost job may carry terminal finality")
     if (
         entry.dispatch_token is not None
         and re.fullmatch(r"[0-9a-f]{32}", entry.dispatch_token) is None
@@ -729,16 +902,20 @@ def _decode_entry_result(
         raise RegistryError(f"registry record disappeared: {name}")
     payload, info = result
     try:
-        raw = json.loads(payload)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raw = decode_strict_json(payload)
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise RegistryError(f"registry record is malformed: {name}") from exc
-    return _decode_entry(
-        raw,
-        layout=layout,
-        registry_updated_at=info.st_mtime,
-        expected_job_id=expected_job_id,
-        include_private=include_private,
-    )
+    try:
+        return decode_registry_document(
+            raw,
+            layout=layout,
+            registry_updated_at=info.st_mtime,
+            expected_job_id=expected_job_id,
+            include_private=include_private,
+        )
+    except RegistryError as exc:
+        detail = diagnostic_excerpt(str(exc), limit=MAX_JOB_DIAGNOSTIC_CHARS)
+        raise RegistryError(f"registry record is invalid: {name}: {detail}") from exc
 
 
 def _read_entry_path(
@@ -767,37 +944,100 @@ class RegistryDamage:
     detail: str
 
 
+@dataclass(frozen=True)
+class RegistryLocation:
+    """The one authoritative on-disk location resolved for a job identity."""
+
+    path: Path
+    layout: str
+    exists: bool
+
+
+def _registry_locations(cfg: HeadConfig, job_id: str) -> list[RegistryLocation]:
+    """Return existing compatible locations, refusing unsafe path objects."""
+    locations: list[RegistryLocation] = []
+    seen: set[Path] = set()
+    candidates = (
+        (cfg.registry_path(), cfg.layout),
+        (cfg.legacy_registry_dir(), LEGACY_LAYOUT),
+    )
+    for directory, layout in candidates:
+        if directory in seen:
+            continue
+        seen.add(directory)
+        if not _require_private_directory(directory, create=False):
+            continue
+        path = directory / f"{job_id}.json"
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise RegistryError(f"cannot inspect registry record: {path.name}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise RegistryError(f"cannot safely open registry record: {path.name}")
+        locations.append(RegistryLocation(path=path, layout=layout, exists=True))
+    return locations
+
+
+def resolve_registry_record(
+    cfg: HeadConfig,
+    job_id: str,
+    *,
+    create: bool = False,
+) -> RegistryLocation | None:
+    """Resolve one authority; never choose between role/legacy split brain."""
+    job_id = _require_job_id(job_id)
+    locations = _registry_locations(cfg, job_id)
+    if len(locations) > 1:
+        roots = ", ".join(str(item.path.parent) for item in locations)
+        raise RegistryError(
+            f"split-brain registry row for {job_id}: exists in {roots}; "
+            "run dt migrate to reconcile"
+        )
+    if locations:
+        return locations[0]
+    if not create:
+        return None
+    directory = cfg.registry_path()
+    _require_private_directory(directory, create=True)
+    return RegistryLocation(
+        path=directory / f"{job_id}.json",
+        layout=cfg.layout,
+        exists=False,
+    )
+
+
 def save(cfg: HeadConfig, entry: JobEntry) -> None:
     job_id = _require_job_id(entry.job_id)
-    if entry.storage_layout is None and cfg.layout == ROLE_LAYOUT:
+    location = resolve_registry_record(cfg, job_id, create=True)
+    assert location is not None
+    path = location.path
+    existing: JobEntry | None = None
+    if location.exists:
+        existing = _read_entry_path(
+            path,
+            layout=location.layout,
+            expected_job_id=job_id,
+        )
+        if existing.terminal_finalized_at is not None and (
+            entry.status != "lost"
+            or entry.terminal_finalized_at != existing.terminal_finalized_at
+        ):
+            raise RegistryError("a finalized lost result cannot be reopened")
+        if entry.storage_layout is None:
+            entry.storage_layout = existing.storage_layout
+    elif entry.storage_layout is None and cfg.layout == ROLE_LAYOUT:
         entry.storage_layout = ROLE_LAYOUT
-    legacy_directory = cfg.legacy_registry_dir()
-    legacy_path = legacy_directory / f"{job_id}.json"
-    legacy_record_exists = False
-    if cfg.layout == ROLE_LAYOUT and entry.storage_layout == LEGACY_LAYOUT:
-        if _require_private_directory(legacy_directory, create=False):
-            try:
-                legacy_info = legacy_path.lstat()
-            except FileNotFoundError:
-                pass
-            else:
-                if stat.S_ISLNK(legacy_info.st_mode) or not stat.S_ISREG(
-                    legacy_info.st_mode
-                ):
-                    raise RegistryError("legacy registry record is unsafe")
-                legacy_record_exists = True
-    if legacy_record_exists:
-        path = legacy_path
-    else:
-        path = cfg.registry_dir() / f"{entry.job_id}.json"
-    _require_private_directory(path.parent, create=True)
+    if location.layout == LEGACY_LAYOUT and entry.storage_layout == ROLE_LAYOUT:
+        raise RegistryError("legacy registry authority cannot store a role-layout row")
     persisted = entry
     if not entry.custom_env_loaded:
         # Lifecycle scans intentionally discard private values.  A later
         # status transition must preserve the exact stored mapping rather than
         # silently clearing replay credentials.  Resolve just this row at the
         # write boundary and verify its public key set did not change.
-        current_entry = load(cfg, job_id)
+        current_entry = existing
         if current_entry is None:
             raise RegistryError(
                 "cannot preserve unloaded custom environment: registry row vanished"
@@ -820,54 +1060,139 @@ def save(cfg: HeadConfig, entry: JobEntry) -> None:
     entry.custom_env_keys = (
         sorted(entry.custom_env) if entry.custom_env_loaded else entry.custom_env_keys
     )
-    document = asdict(persisted)
-    for name in _INTERNAL_JOB_FIELDS:
-        document.pop(name, None)
-    # Validate and bound the final document before it can replace authoritative
-    # state. A successful writer must never create a row its own reader rejects.
-    _decode_entry(document, expected_job_id=job_id)
-    encoded = (json.dumps(document, indent=1) + "\n").encode("utf-8")
-    if len(encoded) > MAX_JOB_RECORD_BYTES:
-        raise RegistryError("job registry record exceeds its size limit")
-    try:
-        atomic_write(path, encoded)
-    except PrivateStateError as exc:
-        raise RegistryError(f"cannot publish registry record: {path.name}") from exc
+    encoded = encode_registry_entry(persisted)
+    # The index is derived, but a valid incremental update is a read-modify-
+    # write transaction across *all* job IDs.  Serialize that transaction with
+    # the authoritative row mutation so two different jobs cannot each publish
+    # a revision-current index that drops the other writer.
+    with _active_index_mutation_lock(cfg):
+        previous_index = _read_active_index(cfg)
+        previous_replica_manifest = _read_replica_manifest(cfg)
+        try:
+            atomic_write(path, encoded)
+        except PrivateStateError as exc:
+            raise RegistryError(f"cannot publish registry record: {path.name}") from exc
+        resolved = resolve_registry_record(cfg, job_id)
+        if resolved is None or resolved.path != path:
+            raise RegistryError("registry authority changed while the record was saved")
+        _refresh_active_index_after_mutation(cfg, previous_index, entry=persisted)
+        _refresh_replica_index_after_mutation(
+            cfg,
+            previous_replica_manifest,
+            previous_entry=existing,
+            entry=persisted,
+        )
+    # A dispatch reservation is useful only if the authority selected by future
+    # readers contains the exact token that the claimant believes it wrote.
+    if entry.dispatch_token is not None:
+        verified = _read_entry_path(
+            path,
+            layout=location.layout,
+            expected_job_id=job_id,
+        )
+        if (
+            verified.dispatch_token != entry.dispatch_token
+            or verified.dispatch_node != entry.dispatch_node
+        ):
+            raise RegistryError("dispatch reservation could not be read back")
 
 
 def remove_record(cfg: HeadConfig, job_id: str) -> None:
-    """Remove every compatible registry copy so an old row cannot reappear."""
+    """Durably remove the single resolved authority for one job."""
     job_id = _require_job_id(job_id)
-    current = cfg.registry_dir()
-    _require_private_directory(current, create=True)
-    paths = {current / f"{job_id}.json"}
-    legacy = cfg.legacy_registry_dir()
-    if legacy != current and _require_private_directory(legacy, create=False):
-        paths.add(legacy / f"{job_id}.json")
-    for path in paths:
-        path.unlink(missing_ok=True)
-        # Persist the deletion's directory entry so a crash cannot roll it back
-        # and resurrect a stale row whose remote data is already gone.
-        fsync_dir(path.parent)
+    location = resolve_registry_record(cfg, job_id)
+    if location is None:
+        return
+    # Destructive callers must understand the authority they are deleting.
+    # A future schema may carry lifecycle or retention semantics this release
+    # cannot safely preserve, so refuse it exactly as load/save do.
+    removed_entry = _read_entry_path(
+        location.path,
+        layout=location.layout,
+        expected_job_id=job_id,
+    )
+    tombstone = location.path.with_name(
+        f".removing-{job_id}-{secrets.token_hex(8)}.json"
+    )
+    with _active_index_mutation_lock(cfg):
+        previous_index = _read_active_index(cfg)
+        previous_replica_manifest = _read_replica_manifest(cfg)
+        try:
+            os.replace(location.path, tombstone)
+            try:
+                # First make the canonical-name removal durable. A crash can then
+                # resurrect only an ignored tombstone, never an authoritative row.
+                fsync_dir(location.path.parent)
+            except PrivateStateError:
+                if tombstone.exists() and not location.path.exists():
+                    os.replace(tombstone, location.path)
+                    fsync_dir(location.path.parent)
+                raise
+            tombstone.unlink()
+            fsync_dir(location.path.parent)
+        except (OSError, PrivateStateError) as exc:
+            raise RegistryError(
+                f"cannot durably remove registry record: {job_id}"
+            ) from exc
+        if resolve_registry_record(cfg, job_id) is not None:
+            raise RegistryError(
+                "registry authority reappeared while the record was removed"
+            )
+        _refresh_active_index_after_mutation(
+            cfg,
+            previous_index,
+            removed_job_id=job_id,
+        )
+        _refresh_replica_index_after_mutation(
+            cfg,
+            previous_replica_manifest,
+            removed_entry=removed_entry,
+        )
 
 
 @contextmanager
-def job_lock(cfg: HeadConfig, job_id: str) -> Iterator[None]:
+def job_lock(
+    cfg: HeadConfig,
+    job_id: str,
+    *,
+    cancel_event: CancelEvent | None = None,
+    poll_interval: float = 0.05,
+) -> Iterator[None]:
     """Serialize status probes and destructive lifecycle transitions."""
+    if poll_interval <= 0:
+        raise ValueError("lock poll interval must be positive")
     job_id = _require_job_id(job_id)
     paths: list[Path] = []
     if cfg.layout == ROLE_LAYOUT and cfg.legacy_registry_dir().is_dir():
         paths.append(cfg.legacy_registry_dir() / f".{job_id}.lock")
     paths.append(cfg.state_dir() / f"job-{job_id}.lock")
+    lock_id = f"job:{paths[-1].absolute()}"
+    held = _HELD_LOCK_IDS.get()
+    if lock_id in held:
+        yield
+        return
     locks: list[int] = []
     try:
         for path in paths:
             descriptor = _open_private_lock(path)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if cancel_event is None:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            else:
+                while True:
+                    if cancel_event.is_set():
+                        os.close(descriptor)
+                        raise RegistryLockCancelled("registry lock wait cancelled")
+                    try:
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(poll_interval)
             locks.append(descriptor)
+        context_token = _HELD_LOCK_IDS.set(held | {lock_id})
         try:
             yield
         finally:
+            _HELD_LOCK_IDS.reset(context_token)
             for descriptor in reversed(locks):
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
     finally:
@@ -876,17 +1201,42 @@ def job_lock(cfg: HeadConfig, job_id: str) -> Iterator[None]:
 
 
 @contextmanager
-def pull_destination_lock(cfg: HeadConfig, destination: Path) -> Iterator[None]:
+def pull_destination_lock(
+    cfg: HeadConfig,
+    destination: Path,
+    *,
+    cancel_event: CancelEvent | None = None,
+    poll_interval: float = 0.05,
+) -> Iterator[None]:
     """Serialize all writers targeting the same canonical result directory."""
+    if poll_interval <= 0:
+        raise ValueError("lock poll interval must be positive")
     canonical = destination.expanduser().resolve(strict=False)
     digest = hashlib.sha256(os.fsencode(canonical)).hexdigest()[:24]
     path = cfg.state_dir() / f"pull-{digest}.lock"
+    lock_id = f"pull:{path.absolute()}"
+    held = _HELD_LOCK_IDS.get()
+    if lock_id in held:
+        yield
+        return
     lock = _open_private_lock(path)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if cancel_event is None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        else:
+            while True:
+                if cancel_event.is_set():
+                    raise RegistryLockCancelled("pull destination lock wait cancelled")
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    time.sleep(poll_interval)
+        context_token = _HELD_LOCK_IDS.set(held | {lock_id})
         try:
             yield
         finally:
+            _HELD_LOCK_IDS.reset(context_token)
             fcntl.flock(lock, fcntl.LOCK_UN)
     finally:
         os.close(lock)
@@ -895,25 +1245,14 @@ def pull_destination_lock(cfg: HeadConfig, destination: Path) -> Iterator[None]:
 def load(cfg: HeadConfig, job_id: str) -> JobEntry | None:
     if not _valid_job_id(job_id):
         return None
-    current = cfg.registry_path()
-    candidates: list[tuple[Path, str]] = []
-    if _require_private_directory(current, create=False):
-        candidates.append((current / f"{job_id}.json", cfg.layout))
-    legacy = cfg.legacy_registry_dir() / f"{job_id}.json"
-    if legacy != current / f"{job_id}.json":
-        if _require_private_directory(legacy.parent, create=False):
-            candidates.append((legacy, LEGACY_LAYOUT))
-    for path, layout in candidates:
-        try:
-            path.lstat()
-        except FileNotFoundError:
-            continue
-        return _read_entry_path(
-            path,
-            layout=layout,
-            expected_job_id=job_id,
-        )
-    return None
+    location = resolve_registry_record(cfg, job_id)
+    if location is None:
+        return None
+    return _read_entry_path(
+        location.path,
+        layout=location.layout,
+        expected_job_id=job_id,
+    )
 
 
 _DECODE_CACHE_ENABLED = False
@@ -949,12 +1288,12 @@ def list_all(
     show state to a human receive it through ``damage``.
     """
     entries: dict[str, JobEntry] = {}
-    origins: dict[str, str] = {}
     cache_seen: set[str] = set()
     directories = [(cfg.legacy_registry_dir(), LEGACY_LAYOUT)]
     current = cfg.registry_path()
     if current != cfg.legacy_registry_dir():
         directories.append((current, cfg.layout))
+    scans: list[tuple[Path, str, list[str]]] = []
     for directory, layout in directories:
         try:
             exists = _require_private_directory(directory, create=False)
@@ -974,6 +1313,32 @@ def list_all(
             if damage is not None:
                 damage.append(RegistryDamage(path=str(directory), detail=str(exc)))
             continue
+        scans.append((directory, layout, names))
+
+    origins: dict[str, list[str]] = {}
+    for directory, _layout, names in scans:
+        for name in names:
+            job_id = name[: -len(".json")]
+            origins.setdefault(job_id, []).append(str(directory))
+    conflicted = {
+        job_id
+        for job_id, source_directories in origins.items()
+        if len(source_directories) > 1
+    }
+    if damage is not None:
+        for job_id in sorted(conflicted):
+            damage.append(
+                RegistryDamage(
+                    path=f"{job_id}.json",
+                    detail=diagnostic_excerpt(
+                        "split-brain registry row: exists in "
+                        f"{', '.join(origins[job_id])}; run dt migrate to reconcile",
+                        limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                    ),
+                )
+            )
+
+    for directory, layout, names in scans:
         # One pinned, validated directory descriptor serves the whole scan
         # instead of re-validating the directory for every record.
         with bounded_directory_reader(
@@ -983,6 +1348,8 @@ def list_all(
             if read_name is None:
                 continue
             for name in names:
+                if name[: -len(".json")] in conflicted:
+                    continue
                 try:
                     try:
                         result = read_name(name)
@@ -1004,20 +1371,7 @@ def list_all(
                             # a failed save cannot make unsaved state appear
                             # durable on the next scan.
                             entry = copy.deepcopy(cached[1])
-                            if entry.job_id in entries and damage is not None:
-                                damage.append(
-                                    RegistryDamage(
-                                        path=name,
-                                        detail=(
-                                            "split-brain registry row: exists "
-                                            f"in both {origins[entry.job_id]} "
-                                            f"and {directory}; run dt migrate "
-                                            "to reconcile"
-                                        ),
-                                    )
-                                )
                             entries[entry.job_id] = entry
-                            origins[entry.job_id] = str(directory)
                             continue
                     entry = _decode_entry_result(
                         result,
@@ -1033,33 +1387,1184 @@ def list_all(
                                 (info.st_ino, info.st_size, info.st_mtime_ns),
                                 copy.deepcopy(entry),
                             )
-                    if entry.job_id in entries and damage is not None:
-                        # A crashed migration window can leave the same job in
-                        # both registries. save() routes by storage_layout, so
-                        # lifecycle writes may land in the copy this listing
-                        # does not prefer; surface the split instead of hiding
-                        # it.
-                        damage.append(
-                            RegistryDamage(
-                                path=name,
-                                detail=(
-                                    "split-brain registry row: exists in both "
-                                    f"{origins[entry.job_id]} and {directory}; "
-                                    "run dt migrate to reconcile"
-                                ),
-                            )
-                        )
                     entries[entry.job_id] = entry
-                    origins[entry.job_id] = str(directory)
-                except Exception as exc:
+                except (OSError, PrivateStateError, RegistryError) as exc:
                     if damage is not None:
-                        detail = " ".join(str(exc).split()) or type(exc).__name__
+                        detail = diagnostic_excerpt(
+                            " ".join(str(exc).split()) or type(exc).__name__,
+                            limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                        )
                         damage.append(RegistryDamage(path=name, detail=detail))
                     continue
     if _DECODE_CACHE_ENABLED and _DECODE_CACHE:
         for key in [k for k in _DECODE_CACHE if k not in cache_seen]:
             del _DECODE_CACHE[key]
     return [entries[job_id] for job_id in sorted(entries)]
+
+
+def iter_all(
+    cfg: HeadConfig,
+    *,
+    damage: list[RegistryDamage] | None = None,
+) -> Iterator[JobEntry]:
+    """Stream validated history without retaining the registry in memory.
+
+    This is the bounded counterpart to :func:`list_all` for consumers that
+    reduce a large terminal history to a small derived view.  Ordering is
+    deliberately unspecified.  The same split-brain rule applies: when a job
+    identity exists in both compatible registry layouts, neither copy is
+    yielded.
+    """
+    candidates = [(cfg.legacy_registry_dir(), LEGACY_LAYOUT)]
+    current = cfg.registry_path()
+    if current != cfg.legacy_registry_dir():
+        candidates.append((current, cfg.layout))
+
+    scans: list[tuple[Path, str]] = []
+    for directory, layout in candidates:
+        try:
+            exists = _require_private_directory(directory, create=False)
+        except RegistryError as exc:
+            if damage is not None:
+                damage.append(RegistryDamage(path=str(directory), detail=str(exc)))
+            continue
+        if exists:
+            scans.append((directory, layout))
+
+    with ExitStack() as stack:
+        readers: list[Callable[[str], tuple[bytes, os.stat_result] | None] | None] = []
+        for directory, _layout in scans:
+            try:
+                reader = stack.enter_context(
+                    bounded_directory_reader(directory, max_bytes=MAX_JOB_RECORD_BYTES)
+                )
+            except PrivateStateError as exc:
+                if damage is not None:
+                    damage.append(
+                        RegistryDamage(
+                            path=str(directory),
+                            detail=diagnostic_excerpt(
+                                " ".join(str(exc).split()) or type(exc).__name__,
+                                limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                            ),
+                        )
+                    )
+                readers.append(None)
+                continue
+            if reader is None and damage is not None:
+                damage.append(
+                    RegistryDamage(
+                        path=str(directory),
+                        detail="registry directory disappeared during history scan",
+                    )
+                )
+            readers.append(reader)
+
+        for scan_index, (directory, layout) in enumerate(scans):
+            read_name = readers[scan_index]
+            if read_name is None:
+                continue
+            try:
+                with os.scandir(directory) as items:
+                    for item in items:
+                        name = item.name
+                        if name.startswith(".") or not name.endswith(".json"):
+                            continue
+
+                        source_indexes = [scan_index]
+                        for other_index, other_reader in enumerate(readers):
+                            if other_index == scan_index or other_reader is None:
+                                continue
+                            try:
+                                duplicate = other_reader(name) is not None
+                            except PrivateStateError:
+                                # Unsafe authority is still an authority. Never
+                                # prefer the readable copy of a split brain.
+                                duplicate = True
+                            if duplicate:
+                                source_indexes.append(other_index)
+                        if len(source_indexes) > 1:
+                            if damage is not None and scan_index == min(source_indexes):
+                                sources = ", ".join(
+                                    str(scans[index][0])
+                                    for index in sorted(source_indexes)
+                                )
+                                damage.append(
+                                    RegistryDamage(
+                                        path=name,
+                                        detail=diagnostic_excerpt(
+                                            "split-brain registry row: exists in "
+                                            f"{sources}; run dt migrate to reconcile",
+                                            limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                                        ),
+                                    )
+                                )
+                            continue
+
+                        try:
+                            result = read_name(name)
+                            yield _decode_entry_result(
+                                result,
+                                name=name,
+                                layout=layout,
+                                expected_job_id=name[: -len(".json")],
+                                include_private=False,
+                            )
+                        except (OSError, PrivateStateError, RegistryError) as exc:
+                            if damage is not None:
+                                damage.append(
+                                    RegistryDamage(
+                                        path=name,
+                                        detail=diagnostic_excerpt(
+                                            " ".join(str(exc).split())
+                                            or type(exc).__name__,
+                                            limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                                        ),
+                                    )
+                                )
+            except OSError as exc:
+                if damage is not None:
+                    damage.append(
+                        RegistryDamage(
+                            path=str(directory),
+                            detail=diagnostic_excerpt(
+                                " ".join(str(exc).split()) or type(exc).__name__,
+                                limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                            ),
+                        )
+                    )
+
+
+@dataclass(frozen=True)
+class _ActiveIndex:
+    job_ids: tuple[str, ...]
+    damage: tuple[RegistryDamage, ...]
+
+
+def _active_index_path(cfg: HeadConfig) -> Path:
+    # Path construction is intentionally side-effect free.  Read-only callers
+    # may inspect an empty head without creating its control-state hierarchy;
+    # ``atomic_write`` creates and validates the parent when publishing.
+    state_root = (
+        cfg.head_root / "state" if cfg.layout == ROLE_LAYOUT else cfg.root / "state"
+    )
+    return state_root / "active-jobs.json"
+
+
+@contextmanager
+def _active_index_mutation_lock(cfg: HeadConfig) -> Iterator[None]:
+    """Serialize registry mutations with their derived-index publication.
+
+    Per-job locks deliberately permit unrelated submissions in parallel.  The
+    active index, however, is one head-wide read-modify-write object; its tiny
+    critical section needs a separate cross-process lock.  Cold rebuild scans
+    stay outside this lock and use a revision fence only for publication.
+    """
+    descriptor = _open_private_lock(cfg.state_dir() / "active-index.lock")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _registry_directory_revisions(cfg: HeadConfig) -> list[dict[str, object]]:
+    revisions: list[dict[str, object]] = []
+    seen: set[Path] = set()
+    for path in (cfg.legacy_registry_dir(), cfg.registry_path()):
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            revisions.append({"path": str(path), "exists": False})
+            continue
+        except OSError as exc:
+            raise RegistryError(f"cannot inspect registry directory: {path}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RegistryError(f"registry directory is unsafe: {path}")
+        revisions.append(
+            {
+                "path": str(path),
+                "exists": True,
+                "device": info.st_dev,
+                "inode": info.st_ino,
+                "mtime_ns": info.st_mtime_ns,
+                "ctime_ns": info.st_ctime_ns,
+            }
+        )
+    return revisions
+
+
+@dataclass(frozen=True)
+class ArtifactReplicaRecord:
+    """One newest durable snapshot holder for a configured site node."""
+
+    digest: str
+    site: str
+    node: str
+    job_id: str
+    job_dir: str
+    recorded_at: float
+
+
+@dataclass(frozen=True)
+class _ReplicaManifest:
+    generation: str
+    item_count: int
+    buckets: tuple[str, ...]
+    bucket_counts: tuple[tuple[str, int], ...]
+    bucket_hashes: tuple[tuple[str, str], ...]
+    registry_revisions: tuple[dict[str, object], ...]
+
+
+def _control_state_root(cfg: HeadConfig) -> Path:
+    return cfg.head_root / "state" if cfg.layout == ROLE_LAYOUT else cfg.root / "state"
+
+
+def _replica_manifest_path(cfg: HeadConfig) -> Path:
+    return _control_state_root(cfg) / "artifact-replicas.json"
+
+
+def _replica_generation_root(cfg: HeadConfig, generation: str) -> Path:
+    return _control_state_root(cfg) / "artifact-replicas" / generation
+
+
+def _replica_bucket_key(digest: str) -> str:
+    # Hash the content identity again instead of trusting its prefix to be
+    # uniformly distributed (tests, migrations, and imported stores often use
+    # sequential/synthetic digests).
+    return hashlib.sha256(digest.encode("ascii")).hexdigest()[:2]
+
+
+def _entry_replica_record(
+    cfg: HeadConfig,
+    entry: JobEntry,
+) -> ArtifactReplicaRecord | None:
+    digest = entry.snapshot_sha256
+    if (
+        not isinstance(digest, str)
+        or SHA256_RE.fullmatch(digest) is None
+        or entry.node == "-"
+        or not entry.job_dir
+    ):
+        return None
+    node = next(
+        (candidate for candidate in cfg.nodes if candidate.name == entry.node), None
+    )
+    if node is None or node.site is None or not node.artifact_seed:
+        return None
+    recorded_at = entry.started_at or entry.created_at
+    if not math.isfinite(recorded_at) or recorded_at < 0:
+        return None
+    return ArtifactReplicaRecord(
+        digest=digest,
+        site=node.site,
+        node=node.name,
+        job_id=entry.job_id,
+        job_dir=entry.job_dir,
+        recorded_at=recorded_at,
+    )
+
+
+def _read_replica_manifest(cfg: HeadConfig) -> _ReplicaManifest | None:
+    try:
+        result = read_bounded(
+            _replica_manifest_path(cfg),
+            max_bytes=MAX_REPLICA_MANIFEST_BYTES,
+        )
+        if result is None:
+            return None
+        raw = decode_strict_json(result[0])
+        if not isinstance(raw, dict) or set(raw) != {
+            "schema_version",
+            "generation",
+            "item_count",
+            "buckets",
+            "bucket_counts",
+            "bucket_hashes",
+            "registry_revisions",
+        }:
+            return None
+        generation = raw.get("generation")
+        item_count = raw.get("item_count")
+        buckets = raw.get("buckets")
+        bucket_counts = raw.get("bucket_counts")
+        bucket_hashes = raw.get("bucket_hashes")
+        revisions = raw.get("registry_revisions")
+        if (
+            raw.get("schema_version") != REPLICA_INDEX_SCHEMA_VERSION
+            or not isinstance(generation, str)
+            or _REPLICA_GENERATION_RE.fullmatch(generation) is None
+            or isinstance(item_count, bool)
+            or not isinstance(item_count, int)
+            or not 0 <= item_count <= MAX_REPLICA_INDEX_ITEMS
+            or not isinstance(buckets, list)
+            or len(buckets) > 256
+            or any(
+                not isinstance(bucket, str)
+                or re.fullmatch(r"[0-9a-f]{2}", bucket) is None
+                for bucket in buckets
+            )
+            or len(set(buckets)) != len(buckets)
+            or not isinstance(bucket_counts, dict)
+            or not isinstance(bucket_hashes, dict)
+            or set(bucket_counts) != set(buckets)
+            or set(bucket_hashes) != set(buckets)
+            or any(
+                isinstance(count, bool)
+                or not isinstance(count, int)
+                or not 0 <= count <= MAX_REPLICA_INDEX_ITEMS
+                for count in bucket_counts.values()
+            )
+            or sum(bucket_counts.values()) != item_count
+            or any(
+                not isinstance(value, str) or SHA256_RE.fullmatch(value) is None
+                for value in bucket_hashes.values()
+            )
+            or not isinstance(revisions, list)
+            or revisions != _registry_directory_revisions(cfg)
+            or any(not isinstance(item, dict) for item in revisions)
+        ):
+            return None
+        return _ReplicaManifest(
+            generation=generation,
+            item_count=item_count,
+            buckets=tuple(sorted(buckets)),
+            bucket_counts=tuple(sorted(bucket_counts.items())),
+            bucket_hashes=tuple(sorted(bucket_hashes.items())),
+            registry_revisions=tuple(revisions),
+        )
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        PrivateStateError,
+        RegistryError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _read_replica_shard(
+    cfg: HeadConfig,
+    manifest: _ReplicaManifest,
+    digest: str,
+) -> dict[tuple[str, str], ArtifactReplicaRecord] | None:
+    bucket = _read_replica_bucket(cfg, manifest, _replica_bucket_key(digest))
+    return None if bucket is None else bucket.get(digest, {})
+
+
+def _read_replica_bucket(
+    cfg: HeadConfig,
+    manifest: _ReplicaManifest,
+    bucket: str,
+) -> dict[str, dict[tuple[str, str], ArtifactReplicaRecord]] | None:
+    if bucket not in manifest.buckets:
+        return {}
+    try:
+        result = read_bounded(
+            _replica_generation_root(cfg, manifest.generation) / f"{bucket}.json",
+            max_bytes=MAX_REPLICA_SHARD_BYTES,
+        )
+        if result is None:
+            return None
+        expected_counts = dict(manifest.bucket_counts)
+        expected_hashes = dict(manifest.bucket_hashes)
+        if hashlib.sha256(result[0]).hexdigest() != expected_hashes[bucket]:
+            return None
+        raw = decode_strict_json(result[0])
+        if not isinstance(raw, dict) or set(raw) != {
+            "schema_version",
+            "bucket",
+            "records",
+        }:
+            return None
+        rows = raw.get("records")
+        if (
+            raw.get("schema_version") != REPLICA_SHARD_SCHEMA_VERSION
+            or raw.get("bucket") != bucket
+            or not isinstance(rows, list)
+            or len(rows) > MAX_REPLICA_INDEX_ITEMS
+        ):
+            return None
+        records: dict[str, dict[tuple[str, str], ArtifactReplicaRecord]] = {}
+        configured = {(node.site, node.name) for node in cfg.nodes if node.site}
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {
+                "digest",
+                "site",
+                "node",
+                "job_id",
+                "job_dir",
+                "recorded_at",
+            }:
+                return None
+            digest = row.get("digest")
+            site = row.get("site")
+            node = row.get("node")
+            job_id = row.get("job_id")
+            job_dir = row.get("job_dir")
+            recorded_at = row.get("recorded_at")
+            if (
+                not isinstance(digest, str)
+                or SHA256_RE.fullmatch(digest) is None
+                or _replica_bucket_key(digest) != bucket
+                or not isinstance(site, str)
+                or not isinstance(node, str)
+                or (site, node) not in configured
+                or not isinstance(job_id, str)
+                or not _valid_job_id(job_id)
+                or not isinstance(job_dir, str)
+                or not job_dir
+                or isinstance(recorded_at, bool)
+                or not isinstance(recorded_at, (int, float))
+                or not math.isfinite(float(recorded_at))
+                or float(recorded_at) < 0
+            ):
+                return None
+            shard = records.setdefault(digest, {})
+            if (site, node) in shard:
+                return None
+            shard[(site, node)] = ArtifactReplicaRecord(
+                digest=digest,
+                site=site,
+                node=node,
+                job_id=job_id,
+                job_dir=job_dir,
+                recorded_at=float(recorded_at),
+            )
+        if sum(len(shard) for shard in records.values()) != expected_counts[bucket]:
+            return None
+        return records
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        PrivateStateError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _write_replica_bucket(
+    cfg: HeadConfig,
+    generation: str,
+    bucket: str,
+    records: dict[str, dict[tuple[str, str], ArtifactReplicaRecord]],
+) -> tuple[int, str]:
+    document = {
+        "schema_version": REPLICA_SHARD_SCHEMA_VERSION,
+        "bucket": bucket,
+        "records": [
+            {
+                "digest": digest,
+                "site": record.site,
+                "node": record.node,
+                "job_id": record.job_id,
+                "job_dir": record.job_dir,
+                "recorded_at": record.recorded_at,
+            }
+            for digest, shard in sorted(records.items())
+            for _key, record in sorted(shard.items())
+        ],
+    }
+    encoded = (
+        json.dumps(document, allow_nan=False, separators=(",", ":")) + "\n"
+    ).encode()
+    if len(encoded) > MAX_REPLICA_SHARD_BYTES:
+        raise RegistryError("artifact replica shard exceeds its size limit")
+    try:
+        atomic_write(
+            _replica_generation_root(cfg, generation) / f"{bucket}.json",
+            encoded,
+        )
+    except PrivateStateError as exc:
+        raise RegistryError("cannot publish artifact replica shard") from exc
+    return (
+        sum(len(shard) for shard in records.values()),
+        hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def _write_replica_manifest(
+    cfg: HeadConfig,
+    generation: str,
+    item_count: int,
+    bucket_evidence: dict[str, tuple[int, str]],
+    revisions: list[dict[str, object]],
+) -> None:
+    if (
+        not 0 <= item_count <= MAX_REPLICA_INDEX_ITEMS
+        or sum(count for count, _digest in bucket_evidence.values()) != item_count
+        or len(bucket_evidence) > 256
+    ):
+        raise RegistryError("artifact replica manifest has invalid counts")
+    document = {
+        "schema_version": REPLICA_INDEX_SCHEMA_VERSION,
+        "generation": generation,
+        "item_count": item_count,
+        "buckets": sorted(bucket_evidence),
+        "bucket_counts": {
+            bucket: evidence[0] for bucket, evidence in sorted(bucket_evidence.items())
+        },
+        "bucket_hashes": {
+            bucket: evidence[1] for bucket, evidence in sorted(bucket_evidence.items())
+        },
+        "registry_revisions": revisions,
+    }
+    encoded = (
+        json.dumps(document, allow_nan=False, separators=(",", ":")) + "\n"
+    ).encode()
+    if len(encoded) > MAX_REPLICA_MANIFEST_BYTES:
+        raise RegistryError("artifact replica manifest exceeds its size limit")
+    try:
+        atomic_write(_replica_manifest_path(cfg), encoded)
+    except PrivateStateError as exc:
+        raise RegistryError("cannot publish artifact replica manifest") from exc
+
+
+def _replica_record_is_newer(
+    candidate: ArtifactReplicaRecord,
+    prior: ArtifactReplicaRecord | None,
+) -> bool:
+    return prior is None or (candidate.recorded_at, candidate.job_id) > (
+        prior.recorded_at,
+        prior.job_id,
+    )
+
+
+def _build_replica_records(
+    cfg: HeadConfig,
+) -> dict[str, dict[tuple[str, str], ArtifactReplicaRecord]]:
+    records: dict[str, dict[tuple[str, str], ArtifactReplicaRecord]] = {}
+    item_count = 0
+    for entry in iter_all(cfg):
+        candidate = _entry_replica_record(cfg, entry)
+        if candidate is None:
+            continue
+        shard = records.setdefault(candidate.digest, {})
+        key = (candidate.site, candidate.node)
+        if _replica_record_is_newer(candidate, shard.get(key)):
+            if key not in shard:
+                item_count += 1
+            shard[key] = candidate
+        if item_count > MAX_REPLICA_INDEX_ITEMS:
+            raise RegistryError("artifact replica index exceeds its item limit")
+    return records
+
+
+def _publish_replica_rebuild(
+    cfg: HeadConfig,
+    records: dict[str, dict[tuple[str, str], ArtifactReplicaRecord]],
+    revisions: list[dict[str, object]],
+) -> bool:
+    previous_generation: str | None = None
+    generation = f"g-{secrets.token_hex(16)}"
+    building = f".building-{generation[2:]}"
+    try:
+        ensure_private_directory(_replica_generation_root(cfg, building))
+    except PrivateStateError as exc:
+        raise RegistryError("cannot prepare artifact replica generation") from exc
+    buckets: dict[str, dict[str, dict[tuple[str, str], ArtifactReplicaRecord]]] = {}
+    for digest, shard in records.items():
+        buckets.setdefault(_replica_bucket_key(digest), {})[digest] = shard
+    try:
+        bucket_evidence = {
+            bucket: _write_replica_bucket(cfg, building, bucket, bucket_records)
+            for bucket, bucket_records in buckets.items()
+        }
+    except BaseException:
+        _remove_replica_generation(cfg, building)
+        raise
+    published = False
+    renamed = False
+    try:
+        with _active_index_mutation_lock(cfg):
+            if _registry_directory_revisions(cfg) == revisions:
+                previous_generation = _replica_manifest_generation(cfg)
+                building_root = _replica_generation_root(cfg, building)
+                generation_root = _replica_generation_root(cfg, generation)
+                os.replace(building_root, generation_root)
+                renamed = True
+                fsync_dir(generation_root.parent)
+                _write_replica_manifest(
+                    cfg,
+                    generation,
+                    sum(len(shard) for shard in records.values()),
+                    bucket_evidence,
+                    revisions,
+                )
+                published = True
+    except (OSError, PrivateStateError) as exc:
+        _remove_replica_generation(cfg, generation if renamed else building)
+        raise RegistryError("cannot publish artifact replica generation") from exc
+    except BaseException:
+        _remove_replica_generation(cfg, generation if renamed else building)
+        raise
+    # The current manifest is the sole authority. Remove the replaced complete
+    # generation, or this builder's unpublished staging directory.
+    if published:
+        if previous_generation is not None and previous_generation != generation:
+            _remove_replica_generation(cfg, previous_generation)
+    else:
+        _remove_replica_generation(cfg, building)
+    return published
+
+
+def _replica_manifest_generation(cfg: HeadConfig) -> str | None:
+    try:
+        result = read_bounded(
+            _replica_manifest_path(cfg),
+            max_bytes=MAX_REPLICA_MANIFEST_BYTES,
+        )
+        raw = decode_strict_json(result[0]) if result is not None else None
+        generation = raw.get("generation") if isinstance(raw, dict) else None
+        return (
+            generation
+            if isinstance(generation, str)
+            and _REPLICA_GENERATION_RE.fullmatch(generation)
+            else None
+        )
+    except (OSError, UnicodeError, ValueError, PrivateStateError):
+        return None
+
+
+def _remove_replica_generation(cfg: HeadConfig, generation: str) -> None:
+    """Remove one known derived generation without following path objects."""
+    directory = _replica_generation_root(cfg, generation)
+    try:
+        info = directory.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return
+        removable = True
+        with os.scandir(directory) as shards:
+            for shard in shards:
+                shard_info = shard.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(shard_info.st_mode)
+                    or re.fullmatch(r"[0-9a-f]{2}\.json", shard.name) is None
+                ):
+                    removable = False
+                    continue
+                os.unlink(shard.path)
+        if removable:
+            directory.rmdir()
+    except OSError:
+        return
+
+
+def artifact_replica_records(
+    cfg: HeadConfig,
+    digest: str,
+    site: str,
+) -> tuple[ArtifactReplicaRecord, ...]:
+    """Return newest configured seeds through a revision-fenced shard index."""
+    if SHA256_RE.fullmatch(digest) is None:
+        return ()
+    manifest = _read_replica_manifest(cfg)
+    if manifest is not None:
+        shard = _read_replica_shard(cfg, manifest, digest)
+        if shard is not None:
+            return tuple(
+                sorted(
+                    (
+                        record
+                        for (row_site, _node), record in shard.items()
+                        if row_site == site
+                    ),
+                    key=lambda record: record.node,
+                )
+            )
+
+    for _attempt in range(2):
+        try:
+            before = _registry_directory_revisions(cfg)
+            records = _build_replica_records(cfg)
+            after = _registry_directory_revisions(cfg)
+        except RegistryError:
+            return ()
+        if before != after:
+            continue
+        try:
+            published = _publish_replica_rebuild(cfg, records, after)
+        except RegistryError:
+            published = False
+        if not published:
+            continue
+        return tuple(
+            sorted(
+                (
+                    record
+                    for (row_site, _node), record in records.get(digest, {}).items()
+                    if row_site == site
+                ),
+                key=lambda record: record.node,
+            )
+        )
+    return ()
+
+
+def _refresh_replica_index_after_mutation(
+    cfg: HeadConfig,
+    manifest: _ReplicaManifest | None,
+    *,
+    previous_entry: JobEntry | None = None,
+    entry: JobEntry | None = None,
+    removed_entry: JobEntry | None = None,
+) -> None:
+    """Advance exact affected shards, or leave the revision fence stale."""
+    if manifest is None:
+        return
+    previous = _entry_replica_record(cfg, previous_entry) if previous_entry else None
+    current = _entry_replica_record(cfg, entry) if entry else None
+    removed = _entry_replica_record(cfg, removed_entry) if removed_entry else None
+    affected = {
+        record.digest for record in (previous, current, removed) if record is not None
+    }
+    buckets: dict[
+        str,
+        dict[str, dict[tuple[str, str], ArtifactReplicaRecord]],
+    ] = {}
+    original_item_count = 0
+    for bucket in {_replica_bucket_key(digest) for digest in affected}:
+        bucket_records = _read_replica_bucket(cfg, manifest, bucket)
+        if bucket_records is None:
+            return
+        buckets[bucket] = bucket_records
+        original_item_count += sum(len(shard) for shard in bucket_records.values())
+
+    def shard_for(digest: str) -> dict[tuple[str, str], ArtifactReplicaRecord]:
+        return buckets[_replica_bucket_key(digest)].setdefault(digest, {})
+
+    old = previous or removed
+    if old is not None:
+        shard = shard_for(old.digest)
+        key = (old.site, old.node)
+        indexed = shard.get(key)
+        if indexed is not None and indexed.job_id == old.job_id:
+            if current is None or (
+                current.digest,
+                current.site,
+                current.node,
+            ) != (old.digest, old.site, old.node):
+                # Finding the next-newest historical holder requires a cold
+                # scan. Leave the old manifest revision stale: no reader can
+                # return the removed/moved seed in the meantime.
+                return
+            shard.pop(key)
+
+    if current is not None:
+        shard = shard_for(current.digest)
+        key = (current.site, current.node)
+        if _replica_record_is_newer(current, shard.get(key)) or (
+            shard.get(key) is not None and shard[key].job_id == current.job_id
+        ):
+            shard[key] = current
+
+    try:
+        new_item_count = (
+            manifest.item_count
+            - original_item_count
+            + sum(
+                len(shard)
+                for bucket_records in buckets.values()
+                for shard in bucket_records.values()
+            )
+        )
+        if not 0 <= new_item_count <= MAX_REPLICA_INDEX_ITEMS:
+            return
+        manifest_counts = dict(manifest.bucket_counts)
+        manifest_hashes = dict(manifest.bucket_hashes)
+        bucket_evidence = {
+            bucket: (manifest_counts[bucket], manifest_hashes[bucket])
+            for bucket in manifest.buckets
+        }
+        for bucket, bucket_records in buckets.items():
+            bucket_evidence[bucket] = _write_replica_bucket(
+                cfg,
+                manifest.generation,
+                bucket,
+                bucket_records,
+            )
+        _write_replica_manifest(
+            cfg,
+            manifest.generation,
+            new_item_count,
+            bucket_evidence,
+            _registry_directory_revisions(cfg),
+        )
+    except RegistryError:
+        return
+
+
+def _read_active_index(cfg: HeadConfig) -> _ActiveIndex | None:
+    """Read the derived index only when its directory revisions still match."""
+    try:
+        result = read_bounded(_active_index_path(cfg), max_bytes=MAX_ACTIVE_INDEX_BYTES)
+        if result is None:
+            return None
+        raw = decode_strict_json(result[0])
+        if (
+            not isinstance(raw, dict)
+            or raw.get("schema_version") != ACTIVE_INDEX_SCHEMA_VERSION
+            or raw.get("registry_revisions") != _registry_directory_revisions(cfg)
+        ):
+            return None
+        raw_ids = raw.get("job_ids")
+        raw_damage = raw.get("damage")
+        if (
+            not isinstance(raw_ids, list)
+            or len(raw_ids) > MAX_ACTIVE_INDEX_ITEMS
+            or any(not _valid_job_id(value) for value in raw_ids)
+            or len(set(raw_ids)) != len(raw_ids)
+            or not isinstance(raw_damage, list)
+            or len(raw_damage) > MAX_ACTIVE_INDEX_ITEMS
+        ):
+            return None
+        damage: list[RegistryDamage] = []
+        for item in raw_damage:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("path"), str)
+                or not isinstance(item.get("detail"), str)
+            ):
+                return None
+            damage.append(
+                RegistryDamage(
+                    path=item["path"],
+                    detail=diagnostic_excerpt(
+                        item["detail"],
+                        limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                    ),
+                )
+            )
+        return _ActiveIndex(tuple(sorted(raw_ids)), tuple(damage))
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        PrivateStateError,
+        RegistryError,
+        RecursionError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+
+
+def _write_active_index(
+    cfg: HeadConfig,
+    job_ids: set[str],
+    damage: list[RegistryDamage] | tuple[RegistryDamage, ...],
+    *,
+    registry_revisions: list[dict[str, object]] | None = None,
+) -> None:
+    """Publish one rebuildable active index; callers may treat failure as a miss."""
+    if len(job_ids) > MAX_ACTIVE_INDEX_ITEMS or len(damage) > MAX_ACTIVE_INDEX_ITEMS:
+        raise RegistryError("active registry index exceeds its item limit")
+    document = {
+        "schema_version": ACTIVE_INDEX_SCHEMA_VERSION,
+        # A rebuild passes the revision observed after its scan.  Recomputing
+        # it here would let a mutation between scan and publish make a stale
+        # result look current.  Mutation-driven incremental updates have no
+        # preceding scan and intentionally take a fresh revision instead.
+        "registry_revisions": (
+            _registry_directory_revisions(cfg)
+            if registry_revisions is None
+            else registry_revisions
+        ),
+        "job_ids": sorted(job_ids),
+        "damage": [
+            {
+                "path": item.path,
+                "detail": diagnostic_excerpt(
+                    item.detail,
+                    limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                ),
+            }
+            for item in damage
+        ],
+    }
+    encoded = (json.dumps(document, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > MAX_ACTIVE_INDEX_BYTES:
+        raise RegistryError("active registry index exceeds its size limit")
+    try:
+        atomic_write(_active_index_path(cfg), encoded)
+    except PrivateStateError as exc:
+        raise RegistryError("cannot publish active registry index") from exc
+
+
+def occupies_quota(entry: JobEntry, *, now: float | None = None) -> bool:
+    """Whether a row may still own or be claiming one execution slot."""
+    if entry.status == "running" or is_uncertain_launch(entry):
+        return True
+    if entry.status == "queued" and (
+        entry.dispatch_node is not None or entry.dispatch_token is not None
+    ):
+        return True
+    if entry.status != "lost" or entry.terminal_finalized_at is not None:
+        return False
+    observed_at = entry.finished_at or entry.updated_at or entry.created_at
+    return (time.time() if now is None else now) - observed_at <= LOST_RECHECK_S
+
+
+def _active_index_member(entry: JobEntry, *, now: float) -> bool:
+    return entry.status == "queued" or occupies_quota(entry, now=now)
+
+
+def _stream_active_registry(
+    cfg: HeadConfig,
+    *,
+    now: float,
+) -> tuple[list[JobEntry], list[RegistryDamage]]:
+    """Decode registry authority while retaining only scheduling state.
+
+    The public history APIs intentionally materialize every row.  A resident
+    scheduler rebuilding its derived index must not: a six-figure terminal
+    history otherwise leaves hundreds of MiB in Python's allocator after one
+    recovery scan.  This scanner keeps directory iteration, row decoding, and
+    validation streaming while preserving the same split-brain rule as
+    :func:`list_all`.
+    """
+    candidates = [(cfg.legacy_registry_dir(), LEGACY_LAYOUT)]
+    current = cfg.registry_path()
+    if current != cfg.legacy_registry_dir():
+        candidates.append((current, cfg.layout))
+
+    damage: list[RegistryDamage] = []
+    scans: list[tuple[Path, str]] = []
+    for directory, layout in candidates:
+        try:
+            exists = _require_private_directory(directory, create=False)
+        except RegistryError as exc:
+            damage.append(RegistryDamage(path=str(directory), detail=str(exc)))
+            continue
+        if exists:
+            scans.append((directory, layout))
+
+    active: list[JobEntry] = []
+    with ExitStack() as stack:
+        readers: list[Callable[[str], tuple[bytes, os.stat_result] | None] | None] = []
+        for directory, _layout in scans:
+            try:
+                reader = stack.enter_context(
+                    bounded_directory_reader(
+                        directory,
+                        max_bytes=MAX_JOB_RECORD_BYTES,
+                    )
+                )
+            except PrivateStateError as exc:
+                detail = diagnostic_excerpt(
+                    " ".join(str(exc).split()) or type(exc).__name__,
+                    limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                )
+                damage.append(RegistryDamage(path=str(directory), detail=detail))
+                readers.append(None)
+                continue
+            if reader is None:
+                damage.append(
+                    RegistryDamage(
+                        path=str(directory),
+                        detail="registry directory disappeared during active scan",
+                    )
+                )
+            readers.append(reader)
+
+        for scan_index, (directory, layout) in enumerate(scans):
+            read_name = readers[scan_index]
+            if read_name is None:
+                continue
+            try:
+                with os.scandir(directory) as items:
+                    for item in items:
+                        name = item.name
+                        if name.startswith(".") or not name.endswith(".json"):
+                            continue
+
+                        source_indexes = [scan_index]
+                        for other_index, other_reader in enumerate(readers):
+                            if other_index == scan_index or other_reader is None:
+                                continue
+                            try:
+                                duplicate = other_reader(name) is not None
+                            except PrivateStateError:
+                                # An unsafe or oversized counterpart still
+                                # occupies that authority path.  Never choose
+                                # the well-formed copy merely because the
+                                # competing copy cannot be read.
+                                duplicate = True
+                            if duplicate:
+                                source_indexes.append(other_index)
+                        if len(source_indexes) > 1:
+                            if scan_index == min(source_indexes):
+                                source_directories = ", ".join(
+                                    str(scans[index][0])
+                                    for index in sorted(source_indexes)
+                                )
+                                damage.append(
+                                    RegistryDamage(
+                                        path=name,
+                                        detail=diagnostic_excerpt(
+                                            "split-brain registry row: exists in "
+                                            f"{source_directories}; run dt migrate "
+                                            "to reconcile",
+                                            limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                                        ),
+                                    )
+                                )
+                            continue
+
+                        try:
+                            result = read_name(name)
+                            entry = _decode_entry_result(
+                                result,
+                                name=name,
+                                layout=layout,
+                                expected_job_id=name[: -len(".json")],
+                                include_private=False,
+                            )
+                        except (OSError, PrivateStateError, RegistryError) as exc:
+                            detail = diagnostic_excerpt(
+                                " ".join(str(exc).split()) or type(exc).__name__,
+                                limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                            )
+                            damage.append(RegistryDamage(path=name, detail=detail))
+                            continue
+                        if _active_index_member(entry, now=now):
+                            active.append(entry)
+            except OSError as exc:
+                detail = diagnostic_excerpt(
+                    " ".join(str(exc).split()) or type(exc).__name__,
+                    limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                )
+                damage.append(RegistryDamage(path=str(directory), detail=detail))
+
+    active.sort(key=lambda entry: entry.job_id)
+    return active, damage
+
+
+def _refresh_active_index_after_mutation(
+    cfg: HeadConfig,
+    previous: _ActiveIndex | None,
+    *,
+    entry: JobEntry | None = None,
+    removed_job_id: str | None = None,
+) -> None:
+    """Advance an old index while ``_active_index_mutation_lock`` is held."""
+    if previous is None:
+        return
+    job_ids = set(previous.job_ids)
+    changed_job_id = removed_job_id or (entry.job_id if entry is not None else None)
+    damage = tuple(
+        item
+        for item in previous.damage
+        if changed_job_id is None or item.path != f"{changed_job_id}.json"
+    )
+    if removed_job_id is not None:
+        job_ids.discard(removed_job_id)
+    if entry is not None:
+        if _active_index_member(entry, now=time.time()):
+            job_ids.add(entry.job_id)
+        else:
+            job_ids.discard(entry.job_id)
+    try:
+        _write_active_index(cfg, job_ids, damage)
+    except RegistryError:
+        # The index is derived. Its old directory revision no longer matches,
+        # so the next active read will rebuild from authoritative rows.
+        return
+
+
+def active_entries(
+    cfg: HeadConfig,
+    *,
+    damage: list[RegistryDamage] | None = None,
+    now: float | None = None,
+    publish_index: bool = True,
+) -> list[JobEntry]:
+    """Read active scheduling state without scanning terminal history.
+
+    A missing/damaged/stale index performs one conservative full rebuild. Every
+    indexed row is still decoded from the authoritative registry, so the index
+    can omit neither schema validation nor split-brain detection. Set
+    ``publish_index=False`` for a strictly read-only query: the rebuilt result
+    remains in memory and neither a missing root nor an invalid index is
+    created or repaired.
+    """
+    observed_now = time.time() if now is None else now
+
+    def rebuild() -> list[JobEntry]:
+        try:
+            before = _registry_directory_revisions(cfg)
+        except RegistryError:
+            before = None
+        active, found_damage = _stream_active_registry(cfg, now=observed_now)
+        try:
+            after = _registry_directory_revisions(cfg)
+        except RegistryError as exc:
+            after = None
+            found_damage.append(
+                RegistryDamage(
+                    path="registry",
+                    detail=diagnostic_excerpt(
+                        " ".join(str(exc).split()) or type(exc).__name__,
+                        limit=MAX_JOB_DIAGNOSTIC_CHARS,
+                    ),
+                )
+            )
+        stable = before is not None and before == after
+        if before is not None and after is not None and not stable:
+            found_damage.append(
+                RegistryDamage(
+                    path="registry",
+                    detail="registry changed during active-index rebuild",
+                )
+            )
+        if publish_index and stable:
+            assert after is not None
+            try:
+                with _active_index_mutation_lock(cfg):
+                    # A registry writer may have committed after the scan's
+                    # final revision read but before this publication.  Never
+                    # bless the stale scan with that writer's newer revision.
+                    if _registry_directory_revisions(cfg) == after:
+                        _write_active_index(
+                            cfg,
+                            {entry.job_id for entry in active},
+                            found_damage,
+                            registry_revisions=after,
+                        )
+            except RegistryError:
+                pass
+        if damage is not None:
+            damage.extend(found_damage)
+        return active
+
+    index = _read_active_index(cfg)
+    if index is None:
+        return rebuild()
+    entries: list[JobEntry] = []
+    for job_id in index.job_ids:
+        try:
+            entry = load(cfg, job_id)
+        except RegistryError:
+            return rebuild()
+        if entry is None:
+            return rebuild()
+        if _active_index_member(entry, now=observed_now):
+            entries.append(entry)
+    if damage is not None:
+        damage.extend(index.damage)
+    return entries
 
 
 def registry_row_count(cfg: HeadConfig) -> int:
@@ -1070,7 +2575,7 @@ def registry_row_count(cfg: HeadConfig) -> int:
     floor of that scan (sub-millisecond where a full decode is tens of
     milliseconds), which keeps the health check itself free.
     """
-    directories = {cfg.legacy_registry_dir(), cfg.registry_path()}
+    directories = tuple(dict.fromkeys((cfg.registry_path(), cfg.legacy_registry_dir())))
     total = 0
     for directory in directories:
         try:
@@ -1084,22 +2589,89 @@ def registry_row_count(cfg: HeadConfig) -> int:
     return total
 
 
-def running_count(cfg: HeadConfig) -> int:
-    """Running jobs, counting unreadable entries as running.
+def registry_authority_schema_state(cfg: HeadConfig) -> str:
+    """Report whether durable authority contains a versioned registry row.
 
-    An entry we cannot decode may be a live job holding GPUs. Treating it as
-    free would let `max_my_jobs` overshoot and oversubscribe the node; treating
-    it as running only delays a submission until the registry is repaired.
+    ``absent`` is proved only after every compatible registry record decodes
+    as a legacy flat row. A malformed, unsafe, unknown-schema, or changing row
+    yields ``unproven``; deployment must treat that state like newer authority
+    rather than authorizing an older reader. The scan streams records because
+    it runs at a rare activation boundary and must remain bounded with a large
+    terminal history.
     """
-    damage: list[RegistryDamage] = []
-    entries = list_all(cfg, damage=damage)
-    return sum(1 for e in entries if e.status == "running") + len(damage)
+    directories = tuple(dict.fromkeys((cfg.registry_path(), cfg.legacy_registry_dir())))
+    observed_rows = 0
+    for directory in directories:
+        try:
+            if not _require_private_directory(directory, create=False):
+                continue
+            with os.scandir(directory) as entries:
+                for directory_entry in entries:
+                    name = directory_entry.name
+                    if name.startswith(".") or not name.endswith(".json"):
+                        continue
+                    observed_rows += 1
+                    if observed_rows > MAX_REGISTRY_AUTHORITY_PROBE_ROWS:
+                        return "unproven"
+                    job_id = name[: -len(".json")]
+                    if JOB_ID_RE.fullmatch(job_id) is None:
+                        return "unproven"
+                    result = read_bounded(
+                        directory / name,
+                        max_bytes=MAX_JOB_RECORD_BYTES,
+                    )
+                    if result is None:
+                        return "unproven"
+                    raw = decode_strict_json(result[0])
+                    if isinstance(raw, dict) and "schema_version" in raw:
+                        decode_registry_document(
+                            raw,
+                            expected_job_id=job_id,
+                            registry_updated_at=result[1].st_mtime,
+                        )
+                        return "present"
+                    decode_registry_document(
+                        raw,
+                        expected_job_id=job_id,
+                        registry_updated_at=result[1].st_mtime,
+                    )
+        except (
+            OSError,
+            PrivateStateError,
+            RegistryError,
+            UnicodeError,
+            ValueError,
+            RecursionError,
+        ):
+            return "unproven"
+    return "absent"
+
+
+def quota_occupancy(
+    cfg: HeadConfig,
+    *,
+    entries: list[JobEntry] | None = None,
+    damage: list[RegistryDamage] | None = None,
+    now: float | None = None,
+) -> int:
+    """Count work that may own a slot, including unreadable authorities."""
+    observed_damage = damage if damage is not None else []
+    if entries is None:
+        entries = active_entries(cfg, damage=observed_damage, now=now)
+    return sum(occupies_quota(entry, now=now) for entry in entries) + len(
+        observed_damage
+    )
+
+
+def running_count(cfg: HeadConfig) -> int:
+    """Compatibility name for conservative admission occupancy."""
+    return quota_occupancy(cfg)
 
 
 def queued_entries(cfg: HeadConfig) -> list[JobEntry]:
     """FIFO order: oldest enqueue first."""
     return sorted(
-        (e for e in list_all(cfg) if e.status == "queued"),
+        (e for e in active_entries(cfg) if e.status == "queued"),
         key=lambda e: e.created_at,
     )
 
@@ -1386,6 +2958,17 @@ def _refresh_status_locked(
 
     remote_started_at = positive_timestamp(started_token)
     remote_finished_at = positive_timestamp(finished_token)
+    if entry.status == "lost" and entry.terminal_finalized_at is not None:
+        # A dependent may already have made an irreversible decision from this
+        # result. Even trusted late worker evidence cannot reopen that history.
+        if observation is not None and token not in {"LOST", "STALE"}:
+            observation.update(
+                status_probe_error=(
+                    "late worker evidence arrived after dependency finalization; "
+                    "registry retained"
+                )
+            )
+        return entry
     if token not in ("RUNNING", "LOST", "STALE", "UNVERIFIED"):
         try:
             exit_code = int(token)
@@ -1422,6 +3005,7 @@ def _refresh_status_locked(
         and current_boot_id != entry.boot_id
     ):
         entry.status = "lost"
+        entry.terminal_finalized_at = None
         entry.reason = (
             "node rebooted since launch "
             f"(boot_id {entry.boot_id} -> {current_boot_id}); exit_code is missing"
@@ -1432,9 +3016,9 @@ def _refresh_status_locked(
         return entry
     if token == "RUNNING":
         if entry.status == "lost" and dependency_settled(entry):
-            # After the documented rescue window, dependents may already have
-            # made irreversible decisions from the terminal record.  A late
-            # ambiguous probe cannot reopen that history.
+            # After durable dependency finalization, dependents may already
+            # have made irreversible decisions. A late ambiguous probe cannot
+            # reopen that history.
             if observation is not None:
                 observation.update(
                     status_probe_error=(
@@ -1513,6 +3097,7 @@ def _refresh_status_locked(
                 save(cfg, entry)
             return entry
         entry.status = "lost"
+        entry.terminal_finalized_at = None
         entry.reason = lost_reason
         entry.finished_at = time.time()
         entry.result_state = "infra_failure"

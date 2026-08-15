@@ -19,7 +19,10 @@ distribution remains `disttrainer` for compatibility.
 - Linux head and worker nodes reachable through non-interactive SSH;
 - Python 3.10–3.11 on the client/head;
 - `uv`, OpenSSH, rsync, tmux, flock, and timeout;
-- NVIDIA drivers and `nvidia-smi` on nodes used for GPU jobs.
+- NVIDIA drivers and `nvidia-smi` on nodes used for GPU jobs;
+- a working user systemd manager with transient scopes and
+  `loginctl Linger=yes` on GPU workers. Without that proven lifecycle the node
+  accepts CPU jobs (`-g 0`) only. Enabling linger may require an administrator.
 
 DistTrainer assumes one trusted Unix identity across trusted hosts. Read the
 [security policy](https://github.com/ChangWinde/dt/blob/main/.github/SECURITY.md)
@@ -178,14 +181,17 @@ dt events --issues
 dt storage
 dt compact --before 2026-07-01 --plan
 dt clean --before 2026-07-01 --plan
+dt clean --inspect-plan PLAN_ID --offset 0 --limit 100 --json
 ```
 
 `dt events` queries the private, bounded operation journal locally; from a
 laptop, add `-c CENTER` to inspect the correlated head journal. It records
 redacted operation state and never raw command arguments or exception text.
 
-Preview destructive maintenance first. Non-interactive mutation requires
-explicit confirmation. Cleanup uses terminal completion time and retains
+Preview destructive maintenance first. Large clean plans return bounded pages;
+follow `page.next_offset` to enumerate their immutable job/result authority.
+Pagination never changes what apply may delete. Non-interactive mutation
+requires explicit confirmation. Cleanup uses terminal completion time and retains
 registry state when a managed path or deletion fails, so the operation is
 visible and retryable. Compaction fails closed unless its recovery snapshot and
 job identity are verified.

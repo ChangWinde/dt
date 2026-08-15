@@ -31,9 +31,22 @@ from dt.pull_relay import cleanup_command, stage_command, staging_relative
 SSHD = shutil.which("sshd") or (
     "/usr/sbin/sshd" if os.path.exists("/usr/sbin/sshd") else None
 )
+_MISSING_HARNESS = [
+    name
+    for name, available in (
+        ("sshd", SSHD),
+        ("ssh-keygen", shutil.which("ssh-keygen")),
+        ("rsync", shutil.which("rsync")),
+    )
+    if available is None
+]
+if _MISSING_HARNESS and os.environ.get("DT_REQUIRE_RELAY_E2E") == "1":
+    raise RuntimeError(
+        "required relay E2E dependencies are missing: " + ", ".join(_MISSING_HARNESS)
+    )
 
 pytestmark = pytest.mark.skipif(
-    SSHD is None or shutil.which("ssh-keygen") is None or shutil.which("rsync") is None,
+    bool(_MISSING_HARNESS),
     reason="loopback sshd harness needs sshd, ssh-keygen, and rsync",
 )
 

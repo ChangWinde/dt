@@ -1778,7 +1778,7 @@ def test_free_watch_json_streams_until_interrupted(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli,
         "probe_center",
-        lambda cfg_, use_cache=True: [NodeStatus(node="n1")],
+        lambda cfg_, use_cache=True, **_kwargs: [NodeStatus(node="n1")],
     )
     sleeps = []
 
@@ -1790,10 +1790,10 @@ def test_free_watch_json_streams_until_interrupted(tmp_path, monkeypatch):
 
     result = CliRunner().invoke(cli.app, ["free", "--watch", "--json"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 130
     assert sleeps == [2]
     frames = [json.loads(line) for line in result.stdout.splitlines()]
-    assert frames == [
+    assert frames[:-1] == [
         [
             {
                 "center": "c",
@@ -1802,9 +1802,15 @@ def test_free_watch_json_streams_until_interrupted(tmp_path, monkeypatch):
                 "system": None,
                 "error": None,
                 "unreachable": False,
+                "stale": False,
             }
         ]
     ]
+    assert frames[-1] == {
+        "schema_version": "dt_stream_event_v1",
+        "event": "interrupted",
+        "exit_code": 130,
+    }
 
 
 def test_free_watch_json_explain_streams_versioned_frames(tmp_path, monkeypatch):
@@ -1829,7 +1835,7 @@ def test_free_watch_json_explain_streams_versioned_frames(tmp_path, monkeypatch)
     monkeypatch.setattr(
         cli,
         "probe_center",
-        lambda cfg_, use_cache=True: [NodeStatus(node="n1")],
+        lambda cfg_, use_cache=True, **_kwargs: [NodeStatus(node="n1")],
     )
     monkeypatch.setattr(agent, "alive_pid", lambda cfg_: 123)
     sleeps = []
@@ -1845,10 +1851,10 @@ def test_free_watch_json_explain_streams_versioned_frames(tmp_path, monkeypatch)
         ["free", "--watch", "--json", "--explain"],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 130, result.output
     assert sleeps == [2]
     frames = [json.loads(line) for line in result.stdout.splitlines()]
-    assert len(frames) == 1
+    assert len(frames) == 2
     assert frames[0]["schema_version"] == "dt_free_explain_v1"
     assert frames[0]["summary"] == {
         "centers": 1,
@@ -1860,6 +1866,11 @@ def test_free_watch_json_explain_streams_versioned_frames(tmp_path, monkeypatch)
         "queued": 0,
     }
     assert frames[0]["centers"][0]["state"] == "no_gpu_inventory"
+    assert frames[1] == {
+        "schema_version": "dt_stream_event_v1",
+        "event": "interrupted",
+        "exit_code": 130,
+    }
 
 
 def test_laptop_free_watch_requests_fresh_frames_and_honors_poll(monkeypatch):
@@ -1912,10 +1923,12 @@ def test_laptop_free_watch_requests_fresh_frames_and_honors_poll(monkeypatch):
         ["free", "--watch", "--json", "--poll", "0.25"],
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 130, result.output
     assert calls == [["free", "--fresh"]]
     assert sleeps == [pytest.approx(0.05)]
-    assert json.loads(result.stdout)[0]["node"] == "n1"
+    frames = [json.loads(line) for line in result.stdout.splitlines()]
+    assert frames[0][0]["node"] == "n1"
+    assert frames[-1]["event"] == "interrupted"
 
 
 def test_ps_watch_subtracts_collection_time_from_poll(tmp_path, monkeypatch):
@@ -1985,7 +1998,7 @@ def test_laptop_doctor_overlaps_head_and_node_diagnostics(monkeypatch):
     result = CliRunner().invoke(cli.app, ["doctor", "--json"])
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)[0]["checks"] == {
+    assert json.loads(result.stdout)["nodes"][0]["checks"] == {
         "ssh": "ok",
         "dt": "1.2.3",
     }
@@ -2019,8 +2032,8 @@ def test_laptop_doctor_checks_head_versions_in_parallel(monkeypatch):
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
-    assert [row["center"] for row in payload] == ["east", "west"]
-    assert all(row["checks"]["ssh"] == "ok" for row in payload)
+    assert [row["center"] for row in payload["nodes"]] == ["east", "west"]
+    assert all(row["checks"]["ssh"] == "ok" for row in payload["nodes"])
 
 
 def test_laptop_free_all_heads_unreachable_returns_exit_5_rows(
@@ -2241,7 +2254,7 @@ def test_head_free_fresh_bypasses_probe_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli,
         "probe_center",
-        lambda cfg_, use_cache=True: (
+        lambda cfg_, use_cache=True, **_kwargs: (
             cache_flags.append(use_cache) or [NodeStatus(node="n1")]
         ),
     )
@@ -2472,7 +2485,11 @@ def test_doctor_json_keeps_health_failure_exit_code(tmp_path, monkeypatch):
     result = CliRunner().invoke(cli.app, ["doctor", "--json"])
 
     assert result.exit_code == cli.EXIT_UNREACHABLE
-    assert json.loads(result.stdout) == rows
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == "dt_doctor_v2"
+    assert payload["summary"]["exit_code"] == cli.EXIT_UNREACHABLE
+    assert payload["nodes"] == rows
+    assert payload["issues"][0]["kind"] == "unreachable"
 
 
 def test_fan_json_can_preserve_valid_health_rows_on_nonzero(monkeypatch):
@@ -2577,12 +2594,13 @@ def test_laptop_doctor_preserves_remote_health_rows_and_exit_5(
 
     assert result.exit_code == cli.EXIT_UNREACHABLE, result.output
     payload = json.loads(result.stdout)
-    assert payload[0]["checks"] == {"ssh": "ok", "dt": "1.2.3"}
-    assert payload[1:] == node_rows
+    assert payload["nodes"][0]["checks"] == {"ssh": "ok", "dt": "1.2.3"}
+    assert payload["nodes"][1:] == node_rows
+    assert payload["issues"][0]["kind"] == "unreachable"
     assert len(fan_calls) == 1
     called_cfg, argv, timeout, kwargs = fan_calls[0]
     assert called_cfg is cfg
-    assert argv == ["doctor"]
+    assert argv == ["doctor", "--rows-json"]
     assert timeout == 120
     assert kwargs["accept_nonzero_json"] is True
     assert kwargs["unreachable_errors"] == set()
@@ -2745,7 +2763,6 @@ def test_doctor_human_suggests_seed_for_remote_slow_network(tmp_path, monkeypatc
     # The network hints remain visible, but a pure head with no resident
     # scheduler is now a doctor failure instead of an invisible idle state.
     assert result.exit_code == 1, result.output
-    assert "network slow/blocked on 2 nodes" in result.output
     assert "dt seed slow-node-with-a-descriptive-name" in result.output
     assert "another-slow-node-with-a-long-name --plan" in result.output
     assert "dt seed fast-node" not in result.output

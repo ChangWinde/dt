@@ -25,7 +25,7 @@ from threading import Lock
 from typing import Callable
 
 from .config import HeadConfig, Node, Site
-from .jobs import list_all
+from .jobs import artifact_replica_records
 from .layout import node_path, node_path_expression
 from .link_metrics import (
     MIN_SAMPLE_SECONDS,
@@ -42,6 +42,7 @@ from .route_health import (
     RouteHealthError,
 )
 from .sshio import (
+    CONTROL_CAPTURE_BYTES,
     ROUTE_TRANSPORT_FAILURE_KINDS,
     RemoteError,
     SSHWorkload,
@@ -70,12 +71,21 @@ _RFC1918_NETWORKS = tuple(
     ipaddress.ip_network(value)
     for value in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
 )
+_RFC6598_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 
 def _is_rfc1918(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return address.version == 4 and any(
         address in network for network in _RFC1918_NETWORKS
     )
+
+
+def _is_private_endpoint(address: ipaddress.IPv4Address, interface: str) -> bool:
+    """Allow explicit-site LAN and authenticated overlay endpoints only."""
+    if _is_rfc1918(address):
+        return True
+    lowered = interface.lower()
+    return address in _RFC6598_NETWORK and lowered.startswith(("tailscale", "wg"))
 
 
 class TopologyDiscoveryError(RuntimeError):
@@ -146,6 +156,11 @@ class DiscoveredRoute:
     # Smoothed measured throughput of this edge (bytes/second) when the
     # link-metrics store has evidence; None means never measured.
     throughput_bps: float | None = None
+    # Exact endpoint circuit selected by discovery.  The opaque token is a
+    # half-open capability carried from the lightweight probe to the bulk
+    # transfer; only that transfer may settle the reserved endpoint trial.
+    endpoint_circuit_destination: str | None = None
+    endpoint_reservation_token: str | None = None
 
     def artifact_source(self, site: Site) -> ArtifactSource:
         kind: SourceKind = (
@@ -175,6 +190,14 @@ class TopologyEdge:
     latency_ms: float | None
     error_kind: str | None
     detail: str | None
+
+
+@dataclass(frozen=True)
+class _CarriedRouteReservations:
+    site: Site
+    aggregate_token: str | None
+    endpoint_destination: str | None
+    endpoint_token: str | None
 
 
 _ADVERTISEMENT_SCRIPT = r"""import glob
@@ -679,7 +702,9 @@ class TopologyDiscovery:
         # deliberately left for the bulk transfer that normally follows.
         # Scopes that never run that transfer must release them via
         # release_carried_reservations().
-        self._carried_reservations: dict[tuple[str, str, str], Site] = {}
+        self._carried_reservations: dict[
+            tuple[str, str, str], _CarriedRouteReservations
+        ] = {}
 
     def advertise(self, node: Node) -> NodeAdvertisement:
         with self._advertisement_lock:
@@ -701,6 +726,7 @@ class TopologyDiscovery:
                     timeout=min(15.0, node.probe_timeout_s),
                     workload=SSHWorkload.CONTROL,
                     retry_stale_mux=True,
+                    capture_limit_bytes=CONTROL_CAPTURE_BYTES,
                 )
             except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
                 raise TopologyDiscoveryError(
@@ -750,35 +776,26 @@ class TopologyDiscovery:
                 recorded_at=float("inf"),
             )
         ]
-        newest: dict[str, ArtifactReplica] = {}
-        for entry in list_all(self.cfg):
-            if (
-                entry.snapshot_sha256 != digest
-                or entry.node == "-"
-                or not entry.job_dir
-            ):
-                continue
+        for record in artifact_replica_records(self.cfg, digest, site.name):
             try:
-                node = self.topology.node(entry.node)
+                node = self.topology.node(record.node)
             except Exception:
                 continue
             if self.topology.site_for(node) != site or not node.artifact_seed:
                 continue
             try:
-                code_dir = _job_code_dir(entry.job_dir)
+                code_dir = _job_code_dir(record.job_dir)
             except ValueError:
                 continue
-            candidate = ArtifactReplica(
-                kind="peer",
-                node=node,
-                code_dir=code_dir,
-                recorded_at=entry.started_at or entry.created_at,
-                job_id=entry.job_id,
+            candidates.append(
+                ArtifactReplica(
+                    kind="peer",
+                    node=node,
+                    code_dir=code_dir,
+                    recorded_at=record.recorded_at,
+                    job_id=record.job_id,
+                )
             )
-            prior = newest.get(node.name)
-            if prior is None or candidate.recorded_at > prior.recorded_at:
-                newest[node.name] = candidate
-        candidates.extend(newest.values())
         return candidates
 
     @staticmethod
@@ -791,6 +808,7 @@ class TopologyDiscovery:
                 f"test -d {code_expression} && test ! -L {code_expression}",
                 timeout=min(15.0, replica.node.probe_timeout_s),
                 workload=SSHWorkload.CONTROL,
+                capture_limit_bytes=CONTROL_CAPTURE_BYTES,
             )
         except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
             raise TopologyDiscoveryError(
@@ -814,6 +832,15 @@ class TopologyDiscovery:
         source: Node,
         destination: Node,
     ) -> DirectEndpoint:
+        """Return the highest-ranked candidate (compatibility helper)."""
+        return self.endpoints(source, destination)[0]
+
+    def endpoints(
+        self,
+        source: Node,
+        destination: Node,
+    ) -> tuple[DirectEndpoint, ...]:
+        """Return every authenticated candidate in deterministic cost order."""
         destination_ad = self.advertise(destination)
         alias = (
             "dt-node-"
@@ -823,17 +850,26 @@ class TopologyDiscovery:
             address = destination.lan_address
             if "@" not in address:
                 address = f"{destination_ad.user}@{address}"
-            return DirectEndpoint(
-                destination=address,
-                port=destination.lan_port,
-                host_key_alias=alias,
-                host_keys=destination_ad.host_keys,
-                origin="configured",
-                link_cost=0.0,
+            return (
+                DirectEndpoint(
+                    destination=address,
+                    port=destination.lan_port,
+                    host_key_alias=alias,
+                    host_keys=destination_ad.host_keys,
+                    origin="configured",
+                    link_cost=0.0,
+                ),
             )
 
         source_ad = self.advertise(source)
-        choices: list[tuple[float, str]] = []
+        choices: dict[str, tuple[float, str]] = {}
+
+        def add_choice(address: str, penalty: float, origin: str) -> None:
+            previous = choices.get(address)
+            candidate = (penalty, origin)
+            if previous is None or candidate < previous:
+                choices[address] = candidate
+
         for source_address in source_ad.addresses:
             # A per-host-identical bridge/virtual network (docker0 172.17.0.1/16)
             # matches on every host and, worse, its presence would shadow the
@@ -863,47 +899,58 @@ class TopologyDiscovery:
                     + (32 - min(source_address.prefixlen, target_address.prefixlen))
                     / 100.0
                 )
-                choices.append((penalty, target_address.address))
-        if not choices:
-            # Overlay networks commonly advertise routable /32 Pod addresses.
-            # Exact private endpoints are safe candidates inside an explicit
-            # site: DT never scans around them, pins the destination host key
-            # learned over its authenticated control route, disables proxies,
-            # and proves the edge before any artifact transfer.
-            for target_address in destination_ad.addresses:
-                target_ip = ipaddress.ip_address(target_address.address)
-                if not _is_rfc1918(target_ip):
-                    continue
-                # docker0's 172.17.0.1 is itself RFC1918; excluding bridges here
-                # too means a node advertising only a bridge address has no
-                # direct endpoint (fail-closed) rather than a self-route.
-                if _interface_penalty(target_address.interface) >= 100.0:
-                    continue
-                choices.append(
-                    (
-                        50.0 + _interface_penalty(target_address.interface),
-                        target_address.address,
-                    )
+                add_choice(
+                    target_address.address,
+                    penalty,
+                    "advertised-shared-subnet",
                 )
+        # Overlay networks commonly advertise routable /32 addresses. Exact
+        # private endpoints are safe inside an explicit site: DT never scans,
+        # pins the host key learned over the authenticated control route,
+        # disables proxies, and proves each edge before transferring bytes.
+        for target_address in destination_ad.addresses:
+            target_ip = ipaddress.ip_address(target_address.address)
+            if not isinstance(
+                target_ip, ipaddress.IPv4Address
+            ) or not _is_private_endpoint(target_ip, target_address.interface):
+                continue
+            if _interface_penalty(target_address.interface) >= 100.0:
+                continue
+            add_choice(
+                target_address.address,
+                50.0 + _interface_penalty(target_address.interface),
+                (
+                    "advertised-overlay-endpoint"
+                    if target_ip in _RFC6598_NETWORK
+                    else "advertised-private-endpoint"
+                ),
+            )
         if not choices:
             raise TopologyDiscoveryError(
                 f"no advertised private direct endpoint connects {source.name} -> "
                 f"{destination.name}"
             )
-        link_cost, address = min(choices)
-        origin = (
-            "advertised-shared-subnet"
-            if link_cost < 50.0
-            else "advertised-private-endpoint"
+        return tuple(
+            DirectEndpoint(
+                destination=f"{destination_ad.user}@{address}",
+                port=destination_ad.ssh_port,
+                host_key_alias=alias,
+                host_keys=destination_ad.host_keys,
+                origin=origin,
+                link_cost=link_cost,
+            )
+            for address, (link_cost, origin) in sorted(
+                choices.items(),
+                key=lambda item: (item[1][0], item[0]),
+            )
         )
-        return DirectEndpoint(
-            destination=f"{destination_ad.user}@{address}",
-            port=destination_ad.ssh_port,
-            host_key_alias=alias,
-            host_keys=destination_ad.host_keys,
-            origin=origin,
-            link_cost=link_cost,
-        )
+
+    @staticmethod
+    def _endpoint_circuit_destination(
+        destination: Node, endpoint: DirectEndpoint
+    ) -> str:
+        material = f"{destination.name}\0{endpoint.destination}\0{endpoint.port}"
+        return "endpoint-" + hashlib.sha256(material.encode()).hexdigest()
 
     @staticmethod
     def _known_hosts_setup(endpoint: DirectEndpoint) -> tuple[str, str]:
@@ -992,6 +1039,7 @@ class TopologyDiscovery:
                 timeout=min(15.0, source.probe_timeout_s),
                 workload=SSHWorkload.ARTIFACT_RELAY,
                 retry_stale_mux=True,
+                capture_limit_bytes=CONTROL_CAPTURE_BYTES,
             )
         except subprocess.TimeoutExpired:
             latency_ms = max(0.0, (time.monotonic() - started) * 1000)
@@ -1037,6 +1085,7 @@ class TopologyDiscovery:
                 command,
                 timeout=BANDWIDTH_PROBE_TIMEOUT_S,
                 workload=SSHWorkload.ARTIFACT_RELAY,
+                capture_limit_bytes=CONTROL_CAPTURE_BYTES,
             )
         except subprocess.TimeoutExpired as exc:
             raise TopologyDiscoveryError(
@@ -1127,6 +1176,12 @@ class TopologyDiscovery:
     ) -> tuple[DirectEndpoint, bool, float, str]:
         """Single-flight one source-to-destination edge within this discovery."""
         key = (source.name, destination.name)
+        site: Site | None = None
+        prior: RouteCircuitDecision | None = None
+        endpoint_key: str | None = None
+        endpoint_prior: RouteCircuitDecision | None = None
+        endpoint_reservation_token: str | None = None
+        aggregate_reservation_token: str | None = None
         with self._route_lock:
             pending = self._route_probes.get(key)
             owner = pending is None
@@ -1152,10 +1207,16 @@ class TopologyDiscovery:
                     f"direct route {source.name} -> {destination.name} has "
                     "invalid circuit state"
                 ) from exc
-            if prior.is_open:
+            if prior.is_open and not (prior.last_kind or "").startswith("transfer."):
                 raise RouteCircuitOpen(source.name, destination.name, prior)
+            # A bulk failure belongs to the exact pinned address that carried
+            # it.  Its endpoint circuit remains authoritative for retry
+            # admission; the aggregate state is retained for diagnostics and
+            # closes only after another endpoint proves a real bulk success.
+            # Otherwise an open aggregate would mask a healthy LAN/overlay
+            # fallback before endpoint selection can even inspect it.
             try:
-                endpoint = self.endpoint(source, destination)
+                endpoints = self.endpoints(source, destination)
             except BaseException:
                 # decision() reserves one half-open trial before endpoint
                 # construction. Advertisement/configuration failures occur
@@ -1166,11 +1227,84 @@ class TopologyDiscovery:
                             site,
                             source.name,
                             destination.name,
+                            prior.reservation_token,
                         )
                     except RouteHealthError:
                         pass
                 raise
-            healthy, latency_ms, kind = self.probe_route(source, endpoint)
+            endpoint = endpoints[0]
+            healthy = False
+            latency_ms = 0.0
+            kind = "unreachable"
+            endpoint_open: list[RouteCircuitDecision] = []
+            attempted = False
+            for candidate in endpoints:
+                endpoint_key = self._endpoint_circuit_destination(
+                    destination, candidate
+                )
+                try:
+                    endpoint_prior = self.route_health.decision(
+                        site,
+                        source.name,
+                        endpoint_key,
+                    )
+                except RouteHealthError as exc:
+                    raise TopologyDiscoveryError(
+                        f"direct endpoint {candidate.destination} has invalid "
+                        "circuit state"
+                    ) from exc
+                if endpoint_prior.is_open:
+                    endpoint_open.append(endpoint_prior)
+                    continue
+                attempted = True
+                endpoint = candidate
+                healthy, latency_ms, kind = self.probe_route(source, candidate)
+                try:
+                    if healthy:
+                        if endpoint_prior.failures > 0 and (
+                            endpoint_prior.last_kind or ""
+                        ).startswith("probe."):
+                            self.route_health.record_success(
+                                site,
+                                source.name,
+                                endpoint_key,
+                                endpoint_prior.reservation_token,
+                            )
+                        elif endpoint_prior.reservation_token is not None:
+                            # A control probe proves reachability, not sustained
+                            # bulk health. Preserve a transfer-failure half-open
+                            # claim until the selected artifact transfer settles
+                            # this exact address.
+                            endpoint_reservation_token = (
+                                endpoint_prior.reservation_token
+                            )
+                    elif kind in ROUTE_TRANSPORT_FAILURE_KINDS:
+                        self.route_health.record_failure(
+                            site,
+                            source.name,
+                            endpoint_key,
+                            f"probe.{kind}",
+                            endpoint_prior.reservation_token,
+                        )
+                    else:
+                        self.route_health.release_reservation(
+                            site,
+                            source.name,
+                            endpoint_key,
+                            endpoint_prior.reservation_token,
+                        )
+                except RouteHealthError as exc:
+                    raise TopologyDiscoveryError(
+                        f"direct endpoint {candidate.destination} circuit update failed"
+                    ) from exc
+                if healthy or kind not in ROUTE_TRANSPORT_FAILURE_KINDS:
+                    break
+            if not attempted:
+                # Preserve the outer route's half-open capability: no endpoint
+                # probe consumed it. The endpoint circuits carry the detailed
+                # failure memory while this message remains route-oriented.
+                decision = max(endpoint_open, key=lambda item: item.retry_after_s)
+                raise RouteCircuitOpen(source.name, destination.name, decision)
             try:
                 if healthy:
                     if prior.failures > 0 and (prior.last_kind or "").startswith(
@@ -1180,24 +1314,23 @@ class TopologyDiscovery:
                             site,
                             source.name,
                             destination.name,
+                            prior.reservation_token,
                         )
-                    elif prior.failures > 0:
+                    elif prior.reservation_token is not None:
                         # A healthy probe does not erase a prior bulk-transfer
                         # failure, so decision()'s half-open claim stays held
                         # for the transfer expected to follow. Remember it:
                         # if this scope never runs that transfer, the claim
                         # must be released, or a read-only probe leaves a
                         # healthy edge circuit-open for a full cooldown.
-                        with self._route_lock:
-                            self._carried_reservations[
-                                (site.name, source.name, destination.name)
-                            ] = site
+                        aggregate_reservation_token = prior.reservation_token
                 elif kind in ROUTE_TRANSPORT_FAILURE_KINDS:
                     self.route_health.record_failure(
                         site,
                         source.name,
                         destination.name,
                         f"probe.{kind}",
+                        prior.reservation_token,
                     )
                 elif prior.failures > 0:
                     # A half-open claimant temporarily renews open_until to
@@ -1209,7 +1342,21 @@ class TopologyDiscovery:
                         site,
                         source.name,
                         destination.name,
+                        prior.reservation_token,
                     )
+                if (
+                    aggregate_reservation_token is not None
+                    or endpoint_reservation_token is not None
+                ):
+                    with self._route_lock:
+                        self._carried_reservations[
+                            (site.name, source.name, destination.name)
+                        ] = _CarriedRouteReservations(
+                            site=site,
+                            aggregate_token=aggregate_reservation_token,
+                            endpoint_destination=endpoint_key,
+                            endpoint_token=endpoint_reservation_token,
+                        )
             except RouteHealthError as exc:
                 raise TopologyDiscoveryError(
                     f"direct route {source.name} -> {destination.name} circuit "
@@ -1217,14 +1364,111 @@ class TopologyDiscovery:
                 ) from exc
             result = (endpoint, healthy, latency_ms, kind)
         except BaseException as exc:
+            # Any failure before the outer route decision is settled must not
+            # strand a half-open reservation. Endpoint circuits remember the
+            # exact failed address; this release only returns the aggregate
+            # route claim so a future call can try a different endpoint.
+            if (
+                site is not None
+                and prior is not None
+                and prior.reservation_token is not None
+            ):
+                try:
+                    self.route_health.release_reservation(
+                        site,
+                        source.name,
+                        destination.name,
+                        prior.reservation_token,
+                    )
+                except RouteHealthError:
+                    pass
+            if (
+                site is not None
+                and endpoint_key is not None
+                and endpoint_prior is not None
+                and endpoint_prior.reservation_token is not None
+            ):
+                try:
+                    self.route_health.release_reservation(
+                        site,
+                        source.name,
+                        endpoint_key,
+                        endpoint_prior.reservation_token,
+                    )
+                except RouteHealthError:
+                    pass
             pending.set_exception(exc)
             raise
         pending.set_result(result)
         return result
 
-    def _discard_carried(self, site: Site, source: str, destination: str) -> None:
+    def _invalidate_completed_route_probe(
+        self,
+        source: str,
+        destination: str,
+    ) -> None:
+        """Forget stale reachability after a bulk failure settles.
+
+        Waiters already holding a completed future remain valid.  An active
+        single-flight probe is deliberately retained so a transfer failure
+        cannot orphan its owner or split its current waiters across probes.
+        """
+        key = (source, destination)
         with self._route_lock:
-            self._carried_reservations.pop((site.name, source, destination), None)
+            pending = self._route_probes.get(key)
+            if pending is None:
+                return
+            if pending.done():
+                del self._route_probes[key]
+                return
+
+        # Do not remove an active future: its owner and existing waiters must
+        # continue to share that probe.  Once it settles, however, the bulk
+        # failure still makes it stale for callers that arrive afterwards.
+        def invalidate_after_completion(
+            completed: Future[tuple[DirectEndpoint, bool, float, str]],
+        ) -> None:
+            with self._route_lock:
+                if self._route_probes.get(key) is completed:
+                    del self._route_probes[key]
+
+        pending.add_done_callback(invalidate_after_completion)
+
+    def _discard_carried(
+        self,
+        site: Site,
+        source: str,
+        destination: str,
+    ) -> _CarriedRouteReservations | None:
+        with self._route_lock:
+            return self._carried_reservations.pop(
+                (site.name, source, destination), None
+            )
+
+    def _take_transfer_circuit_targets(
+        self,
+        route: DiscoveredRoute,
+        destination: Node,
+    ) -> tuple[Site, str, tuple[tuple[str | None, str | None], ...]]:
+        """Consume one route's aggregate and exact-endpoint capabilities."""
+        source = route.replica.node.name
+        site = self.topology.site_for(route.replica.node)
+        if site is None or self.topology.site_for(destination) != site:
+            raise TopologyDiscoveryError("transfer route is outside one site")
+        carried = self._discard_carried(site, source, destination.name)
+        endpoint_destination = route.endpoint_circuit_destination
+        endpoint_token = route.endpoint_reservation_token
+        if carried is not None:
+            endpoint_destination = endpoint_destination or carried.endpoint_destination
+            endpoint_token = endpoint_token or carried.endpoint_token
+        return (
+            site,
+            source,
+            (
+                (endpoint_destination, endpoint_token),
+                (destination.name, carried.aggregate_token if carried else None),
+            ),
+        )
 
     def release_carried_reservations(self) -> list[str]:
         """Release half-open claims whose bulk transfer never ran.
@@ -1239,11 +1483,23 @@ class TopologyDiscovery:
             carried = dict(self._carried_reservations)
             self._carried_reservations.clear()
         failures: list[str] = []
-        for (_, source, destination), site in carried.items():
-            try:
-                self.route_health.release_reservation(site, source, destination)
-            except RouteHealthError as exc:
-                failures.append(f"{source} -> {destination}: {exc}")
+        for (_, source, destination), reservation in carried.items():
+            targets = (
+                (reservation.endpoint_destination, reservation.endpoint_token),
+                (destination, reservation.aggregate_token),
+            )
+            for circuit_destination, reservation_token in targets:
+                if circuit_destination is None or reservation_token is None:
+                    continue
+                try:
+                    self.route_health.release_reservation(
+                        reservation.site,
+                        source,
+                        circuit_destination,
+                        reservation_token,
+                    )
+                except RouteHealthError as exc:
+                    failures.append(f"{source} -> {circuit_destination}: {exc}")
         return failures
 
     def record_transfer_failure(
@@ -1254,19 +1510,29 @@ class TopologyDiscovery:
     ) -> None:
         if route.endpoint is None:
             return
-        site = self.topology.site_for(route.replica.node)
-        if site is None or self.topology.site_for(destination) != site:
-            raise TopologyDiscoveryError("transfer route is outside one site")
-        try:
-            self.route_health.record_failure(
-                site,
-                route.replica.node.name,
-                destination.name,
-                f"transfer.{kind}",
-            )
-        except RouteHealthError as exc:
-            raise TopologyDiscoveryError("route circuit failure update failed") from exc
-        self._discard_carried(site, route.replica.node.name, destination.name)
+        site, source, targets = self._take_transfer_circuit_targets(route, destination)
+        failures: list[RouteHealthError] = []
+        for circuit_destination, reservation_token in targets:
+            if circuit_destination is None:
+                continue
+            try:
+                self.route_health.record_failure(
+                    site,
+                    source,
+                    circuit_destination,
+                    f"transfer.{kind}",
+                    reservation_token,
+                )
+            except RouteHealthError as exc:
+                failures.append(exc)
+        # The control probe predates this authoritative bulk outcome.  A
+        # later replica on the same source node must re-enter aggregate and
+        # exact-endpoint admission instead of reusing stale reachability.
+        self._invalidate_completed_route_probe(source, destination.name)
+        if failures:
+            raise TopologyDiscoveryError(
+                "route circuit failure update failed"
+            ) from failures[0]
 
     def record_transfer_success(
         self,
@@ -1275,18 +1541,24 @@ class TopologyDiscovery:
     ) -> None:
         if route.endpoint is None:
             return
-        site = self.topology.site_for(route.replica.node)
-        if site is None or self.topology.site_for(destination) != site:
-            raise TopologyDiscoveryError("transfer route is outside one site")
-        try:
-            self.route_health.record_success(
-                site,
-                route.replica.node.name,
-                destination.name,
-            )
-        except RouteHealthError as exc:
-            raise TopologyDiscoveryError("route circuit success update failed") from exc
-        self._discard_carried(site, route.replica.node.name, destination.name)
+        site, source, targets = self._take_transfer_circuit_targets(route, destination)
+        failures: list[RouteHealthError] = []
+        for circuit_destination, reservation_token in targets:
+            if circuit_destination is None:
+                continue
+            try:
+                self.route_health.record_success(
+                    site,
+                    source,
+                    circuit_destination,
+                    reservation_token,
+                )
+            except RouteHealthError as exc:
+                failures.append(exc)
+        if failures:
+            raise TopologyDiscoveryError(
+                "route circuit success update failed"
+            ) from failures[0]
 
     def release_transfer_reservation(
         self,
@@ -1296,20 +1568,24 @@ class TopologyDiscovery:
         """Release only a half-open claim after a non-route transfer failure."""
         if route.endpoint is None:
             return
-        site = self.topology.site_for(route.replica.node)
-        if site is None or self.topology.site_for(destination) != site:
-            raise TopologyDiscoveryError("transfer route is outside one site")
-        try:
-            self.route_health.release_reservation(
-                site,
-                route.replica.node.name,
-                destination.name,
-            )
-        except RouteHealthError as exc:
+        site, source, targets = self._take_transfer_circuit_targets(route, destination)
+        failures: list[RouteHealthError] = []
+        for circuit_destination, reservation_token in targets:
+            if circuit_destination is None or reservation_token is None:
+                continue
+            try:
+                self.route_health.release_reservation(
+                    site,
+                    source,
+                    circuit_destination,
+                    reservation_token,
+                )
+            except RouteHealthError as exc:
+                failures.append(exc)
+        if failures:
             raise TopologyDiscoveryError(
                 "route circuit reservation update failed"
-            ) from exc
-        self._discard_carried(site, route.replica.node.name, destination.name)
+            ) from failures[0]
 
     def route(
         self,
@@ -1332,6 +1608,22 @@ class TopologyDiscovery:
                 f"direct route {replica.node.name} -> {destination.name} "
                 f"failed ({kind})"
             )
+        endpoint_circuit_destination = self._endpoint_circuit_destination(
+            destination,
+            endpoint,
+        )
+        site = self.topology.site_for(replica.node)
+        endpoint_reservation_token: str | None = None
+        if site is not None:
+            with self._route_lock:
+                carried = self._carried_reservations.get(
+                    (site.name, replica.node.name, destination.name)
+                )
+            if (
+                carried is not None
+                and carried.endpoint_destination == endpoint_circuit_destination
+            ):
+                endpoint_reservation_token = carried.endpoint_token
         kind_penalty = 0.0 if replica.kind == "peer" else 1.0
         score = (
             replica.node.transfer_cost
@@ -1346,6 +1638,8 @@ class TopologyDiscovery:
             probe_latency_ms=latency_ms,
             score=score,
             throughput_bps=self.edge_throughput_bps(replica.node, destination),
+            endpoint_circuit_destination=endpoint_circuit_destination,
+            endpoint_reservation_token=endpoint_reservation_token,
         )
 
     def edge_throughput_bps(self, source: Node, destination: Node) -> float | None:

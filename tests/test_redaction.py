@@ -24,6 +24,12 @@ def test_embedded_home_occurrences_are_rewritten(monkeypatch):
     assert redact_home_path(text) == "journal ~/a and ~/b"
 
 
+def test_home_redaction_respects_path_component_boundaries(monkeypatch):
+    monkeypatch.setenv("HOME", "/home/alice")
+    text = "/home/alice2 /srv/home/alice-copy /home/alice/secret"
+    assert redact_home_path(text) == ("/home/alice2 /srv/home/alice-copy ~/secret")
+
+
 def test_text_without_home_is_unchanged(monkeypatch):
     monkeypatch.setenv("HOME", "/home/alice")
     assert redact_home_path("/var/lib/dt/journal") == "/var/lib/dt/journal"

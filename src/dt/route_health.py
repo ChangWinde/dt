@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import stat
 import time
@@ -16,12 +17,19 @@ from typing import Callable, Iterator, Protocol
 from uuid import uuid4
 
 from .config import HeadConfig, Site
-from .private_state import openat_create_retry
+from .private_state import (
+    PrivateStateError,
+    decode_strict_json,
+    openat_create_retry,
+    read_bounded_at,
+)
 
-SCHEMA_VERSION = "dt_route_health_v1"
+SCHEMA_VERSION = "dt_route_health_v2"
+LEGACY_SCHEMA_VERSION = "dt_route_health_v1"
 MAX_STATE_BYTES = 4096
 MAX_FAILURES = 64
 _KIND_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_RESERVATION_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 class RouteHealthError(RuntimeError):
@@ -37,6 +45,7 @@ class RouteCircuitState:
     last_failure_at: float
     last_kind: str
     updated_at: float
+    reservation_token: str | None
 
 
 @dataclass(frozen=True)
@@ -45,6 +54,7 @@ class RouteCircuitDecision:
     retry_after_s: float
     failures: int
     last_kind: str | None
+    reservation_token: str | None = None
 
 
 class RouteHealth(Protocol):
@@ -53,7 +63,13 @@ class RouteHealth(Protocol):
     ) -> RouteCircuitDecision:
         """Return whether one configured direct edge may be probed now."""
 
-    def record_success(self, site: Site, source: str, destination: str) -> None:
+    def record_success(
+        self,
+        site: Site,
+        source: str,
+        destination: str,
+        reservation_token: str | None = None,
+    ) -> None:
         """Close an edge circuit after a proved successful route."""
 
     def record_failure(
@@ -62,10 +78,17 @@ class RouteHealth(Protocol):
         source: str,
         destination: str,
         kind: str,
+        reservation_token: str | None = None,
     ) -> RouteCircuitDecision:
         """Record one route failure and possibly open its circuit."""
 
-    def release_reservation(self, site: Site, source: str, destination: str) -> None:
+    def release_reservation(
+        self,
+        site: Site,
+        source: str,
+        destination: str,
+        reservation_token: str | None = None,
+    ) -> None:
         """Release a half-open trial after a non-transport outcome."""
 
 
@@ -79,7 +102,7 @@ def _route_key(site: Site, source: str, destination: str) -> str:
 
 
 def _validate_state(raw: object, expected_key: str) -> RouteCircuitState:
-    if not isinstance(raw, dict) or set(raw) != {
+    legacy_fields = {
         "schema_version",
         "key_digest",
         "failures",
@@ -87,13 +110,24 @@ def _validate_state(raw: object, expected_key: str) -> RouteCircuitState:
         "last_failure_at",
         "last_kind",
         "updated_at",
-    }:
+    }
+    current_fields = legacy_fields | {"reservation_token"}
+    if not isinstance(raw, dict):
         raise RouteHealthError("route circuit state has an invalid schema")
-    if raw.get("schema_version") != SCHEMA_VERSION:
+    fields = set(raw)
+    if fields not in (legacy_fields, current_fields):
+        raise RouteHealthError("route circuit state has an invalid schema")
+    schema = raw.get("schema_version")
+    if schema not in {SCHEMA_VERSION, LEGACY_SCHEMA_VERSION}:
         raise RouteHealthError("route circuit state has an unsupported version")
+    if schema == SCHEMA_VERSION and set(raw) != current_fields:
+        raise RouteHealthError("route circuit state has an invalid schema")
+    if schema == LEGACY_SCHEMA_VERSION and set(raw) != legacy_fields:
+        raise RouteHealthError("route circuit state has an invalid schema")
     key = raw.get("key_digest")
     failures = raw.get("failures")
     last_kind = raw.get("last_kind")
+    reservation_token = raw.get("reservation_token")
     if key != expected_key:
         raise RouteHealthError("route circuit state key does not match its path")
     if (
@@ -104,6 +138,11 @@ def _validate_state(raw: object, expected_key: str) -> RouteCircuitState:
         raise RouteHealthError("route circuit failure count is invalid")
     if not isinstance(last_kind, str) or _KIND_RE.fullmatch(last_kind) is None:
         raise RouteHealthError("route circuit failure kind is invalid")
+    if reservation_token is not None and (
+        not isinstance(reservation_token, str)
+        or _RESERVATION_RE.fullmatch(reservation_token) is None
+    ):
+        raise RouteHealthError("route circuit reservation token is invalid")
     values: dict[str, float] = {}
     for name in ("open_until", "last_failure_at", "updated_at"):
         value = raw.get(name)
@@ -121,6 +160,7 @@ def _validate_state(raw: object, expected_key: str) -> RouteCircuitState:
         last_failure_at=values["last_failure_at"],
         last_kind=last_kind,
         updated_at=values["updated_at"],
+        reservation_token=reservation_token,
     )
 
 
@@ -132,9 +172,59 @@ class PersistentRouteHealth:
         cfg: HeadConfig,
         *,
         clock: Callable[[], float] = time.time,
+        jitter: Callable[[], float] | None = None,
     ) -> None:
         self.root = cfg.control_state_dir() / "route-health"
         self.clock = clock
+        # A supplied/fake wall clock normally belongs to a deterministic test
+        # or simulation. Production construction uses ``time.time`` and gets
+        # real per-transition jitter to avoid synchronized retry waves.
+        self.jitter = jitter or (random.random if clock is time.time else lambda: 0.5)
+
+    def _wall_now(self) -> float:
+        now = float(self.clock())
+        if not math.isfinite(now) or now < 0:
+            raise RouteHealthError("route circuit clock returned an invalid time")
+        return now
+
+    def _current_state(
+        self,
+        directory_fd: int,
+        name: str,
+        key: str,
+    ) -> tuple[RouteCircuitState | None, float]:
+        """Read state and rebase absolute timestamps after a wall-clock rollback.
+
+        Treating ``updated_at`` as a logical-clock floor freezes an open circuit
+        until the wall clock catches up, which can suppress a route for hours
+        after an RTC/NTP correction.  Shift every persisted timestamp by the
+        same delta instead: remaining cooldown and failure age are conserved,
+        while the per-edge lock still admits only one half-open claimant.
+        """
+        state = self._read(directory_fd, name, key)
+        now = self._wall_now()
+        if state is None or now >= state.updated_at:
+            return state, now
+        rollback = state.updated_at - now
+        state = RouteCircuitState(
+            schema_version=SCHEMA_VERSION,
+            key_digest=key,
+            failures=state.failures,
+            open_until=max(0.0, state.open_until - rollback),
+            last_failure_at=max(0.0, state.last_failure_at - rollback),
+            last_kind=state.last_kind,
+            updated_at=now,
+            reservation_token=state.reservation_token,
+        )
+        self._write(directory_fd, name, state)
+        return state, now
+
+    def _cooldown(self, value: float, maximum: float) -> float:
+        sample = float(self.jitter())
+        if not math.isfinite(sample):
+            sample = 0.5
+        sample = min(1.0, max(0.0, sample))
+        return min(maximum, max(0.0, value * (0.9 + 0.2 * sample)))
 
     @contextmanager
     def _locked(self, key: str) -> Iterator[tuple[int, str]]:
@@ -182,34 +272,23 @@ class PersistentRouteHealth:
 
     @staticmethod
     def _read(directory_fd: int, name: str, key: str) -> RouteCircuitState | None:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
         try:
-            descriptor = os.open(name, flags, dir_fd=directory_fd)
-        except FileNotFoundError:
-            return None
-        except OSError as exc:
+            result = read_bounded_at(
+                directory_fd,
+                name,
+                max_bytes=MAX_STATE_BYTES,
+            )
+        except PrivateStateError as exc:
+            if "exceeds its size limit" in str(exc):
+                raise RouteHealthError(
+                    "route circuit state is not a bounded file"
+                ) from exc
             raise RouteHealthError("route circuit state is unsafe") from exc
+        if result is None:
+            return None
         try:
-            info = os.fstat(descriptor)
-            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_STATE_BYTES:
-                raise RouteHealthError("route circuit state is not a bounded file")
-            payload = bytearray()
-            while len(payload) <= MAX_STATE_BYTES:
-                chunk = os.read(
-                    descriptor, min(4096, MAX_STATE_BYTES + 1 - len(payload))
-                )
-                if not chunk:
-                    break
-                payload.extend(chunk)
-            if len(payload) > MAX_STATE_BYTES:
-                raise RouteHealthError("route circuit state exceeds its size limit")
-        finally:
-            os.close(descriptor)
-        try:
-            raw = json.loads(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raw = decode_strict_json(result[0])
+        except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
             raise RouteHealthError("route circuit state is malformed") from exc
         return _validate_state(raw, key)
 
@@ -257,14 +336,23 @@ class PersistentRouteHealth:
                 pass
 
     @staticmethod
-    def _decision(state: RouteCircuitState | None, now: float) -> RouteCircuitDecision:
+    def _decision(
+        state: RouteCircuitState | None,
+        now: float,
+        maximum_cooldown: float,
+    ) -> RouteCircuitDecision:
         if state is None:
-            return RouteCircuitDecision(False, 0.0, 0, None)
+            return RouteCircuitDecision(False, 0.0, 0, None, None)
+        retry_after = min(
+            maximum_cooldown,
+            max(0.0, state.open_until - now),
+        )
         return RouteCircuitDecision(
-            is_open=state.open_until > now,
-            retry_after_s=max(0.0, state.open_until - now),
+            is_open=retry_after > 0,
+            retry_after_s=retry_after,
             failures=state.failures,
             last_kind=state.last_kind,
+            reservation_token=None,
         )
 
     def decision(
@@ -272,9 +360,8 @@ class PersistentRouteHealth:
     ) -> RouteCircuitDecision:
         key = _route_key(site, source, destination)
         with self._locked(key) as (directory_fd, name):
-            state = self._read(directory_fd, name, key)
-            now = self.clock()
-            decision = self._decision(state, now)
+            state, now = self._current_state(directory_fd, name, key)
+            decision = self._decision(state, now, site.route_circuit_max_cooldown_s)
             if (
                 decision.is_open
                 or state is None
@@ -289,10 +376,14 @@ class PersistentRouteHealth:
                 max(0, state.failures - site.route_circuit_failures),
                 MAX_FAILURES,
             )
-            trial_window = min(
-                site.route_circuit_cooldown_s * (2**exponent),
+            trial_window = self._cooldown(
+                min(
+                    site.route_circuit_cooldown_s * (2**exponent),
+                    site.route_circuit_max_cooldown_s,
+                ),
                 site.route_circuit_max_cooldown_s,
             )
+            reservation_token = uuid4().hex
             claimed = RouteCircuitState(
                 schema_version=SCHEMA_VERSION,
                 key_digest=key,
@@ -301,6 +392,7 @@ class PersistentRouteHealth:
                 last_failure_at=state.last_failure_at,
                 last_kind=state.last_kind,
                 updated_at=now,
+                reservation_token=reservation_token,
             )
             self._write(directory_fd, name, claimed)
             return RouteCircuitDecision(
@@ -308,17 +400,31 @@ class PersistentRouteHealth:
                 retry_after_s=0.0,
                 failures=state.failures,
                 last_kind=state.last_kind,
+                reservation_token=reservation_token,
             )
 
-    def record_success(self, site: Site, source: str, destination: str) -> None:
+    def record_success(
+        self,
+        site: Site,
+        source: str,
+        destination: str,
+        reservation_token: str | None = None,
+    ) -> None:
         key = _route_key(site, source, destination)
-        now = self.clock()
         with self._locked(key) as (directory_fd, name):
-            prior = self._read(directory_fd, name, key)
+            prior, now = self._current_state(directory_fd, name, key)
             # Healthy is the default state. Avoid a durable write for every
             # first successful probe; only an existing failure circuit needs
             # an explicit recovery record.
             if prior is None:
+                return
+            if reservation_token is not None:
+                if prior.reservation_token is None or not hmac_compare(
+                    prior.reservation_token,
+                    reservation_token,
+                ):
+                    return
+            elif prior.reservation_token is not None:
                 return
             if (
                 prior.failures == 0
@@ -334,10 +440,17 @@ class PersistentRouteHealth:
                 last_failure_at=0.0,
                 last_kind="success",
                 updated_at=now,
+                reservation_token=None,
             )
             self._write(directory_fd, name, state)
 
-    def release_reservation(self, site: Site, source: str, destination: str) -> None:
+    def release_reservation(
+        self,
+        site: Site,
+        source: str,
+        destination: str,
+        reservation_token: str | None = None,
+    ) -> None:
         """Make a neutral half-open trial immediately available again.
 
         A successful lightweight SSH probe deliberately does not erase a
@@ -347,11 +460,12 @@ class PersistentRouteHealth:
         fresh network cooldown.
         """
         key = _route_key(site, source, destination)
-        now = self.clock()
         with self._locked(key) as (directory_fd, name):
-            prior = self._read(directory_fd, name, key)
+            prior, now = self._current_state(directory_fd, name, key)
             if (
                 prior is None
+                or prior.reservation_token is None
+                or not hmac_compare(prior.reservation_token, reservation_token)
                 or prior.failures < site.route_circuit_failures
                 or prior.open_until <= now
                 or prior.updated_at <= prior.last_failure_at
@@ -365,6 +479,7 @@ class PersistentRouteHealth:
                 last_failure_at=prior.last_failure_at,
                 last_kind=prior.last_kind,
                 updated_at=now,
+                reservation_token=None,
             )
             self._write(directory_fd, name, released)
 
@@ -374,12 +489,28 @@ class PersistentRouteHealth:
         source: str,
         destination: str,
         kind: str,
+        reservation_token: str | None = None,
     ) -> RouteCircuitDecision:
         safe_kind = kind if _KIND_RE.fullmatch(kind) else "unclassified"
         key = _route_key(site, source, destination)
-        now = self.clock()
         with self._locked(key) as (directory_fd, name):
-            prior = self._read(directory_fd, name, key)
+            prior, now = self._current_state(directory_fd, name, key)
+            stale_reservation = reservation_token is not None and (
+                prior is None
+                or prior.reservation_token is None
+                or not hmac_compare(prior.reservation_token, reservation_token)
+            )
+            reserved_by_another = (
+                reservation_token is None
+                and prior is not None
+                and prior.reservation_token is not None
+            )
+            if stale_reservation or reserved_by_another:
+                return self._decision(
+                    prior,
+                    now,
+                    site.route_circuit_max_cooldown_s,
+                )
             failures = 1
             if prior is not None and prior.failures > 0:
                 # Decay from the last time the circuit re-admitted traffic, not
@@ -396,8 +527,11 @@ class PersistentRouteHealth:
                     failures - site.route_circuit_failures,
                     MAX_FAILURES,
                 )
-                open_for = min(
-                    site.route_circuit_cooldown_s * (2**exponent),
+                open_for = self._cooldown(
+                    min(
+                        site.route_circuit_cooldown_s * (2**exponent),
+                        site.route_circuit_max_cooldown_s,
+                    ),
                     site.route_circuit_max_cooldown_s,
                 )
             state = RouteCircuitState(
@@ -408,6 +542,14 @@ class PersistentRouteHealth:
                 last_failure_at=now,
                 last_kind=safe_kind,
                 updated_at=now,
+                reservation_token=None,
             )
             self._write(directory_fd, name, state)
-            return self._decision(state, now)
+            return self._decision(state, now, site.route_circuit_max_cooldown_s)
+
+
+def hmac_compare(expected: str, observed: str | None) -> bool:
+    """Constant-time compare for opaque reservation capabilities."""
+    import hmac
+
+    return observed is not None and hmac.compare_digest(expected, observed)

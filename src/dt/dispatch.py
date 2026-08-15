@@ -26,12 +26,14 @@ import time
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from threading import Event
 from typing import Callable, Mapping, cast
 
 from . import custom_env as custom_env_mod
+from . import private_env as private_env_mod
 from .config import (
     ConfigError,
     HeadConfig,
@@ -47,6 +49,7 @@ from .lifecycle import (
     launch_recovery_probe,
     termination_probe,
     termination_verdict,
+    validate_job_capsule,
 )
 from .layout import (
     LEGACY_LAYOUT,
@@ -65,6 +68,7 @@ from .layout import (
 )
 from .maintenance import (
     BeforeRegistryRemove,
+    CleanAuthorization,
     CleanReport,
     clean_job_victims as _clean_job_victims,
     clean_jobs as _clean_jobs,
@@ -77,9 +81,13 @@ from .jobs import (
     UNCERTAIN_LAUNCH_PREFIX,
     RESULT_STATES,
     JobEntry,
+    RegistryDamage,
     RegistryError,
+    active_entries,
     dependency_settled,
     effective_result_state,
+    finalize_dependency_terminal,
+    finalize_dependency_terminal_locked,
     is_uncertain_launch,
     job_lock,
     load,
@@ -90,7 +98,6 @@ from .jobs import (
     sanitize_name,
     save,
     transition_terminal,
-    queued_entries,
 )
 from . import git_provenance as git_provenance_mod
 from . import payload_hash as payload_hash_mod
@@ -105,6 +112,7 @@ from .probe import Gpu, NodeStatus, probe_center, probe_node
 from .private_state import (
     PrivateStateError,
     atomic_write,
+    decode_strict_json,
     ensure_private_directory,
     fsync_dir,
     fsync_tree,
@@ -136,6 +144,7 @@ GPU_PULSE_MEMORY_MIB = 512
 SNAPSHOT_METADATA_MAX_BYTES = 64 * 1024
 LINKDEST_STATE_MAX_BYTES = 4 * 1024 * 1024
 MAX_GIT_DIFF_BYTES = 4 * 1024 * 1024
+REQUEST_REMOTE_PROOF_MARK = "@@DT_REQUEST_REMOTE_PROOF_V1@@"
 # Root-anchored (leading /): project artifact dirs that may legitimately
 # collide with package subpaths deeper in the tree (omnistack/data is a
 # Python module; an unanchored "data/" would silently drop it from the
@@ -193,6 +202,9 @@ LAUNCH_PHASE_KEYS = (
     "gpu_probe",
     "session_start",
     "remote_total",
+)
+_HELD_REQUEST_ID: ContextVar[str | None] = ContextVar(
+    "dt_held_submission_request_id", default=None
 )
 
 _GROUPED_INTEGER = r"([0-9][0-9,. \u00a0\u202f]*)"
@@ -348,7 +360,10 @@ def _file_sha256(path: Path) -> str:
     metadata = path.lstat()
     if not stat.S_ISREG(metadata.st_mode):
         raise OSError(f"not a regular file: {path}")
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+    )
     digest = hashlib.sha256()
     try:
         opened = os.fstat(descriptor)
@@ -589,6 +604,133 @@ def _artifact_remote_check(
         "exit 73; fi; "
         f"{operation}"
     )
+
+
+def _publish_verified_artifact_manifest(
+    node: Node,
+    root_rel: str,
+    manifest_bytes: bytes,
+    manifest_sha256: str,
+    *,
+    retries: int,
+    bwlimit_kbps: int | None,
+    on_retry: Callable[[RsyncRetryEvent], None] | None,
+    cancel_event: Event | None,
+) -> None:
+    """Verify remote artifact bytes before atomically publishing their manifest.
+
+    A local before/after hash only detects monotonic source drift.  A producer can
+    change A -> B while rsync reads the source and restore A before the second
+    hash, so the destination itself is the commit authority.  The verifier and
+    manifest are staged privately, the destination is checked against the exact
+    manifest, and only then is that manifest renamed into the public digest path.
+    """
+    token = uuid.uuid4().hex
+    incoming_rel = f"{root_rel}/.dt/incoming/{manifest_sha256}-{token}"
+    incoming_manifest_rel = f"{incoming_rel}/{manifest_sha256}.json"
+    manifest_rel = f"{root_rel}/.dt/manifests"
+    manifest_path = f"{manifest_rel}/{manifest_sha256}.json"
+    prepared = run_on(
+        node.name,
+        node.local,
+        _artifact_remote_check(
+            root_rel,
+            f".dt/incoming/{manifest_sha256}-{token}/{manifest_sha256}.json",
+            is_dir=False,
+            prepare=True,
+        )
+        + f"; chmod 700 {node_path_expression(incoming_rel)}",
+        timeout=15,
+    )
+    if prepared.returncode != 0:
+        detail = diagnostic_excerpt(
+            prepared.stderr,
+            prepared.stdout,
+            fallback=f"remote preparation exited {prepared.returncode}",
+        )
+        if prepared.returncode == 255:
+            raise RemoteError(
+                node.name,
+                f"artifact verification preparation failed: {detail}",
+                prepared.returncode,
+            )
+        raise DispatchError(
+            f"artifact verification preparation on {node.name} failed: {detail}"
+        )
+
+    runtime = _runtime_payload_files()
+    with tempfile.TemporaryDirectory() as temporary:
+        local_stage = Path(temporary)
+        (local_stage / f"{manifest_sha256}.json").write_bytes(manifest_bytes)
+        for name in ("artifact_verify.py", "snapshot_hash.py"):
+            (local_stage / name).write_text(runtime[name], encoding="utf-8")
+        uploaded = rsync(
+            f"{local_stage}/",
+            rsync_destination(
+                node.name,
+                node.local,
+                incoming_rel,
+                directory=True,
+            ),
+            timeout=60,
+            retries=retries,
+            bwlimit_kbps=bwlimit_kbps,
+            on_retry=on_retry,
+            checksum=True,
+            private_destination=True,
+            cancel_event=cancel_event,
+        )
+    if uploaded.returncode != 0:
+        detail = diagnostic_excerpt(
+            uploaded.stderr,
+            uploaded.stdout,
+            fallback=f"rsync exited {uploaded.returncode}",
+        )
+        if uploaded.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
+            raise RemoteError(
+                node.name,
+                f"artifact verification upload failed: {detail}",
+                uploaded.returncode,
+            )
+        raise DispatchError(
+            f"artifact verification upload to {node.name} failed: {detail}"
+        )
+
+    incoming_expr = node_path_expression(incoming_rel)
+    cleanup = f"rm -rf -- {incoming_expr}"
+    publish_guard = _artifact_remote_check(
+        root_rel,
+        f".dt/manifests/{manifest_sha256}.json",
+        is_dir=False,
+        prepare=True,
+    )
+    verified = run_on(
+        node.name,
+        node.local,
+        "set -eu; umask 077; "
+        f"trap {shlex.quote(cleanup)} EXIT HUP INT TERM; "
+        f"python3 -I {node_path_expression(f'{incoming_rel}/artifact_verify.py')} "
+        f"--root {node_path_expression(root_rel)} "
+        f"--manifest {node_path_expression(incoming_manifest_rel)} "
+        f"--expected-sha256 {shlex.quote(manifest_sha256)}; "
+        f"{publish_guard}; "
+        f"mv -f -- {node_path_expression(incoming_manifest_rel)} "
+        f"{node_path_expression(manifest_path)}",
+        timeout=300,
+    )
+    if verified.returncode != 0:
+        detail = diagnostic_excerpt(
+            verified.stderr,
+            verified.stdout,
+            fallback=f"remote verifier exited {verified.returncode}",
+        )
+        if verified.returncode == 255:
+            raise RemoteError(
+                node.name,
+                f"artifact verification failed: {detail}",
+                verified.returncode,
+            )
+        raise DispatchError(f"artifact verification failed on {node.name}: {detail}")
 
 
 def _private_remote_directories(*paths: str) -> str:
@@ -1212,69 +1354,19 @@ def sync_artifacts(
                 "artifact source changed during sync; rerun after writes finish"
             )
 
-        manifest_rel = f"{root_rel}/.dt/manifests"
-        manifest_path = f"{manifest_rel}/{manifest_sha256}.json"
         if not plan:
-            manifest_check = _artifact_remote_check(
+            _publish_verified_artifact_manifest(
+                node,
                 root_rel,
-                f".dt/manifests/{manifest_sha256}.json",
-                is_dir=False,
-                prepare=True,
+                manifest_bytes,
+                manifest_sha256,
+                retries=retries,
+                bwlimit_kbps=effective_bwlimit,
+                on_retry=on_retry,
+                cancel_event=cancel_event,
             )
-            prepared = run_on(
-                node.name,
-                node.local,
-                manifest_check,
-                timeout=15,
-            )
-            if prepared.returncode != 0:
-                detail = (
-                    prepared.stderr.strip()
-                    or prepared.stdout.strip()
-                    or f"remote preparation exited {prepared.returncode}"
-                )
-                if prepared.returncode == 255:
-                    raise RemoteError(
-                        node.name,
-                        f"artifact manifest preparation failed: {detail}",
-                        prepared.returncode,
-                    )
-                raise DispatchError(
-                    f"artifact manifest preparation on {node.name} failed: {detail}"
-                )
-            with tempfile.TemporaryDirectory() as temporary:
-                local_manifest = Path(temporary) / f"{manifest_sha256}.json"
-                local_manifest.write_bytes(manifest_bytes)
-                manifest_destination = rsync_destination(
-                    node.name,
-                    node.local,
-                    manifest_rel,
-                    directory=True,
-                )
-                published = rsync(
-                    str(local_manifest),
-                    manifest_destination,
-                    timeout=60,
-                    retries=retries,
-                    bwlimit_kbps=effective_bwlimit,
-                    on_retry=on_retry,
-                    checksum=True,
-                    cancel_event=cancel_event,
-                )
-            if published.returncode != 0:
-                detail = (
-                    published.stderr.strip() or f"rsync exited {published.returncode}"
-                )
-                if published.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
-                    raise RemoteError(
-                        node.name,
-                        f"artifact manifest publish failed: {detail}",
-                        published.returncode,
-                    )
-                raise DispatchError(
-                    f"artifact manifest publish to {node.name} failed: {detail}"
-                )
 
+    manifest_path = f"{root_rel}/.dt/manifests/{manifest_sha256}.json"
     result: dict[str, object] = {
         "node": node.name,
         "project": project_name,
@@ -1377,6 +1469,11 @@ def require_compatible_resident_agent(cfg: HeadConfig) -> None:
     # Lazy import avoids the module cycle: agent imports ``dispatch_queued``.
     from . import agent as agent_mod
 
+    if agent_mod.legacy_agent_lock_blocks_role_layout(cfg):
+        raise ConfigError(
+            "legacy DT agent ownership is active or unprovable; stop the old "
+            "agent before submitting with the role layout"
+        )
     if agent_mod.alive_pid(cfg) is None:
         observed = _active_command_dispatch_protocol()
         if observed != DISPATCH_PROTOCOL_VERSION:
@@ -1393,7 +1490,7 @@ def require_compatible_resident_agent(cfg: HeadConfig) -> None:
         )
         if result is None:
             raise ValueError("runtime record is missing")
-        payload = json.loads(result[0].decode("utf-8"))
+        payload = decode_strict_json(result[0])
         if not isinstance(payload, dict):
             raise ValueError("runtime record is not an object")
         observed = payload.get("dispatch_protocol")
@@ -1426,12 +1523,11 @@ def reconcile_submission_request(
     """Repair an interrupted receipt from its authoritative job row.
 
     ``preparing`` is an interrupted submission; ``uncertain`` is a launch
-    whose outcome was unknown when the receipt was written.  Both heal from
-    the job row: a verified `dt kill` cleanup (row killed, or finished when
-    the exit marker surfaced) settles an uncertain launch, so the receipt
-    must follow it.  Leaving the receipt uncertain forever made the same
-    request id answer RequestOutcomeUnknown for good and pushed callers to
-    abandon the id and resubmit blind.
+    whose outcome was unknown when the receipt was written. Both heal from
+    the job row. A replay authorization also yields to an exact authoritative
+    row that appeared after its absence proof, avoiding a duplicate retry.
+    A verified `dt kill` cleanup (row killed, or finished when the exit marker
+    surfaced) settles an uncertain launch, so the receipt must follow it.
     """
     existing = load(cfg, record.job_id)
     if existing is None:
@@ -1457,6 +1553,8 @@ def reconcile_submission_request(
             )
         else:
             updated = intent_mod.transition(record, "confirmed")
+    elif record.state == "replay_authorized":
+        updated = intent_mod.transition(record, "confirmed")
     elif record.state == "uncertain":
         if is_uncertain_launch(existing) or existing.status == "lost":
             # Still unresolved (or inside the lost recovery window): the
@@ -1537,6 +1635,16 @@ def waiting_capacity_reason(reasons: dict[str, str]) -> str:
         f"waiting: no free capacity ({detail})"
         if detail
         else "waiting: no free capacity"
+    )
+
+
+def waiting_placement_failure_reason(reasons: dict[str, str]) -> str:
+    """Preserve the last launch boundary evidence without calling it capacity."""
+    detail = "; ".join(f"{node}: {reason}" for node, reason in reasons.items())
+    return (
+        f"waiting: placement attempt failed ({detail})"
+        if detail
+        else "waiting: placement attempt failed"
     )
 
 
@@ -2329,8 +2437,9 @@ def _publish_durable_object_directory(
                 fsync_dir(parent)
             raise
         fsync_dir(parent)
-    except OSError as exc:
-        raise DispatchError(f"{label} cannot be published durably: {exc}") from exc
+    except (OSError, PrivateStateError) as exc:
+        detail = diagnostic_excerpt(str(exc), fallback=type(exc).__name__)
+        raise DispatchError(f"{label} cannot be published durably: {detail}") from exc
     if quarantine is not None:
         shutil.rmtree(quarantine, ignore_errors=True)
 
@@ -2808,7 +2917,12 @@ def _stable_snapshot_copy_dest(
     whole_job: bool,
     job_dir: str | None = None,
 ) -> Iterator[str | None]:
-    """Hold a shared cache lock only when copy-dest points at that cache."""
+    """Keep an optional copy baseline alive for the complete transfer.
+
+    Mutable sync-cache baselines use their shared cache lock.  Previous-job
+    baselines use that job's lifecycle lock so clean/compact cannot remove the
+    workdir between the existence probe and rsync reading ``--copy-dest``.
+    """
     if copy_dest != _sync_cache_copy_dest(
         project_name,
         whole_job,
@@ -2816,7 +2930,30 @@ def _stable_snapshot_copy_dest(
         node=node,
         job_dir=job_dir,
     ):
-        yield copy_dest
+        if copy_dest is None or job_dir is None:
+            yield copy_dest
+            return
+        destination = job_dir if whole_job else f"{job_dir}/code"
+        baseline = PurePosixPath(
+            posixpath.normpath(posixpath.join(destination, copy_dest))
+        )
+        if whole_job:
+            source_job_id = baseline.name
+        elif baseline.name == "code":
+            source_job_id = baseline.parent.name
+        else:
+            source_job_id = ""
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", source_job_id) is None:
+            yield None
+            return
+        with job_lock(cfg, source_job_id):
+            ready = run_on(
+                node.name,
+                node.local,
+                f"test -d {node_path_expression(baseline.as_posix())}",
+                timeout=10,
+            )
+            yield copy_dest if ready.returncode == 0 else None
         return
     with _sync_cache_lock(
         cfg,
@@ -3176,14 +3313,69 @@ def preview_submission(
     _validate_run_spec(spec)
     _require_submission_references(cfg, spec)
 
-    queue_depth = len(queued_entries(cfg))
+    damage: list[RegistryDamage] = []
+    entries = active_entries(cfg, damage=damage, publish_index=False)
+    # Active-only authority keeps preview bounded even after years of job
+    # history.  Terminal dependency rows are the one historical fact needed
+    # by admission, so load only the explicitly referenced identities.
+    known_ids = {entry.job_id for entry in entries}
+    for dependency_id in (
+        spec.after_success,
+        spec.after_complete,
+        spec.after_result,
+    ):
+        if dependency_id is None or dependency_id in known_ids:
+            continue
+        dependency = load(cfg, dependency_id)
+        if dependency is not None:
+            entries.append(dependency)
+            known_ids.add(dependency_id)
+    queue_depth = sum(entry.status == "queued" for entry in entries)
     outcome: str | None = None
     outcome_reason: str | None = None
     reasons: dict[str, str] = {}
     candidates: list[Node] = []
     statuses: list[NodeStatus] = []
 
-    if spec.after_success:
+    from .scheduler import admission_decision
+
+    hypothetical = JobEntry(
+        job_id="__preview__",
+        name=spec.name,
+        center=cfg.center,
+        project=project_name,
+        node="-",
+        node_local=False,
+        job_dir="",
+        session="",
+        cmd=shlex.join(spec.cmd),
+        status="queued",
+        created_at=time.time(),
+        gpus_requested=spec.gpus,
+        min_vram_mib=spec.min_vram_mib,
+        require_path=spec.require_path,
+        require_disk_gib=spec.require_disk_gib,
+        pin_node=spec.node,
+        after_success=spec.after_success,
+        after_complete=spec.after_complete,
+        after_result=spec.after_result,
+        after_result_states=list(spec.after_result_states),
+    )
+    forecast = admission_decision(
+        cfg,
+        hypothetical,
+        [*entries, hypothetical],
+        candidate_node=spec.node or "",
+        registry_damage=len(damage),
+    )
+    if not forecast.allowed:
+        if forecast.state in {"blocked_dependency_false", "blocked_predicate_false"}:
+            outcome = "skip"
+        else:
+            outcome = "reject" if no_queue else "queue"
+        outcome_reason = forecast.reason
+
+    if outcome is None and spec.after_success:
         predecessor = load(cfg, spec.after_success)
         if predecessor is not None and _dependency_settled(predecessor):
             if not _job_succeeded(predecessor):
@@ -3196,12 +3388,12 @@ def preview_submission(
         else:
             outcome = "queue"
             outcome_reason = f"waiting: dependency {spec.after_success}"
-    elif spec.after_complete:
+    elif outcome is None and spec.after_complete:
         predecessor = load(cfg, spec.after_complete)
         if predecessor is None or not _dependency_settled(predecessor):
             outcome = "queue"
             outcome_reason = f"waiting: completion dependency {spec.after_complete}"
-    elif spec.after_result:
+    elif outcome is None and spec.after_result:
         predecessor = load(cfg, spec.after_result)
         if predecessor is None or not _dependency_settled(predecessor):
             expected = ",".join(spec.after_result_states)
@@ -3218,11 +3410,6 @@ def preview_submission(
                     f"dependency {spec.after_result} completed as {result}; "
                     f"expected one of {expected}"
                 )
-
-    cap = cfg.queue.max_my_jobs
-    if outcome is None and cap is not None and running_count(cfg) >= cap:
-        outcome = "reject" if no_queue else "queue"
-        outcome_reason = f"waiting: max_my_jobs={cap} reached"
 
     if outcome is None:
         if spec.node:
@@ -3533,7 +3720,7 @@ def snapshot(
                 meta,
                 spec.setup,
                 env_key,
-                custom_env=spec.custom_env,
+                custom_env=None,
                 runtime_files=runtime_files,
                 layout=cfg.layout,
             ),
@@ -3663,7 +3850,7 @@ def _stage(
         meta,
         spec.setup,
         env_key,
-        custom_env=spec.custom_env,
+        custom_env=None,
         runtime_files=({} if cfg.layout == ROLE_LAYOUT else runtime_files),
         layout=cfg.layout,
     )
@@ -3727,19 +3914,12 @@ def launch(
         "DT_CENTER": cfg.center,
         "DT_NODE": node.name,
         "DT_ENV_MODE": spec.env_mode,
+        "DT_PRIVATE_ENV_STDIN": "1",
     }
-    if spec.dispatch_token is not None:
-        envs["DT_LAUNCH_TOKEN"] = spec.dispatch_token
-    if spec.custom_env:
-        envs["DT_CUSTOM_ENV_PATH"] = f"{control_dir}/custom-env"
     if spec.project:
         envs["DT_ARTIFACT_ROOT"] = artifact_root_rel(spec.project, cfg, node)
     if spec.artifact_manifest:
         envs["DT_ARTIFACT_MANIFEST"] = spec.artifact_manifest
-    if cfg.webhook:
-        envs["DT_WEBHOOK"] = cfg.webhook
-    if cfg.proxy:
-        envs["DT_PROXY"] = cfg.proxy
     if spec.extras:
         envs["DT_EXTRAS"] = " ".join(spec.extras)
     if spec.require_path:
@@ -3805,9 +3985,25 @@ def launch(
         f"{attestation}exec env {env_str} bash "
         f"{node_path_expression(f'{payload_dir}/launcher.sh')}"
     )
+    private_values = dict(spec.custom_env)
+    if spec.dispatch_token is not None:
+        private_values["DT_LAUNCH_TOKEN"] = spec.dispatch_token
+    if cfg.webhook:
+        private_values["DT_WEBHOOK"] = cfg.webhook
+    if cfg.proxy:
+        private_values["DT_PROXY"] = cfg.proxy
+    private_envelope = private_env_mod.encode(
+        cast(Mapping[object, object], private_values)
+    )
     # generous: a first-time uv sync of a torch env can exceed 30 min; on
     # timeout the caller cancels via the sentinel, so no orphan is possible
-    proc = run_on(node.name, node.local, cmd, timeout=3600)
+    proc = run_on(
+        node.name,
+        node.local,
+        cmd,
+        timeout=3600,
+        stdin_bytes=private_envelope,
+    )
     if proc.returncode == 0:
         last = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "{}"
         try:
@@ -3996,14 +4192,22 @@ def _probe_interrupted_queued_launch(
     node_job_dir: str,
 ) -> _RecoveredLaunch:
     try:
-        command = launch_recovery_probe(
+        if entry.dispatch_token is None:
+            raise DispatchError("queued launch recovery has no bound attempt identity")
+        expected_identity = hashlib.sha256(
+            entry.dispatch_token.encode("ascii")
+        ).hexdigest()
+        command = _request_remote_proof_command(
             node_job_dir,
             entry.session,
             layout=entry.storage_layout,
+            expected_identity=expected_identity,
         )
         proc = run_on(node.name, node.local, command, timeout=20)
+    except DispatchError:
+        raise
     except (RemoteError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
-        detail = " ".join(str(exc).split()) or type(exc).__name__
+        detail = " ".join(str(exc).split())[:512] or type(exc).__name__
         raise DispatchError(f"queued launch recovery probe failed: {detail}") from exc
     if proc.returncode != 0:
         detail = diagnostic_excerpt(
@@ -4012,7 +4216,18 @@ def _probe_interrupted_queued_launch(
             fallback=f"exit {proc.returncode}",
         )
         raise DispatchError(f"queued launch recovery probe failed: {detail}")
-    return _parse_launch_recovery(proc.stdout)
+    marker_state, recovered = _parse_request_remote_proof(proc.stdout)
+    if marker_state == "ABSENT" and recovered.state == "NONE":
+        return recovered
+    if marker_state != "MATCH":
+        raise DispatchError(
+            "queued launch recovery marker is missing, unsafe, or mismatched"
+        )
+    if recovered.state not in {"RUNNING", "FINISHED", "UNPROVEN"}:
+        raise DispatchError(
+            "queued launch crossed the remote boundary but runtime state is unproven"
+        )
+    return recovered
 
 
 def _adopt_interrupted_queued_launch(
@@ -4549,6 +4764,18 @@ def _require_submission_references(cfg: HeadConfig, spec: RunSpec) -> None:
             raise ConfigError(f"{label} job {job_id!r} disappeared; resolve and retry")
 
 
+def _finalize_submission_dependencies_locked(cfg: HeadConfig, spec: RunSpec) -> None:
+    """Fence expired lost dependencies while reference locks are already held."""
+    for dependency in dict.fromkeys(
+        (spec.after_success, spec.after_complete, spec.after_result)
+    ):
+        if dependency is None:
+            continue
+        predecessor = load(cfg, dependency)
+        if predecessor is not None:
+            finalize_dependency_terminal_locked(cfg, predecessor)
+
+
 def _submit_fork_locked(
     cfg: HeadConfig,
     source: JobEntry,
@@ -4666,6 +4893,7 @@ def _submit_prepared(
         if dependency is not None:
             raise ConfigError(f"{dependency} requires queueing")
     _require_submission_references(cfg, spec)
+    _finalize_submission_dependencies_locked(cfg, spec)
     # Freeze the effective floor into the job contract. This keeps queued,
     # rerun, and exact-fork behavior stable even if center config changes.
     # A floor of zero stays None: freezing a literal 0 would fail the
@@ -4729,6 +4957,7 @@ def _submit_prepared(
             f"request {request_id!r} was not launched because its durable "
             f"lock could not be acquired: {exc}"
         ) from exc
+    request_owner_token = _HELD_REQUEST_ID.set(request_id)
     try:
         try:
             # Single- and multi-job requests share one public identity
@@ -4785,37 +5014,65 @@ def _submit_prepared(
                 raise RequestRejected(
                     f"request {request_id!r} was already rejected: {detail}"
                 )
-            raise RequestOutcomeUnknown(
-                request_id,
-                record.job_id,
-                f"request {request_id!r} may have been submitted as "
-                f"{record.job_id}; inspect `dt request {request_id} --json` "
-                "before retrying",
-            )
+            if record.state != "replay_authorized":
+                raise RequestOutcomeUnknown(
+                    request_id,
+                    record.job_id,
+                    f"request {request_id!r} may have been submitted as "
+                    f"{record.job_id}; inspect `dt request {request_id} --json` "
+                    "before retrying",
+                )
+            if existing is not None:
+                raise RequestOutcomeUnknown(
+                    request_id,
+                    record.job_id,
+                    f"request {request_id!r} was authorized for replay but job "
+                    f"{record.job_id} appeared; inspect it before retrying",
+                )
 
         # Close the small race in which an incompatible supervisor starts
-        # after the first check but before the durable request claim.
+        # after the first check but before a new or replayed durable claim.
         require_compatible_resident_agent(cfg)
-        job_id = new_job_id(spec.name)
-        record = intent_mod.create(request_id, intent_sha256, job_id)
-        try:
-            intent_mod.save(cfg, record)
-        except intent_mod.RequestDurabilityUnknown as exc:
-            raise RequestOutcomeUnknown(
-                request_id,
-                job_id,
-                f"request {request_id!r} was not launched because its durable "
-                "claim durability is unknown; inspect "
-                f"`dt request {request_id} --json` before retrying",
-            ) from exc
-        except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
-            # The launch boundary has not been crossed. Report a known safe
-            # rejection instead of leaking an OSError/traceback or inviting a
-            # retry whose durable identity was never proven.
-            raise RequestRejected(
-                f"request {request_id!r} was not launched because its durable "
-                f"claim could not be persisted: {exc}"
-            ) from exc
+        if record is None:
+            job_id = new_job_id(spec.name)
+            record = intent_mod.create(request_id, intent_sha256, job_id)
+            try:
+                intent_mod.save(cfg, record)
+            except intent_mod.RequestDurabilityUnknown as exc:
+                raise RequestOutcomeUnknown(
+                    request_id,
+                    job_id,
+                    f"request {request_id!r} was not launched because its durable "
+                    "claim durability is unknown; inspect "
+                    f"`dt request {request_id} --json` before retrying",
+                ) from exc
+            except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+                # The launch boundary has not been crossed. Report a known safe
+                # rejection instead of leaking an OSError/traceback or inviting a
+                # retry whose durable identity was never proven.
+                raise RequestRejected(
+                    f"request {request_id!r} was not launched because its durable "
+                    f"claim could not be persisted: {exc}"
+                ) from exc
+        else:
+            job_id = record.job_id
+            try:
+                record = intent_mod.reclaim_replay(record)
+                intent_mod.save(cfg, record)
+            except (
+                OSError,
+                intent_mod.RequestRecordError,
+                ValueError,
+            ) as exc:
+                # A failed atomic replace may leave either the durable
+                # authorization or the reclaimed preparing state visible.
+                # Both are launch-free, but only a fresh query can prove which.
+                raise RequestOutcomeUnknown(
+                    request_id,
+                    job_id,
+                    f"request {request_id!r} replay claim durability is unknown; "
+                    f"inspect `dt request {request_id} --json` before retrying",
+                ) from exc
         claimed_action_in_progress = claimed_action is not None
         try:
             if claimed_action is not None:
@@ -4871,10 +5128,11 @@ def _submit_prepared(
                 state = "uncertain"
                 error_kind = type(exc).__name__
             try:
+                latest_record = intent_mod.load(cfg, request_id) or record
                 intent_mod.save(
                     cfg,
                     intent_mod.transition(
-                        record,
+                        latest_record,
                         state,
                         error_kind=error_kind,
                         error_message=str(exc),
@@ -4894,7 +5152,8 @@ def _submit_prepared(
                 ) from persistence_exc
             raise
         try:
-            intent_mod.save(cfg, intent_mod.transition(record, "confirmed"))
+            latest_record = intent_mod.load(cfg, request_id) or record
+            intent_mod.save(cfg, intent_mod.transition(latest_record, "confirmed"))
         except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
             raise RequestOutcomeUnknown(
                 request_id,
@@ -4905,6 +5164,7 @@ def _submit_prepared(
             ) from exc
         return entry
     finally:
+        _HELD_REQUEST_ID.reset(request_owner_token)
         lock_context.__exit__(None, None, None)
 
 
@@ -5317,6 +5577,7 @@ def _submit_prepared_once(
         # No launch is live (otherwise the dispatcher would have adopted it),
         # so restore the fail-fast contract without leaving an agent-visible
         # queued row behind.
+        failure_reasons = dict(probe_reasons)
         with job_lock(cfg, pending.job_id):
             current = load(cfg, pending.job_id)
             if (
@@ -5325,6 +5586,8 @@ def _submit_prepared_once(
                 and current.dispatch_node is None
                 and current.dispatch_token is None
             ):
+                if current.placement_failures:
+                    failure_reasons = dict(current.placement_failures)
                 remove_staging(cfg, pending.job_id)
                 remove_record(cfg, pending.job_id)
             elif (
@@ -5342,7 +5605,7 @@ def _submit_prepared_once(
             elif current is not None:
                 pending.__dict__.update(current.__dict__)
                 return pending
-        raise NoCapacity(probe_reasons)
+        raise NoCapacity(failure_reasons)
     if outcome in {"busy", "waiting", "blocked"}:
         return pending
     return pending
@@ -5364,6 +5627,27 @@ def _load_predecessor(
         return None, f"registry row for dependency {dependency} is unreadable"
 
 
+def _finalize_dependency_rows(
+    cfg: HeadConfig,
+    dependencies: Sequence[str | None],
+    *,
+    dependent_job_id: str | None = None,
+) -> None:
+    """Fence expired lost predecessors before an irreversible decision.
+
+    Finalization owns the predecessor lock, so callers invoke this before
+    taking the dependent job lock.  Failure is intentionally deferred: the
+    subsequent read sees an unfenced lost row and keeps the dependent waiting.
+    """
+    for dependency in dict.fromkeys(dependencies):
+        if dependency is None or dependency == dependent_job_id:
+            continue
+        try:
+            finalize_dependency_terminal(cfg, dependency)
+        except (OSError, RegistryError, PrivateStateError, ValueError):
+            continue
+
+
 def dispatch_queued(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -5375,6 +5659,11 @@ def dispatch_queued(
     ``waiting`` is a cheap local dependency wait; ``blocked`` is a
     job-specific placement blocker whose retry re-probes nodes, so the agent
     may back it off. Called by the agent (and tests)."""
+    _finalize_dependency_rows(
+        cfg,
+        (entry.after_success, entry.after_complete, entry.after_result),
+        dependent_job_id=entry.job_id,
+    )
     with job_lock(cfg, entry.job_id):
         current = load(cfg, entry.job_id) or entry
         if current.status != "queued":
@@ -5646,6 +5935,7 @@ def _claim_queued_dispatch_attempt(
     entry: JobEntry,
     spec: RunSpec,
     node: Node,
+    node_job_dir: str,
 ) -> bool:
     """Compare-and-swap ownership of one queued remote launch attempt.
 
@@ -5655,27 +5945,244 @@ def _claim_queued_dispatch_attempt(
     advance through candidates while making every concurrent dispatcher stop
     before synchronization or launch.
     """
+    from .scheduler import admission_decision
+
     expected_token = spec.dispatch_token
     expected_node = entry.dispatch_node if expected_token is not None else None
     token = uuid.uuid4().hex
-    with job_lock(cfg, entry.job_id):
-        current = load(cfg, entry.job_id)
-        if (
-            current is None
-            or current.status != "queued"
-            or current.dispatch_node != expected_node
-            or current.dispatch_token != expected_token
-        ):
-            if current is not None:
+    try:
+        with private_lock(cfg.state_dir() / "scheduler-admission.lock") as acquired:
+            if not acquired:
+                entry.reason = "waiting: scheduler admission lock is busy"
+                return False
+            with job_lock(cfg, entry.job_id):
+                current = load(cfg, entry.job_id)
+                if (
+                    current is None
+                    or current.status != "queued"
+                    or current.dispatch_node != expected_node
+                    or current.dispatch_token != expected_token
+                ):
+                    if current is not None:
+                        entry.__dict__.update(current.__dict__)
+                    return False
+                damage: list[RegistryDamage] = []
+                entries = active_entries(cfg, damage=damage)
+                decision = admission_decision(
+                    cfg,
+                    current,
+                    entries,
+                    candidate_node=node.name,
+                    registry_damage=len(damage),
+                    has_fresh_candidate=True,
+                )
+                if not decision.allowed:
+                    current.reason = f"waiting: {decision.reason}"
+                    save(cfg, current)
+                    entry.__dict__.update(current.__dict__)
+                    return False
+                current.dispatch_node = node.name
+                current.dispatch_token = token
+                current.reason = f"dispatching: {node.name}"
+                save(cfg, current)
                 entry.__dict__.update(current.__dict__)
+    except (OSError, PrivateStateError, RegistryError) as exc:
+        detail = diagnostic_excerpt(str(exc), fallback=type(exc).__name__)
+        entry.reason = f"waiting: scheduler admission unavailable ({detail})"
+        return False
+    if entry.request_id is not None:
+        try:
+            _bind_request_remote_attempt(
+                cfg,
+                entry.request_id,
+                entry.job_id,
+                node=node.name,
+                job_dir=node_job_dir,
+                launch_token=token,
+            )
+        except (
+            OSError,
+            intent_mod.RequestLockError,
+            intent_mod.RequestRecordError,
+            ValueError,
+        ) as exc:
+            detail = diagnostic_excerpt(str(exc), fallback=type(exc).__name__)
+            entry.reason = f"waiting: request launch proof unavailable ({detail})"
             return False
-        current.dispatch_node = node.name
-        current.dispatch_token = token
-        current.reason = f"dispatching: {node.name}"
-        save(cfg, current)
-        entry.__dict__.update(current.__dict__)
     spec.dispatch_token = token
     return True
+
+
+def _bind_request_remote_attempt(
+    cfg: HeadConfig,
+    request_id: str,
+    job_id: str,
+    *,
+    node: str,
+    job_dir: str,
+    launch_token: str,
+) -> None:
+    """Persist an identity-only remote proof locator before remote mutation."""
+
+    def bind() -> None:
+        record = intent_mod.load(cfg, request_id)
+        if record is None or record.job_id != job_id:
+            raise intent_mod.RequestRecordError(
+                "submission request record is missing or belongs to another job"
+            )
+        if record.state == "rejected":
+            raise intent_mod.RequestRecordError(
+                "submission request was rejected before remote launch"
+            )
+        intent_mod.save(
+            cfg,
+            intent_mod.bind_remote_attempt(
+                record,
+                node=node,
+                job_dir=job_dir,
+                launch_token=launch_token,
+            ),
+        )
+
+    if _HELD_REQUEST_ID.get() == request_id:
+        bind()
+        return
+    with intent_mod.lock(cfg, request_id) as acquired:
+        if not acquired:
+            raise intent_mod.RequestLockError("submission request proof lock is busy")
+        bind()
+
+
+def _request_remote_proof_command(
+    job_dir: str,
+    session: str,
+    *,
+    layout: str | None,
+    expected_identity: str,
+) -> str:
+    """Build one read-only, identity-bound remote request probe."""
+    if re.fullmatch(r"[0-9a-f]{64}", expected_identity) is None:
+        raise ValueError("remote launch identity is invalid")
+    marker_path = (
+        f"{job_state_dir(job_dir, layout)}/{intent_mod.REMOTE_LAUNCH_MARKER_NAME}"
+    )
+    marker = node_path_expression(marker_path)
+    marker_probe = (
+        f"DT_RPM={marker}; "
+        f"echo {REQUEST_REMOTE_PROOF_MARK}; "
+        'if [ ! -e "$DT_RPM" ] && [ ! -L "$DT_RPM" ]; then '
+        "echo ABSENT; "
+        'elif [ -f "$DT_RPM" ] && [ ! -L "$DT_RPM" ]; then '
+        'DT_RPM_META=$(stat -c "%u:%a:%s:%h" -- "$DT_RPM" 2>/dev/null) '
+        "|| DT_RPM_META=INVALID; "
+        'DT_RPM_VALUE=$(head -c 66 -- "$DT_RPM" 2>/dev/null '
+        "| tr -d '\\r\\n') || DT_RPM_VALUE=INVALID; "
+        'if [ "$DT_RPM_META" = "$(id -u):600:65:1" ] '
+        f'&& [ "$DT_RPM_VALUE" = {shlex.quote(expected_identity)} ]; then '
+        "echo MATCH; else echo INVALID; fi; "
+        "else echo INVALID; fi"
+    )
+    recovery = launch_recovery_probe(job_dir, session, layout=layout)
+    return f"env LC_ALL=C bash -c {shlex.quote(marker_probe)}; {recovery}"
+
+
+def _parse_request_remote_proof(stdout: str) -> tuple[str, _RecoveredLaunch]:
+    """Parse the last anchored marker/recovery pair from one remote probe."""
+    lines = (stdout or "").splitlines()
+    try:
+        proof_index = max(
+            index
+            for index, line in enumerate(lines)
+            if line == REQUEST_REMOTE_PROOF_MARK
+        )
+        marker_state = lines[proof_index + 1]
+        recovery_index = max(
+            index
+            for index, line in enumerate(lines)
+            if index > proof_index and line == LAUNCH_RECOVERY_MARK
+        )
+    except (IndexError, ValueError) as exc:
+        raise DispatchError("remote launch proof returned no protocol marker") from exc
+    if marker_state not in {"ABSENT", "MATCH", "INVALID"} or recovery_index == 0:
+        raise DispatchError("remote launch proof returned an invalid marker state")
+    recovered = _parse_launch_recovery("\n".join(lines[recovery_index - 1 :]))
+    return marker_state, recovered
+
+
+def inspect_request_remote_proof(
+    cfg: HeadConfig,
+    record: intent_mod.RequestRecord,
+) -> intent_mod.RemoteLaunchProof:
+    """Inspect only the exact configured worker and token-derived marker.
+
+    The remote protocol never prints the marker value.  It compares the
+    expected SHA-256 on-node, then combines that fact with the existing
+    process-identity recovery probe.  Missing proof is replay-safe only when
+    the capsule also has no runtime evidence; every ambiguous state fails
+    closed as ``invalid`` or ``unavailable``.
+    """
+    if (
+        record.proof_requirement != "remote_launch_marker"
+        or record.proof_node is None
+        or record.proof_job_dir is None
+        or record.launch_identity_sha256 is None
+    ):
+        raise intent_mod.RequestRecordError(
+            "submission request has no exact remote proof locator"
+        )
+
+    def proof(outcome: str) -> intent_mod.RemoteLaunchProof:
+        return intent_mod.RemoteLaunchProof(
+            outcome=outcome,
+            node=record.proof_node or "",
+            job_dir=record.proof_job_dir or "",
+            launch_identity_sha256=record.launch_identity_sha256 or "",
+        )
+
+    node = next(
+        (candidate for candidate in cfg.nodes if candidate.name == record.proof_node),
+        None,
+    )
+    if node is None:
+        return proof("unavailable")
+    try:
+        validate_job_capsule(record.proof_job_dir, job_id=record.job_id)
+        expected_job_dir = cfg.worker_job_dir(node, record.job_id)
+    except (ConfigError, ValueError):
+        return proof("invalid")
+    if record.proof_job_dir != expected_job_dir:
+        return proof("invalid")
+    try:
+        command = _request_remote_proof_command(
+            record.proof_job_dir,
+            f"dt_{record.job_id}",
+            layout=cfg.layout,
+            expected_identity=record.launch_identity_sha256,
+        )
+        proc = run_on(
+            node.name,
+            node.local,
+            command,
+            timeout=20,
+            retry_stale_mux=True,
+        )
+    except (RemoteError, OSError, subprocess.TimeoutExpired, ValueError):
+        return proof("unavailable")
+    if proc.returncode != 0:
+        return proof("unavailable" if proc.returncode == 255 else "invalid")
+    try:
+        marker_state, recovered = _parse_request_remote_proof(proc.stdout)
+    except DispatchError:
+        return proof("invalid")
+    if marker_state == "ABSENT" and recovered.state == "NONE":
+        return proof("absent")
+    if marker_state != "MATCH":
+        return proof("invalid")
+    if recovered.state == "RUNNING":
+        return proof("running")
+    if recovered.state == "FINISHED":
+        return proof("finished")
+    return proof("invalid")
 
 
 def _queued_node(cfg: HeadConfig, entry: JobEntry, node: Node) -> Node:
@@ -6181,8 +6688,8 @@ def _dispatch_queued_active(
         _remember_snapshot(cfg, entry.project, node, entry.job_id)
         return observed
 
-    def record_attempt(node: Node, _node_job_dir: str) -> bool:
-        return _claim_queued_dispatch_attempt(cfg, entry, spec, node)
+    def record_attempt(node: Node, node_job_dir: str) -> bool:
+        return _claim_queued_dispatch_attempt(cfg, entry, spec, node, node_job_dir)
 
     try:
         placed, reasons, fatal, failure_kinds = _try_nodes(
@@ -6209,9 +6716,16 @@ def _dispatch_queued_active(
     if placed:
         return finish_placement(placed)
     if "interrupted" in failure_kinds:
-        if entry.status == "queued" and entry.dispatch_node is not None:
-            return "waiting", f"dispatch already active on {entry.dispatch_node}"
+        if entry.status == "queued":
+            if entry.dispatch_node is not None:
+                return "waiting", f"dispatch already active on {entry.dispatch_node}"
+            detail = (
+                entry.reason or "waiting: scheduler admission deferred"
+            ).removeprefix("waiting: ")
+            return "waiting", detail
         return _existing_dispatch_outcome(entry)
+    placement_failures_changed = entry.placement_failures != reasons
+    entry.placement_failures = dict(reasons)
     owned_attempt = (entry.dispatch_node, entry.dispatch_token)
     entry.dispatch_node = None
     entry.dispatch_token = None
@@ -6246,7 +6760,7 @@ def _dispatch_queued_active(
         return "failed", entry.reason
     if failure_kinds == {"unreachable"}:
         waiting_reason = waiting_unreachable_reason(reasons)
-        changed = entry.reason != waiting_reason
+        changed = entry.reason != waiting_reason or placement_failures_changed
         if changed:
             entry.reason = waiting_reason
         current = _commit_queued_transition(
@@ -6262,7 +6776,7 @@ def _dispatch_queued_active(
     if blocked_not_busy(reasons):
         detail = "; ".join(f"{n}: {r}" for n, r in reasons.items())
         blocked_reason = f"blocked: {detail}"
-        changed = entry.reason != blocked_reason
+        changed = entry.reason != blocked_reason or placement_failures_changed
         if changed:
             entry.reason = blocked_reason
         current = _commit_queued_transition(
@@ -6275,8 +6789,12 @@ def _dispatch_queued_active(
             entry.__dict__.update(current.__dict__)
             return _existing_dispatch_outcome(current)
         return "blocked", detail
-    waiting_reason = waiting_capacity_reason({**probe_reasons, **reasons})
-    changed = entry.reason != waiting_reason
+    waiting_reason = (
+        waiting_placement_failure_reason(reasons)
+        if reasons
+        else waiting_capacity_reason(probe_reasons)
+    )
+    changed = entry.reason != waiting_reason or placement_failures_changed
     if changed:
         entry.reason = waiting_reason
     current = _commit_queued_transition(
@@ -6314,7 +6832,7 @@ def clean_jobs(
     *,
     projects: set[str] | None = None,
     before_registry_remove: BeforeRegistryRemove | None = None,
-    authorized: Sequence[JobEntry] | None = None,
+    authorized: Sequence[JobEntry | CleanAuthorization] | None = None,
 ) -> CleanReport:
     """Compatibility wrapper preserving dispatch's injectable SSH seam."""
     return _clean_jobs(

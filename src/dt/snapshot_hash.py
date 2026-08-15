@@ -10,6 +10,10 @@ from pathlib import Path
 
 _SCHEMA = b"dt-snapshot-tree-v1\0"
 _CHUNK_SIZE = 1024 * 1024
+MAX_SNAPSHOT_ENTRIES = 2_000_000
+MAX_SNAPSHOT_BYTES = 1 << 40
+MAX_SNAPSHOT_DEPTH = 256
+MAX_SNAPSHOT_PATH_BYTES = 4096
 
 
 def _bytes_field(value: bytes) -> bytes:
@@ -27,6 +31,7 @@ def tree_sha256(root: Path) -> str:
     root_info = root.lstat()
     if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
         raise NotADirectoryError(root)
+    resolved_root = root.resolve(strict=True)
 
     def _abort(error: OSError) -> None:
         # An unreadable directory must fail the hash outright. Silently
@@ -42,12 +47,20 @@ def tree_sha256(root: Path) -> str:
             discovered.append(parent_path / name)
         for name in filenames:
             discovered.append(parent_path / name)
+        if len(discovered) > MAX_SNAPSHOT_ENTRIES:
+            raise ValueError(f"snapshot exceeds entry budget {MAX_SNAPSHOT_ENTRIES}")
     entries = sorted(
         discovered,
         key=lambda path: os.fsencode(path.relative_to(root).as_posix()),
     )
+    total_bytes = 0
     for path in entries:
-        relative = os.fsencode(path.relative_to(root).as_posix())
+        relative_path = path.relative_to(root)
+        if len(relative_path.parts) > MAX_SNAPSHOT_DEPTH:
+            raise ValueError(f"snapshot path exceeds depth budget: {relative_path}")
+        relative = os.fsencode(relative_path.as_posix())
+        if len(relative) > MAX_SNAPSHOT_PATH_BYTES:
+            raise ValueError(f"snapshot path exceeds byte budget: {relative_path}")
         metadata = path.lstat()
         mode = stat.S_IMODE(metadata.st_mode)
         if stat.S_ISDIR(metadata.st_mode):
@@ -56,9 +69,28 @@ def tree_sha256(root: Path) -> str:
         elif stat.S_ISREG(metadata.st_mode):
             kind = b"f"
             payload_size = metadata.st_size
+            total_bytes += payload_size
+            if total_bytes > MAX_SNAPSHOT_BYTES:
+                raise ValueError(
+                    f"snapshot exceeds regular-file byte budget {MAX_SNAPSHOT_BYTES}"
+                )
         elif stat.S_ISLNK(metadata.st_mode):
             kind = b"l"
-            target = os.fsencode(os.readlink(path))
+            target_text = os.readlink(path)
+            if os.path.isabs(target_text):
+                raise ValueError(f"snapshot symlink has an absolute target: {path}")
+            try:
+                resolved_target = (path.parent / target_text).resolve(strict=True)
+                resolved_target.relative_to(resolved_root)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ValueError(
+                    f"snapshot symlink is broken or escapes the root: {path}"
+                ) from exc
+            if os.readlink(path) != target_text:
+                raise OSError(f"snapshot symlink changed while hashing: {path}")
+            target = os.fsencode(target_text)
+            if len(target) > MAX_SNAPSHOT_PATH_BYTES:
+                raise ValueError(f"snapshot symlink target is too long: {path}")
             payload_size = len(target)
         else:
             raise ValueError(f"unsupported snapshot entry type: {path}")
@@ -68,7 +100,11 @@ def tree_sha256(root: Path) -> str:
         digest.update(_bytes_field(relative))
         digest.update(payload_size.to_bytes(8, "big"))
         if kind == b"f":
-            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            flags = (
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0)
+            )
             descriptor = os.open(path, flags)
             try:
                 opened = os.fstat(descriptor)

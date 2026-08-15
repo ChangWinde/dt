@@ -53,11 +53,12 @@ paths, undeclared remote side effects, or a transparent shared filesystem.
 
 Every CLI process also writes a bounded `dt_operation_event_v1` start/finish
 trace. Laptop and head traces are linked by a generated parent operation ID.
-The private journal records command categories, timing, build, exit status, and
-redacted problem fingerprints, never raw arguments or exception messages. It is
-an operation index over the authoritative request, registry, job, and agent
-evidence, not a tamper-proof audit system. `dt events` exposes its bounded query
-contract; ADR 0016 defines the security and retention boundary.
+The private journal records command categories, timing, build, exit status,
+optional request/job correlation, and redacted problem fingerprints, never raw
+arguments or exception messages. It is an operation index over the
+authoritative request, registry, job, and agent evidence, not a tamper-proof
+audit system. `dt events` exposes its bounded query contract; ADR 0016 defines
+the security and retention boundary.
 
 The head registry is the lifecycle source of truth. A separate durable request
 store binds an optional caller request ID and normalized intent digest to one
@@ -76,9 +77,10 @@ single-job launch boundary. A registered job contains:
 
 The resident agent reconciles queued and running entries. A restartable user
 systemd service is preferred, with a visible cron compatibility fallback; its
-heartbeat distinguishes an owned lock from a responsive scheduler. Runtime
-tmux servers enter independent user scopes when available so stopping an
-invoking service does not inherit ownership of active jobs.
+heartbeat distinguishes an owned lock from a responsive scheduler. GPU runtime
+is stricter than agent supervision: every GPU job requires a proved independent
+user scope and `Linger=yes`, so logout cannot tear down its user manager. CPU
+jobs retain a visibly weaker portable tmux path.
 
 The agent resolves dependencies before probing GPU capacity. Dependencies can
 require success, any terminal completion, or selected typed result states. A
@@ -116,16 +118,19 @@ Each job owns:
 ```text
 code/                   writable working copy of the immutable source snapshot
 logs/                   setup and application logs
-outputs/                recoverable application and DistTrainer evidence
+outputs/                recoverable application outputs (application-owned)
 .dt/meta.json           dispatch contract
 .dt/command.sh          normalized application command
 .dt/payload/            attested node runtime
 .dt/state/              process, GPU, timestamp, and terminal markers
+.dt/evidence/           DT-owned result, lifecycle, guard, phase, and telemetry
 ```
 
-Managed pulls copy `outputs/` and the recovery record to the head results root.
-Compaction can remove an old private `code/` copy only after validating its
-content-addressed recovery snapshot.
+Managed pulls exclude `outputs/dt/`, copy application outputs with special
+files disabled, then recover only a fixed, schema-validated allowlist from
+`.dt/evidence/`. This prevents application-writable files from impersonating
+DT lifecycle evidence. Compaction can remove an old private `code/` copy only
+after validating its content-addressed recovery snapshot.
 
 ### Site-aware snapshot distribution
 

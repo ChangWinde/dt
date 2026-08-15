@@ -16,13 +16,23 @@ The agent owns queue reconciliation and dispatch. It does not invent
 experiments. When stopped, running jobs continue and queued jobs remain
 registered.
 
-On a usable user systemd manager, installation creates
+Installation creates
 `disttrainer-agent.service` with `Restart=always`. Runtime tmux creation enters
 an independent user scope so stopping the agent's invoking service does not
 take running jobs with it. `agent status --json` reports the supervisor,
-heartbeat age, and user-lingering state. If lingering is disabled, enable it
-through the host's normal administrator policy so the user manager survives
-logout. Crontab remains a reported compatibility fallback only.
+heartbeat age, and user-lingering state. GPU jobs fail closed before user code
+unless the worker proves both a usable user systemd scope and `Linger=yes`;
+CPU jobs (`-g 0`) retain the explicitly weaker portable fallback. Verify and,
+under the host's administrator policy, enable the GPU lifecycle with:
+
+```bash
+systemd-run --user --scope true
+loginctl show-user "$USER" -p Linger --value
+sudo loginctl enable-linger "$USER"  # administrator action when required
+```
+
+Crontab remains an agent-supervisor compatibility fallback only; it does not
+provide the per-job containment required for GPU execution.
 Unit installation is atomic: a reload or enable failure restores the prior
 unit, while a first-time failure removes the candidate and reloads the user
 manager. An install error therefore must be investigated; it is never evidence
@@ -38,6 +48,10 @@ recovery commands remain usable during this upgrade boundary. When no agent is
 alive, `dt` also verifies the active command's bounded protocol advertisement
 before starting the installed supervisor; an old stopped service is left
 stopped and queued work remains durable.
+The advertisement also reports the supported registry schema and whether a
+versioned registry envelope is present, absent, or cannot be proved. Deployment
+treats an unproven state as authority: it will not activate or start a retained
+release that lacks the advertised schema and current dispatch protocol.
 
 Queue limits, nodes, projects, routes, and other operational settings reload on
 the next poll. `center`, `paths.root`, and the runtime layout are agent identity,
@@ -101,6 +115,7 @@ dt ps
 dt ps --watch
 dt watch JOB
 dt info JOB
+dt diagnose JOB --json
 dt logs JOB -f
 dt metrics JOB
 ```
@@ -125,6 +140,12 @@ Use `dt info JOB --json` instead of parsing table output. The `snapshot_sha256`
 field distinguishes exact source trees, including dirty snapshots that share a
 Git commit.
 
+Use `dt diagnose JOB --json` when one caller needs correlated evidence rather
+than separate command responses. Its fixed 64 KiB contract qualifies every
+source with completeness, freshness, and an omission reason; unavailable
+nodes, absent telemetry, damaged journals, and budget truncation stay explicit.
+Facts never blend with inferences, and suggested actions remain argv arrays.
+
 ## Failure recovery
 
 Artifact, seed, and pull transfers accept 0-10 retries after the first
@@ -135,6 +156,7 @@ partials remain resumable on a later explicit invocation.
 Start with:
 
 ```bash
+dt diagnose JOB --json
 dt events --issues
 dt info JOB
 dt logs JOB -n 200
@@ -145,7 +167,8 @@ dt wait JOB
 role, build, timing, exit state, and a stable problem classification. On a
 laptop the default is the private laptop journal; add `-c CENTER` to inspect
 the authoritative head-side invocation. Use an operation ID to correlate the
-two sides. The journal intentionally excludes command arguments, exception
+two sides, or filter finish evidence directly with `--request-id` or
+`--job-id`. The journal intentionally excludes command arguments, exception
 messages, environment variables, hostnames, and usernames.
 
 An operation-journal warning means the command continued without complete
@@ -371,12 +394,23 @@ Cleanup removes old terminal jobs and optional managed data:
 ```bash
 dt clean --before 2026-07-01 --plan
 dt clean --before 2026-07-01 -p smoke --plan
-dt clean --before 2026-07-01 --results --envs --plan
+dt clean --before 2026-07-01 --results --plan --json
+dt clean --inspect-plan PLAN_ID --offset 0 --limit 100 --json
+dt clean --apply-plan PLAN_ID -y
+dt clean --before 2026-07-01 --envs -y
 dt clean --before 2026-07-01 --deployments -y
 ```
 
-Review the exact plan before adding `-y`. Project filters are repeatable.
-Active dependency chains protect predecessor outputs from premature cleanup.
+The durable job/result plan expires after 24 hours and is capped at 200,000
+identities or 64 MiB. `--plan --json` returns only its first bounded page;
+follow `page.next_offset` with `--inspect-plan` to enumerate the immutable
+sequence of jobs followed by managed results. `--offset` and `--limit` never
+change deletion authority and are rejected with `--apply-plan`. Applying can
+drop a candidate whose identity or references changed, but cannot add a
+candidate that became eligible later. Project filters are repeatable.
+Environment and deployment sweeps require an immediate confirmation because
+their exact candidate identities are not yet exposed. Active dependency chains
+protect predecessor outputs from premature cleanup.
 
 `--deployments` sweeps `releases/`, deploy staging, and tool installations
 older than the cutoff on every configured node. The release `current` points
@@ -402,8 +436,11 @@ Run one bounded CPU-only canary, then one authorized bounded GPU canary before
 broad use. Preserve the job IDs and `dt info --json` outputs with the upgrade
 record.
 
-The head row's `registry` check reports how many job records every command
-must scan. Past a few thousand rows the label turns to `large:` and names
-the lever: set `queue.auto_clean_days` to retire ended jobs on a schedule,
-or run `dt clean` once. dt never retires experiment history on its own — an
-unset retention means unbounded growth by choice, not by accident.
+The head row's `registry` check reports how much job history is retained.
+Active scheduling, status, `free`, and the default active `ps` view use the
+derived active index instead of scanning terminal history. Past a few thousand
+rows the label turns to `large:` because historical views, maintenance,
+storage, and a cold index rebuild still scale with retained history. Set
+`queue.auto_clean_days` to retire ended jobs on a schedule, or run `dt clean`
+once. dt never retires experiment history on its own — an unset retention
+means unbounded growth by choice, not by accident.

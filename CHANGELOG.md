@@ -8,6 +8,30 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Added
 
+- `dt diagnose JOB [--json]` correlates job, request, operation, agent, node,
+  queue, log, telemetry, result, and transfer evidence in a fixed 64 KiB
+  envelope. Every section reports completeness, freshness, and omission;
+  facts, inferences, and typed argv actions remain separate, and the human
+  view is rendered from the same model.
+
+- `dt request ID --json` now resolves interrupted single-job submissions to a
+  typed disposition using the durable registry plus an identity-bound remote
+  launch proof. A proven pre-launch interruption becomes a durable,
+  single-flight replay authorization for the same intent and request id;
+  in-progress, confirmed, and inspection-required outcomes remain distinct.
+  Launch hashes and private capsule paths are never exposed. `dt events` can
+  filter correlated evidence directly with `--request-id` or `--job-id`.
+
+- `dt clean --plan` now persists a 24-hour, exact job/result authorization of
+  up to 200,000 identities; its JSON preview is bounded. Enumerate the
+  immutable authorization with `dt clean --inspect-plan PLAN_ID --offset N
+  --limit N --json`. Applying a plan may shrink that set after locked
+  revalidation but can never delete a candidate the operator did not review.
+
+- `dt doctor --json` now emits `dt_doctor_v2` with typed issues, severity,
+  facts, summary, and machine-executable or config-edit actions. Human next
+  steps are rendered from the same model.
+
 - GPU submissions accept `--min-vram-mib N`: every selected card must expose
   at least `N` MiB of total memory. The constraint persists through queueing,
   replay, `rerun`, and `fork`, appears in plans and JSON explanations, and
@@ -60,11 +84,12 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   artifact's project-relative layout so the LAN replay preserves the exact
   file/directory semantics of a direct push. `--plan` never stages.
 
-- `dt doctor` reports a `registry` check on the head: how many job records
-  every command must scan, and past a few thousand rows which lever to
-  reach for (`queue.auto_clean_days` or `dt clean`). It is advisory and
-  never fails the health check — dt does not retire experiment history on
-  its own.
+- `dt doctor` reports a `registry` check on the head: how much history is
+  retained and, past a few thousand rows, which lever to use
+  (`queue.auto_clean_days` or `dt clean`). Active scheduling and observation
+  use the derived active index; the advisory covers historical operations,
+  maintenance, storage, and cold index rebuilds. It never fails the health
+  check, and dt does not retire experiment history on its own.
 
 - `dt clean --deployments` garbage-collects old release trees, staging
   directories, and installations, never touching the live release or the
@@ -78,6 +103,30 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   laptop, and `dt ps --active` is now a documented filter.
 
 ### Changed
+
+- Runtime evidence is separated under the control capsule's `.dt/evidence/`
+  path, which is not exported to the application environment. Pull excludes
+  application `outputs/dt/`, disables special-file materialization, validates
+  a fixed evidence allowlist, and reports provenance without claiming a
+  hostile same-UID attestation boundary.
+
+- GPU jobs now start only after the worker proves an independent user systemd
+  scope and `loginctl Linger=yes`; unavailable lifecycle proof fails before
+  user code as `infra_failure`. CPU-only jobs retain the portable fallback.
+  Cache-clone mode also behavior-probes its user/mount namespace and rejects
+  escaping links, special files, or content drift before cloning.
+
+- Telemetry aggregation runs node-side with bounded memory and reports whether
+  the requested window is complete. Positive tails scan only a bounded suffix;
+  `--tail 0` no longer depends on a bounded transport capture of raw history.
+
+- Agent status, ordinary `free`, active `ps`, queue/watch context, and registry
+  recovery use a crash-rebuildable active index instead of materializing
+  terminal history. Derived-index writes are revision-fenced against concurrent
+  registry mutations.
+
+- CI treats unhandled test-thread exceptions as failures and requires the real
+  loopback SSH/rsync relay E2E harness on both supported Python versions.
 
 - An alive queue agent must advertise the same durable dispatch protocol as
   the submitting CLI, and a stopped supervisor is restarted only when its
@@ -119,6 +168,17 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- Registry-envelope compatibility now participates in the dispatch protocol.
+  Deployment and rollback inspect the verified target wheel before activation,
+  so a retained release that cannot read the current authoritative registry is
+  rejected before the command marker or queue agent changes; automatic rollback
+  cannot start an incompatible scheduling authority.
+
+- A very short local CPU task no longer lets wrapper cleanup mistake the still
+  returning launcher for an escaped workload process. Successful launches keep
+  their terminal result instead of being reported as `no_capacity`, and genuine
+  launch failures retain their bounded placement diagnostic.
+
 - Queue-agent placement preserves the durable `request_id` when a queued row
   becomes running or finished, so `dt info` keeps the same idempotency lineage
   as `dt request` after delayed dispatch.
@@ -136,6 +196,11 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   compare-and-swap attempt owner. A contender cannot replace the recovery
   token or launch a second process, and `--no-queue` never deletes a row while
   another dispatcher owns an in-flight launch.
+
+- Concurrent registry writers serialize the derived active-index
+  read-modify-write. Two unrelated submissions can no longer publish a
+  revision-current index that omits one queued job; cold rebuild publication
+  remains revision-fenced without holding the lock during its history scan.
 
 - Formal release qualification confines bootstrap activation metadata to its
   temporary workspace. Testing a wheel no longer rewrites the operator's

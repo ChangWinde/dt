@@ -921,6 +921,271 @@ def test_clean_treats_unprovable_liveness_as_refusal(tmp_path):
     assert load(cfg, "blind") is not None
 
 
+def test_durable_clean_plan_round_trips_exact_authority_and_expires(tmp_path):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry("planned", "finished", created_at=1.0, node="n1", node_local=True),
+    )
+    selected = load(cfg, "planned")
+    assert selected is not None
+
+    plan = maintenance.create_clean_plan(
+        cfg,
+        [selected],
+        managed_identity={"projects": ["p"], "cutoff_ts": 100.0},
+        now=10.0,
+    )
+    restored = maintenance.load_clean_plan(cfg, plan.plan_id, now=20.0)
+
+    assert restored == plan
+    assert restored.jobs == (maintenance.CleanAuthorization.from_entry(selected),)
+    record = cfg.control_state_dir() / "clean-plans" / f"{plan.plan_id}.json"
+    assert record.stat().st_mode & 0o777 == 0o600
+    assert json.loads(record.read_text(encoding="utf-8"))["schema_version"] == (
+        maintenance.CLEAN_PLAN_SCHEMA_VERSION
+    )
+    with pytest.raises(maintenance.CleanPlanError, match="expired"):
+        maintenance.load_clean_plan(cfg, plan.plan_id, now=plan.expires_at)
+
+    future = json.loads(record.read_text(encoding="utf-8"))
+    future["schema_version"] = "dt_clean_plan_v99"
+    record.write_text(json.dumps(future), encoding="utf-8")
+    with pytest.raises(maintenance.CleanPlanError, match="schema is unsupported"):
+        maintenance.load_clean_plan(cfg, plan.plan_id, now=20.0)
+
+
+def test_clean_plan_rejects_duplicate_fields_at_every_depth(tmp_path):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    selected = _entry(
+        "duplicate-plan",
+        "finished",
+        created_at=1.0,
+        node="n1",
+        node_local=True,
+    )
+    plan = maintenance.create_clean_plan(
+        cfg,
+        [selected],
+        managed_identity={"cutoff_ts": 100.0},
+        now=10.0,
+    )
+    record = cfg.control_state_dir() / "clean-plans" / f"{plan.plan_id}.json"
+    original = record.read_text(encoding="utf-8")
+    tampered_documents = (
+        original.replace(
+            '"center":"test"',
+            '"center":"test","center":"test"',
+            1,
+        ),
+        original.replace(
+            '"cutoff_ts":100.0',
+            '"cutoff_ts":100.0,"cutoff_ts":100.0',
+            1,
+        ),
+    )
+
+    for tampered in tampered_documents:
+        assert tampered != original
+        record.write_text(tampered, encoding="utf-8")
+        with pytest.raises(maintenance.CleanPlanError, match="malformed"):
+            maintenance.load_clean_plan(cfg, plan.plan_id, now=20.0)
+
+
+def test_clean_plan_authorization_only_shrinks_after_registry_change(tmp_path):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry("changed", "finished", created_at=1.0, node="n1", node_local=True),
+    )
+    selected = load(cfg, "changed")
+    assert selected is not None
+    plan = maintenance.create_clean_plan(cfg, [selected], now=10.0)
+
+    current = load(cfg, "changed")
+    assert current is not None
+    current.reason = "changed after preview"
+    save(cfg, current)
+
+    report = maintenance.clean_jobs(
+        cfg,
+        cutoff_ts=100.0,
+        envs=False,
+        log=lambda _message: None,
+        runner=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("changed authorization must stop before remote deletion")
+        ),
+        authorized=maintenance.load_clean_plan(
+            cfg,
+            plan.plan_id,
+            now=20.0,
+        ).jobs,
+    )
+
+    assert report.removed == 0
+    assert [failure.kind for failure in report.failures] == ["state_changed"]
+    assert load(cfg, "changed") is not None
+
+
+def test_clean_plan_rejects_oversized_or_lossy_generic_identity(tmp_path, monkeypatch):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    with pytest.raises(maintenance.CleanPlanError, match="lossless JSON"):
+        maintenance.create_clean_plan(
+            cfg,
+            [],
+            managed_identity={"tuple": ("not", "json")},
+        )
+    with pytest.raises(maintenance.CleanPlanError, match="identity exceeds"):
+        maintenance.create_clean_plan(
+            cfg,
+            [
+                maintenance.CleanAuthorization(
+                    job_id="huge",
+                    node="n1",
+                    node_local=True,
+                    job_dir="x" * (70 * 1024),
+                    storage_layout=None,
+                    updated_at=1.0,
+                )
+            ],
+        )
+    monkeypatch.setattr(maintenance, "MAX_CLEAN_PLAN_BYTES", 4096)
+    with pytest.raises(maintenance.CleanPlanError, match="size limit"):
+        maintenance.create_clean_plan(
+            cfg,
+            [],
+            managed_identity={"oversized": "x" * maintenance.MAX_CLEAN_PLAN_BYTES},
+        )
+
+
+def test_clean_plan_enforces_an_explicit_identity_count_limit(tmp_path, monkeypatch):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(maintenance, "MAX_CLEAN_PLAN_ITEMS", 1)
+    jobs = [
+        maintenance.CleanAuthorization(
+            job_id=f"job-{index}",
+            node="n1",
+            node_local=True,
+            job_dir=f"dt/jobs/job-{index}",
+            storage_layout=None,
+            updated_at=float(index),
+        )
+        for index in range(2)
+    ]
+
+    with pytest.raises(maintenance.CleanPlanError, match="item limit"):
+        maintenance.create_clean_plan(cfg, jobs)
+
+
+def test_clean_plan_propagates_unknown_durability(tmp_path, monkeypatch):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+
+    def fail_write(*_args, **_kwargs):
+        raise maintenance.PrivateStateError("injected fsync failure")
+
+    monkeypatch.setattr(maintenance, "atomic_write", fail_write)
+
+    with pytest.raises(maintenance.CleanPlanError, match="persisted durably"):
+        maintenance.create_clean_plan(cfg, [], now=10.0)
+
+
+def test_clean_plan_supports_one_hundred_thousand_exact_job_authorizations(tmp_path):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    authorizations = [
+        maintenance.CleanAuthorization(
+            job_id=f"job-{index:06d}",
+            node="n1",
+            node_local=True,
+            job_dir=f"dt/jobs/job-{index:06d}",
+            storage_layout=None,
+            updated_at=float(index),
+        )
+        for index in range(100_000)
+    ]
+
+    plan = maintenance.create_clean_plan(cfg, authorizations, now=10.0)
+    restored = maintenance.load_clean_plan(cfg, plan.plan_id, now=20.0)
+    record = cfg.control_state_dir() / "clean-plans" / f"{plan.plan_id}.json"
+
+    assert len(restored.jobs) == 100_000
+    assert restored.jobs[0].job_id == "job-000000"
+    assert restored.jobs[-1].job_id == "job-099999"
+    assert 4 * 1024 * 1024 < record.stat().st_size <= maintenance.MAX_CLEAN_PLAN_BYTES
+
+
+def test_clean_plan_page_enumerates_jobs_and_results_without_gaps(tmp_path):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    jobs = [
+        maintenance.CleanAuthorization(
+            job_id=f"job-{index}",
+            node="n1",
+            node_local=True,
+            job_dir=f"dt/jobs/job-{index}",
+            storage_layout=None,
+            updated_at=float(index),
+        )
+        for index in range(5)
+    ]
+    results = [
+        {
+            "job_id": f"job-{index}",
+            "path": f"/tmp/results/job-{index}",
+            "device": 1,
+            "inode": index + 1,
+        }
+        for index in range(3)
+    ]
+    plan = maintenance.create_clean_plan(
+        cfg,
+        jobs,
+        managed_identity={"managed_results": results},
+        now=10.0,
+    )
+
+    observed = []
+    offset = 0
+    while True:
+        page = maintenance.clean_plan_page(plan, offset=offset, limit=3)
+        observed.extend(page.items)
+        if page.next_offset is None:
+            break
+        offset = page.next_offset
+
+    assert [item.index for item in observed] == list(range(8))
+    assert [item.kind for item in observed] == ["job"] * 5 + ["managed_result"] * 3
+    assert [item.identity["job_id"] for item in observed] == [
+        "job-0",
+        "job-1",
+        "job-2",
+        "job-3",
+        "job-4",
+        "job-0",
+        "job-1",
+        "job-2",
+    ]
+    assert maintenance.clean_plan_page(plan, offset=8, limit=3).items == ()
+    with pytest.raises(maintenance.CleanPlanError, match="offset"):
+        maintenance.clean_plan_page(plan, offset=9, limit=3)
+    with pytest.raises(maintenance.CleanPlanError, match="limit"):
+        maintenance.clean_plan_page(plan, offset=0, limit=0)
+
+
 def test_clean_census_refuses_live_capsule_orphan_and_allows_quiet_one(tmp_path):
     # Real census: a live process whose cwd is inside the capsule blocks the
     # rm -rf even though the row is terminal and records no pgid; once the
@@ -1069,9 +1334,12 @@ def test_dependency_settled_treats_recoverable_lost_as_pending():
     # Inside the recovery window a lost predecessor is not yet settled, so a
     # dependent must keep waiting instead of being permanently skipped.
     assert _dependency_settled(lost, now=1000.0 + 10) is False
-    # Once the window closes and it is still lost, it settles as an infra
-    # failure and the dependent can be finalized.
-    assert _dependency_settled(lost, now=1000.0 + LOST_RECOVERY_WINDOW_S + 1) is True
+    # Expiry alone is not an irreversible fact. The dispatcher must first
+    # persist the terminal fence while holding the predecessor lock.
+    after_window = 1000.0 + LOST_RECOVERY_WINDOW_S + 1
+    assert _dependency_settled(lost, now=after_window) is False
+    lost.terminal_finalized_at = after_window
+    assert _dependency_settled(lost, now=after_window) is True
 
     finished = _entry("prev-done", "finished", created_at=1.0, exit_code=0)
     assert _dependency_settled(finished, now=1e12) is True
@@ -1609,7 +1877,8 @@ def test_clean_results_plan_then_removes_only_identity_verified_managed_pull(
     )
 
     assert preview.exit_code == 0, preview.output
-    assert "1 identity-verified managed results" in preview.output
+    assert "1 identity-verified" in preview.output
+    assert "managed results" in preview.output
     assert owned.is_dir()
     assert unowned.is_dir()
     assert load(cfg, old.job_id) is not None
@@ -1623,6 +1892,63 @@ def test_clean_results_plan_then_removes_only_identity_verified_managed_pull(
     assert not owned.exists()
     assert unowned.is_dir()
     assert load(cfg, old.job_id) is None
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        '{"job_id":"old-done","job_id":"old-done"}\n',
+        '{"job_id":"../old-done"}\n',
+    ],
+)
+def test_managed_result_invalid_identity_never_authorizes_deletion(tmp_path, record):
+    cfg = _cfg(tmp_path)
+    result = cfg.results_dir() / "old-done"
+    (result / "dt").mkdir(parents=True)
+    (result / "dt" / "job.json").write_text(record)
+    (result / "keep.txt").write_text("user data\n")
+
+    assert cli._owned_managed_results(cfg, {"old-done"}) == []
+    assert result.is_dir()
+    assert (result / "keep.txt").read_text() == "user data\n"
+
+
+def test_pull_refuses_duplicate_matching_destination_record_before_remote_access(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    entry = _entry(
+        "pull-job",
+        "finished",
+        created_at=1.0,
+        node="n1",
+        node_local=True,
+    )
+    destination = tmp_path / "existing-result"
+    (destination / "dt").mkdir(parents=True)
+    (destination / "dt" / "job.json").write_text(
+        '{"job_id":"pull-job","job_id":"pull-job"}\n'
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("untrusted destination must fail before remote access")
+        ),
+    )
+
+    pulled = CliRunner().invoke(
+        cli.app,
+        ["pull", entry.job_id, "--to", str(destination), "--json"],
+    )
+
+    assert pulled.exit_code == 1
+    payload = json.loads(pulled.stdout)
+    assert payload["error"] == "destination_conflict"
+    assert payload["existing_job_id"] is None
+    assert "unreadable dt/job.json" in payload["message"]
 
 
 def test_clean_json_emits_versioned_plan_and_apply_envelopes(tmp_path, monkeypatch):
@@ -1659,6 +1985,264 @@ def test_clean_json_emits_versioned_plan_and_apply_envelopes(tmp_path, monkeypat
     assert apply_payload["removed_jobs"] == 1
     assert apply_payload["failures"] == []
     assert load(cfg, "old-done") is None
+
+
+def test_clean_plan_json_is_bounded_and_inspection_is_stably_paginated(
+    tmp_path, monkeypatch
+):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    victims = [
+        _entry(f"old-{index:04d}", "finished", created_at=float(index + 1))
+        for index in range(500)
+    ]
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr("dt.dispatch.clean_job_victims", lambda *_args, **_kw: victims)
+
+    preview = CliRunner().invoke(
+        cli.app, ["clean", "--before", "1970-01-02", "--plan", "--json"]
+    )
+
+    assert preview.exit_code == 0, preview.output
+    assert len(preview.stdout.encode("utf-8")) <= maintenance.MAX_CLEAN_PLAN_PAGE_BYTES
+    payload = json.loads(preview.stdout)
+    assert payload["eligible_jobs"] == 500
+    assert payload["page"] == {
+        "offset": 0,
+        "limit": maintenance.DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
+        "returned": maintenance.DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
+        "total": 500,
+        "next_offset": maintenance.DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
+    }
+    assert len(payload["jobs"]) == maintenance.DEFAULT_CLEAN_PLAN_PAGE_ITEMS
+
+    plan_id = payload["plan_id"]
+    seen: list[tuple[int, str, str]] = []
+    offset = 0
+    while True:
+        inspected = CliRunner().invoke(
+            cli.app,
+            [
+                "clean",
+                "--inspect-plan",
+                plan_id,
+                "--offset",
+                str(offset),
+                "--limit",
+                "73",
+                "--json",
+            ],
+        )
+        assert inspected.exit_code == 0, inspected.output
+        assert len(inspected.stdout.encode("utf-8")) <= (
+            maintenance.MAX_CLEAN_PLAN_PAGE_BYTES
+        )
+        page_payload = json.loads(inspected.stdout)
+        seen.extend(
+            (item["index"], item["kind"], item["job_id"])
+            for item in [*page_payload["jobs"], *page_payload["managed_results"]]
+        )
+        next_offset = page_payload["page"]["next_offset"]
+        if next_offset is None:
+            break
+        offset = next_offset
+
+    assert seen == [(index, "job", f"old-{index:04d}") for index in range(500)]
+
+
+def test_clean_plan_pagination_options_never_change_apply_authority(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("authorized", "finished", created_at=1.0))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    preview = CliRunner().invoke(
+        cli.app, ["clean", "--before", "1970-01-02", "--plan", "--json"]
+    )
+    assert preview.exit_code == 0, preview.output
+    plan_id = json.loads(preview.stdout)["plan_id"]
+
+    for page_option in (["--offset", "0"], ["--limit", "100"]):
+        rejected = CliRunner().invoke(
+            cli.app,
+            ["clean", "--apply-plan", plan_id, *page_option, "-y", "--json"],
+        )
+
+        assert rejected.exit_code == 1
+        assert json.loads(rejected.stdout)["error"] == "invalid_argument"
+        assert load(cfg, "authorized") is not None
+
+
+def test_clean_inspect_plan_page_crosses_from_jobs_to_managed_results(
+    tmp_path, monkeypatch
+):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    plan = maintenance.create_clean_plan(
+        cfg,
+        [
+            maintenance.CleanAuthorization(
+                job_id=f"job-{index}",
+                node="n1",
+                node_local=True,
+                job_dir=f"dt/jobs/job-{index}",
+                storage_layout=None,
+                updated_at=float(index),
+            )
+            for index in range(3)
+        ],
+        managed_identity={
+            "managed_results": [
+                {
+                    "job_id": f"job-{index}",
+                    "path": f"/tmp/results/job-{index}",
+                    "device": 1,
+                    "inode": index + 1,
+                }
+                for index in range(2)
+            ]
+        },
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    inspected = CliRunner().invoke(
+        cli.app,
+        [
+            "clean",
+            "--inspect-plan",
+            plan.plan_id,
+            "--offset",
+            "2",
+            "--limit",
+            "3",
+            "--json",
+        ],
+    )
+
+    assert inspected.exit_code == 0, inspected.output
+    payload = json.loads(inspected.stdout)
+    assert [(item["index"], item["kind"]) for item in payload["jobs"]] == [(2, "job")]
+    assert [(item["index"], item["kind"]) for item in payload["managed_results"]] == [
+        (3, "managed_result"),
+        (4, "managed_result"),
+    ]
+    assert payload["page"]["next_offset"] is None
+
+
+def test_clean_inspect_plan_human_output_has_a_fixed_line_bound(tmp_path, monkeypatch):
+    import dt.maintenance as maintenance
+
+    cfg = _cfg(tmp_path)
+    plan = maintenance.create_clean_plan(
+        cfg,
+        [
+            maintenance.CleanAuthorization(
+                job_id=f"job-{index}",
+                node="n1",
+                node_local=True,
+                job_dir=f"dt/jobs/job-{index}",
+                storage_layout=None,
+                updated_at=float(index),
+            )
+            for index in range(100)
+        ],
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    inspected = CliRunner().invoke(cli.app, ["clean", "--inspect-plan", plan.plan_id])
+
+    assert inspected.exit_code == 0, inspected.output
+    assert len(inspected.output.splitlines()) <= 25
+
+
+def test_laptop_clean_forwards_read_only_plan_pagination_without_a_tty(monkeypatch):
+    from dt.config import LaptopConfig
+
+    cfg = LaptopConfig(centers={"test": "head"}, default_center="test")
+    forwarded = []
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "forward_call",
+        lambda head, argv, tty: forwarded.append((head, argv, tty)) or 0,
+    )
+    plan_id = "a" * 32
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "clean",
+            "--inspect-plan",
+            plan_id,
+            "--offset",
+            "7",
+            "--limit",
+            "11",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert forwarded == [
+        (
+            "head",
+            [
+                "clean",
+                "--inspect-plan",
+                plan_id,
+                "--offset",
+                "7",
+                "--limit",
+                "11",
+                "--json",
+            ],
+            False,
+        )
+    ]
+
+
+def test_clean_apply_plan_never_expands_to_a_newly_eligible_job(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("authorized", "finished", created_at=1.0))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    preview = CliRunner().invoke(
+        cli.app,
+        ["clean", "--before", "1970-01-02", "--plan", "--json"],
+    )
+    assert preview.exit_code == 0, preview.output
+    plan_id = json.loads(preview.stdout)["plan_id"]
+
+    # A second old row appears only after the operator reviewed the plan.
+    save(cfg, _entry("not-authorized", "finished", created_at=2.0))
+    applied = CliRunner().invoke(
+        cli.app,
+        ["clean", "--apply-plan", plan_id, "-y", "--json"],
+    )
+
+    assert applied.exit_code == 0, applied.output
+    payload = json.loads(applied.stdout)
+    assert payload["plan_id"] == plan_id
+    assert payload["eligible_jobs"] == 1
+    assert payload["removed_jobs"] == 1
+    assert load(cfg, "authorized") is None
+    assert load(cfg, "not-authorized") is not None
+
+
+def test_clean_plan_refuses_unenumerated_env_and_deployment_sweeps(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cli, "_cfg", lambda: _cfg(tmp_path))
+
+    for option in ("--envs", "--deployments"):
+        result = CliRunner().invoke(
+            cli.app,
+            ["clean", "--before", "1970-01-02", option, "--plan", "--json"],
+        )
+        assert result.exit_code == 1
+        assert json.loads(result.stdout)["error"] == "unsupported_plan_scope"
 
 
 def test_ps_center_is_laptop_only_and_scopes_the_fan_out(tmp_path, monkeypatch):

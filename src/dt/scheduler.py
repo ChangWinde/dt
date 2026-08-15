@@ -13,6 +13,7 @@ from .jobs import (
     dependency_settled,
     effective_result_state,
     is_uncertain_launch,
+    occupies_quota,
 )
 
 SCHEDULER_SCHEMA = "dt_scheduler_state_v1"
@@ -28,6 +29,102 @@ class _ResourceCapacity:
     gpu_memory_mib: dict[str, list[int | None]]
     gpu_inventory_unknown: set[str]
     memory_inventory_unknown: set[str]
+
+
+@dataclass(frozen=True)
+class AdmissionDecision:
+    """Pure verdict for one durable queued row at the mutation boundary."""
+
+    allowed: bool
+    state: str
+    reason: str
+    blocking_job_id: str | None = None
+
+
+def _capacity_overlaps(
+    older: JobEntry,
+    candidate: JobEntry,
+    candidate_node: str,
+) -> bool:
+    """Mirror the agent's permitted pinned-queue bypass, conservatively."""
+    if older.gpus_requested <= 0 or candidate.gpus_requested <= 0:
+        return True
+    if candidate.pin_node is None:
+        return True
+    return older.pin_node is None or older.pin_node == candidate_node
+
+
+def admission_decision(
+    cfg: HeadConfig,
+    candidate: JobEntry,
+    entries: Sequence[JobEntry],
+    *,
+    candidate_node: str,
+    registry_damage: int = 0,
+    has_fresh_candidate: bool = False,
+    now: float | None = None,
+) -> AdmissionDecision:
+    """Decide one reservation from a complete immutable head snapshot.
+
+    This function performs no I/O. Callers serialize the snapshot+reservation
+    transaction and repeat node-side lease checks after the lock is released.
+    ``has_fresh_candidate`` is valid only when the current placement pass
+    selected ``candidate_node`` from fresh probe evidence. It supersedes only
+    derived historical reachability diagnostics; dependency and explicit
+    constraint blockers remain authoritative.
+    """
+    observed_at = time.time() if now is None else now
+    by_id = {entry.job_id: entry for entry in entries}
+    dependency = _dependency_state(candidate, by_id, now=observed_at)
+    if dependency is not None:
+        state, reason, _condition = dependency
+        return AdmissionDecision(False, state, reason)
+    persisted = _persisted_wait(
+        candidate,
+        has_resource_snapshot=has_fresh_candidate,
+    )
+    if persisted is not None:
+        state, reason, _condition = persisted
+        return AdmissionDecision(False, state, reason)
+    occupancy = (
+        sum(occupies_quota(entry, now=observed_at) for entry in entries)
+        + registry_damage
+    )
+    if occupies_quota(candidate, now=observed_at):
+        occupancy = max(0, occupancy - 1)
+    cap = cfg.queue.max_my_jobs
+    if cap is not None and occupancy >= cap:
+        return AdmissionDecision(
+            False,
+            "waiting_quota",
+            f"max_my_jobs={cap} is reached",
+        )
+
+    queue = sorted(
+        (entry for entry in entries if entry.status == "queued"),
+        key=lambda entry: (entry.created_at, entry.job_id),
+    )
+    for older in queue:
+        if older.job_id == candidate.job_id:
+            break
+        dependency = _dependency_state(older, by_id, now=observed_at)
+        # The caller proved reachability only for the candidate reservation;
+        # it cannot erase another row's node evidence. An older unreachable
+        # row remains skippable instead of becoming a false FIFO owner.
+        persisted = _persisted_wait(older, has_resource_snapshot=False)
+        if dependency is not None or persisted is not None:
+            # The resident agent explicitly skips job-specific/dependency
+            # blockers; they do not reserve unrelated capacity forever.
+            continue
+        if not _capacity_overlaps(older, candidate, candidate_node):
+            continue
+        return AdmissionDecision(
+            False,
+            "waiting_fifo",
+            f"FIFO capacity is reserved for earlier job {older.job_id}",
+            older.job_id,
+        )
+    return AdmissionDecision(True, "admit", "reservation may be claimed")
 
 
 def _gpu_total_mib(row: Mapping[str, object]) -> int | None:
@@ -48,7 +145,7 @@ def _dependency_wait_reason(entry: JobEntry) -> str:
     if is_uncertain_launch(entry):
         return "has an uncertain launch outcome"
     if entry.status == "lost":
-        return "is lost but inside the rescue window"
+        return "is provisionally lost pending durable terminal finalization"
     return f"is {entry.status}"
 
 
@@ -430,12 +527,12 @@ def scheduler_snapshot(
         (entry for entry in entries if entry.status == "queued"),
         key=lambda entry: entry.created_at,
     )
-    running = sum(entry.status == "running" for entry in entries) + registry_damage
+    now = time.time()
+    running = sum(occupies_quota(entry, now=now) for entry in entries) + registry_damage
     forecast_running = running
     by_id = {entry.job_id: entry for entry in entries}
     capacity = _resource_capacity(resources)
     physical_free = dict(capacity.free) if capacity is not None else {}
-    now = time.time()
     rows: list[dict[str, object]] = []
     unpinned_capacity_wait: str | None = None
     busy_pins: dict[str, str] = {}
@@ -450,6 +547,15 @@ def scheduler_snapshot(
             state, reason, condition = dependency
         elif persisted is not None:
             state, reason, condition = persisted
+        elif entry.dispatch_node is not None or entry.dispatch_token is not None:
+            state = "dispatch_reserved"
+            reason = (
+                f"launch reservation is being recovered on {entry.dispatch_node}"
+                if entry.dispatch_node is not None
+                else "launch reservation has incomplete node identity"
+            )
+            condition = "the reserved launch must be adopted or proven absent"
+            selected_node = entry.dispatch_node
         elif (
             cfg.queue.max_my_jobs is not None
             and forecast_running >= cfg.queue.max_my_jobs
