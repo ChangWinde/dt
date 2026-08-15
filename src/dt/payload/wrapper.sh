@@ -213,12 +213,75 @@ dt_publish_state_marker() {
 }
 
 dt_telemetry_pid=""
+dt_log_capture_pid=""
 dt_stop_telemetry() {
     if [ -n "$dt_telemetry_pid" ]; then
         kill -TERM "$dt_telemetry_pid" 2>/dev/null || true
         wait "$dt_telemetry_pid" 2>/dev/null || true
         dt_telemetry_pid=""
     fi
+}
+
+dt_start_log_capture() {
+    [ -n "${DT_JOB_LOG_MAX_BYTES:-}" ] \
+        || [ -n "${DT_JOB_LOG_KEEP_FILES:-}" ] \
+        || return 0
+    case "${DT_JOB_LOG_MAX_BYTES:-}:${DT_JOB_LOG_KEEP_FILES:-}" in
+        *[!0-9:]*)
+            echo "[wrapper] invalid job-log retention settings" >&2
+            return 76
+            ;;
+    esac
+    if [ "${DT_JOB_LOG_MAX_BYTES:-0}" -lt 1 ] \
+       || [ "${DT_JOB_LOG_MAX_BYTES:-0}" -gt 268435456 ] \
+       || [ "${DT_JOB_LOG_KEEP_FILES:-0}" -lt 1 ] \
+       || [ "${DT_JOB_LOG_KEEP_FILES:-0}" -gt 16 ] \
+       || [ ! -f "$DT_PAYLOAD_DIR/log_capture.py" ] \
+       || [ -L "$DT_PAYLOAD_DIR/log_capture.py" ] \
+       || ! command -v python3 >/dev/null 2>&1; then
+        echo "[wrapper] bounded job-log capture is unavailable" >&2
+        return 76
+    fi
+    # Process substitution preserves this wrapper as the pane's process-group
+    # leader. The helper leaves the capsule before reading so completion's cwd
+    # census cannot mistake DT's own logger for an escaped application child.
+    exec > >(
+        cd / || exit 74
+        exec python3 -I "$DT_PAYLOAD_DIR/log_capture.py" capture \
+            --path "$DT_JOB_DIR/logs/stdout.log" \
+            --max-bytes "$DT_JOB_LOG_MAX_BYTES" \
+            --keep-files "$DT_JOB_LOG_KEEP_FILES"
+    ) 2>&1
+    dt_log_capture_pid=$!
+}
+
+dt_finish_log_capture() {
+    [ -n "$dt_log_capture_pid" ] || return 0
+    # Close the only pipe writers, then wait until the helper has flushed and
+    # fsynced every final byte before tmux tears down this per-job session.
+    # A wedged filesystem must not keep an otherwise terminal job running
+    # forever, so the flush and termination grace are both bounded.
+    exec 1>&- 2>&-
+    for _ in {1..100}; do
+        if ! kill -0 "$dt_log_capture_pid" 2>/dev/null; then
+            wait "$dt_log_capture_pid" 2>/dev/null || true
+            dt_log_capture_pid=""
+            return 0
+        fi
+        sleep 0.05
+    done
+    kill -TERM "$dt_log_capture_pid" 2>/dev/null || true
+    for _ in {1..20}; do
+        if ! kill -0 "$dt_log_capture_pid" 2>/dev/null; then
+            wait "$dt_log_capture_pid" 2>/dev/null || true
+            dt_log_capture_pid=""
+            return 0
+        fi
+        sleep 0.05
+    done
+    kill -KILL "$dt_log_capture_pid" 2>/dev/null || true
+    wait "$dt_log_capture_pid" 2>/dev/null || true
+    dt_log_capture_pid=""
 }
 
 dt_escape_cleanup_done=0
@@ -228,6 +291,8 @@ dt_add_escape_pid() {
     local candidate=$1 existing
     case "$candidate" in *[!0-9]*|""|0) return;; esac
     [ -e "/proc/$candidate" ] || return
+    [ -z "$dt_log_capture_pid" ] || [ "$candidate" != "$dt_log_capture_pid" ] \
+        || return
     case "$dt_ancestor_pids" in *" $candidate "*) return;; esac
     for existing in "${dt_escape_pids[@]}"; do
         [ "$existing" != "$candidate" ] || return
@@ -395,11 +460,14 @@ dt_on_exit() {
         || rm -f -- "$dt_cache_namespace_failure" 2>/dev/null || true
     dt_reap_escapees
     dt_record_completion "$dt_rc"
+    dt_finish_log_capture
 }
 trap 'dt_on_exit $?' EXIT
 trap 'dt_signal_exit HUP 129' HUP
 trap 'dt_signal_exit INT 130' INT
 trap 'dt_signal_exit TERM 143' TERM
+
+dt_start_log_capture || exit $?
 
 # A GPU runner may never cross this point without the launcher's post-create
 # proof that its exact systemd scope is visible. The pending value closes the

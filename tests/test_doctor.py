@@ -6,7 +6,7 @@ from typer.testing import CliRunner
 
 from dt import agent as agent_mod
 from dt import cli, doctor
-from dt.config import HeadConfig, Node, Site
+from dt.config import HeadConfig, Node, Project, Site
 
 
 def _cfg(tmp_path, *, nodes=None, sites=None) -> HeadConfig:
@@ -40,6 +40,51 @@ def test_relay_status_is_absent_because_gateway_uses_local_credentials(tmp_path)
         raise AssertionError("head ssh-agent must not be probed")
 
     assert doctor.relay_agent_status(cfg, environ={}, runner=should_not_run) is None
+
+
+def test_default_project_status_is_actionable_without_disclosing_its_path(tmp_path):
+    missing = tmp_path / "private" / "missing-project"
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="head", local=True)],
+        projects={"smoke": Project(path=missing)},
+        default_project="smoke",
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+
+    status = doctor.default_project_status(cfg)
+
+    assert status == "unavailable: smoke"
+    assert str(missing) not in status
+
+
+def test_doctor_contract_reports_default_project_and_indirect_bulk_route():
+    rows = [
+        {
+            "node": "head",
+            "checks": {
+                "ssh": "ok",
+                "default_project": "unavailable: smoke",
+                "link": "relayed: local tunnel; bulk transfers ride this tunnel",
+            },
+            "unreachable": False,
+        }
+    ]
+
+    payload = cli._doctor_contract(rows, exit_code=0)  # noqa: SLF001
+
+    kinds = {issue["kind"] for issue in payload["issues"]}
+    assert kinds == {"default_project_unavailable", "bulk_route_indirect"}
+    assert all(issue["severity"] == "warning" for issue in payload["issues"])
+    assert any(
+        action.get("type") == "config_edit" and action.get("field") == "default_project"
+        for action in payload["actions"]
+    )
+    assert any(
+        action.get("argv") == ["dt", "topology", "--destination", "head", "--json"]
+        for action in payload["actions"]
+    )
 
 
 def test_lan_annotation_flags_drifted_pinned_address(tmp_path):

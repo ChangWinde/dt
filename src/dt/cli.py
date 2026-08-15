@@ -76,6 +76,7 @@ from .dispatch import (
     submit,
 )
 from .doctor import (
+    default_project_status,
     doctor_center,
     head_capability_checks,
     registry_growth_status,
@@ -87,6 +88,7 @@ from .layout import (
     ROLE_LAYOUT,
     display_node_path,
     job_control_dir,
+    job_payload_dir,
     job_state_dir,
     local_node_path,
     node_path_expression,
@@ -6500,6 +6502,7 @@ def ps(
 LOG_SOURCE_MARK = "@@DT_LOG_SOURCE@@"
 LOG_MTIME_MARK = "@@DT_LOG_MTIME@@"
 RESOURCE_SAMPLE_MARK = "@@DT_RESOURCE_SAMPLE@@"
+LOG_TAIL_TRANSPORT_CAPTURE_BYTES = AUTO_LOG_TAIL_MAX_BYTES + 64 * 1024
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _LOG_STEP_RE = re.compile(r"\bstep\s*[:=#]?\s*(\d+)\b", re.IGNORECASE)
 _LOG_STEP_FRACTION_RE = re.compile(
@@ -6559,6 +6562,8 @@ def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
     stdout_path = f"{entry.job_dir}/{primary_relative}"
     outputs_path = f"{entry.job_dir}/outputs"
     control_path = job_control_dir(entry.job_dir, entry.storage_layout)
+    payload_path = job_payload_dir(entry.job_dir, entry.storage_layout)
+    log_tail_helper = f"{payload_path}/log_capture.py"
     resources_path = f"{control_path}/evidence/resources.jsonl"
     resource_select = f"dt_resource_path={node_path_expression(resources_path)}; "
     if entry.storage_layout != ROLE_LAYOUT:
@@ -6569,6 +6574,7 @@ def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
         )
     return (
         f"dt_stdout={node_path_expression(stdout_path)}; "
+        f"dt_log_helper={node_path_expression(log_tail_helper)}; "
         'dt_log_source="$dt_stdout"; '
         'dt_stdout_size=$(stat -c %s -- "$dt_stdout" 2>/dev/null || echo 0); '
         'dt_stdout_mtime=$(stat -c %Y -- "$dt_stdout" 2>/dev/null || echo 0); '
@@ -6594,8 +6600,14 @@ def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
         f'{shlex.quote(LOG_SOURCE_MARK)} "$dt_log_display" '
         f'{shlex.quote(LOG_MTIME_MARK)} "$dt_log_mtime" '
         f'{shlex.quote(RESOURCE_SAMPLE_MARK)} "$dt_resource_sample"; '
+        'if [ "$dt_log_source" = "$dt_stdout" ] '
+        '&& [ -f "$dt_log_helper" ] && [ ! -L "$dt_log_helper" ]; then '
+        'python3 -I "$dt_log_helper" tail '
+        '--path "$dt_log_source" '
+        f"--lines {lines} --max-bytes {AUTO_LOG_TAIL_MAX_BYTES}; "
+        "else "
         f'tail -c {AUTO_LOG_TAIL_MAX_BYTES} -- "$dt_log_source" | '
-        f"tail -n {lines}"
+        f"tail -n {lines}; fi"
     )
 
 
@@ -6974,6 +6986,7 @@ def _read_job_log_tail(
         entry.node_local,
         _job_log_tail_command(entry, lines),
         timeout=timeout,
+        capture_limit_bytes=LOG_TAIL_TRANSPORT_CAPTURE_BYTES,
     )
     path, display, tail, updated_at, resource_sample = _parse_job_log_tail_response(
         entry, proc.stdout or ""
@@ -7690,14 +7703,25 @@ def _read_finished_failure_log(
         "referenced": None,
     }
     log_path = f"{entry.job_dir}/logs/stdout.log"
+    payload_path = job_payload_dir(entry.job_dir, entry.storage_layout)
+    log_tail_helper = f"{payload_path}/log_capture.py"
+    log_path_expression = node_path_expression(log_path)
+    helper_expression = node_path_expression(log_tail_helper)
+    primary_command = (
+        f"test -r {log_path_expression} && "
+        f"if test -f {helper_expression} && test ! -L {helper_expression}; then "
+        f"python3 -I {helper_expression} tail --path {log_path_expression} "
+        f"--lines {error_lines} --max-bytes {AUTO_LOG_TAIL_MAX_BYTES}; "
+        f"else tail -c {AUTO_LOG_TAIL_MAX_BYTES} -- {log_path_expression} | "
+        f"tail -n {error_lines}; fi"
+    )
     try:
         proc = run_on(
             entry.node,
             entry.node_local,
-            f"test -r {node_path_expression(log_path)} && "
-            f"tail -c {AUTO_LOG_TAIL_MAX_BYTES} -- "
-            f"{node_path_expression(log_path)} | tail -n {error_lines}",
+            primary_command,
             timeout=30,
+            capture_limit_bytes=LOG_TAIL_TRANSPORT_CAPTURE_BYTES,
         )
         primary_tail = _sanitize_log_text(proc.stdout or "")
         failure_log["tail"] = primary_tail
@@ -17929,6 +17953,29 @@ def _doctor_contract(rows: list[JsonDict], *, exit_code: int) -> JsonDict:
                 observed=network,
                 action={"type": "argv", "argv": ["dt", "seed", node, "--plan"]},
             )
+        default_project = str(checks.get("default_project", ""))
+        if default_project.startswith("unavailable"):
+            add(
+                node=node,
+                kind="default_project_unavailable",
+                severity="warning",
+                check="default_project",
+                observed=default_project,
+                action={"type": "config_edit", "field": "default_project"},
+            )
+        link = str(checks.get("link", ""))
+        if link.startswith(("relayed", "proxied")):
+            add(
+                node=node,
+                kind="bulk_route_indirect",
+                severity="warning",
+                check="link",
+                observed=link,
+                action={
+                    "type": "argv",
+                    "argv": ["dt", "topology", "--destination", node, "--json"],
+                },
+            )
         gpu = str(checks.get("gpu", ""))
         linger = str(checks.get("linger", "unavailable"))
         if gpu and not gpu.startswith(("missing", "error")) and linger != "yes":
@@ -18026,6 +18073,7 @@ def doctor(
         )
         registry_label = registry_growth_status(cfg)
         capability_checks = head_capability_checks()
+        project_status = default_project_status(cfg)
         local_names = {n.name for n in cfg.nodes if n.local}
         drained_names = {n.name for n in cfg.nodes if n.drained}
         attached = False
@@ -18036,6 +18084,7 @@ def doctor(
                 r["checks"]["agent"] = agent_label
                 r["checks"]["registry"] = registry_label
                 r["checks"].update(capability_checks)
+                r["checks"]["default_project"] = project_status
                 if relay_status is not None:
                     r["checks"]["relay"] = relay_status
                 attached = True
@@ -18049,6 +18098,7 @@ def doctor(
                 "agent": agent_label,
                 "registry": registry_label,
                 **capability_checks,
+                "default_project": project_status,
             }
             if relay_status is not None:
                 checks["relay"] = relay_status

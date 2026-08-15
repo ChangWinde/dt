@@ -659,11 +659,36 @@ def test_revalidate_project_root_requires_an_existing_directory(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "section", ["paths", "projects", "queue", "operations", "sites"]
+    "section", ["paths", "projects", "queue", "operations", "job_logs", "sites"]
 )
 def test_explicit_null_mapping_sections_are_rejected(section):
     with pytest.raises(ConfigError, match=rf"`{section}` must be a mapping"):
         parse({"center": "c", "nodes": ["n1"], section: None})
+
+
+def test_job_log_retention_is_bounded_and_head_only():
+    cfg = parse(
+        {
+            "center": "c",
+            "nodes": ["n1"],
+            "job_logs": {"max_file_mib": 32, "keep_files": 5},
+        }
+    )
+    assert cfg.job_logs.max_file_mib == 32
+    assert cfg.job_logs.keep_files == 5
+
+    for settings in (
+        {"max_file_mib": 0},
+        {"max_file_mib": 257},
+        {"keep_files": 0},
+        {"keep_files": 17},
+        {"unknown": 1},
+    ):
+        with pytest.raises(ConfigError, match="job_logs"):
+            parse({"center": "c", "nodes": ["n1"], "job_logs": settings})
+
+    with pytest.raises(ConfigError, match="laptop config"):
+        parse({"centers": {"c": "head"}, "job_logs": {"keep_files": 2}})
 
 
 def test_proxy_requires_a_scheme():

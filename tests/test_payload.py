@@ -37,6 +37,14 @@ WRAPPER_TIMEOUT_SECONDS = 15
 TEST_RUNTIME_SCOPE = f"dt-runtime-{'a' * 20}.scope"
 
 
+def _stage_runtime_payload(path: Path) -> Path:
+    path.mkdir()
+    runtime = _support_files(["true"], {})
+    for name in RUNTIME_PAYLOAD_NAMES:
+        (path / name).write_text(runtime[name], encoding="utf-8")
+    return path
+
+
 def _write_verified_runtime_scope(state_dir: Path) -> str:
     containment = state_dir / "runtime_containment"
     containment.write_text("systemd_scope_verified\n")
@@ -1364,7 +1372,7 @@ def test_launcher_rejects_shell_special_variable_from_forged_handoff(tmp_path):
 
 def test_launch_propagates_configured_node_identity_to_telemetry(tmp_path, monkeypatch):
     import dt.dispatch as dispatch
-    from dt.config import HeadConfig, Node
+    from dt.config import HeadConfig, JobLogsCfg, Node
 
     node = Node(name="configured-node-alias")
     cfg = HeadConfig(
@@ -1374,6 +1382,7 @@ def test_launch_propagates_configured_node_identity_to_telemetry(tmp_path, monke
         default_project=None,
         root=tmp_path / "dt",
         envs="~/dt/envs",
+        job_logs=JobLogsCfg(max_file_mib=7, keep_files=3),
     )
     commands = []
 
@@ -1400,6 +1409,10 @@ def test_launch_propagates_configured_node_identity_to_telemetry(tmp_path, monke
     assert rc == 0
     assert "DT_NODE=configured-node-alias" in commands[0]
     assert "DT_NODE" in _tmux_session_env_names()
+    assert "DT_JOB_LOG_MAX_BYTES=7340032" in commands[0]
+    assert "DT_JOB_LOG_KEEP_FILES=3" in commands[0]
+    assert "DT_JOB_LOG_MAX_BYTES" in _tmux_session_env_names()
+    assert "DT_JOB_LOG_KEEP_FILES" in _tmux_session_env_names()
 
 
 def test_launch_uses_task_disk_contract_above_config_floor(tmp_path, monkeypatch):
@@ -2235,6 +2248,109 @@ def test_wrapper_unbuffers_logs():
     # block-buffered stdout hides training progress from `dt logs -f`
     assert "PYTHONUNBUFFERED=1" in WRAPPER
     assert "stdbuf -oL" in WRAPPER
+
+
+def test_wrapper_rotates_and_flushes_application_log_before_exit(tmp_path):
+    (tmp_path / "code").mkdir()
+    payload_dir = _stage_runtime_payload(tmp_path / "payload")
+    (tmp_path / "cmd.sh").write_text(
+        "python3 - <<'PY'\n"
+        "for index in range(20):\n"
+        "    print(f'log-line-{index:02d}')\n"
+        "PY\n"
+    )
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_PAYLOAD_DIR": str(payload_dir),
+        "DT_GPU_IDS": "",
+        "DT_GPUS": "0",
+        "DT_MAX_HOURS": "",
+        "DT_UV": "",
+        "DT_UV_ENV": "",
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+        "DT_JOB_LOG_MAX_BYTES": "64",
+        "DT_JOB_LOG_KEEP_FILES": "4",
+    }
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    log = tmp_path / "logs" / "stdout.log"
+    assert log.is_file()
+    assert (tmp_path / "logs" / "stdout.log.1").is_file()
+    tail = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(PAYLOAD / "log_capture.py"),
+            "tail",
+            "--path",
+            str(log),
+            "--lines",
+            "3",
+            "--max-bytes",
+            "1024",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert tail.returncode == 0, tail.stderr
+    assert tail.stdout == "log-line-17\nlog-line-18\nlog-line-19\n"
+    assert (tmp_path / "exit_code").read_text() == "0\n"
+    assert (tmp_path / "result_state").read_text() == "success\n"
+
+
+def test_wrapper_log_storage_failure_does_not_sigpipe_the_application(tmp_path):
+    (tmp_path / "code").mkdir()
+    payload_dir = _stage_runtime_payload(tmp_path / "payload")
+    logs = tmp_path / "logs"
+    logs.mkdir(mode=0o700)
+    victim = tmp_path / "victim"
+    victim.write_text("unchanged\n")
+    (logs / "stdout.log").symlink_to(victim)
+    (tmp_path / "cmd.sh").write_text(
+        "python3 - <<'PY'\n"
+        "for _ in range(20000):\n"
+        "    print('application-output-must-be-drained')\n"
+        "PY\n"
+    )
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_PAYLOAD_DIR": str(payload_dir),
+        "DT_GPU_IDS": "",
+        "DT_GPUS": "0",
+        "DT_MAX_HOURS": "",
+        "DT_UV": "",
+        "DT_UV_ENV": "",
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+        "DT_JOB_LOG_MAX_BYTES": "1024",
+        "DT_JOB_LOG_KEEP_FILES": "2",
+    }
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert victim.read_text() == "unchanged\n"
+    assert (tmp_path / "exit_code").read_text() == "0\n"
+    assert (tmp_path / "result_state").read_text() == "success\n"
 
 
 def test_wrapper_prevents_python_bytecode_mutating_bound_artifacts(tmp_path):
