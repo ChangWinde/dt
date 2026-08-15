@@ -438,7 +438,9 @@ def test_group_record_rejects_symlinked_state_directory(tmp_path):
     [
         ("requested", True, "progress"),
         ("submitted", 0.5, "progress"),
-        ("created_at", float("nan"), "timestamps"),
+        # Non-finite JSON is rejected by the stable reader before schema
+        # coercion, so it never reaches the timestamp validator.
+        ("created_at", float("nan"), "safely read"),
         ("updated_at", False, "timestamps"),
         ("exit_code", True, "exit code"),
         ("error_kind", {"nested": "value"}, "error kind"),

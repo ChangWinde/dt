@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from typer.testing import CliRunner
 
 from dt import cli, ps_query
@@ -261,6 +262,190 @@ def test_laptop_query_merges_center_pages_and_scopes_refs(monkeypatch):
         {"display_ref": "b:ob-b", "status": "running"},
         {"display_ref": "a:ob-a", "status": "running"},
     ]
+
+
+def test_partial_laptop_page_does_not_emit_an_unsafe_global_cursor(monkeypatch):
+    cfg = LaptopConfig(centers={"a": "head-a", "b": "head-b"})
+    first = {
+        "job_id": "a-new",
+        "display_ref": "a-new",
+        "center": "a",
+        "created_at": 100.0,
+        "updated_at": 100.0,
+        "status": "running",
+    }
+    response = ps_query.build_payload(
+        [first, dict(first, job_id="a-old", created_at=90.0, updated_at=90.0)],
+        center="a",
+        status=None,
+        active_only=False,
+        issues_only=False,
+        since=None,
+        selected_fields=(
+            "job_id",
+            "status",
+            "center",
+            "created_at",
+            "display_ref",
+            "updated_at",
+        ),
+        limit=1,
+        cursor=None,
+        summary_only=False,
+    )
+    errors = FanErrors()
+    errors["b"] = "timed out"
+    errors.unreachable.add("b")
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "fan_json_by_center",
+        lambda cfg_, argv: ({"a": response}, errors),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["ps", "--compact", "--fields", "job_id,status", "--limit", "1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["partial"] is True
+    assert payload["page"]["returned"] == 1
+    assert payload["page"]["next_cursor"] is None
+
+
+def test_laptop_isolates_a_byte_fitted_center_before_global_pagination(monkeypatch):
+    cfg = LaptopConfig(centers={"a": "head-a", "b": "head-b"})
+    selected_fields = ("job_id", "cmd")
+    internal_fields = tuple(
+        dict.fromkeys([*selected_fields, *sorted(ps_query.MERGE_FIELDS)])
+    )
+
+    def row(center, job_id, created_at, command):
+        return {
+            "job_id": job_id,
+            "display_ref": job_id,
+            "center": center,
+            "created_at": created_at,
+            "updated_at": created_at,
+            "status": "running",
+            "cmd": command,
+        }
+
+    large = "x" * 2_500_000
+    center_a = ps_query.build_payload(
+        [
+            row("a", "a-new", 100.0, large),
+            row("a", "a-middle", 90.0, large),
+        ],
+        center="a",
+        status=None,
+        active_only=False,
+        issues_only=False,
+        since=None,
+        selected_fields=internal_fields,
+        limit=2,
+        cursor=None,
+        summary_only=False,
+    )
+    assert center_a["page"]["eligible"] == 2
+    assert center_a["page"]["returned"] == 1
+    center_b = ps_query.build_payload(
+        [row("b", "b-old", 80.0, "true")],
+        center="b",
+        status=None,
+        active_only=False,
+        issues_only=False,
+        since=None,
+        selected_fields=internal_fields,
+        limit=2,
+        cursor=None,
+        summary_only=False,
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli,
+        "fan_json_by_center",
+        lambda cfg_, argv: (
+            {"a": center_a, "b": center_b},
+            FanErrors(),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ps",
+            "--compact",
+            "--fields",
+            ",".join(selected_fields),
+            "--limit",
+            "2",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["jobs"] == [{"job_id": "b-old", "cmd": "true"}]
+    assert payload["partial"] is True
+    assert payload["page"]["next_cursor"] is None
+    assert "serialized byte budget" in payload["errors"]["a"]
+
+
+def test_summary_validator_rejects_unknown_status_and_result_buckets():
+    row = {
+        "job_id": "job-a",
+        "display_ref": "job-a",
+        "center": "a",
+        "created_at": 1.0,
+        "updated_at": 1.0,
+        "status": "running",
+    }
+    expected_fields = (
+        "display_ref",
+        "status",
+        "center",
+        "created_at",
+        "job_id",
+        "updated_at",
+    )
+    expected_query = ps_query.query_contract(
+        status=None,
+        active_only=False,
+        issues_only=False,
+        since=None,
+        selected_fields=expected_fields,
+        limit=50,
+        cursor=None,
+        summary_only=False,
+    )
+    for field, bucket in (
+        ("by_status", "not-a-status"),
+        ("by_result_state", "not-a-result"),
+    ):
+        payload = ps_query.build_payload(
+            [row],
+            center="a",
+            status=None,
+            active_only=False,
+            issues_only=False,
+            since=None,
+            selected_fields=expected_fields,
+            limit=50,
+            cursor=None,
+            summary_only=False,
+        )
+        payload["summary"][field] = {bucket: 1}
+        with pytest.raises(ps_query.QueryError):
+            ps_query.validate_payload_contract(
+                payload,
+                center="a",
+                expected_query=expected_query,
+                expected_fields=expected_fields,
+                expected_cursor=None,
+            )
 
 
 def test_ps_agent_query_flags_imply_json(tmp_path, monkeypatch):

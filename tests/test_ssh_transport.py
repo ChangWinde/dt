@@ -1,5 +1,6 @@
 import io
 import hashlib
+import json
 import os
 import shlex
 import stat
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -115,7 +117,18 @@ def test_relay_subprocess_never_forwards_or_injects_an_agent(tmp_path, monkeypat
     monkeypatch.setenv("SSH_AUTH_SOCK", str(tmp_path / "operator-agent.sock"))
     seen = []
 
-    def fake_run(cmd, *, timeout, cwd=None, cancel_event=None, env=None):
+    def fake_run(
+        cmd,
+        *,
+        timeout,
+        cwd=None,
+        capture_limit_bytes=None,
+        cancel_event=None,
+        cancel_grace_s=None,
+        env=None,
+        stdin_bytes=None,
+    ):
+        assert stdin_bytes is None
         seen.append(env)
         return subprocess.CompletedProcess(cmd, 0, "ok\n", "")
 
@@ -450,6 +463,59 @@ def test_bounded_transport_cancellation_reaps_the_process_group():
     assert time.monotonic() - started < 2
 
 
+def test_fast_cancellation_kills_and_reaps_a_term_ignoring_process(tmp_path):
+    cancel = threading.Event()
+    pid_file = tmp_path / "transport.pid"
+    cancelled_at: list[float] = []
+    prior_readers = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("dt-") and thread.ident is not None
+    }
+
+    def request_cancel_when_ready():
+        deadline = time.monotonic() + 2
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        cancelled_at.append(time.monotonic())
+        cancel.set()
+
+    thread = threading.Thread(target=request_cancel_when_ready)
+    thread.start()
+    try:
+        proc = sshio._run_bounded_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,signal,sys,time; "
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                    "open(sys.argv[1], 'w').write(str(os.getpid())); "
+                    "time.sleep(30)"
+                ),
+                str(pid_file),
+            ],
+            timeout=5,
+            cancel_event=cancel,
+            cancel_grace_s=0.05,
+        )
+    finally:
+        thread.join(timeout=3)
+
+    assert proc.returncode == 130
+    assert cancelled_at
+    assert time.monotonic() - cancelled_at[0] < 0.5
+    pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert not any(
+        candidate.is_alive()
+        and candidate.name.startswith("dt-")
+        and candidate.ident not in prior_readers
+        for candidate in threading.enumerate()
+    )
+
+
 def test_local_transport_timeout_uses_the_remote_error_contract(monkeypatch):
     def timeout(*_args, **_kwargs):
         raise subprocess.TimeoutExpired(["bash"], 3)
@@ -460,10 +526,64 @@ def test_local_transport_timeout_uses_the_remote_error_contract(monkeypatch):
         sshio.run_local("true", timeout=3)
 
 
-def test_transport_drains_both_streams_but_retains_bounded_head_and_tail(
-    monkeypatch,
+def test_run_on_forwards_bounded_private_stdin_locally():
+    private = b"DT_PRIVATE_ENV_V1\0TOKEN\0private\0"
+
+    proc = sshio.run_on(
+        "local",
+        True,
+        "python3 -c 'import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())'",
+        timeout=2,
+        stdin_bytes=private,
+    )
+
+    assert proc.returncode == 0
+    assert proc.stdout.encode() == private
+    assert all("private" not in arg for arg in proc.args)
+
+
+def test_run_remote_forwards_private_stdin_to_each_transport_attempt(
+    tmp_path, monkeypatch
 ):
-    monkeypatch.setattr(sshio, "MAX_CAPTURE_CHARS", 1024)
+    _transport_home(tmp_path, monkeypatch)
+    private = b"DT_PRIVATE_ENV_V1\0TOKEN\0private\0"
+    seen = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs.get("stdin_bytes"))
+        if len(seen) == 1:
+            return subprocess.CompletedProcess(
+                cmd,
+                255,
+                "",
+                "mux_client_request_session: read from master failed",
+            )
+        return subprocess.CompletedProcess(cmd, 0, "ok\n", "")
+
+    monkeypatch.setattr(sshio, "_run_bounded_process", fake_run)
+
+    proc = sshio.run_remote(
+        "worker",
+        "true",
+        retry_stale_mux=True,
+        stdin_bytes=private,
+    )
+
+    assert proc.returncode == 0
+    assert seen == [private, private]
+
+
+def test_run_on_rejects_oversized_private_stdin_before_spawning():
+    with pytest.raises(ValueError, match="stdin payload exceeds"):
+        sshio.run_on(
+            "local",
+            True,
+            "true",
+            stdin_bytes=b"x" * (sshio.MAX_STDIN_BYTES + 1),
+        )
+
+
+def test_transport_drains_both_streams_but_retains_bounded_head_and_tail():
     script = (
         "import sys; "
         "sys.stdout.write('stdout-begin|' + 'x' * 200000 + '|stdout-end'); "
@@ -473,17 +593,37 @@ def test_transport_drains_both_streams_but_retains_bounded_head_and_tail(
     proc = sshio._run_bounded_process(
         [sys.executable, "-c", script],
         timeout=2,
+        capture_limit_bytes=1024,
     )
 
     assert proc.returncode == 0
     assert proc.stdout.startswith("stdout-begin|")
     assert proc.stdout.endswith("|stdout-end")
-    assert "output characters omitted" in proc.stdout
+    assert "output bytes omitted" in proc.stdout
     assert proc.stderr.startswith("stderr-begin|")
     assert proc.stderr.endswith("|stderr-end")
-    assert "output characters omitted" in proc.stderr
+    assert "output bytes omitted" in proc.stderr
     assert len(proc.stdout) < 1200
     assert len(proc.stderr) < 1200
+
+
+def test_remote_dt_preserves_a_legal_multi_megabyte_json_response(monkeypatch):
+    import dt.remote as remote
+
+    payload_bytes = 3 * 1024 * 1024
+    command = [
+        sys.executable,
+        "-c",
+        f"import json; print(json.dumps(['x' * {payload_bytes}]))",
+    ]
+    monkeypatch.setattr(sshio, "ssh_cmd", lambda *args, **kwargs: command)
+
+    proc = remote.remote_dt("head", ["ps", "--json"], timeout=5)
+
+    assert proc.returncode == 0
+    decoded = json.loads(proc.stdout)
+    assert len(decoded[0]) == payload_bytes
+    assert "output bytes omitted" not in proc.stdout
 
 
 def test_completed_transport_reaps_descendant_that_keeps_output_pipe_open():
@@ -505,9 +645,8 @@ def test_completed_transport_reaps_descendant_that_keeps_output_pipe_open():
 
 
 def test_capture_stdout_bounds_machine_response_while_inheriting_stderr(
-    monkeypatch, capfd
+    capfd,
 ):
-    monkeypatch.setattr(sshio, "MAX_CAPTURE_CHARS", 1024)
     proc = sshio.run_capture_stdout(
         [
             sys.executable,
@@ -519,15 +658,71 @@ def test_capture_stdout_bounds_machine_response_while_inheriting_stderr(
             ),
         ],
         timeout=2,
+        capture_limit_bytes=1024,
     )
 
     assert proc.returncode == 0
     assert proc.stdout.startswith("begin|")
     assert proc.stdout.endswith("|end")
-    assert "output characters omitted" in proc.stdout
+    assert "output bytes omitted" in proc.stdout
     assert len(proc.stdout) < 1200
     assert proc.stderr == ""
     assert capfd.readouterr().err == "live-diagnostic"
+
+
+def test_control_capture_budget_bounds_32_concurrent_hostile_streams():
+    statm = Path("/proc/self/statm")
+    if not statm.is_file():
+        pytest.skip("RSS sampling requires Linux /proc")
+
+    def rss_bytes() -> int:
+        resident_pages = int(statm.read_text().split()[1])
+        return resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+
+    stop = threading.Event()
+    samples = [rss_bytes()]
+
+    def sample_rss():
+        while not stop.wait(0.005):
+            samples.append(rss_bytes())
+
+    monitor = threading.Thread(target=sample_rss, name="dt-test-rss-monitor")
+    monitor.start()
+    command = shlex.join(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; "
+                "os.write(1, b'out-begin|' + b'x' * (1 << 20) + b'|out-end'); "
+                "os.write(2, b'err-begin|' + b'y' * (1 << 20) + b'|err-end')"
+            ),
+        ]
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=32) as pool:
+            results = list(
+                pool.map(
+                    lambda _index: sshio.run_local(
+                        command,
+                        timeout=5,
+                        workload=sshio.SSHWorkload.CONTROL,
+                    ),
+                    range(32),
+                )
+            )
+        samples.append(rss_bytes())
+    finally:
+        stop.set()
+        monitor.join(timeout=1)
+
+    for result in results:
+        assert result.returncode == 0
+        assert len(result.stdout) <= sshio.CONTROL_CAPTURE_BYTES
+        assert len(result.stderr) <= sshio.CONTROL_CAPTURE_BYTES
+        assert "output bytes omitted" in result.stdout
+        assert "output bytes omitted" in result.stderr
+    assert max(samples) - samples[0] < 96 * 1024 * 1024
 
 
 def test_capture_stdout_sends_private_bytes_outside_argv():
@@ -635,7 +830,18 @@ def test_read_only_remote_probe_retries_stale_mux_once_without_mux(
     state, _user_config, _system_config = _transport_home(tmp_path, monkeypatch)
     calls = []
 
-    def fake_run(cmd, *, timeout, cwd=None, cancel_event=None, env=None):
+    def fake_run(
+        cmd,
+        *,
+        timeout,
+        cwd=None,
+        capture_limit_bytes=None,
+        cancel_event=None,
+        cancel_grace_s=None,
+        env=None,
+        stdin_bytes=None,
+    ):
+        assert stdin_bytes is None
         calls.append((cmd, timeout, cwd))
         if len(calls) == 1:
             return subprocess.CompletedProcess(
@@ -666,7 +872,18 @@ def test_remote_mutation_never_retries_stale_mux_by_default(tmp_path, monkeypatc
     _transport_home(tmp_path, monkeypatch)
     calls = []
 
-    def fake_run(cmd, *, timeout, cwd=None, cancel_event=None, env=None):
+    def fake_run(
+        cmd,
+        *,
+        timeout,
+        cwd=None,
+        capture_limit_bytes=None,
+        cancel_event=None,
+        cancel_grace_s=None,
+        env=None,
+        stdin_bytes=None,
+    ):
+        assert stdin_bytes is None
         calls.append((cmd, timeout, cwd))
         return subprocess.CompletedProcess(
             cmd,

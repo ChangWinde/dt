@@ -7,10 +7,13 @@ import stat as stat_module
 import shutil
 import subprocess
 import time
+import zipfile
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+from dt.jobs import JobEntry, encode_registry_entry
 
 
 ROOT = Path(__file__).parents[1]
@@ -210,12 +213,24 @@ def _release(
     *,
     audit_distribution: str = "disttrainer",
     require_uv: bool = False,
+    authority_capable: bool = True,
 ) -> Path:
     root = tmp_path / f"release-{version}-{marker}"
     root.mkdir()
     wheel = root / f"disttrainer-{version}-py3-none-any.whl"
     sdist = root / f"disttrainer-{version}.tar.gz"
-    wheel.write_text(f"wheel {marker}\n", encoding="utf-8")
+    jobs_source = (
+        f'DISPATCH_PROTOCOL_VERSION = "dt_dispatch_attempt_'
+        f'{"v2" if authority_capable else "v1"}"\n'
+        + (
+            'REGISTRY_SCHEMA_VERSION = "dt_job_registry_v1"\n'
+            if authority_capable
+            else ""
+        )
+    )
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("dt/jobs.py", jobs_source)
+        archive.writestr("fake-release-marker.txt", f"wheel {marker}\n")
     sdist.write_text(f"sdist {marker}\n", encoding="utf-8")
     (root / "runtime-constraints.txt").write_text("pyyaml==6.0\n", encoding="utf-8")
     (root / "sbom.cdx.json").write_text("{}\n", encoding="utf-8")
@@ -237,6 +252,7 @@ def _release(
         root / "bootstrap.sh",
         "#!/usr/bin/env bash\nset -euo pipefail\n"
         + ("command -v uv >/dev/null\n" if require_uv else "")
+        + f"authority_capable={'1' if authority_capable else '0'}\n"
         + r"""wheel=$1
 version=${wheel#disttrainer-}
 version=${version%-py3-none-any.whl}
@@ -253,6 +269,23 @@ mkdir -p "$tool_bin"
 cat > "$tool_bin/dt" <<FAKE_DT
 #!/usr/bin/env bash
 if [[ "\${1:-}" == "agent" ]]; then
+    if [[ "\${2:-}" == "protocol" ]]; then
+        if [[ "$authority_capable" == "1" ]]; then
+            authority_state=absent
+            registry_root="\$HOME/dt/head/state/registry"
+            for record in "\$registry_root"/*.json; do
+                [[ -f "\$record" && ! -L "\$record" ]] || continue
+                if grep -Eq '"schema_version"[[:space:]]*:[[:space:]]*"dt_job_registry_v1"' "\$record"; then
+                    authority_state=present
+                    break
+                fi
+            done
+            printf '{"schema_version":"dt_agent_protocol_v1","dispatch_protocol":"dt_dispatch_attempt_v2","registry_schema":"dt_job_registry_v1","registry_authority_state":"%s"}\n' "\$authority_state"
+        else
+            printf 'dt_dispatch_attempt_v1\n'
+        fi
+        exit 0
+    fi
     if [[ "\${2:-}" == "status" \
           && "\${DT_FAKE_AGENT_STATUS_HANG_VERSION:-}" == "$version" ]]; then
         trap '' TERM
@@ -495,6 +528,24 @@ def _installed_version(remote_home: Path) -> str:
     ).strip()
 
 
+def _write_versioned_registry_authority(remote_home: Path) -> None:
+    registry = remote_home / "dt" / "head" / "state" / "registry"
+    registry.mkdir(parents=True, exist_ok=True)
+    entry = JobEntry(
+        job_id="current-write",
+        name="current-write",
+        center="test",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="jobs/current-write",
+        session="dt_current-write",
+        cmd="true",
+        status="queued",
+    )
+    (registry / f"{entry.job_id}.json").write_bytes(encode_registry_entry(entry))
+
+
 def _start_cleanup_test_agent(tmp_path: Path) -> tuple[int, int]:
     env, remote_home = _transport(tmp_path)
     release = _release(tmp_path, "0.9.0", "cleanup")
@@ -615,6 +666,59 @@ def test_deploy_upgrade_and_explicit_rollback_are_atomic(tmp_path):
     assert rollback.returncode == 0, rollback.stderr
     assert _installed_version(remote_home) == "dt 0.9.0"
     assert (base / "current").readlink() == Path("releases/0.9.0")
+
+
+def test_rollback_refuses_old_authority_after_a_versioned_registry_write(tmp_path):
+    env, remote_home = _transport(tmp_path)
+    previous = _release(tmp_path, "0.9.0", "compatible")
+    old_style = _release(
+        tmp_path,
+        "0.9.0",
+        "origin-main-style",
+        authority_capable=False,
+    )
+    current = _release(tmp_path, "0.10.0", "current")
+    assert _deploy(env, str(previous), "head").returncode == 0
+    assert _deploy(env, str(current), "head").returncode == 0
+    base = remote_home / ".local" / "share" / "disttrainer"
+    retained = base / "releases" / "0.9.0"
+    shutil.rmtree(retained)
+    shutil.copytree(old_style, retained)
+    _write_versioned_registry_authority(remote_home)
+
+    refused = _deploy(env, "--rollback", "0.9.0", "head")
+
+    assert refused.returncode == 1
+    assert "cannot read existing versioned registry authority" in refused.stderr
+    assert _installed_version(remote_home) == "dt 0.10.0"
+    assert (base / "current").readlink() == Path("releases/0.10.0")
+
+
+def test_automatic_rollback_never_starts_old_versioned_registry_authority(tmp_path):
+    env, remote_home = _transport(tmp_path)
+    previous = _release(tmp_path, "0.9.0", "compatible")
+    old_style = _release(
+        tmp_path,
+        "0.9.0",
+        "origin-main-style",
+        authority_capable=False,
+    )
+    candidate = _release(tmp_path, "0.10.0", "candidate")
+    assert _deploy(env, str(previous), "head").returncode == 0
+    base = remote_home / ".local" / "share" / "disttrainer"
+    retained = base / "releases" / "0.9.0"
+    shutil.rmtree(retained)
+    shutil.copytree(old_style, retained)
+    _write_versioned_registry_authority(remote_home)
+    env["DT_FAKE_AGENT_RUNNING"] = "1"
+    env["DT_FAKE_AGENT_ATTEST_FAIL_VERSION"] = "0.10.0"
+
+    refused = _deploy(env, str(candidate), "head")
+
+    assert refused.returncode == 1
+    assert "cannot read existing versioned registry authority" in refused.stderr
+    assert _installed_version(remote_home) == "dt 0.10.0"
+    assert (base / "current").readlink() == Path("releases/0.10.0")
 
 
 def test_rollback_uses_current_bootstrap_for_a_legacy_retained_release(tmp_path):
@@ -1078,7 +1182,8 @@ def test_deploy_refuses_same_version_with_different_content(tmp_path):
         / "0.9.0"
         / "disttrainer-0.9.0-py3-none-any.whl"
     )
-    assert retained.read_text("utf-8") == "wheel trusted\n"
+    with zipfile.ZipFile(retained) as archive:
+        assert archive.read("fake-release-marker.txt") == b"wheel trusted\n"
 
 
 def test_deploy_refuses_manifest_size_mismatch(tmp_path):

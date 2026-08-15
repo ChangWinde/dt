@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 import dt.dispatch as dispatch
 import dt.sshio as sshio
 from dt.config import HeadConfig, LaptopConfig, Node, Project, Site
+from dt.private_state import PrivateStateError
 from dt.sshio import RemoteError
 
 
@@ -24,6 +25,29 @@ def _cfg(tmp_path):
         root=tmp_path / "dt",
         envs="~/dt/envs",
     )
+
+
+def test_durable_object_publish_fails_closed_on_unknown_tree_durability(
+    tmp_path, monkeypatch
+):
+    temporary = tmp_path / "incoming"
+    final = tmp_path / "objects" / "digest"
+    temporary.mkdir()
+    final.parent.mkdir()
+    (temporary / "payload").write_text("bytes")
+    monkeypatch.setattr(
+        dispatch,
+        "fsync_tree",
+        lambda _path: (_ for _ in ()).throw(
+            PrivateStateError("durability evidence unavailable")
+        ),
+    )
+
+    with pytest.raises(dispatch.DispatchError, match="cannot be published durably"):
+        dispatch._publish_durable_object_directory(temporary, final, label="snapshot")
+
+    assert temporary.is_dir()
+    assert not final.exists()
 
 
 def test_sync_project_is_exact_resumable_remote_cache(tmp_path, monkeypatch):
@@ -121,7 +145,9 @@ def test_sync_artifacts_preserves_relative_file_path(tmp_path, monkeypatch):
 
     assert "mkdir -p dt/artifacts/omni/outputs/run-a" in seen["prepare"][0][2]
     assert "artifact destination contains symlink" in seen["prepare"][0][2]
-    assert "mkdir -p dt/artifacts/omni/.dt/manifests" in seen["prepare"][1][2]
+    assert "dt/artifacts/omni/.dt/incoming/" in seen["prepare"][1][2]
+    assert "artifact_verify.py" in seen["prepare"][2][2]
+    assert "mkdir -p dt/artifacts/omni/.dt/manifests" in seen["prepare"][2][2]
     artifact_transfer, manifest_transfer = seen["rsync"]
     assert artifact_transfer[0] == str(checkpoint)
     assert artifact_transfer[1] == "n1:dt/artifacts/omni/outputs/run-a/"
@@ -129,7 +155,8 @@ def test_sync_artifacts_preserves_relative_file_path(tmp_path, monkeypatch):
     assert artifact_transfer[2]["checksum"] is True
     assert artifact_transfer[2]["retries"] == 2
     assert artifact_transfer[2]["cancel_event"] is cancel_event
-    assert manifest_transfer[1] == "n1:dt/artifacts/omni/.dt/manifests/"
+    assert "n1:dt/artifacts/omni/.dt/incoming/" in manifest_transfer[1]
+    assert manifest_transfer[2]["private_destination"] is True
     assert manifest_transfer[2]["cancel_event"] is cancel_event
     assert result["node"] == "n1"
     assert result["project"] == "omni"
@@ -461,6 +488,61 @@ def test_sync_artifacts_rejects_source_change_after_transfer(
             ["outputs/model.pt"],
             lambda message: None,
         )
+
+
+def test_sync_artifacts_rejects_aba_source_change_before_manifest_publish(
+    tmp_path,
+    monkeypatch,
+):
+    """A->B->A local drift must not bless remote B with manifest A."""
+    cfg = _cfg(tmp_path)
+    project = tmp_path / "project"
+    artifact = project / "outputs" / "model.pt"
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"version-a")
+    verification_attempted = False
+
+    def fake_run_on(node, local, command, **kwargs):
+        nonlocal verification_attempted
+        del node, local, kwargs
+        if "artifact_verify.py" in command:
+            verification_attempted = True
+            return subprocess.CompletedProcess([], 1, "", "artifact SHA-256 mismatch")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    transfer_count = 0
+
+    def copy_intermediate_version(*args, **kwargs):
+        nonlocal transfer_count
+        del args, kwargs
+        transfer_count += 1
+        if transfer_count == 1:
+            artifact.write_bytes(b"version-b")
+            # Model rsync consuming B, followed by an ordinary producer restoring A
+            # before the post-transfer local identity check.
+            artifact.write_bytes(b"version-a")
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            "Number of regular files transferred: 1\n"
+            "Total transferred file size: 9 bytes\n",
+            "",
+        )
+
+    monkeypatch.setattr(dispatch, "run_on", fake_run_on)
+    monkeypatch.setattr(dispatch, "rsync", copy_intermediate_version)
+
+    with pytest.raises(dispatch.DispatchError, match="verification failed"):
+        dispatch.sync_artifacts(
+            cfg,
+            "omni",
+            project,
+            Node(name="n1"),
+            ["outputs/model.pt"],
+            lambda _message: None,
+        )
+
+    assert verification_attempted is True
 
 
 @pytest.mark.parametrize("mutation", ["delete", "directory", "symlink"])
@@ -1440,6 +1522,42 @@ def test_missing_previous_job_falls_back_without_broken_copy_dest(
     )
 
     assert dispatch._snapshot_baselines(cfg, "omni", node) == (None, None)
+
+
+def test_previous_job_copy_baseline_holds_source_job_lock(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    node = Node(name="n1")
+    attempted = threading.Event()
+    acquired = threading.Event()
+
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+
+    def acquire_source_lock():
+        attempted.set()
+        with dispatch.job_lock(cfg, "previous"):
+            acquired.set()
+
+    worker = threading.Thread(target=acquire_source_lock, daemon=True)
+    with dispatch._stable_snapshot_copy_dest(
+        cfg,
+        "omni",
+        node,
+        "../../previous/code",
+        whole_job=False,
+        job_dir="dt/worker/jobs/current",
+    ) as stable:
+        assert stable == "../../previous/code"
+        worker.start()
+        assert attempted.wait(timeout=1)
+        assert not acquired.wait(timeout=0.05)
+
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+    assert acquired.is_set()
 
 
 def test_copy_dest_does_not_hardlink_snapshot_to_mutable_cache(tmp_path):

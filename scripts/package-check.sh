@@ -92,7 +92,7 @@ uv --no-config pip check --python "$INSTALL_ENV/bin/python" >/dev/null
 "$INSTALL_ENV/bin/dt" --help >/dev/null
 for command in init free run ps logs wait info request pull batch chain compare \
     watch metrics rerun exec fork attach kill clean events storage compact sync \
-    seed topology doctor agent migrate; do
+    seed topology doctor diagnose agent migrate; do
     "$INSTALL_ENV/bin/dt" "$command" --help >/dev/null
 done
 "$INSTALL_ENV/bin/dt" agent install --help >/dev/null

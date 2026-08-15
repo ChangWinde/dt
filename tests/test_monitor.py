@@ -13,7 +13,31 @@ from dt import cli, completion
 from dt.completion import CompletionSignals
 from dt.config import HeadConfig, LaptopConfig, Node
 from dt.jobs import JobEntry
+from dt.monitoring import summarize_resource_text
 from dt.probe import Gpu, NodeStatus, SystemStats
+
+
+def _telemetry_envelope(resource_text: str, *, tail: int) -> str:
+    summary, invalid = summarize_resource_text(resource_text)
+    lines = len(resource_text.splitlines())
+    counts = {
+        "lines_total": lines,
+        "lines_selected": lines,
+        "valid_rows": lines - invalid,
+        "invalid_lines": invalid,
+        "bytes_read": len(resource_text.encode("utf-8")),
+    }
+    return json.dumps(
+        {
+            "schema_version": "dt_telemetry_summary_envelope_v1",
+            "requested_tail": tail,
+            **counts,
+            "counts": counts,
+            "complete": True,
+            "omission_reason": None,
+            "summary": summary,
+        }
+    )
 
 
 def test_completion_signal_wakes_on_local_exit_marker(tmp_path):
@@ -202,7 +226,7 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
     )
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    resource = json.dumps(
+    resource_row = json.dumps(
         {
             "schema_version": "dt_resource_v1",
             "timestamp": 101.0,
@@ -225,6 +249,7 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
             "gpu_error": None,
         }
     )
+    resource = _telemetry_envelope(resource_row, tail=cli.INFO_RESOURCE_TAIL)
     phases = "\n".join(
         [
             '{"schema_version":"dt_phase_v1","phase":"wrapper","timestamp":100.1}',
@@ -241,14 +266,16 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
             "observed_mib": 20623,
             "limit_mib": 20000,
             "phase": "train",
-            "action": "terminate_process_group",
+            "action": "terminate_process_tree_and_group",
             "root_pid": 123,
+            "term_descendants": 2,
         }
     )
     probe = (
         f"100\n{cli.INFO_MARK}\n102\n{cli.INFO_MARK}\n1G\n"
         f"{cli.INFO_MARK}\nyes\n{cli.INFO_MARK}\n{resource}\n"
         f"{cli.INFO_MARK}\n{phases}\n{cli.INFO_MARK}\n{guard}\n"
+        f"{cli.INFO_MARK}\nsystemd_scope_verified\n{cli.INFO_MARK}\nyes\n"
     )
     monkeypatch.setattr(
         cli,
@@ -279,6 +306,8 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
     assert data["resource_guard"]["kind"] == "max_job_memory_mib"
     assert data["resource_guard"]["observed_mib"] == 20623
     assert data["resource_guard"]["phase"] == "train"
+    assert data["runtime_containment"] == "systemd_scope_verified"
+    assert data["runtime_linger"] == "yes"
     assert [
         round(row["duration_s"], 3) for row in data["phase_summary"]["markers"]
     ] == [
@@ -1189,6 +1218,32 @@ def test_info_live_missing_optional_telemetry_keeps_reachable_node(
     assert live["outputs_size"] is not None
     assert live["resource_text"] == ""
     assert live["phase_text"] == ""
+    assert live["runtime_containment"] is None
+    assert live["runtime_linger"] is None
+
+
+def test_info_live_exposes_runtime_containment_and_linger(tmp_path):
+    job_dir = tmp_path / "job"
+    (job_dir / "outputs" / "dt").mkdir(parents=True)
+    (job_dir / "runtime_containment").write_text("systemd_scope_verified\n")
+    (job_dir / "runtime_linger").write_text("yes\n")
+    entry = JobEntry(
+        job_id="runtime-info",
+        name="runtime-info",
+        center="c",
+        project="p",
+        node="local",
+        node_local=True,
+        job_dir=str(job_dir),
+        session="dt_runtime_info",
+        cmd="true",
+        status="running",
+    )
+
+    live = cli._info_live(entry)
+
+    assert live["runtime_containment"] == "systemd_scope_verified"
+    assert live["runtime_linger"] == "yes"
 
 
 def test_info_live_preserves_subsecond_remote_timestamps(tmp_path):
@@ -1239,7 +1294,7 @@ def test_info_metrics_tail_uses_the_shared_telemetry_query(tmp_path, monkeypatch
         exit_code=0,
     )
     cli.jobs_mod.save(cfg, entry)
-    resource = json.dumps(
+    resource_row = json.dumps(
         {
             "schema_version": "dt_resource_v1",
             "timestamp": 101.0,
@@ -1247,10 +1302,11 @@ def test_info_metrics_tail_uses_the_shared_telemetry_query(tmp_path, monkeypatch
             "host": {},
         }
     )
+    resource = _telemetry_envelope(resource_row, tail=12)
     probe = (
         f"100\n{cli.INFO_MARK}\n102\n{cli.INFO_MARK}\n1M\n"
         f"{cli.INFO_MARK}\n{cli.INFO_MARK}\n{resource}\n"
-        f"{cli.INFO_MARK}\n{cli.INFO_MARK}\n"
+        f"{cli.INFO_MARK}\n{cli.INFO_MARK}\n{cli.INFO_MARK}\n{cli.INFO_MARK}\n"
     )
     commands = []
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
@@ -1271,10 +1327,11 @@ def test_info_metrics_tail_uses_the_shared_telemetry_query(tmp_path, monkeypatch
     assert result.exit_code == 0, result.output
     summary = json.loads(result.stdout)["resource_summary"]
     assert summary["tail_limit"] == 12
-    assert summary["path"] == "~/dt/jobs/tail-info/outputs/dt/resources.jsonl"
+    assert summary["path"] == "~/dt/jobs/tail-info/evidence/resources.jsonl"
+    assert summary["evidence_provenance"] == "legacy_unisolated"
     assert any(
-        "tail -c 262144 -- dt/jobs/tail-info/outputs/dt/resources.jsonl | tail -n 12"
-        in command
+        "python3 -I dt/jobs/tail-info/telemetry_summary.py "
+        "--path dt/jobs/tail-info/evidence/resources.jsonl --tail 12" in command
         for command in commands
     )
 
@@ -1404,6 +1461,113 @@ def test_ps_surfaces_unreachable_and_overdue_running_job(tmp_path, monkeypatch):
     assert rows[0]["status_probe_error"] == "ssh: No route to host"
     assert rows[0]["max_hours_exceeded"] is True
     assert rows[0]["max_hours_overdue_s"] == 6.4
+
+
+def test_active_ps_and_free_scheduler_context_do_not_decode_terminal_history(
+    tmp_path, monkeypatch
+):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    for index in range(50):
+        cli.jobs_mod.save(
+            cfg,
+            JobEntry(
+                job_id=f"done-{index}",
+                name=f"done-{index}",
+                center="c",
+                project="p",
+                node="n1",
+                node_local=False,
+                job_dir=f"dt/jobs/done-{index}",
+                session=f"dt_done_{index}",
+                cmd="true",
+                status="finished",
+                exit_code=0,
+            ),
+        )
+    queued = JobEntry(
+        job_id="active-queued",
+        name="active-queued",
+        center="c",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/active-queued",
+        session="dt_active_queued",
+        cmd="true",
+        status="queued",
+    )
+    cli.jobs_mod.save(cfg, queued)
+    monkeypatch.setattr(
+        cli.jobs_mod,
+        "list_all",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("active control path decoded terminal history")
+        ),
+    )
+    from dt import agent as agent_mod
+
+    monkeypatch.setattr(agent_mod, "alive_pid", lambda _cfg: 1234)
+    monkeypatch.setattr(
+        agent_mod,
+        "heartbeat_health",
+        lambda _cfg, *, alive: {"heartbeat_stale": False},
+    )
+
+    rows, errors = cli._gather_ps_rows(cfg, None, active_only=True)
+    context = cli._free_scheduler_context(cfg, resources=[])
+
+    assert errors == {}
+    assert [row["job_id"] for row in rows] == ["active-queued"]
+    assert rows[0]["display_ref"] == "active-queued"
+    assert context["queued"] == 1
+    assert context["queue_head_job_id"] == "active-queued"
+
+
+def test_ps_does_not_probe_lost_jobs_after_the_rescue_window(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entry = JobEntry(
+        job_id="settled-lost",
+        name="settled-lost",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/settled-lost",
+        session="dt_settled_lost",
+        cmd="true",
+        status="lost",
+        finished_at=100.0,
+        updated_at=100.0,
+    )
+    cli.jobs_mod.save(cfg, entry)
+    monkeypatch.setattr(cli.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(
+        cli.jobs_mod,
+        "refresh_status",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("expired lost jobs must not create remote ps probes")
+        ),
+    )
+
+    rows, errors = cli._gather_ps_rows(cfg, status=None)
+
+    assert errors == {}
+    assert len(rows) == 1
+    assert rows[0]["status"] == "lost"
 
 
 def test_ps_queued_rows_report_fifo_position_depth_and_predecessor(
@@ -1971,7 +2135,7 @@ def test_watch_terminal_transition_includes_persisted_resource_summary(
         status="running",
         started_at=100.0,
     )
-    resource = json.dumps(
+    resource_row = json.dumps(
         {
             "schema_version": "dt_resource_v1",
             "timestamp": 101.0,
@@ -1994,6 +2158,8 @@ def test_watch_terminal_transition_includes_persisted_resource_summary(
             "gpu_error": None,
         }
     )
+
+    resource = _telemetry_envelope(resource_row, tail=cli.INFO_RESOURCE_TAIL)
 
     def refresh(cfg_, entry_, **kwargs):
         entry_.status = "finished"
@@ -2029,7 +2195,7 @@ def test_watch_terminal_transition_includes_persisted_resource_summary(
     assert snapshot["resources"] is None
     assert snapshot["resource_summary"]["samples"] == 1
     assert snapshot["resource_summary"]["gpus"]["0"]["util_peak_pct"] == 99
-    assert snapshot["resource_summary"]["path"].endswith("/outputs/dt/resources.jsonl")
+    assert snapshot["resource_summary"]["path"].endswith("/evidence/resources.jsonl")
 
     entry.status = "running"
     entry.exit_code = None

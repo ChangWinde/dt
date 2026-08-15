@@ -134,13 +134,16 @@ def test_pull_applies_the_site_default_and_flag_override(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "dt.topology_discovery.resolved_ssh_options", lambda node, **kw: {}
     )
-    monkeypatch.setattr(
-        cli,
-        "run_on",
-        lambda *a, **k: subprocess.CompletedProcess(
-            a, 0, "1073741824\tdt/jobs/jid/outputs\n", ""
-        ),
-    )
+
+    def fake_run_on(_node, _local, command, **_kwargs):
+        stdout = (
+            ""
+            if cli.PULL_EVIDENCE_MARK in command
+            else "1073741824\tdt/jobs/jid/outputs\n"
+        )
+        return subprocess.CompletedProcess([], 0, stdout, "")
+
+    monkeypatch.setattr(cli, "run_on", fake_run_on)
     seen = []
 
     def fake_rsync(src, dst, **kwargs):

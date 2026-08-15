@@ -12,6 +12,7 @@ from dt.operation_log import (
     OperationJournalError,
     append_event,
     begin,
+    bind_identity,
     finish,
     mark_problem,
     query,
@@ -141,6 +142,92 @@ def test_unknown_command_is_collapsed_instead_of_logged(tmp_path, monkeypatch):
     raw = session.target.current.read_text("utf-8")
     assert secret not in raw
     assert json.loads(raw.splitlines()[0])["command"] == "unknown"
+
+
+def test_diagnose_is_recorded_as_a_known_public_command(tmp_path, monkeypatch):
+    _write_head_config(tmp_path, monkeypatch)
+
+    session = begin(["diagnose", "job-42", "--json"])
+    finish(session, exit_code=0, status="success")
+
+    records = [
+        json.loads(line)
+        for line in session.target.current.read_text("utf-8").splitlines()
+    ]
+    assert [record["command"] for record in records] == ["diagnose", "diagnose"]
+
+
+def test_finish_event_binds_request_and_job_without_recording_invalid_values(
+    tmp_path, monkeypatch
+):
+    _write_head_config(tmp_path, monkeypatch)
+
+    session = begin(["run", "--request-id", "request-42", "--", "true"])
+    bind_identity(request_id="request-42", job_id="20260815-0100_run_deadbeef")
+    bind_identity(request_id="unsafe request secret", job_id="../unsafe")
+    finish(session, exit_code=0, status="success")
+
+    records = [
+        json.loads(line)
+        for line in session.target.current.read_text("utf-8").splitlines()
+    ]
+    assert "request_id" not in records[0]
+    assert records[1]["request_id"] == "request-42"
+    assert records[1]["job_id"] == "20260815-0100_run_deadbeef"
+    assert query(session.target).events[0]["job_id"] == ("20260815-0100_run_deadbeef")
+    assert (
+        query(session.target, request_id="request-42").events[0]["request_id"]
+        == "request-42"
+    )
+    assert (
+        query(session.target, job_id="20260815-0100_run_deadbeef").events[0]["job_id"]
+        == "20260815-0100_run_deadbeef"
+    )
+    assert query(session.target, request_id="another-request").events == []
+
+
+def test_job_id_length_boundary_matches_registry_and_round_trips(tmp_path, monkeypatch):
+    _write_head_config(tmp_path, monkeypatch)
+    accepted = "j" * 240
+    rejected = "j" * 241
+
+    accepted_session = begin(["run", "--", "true"])
+    bind_identity(job_id=accepted)
+    finish(accepted_session, exit_code=0, status="success")
+
+    rejected_session = begin(["run", "--", "true"])
+    bind_identity(job_id=rejected)
+    finish(rejected_session, exit_code=0, status="success")
+
+    append_event(
+        accepted_session.target,
+        _finish_event("f" * 32, job_id=rejected),
+    )
+
+    matching = query(accepted_session.target, job_id=accepted)
+    assert [event["job_id"] for event in matching.events] == [accepted]
+    assert matching.corrupt_records == 1
+    rejected_finish = query(
+        accepted_session.target,
+        exclude_operation_id=accepted_session.operation_id,
+    ).events[0]
+    assert rejected_finish["operation_id"] == rejected_session.operation_id
+    assert "job_id" not in rejected_finish
+    with pytest.raises(ValueError):
+        query(accepted_session.target, job_id=rejected)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("request_id", "unsafe request"), ("job_id", "../unsafe")],
+)
+def test_query_rejects_invalid_correlation_filters(tmp_path, monkeypatch, field, value):
+    _write_head_config(tmp_path, monkeypatch)
+    session = begin(["events"])
+    finish(session, exit_code=0, status="success")
+
+    with pytest.raises(ValueError):
+        query(session.target, **{field: value})
 
 
 def test_invalid_problem_kind_is_collapsed_and_cannot_break_the_command(
@@ -386,11 +473,28 @@ def test_events_cli_emits_bounded_machine_contract(tmp_path, monkeypatch):
     target = resolve_target(cfg)
     append_event(
         target,
-        _finish_event("3" * 32),
+        _finish_event(
+            "3" * 32,
+            request_id="request-42",
+            job_id="20260815-0100_run_deadbeef",
+        ),
     )
+    append_event(target, _finish_event("4" * 32, request_id="request-other"))
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
 
-    result = CliRunner().invoke(cli.app, ["events", "--limit", "1", "--json"])
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "events",
+            "--limit",
+            "1",
+            "--request-id",
+            "request-42",
+            "--job-id",
+            "20260815-0100_run_deadbeef",
+            "--json",
+        ],
+    )
 
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
@@ -453,7 +557,7 @@ def test_main_records_remote_failures(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli,
         "app",
-        lambda: (_ for _ in ()).throw(cli.RemoteError("head", "offline")),
+        lambda **_kwargs: (_ for _ in ()).throw(cli.RemoteError("head", "offline")),
     )
 
     with pytest.raises(SystemExit) as caught:
@@ -482,7 +586,7 @@ def test_begin_survives_home_less_environment(tmp_path, monkeypatch):
 
     session = operation_log.begin(["dt", "--version"])
     assert session.operation_id
-    operation_log.finish(session, status="ok", exit_code=0)
+    operation_log.finish(session, status="success", exit_code=0)
 
 
 def test_fallback_state_root_degrades_when_home_unresolvable(monkeypatch):

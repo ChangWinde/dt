@@ -1,5 +1,6 @@
 """Gateway-staged project sync (ADR 0026)."""
 
+import os
 import subprocess
 import threading
 from contextlib import contextmanager
@@ -399,13 +400,38 @@ def test_artifact_mirror_prepares_every_parent_once():
     )
 
     assert command.startswith("bash -c ")
-    assert 'test ! -L "$HOME/.dt"' in command
+    assert "dt_ensure_private_dir" in command
     assert '"$mirror"/configs' in command
     assert '"$mirror"/data' in command
     # A root-level artifact contributes no extra parent.
     assert '"$mirror"/top.txt' not in command
     # Parents are deduplicated.
-    assert command.count('"$mirror"/data') == 1
+    assert command.count('"$mirror"/data;') == 1
+
+
+def test_artifact_mirror_refuses_a_nested_symlink_before_creating_below_it(
+    tmp_path,
+):
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    mirror = home / ".dt/sync-staging/omni/artifacts"
+    mirror.mkdir(parents=True)
+    outside.mkdir()
+    (mirror / "data").symlink_to(outside, target_is_directory=True)
+    command = sync_relay.prepare_artifact_mirror_command(
+        "omni", ["data/nested/model.bin"]
+    )
+
+    proc = subprocess.run(
+        command,
+        shell=True,
+        env={**os.environ, "HOME": str(home)},
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 70
+    assert not (outside / "nested").exists()
 
 
 def test_artifact_push_matches_direct_semantics():

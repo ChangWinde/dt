@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -95,7 +96,12 @@ def test_layout_plan_and_apply_migrate_verified_head_records_and_snapshots(tmp_p
     assert applied["verification"]["accounting_delta_bytes"] == 0
     assert applied["verification"]["post_legacy_known_bytes"] == 0
     assert not (legacy_registry / f"{entry.job_id}.json").exists()
-    assert (cfg.registry_dir() / f"{entry.job_id}.json").is_file()
+    migrated_registry = cfg.registry_dir() / f"{entry.job_id}.json"
+    assert migrated_registry.is_file()
+    assert (
+        json.loads(migrated_registry.read_text(encoding="utf-8"))["schema_version"]
+        == "dt_job_registry_v1"
+    )
     assert not snapshot.exists()
     assert (cfg.snapshots_dir() / digest / "code" / "train.py").is_file()
 
@@ -142,6 +148,41 @@ def test_snapshot_migration_flushes_destination_before_source_delete(
         for kind, path, source_live in events
     )
     assert not source.exists()
+
+
+def test_snapshot_migration_aborts_publish_when_tree_barrier_fails(
+    tmp_path, monkeypatch
+):
+    source_code = tmp_path / "source-code"
+    source_code.mkdir()
+    (source_code / "train.py").write_text("print('exact')\n")
+    digest = tree_sha256(source_code)
+    source = tmp_path / "legacy" / digest
+    destination = tmp_path / "role" / digest
+    (source / "code").mkdir(parents=True)
+    (source / "code" / "train.py").write_text("print('exact')\n")
+    (source / "meta.json").write_text(json.dumps({"snapshot_sha256": digest}))
+
+    def fail_tree(path):
+        raise migration_mod.PrivateStateError(f"cannot persist directory tree: {path}")
+
+    monkeypatch.setattr(migration_mod, "fsync_tree", fail_tree)
+
+    with pytest.raises(
+        migration_mod.PrivateStateError,
+        match="cannot persist directory tree",
+    ):
+        migration_mod._copy_snapshot_row(
+            {
+                "source": str(source),
+                "destination": str(destination),
+                "identity": digest,
+                "status": "movable",
+            }
+        )
+
+    assert source.is_dir()
+    assert not destination.exists()
 
 
 def test_duplicate_snapshot_is_reverified_before_legacy_source_removal(tmp_path):
@@ -246,25 +287,65 @@ def test_layout_plan_bounds_legacy_registry_and_snapshot_metadata(tmp_path):
     assert "size limit" in rows[("snapshot", digest)]["blocker"]
 
 
+def test_registry_migration_blocks_duplicate_fields_without_deleting_source(tmp_path):
+    cfg = _cfg(tmp_path)
+    entry = _entry("duplicate-registry")
+    source = cfg.legacy_registry_dir() / f"{entry.job_id}.json"
+    source.parent.mkdir(parents=True)
+    encoded = json.dumps(asdict(entry), separators=(",", ":"))
+    duplicate = encoded.replace(
+        '"job_id":"duplicate-registry"',
+        '"job_id":"duplicate-registry","job_id":"duplicate-registry"',
+        1,
+    )
+    assert duplicate != encoded
+    source.write_text(duplicate, encoding="utf-8")
+
+    def runner(*_args, **_kwargs):
+        raise AssertionError("head-only registry migration must not contact workers")
+
+    planned = plan_layout(cfg, runner=runner)
+    row = next(
+        item
+        for item in planned["rows"]
+        if item["kind"] == "registry" and item["identity"] == entry.job_id
+    )
+    assert row["status"] == "blocked"
+    assert row["blocker"] == "registry record is malformed"
+
+    applied = apply_layout(cfg, runner=runner)
+    applied_row = next(
+        item
+        for item in applied["rows"]
+        if item["kind"] == "registry" and item["identity"] == entry.job_id
+    )
+    assert applied_row["status"] == "blocked"
+    assert source.read_text(encoding="utf-8") == duplicate
+    assert not (cfg.registry_dir() / source.name).exists()
+
+
 def test_registry_migration_revalidates_duplicate_before_deleting_source(tmp_path):
     source = tmp_path / "legacy" / "job.json"
     destination = tmp_path / "current" / "job.json"
     source.parent.mkdir()
     destination.parent.mkdir()
-    source.write_bytes(b'{"job_id":"job"}\n')
-    destination.write_bytes(b'{"job_id":"changed"}\n')
+    source.write_text(json.dumps(asdict(_entry("job"))), encoding="utf-8")
+    changed = _entry("job")
+    changed.cmd = "changed"
+    destination.write_text(json.dumps(asdict(changed)), encoding="utf-8")
 
     with pytest.raises(OSError, match="duplicate changed"):
         migration_mod._copy_registry_row(
             {
                 "source": str(source),
                 "destination": str(destination),
+                "identity": "job",
                 "status": "duplicate_verified",
             }
         )
 
     assert source.is_file()
-    assert destination.read_bytes() == b'{"job_id":"changed"}\n'
+    assert json.loads(destination.read_text(encoding="utf-8"))["cmd"] == "changed"
 
 
 def test_registry_migration_rolls_back_if_source_changes_during_publish(
@@ -274,7 +355,7 @@ def test_registry_migration_rolls_back_if_source_changes_during_publish(
     destination = tmp_path / "current" / "job.json"
     source.parent.mkdir()
     destination.parent.mkdir()
-    source.write_bytes(b'{"job_id":"job"}\n')
+    source.write_text(json.dumps(asdict(_entry("job"))), encoding="utf-8")
     real_link = migration_mod.os.link
 
     def racing_link(*args, **kwargs):
@@ -289,6 +370,7 @@ def test_registry_migration_rolls_back_if_source_changes_during_publish(
             {
                 "source": str(source),
                 "destination": str(destination),
+                "identity": "job",
                 "status": "movable",
             }
         )
@@ -477,6 +559,52 @@ def test_worker_copy_preserves_data_inside_a_private_capsule(tmp_path):
     assert (destination / ".dt" / "meta.json").is_file()
     assert (destination / ".dt" / "command.sh").is_file()
     assert source.is_dir()
+
+
+def test_worker_migration_rejects_duplicate_metadata_and_retains_source(tmp_path):
+    cfg = _cfg(tmp_path)
+    entry = _entry("duplicate-meta", node="n1")
+    cfg.legacy_registry_dir().mkdir(parents=True)
+    (cfg.legacy_registry_dir() / f"{entry.job_id}.json").write_text(
+        json.dumps(asdict(entry))
+    )
+    source = tmp_path / entry.job_dir
+    (source / "code").mkdir(parents=True)
+    (source / "code" / "train.py").write_text("print('retained')\n")
+    (source / "meta.json").write_text(
+        '{"job_id":"duplicate-meta","job_id":"duplicate-meta"}\n'
+    )
+    destination = Path(cfg.worker_job_dir(cfg.nodes[0], entry.job_id))
+
+    def runner(_node, _local, command, timeout=15, check=False):
+        return subprocess.run(
+            ["bash", "-c", command],
+            env={**os.environ, "HOME": str(tmp_path)},
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=check,
+        )
+
+    planned = plan_layout(cfg, runner=runner)
+    row = next(
+        item
+        for item in planned["rows"]
+        if item["kind"] == "job" and item["identity"] == entry.job_id
+    )
+    assert row["status"] == "blocked"
+    assert row["blocker"] == "metadata_identity_mismatch"
+
+    applied = apply_layout(cfg, runner=runner)
+    applied_row = next(
+        item
+        for item in applied["rows"]
+        if item["kind"] == "job" and item["identity"] == entry.job_id
+    )
+    assert applied_row["status"] == "blocked"
+    assert (source / "code" / "train.py").read_text() == "print('retained')\n"
+    assert not destination.exists()
 
 
 def test_worker_source_delete_refuses_live_capsule(tmp_path):

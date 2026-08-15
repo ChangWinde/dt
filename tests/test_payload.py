@@ -9,12 +9,14 @@ import shlex
 import signal
 import shutil
 import subprocess
+import stat
 import sys
 import time
 from pathlib import Path
 
 import pytest
 
+import dt.payload.artifact_verify as artifact_verify
 from dt.dispatch import (
     RUNTIME_PAYLOAD_NAMES,
     RunSpec,
@@ -26,11 +28,23 @@ from dt.dispatch import (
 from dt.jobs import JobEntry
 from dt.payload.artifact_verify import verify as verify_artifacts
 from dt.payload_hash import payload_files_from_dir
+from dt.private_env import encode as encode_private_env
 
 PAYLOAD = Path(__file__).parent.parent / "src" / "dt" / "payload"
 LAUNCHER = (PAYLOAD / "launcher.sh").read_text()
 WRAPPER = (PAYLOAD / "wrapper.sh").read_text()
 WRAPPER_TIMEOUT_SECONDS = 15
+TEST_RUNTIME_SCOPE = f"dt-runtime-{'a' * 20}.scope"
+
+
+def _write_verified_runtime_scope(state_dir: Path) -> str:
+    containment = state_dir / "runtime_containment"
+    containment.write_text("systemd_scope_verified\n")
+    containment.chmod(0o600)
+    scope = state_dir / "runtime_scope"
+    scope.write_text(f"{TEST_RUNTIME_SCOPE}\n")
+    scope.chmod(0o600)
+    return TEST_RUNTIME_SCOPE
 
 
 def test_runtime_payload_uses_private_umask_before_creating_state():
@@ -170,8 +184,9 @@ def test_dispatch_remote_command_enters_capsule_before_launcher_exec(
     )
     seen = {}
 
-    def fake_run_on(name, local, command, timeout):
+    def fake_run_on(name, local, command, timeout, **kwargs):
         seen["command"] = command
+        seen["stdin_bytes"] = kwargs.get("stdin_bytes")
         return subprocess.CompletedProcess(
             [name],
             0,
@@ -192,6 +207,7 @@ def test_dispatch_remote_command_enters_capsule_before_launcher_exec(
 
     assert code == 0
     assert seen["command"].startswith('cd "$HOME"/dt/jobs/job1 && ')
+    assert dispatch.private_env_mod.decode(seen["stdin_bytes"]) == {}
 
 
 def _cancel_supersede_block() -> str:
@@ -283,7 +299,7 @@ def test_launcher_attempt_token_honors_its_targeted_cancellation(tmp_path):
 
 
 def test_launcher_rechecks_cancel_sentinel_after_session_start():
-    session_start = LAUNCHER.index('start_session "$ids" || return 14')
+    session_start = LAUNCHER.index('start_session "$ids"')
     post_start = LAUNCHER.index(
         'log "cancelled by dispatcher during session start"',
         session_start,
@@ -325,6 +341,7 @@ def test_launcher_setup_hook_contract():
     assert "setup.sh" in LAUNCHER
     assert "--inexact" in LAUNCHER
     assert ".dt-setup-" in LAUNCHER
+    assert "env -u DT_EVIDENCE_DIR" in LAUNCHER
     assert '"$DT_CONTROL_DIR/env-key"' in LAUNCHER
 
 
@@ -335,6 +352,9 @@ def _run_launcher_with_fake_uv(
     env_overrides: dict[str, str] | None = None,
     custom_env: dict[str, str] | None = None,
     gpu_rows: str | None = None,
+    private_env: dict[str, str] | None = None,
+    systemd_scope: bool = True,
+    linger: bool = True,
 ) -> subprocess.CompletedProcess:
     job = tmp_path / "job"
     code = job / "code"
@@ -352,6 +372,24 @@ def _run_launcher_with_fake_uv(
         custom_path.chmod(0o600)
     if mode == "setup":
         (job / "setup.sh").write_text("true\n")
+    elif mode == "private_proxy":
+        (job / "setup.sh").write_text(
+            'proxy_digest=$(printf "%s" "${HTTPS_PROXY:-}" '
+            "| sha256sum | cut -d' ' -f1)\n"
+            'if [ "$proxy_digest" = "$DT_TEST_PROXY_SHA256" ] '
+            '&& [ "${HTTP_PROXY:-}" = "${HTTPS_PROXY:-}" ] '
+            '&& [ "${http_proxy:-}" = "${HTTPS_PROXY:-}" ] '
+            '&& [ "${https_proxy:-}" = "${HTTPS_PROXY:-}" ]; then\n'
+            '  printf "true\\n" > "$DT_TEST_STATE/setup-proxy-ok"\n'
+            "else\n"
+            '  printf "false\\n" > "$DT_TEST_STATE/setup-proxy-ok"\n'
+            "fi\n"
+            "if [[ -v DT_EVIDENCE_DIR ]]; then\n"
+            '  printf "false\\n" > "$DT_TEST_STATE/setup-evidence-private"\n'
+            "else\n"
+            '  printf "true\\n" > "$DT_TEST_STATE/setup-evidence-private"\n'
+            "fi\n"
+        )
     elif mode == "setup_failure":
         (job / "setup.sh").write_text("false\ntrue\n")
     elif mode in {"network_setup", "network_warm_setup"}:
@@ -389,6 +427,18 @@ def _run_launcher_with_fake_uv(
         'state="$DT_TEST_STATE"\n'
         'if [ "${1:-}" = sync ]; then\n'
         '  printf "%s\\n" "$*" >> "$state/sync-argv"\n'
+        '  if [ "$DT_TEST_UV_MODE" = private_proxy ]; then\n'
+        '    proxy_digest=$(printf "%s" "${HTTPS_PROXY:-}" '
+        "| sha256sum | cut -d' ' -f1)\n"
+        '    if [ "$proxy_digest" = "$DT_TEST_PROXY_SHA256" ] '
+        '&& [ "${HTTP_PROXY:-}" = "${HTTPS_PROXY:-}" ] '
+        '&& [ "${http_proxy:-}" = "${HTTPS_PROXY:-}" ] '
+        '&& [ "${https_proxy:-}" = "${HTTPS_PROXY:-}" ]; then\n'
+        '      printf "true\\n" > "$state/sync-proxy-ok"\n'
+        "    else\n"
+        '      printf "false\\n" > "$state/sync-proxy-ok"\n'
+        "    fi\n"
+        "  fi\n"
         '  mkdir -p "$UV_PROJECT_ENVIRONMENT"\n'
         '  count=$(cat "$state/sync-count" 2>/dev/null || echo 0)\n'
         "  count=$((count + 1))\n"
@@ -445,6 +495,7 @@ def _run_launcher_with_fake_uv(
         'case " $* " in\n'
         '  *" has-session "*) exit 1 ;;\n'
         '  *" new-session "*)\n'
+        '    : > "$DT_TEST_STATE/tmux-new-session"\n'
         '    if [ -n "${DT_TEST_TMUX_CAPTURE:-}" ]; then\n'
         '      printf "%s" "${7:-}" > "$DT_TEST_STATE/session-command"\n'
         "    fi\n"
@@ -454,6 +505,67 @@ def _run_launcher_with_fake_uv(
         "exit 99\n"
     )
     tmux.chmod(0o755)
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        "#!/usr/bin/env bash\n"
+        '[ "${DT_TEST_SYSTEMD_SCOPE_AVAILABLE:-0}" = 1 ] || exit 1\n'
+        'case " $* " in\n'
+        '  *" show-environment "*) exit 0 ;;\n'
+        '  *" --property=LoadState "*) printf "loaded\\n" ;;\n'
+        '  *" --property=ActiveState "*) printf "active\\n" ;;\n'
+        '  *" --property=ControlGroup "*)\n'
+        '    unit=""\n'
+        '    for value in "$@"; do case "$value" in *.scope) unit=$value;; esac; done\n'
+        '    [ -n "$unit" ] || exit 1\n'
+        '    printf "/user.slice/%s\\n" "$unit" ;;\n'
+        '  *" stop "*) exit 0 ;;\n'
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    systemctl.chmod(0o755)
+    systemd_run = fake_bin / "systemd-run"
+    systemd_run.write_text(
+        "#!/usr/bin/env bash\n"
+        '[ "${DT_TEST_SYSTEMD_SCOPE_AVAILABLE:-0}" = 1 ] || exit 1\n'
+        'while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done\n'
+        '[ "${1:-}" = -- ] || exit 2\n'
+        "shift\n"
+        'exec "$@"\n'
+    )
+    systemd_run.chmod(0o755)
+    loginctl = fake_bin / "loginctl"
+    loginctl.write_text(
+        "#!/usr/bin/env bash\n"
+        'case " $* " in\n'
+        '  *" show-user "*" --property=Linger --value "*)\n'
+        '    [ "${DT_TEST_LINGER:-no}" = yes ] && printf "yes\\n" '
+        '|| printf "no\\n" ;;\n'
+        "  *) exit 1 ;;\n"
+        "esac\n"
+    )
+    loginctl.chmod(0o755)
+    unshare = fake_bin / "unshare"
+    unshare.write_text(
+        "#!/usr/bin/env bash\n"
+        '[ "${DT_TEST_UNSHARE_AVAILABLE:-1}" = 1 ] || exit 1\n'
+        'while [[ "${1:-}" == -* ]]; do shift; done\n'
+        'exec "$@"\n'
+    )
+    unshare.chmod(0o755)
+    mount = fake_bin / "mount"
+    mount.write_text(
+        "#!/usr/bin/env bash\n"
+        '[ "${1:-}" = --bind ] || exit 2\n'
+        'cp -a -- "${2:?}/." "${3:?}/"\n'
+    )
+    mount.chmod(0o755)
+    umount = fake_bin / "umount"
+    umount.write_text(
+        "#!/usr/bin/env bash\n"
+        '[ "${1:-}" = -- ] && shift\n'
+        'find "${1:?}" -mindepth 1 -delete\n'
+    )
+    umount.chmod(0o755)
     test_runtime_id = hashlib.sha256(str(tmp_path).encode()).hexdigest()[:12]
     env = {
         **os.environ,
@@ -469,6 +581,8 @@ def _run_launcher_with_fake_uv(
         "DT_DISK_GIB": "0",
         "DT_TEST_STATE": str(state),
         "DT_TEST_UV_MODE": mode,
+        "DT_TEST_SYSTEMD_SCOPE_AVAILABLE": "1" if systemd_scope else "0",
+        "DT_TEST_LINGER": "yes" if linger else "no",
     }
     if custom_env:
         env["DT_CUSTOM_ENV_PATH"] = str(job / "custom-env")
@@ -490,6 +604,20 @@ def _run_launcher_with_fake_uv(
         else:
             source_cache.mkdir()
             (source_cache / "kernel.bin").write_bytes(b"source-cache")
+            if cache_mode == "clone_symlink_escape":
+                outside = fake_home / "outside-secret"
+                outside.write_bytes(b"must-not-copy")
+                (source_cache / "escape").symlink_to(
+                    os.path.relpath(outside, source_cache)
+                )
+            elif cache_mode == "clone_symlink_absolute":
+                outside = fake_home / "outside-secret"
+                outside.write_bytes(b"must-not-copy")
+                (source_cache / "escape").symlink_to(outside)
+            elif cache_mode == "clone_fifo":
+                os.mkfifo(source_cache / "blocked")
+            elif cache_mode == "clone_safe_symlink":
+                (source_cache / "kernel-link").symlink_to("kernel.bin")
         (source / "exit_code").write_text("0\n")
         (source / "env-key").write_text("0123456789ab\n")
         (source / "meta.json").write_text(json.dumps({"snapshot_sha256": "a" * 64}))
@@ -503,16 +631,332 @@ def _run_launcher_with_fake_uv(
                 "DT_CACHE_SOURCE_SNAPSHOT": "a" * 64,
             }
         )
-        if cache_mode == "clone":
+        if cache_mode.startswith("clone"):
             env["DT_CACHE_MODE"] = "clone"
+        if cache_mode == "clone_corrupt":
+            fake_cp = fake_bin / "cp"
+            fake_cp.write_text(
+                "#!/usr/bin/env bash\n"
+                'if [ "${1:-}" = --help ]; then exec /bin/cp --help; fi\n'
+                'args=("$@")\n'
+                "source_arg=${args[${#args[@]}-2]}\n"
+                "destination=${args[${#args[@]}-1]}\n"
+                '/bin/cp "$@" || exit $?\n'
+                'case "$destination" in\n'
+                "  */.dt-clone.*)\n"
+                "    source_file=${source_arg%/.}/kernel.bin\n"
+                '    printf "clone-broken" >"$destination/kernel.bin"\n'
+                '    touch -r "$source_file" "$destination/kernel.bin" ;;\n'
+                "esac\n"
+            )
+            fake_cp.chmod(0o755)
     env.update(env_overrides or {})
+    stdin = None
+    if private_env is not None:
+        env["DT_PRIVATE_ENV_STDIN"] = "1"
+        stdin = encode_private_env(private_env)
+    command = ["bash", str(PAYLOAD / "launcher.sh")]
+    if stdin is None:
+        return subprocess.run(
+            command,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
     return subprocess.run(
-        ["bash", str(PAYLOAD / "launcher.sh")],
+        command,
         env=env,
+        input=stdin,
         capture_output=True,
-        text=True,
         timeout=10,
     )
+
+
+def test_gpu_launcher_refuses_unobservable_runtime_scope_before_tmux(tmp_path):
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        gpu_rows="0, GPU-fit, 0, 81920",
+        env_overrides={"DT_GPUS": "1"},
+        systemd_scope=False,
+    )
+
+    assert proc.returncode == 15, proc.stderr
+    assert not (tmp_path / "state" / "tmux-new-session").exists()
+    assert (tmp_path / "job" / "exit_code").read_text() == "15\n"
+    assert (tmp_path / "job" / "result_state").read_text() == "infra_failure\n"
+
+
+def test_gpu_launcher_requires_lingering_user_manager_before_tmux(tmp_path):
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        gpu_rows="0, GPU-fit, 0, 81920",
+        env_overrides={"DT_GPUS": "1"},
+        linger=False,
+    )
+
+    assert proc.returncode == 15, proc.stderr
+    assert "requires loginctl Linger=yes (observed no)" in proc.stderr
+    assert not (tmp_path / "state" / "tmux-new-session").exists()
+    assert (tmp_path / "job" / "runtime_linger").read_text() == "no\n"
+    assert (tmp_path / "job" / "exit_code").read_text() == "15\n"
+    assert (tmp_path / "job" / "result_state").read_text() == "infra_failure\n"
+
+
+def test_cpu_launcher_marks_portable_unproven_fallback(tmp_path):
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        systemd_scope=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "state" / "tmux-new-session").exists()
+    assert (tmp_path / "job" / "runtime_containment").read_text() == (
+        "portable_unproven\n"
+    )
+
+
+def test_gpu_wrapper_rejects_symlinked_containment_attestation(tmp_path):
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text("touch ../runner-ran\n")
+    target = tmp_path / "claimed-containment"
+    target.write_text("systemd_scope_verified\n")
+    target.chmod(0o600)
+    (tmp_path / "runtime_containment").symlink_to(target)
+    scope = tmp_path / "runtime_scope"
+    scope.write_text(f"{TEST_RUNTIME_SCOPE}\n")
+    scope.chmod(0o600)
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env={
+            **os.environ,
+            "DT_JOB_DIR": str(tmp_path),
+            "DT_GPU_IDS": "0",
+            "DT_GPUS": "1",
+            "DT_RUNTIME_SCOPE": TEST_RUNTIME_SCOPE,
+        },
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 76
+    assert "without verified systemd scope" in proc.stderr
+    assert not (tmp_path / "runner-ran").exists()
+
+
+def test_launcher_keeps_private_values_out_of_tmux_and_runtime_argv(tmp_path):
+    secret = "private-value-that-must-not-enter-argv"
+    launch_token = "a" * 32
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={"DT_TEST_TMUX_CAPTURE": "1"},
+        private_env={
+            "DT_LAUNCH_TOKEN": launch_token,
+            "DT_PROXY": f"http://operator:{secret}@proxy.invalid:8080",
+            "DT_WEBHOOK": f"https://hooks.invalid/{secret}",
+            "HF_TOKEN": secret,
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr.decode()
+    session_command = (tmp_path / "state" / "session-command").read_text()
+    assert secret not in session_command
+    assert "DT_LAUNCH_TOKEN" not in session_command
+    assert "DT_RUNTIME_ENV_PATH=" in session_command
+    runtime_env = tmp_path / "job" / "runtime-env"
+    assert runtime_env.is_file() and not runtime_env.is_symlink()
+    assert runtime_env.stat().st_mode & 0o077 == 0
+    assert secret.encode() in runtime_env.read_bytes()
+    launch_identity = tmp_path / "job" / "launch-identity.sha256"
+    assert launch_identity.is_file() and not launch_identity.is_symlink()
+    assert stat.S_IMODE(launch_identity.stat().st_mode) == 0o600
+    assert (
+        launch_identity.read_text().strip()
+        == hashlib.sha256(launch_token.encode("ascii")).hexdigest()
+    )
+    assert launch_token.encode() not in launch_identity.read_bytes()
+    marker = tmp_path / "job" / "launch-identity.sha256"
+    expected = hashlib.sha256(("a" * 32).encode()).hexdigest() + "\n"
+    assert marker.read_text() == expected
+    assert marker.stat().st_mode & 0o777 == 0o600
+    assert ("a" * 32) not in marker.read_text()
+
+
+def test_private_proxy_reaches_setup_and_runtime_without_crossing_public_channels(
+    tmp_path,
+):
+    proxy = "http://operator:p%40ss%3Aprivate@proxy.invalid:8080"
+    proxy_digest = hashlib.sha256(proxy.encode()).hexdigest()
+    secret = "p%40ss%3Aprivate"
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "private_proxy",
+        env_overrides={
+            "DT_TEST_PROXY_SHA256": proxy_digest,
+            "DT_TEST_TMUX_CAPTURE": "1",
+        },
+        private_env={
+            "DT_LAUNCH_TOKEN": "a" * 32,
+            "DT_PROXY": proxy,
+            "DT_WEBHOOK": f"https://hooks.invalid/{secret}",
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr.decode()
+    state = tmp_path / "state"
+    job = tmp_path / "job"
+    assert (state / "sync-proxy-ok").read_text() == "true\n"
+    assert (state / "setup-proxy-ok").read_text() == "true\n"
+    assert (state / "setup-evidence-private").read_text() == "true\n"
+
+    session_command = (state / "session-command").read_bytes()
+    env_log = (job / "logs" / "env.log").read_bytes()
+    launch_identity = (job / "launch-identity.sha256").read_bytes()
+    for public_channel in (
+        proc.stdout,
+        proc.stderr,
+        session_command,
+        env_log,
+        launch_identity,
+    ):
+        assert secret.encode() not in public_channel
+        assert proxy.encode() not in public_channel
+
+    runtime_env = job / "runtime-env"
+    assert runtime_env.is_file() and not runtime_env.is_symlink()
+    assert stat.S_IMODE(runtime_env.stat().st_mode) == 0o600
+    assert proxy.encode() in runtime_env.read_bytes()
+    # The fake launcher proved a synthetic systemd scope, but this direct
+    # wrapper invocation runs in pytest's real cgroup. Exercise the portable
+    # CPU path rather than impersonating that scope across the trust boundary.
+    (job / "runtime_scope").unlink(missing_ok=True)
+    (job / "runtime_containment").unlink(missing_ok=True)
+    (job / "cmd.sh").write_text(
+        'proxy_digest=$(printf "%s" "${DT_PROXY:-}" '
+        "| sha256sum | cut -d' ' -f1)\n"
+        'if [ "$proxy_digest" = "$DT_TEST_PROXY_SHA256" ] '
+        '&& [ "${HTTPS_PROXY:-}" = "$DT_PROXY" ] '
+        "&& ! [[ -v DT_EVIDENCE_DIR ]]; then\n"
+        '  printf "true\\n" > "$DT_JOB_DIR/runtime-private-ok"\n'
+        "else\n"
+        '  printf "false\\n" > "$DT_JOB_DIR/runtime-private-ok"\n'
+        "fi\n"
+    )
+    wrapper = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env={
+            **os.environ,
+            "DT_JOB_DIR": str(job),
+            "DT_RUNTIME_ENV_PATH": str(runtime_env),
+            "DT_GPU_IDS": "",
+            "DT_GPUS": "0",
+            "DT_MAX_HOURS": "",
+            "DT_UV": "",
+            "DT_UV_ENV": "",
+            "DT_TEST_PROXY_SHA256": proxy_digest,
+        },
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert wrapper.returncode == 0, wrapper.stderr
+    assert (job / "runtime-private-ok").read_text() == "true\n"
+    assert not runtime_env.exists()
+    assert secret not in wrapper.stdout
+    assert secret not in wrapper.stderr
+
+
+def test_launcher_never_overwrites_a_different_launch_identity(tmp_path):
+    proof_state = tmp_path / "proof-state"
+    proof_state.mkdir(mode=0o700)
+    marker = proof_state / "launch-identity.sha256"
+    original = hashlib.sha256(("a" * 32).encode()).hexdigest() + "\n"
+    marker.write_text(original)
+    marker.chmod(0o600)
+
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={"DT_STATE_DIR": str(proof_state)},
+        private_env={"DT_LAUNCH_TOKEN": "b" * 32},
+    )
+
+    assert proc.returncode == 14
+    assert b"different launch" in proc.stderr
+    assert marker.read_text() == original
+
+
+def test_launcher_refuses_a_symlinked_launch_identity_marker(tmp_path):
+    proof_state = tmp_path / "proof-state"
+    proof_state.mkdir(mode=0o700)
+    outside = tmp_path / "outside-marker"
+    original = hashlib.sha256(("c" * 32).encode()).hexdigest() + "\n"
+    outside.write_text(original)
+    outside.chmod(0o600)
+    (proof_state / "launch-identity.sha256").symlink_to(outside)
+
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={"DT_STATE_DIR": str(proof_state)},
+        private_env={"DT_LAUNCH_TOKEN": "d" * 32},
+    )
+
+    assert proc.returncode == 14
+    assert outside.read_text() == original
+
+
+def test_wrapper_consumes_private_runtime_env_once_without_exposing_values(tmp_path):
+    secret = "runtime-secret"
+    (tmp_path / "code").mkdir()
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "cmd.sh").write_text(
+        'printf "%s|%s|%s\\n" "$HF_TOKEN" "$DT_PROXY" "$DT_WEBHOOK" '
+        '> "$DT_JOB_DIR/private-seen"\n'
+    )
+    runtime_env = tmp_path / "runtime-env"
+    runtime_env.write_bytes(
+        encode_private_env(
+            {
+                "HF_TOKEN": secret,
+                "DT_PROXY": "http://proxy.invalid/private",
+                "DT_WEBHOOK": "",
+            }
+        )
+    )
+    runtime_env.chmod(0o600)
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env={
+            **os.environ,
+            "DT_JOB_DIR": str(tmp_path),
+            "DT_RUNTIME_ENV_PATH": str(runtime_env),
+            "DT_GPU_IDS": "",
+            "DT_GPUS": "0",
+            "DT_MAX_HOURS": "",
+            "DT_UV": "",
+            "DT_UV_ENV": "",
+        },
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "private-seen").read_text().strip() == (
+        f"{secret}|http://proxy.invalid/private|"
+    )
+    assert not runtime_env.exists()
+    assert secret not in proc.stdout
+    assert secret not in proc.stderr
 
 
 def test_launcher_selects_only_cards_that_meet_minimum_total_memory(tmp_path):
@@ -752,6 +1196,91 @@ def test_launcher_clones_verified_cache_into_private_job_output(tmp_path):
     assert source.read_bytes() == b"source-cache"
 
 
+def test_launcher_clone_accepts_only_confined_relative_symlinks(tmp_path):
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        cache_mode="clone_safe_symlink",
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    clone = tmp_path / "job" / "outputs" / ".cache" / "dt-clone"
+    assert (clone / "kernel-link").is_symlink()
+    assert os.readlink(clone / "kernel-link") == "kernel.bin"
+
+
+@pytest.mark.parametrize(
+    ("cache_mode", "diagnostic"),
+    [
+        ("clone_symlink_absolute", "absolute symlink"),
+        ("clone_symlink_escape", "escaping symlink"),
+        ("clone_fifo", "special file is forbidden"),
+    ],
+)
+def test_launcher_clone_rejects_unsafe_cache_tree_before_copy(
+    tmp_path, cache_mode, diagnostic
+):
+    proc = _run_launcher_with_fake_uv(tmp_path, "plain", cache_mode=cache_mode)
+
+    assert proc.returncode == 15, proc.stderr
+    assert diagnostic in proc.stderr
+    assert not (tmp_path / "state" / "tmux-new-session").exists()
+    assert not (tmp_path / "job" / "outputs" / ".cache" / "dt-clone").exists()
+
+
+def test_launcher_clone_content_verification_detects_metadata_preserving_corruption(
+    tmp_path,
+):
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        cache_mode="clone_corrupt",
+    )
+
+    source = (
+        tmp_path
+        / "home"
+        / "dt"
+        / "jobs"
+        / "source"
+        / "outputs"
+        / ".cache"
+        / "torchinductor"
+        / "kernel.bin"
+    )
+    assert proc.returncode == 15, proc.stderr
+    assert "clone content mismatched" in proc.stderr
+    assert source.read_bytes() == b"source-cache"
+    assert not (tmp_path / "state" / "tmux-new-session").exists()
+    assert not (tmp_path / "job" / "outputs" / ".cache" / "dt-clone").exists()
+
+
+def test_launcher_clone_refuses_unusable_user_mount_namespace_before_copy(tmp_path):
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        cache_mode="clone",
+        env_overrides={"DT_TEST_UNSHARE_AVAILABLE": "0"},
+    )
+
+    source = (
+        tmp_path
+        / "home"
+        / "dt"
+        / "jobs"
+        / "source"
+        / "outputs"
+        / ".cache"
+        / "torchinductor"
+        / "kernel.bin"
+    )
+    assert proc.returncode == 15, proc.stderr
+    assert "user mount namespace or bind mount is unavailable" in proc.stderr
+    assert source.read_bytes() == b"source-cache"
+    assert not (tmp_path / "state" / "tmux-new-session").exists()
+    assert not (tmp_path / "job" / "outputs" / ".cache" / "dt-clone").exists()
+
+
 def test_launcher_rejects_cache_symlink_escape(tmp_path):
     proc = _run_launcher_with_fake_uv(tmp_path, "plain", cache_mode="escape")
 
@@ -764,7 +1293,9 @@ def test_proxy_injection_contract():
     for script in (LAUNCHER, WRAPPER):
         assert 'HTTPS_PROXY="$DT_PROXY"' in script
         assert 'NO_PROXY="localhost,127.0.0.1"' in script
-    assert "DT_WEBHOOK DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME DT_PROXY" in LAUNCHER
+    assert "DT_RUNTIME_ENV_PATH" in LAUNCHER
+    assert "DT_WEBHOOK" not in _tmux_session_env_names()
+    assert "DT_PROXY" not in _tmux_session_env_names()
     assert 'DT_SESSION_COMMAND+=" $name=$DT_SHELL_QUOTED"' in LAUNCHER
     assert "$(dt_shell_quote" not in LAUNCHER
 
@@ -810,21 +1341,12 @@ def test_launcher_injects_custom_environment_without_shell_interpretation(tmp_pa
     assert proc.returncode == 0, proc.stderr
     assert not (tmp_path / "job" / "custom-env").exists()
     command = (tmp_path / "state" / "session-command").read_text()
-    wrapper = tmp_path / "job" / "wrapper.sh"
-    wrapper.write_text(
-        'printf "%s" "$HF_TOKEN" > received-token\n'
-        'printf "%s" "$DATASET_SPLIT" > received-split\n'
-    )
-    executed = subprocess.run(
-        ["bash", "-c", command],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-
-    assert executed.returncode == 0, executed.stderr
-    assert (tmp_path / "job" / "received-token").read_text() == secret
-    assert (tmp_path / "job" / "received-split").read_text() == "validation"
+    runtime = (tmp_path / "job" / "runtime-env").read_bytes()
+    assert runtime.startswith(b"DT_PRIVATE_ENV_V1\0")
+    assert b"HF_TOKEN\0" + secret.encode() + b"\0" in runtime
+    assert b"DATASET_SPLIT\0validation\0" in runtime
+    assert secret not in command
+    assert "HF_TOKEN" not in command
     assert not sentinel.exists()
 
 
@@ -855,7 +1377,7 @@ def test_launch_propagates_configured_node_identity_to_telemetry(tmp_path, monke
     )
     commands = []
 
-    def fake_run_on(name, local, command, timeout):
+    def fake_run_on(name, local, command, timeout, **kwargs):
         commands.append(command)
         return subprocess.CompletedProcess(
             [name],
@@ -898,7 +1420,7 @@ def test_launch_uses_task_disk_contract_above_config_floor(tmp_path, monkeypatch
     monkeypatch.setattr(
         dispatch,
         "run_on",
-        lambda name, local, command, timeout: (
+        lambda name, local, command, timeout, **kwargs: (
             commands.append(command)
             or subprocess.CompletedProcess(
                 [name],
@@ -944,7 +1466,7 @@ def test_launch_propagates_resource_guards(tmp_path, monkeypatch):
     monkeypatch.setattr(
         dispatch,
         "run_on",
-        lambda name, local, command, timeout: (
+        lambda name, local, command, timeout, **kwargs: (
             commands.append(command)
             or subprocess.CompletedProcess(
                 [name],
@@ -1007,7 +1529,7 @@ def test_launch_propagates_project_artifact_root(tmp_path, monkeypatch):
     )
     commands = []
 
-    def fake_run_on(name, local, command, timeout):
+    def fake_run_on(name, local, command, timeout, **kwargs):
         commands.append(command)
         return subprocess.CompletedProcess(
             [name],
@@ -1066,7 +1588,7 @@ def test_launch_exposes_successful_same_node_predecessor_outputs(tmp_path, monke
     monkeypatch.setattr(
         dispatch,
         "run_on",
-        lambda name, local, command, timeout: (
+        lambda name, local, command, timeout, **kwargs: (
             commands.append(command)
             or subprocess.CompletedProcess([], 0, '{"gpus": [], "pgid": 123}\n', "")
         ),
@@ -1110,7 +1632,7 @@ def test_launch_propagates_exact_fork_cache_contract(tmp_path, monkeypatch):
     monkeypatch.setattr(
         dispatch,
         "run_on",
-        lambda name, local, command, timeout: (
+        lambda name, local, command, timeout, **kwargs: (
             commands.append(command)
             or subprocess.CompletedProcess([], 0, '{"gpus": [], "pgid": 123}\n', "")
         ),
@@ -1153,6 +1675,8 @@ def test_launch_propagates_exact_fork_cache_contract(tmp_path, monkeypatch):
 
 
 def test_wrapper_exports_verified_cache_and_writes_receipt(tmp_path):
+    from dt import cli
+
     job = tmp_path / "job"
     code = job / "code"
     cache = tmp_path / "source" / "outputs" / ".cache" / "torchinductor"
@@ -1189,7 +1713,7 @@ def test_wrapper_exports_verified_cache_and_writes_receipt(tmp_path):
     )
 
     assert proc.returncode == 0, proc.stderr
-    receipt = json.loads((job / "outputs" / "dt" / "cache-reuse.json").read_text())
+    receipt = json.loads((job / "evidence" / "cache-reuse.json").read_text())
     assert receipt == {
         "schema_version": "dt_cache_reuse_v1",
         "source_job_id": "source",
@@ -1198,9 +1722,15 @@ def test_wrapper_exports_verified_cache_and_writes_receipt(tmp_path):
         "source_env_hash": "6fb61a247969",
         "source_snapshot_sha256": "a" * 64,
     }
+    cli._validate_pulled_evidence(
+        job / "evidence" / "cache-reuse.json",
+        "cache-reuse.json",
+    )
 
 
 def test_wrapper_exports_private_clone_and_writes_v2_receipt(tmp_path):
+    from dt import cli
+
     job = tmp_path / "job"
     code = job / "code"
     source = tmp_path / "source" / "outputs" / ".cache" / "torchinductor"
@@ -1272,7 +1802,7 @@ def test_wrapper_exports_private_clone_and_writes_v2_receipt(tmp_path):
         str(clone),
         str(source),
     ]
-    receipt = json.loads((job / "outputs" / "dt" / "cache-reuse.json").read_text())
+    receipt = json.loads((job / "evidence" / "cache-reuse.json").read_text())
     assert receipt == {
         "schema_version": "dt_cache_reuse_v2",
         "source_job_id": "source",
@@ -1293,6 +1823,41 @@ def test_wrapper_exports_private_clone_and_writes_v2_receipt(tmp_path):
             "duration_ms": 23,
         },
     }
+    cli._validate_pulled_evidence(
+        job / "evidence" / "cache-reuse.json",
+        "cache-reuse.json",
+    )
+
+    # The launcher's behavioral probe can become stale before wrapper start.
+    # A runtime namespace failure is infrastructure, never a user-command
+    # failure, and the user runner must not execute.
+    failed_job = tmp_path / "failed-job"
+    failed_clone = failed_job / "outputs" / ".cache" / "dt-clone"
+    failed_sentinel = tmp_path / "failed-runner-started"
+    (failed_job / "code").mkdir(parents=True)
+    failed_clone.mkdir(parents=True)
+    (failed_job / "cmd.sh").write_text(f"touch {failed_sentinel!s}\n")
+    fake_unshare.write_text("#!/usr/bin/env bash\nexit 1\n")
+    failed_env = {
+        **env,
+        "DT_JOB_DIR": str(failed_job),
+        "DT_REUSE_CACHE_PATH": str(failed_clone),
+        "DT_EXPECTED_CACHE": str(failed_clone),
+    }
+
+    failed = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=failed_env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert failed.returncode == 76, failed.stderr
+    assert "isolated cache namespace failed before user runner" in failed.stderr
+    assert not failed_sentinel.exists()
+    assert (failed_job / "result_state").read_text().strip() == "infra_failure"
+    assert (failed_job / "exit_code").read_text().strip() == "76"
 
 
 def test_artifact_manifest_is_persisted_and_verified_before_environment(
@@ -1316,7 +1881,7 @@ def test_artifact_manifest_is_persisted_and_verified_before_environment(
     monkeypatch.setattr(
         dispatch,
         "run_on",
-        lambda name, local, command, timeout: (
+        lambda name, local, command, timeout, **kwargs: (
             commands.append(command)
             or subprocess.CompletedProcess([], 0, '{"gpus": [], "pgid": 123}\n', "")
         ),
@@ -1379,6 +1944,15 @@ def test_artifact_verifier_detects_content_drift(tmp_path):
     manifest = root / ".dt" / "manifests" / f"{manifest_sha256}.json"
     manifest.parent.mkdir(parents=True)
     manifest.write_bytes(manifest_bytes)
+    decoded = json.loads(manifest_bytes)
+    assert set(decoded) == {"schema_version", "project", "artifacts"}
+    assert set(decoded["artifacts"][0]) == {
+        "path",
+        "kind",
+        "mode",
+        "size_bytes",
+        "sha256",
+    }
 
     job = tmp_path / "job"
     job.mkdir()
@@ -1387,6 +1961,7 @@ def test_artifact_verifier_detects_content_drift(tmp_path):
     (job / "snapshot_hash.py").write_text(support["snapshot_hash.py"])
     command = [
         "python3",
+        "-I",
         str(job / "artifact_verify.py"),
         "--root",
         str(root),
@@ -1413,7 +1988,11 @@ def test_artifact_verifier_refuses_symlinked_trust_roots(tmp_path):
     root_alias = tmp_path / "artifact-alias"
     root_alias.symlink_to(real_root, target_is_directory=True)
     manifest_payload = json.dumps(
-        {"schema_version": "dt_artifact_manifest_v1", "artifacts": []}
+        {
+            "schema_version": "dt_artifact_manifest_v1",
+            "project": "omni",
+            "artifacts": [{}],
+        }
     ).encode()
     outside_manifest = tmp_path / "outside-manifest.json"
     outside_manifest.write_bytes(manifest_payload)
@@ -1423,8 +2002,218 @@ def test_artifact_verifier_refuses_symlinked_trust_roots(tmp_path):
 
     with pytest.raises(ValueError, match="artifact root"):
         verify_artifacts(root_alias, outside_manifest, digest)
-    with pytest.raises(OSError):
+    with pytest.raises(ValueError, match="regular file"):
         verify_artifacts(real_root, manifest_alias, digest)
+
+
+def _raw_manifest_entry(path="artifact.bin", **overrides):
+    entry = {
+        "path": path,
+        "kind": "file",
+        "mode": 0o600,
+        "size_bytes": 0,
+        "sha256": hashlib.sha256(b"").hexdigest(),
+    }
+    entry.update(overrides)
+    return entry
+
+
+def _verify_raw_manifest(root, tmp_path, raw):
+    manifest = tmp_path / "raw-manifest.json"
+    manifest.write_bytes(raw)
+    return verify_artifacts(root, manifest, hashlib.sha256(raw).hexdigest())
+
+
+def test_artifact_verifier_rejects_duplicate_json_even_when_raw_hash_matches(tmp_path):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    raw = (
+        b'{"schema_version":"dt_artifact_manifest_v1","project":"omni",'
+        b'"project":"other","artifacts":[]}'
+    )
+
+    with pytest.raises(ValueError, match="duplicate artifact manifest field"):
+        _verify_raw_manifest(root, tmp_path, raw)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "",
+        ".",
+        "/artifact.bin",
+        "../artifact.bin",
+        "a/../artifact.bin",
+        "a\\b",
+        "a//b",
+        "a/./a",
+    ],
+)
+def test_artifact_verifier_rejects_noncanonical_posix_paths(tmp_path, path):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    raw = json.dumps(
+        {
+            "schema_version": "dt_artifact_manifest_v1",
+            "project": "omni",
+            "artifacts": [_raw_manifest_entry(path)],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    with pytest.raises(ValueError, match="path"):
+        _verify_raw_manifest(root, tmp_path, raw)
+
+
+def test_artifact_verifier_enforces_project_and_path_byte_bounds(tmp_path):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    for project, path, message in (
+        ("bad/project", "artifact.bin", "project"),
+        ("a" * (artifact_verify.MAX_PROJECT_BYTES + 1), "artifact.bin", "project"),
+        ("omni", "a" * (artifact_verify.MAX_ARTIFACT_PATH_BYTES + 1), "path"),
+    ):
+        raw = json.dumps(
+            {
+                "schema_version": "dt_artifact_manifest_v1",
+                "project": project,
+                "artifacts": [_raw_manifest_entry(path)],
+            },
+            separators=(",", ":"),
+        ).encode()
+        with pytest.raises(ValueError, match=message):
+            _verify_raw_manifest(root, tmp_path, raw)
+
+
+@pytest.mark.parametrize("paths", [("a", "a"), ("a", "a/b")])
+def test_artifact_verifier_rejects_duplicate_or_parent_child_paths(tmp_path, paths):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    raw = json.dumps(
+        {
+            "schema_version": "dt_artifact_manifest_v1",
+            "project": "omni",
+            "artifacts": [_raw_manifest_entry(path) for path in paths],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    with pytest.raises(ValueError, match="paths overlap"):
+        _verify_raw_manifest(root, tmp_path, raw)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("mode", True, "mode"),
+        ("size_bytes", False, "size"),
+        ("mode", float(0o600), "mode"),
+        ("size_bytes", 0.0, "size"),
+        ("mode", 0o10000, "mode"),
+        ("size_bytes", -1, "size"),
+        ("size_bytes", artifact_verify.MAX_ARTIFACT_SIZE_BYTES + 1, "size"),
+        ("sha256", "A" * 64, "SHA-256"),
+    ],
+)
+def test_artifact_verifier_rejects_ambiguous_or_unbounded_entry_values(
+    tmp_path, field, value, message
+):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    raw = json.dumps(
+        {
+            "schema_version": "dt_artifact_manifest_v1",
+            "project": "omni",
+            "artifacts": [_raw_manifest_entry(**{field: value})],
+        },
+        separators=(",", ":"),
+    ).encode()
+
+    with pytest.raises(ValueError, match=message):
+        _verify_raw_manifest(root, tmp_path, raw)
+
+
+@pytest.mark.parametrize("location", ["top", "entry"])
+def test_artifact_verifier_rejects_extra_fields(tmp_path, location):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    payload = {
+        "schema_version": "dt_artifact_manifest_v1",
+        "project": "omni",
+        "artifacts": [_raw_manifest_entry()],
+    }
+    if location == "top":
+        payload["extra"] = True
+    else:
+        payload["artifacts"][0]["extra"] = True
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+
+    with pytest.raises(ValueError, match="fields"):
+        _verify_raw_manifest(root, tmp_path, raw)
+
+
+def test_artifact_verifier_rejects_nonfinite_json(tmp_path):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    raw = (
+        b'{"schema_version":"dt_artifact_manifest_v1","project":"omni",'
+        b'"artifacts":[{"path":"artifact.bin","kind":"file","mode":384,'
+        b'"size_bytes":NaN,"sha256":"' + b"a" * 64 + b'"}]}'
+    )
+
+    with pytest.raises(ValueError, match="non-standard JSON number"):
+        _verify_raw_manifest(root, tmp_path, raw)
+
+
+def test_artifact_verifier_rejects_oversized_manifest_and_artifact_count(tmp_path):
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    oversized = b" " * (artifact_verify.MAX_MANIFEST_BYTES + 1)
+    with pytest.raises(ValueError, match="too large"):
+        _verify_raw_manifest(root, tmp_path, oversized)
+
+    raw = json.dumps(
+        {
+            "schema_version": "dt_artifact_manifest_v1",
+            "project": "omni",
+            "artifacts": [{}] * (artifact_verify.MAX_MANIFEST_ARTIFACTS + 1),
+        },
+        separators=(",", ":"),
+    ).encode()
+    with pytest.raises(ValueError, match="artifact count"):
+        _verify_raw_manifest(root, tmp_path, raw)
+
+
+def test_artifact_verifier_rejects_manifest_path_replacement_during_read(
+    tmp_path, monkeypatch
+):
+    import dt.dispatch as dispatch
+
+    root = tmp_path / "artifacts"
+    artifact = root / "artifact.bin"
+    root.mkdir()
+    artifact.write_bytes(b"content")
+    sources = dispatch._artifact_sources(root, ["artifact.bin"])  # noqa: SLF001
+    raw, digest = dispatch._artifact_manifest("omni", sources)  # noqa: SLF001
+    manifest = tmp_path / "manifest.json"
+    manifest.write_bytes(raw)
+    replacement = tmp_path / "replacement.json"
+    real_read = artifact_verify.os.read
+    replaced = False
+
+    def replace_after_read(descriptor, count):
+        nonlocal replaced
+        chunk = real_read(descriptor, count)
+        if chunk and not replaced:
+            replaced = True
+            replacement.write_bytes(raw)
+            replacement.replace(manifest)
+        return chunk
+
+    monkeypatch.setattr(artifact_verify.os, "read", replace_after_read)
+
+    with pytest.raises(ValueError, match="changed while reading"):
+        verify_artifacts(root, manifest, digest)
 
 
 def test_payload_attestation_refuses_a_symlinked_runtime_file(tmp_path):
@@ -1606,6 +2395,7 @@ def test_gpu_lease_content_survives_a_rejected_wrapper_contender(tmp_path):
         assert ready.exists(), "lease owner did not acquire its lock"
         (tmp_path / "code").mkdir()
         (tmp_path / "cmd.sh").write_text("true\n")
+        runtime_scope = _write_verified_runtime_scope(tmp_path)
         proc = subprocess.run(
             ["bash", str(PAYLOAD / "wrapper.sh")],
             env={
@@ -1614,6 +2404,7 @@ def test_gpu_lease_content_survives_a_rejected_wrapper_contender(tmp_path):
                 "DT_GPU_LEASE_ROOT": str(lease_root),
                 "DT_GPU_IDS": "0",
                 "DT_GPUS": "1",
+                "DT_RUNTIME_SCOPE": runtime_scope,
                 "DT_MAX_HOURS": "",
                 "DT_UV": "",
                 "DT_UV_ENV": "",
@@ -1635,11 +2426,13 @@ def test_gpu_lease_content_survives_a_rejected_wrapper_contender(tmp_path):
 def test_wrapper_rejects_duplicate_or_count_mismatched_gpu_selection(tmp_path):
     (tmp_path / "code").mkdir()
     (tmp_path / "cmd.sh").write_text("true\n")
+    runtime_scope = _write_verified_runtime_scope(tmp_path)
     env = {
         **os.environ,
         "DT_JOB_DIR": str(tmp_path),
         "DT_GPU_IDS": "0,0",
         "DT_GPUS": "2",
+        "DT_RUNTIME_SCOPE": runtime_scope,
         "DT_MAX_HOURS": "",
         "DT_UV": "",
         "DT_UV_ENV": "",
@@ -1858,6 +2651,130 @@ def test_wrapper_fails_closed_when_the_code_directory_is_missing(tmp_path):
     assert proc.returncode == 76
     assert "cannot enter job code directory" in proc.stderr
     assert (tmp_path / "exit_code").read_text() == "76\n"
+    assert (tmp_path / "result_state").read_text() == "infra_failure\n"
+
+
+def test_wrapper_keeps_user_exit_76_as_execution_failure(tmp_path):
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text("exit 76\n")
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env={**os.environ, "DT_JOB_DIR": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 76
+    assert (tmp_path / "exit_code").read_text() == "76\n"
+    assert (tmp_path / "result_state").read_text() == "execution_failure\n"
+
+
+def test_wrapper_webhook_is_structured_json_and_keeps_url_out_of_argv(tmp_path):
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text("true\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    capture = tmp_path / "webhook-capture"
+    argv_capture = tmp_path / "webhook-argv"
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "%s\\n" "$@" > "$DT_WEBHOOK_ARGV_CAPTURE"\n'
+        'for value in "$@"; do\n'
+        '  case "$value" in @*) cat -- "${value#@}" > "$DT_WEBHOOK_CAPTURE";; esac\n'
+        "done\n"
+    )
+    fake_curl.chmod(0o755)
+    secret_url = "https://hooks.invalid/private-token"
+    hostile_name = 'quote" and newline\nkept'
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DT_JOB_DIR": str(tmp_path),
+            "DT_WEBHOOK": secret_url,
+            "DT_WEBHOOK_CAPTURE": str(capture),
+            "DT_WEBHOOK_ARGV_CAPTURE": str(argv_capture),
+            "DT_JOB_NAME": hostile_name,
+            "DT_JOB_ID": "jid",
+            "DT_CENTER": "center",
+            "DT_NODE": "node",
+        },
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(capture.read_text())
+    assert payload["schema_version"] == "dt_webhook_event_v1"
+    assert payload["name"] == hostile_name
+    assert payload["exit_code"] == 0
+    assert secret_url not in argv_capture.read_text()
+    assert not list((tmp_path / "tmp").glob(".webhook-*"))
+
+
+def test_wrapper_does_not_inherit_gpu_lease_fds_into_the_runner(tmp_path):
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text(
+        "python3 - <<'PY'\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "targets=[]\n"
+        "for entry in Path('/proc/self/fd').iterdir():\n"
+        "    try: targets.append(os.readlink(entry))\n"
+        "    except OSError: pass\n"
+        "Path('../runner-fds').write_text('\\n'.join(targets))\n"
+        "PY\n"
+    )
+    lease_root = tmp_path / "leases"
+    runtime_scope = _write_verified_runtime_scope(tmp_path)
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env={
+            **os.environ,
+            "DT_JOB_DIR": str(tmp_path),
+            "DT_GPU_IDS": "0",
+            "DT_GPUS": "1",
+            "DT_RUNTIME_SCOPE": runtime_scope,
+            "DT_GPU_LEASE_ROOT": str(lease_root),
+        },
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "gpu-0.lock" not in (tmp_path / "runner-fds").read_text()
+
+
+def test_wrapper_does_not_export_control_evidence_root_to_runner(tmp_path):
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text(
+        "if [[ -v DT_EVIDENCE_DIR ]]; then exit 91; fi\n"
+        'printf "separated\\n" >../runner-evidence-env\n'
+    )
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env={
+            **os.environ,
+            "DT_JOB_DIR": str(tmp_path),
+            "DT_GPU_IDS": "",
+            "DT_GPUS": "0",
+        },
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "runner-evidence-env").read_text() == "separated\n"
 
 
 def test_wrapper_records_subsecond_start_and_finish_timestamps(tmp_path):
@@ -1892,7 +2809,7 @@ def test_wrapper_records_subsecond_start_and_finish_timestamps(tmp_path):
 
     lifecycle_rows = [
         json.loads(line)
-        for line in (tmp_path / "outputs/dt/lifecycle.jsonl").read_text().splitlines()
+        for line in (tmp_path / "evidence/lifecycle.jsonl").read_text().splitlines()
     ]
     assert [row["event"] for row in lifecycle_rows] == [
         "wrapper_ready",
@@ -1909,10 +2826,66 @@ def test_wrapper_records_subsecond_start_and_finish_timestamps(tmp_path):
     assert by_event["escapees_reaped"] - by_event["telemetry_stopped"] < 0.75
 
 
+def test_wrapper_keeps_trusted_evidence_out_of_application_outputs(tmp_path):
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text(
+        "mkdir -p ../outputs/dt\n"
+        "printf '{not-trusted}' > ../outputs/dt/resource-guard.json\n"
+    )
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "",
+        "DT_MAX_HOURS": "",
+        "DT_UV": "",
+        "DT_UV_ENV": "",
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "result_state").read_text().strip() == "success"
+    evidence = tmp_path / "evidence"
+    assert stat.S_IMODE(evidence.stat().st_mode) == 0o700
+    for name in ("lifecycle.jsonl", "phases.jsonl", "phase-current"):
+        path = evidence / name
+        if path.exists():
+            assert path.is_file() and not path.is_symlink()
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_wrapper_refuses_a_symlinked_runtime_evidence_directory(tmp_path):
+    (tmp_path / "code").mkdir()
+    (tmp_path / "cmd.sh").write_text("true\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "evidence").symlink_to(outside, target_is_directory=True)
+
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env={**os.environ, "DT_JOB_DIR": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+
+    assert proc.returncode == 76
+    assert "unsafe runtime evidence directory" in proc.stderr
+    assert not list(outside.iterdir())
+
+
 def test_wrapper_preserves_explicit_scientific_rejection(tmp_path):
     (tmp_path / "code").mkdir()
     (tmp_path / "result.py").write_text((PAYLOAD / "result.py").read_text())
-    result_path = tmp_path / "outputs" / "dt" / "result.json"
+    result_path = tmp_path / "evidence" / "result.json"
     (tmp_path / "cmd.sh").write_text(
         f"python3 {tmp_path / 'result.py'} --output {result_path} emit "
         "--state scientific_reject --reason 'hypothesis not supported'\n"
@@ -1938,9 +2911,23 @@ def test_wrapper_preserves_explicit_scientific_rejection(tmp_path):
 
     assert proc.returncode == 0, proc.stderr
     assert (tmp_path / "result_state").read_text().strip() == "scientific_reject"
-    result = json.loads(result_path.read_text())
-    assert result["schema_version"] == "dt_result_v1"
-    assert result["reason"] == "hypothesis not supported"
+    result_payload = json.loads(result_path.read_text())
+    assert result_payload["schema_version"] == "dt_result_v1"
+    assert result_payload["reason"] == "hypothesis not supported"
+
+
+def test_result_emit_enforces_the_final_encoded_document_limit(tmp_path, monkeypatch):
+    from dt.payload import result as result_module
+
+    monkeypatch.setattr(result_module, "MAX_RESULT_BYTES", 128)
+    with pytest.raises(ValueError, match="encoded size limit"):
+        result_module.emit(
+            tmp_path / "result.json",
+            "success",
+            '"' * 100,
+            '{"value":"' + "x" * 30 + '"}',
+        )
+    assert not (tmp_path / "result.json").exists()
 
 
 def test_result_helper_is_first_writer_and_rejects_control_states(tmp_path):
@@ -2020,6 +3007,60 @@ def test_result_reader_rejects_forged_control_state(tmp_path):
 
     assert read.returncode == 2
     assert "invalid application result state" in read.stderr
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        (
+            '{"schema_version":"dt_result_v1","state":"success",'
+            '"state":"scientific_reject","reason":null,"metadata":{},'
+            '"emitted_at":1}'
+        ),
+        (
+            '{"schema_version":"dt_result_v1","state":"success",'
+            '"reason":null,"metadata":{},"emitted_at":1,"unknown":true}'
+        ),
+    ],
+)
+def test_result_reader_and_wrapper_reject_ambiguous_or_extended_v1(tmp_path, payload):
+    helper = PAYLOAD / "result.py"
+    job = tmp_path / "job"
+    (job / "code").mkdir(parents=True)
+    (job / "cmd.sh").write_text("true\n")
+    (job / "evidence").mkdir()
+    output = job / "evidence" / "result.json"
+    output.write_text(payload)
+
+    read = subprocess.run(
+        ["python3", str(helper), "--output", str(output), "state"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert read.returncode == 2
+    assert "dt-result:" in read.stderr
+
+    wrapped = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env={
+            **os.environ,
+            "DT_JOB_DIR": str(job),
+            "DT_GPU_IDS": "",
+            "DT_GPUS": "0",
+            "DT_MAX_HOURS": "",
+            "DT_UV": "",
+            "DT_UV_ENV": "",
+            "DT_WEBHOOK": "",
+            "DT_PROXY": "",
+        },
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+    assert wrapped.returncode == 0
+    assert (job / "result_state").read_text().strip() == "execution_failure"
 
 
 def test_result_helper_refuses_a_symlinked_result_document(tmp_path):
@@ -2132,7 +3173,7 @@ def test_wrapper_exports_phase_helper_and_records_automatic_markers(tmp_path):
     assert proc.returncode == 0, proc.stderr
     rows = [
         json.loads(line)
-        for line in (tmp_path / "outputs/dt/phases.jsonl").read_text().splitlines()
+        for line in (tmp_path / "evidence/phases.jsonl").read_text().splitlines()
     ]
     assert [row["phase"] for row in rows] == [
         "wrapper",
@@ -2141,7 +3182,7 @@ def test_wrapper_exports_phase_helper_and_records_automatic_markers(tmp_path):
         "runner_returned",
     ]
     assert all(row["schema_version"] == "dt_phase_v1" for row in rows)
-    assert (tmp_path / "outputs/dt/phase-current").read_text().strip() == (
+    assert (tmp_path / "evidence/phase-current").read_text().strip() == (
         "runner_returned"
     )
 

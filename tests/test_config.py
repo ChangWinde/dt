@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 
 import pytest
 
@@ -521,6 +523,9 @@ def test_malformed_config_shapes_raise_config_error(payload):
         {"webhook": []},
         {"proxy": {}},
         {"snapshot_excludes": [""]},
+        {"snapshot_excludes": ["cache\x00escape"]},
+        {"snapshot_excludes": ["cache\nother"]},
+        {"snapshot_excludes": ["x" * 4097]},
     ],
 )
 def test_head_config_rejects_wrong_nested_types(field):
@@ -926,3 +931,30 @@ def test_active_command_contract_does_not_follow_a_record_symlink(
     monkeypatch.setenv("XDG_DATA_HOME", str(data_home))
 
     assert config_module.active_dt_command() == legacy
+
+
+def test_active_command_fifo_fails_fast_to_the_legacy_command(tmp_path):
+    home = tmp_path / "home"
+    legacy = home / ".local" / "bin" / "dt"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("#!/bin/sh\n", encoding="utf-8")
+    legacy.chmod(0o700)
+    data_home = tmp_path / "data"
+    record = data_home / "disttrainer" / "active-command"
+    record.parent.mkdir(parents=True)
+    os.mkfifo(record)
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from dt.config import active_dt_command; print(active_dt_command())",
+        ],
+        env={**os.environ, "HOME": str(home), "XDG_DATA_HOME": str(data_home)},
+        capture_output=True,
+        text=True,
+        timeout=1,
+        check=True,
+    )
+
+    assert proc.stdout.strip() == str(legacy)

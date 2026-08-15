@@ -79,7 +79,8 @@ changes require a denied or failure-path regression.
 Run:
 
 ```bash
-uv run --no-sync pytest -q -p no:cacheprovider
+uv run --no-sync pytest -q -p no:cacheprovider \
+  -W error::pytest.PytestUnhandledThreadExceptionWarning
 uv run --no-sync python scripts/docs.py
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .

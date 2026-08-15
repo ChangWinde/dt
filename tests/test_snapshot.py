@@ -1,10 +1,12 @@
 import os
+import re
 import subprocess
 
 import pytest
 
 import dt.dispatch as dispatch
 import dt.git_provenance as git_provenance
+import dt.snapshot_hash as snapshot_hash
 from dt.snapshot_hash import tree_sha256
 
 
@@ -52,6 +54,43 @@ def test_tree_sha256_binds_content_mode_and_symlink_target(tmp_path):
     link.unlink()
     link.symlink_to("other.py")
     assert tree_sha256(root) != mode_changed
+
+
+@pytest.mark.parametrize("target", ["/etc/passwd", "../outside", "missing"])
+def test_tree_sha256_rejects_unsafe_or_broken_symlinks(tmp_path, target):
+    root = tmp_path / "code"
+    root.mkdir()
+    (tmp_path / "outside").write_text("outside")
+    (root / "link").symlink_to(target)
+
+    with pytest.raises(ValueError, match="symlink"):
+        tree_sha256(root)
+
+
+def test_tree_sha256_accepts_an_internal_relative_symlink(tmp_path):
+    root = tmp_path / "code"
+    root.mkdir()
+    (root / "real").mkdir()
+    (root / "real/data").write_text("safe")
+    (root / "link").symlink_to("real/data")
+
+    assert re.fullmatch(r"[0-9a-f]{64}", tree_sha256(root))
+
+
+def test_tree_sha256_enforces_entry_and_byte_budgets(tmp_path, monkeypatch):
+    root = tmp_path / "code"
+    root.mkdir()
+    (root / "one").write_bytes(b"1234")
+    (root / "two").write_bytes(b"5678")
+
+    monkeypatch.setattr(snapshot_hash, "MAX_SNAPSHOT_ENTRIES", 1)
+    with pytest.raises(ValueError, match="entry budget"):
+        tree_sha256(root)
+
+    monkeypatch.setattr(snapshot_hash, "MAX_SNAPSHOT_ENTRIES", 10)
+    monkeypatch.setattr(snapshot_hash, "MAX_SNAPSHOT_BYTES", 7)
+    with pytest.raises(ValueError, match="byte budget"):
+        tree_sha256(root)
 
 
 def test_git_provenance_is_bounded_without_claiming_dirty_tree_clean(

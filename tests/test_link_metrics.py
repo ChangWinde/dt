@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -275,6 +276,43 @@ def test_state_rejects_wrong_key_and_oversize(tmp_path):
     oversized = root / f"{key}.json"
     oversized.write_text("x" * 8192)
     with pytest.raises(LinkMetricsError, match="bounded"):
+        store.sample("site:s", "n1", "n2")
+
+
+def test_link_metrics_fifo_state_fails_without_blocking(tmp_path):
+    cfg = _cfg(tmp_path)
+    store = PersistentLinkMetrics(cfg)
+    store.record("site:s", "n1", "n2", transferred_bytes=4 << 20, elapsed_seconds=1)
+    key = link_key("site:s", "n1", "n2")
+    state = cfg.control_state_dir() / "link-metrics" / f"{key}.json"
+    state.unlink()
+    os.mkfifo(state)
+
+    started = time.monotonic()
+    with pytest.raises(LinkMetricsError, match="unsafe"):
+        store.sample("site:s", "n1", "n2")
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize("poison", ["duplicate", "nonfinite"])
+def test_link_metrics_rejects_ambiguous_json(tmp_path, poison):
+    cfg = _cfg(tmp_path)
+    store = PersistentLinkMetrics(cfg)
+    store.record("site:s", "n1", "n2", transferred_bytes=4 << 20, elapsed_seconds=1)
+    key = link_key("site:s", "n1", "n2")
+    state = cfg.control_state_dir() / "link-metrics" / f"{key}.json"
+    payload = state.read_text("utf-8")
+    if poison == "duplicate":
+        payload = payload.replace(
+            '"last_bytes":4194304', '"last_bytes":4194304,"last_bytes":4194304'
+        )
+    else:
+        document = json.loads(payload)
+        document["last_bps"] = float("nan")
+        payload = json.dumps(document)
+    state.write_text(payload, "utf-8")
+
+    with pytest.raises(LinkMetricsError, match="malformed"):
         store.sample("site:s", "n1", "n2")
 
 
