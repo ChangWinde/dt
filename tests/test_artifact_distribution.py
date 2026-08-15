@@ -1210,8 +1210,17 @@ def test_topology_lazy_selection_does_not_probe_or_hash_later_candidates(
 def test_topology_aware_cold_miss_uploads_once_then_uses_discovered_lan(
     tmp_path, monkeypatch
 ):
+    import dt.artifact_distribution as module
+
     cfg = _topology_cfg(tmp_path)
     executor = TransferExecutor(cfg)
+
+    def fake_run_on(node, local, command, **kwargs):
+        if "DT_CACHE" in command:
+            return subprocess.CompletedProcess([], 0, "DT_CACHE=absent\n", "")
+        return subprocess.CompletedProcess([], 1, "", "")
+
+    monkeypatch.setattr(module, "run_on", fake_run_on)
     monkeypatch.setattr(executor.discovery, "replicas", lambda *args: [])
     monkeypatch.setattr(executor.verifier, "require", lambda *args: None)
     monkeypatch.setattr(executor, "_populate_cache", lambda *args: (1_200, 12))
