@@ -97,6 +97,10 @@ operations:
   max_file_mib: 16
   keep_files: 8
 
+job_logs:
+  max_file_mib: 64
+  keep_files: 4
+
 webhook: https://notifications.example.invalid/dt
 proxy: http://proxy.example.invalid:8080
 ```
@@ -296,6 +300,24 @@ On a head it lives below managed control state; on a laptop it lives below the
 XDG user state directory. Use `dt events` to query it.
 
 The configured product of size and file count may not exceed 4096 MiB.
+
+### Job log retention
+
+| Key | Default | Allowed | Meaning |
+|---|---:|---:|---|
+| `job_logs.max_file_mib` | 64 | 1–256 | Maximum MiB in each new job's current stdout/stderr generation |
+| `job_logs.keep_files` | 4 | 1–16 | Current plus numbered stdout/stderr generations retained per job |
+
+The product may not exceed 4096 MiB per job. This setting bounds merged
+application stdout/stderr for newly dispatched jobs; setup and telemetry
+diagnostic logs remain separate. `dt logs` reads one 256 KiB tail across the
+retained stdout generations. Jobs created by an older payload remain readable
+through their legacy single file.
+
+Rotation is local to the worker and does not depend on a collector. DT never
+exports raw application output automatically; use the bounded redacted
+`dt events --json` operation contract as input to an explicitly configured
+external collector.
 
 ### Resource and transport policy
 

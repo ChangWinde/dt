@@ -8,6 +8,18 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Added
 
+- New jobs bound merged application stdout/stderr with configurable
+  `job_logs.max_file_mib` and `job_logs.keep_files` retention. The attested
+  node helper rotates without changing the wrapper process-group identity,
+  drains input after storage failure instead of delivering SIGPIPE to the
+  experiment, and lets `dt logs` read one bounded 256 KiB tail across retained
+  generations. Older job capsules keep their single-file behavior.
+
+- `scripts/benchmark_remote_plane.py` records a source-bound, endpoint-redacted
+  evaluation of CLI, agent, capacity, per-node plan, topology, measured link,
+  doctor, and optional submit-to-pull performance. The default is read-only;
+  an end-to-end canary requires an explicit project and node.
+
 - `dt diagnose JOB [--json]` correlates job, request, operation, agent, node,
   queue, log, telemetry, result, and transfer evidence in a fixed 64 KiB
   envelope. Every section reports completeness, freshness, and omission;
@@ -30,7 +42,9 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 - `dt doctor --json` now emits `dt_doctor_v2` with typed issues, severity,
   facts, summary, and machine-executable or config-edit actions. Human next
-  steps are rendered from the same model.
+  steps are rendered from the same model. It also reports an unavailable
+  default project and indirect bulk routes with typed configuration or
+  `dt topology` actions instead of leaving those failures for submission.
 
 - GPU submissions accept `--min-vram-mib N`: every selected card must expose
   at least `N` MiB of total memory. The constraint persists through queueing,

@@ -126,6 +126,13 @@ outputs/                recoverable application outputs (application-owned)
 .dt/evidence/           DT-owned result, lifecycle, guard, phase, and telemetry
 ```
 
+New runtime payloads pipe merged application stdout/stderr through a small
+attested helper that retains a configured current-plus-generation set. The
+wrapper remains the tmux process-group leader; logging failure drains rather
+than closing the application pipe. Observation reads one bounded logical tail
+across retained generations, with a single-file compatibility fallback for old
+capsules. ADR 0034 records why external log storage remains optional.
+
 Managed pulls exclude `outputs/dt/`, copy application outputs with special
 files disabled, then recover only a fixed, schema-validated allowlist from
 `.dt/evidence/`. This prevents application-writable files from impersonating
