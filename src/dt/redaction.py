@@ -36,7 +36,11 @@ def redact_home_path(text: str) -> str:
         return text
     if not home or home == "/":
         return text
-    return text.replace(home, "~")
+    # Match the complete home path only. A raw substring replacement corrupts
+    # `/home/alice2` and `/srv/home/alice-copy`, while a start/word boundary is
+    # insufficient because absolute paths may appear after punctuation.
+    pattern = re.compile(rf"(?<![A-Za-z0-9._-]){re.escape(home)}(?=$|/)")
+    return pattern.sub("~", text)
 
 
 def _mask_dotted_token(match: re.Match[str]) -> str:

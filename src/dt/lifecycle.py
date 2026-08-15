@@ -157,10 +157,12 @@ def runtime_scope_shell() -> str:
 
     ``dt_scope_marker STATE EXPECTED`` prints the validated unit and returns
     0, returns 1 when no scope was used (legacy or portable fallback), and 2
-    for a malformed/mismatched marker. ``dt_scope_census UNIT`` prints a
-    status line followed by every non-zombie PID in the scope hierarchy.
-    Inspection failures are ``DEGRADED``; callers must never translate them
-    into proof of death.
+    for a malformed/mismatched marker. ``dt_gpu_containment_unproven STATE``
+    returns 0 when GPU work lacks an attested scope, 1 when the runtime is CPU
+    only or attested, and 2 for malformed evidence. ``dt_scope_census UNIT``
+    prints a status line followed by every non-zombie PID in the scope
+    hierarchy. Inspection failures are ``DEGRADED``; callers must never
+    translate them into proof of death.
     """
     return (
         "dt_scope_marker() { "
@@ -178,6 +180,54 @@ def runtime_scope_shell() -> str:
         'case "$dt_sm_hex" in *[!0-9a-f]*) return 2;; esac; '
         '[ -z "$dt_sm_expected" ] || [ "$dt_sm_value" = "$dt_sm_expected" ] '
         '|| return 2; printf "%s\\n" "$dt_sm_value"; }; '
+        "dt_containment_marker() { "
+        'dt_cm_path="$1/runtime_containment"; '
+        '[ -e "$dt_cm_path" ] || [ -L "$dt_cm_path" ] || return 1; '
+        '[ -f "$dt_cm_path" ] && [ ! -L "$dt_cm_path" ] || return 2; '
+        'dt_cm_size=$(wc -c <"$dt_cm_path" 2>/dev/null) || return 2; '
+        'case "$dt_cm_size" in *[!0-9]*|"") return 2;; esac; '
+        '[ "$dt_cm_size" -gt 0 ] && [ "$dt_cm_size" -le 64 ] || return 2; '
+        'dt_cm_value=$(cat "$dt_cm_path" 2>/dev/null) || return 2; '
+        'case "$dt_cm_value" in systemd_scope_pending|systemd_scope_verified|'
+        'portable_unproven) printf "%s\\n" "$dt_cm_value";; '
+        "*) return 2;; esac; }; "
+        "dt_requested_gpus() { "
+        'dt_rg_path="$1/runtime_gpus_requested"; '
+        'if [ -e "$dt_rg_path" ] || [ -L "$dt_rg_path" ]; then '
+        '[ -f "$dt_rg_path" ] && [ ! -L "$dt_rg_path" ] || return 2; '
+        'dt_rg_size=$(wc -c <"$dt_rg_path" 2>/dev/null) || return 2; '
+        'case "$dt_rg_size" in *[!0-9]*|"") return 2;; esac; '
+        '[ "$dt_rg_size" -gt 0 ] && [ "$dt_rg_size" -le 16 ] || return 2; '
+        'dt_rg_value=$(cat "$dt_rg_path" 2>/dev/null) || return 2; '
+        'case "$dt_rg_value" in *[!0-9]*|"") return 2;; esac; '
+        'printf "%s\\n" "$dt_rg_value"; return 0; fi; '
+        'dt_rg_path="$1/gpus"; '
+        '[ -e "$dt_rg_path" ] || [ -L "$dt_rg_path" ] || { echo 0; return 0; }; '
+        '[ -f "$dt_rg_path" ] && [ ! -L "$dt_rg_path" ] || return 2; '
+        'dt_rg_size=$(wc -c <"$dt_rg_path" 2>/dev/null) || return 2; '
+        'case "$dt_rg_size" in *[!0-9]*|"") return 2;; esac; '
+        '[ "$dt_rg_size" -le 1024 ] || return 2; '
+        'dt_rg_value=$(cat "$dt_rg_path" 2>/dev/null) || return 2; '
+        '[ -z "$dt_rg_value" ] && { echo 0; return 0; }; '
+        'case "$dt_rg_value" in *[!0-9,]*|,*|*,|*,,*) return 2;; esac; '
+        "echo 1; }; "
+        "dt_gpu_containment_unproven() { "
+        # A job without either new marker predates containment attestation.
+        # Preserve its existing lifecycle semantics; new launchers always
+        # publish runtime_gpus_requested before starting a session.
+        'dt_gc_requested="$1/runtime_gpus_requested"; '
+        'if [ ! -e "$dt_gc_requested" ] && [ ! -L "$dt_gc_requested" ]; then '
+        'dt_gc_value=$(dt_containment_marker "$1"); dt_gc_rc=$?; '
+        '[ "$dt_gc_rc" -eq 1 ] && return 1; '
+        '[ "$dt_gc_rc" -eq 0 ] || return 2; fi; '
+        'dt_gc_count=$(dt_requested_gpus "$1"); dt_gc_rc=$?; '
+        '[ "$dt_gc_rc" -eq 0 ] || return 2; '
+        '[ "$dt_gc_count" -gt 0 ] 2>/dev/null || return 1; '
+        'dt_gc_value=$(dt_containment_marker "$1"); dt_gc_rc=$?; '
+        '[ "$dt_gc_rc" -eq 0 ] || return 0; '
+        '[ "$dt_gc_value" = systemd_scope_verified ] || return 0; '
+        'dt_scope_marker "$1" "" >/dev/null 2>&1; dt_gc_rc=$?; '
+        '[ "$dt_gc_rc" -eq 0 ] && return 1; return 0; }; '
         "dt_scope_census() { "
         "dt_sc_unit=$1; command -v systemctl >/dev/null 2>&1 "
         "|| { echo DEGRADED; return 0; }; "
@@ -239,6 +289,8 @@ def liveness_shell() -> str:
         "|| { echo UNPROVEN; return 0; }; "
         '[ "$dt_jl_cur" = "$dt_jl_boot" ] || { echo DEAD; return 0; }; fi; '
         "dt_jl_state=${dt_jl_ident%/*}; "
+        'dt_gpu_containment_unproven "$dt_jl_state"; dt_jl_gcrc=$?; '
+        '[ "$dt_jl_gcrc" -eq 1 ] || { echo UNPROVEN; return 0; }; '
         'dt_jl_scope=$(dt_scope_marker "$dt_jl_state" ""); dt_jl_src=$?; '
         '[ "$dt_jl_src" -eq 2 ] && { echo UNPROVEN; return 0; }; '
         'if [ "$dt_jl_src" -eq 0 ]; then '
@@ -507,7 +559,9 @@ def termination_probe(
         + '[ "$DT_KBOOT_UNKNOWN" -eq 0 ] && [ "$DT_KBOOT_MATCH" -eq 0 ] '
         "&& { echo DEAD; exit 0; }; "
         '[ "$DT_KBOOT_UNKNOWN" -eq 1 ] && { echo UNPROVEN; exit 3; }; '
-        + "owned_group; dt_k_owned_rc=$?; "
+        + 'dt_gpu_containment_unproven "$DT_KSTATE"; dt_k_gpu_rc=$?; '
+        'DT_KGPU_UNPROVEN=0; [ "$dt_k_gpu_rc" -eq 1 ] '
+        "|| DT_KGPU_UNPROVEN=1; " + "owned_group; dt_k_owned_rc=$?; "
         "DT_KGROUP_OWNED=0; DT_KLEADER_GONE=0; "
         '[ "$dt_k_owned_rc" -eq 0 ] && DT_KGROUP_OWNED=1; '
         '[ "$dt_k_owned_rc" -eq 1 ] && DT_KLEADER_GONE=1; '
@@ -522,7 +576,8 @@ def termination_probe(
         + (
             ""
             if ignore_exit_marker
-            else 'if [ "$dt_k_pre" = OK ] '
+            else 'if [ "$DT_KGPU_UNPROVEN" -eq 0 ] '
+            '&& [ "$dt_k_pre" = OK ] '
             '&& [ -f "$DT_KSTATE/exit_code" ] '
             '&& [ ! -L "$DT_KSTATE/exit_code" ]; then '
             'dt_k_size=$(wc -c <"$DT_KSTATE/exit_code" 2>/dev/null) '
@@ -563,7 +618,9 @@ def termination_probe(
         "dt_k_out=$(survivors); "
         'dt_k_out_head=$(printf "%s\\n" "$dt_k_out" | sed -n "1p"); '
         'case "$dt_k_out_head" in '
-        'OK) [ "$dt_k_out" = OK ] && { echo DEAD; exit 0; };; '
+        'OK) if [ "$dt_k_out" = OK ]; then '
+        '[ "$DT_KGPU_UNPROVEN" -eq 0 ] '
+        "&& { echo DEAD; exit 0; }; echo UNPROVEN; exit 3; fi;; "
         "DEGRADED) echo UNPROVEN; exit 3;; "
         "esac; done; "
         "echo ALIVE"

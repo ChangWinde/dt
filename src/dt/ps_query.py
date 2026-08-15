@@ -28,10 +28,11 @@ JsonDict: TypeAlias = dict[str, Any]
 SCHEMA_VERSION = "dt_ps_query_v1"
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 500
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CURSOR_LENGTH = 2048
-MAX_SUMMARY_BUCKETS = 4096
-MAX_SUMMARY_KEY_LENGTH = 512
-MAX_PARTIAL_ERRORS = 1024
+MAX_SUMMARY_BUCKETS = 1024
+MAX_SUMMARY_KEY_LENGTH = 256
+MAX_PARTIAL_ERRORS = 256
 MAX_PROJECTED_STRING_LENGTH = 8 * 1024 * 1024
 MAX_PROJECTED_JSON_ITEMS = 4096
 MAX_PROJECTED_JSON_DEPTH = 16
@@ -195,6 +196,7 @@ _OPTIONAL_NUMBER_FIELDS = frozenset(
         "launch_duration_s",
         "started_at",
         "recovered_at",
+        "terminal_finalized_at",
         "max_hours_overdue_s",
     }
 )
@@ -544,6 +546,68 @@ def project(rows: list[JsonDict], selected: tuple[str, ...]) -> list[JsonDict]:
     return [{name: row.get(name) for name in selected} for row in rows]
 
 
+def serialized_size(payload: object) -> int:
+    """Return the exact public JSON byte count used by the CLI transport."""
+    return len(json.dumps(payload).encode("utf-8"))
+
+
+def fit_payload_page(
+    payload: JsonDict,
+    source_rows: list[JsonDict],
+    *,
+    selected_fields: tuple[str, ...],
+    digest: str,
+    order: str,
+) -> JsonDict:
+    """Fit a projected prefix in the response budget without truncating fields.
+
+    A cursor may advance only past a complete row. If even one projected row
+    cannot fit, the caller must request fewer fields instead of receiving a
+    syntactically truncated or semantically partial record.
+    """
+    page = payload.get("page")
+    if not isinstance(page, dict):
+        raise QueryError("invalid ps response page")
+    eligible = page.get("eligible")
+    if not isinstance(eligible, int) or isinstance(eligible, bool) or eligible < 0:
+        raise QueryError("invalid ps response eligible count")
+
+    def candidate(count: int) -> JsonDict:
+        result = dict(payload)
+        result["jobs"] = project(source_rows[:count], selected_fields)
+        continuation = None
+        if eligible > count and count > 0:
+            continuation = continuation_cursor(
+                source_rows[count - 1], digest=digest, order=order
+            )
+        result["page"] = {
+            "eligible": eligible,
+            "returned": count,
+            "next_cursor": continuation,
+        }
+        return result
+
+    complete = candidate(len(source_rows))
+    if serialized_size(complete) <= MAX_RESPONSE_BYTES:
+        return complete
+    low = 0
+    high = len(source_rows)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if serialized_size(candidate(middle)) <= MAX_RESPONSE_BYTES:
+            low = middle
+        else:
+            high = middle - 1
+    if low == 0 and eligible:
+        raise QueryError(
+            "one projected job exceeds the ps response byte budget; request fewer fields"
+        )
+    fitted = candidate(low)
+    if serialized_size(fitted) > MAX_RESPONSE_BYTES:  # defensive invariant
+        raise QueryError("ps response metadata exceeds its byte budget")
+    return fitted
+
+
 def effective_result_state(row: JsonDict) -> str | None:
     """Derive the typed result for legacy projected registry rows."""
     explicit = row.get("result_state")
@@ -744,6 +808,19 @@ def validate_payload_contract(
         isinstance(counts, dict)
         for counts in (by_status, by_result, by_center, by_node)
     )
+    if not set(cast(dict[str, int], by_status)).issubset(JOB_STATUSES):
+        raise QueryError("invalid ps lifecycle bucket from head")
+    if not set(cast(dict[str, int], by_result)).issubset(RESULT_STATES):
+        raise QueryError("invalid ps result bucket from head")
+    expected_status = expected_query.get("status")
+    if isinstance(expected_status, str) and set(cast(dict[str, int], by_status)) - {
+        expected_status
+    }:
+        raise QueryError("ps summary violates its status filter")
+    if expected_query.get("active_only") is True and set(
+        cast(dict[str, int], by_status)
+    ) - {"queued", "running"}:
+        raise QueryError("ps summary violates its active filter")
     if (
         sum(cast(dict[str, int], by_status).values()) != summary_total
         or cast(dict[str, int], by_center)
@@ -870,6 +947,8 @@ def validate_payload_contract(
         or partial != bool(errors)
     ):
         raise QueryError("invalid ps query error contract from head")
+    if serialized_size(payload) > MAX_RESPONSE_BYTES:
+        raise QueryError("ps query response exceeds its byte budget")
     return payload
 
 
@@ -897,6 +976,32 @@ def build_payload(
         since=since,
     )
     order = ORDER_FIELD
+    failures = bounded_errors(errors or {})
+    query = query_contract(
+        status=status,
+        active_only=active_only,
+        issues_only=issues_only,
+        since=since,
+        selected_fields=selected_fields,
+        limit=None if summary_only else limit,
+        cursor=cursor,
+        summary_only=summary_only,
+    )
+    if summary_only:
+        payload: JsonDict = {
+            "schema_version": SCHEMA_VERSION,
+            "generated_at": time.time(),
+            "center": center,
+            "query": query,
+            "summary": summary,
+            "page": {"eligible": len(matching), "returned": 0, "next_cursor": None},
+            "jobs": [],
+            "partial": bool(failures),
+            "errors": failures,
+        }
+        if serialized_size(payload) > MAX_RESPONSE_BYTES:
+            raise QueryError("ps summary exceeds its response byte budget")
+        return payload
     page = paginate(
         matching,
         limit=limit,
@@ -904,31 +1009,28 @@ def build_payload(
         digest=digest,
         order=order,
     )
-    failures = bounded_errors(errors or {})
-    return {
+    payload = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": time.time(),
         "center": center,
-        "query": query_contract(
-            status=status,
-            active_only=active_only,
-            issues_only=issues_only,
-            since=since,
-            selected_fields=selected_fields,
-            limit=None if summary_only else limit,
-            cursor=cursor,
-            summary_only=summary_only,
-        ),
+        "query": query,
         "summary": summary,
         "page": {
             "eligible": page.eligible,
-            "returned": 0 if summary_only else len(page.rows),
-            "next_cursor": None if summary_only else page.next_cursor,
+            "returned": len(page.rows),
+            "next_cursor": page.next_cursor,
         },
-        "jobs": [] if summary_only else project(page.rows, selected_fields),
+        "jobs": project(page.rows, selected_fields),
         "partial": bool(failures),
         "errors": failures,
     }
+    return fit_payload_page(
+        payload,
+        page.rows,
+        selected_fields=selected_fields,
+        digest=digest,
+        order=order,
+    )
 
 
 def unsupported_remote_query(message: str) -> bool:

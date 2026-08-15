@@ -22,6 +22,7 @@ RUNTIME_PAYLOAD_NAMES = (
     "wrapper.sh",
     "cuda_probe.py",
     "telemetry.py",
+    "telemetry_summary.py",
     "phase.sh",
     "result.py",
     "snapshot_hash.py",

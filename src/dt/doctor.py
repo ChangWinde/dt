@@ -59,6 +59,15 @@ if command -v rsync >/dev/null 2>&1; then echo DT_RSYNC=ok; else echo DT_RSYNC=m
 if command -v flock >/dev/null 2>&1; then echo DT_FLOCK=ok; else echo DT_FLOCK=missing; fi
 if command -v python3 >/dev/null 2>&1; then echo DT_PYTHON3=ok; else echo DT_PYTHON3=missing; fi
 if command -v timeout >/dev/null 2>&1; then echo DT_TIMEOUT=ok; else echo DT_TIMEOUT=missing; fi
+# A user scope is not a durable GPU runtime when logind may tear down the user
+# manager after the final login session. CPU-only jobs retain their explicit
+# portable fallback, so report this fact separately from generic dependencies.
+if command -v loginctl >/dev/null 2>&1; then
+    dt_linger=$(loginctl show-user "$(id -u)" --property=Linger --value 2>/dev/null) || dt_linger=unavailable
+else
+    dt_linger=unavailable
+fi
+case "$dt_linger" in yes|no) echo "DT_LINGER=$dt_linger" ;; *) echo DT_LINGER=unavailable ;; esac
 # What this sshd observed about the control connection: a loopback peer
 # means the route enters through a local tunnel endpoint (frp/autossh).
 # Consumed and redacted head-side; never rendered raw.
@@ -260,10 +269,11 @@ def doctor_center(cfg: HeadConfig) -> list[dict[str, Any]]:
     return rows
 
 
-# Every command's registry scan is linear in the row count (measured ~32 us
-# per row), so a history that grows without bound slowly taxes every
-# invocation. Warn well before it is painful and name the two existing
-# levers; dt never deletes an operator's experiment history on its own.
+# Active scheduling and observation use the derived active index, but
+# historical queries, maintenance, and a cold index rebuild still scale with
+# the retained registry. Warn before those operations become cumbersome and
+# name the two existing levers; dt never deletes experiment history on its
+# own.
 REGISTRY_ADVISORY_ROWS = 2000
 
 
@@ -279,4 +289,4 @@ def registry_growth_status(cfg: HeadConfig) -> str:
         if cfg.queue.auto_clean_days is None
         else "run dt clean"
     )
-    return f"large: {rows} rows slow every command; {lever}"
+    return f"large: {rows} rows slow historical operations; {lever}"

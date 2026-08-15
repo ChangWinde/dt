@@ -35,6 +35,7 @@ MAX_EVENT_BYTES = 8192
 MAX_QUERY_LIMIT = 1000
 
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$")
 _SAFE_KIND_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 _VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]{0,39}$")
@@ -53,6 +54,7 @@ _COMMANDS = frozenset(
         "clean",
         "compact",
         "compare",
+        "diagnose",
         "doctor",
         "events",
         "exec",
@@ -120,6 +122,8 @@ _EVENT_FIELDS = (
     "exit_code",
     "duration_ms",
     "problem",
+    "request_id",
+    "job_id",
 )
 _EVENT_FIELD_SET = frozenset(_EVENT_FIELDS)
 
@@ -150,6 +154,8 @@ class OperationSession:
     started_monotonic: float
     target: JournalTarget
     problem: dict[str, str] | None = None
+    request_id: str | None = None
+    job_id: str | None = None
     journal_errors: list[str] = field(default_factory=list)
     finished: bool = False
     _lock: Lock = field(default_factory=Lock, repr=False)
@@ -239,6 +245,21 @@ def _safe_parent_id() -> str | None:
     # helper subprocess so a stale parent cannot leak into unrelated work.
     value = os.environ.pop("DT_PARENT_OPERATION_ID", "")
     return value if _ID_RE.fullmatch(value) else None
+
+
+def _valid_job_id(value: object) -> bool:
+    """Use the registry's identity contract without creating an import cycle.
+
+    ``jobs`` imports ``sshio``, which imports this module for operation trace
+    propagation.  Loading the authority lazily keeps CLI journal bootstrap
+    acyclic while ensuring its length and alphabet cannot drift from registry
+    acceptance.
+    """
+    if not isinstance(value, str):
+        return False
+    from .jobs import JOB_ID_RE, MAX_JOB_ID_LENGTH
+
+    return len(value) <= MAX_JOB_ID_LENGTH and JOB_ID_RE.fullmatch(value) is not None
 
 
 def _problem_fingerprint(exc: BaseException) -> str:
@@ -433,6 +454,10 @@ def _base_event(session: OperationSession, phase: str) -> dict[str, Any]:
         event["source_commit"] = SOURCE_COMMIT[:12]
     if session.parent_operation_id is not None:
         event["parent_operation_id"] = session.parent_operation_id
+    if session.request_id is not None:
+        event["request_id"] = session.request_id
+    if session.job_id is not None:
+        event["job_id"] = session.job_id
     return event
 
 
@@ -473,6 +498,34 @@ def begin(argv: list[str]) -> OperationSession:
 def current_operation_id() -> str | None:
     with _CURRENT_LOCK:
         return _CURRENT.operation_id if _CURRENT is not None else None
+
+
+def bind_identity(*, request_id: str | None = None, job_id: str | None = None) -> None:
+    """Correlate the current operation with durable, non-secret identities.
+
+    Allocation often happens after the start event is persisted.  The finish
+    or handoff event therefore carries the identity discovered by the command;
+    query consumers can join it to the request receipt or job registry without
+    recording commands, paths, environment values, or exception text.
+    Invalid values are ignored rather than copied into this evidence sink.
+    """
+    safe_request = (
+        request_id
+        if isinstance(request_id, str) and _REQUEST_ID_RE.fullmatch(request_id)
+        else None
+    )
+    safe_job = job_id if _valid_job_id(job_id) else None
+    if safe_request is None and safe_job is None:
+        return
+    with _CURRENT_LOCK:
+        session = _CURRENT
+    if session is None:
+        return
+    with session._lock:
+        if safe_request is not None:
+            session.request_id = safe_request
+        if safe_job is not None:
+            session.job_id = safe_job
 
 
 def mark_problem(kind: str, exc: BaseException | None = None) -> None:
@@ -636,6 +689,15 @@ def _validated_event(raw: object) -> dict[str, Any] | None:
     ):
         return None
 
+    request_id = raw.get("request_id")
+    if request_id is not None and (
+        not isinstance(request_id, str) or _REQUEST_ID_RE.fullmatch(request_id) is None
+    ):
+        return None
+    job_id = raw.get("job_id")
+    if job_id is not None and not _valid_job_id(job_id):
+        return None
+
     if phase == "start":
         started_at = raw.get("started_at")
         if not isinstance(started_at, str) or not _TIMESTAMP_RE.fullmatch(started_at):
@@ -709,12 +771,18 @@ def query(
     limit: int = 100,
     issues_only: bool = False,
     operation_id: str | None = None,
+    request_id: str | None = None,
+    job_id: str | None = None,
     exclude_operation_id: str | None = None,
 ) -> OperationQuery:
     if not 1 <= limit <= MAX_QUERY_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_QUERY_LIMIT}")
     if operation_id is not None and not _ID_RE.fullmatch(operation_id):
         raise ValueError("operation ID must be 32 lowercase hexadecimal characters")
+    if request_id is not None and not _REQUEST_ID_RE.fullmatch(request_id):
+        raise ValueError("request ID is invalid")
+    if job_id is not None and not _valid_job_id(job_id):
+        raise ValueError("job ID is invalid")
     if exclude_operation_id is not None and not _ID_RE.fullmatch(exclude_operation_id):
         raise ValueError("excluded operation ID is invalid")
     if not target.directory.exists():
@@ -753,6 +821,10 @@ def query(
                     operation_id is not None
                     and event.get("operation_id") != operation_id
                 ):
+                    continue
+                if request_id is not None and event.get("request_id") != request_id:
+                    continue
+                if job_id is not None and event.get("job_id") != job_id:
                     continue
                 if event.get("operation_id") == exclude_operation_id:
                     continue

@@ -465,9 +465,10 @@ def locked_claim(
                 f"`dt request {request_id} --json` before retrying"
             ) from exc
         except OSError as exc:
+            detail = " ".join(str(exc).split())[:512] or type(exc).__name__
             raise GroupRequestRejected(
                 f"request {request_id!r} was not prepared because its durable "
-                f"claim could not be persisted: {exc}"
+                f"claim could not be persisted: {detail}"
             ) from exc
         if not created:
             if record.state == "rejected":

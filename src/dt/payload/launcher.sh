@@ -8,7 +8,7 @@
 #                     [DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST]
 #                     [DT_ENV_MODE=sync|reuse]
 #                     [DT_GPU_ISOLATION=advisory]
-#                     [DT_CUSTOM_ENV_PATH]
+#                     [DT_PRIVATE_ENV_STDIN=1] [DT_CUSTOM_ENV_PATH]
 #                     [DT_PAYLOAD_ATTEST_MS]
 #                     [DT_PREDECESSOR_JOB_ID DT_PREDECESSOR_JOB_DIR]
 #                     [DT_CACHE_SOURCE_JOB_ID DT_CACHE_SOURCE_JOB_DIR
@@ -43,6 +43,7 @@ DT_ENV_MODE="${DT_ENV_MODE:-sync}"
 DT_GPU_ISOLATION="${DT_GPU_ISOLATION:-advisory}"
 DT_MIN_VRAM_MIB="${DT_MIN_VRAM_MIB:-0}"
 DT_LAUNCH_TOKEN="${DT_LAUNCH_TOKEN:-}"
+DT_PRIVATE_ENV_STDIN="${DT_PRIVATE_ENV_STDIN:-0}"
 case "$DT_ENV_MODE" in
     sync|reuse) : ;;
     *) log "invalid environment mode: $DT_ENV_MODE"; exit 13 ;;
@@ -57,11 +58,6 @@ esac
 if [ "$DT_GPUS" -eq 0 ] && [ "$DT_MIN_VRAM_MIB" -ne 0 ]; then
     log "minimum GPU memory requires at least one GPU"
     exit 15
-fi
-if [ -n "$DT_LAUNCH_TOKEN" ] \
-   && ! [[ "$DT_LAUNCH_TOKEN" =~ ^[0-9a-f]{32}$ ]]; then
-    log "invalid launch attempt token"
-    exit 14
 fi
 
 # Values arrive shell-quoted, so `~` never expanded; job_dir may be
@@ -79,6 +75,7 @@ DT_JOB_DIR=$(dt_absolutize "$DT_JOB_DIR")
 DT_ROOT=$(dt_absolutize "${DT_ROOT:-$HOME/dt}")
 DT_WORKER_ROOT=$(dt_absolutize "${DT_WORKER_ROOT:-$DT_ROOT}")
 DT_CONTROL_DIR=$(dt_absolutize "${DT_CONTROL_DIR:-$DT_JOB_DIR}")
+DT_EVIDENCE_DIR="$DT_CONTROL_DIR/evidence"
 DT_PAYLOAD_DIR=$(dt_absolutize "${DT_PAYLOAD_DIR:-$DT_JOB_DIR}")
 DT_STATE_DIR=$(dt_absolutize "${DT_STATE_DIR:-$DT_JOB_DIR}")
 DT_OUTPUT_DIR=$(dt_absolutize "${DT_OUTPUT_DIR:-$DT_JOB_DIR/outputs}")
@@ -119,6 +116,7 @@ DT_CACHE_CLONE_BYTES=0
 DT_CACHE_CLONE_DURATION_MS=0
 ARTIFACT_VERIFY_DURATION_MS=0
 DT_CUSTOM_ENV_NAMES=()
+DT_RUNTIME_ENV_PATH=""
 case "$DT_ARTIFACT_ROOT" in
     "") : ;;
     "~/"*) DT_ARTIFACT_ROOT="$HOME/${DT_ARTIFACT_ROOT#\~/}" ;;
@@ -138,23 +136,410 @@ mkdir -p "$DT_JOB_DIR/logs" "$DT_OUTPUT_DIR" "$DT_CONTROL_DIR" \
          "$DT_STATE_DIR" "$DT_GPU_LEASE_ROOT" "$DT_RUNTIME_ROOT/locks" \
          "$DT_CACHE_ROOT/tools/xdg" "$DT_CACHE_ROOT/tools/uv" \
          "$DT_CACHE_ROOT/tools/torch" "$DT_CONTROL_DIR/tmp"
+if [ -L "$DT_EVIDENCE_DIR" ] \
+   || { [ -e "$DT_EVIDENCE_DIR" ] && [ ! -d "$DT_EVIDENCE_DIR" ]; }; then
+    log "unsafe runtime evidence directory: $DT_EVIDENCE_DIR"
+    exit 15
+fi
+mkdir -m 700 -p "$DT_EVIDENCE_DIR" || exit 15
+chmod 700 "$DT_EVIDENCE_DIR" || exit 15
 export DT_ROOT DT_WORKER_ROOT DT_JOB_DIR DT_CONTROL_DIR DT_PAYLOAD_DIR \
        DT_STATE_DIR DT_OUTPUT_DIR \
        DT_META_PATH DT_COMMAND_PATH DT_CANCEL_PATH DT_BIN_DIR DT_ENVS_DIR DT_CACHE_ROOT DT_RUNTIME_ROOT \
        DT_GPU_LEASE_ROOT DT_GPU_ISOLATION
+# This path is an explicit wrapper-internal contract, not project environment.
+# Keep the shell value for evidence publication and start_session's allowlist,
+# while preventing uv and setup subprocesses from discovering it implicitly.
+export -n DT_EVIDENCE_DIR
 export TMPDIR="$DT_CONTROL_DIR/tmp"
 export XDG_CACHE_HOME="$DT_CACHE_ROOT/tools/xdg"
 export UV_CACHE_DIR="$DT_CACHE_ROOT/tools/uv"
 export TORCH_HOME="$DT_CACHE_ROOT/tools/torch"
 
-# Keep the launcher's own cwd inside the private capsule for its complete
-# lifetime. If the head dies before receiving the launch receipt, the shared
-# lifecycle census can then find and terminate an in-progress environment
-# setup before a retry removes the cancellation sentinel.
+# Keep the launcher's cwd inside the private capsule through environment sync,
+# setup, and session preparation. If the head dies during those phases, the
+# shared lifecycle census can find and terminate that in-progress attempt
+# before a retry removes the cancellation sentinel. start_session leaves the
+# capsule immediately before the detached wrapper begins its own census.
 if ! cd "$DT_JOB_DIR"; then
     log "cannot enter job directory: $DT_JOB_DIR"
     exit 14
 fi
+
+if ! command -v python3 >/dev/null 2>&1 \
+   || ! python3 -I -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'; then
+    log "node-unfit: Python 3.10 or newer is required by the runtime payload"
+    exit 15
+fi
+
+dt_load_private_env() {
+    [ "$DT_PRIVATE_ENV_STDIN" = 1 ] || return 0
+    command -v python3 >/dev/null 2>&1 || {
+        log "private environment requires Python 3.10 or newer"
+        return 1
+    }
+    DT_RUNTIME_ENV_PATH="$DT_CONTROL_DIR/runtime-env"
+    local loader token channel_path channel_magic channel_present channel_value extra
+    channel_path=$(mktemp "$DT_CONTROL_DIR/tmp/.launcher-private.XXXXXXXX") \
+        || return 1
+    chmod 600 "$channel_path" || {
+        rm -f -- "$channel_path"
+        return 1
+    }
+    exec 7<>"$channel_path" || {
+        rm -f -- "$channel_path"
+        return 1
+    }
+    if ! rm -f -- "$channel_path"; then
+        exec 7>&-
+        return 1
+    fi
+    read -r -d '' loader <<'PY' || true
+import os
+import re
+import stat
+import sys
+import uuid
+
+MAGIC = b"DT_PRIVATE_ENV_V1\0"
+MAX_BYTES = 128 * 1024
+MAX_VARS = 67
+MAX_VALUE = 64 * 1024
+INTERNAL = {"DT_LAUNCH_TOKEN", "DT_PROXY", "DT_WEBHOOK"}
+LAUNCHER_ONLY = {"DT_LAUNCH_TOKEN"}
+RESERVED = {
+    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "BASH_ENV",
+    "ENV", "BASHOPTS", "SHELLOPTS", "CDPATH", "GLOBIGNORE", "IFS",
+    "LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH", "TMUX", "TMUX_TMPDIR",
+    "PWD", "OLDPWD", "SHLVL", "UID", "EUID", "PPID", "RANDOM",
+    "SRANDOM", "SECONDS", "LINENO", "OPTARG", "OPTIND", "FUNCNAME",
+    "GROUPS", "DIRSTACK", "PIPESTATUS", "HOSTNAME", "HOSTTYPE",
+    "MACHTYPE", "OSTYPE", "PROMPT_COMMAND", "PS0", "PS1", "PS2",
+    "PS3", "PS4", "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES",
+    "ROCR_VISIBLE_DEVICES", "VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT",
+}
+NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
+
+
+def fail(message: str) -> None:
+    print(f"private environment rejected: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+raw = sys.stdin.buffer.read(MAX_BYTES + 1)
+if len(raw) > MAX_BYTES:
+    fail("envelope exceeds 128 KiB")
+if not raw.startswith(MAGIC):
+    fail("invalid envelope magic")
+body = raw[len(MAGIC):]
+if body and not body.endswith(b"\0"):
+    fail("truncated envelope")
+fields = body[:-1].split(b"\0") if body else []
+if len(fields) % 2 or len(fields) // 2 > MAX_VARS:
+    fail("invalid envelope field count")
+values = {}
+for index in range(0, len(fields), 2):
+    try:
+        name = fields[index].decode("ascii")
+        value = fields[index + 1].decode("utf-8")
+    except UnicodeDecodeError:
+        fail("invalid envelope encoding")
+    if name in values:
+        fail("duplicate variable")
+    if NAME.fullmatch(name) is None:
+        fail("invalid variable name")
+    if name.startswith("DT_"):
+        if name not in INTERNAL:
+            fail("unrecognized internal variable")
+    elif name.startswith("BASH") or name in RESERVED:
+        fail("reserved runtime variable")
+    if len(value.encode("utf-8")) > MAX_VALUE:
+        fail("variable value exceeds 64 KiB")
+    values[name] = value
+token = values.get("DT_LAUNCH_TOKEN", "")
+if token and re.fullmatch(r"[0-9a-f]{32}", token) is None:
+    fail("invalid launch token")
+
+channel_descriptor = int(sys.argv[2])
+channel_info = os.fstat(channel_descriptor)
+if (
+    not stat.S_ISREG(channel_info.st_mode)
+    or channel_info.st_uid != os.getuid()
+    or stat.S_IMODE(channel_info.st_mode) & 0o077
+):
+    fail("unsafe launcher-private channel")
+
+runtime = {key: value for key, value in values.items() if key not in LAUNCHER_ONLY}
+path = os.path.abspath(sys.argv[1])
+parent = os.path.dirname(path)
+temporary = os.path.join(parent, f".runtime-env.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+descriptor = -1
+try:
+    descriptor = os.open(temporary, flags, 0o600)
+    payload = bytearray(MAGIC)
+    for key in sorted(runtime):
+        payload.extend(key.encode("ascii") + b"\0")
+        payload.extend(runtime[key].encode("utf-8") + b"\0")
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            fail("short runtime environment write")
+        view = view[written:]
+    os.fchmod(descriptor, 0o600)
+    os.fsync(descriptor)
+    os.close(descriptor)
+    descriptor = -1
+    os.replace(temporary, path)
+    directory = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+
+proxy = values.get("DT_PROXY")
+channel = bytearray(b"DT_LAUNCHER_PRIVATE_V1\0")
+channel.extend(b"1\0" if proxy is not None else b"0\0")
+if proxy is not None:
+    channel.extend(proxy.encode("utf-8"))
+channel.extend(b"\0")
+os.ftruncate(channel_descriptor, 0)
+os.lseek(channel_descriptor, 0, os.SEEK_SET)
+view = memoryview(channel)
+while view:
+    written = os.write(channel_descriptor, view)
+    if written <= 0:
+        fail("short launcher-private channel write")
+    view = view[written:]
+os.lseek(channel_descriptor, 0, os.SEEK_SET)
+sys.stdout.write(token)
+PY
+    token=$(python3 -I -c "$loader" "$DT_RUNTIME_ENV_PATH" 7) || {
+        exec 7>&-
+        return 1
+    }
+    channel_magic=""
+    channel_present=""
+    channel_value=""
+    extra=""
+    if ! IFS= read -r -d '' channel_magic <&7 \
+       || ! IFS= read -r -d '' channel_present <&7 \
+       || ! IFS= read -r -d '' channel_value <&7 \
+       || [ "$channel_magic" != DT_LAUNCHER_PRIVATE_V1 ]; then
+        log "private environment loader returned an invalid private channel"
+        exec 7>&-
+        rm -f -- "$DT_RUNTIME_ENV_PATH"
+        return 1
+    fi
+    if IFS= read -r -n 1 extra <&7; then
+        log "private environment loader returned excess private channel data"
+        exec 7>&-
+        rm -f -- "$DT_RUNTIME_ENV_PATH"
+        return 1
+    fi
+    exec 7>&-
+    case "$channel_present" in
+        0)
+            if [ -n "$channel_value" ]; then
+                log "private environment loader returned an invalid proxy state"
+                rm -f -- "$DT_RUNTIME_ENV_PATH"
+                return 1
+            fi
+            unset DT_PROXY
+            ;;
+        1)
+            DT_PROXY=$channel_value
+            export -n DT_PROXY
+            ;;
+        *)
+            log "private environment loader returned an invalid proxy state"
+            rm -f -- "$DT_RUNTIME_ENV_PATH"
+            return 1
+            ;;
+    esac
+    DT_LAUNCH_TOKEN=$token
+    export -n DT_LAUNCH_TOKEN 2>/dev/null || true
+    unset DT_PRIVATE_ENV_STDIN
+    return 0
+}
+
+dt_load_private_env || exit 14
+
+if [ -n "$DT_LAUNCH_TOKEN" ] \
+   && ! [[ "$DT_LAUNCH_TOKEN" =~ ^[0-9a-f]{32}$ ]]; then
+    log "invalid launch attempt token"
+    exit 14
+fi
+
+# Persist only a one-way identity for an idempotent dispatch attempt.  The
+# head can later prove whether its exact private token reached this launcher
+# without putting that token in argv, logs, registry state, or a remote file.
+# Publish before any environment/cache work so every possible compute launch
+# is preceded by durable proof; a matching marker with no runtime state stays
+# uncertain (never safe to replay) until recovery can classify it.
+dt_publish_launch_identity() {
+    [ -n "$DT_LAUNCH_TOKEN" ] || return 0
+    local marker="$DT_STATE_DIR/launch-identity.sha256" publisher
+    read -r -d '' publisher <<'PY' || true
+import hashlib
+import hmac
+import os
+import re
+import secrets
+import stat
+import sys
+
+NAME = "launch-identity.sha256"
+TOKEN = re.compile(rb"[0-9a-f]{32}")
+DIGEST = re.compile(rb"[0-9a-f]{64}\n")
+
+
+def fail(message):
+    print(f"launch identity marker rejected: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def file_identity(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def open_directory_nofollow(path):
+    if not hasattr(os, "O_NOFOLLOW"):
+        fail("node cannot enforce no-follow marker paths")
+    absolute = os.path.abspath(path)
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for component in absolute.split("/")[1:]:
+            if not component or component in {".", ".."}:
+                fail("state directory is non-canonical")
+            child = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = child
+        info = os.fstat(descriptor)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+            fail("state directory ownership is unsafe")
+        os.fchmod(descriptor, 0o700)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def read_existing(directory):
+    try:
+        descriptor = os.open(
+            NAME,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_size != 65
+        ):
+            fail("existing marker metadata is unsafe")
+        payload = os.read(descriptor, 66)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    current = os.stat(NAME, dir_fd=directory, follow_symlinks=False)
+    if (
+        file_identity(before) != file_identity(after)
+        or file_identity(after) != file_identity(current)
+    ):
+        fail("existing marker changed while reading")
+    if DIGEST.fullmatch(payload) is None:
+        fail("existing marker content is invalid")
+    return payload
+
+
+token = sys.stdin.buffer.read(65)
+if TOKEN.fullmatch(token) is None:
+    fail("launch token is invalid")
+expected = hashlib.sha256(token).hexdigest().encode("ascii") + b"\n"
+directory = open_directory_nofollow(os.path.dirname(os.path.abspath(sys.argv[1])))
+temporary = f".{NAME}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+descriptor = -1
+try:
+    existing = read_existing(directory)
+    if existing is not None:
+        if not hmac.compare_digest(existing, expected):
+            fail("existing marker belongs to a different launch")
+        raise SystemExit(0)
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=directory,
+    )
+    view = memoryview(expected)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            fail("short marker write")
+        view = view[written:]
+    os.fchmod(descriptor, 0o600)
+    os.fsync(descriptor)
+    os.close(descriptor)
+    descriptor = -1
+    try:
+        # A hard-link publish is atomic and never replaces an identity that a
+        # racing launcher already bound to this immutable job capsule.
+        os.link(
+            temporary,
+            NAME,
+            src_dir_fd=directory,
+            dst_dir_fd=directory,
+            follow_symlinks=False,
+        )
+    except FileExistsError:
+        existing = read_existing(directory)
+        if existing is None or not hmac.compare_digest(existing, expected):
+            fail("racing marker belongs to a different launch")
+    os.fsync(directory)
+finally:
+    if descriptor >= 0:
+        os.close(descriptor)
+    try:
+        os.unlink(temporary, dir_fd=directory)
+    except FileNotFoundError:
+        pass
+    os.close(directory)
+PY
+    if ! printf '%s' "$DT_LAUNCH_TOKEN" \
+        | python3 -I -c "$publisher" "$marker"; then
+        log "cannot publish launch identity"
+        return 1
+    fi
+    export -n DT_LAUNCH_TOKEN 2>/dev/null || true
+}
+
+dt_publish_launch_identity || exit 14
 
 dt_custom_env_reject() {
     local path=$1 reason=$2
@@ -254,6 +639,30 @@ dt_load_custom_env() {
 
 dt_load_custom_env || exit 14
 
+dt_publish_legacy_runtime_env() {
+    [ -z "$DT_RUNTIME_ENV_PATH" ] || return 0
+    if [ -z "${DT_PROXY:-}" ] && [ -z "${DT_WEBHOOK:-}" ] \
+       && [ "${#DT_CUSTOM_ENV_NAMES[@]}" -eq 0 ]; then
+        return 0
+    fi
+    DT_RUNTIME_ENV_PATH="$DT_CONTROL_DIR/runtime-env"
+    local temporary name
+    temporary=$(mktemp "$DT_CONTROL_DIR/.runtime-env.XXXXXXXX") || return 1
+    chmod 600 "$temporary" || return 1
+    printf 'DT_PRIVATE_ENV_V1\0' >"$temporary" || return 1
+    for name in DT_PROXY DT_WEBHOOK; do
+        if [[ -v "$name" ]]; then
+            printf '%s\0%s\0' "$name" "${!name}" >>"$temporary" || return 1
+        fi
+    done
+    for name in "${DT_CUSTOM_ENV_NAMES[@]}"; do
+        printf '%s\0%s\0' "$name" "${!name}" >>"$temporary" || return 1
+    done
+    mv -Tf -- "$temporary" "$DT_RUNTIME_ENV_PATH"
+}
+
+dt_publish_legacy_runtime_env || exit 14
+
 lease_available() {
     local idx=$1 lock="$DT_GPU_LEASE_ROOT/gpu-$1.lock"
     [ ! -e "$lock" ] || flock -n "$lock" -c true
@@ -308,7 +717,7 @@ cancelled() {
     # only the attempt whose recovery probe wrote it, so the next retry cannot
     # accidentally release a still-running older launcher.
     case "$value" in ""|"*") return 0;; esac
-    [ -n "$DT_LAUNCH_TOKEN" ] && [ "$value" = "$DT_LAUNCH_TOKEN" ]
+    [ -n "${DT_LAUNCH_TOKEN:-}" ] && [ "$value" = "$DT_LAUNCH_TOKEN" ]
 }
 
 # A tmux client cannot move an already-running server into a new cgroup. Use a
@@ -353,6 +762,11 @@ if ! tmux -L "$DT_TMUX_SOCKET" has-session -t "$DT_SESSION" 2>/dev/null \
     rm -f "$DT_STATE_DIR/pgid" "$DT_STATE_DIR/gpus" \
           "$DT_STATE_DIR/boot_id" \
           "$DT_STATE_DIR/process_start_ticks" \
+          "$DT_STATE_DIR/runtime_scope" \
+          "$DT_STATE_DIR/runtime_containment" \
+          "$DT_STATE_DIR/runtime_gpus_requested" \
+          "$DT_STATE_DIR/runtime_linger" \
+          "$DT_STATE_DIR/tmux_socket" \
           "$DT_STATE_DIR/started_at" "$DT_STATE_DIR/finished_at" \
           "$DT_STATE_DIR/exit_code" "$DT_STATE_DIR"/exit_code.tmp.* \
           "$DT_STATE_DIR/result_state" "$DT_STATE_DIR"/result_state.tmp.* \
@@ -362,30 +776,154 @@ fi
 cache_metadata_manifest() {
     python3 -I - "$1" <<'PY'
 import hashlib
-import pathlib
+import os
+import stat
 import sys
 
-root = pathlib.Path(sys.argv[1])
-files = sorted(
-    (path for path in root.rglob("*") if path.is_file()),
-    key=lambda path: str(path.relative_to(root)),
+root = os.path.abspath(sys.argv[1])
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+file_flags = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
 )
 digest = hashlib.sha256()
-size = 0
-for path in files:
-    metadata = path.stat()
-    size += metadata.st_size
-    digest.update(
-        (
-            str(path.relative_to(root))
-            + "\0"
-            + str(metadata.st_size)
-            + "\0"
-            + str(metadata.st_mtime_ns)
-            + "\n"
-        ).encode()
+file_count = 0
+total_size = 0
+
+
+def fail(message):
+    print(f"unsafe cache tree: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def identity(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
     )
-print(f"{len(files)}\t{size}\t{digest.hexdigest()}")
+
+
+def emit(*fields):
+    for field in fields:
+        value = field if isinstance(field, bytes) else str(field).encode("ascii")
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+
+
+def relative_bytes(parts):
+    return b"/".join(os.fsencode(part) for part in parts)
+
+
+def validate_link(parts, target):
+    if os.path.isabs(target):
+        fail(f"absolute symlink at {os.fsdecode(relative_bytes(parts))}")
+    # realpath also resolves a contained link that points through another
+    # link. It is used only for confinement; traversal and hashing below are
+    # lstat/openat based and never follow cache links.
+    candidate = os.path.realpath(os.path.join(root, *parts[:-1], target))
+    try:
+        confined = os.path.commonpath((root, candidate)) == root
+    except ValueError:
+        confined = False
+    if not confined:
+        fail(f"escaping symlink at {os.fsdecode(relative_bytes(parts))}")
+
+
+def walk(directory, parts=()):
+    global file_count, total_size
+    before = os.fstat(directory)
+    if not stat.S_ISDIR(before.st_mode):
+        fail("walk root changed type")
+    try:
+        names = sorted((entry.name for entry in os.scandir(directory)), key=os.fsencode)
+    except OSError as error:
+        fail(f"cannot enumerate cache directory: {error}")
+    for name in names:
+        child_parts = (*parts, name)
+        relative = relative_bytes(child_parts)
+        try:
+            observed = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except OSError as error:
+            fail(f"cannot inspect {os.fsdecode(relative)}: {error}")
+        mode = stat.S_IMODE(observed.st_mode)
+        if stat.S_ISDIR(observed.st_mode):
+            try:
+                child = os.open(name, directory_flags, dir_fd=directory)
+            except OSError as error:
+                fail(f"cannot safely open directory {os.fsdecode(relative)}: {error}")
+            try:
+                if identity(os.fstat(child)) != identity(observed):
+                    fail(f"directory changed before read: {os.fsdecode(relative)}")
+                emit(b"D", relative, mode)
+                walk(child, child_parts)
+                if identity(os.fstat(child)) != identity(observed):
+                    fail(f"directory changed during read: {os.fsdecode(relative)}")
+            finally:
+                os.close(child)
+        elif stat.S_ISREG(observed.st_mode):
+            try:
+                descriptor = os.open(name, file_flags, dir_fd=directory)
+            except OSError as error:
+                fail(f"cannot safely open file {os.fsdecode(relative)}: {error}")
+            content = hashlib.sha256()
+            try:
+                opened = os.fstat(descriptor)
+                if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(
+                    observed
+                ):
+                    fail(f"file changed before read: {os.fsdecode(relative)}")
+                while True:
+                    block = os.read(descriptor, 1024 * 1024)
+                    if not block:
+                        break
+                    content.update(block)
+                if identity(os.fstat(descriptor)) != identity(opened):
+                    fail(f"file changed during read: {os.fsdecode(relative)}")
+            finally:
+                os.close(descriptor)
+            file_count += 1
+            total_size += opened.st_size
+            emit(b"F", relative, mode, opened.st_size, content.digest())
+        elif stat.S_ISLNK(observed.st_mode):
+            try:
+                target = os.readlink(name, dir_fd=directory)
+                current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            except OSError as error:
+                fail(f"cannot read symlink {os.fsdecode(relative)}: {error}")
+            if identity(current) != identity(observed):
+                fail(f"symlink changed during read: {os.fsdecode(relative)}")
+            validate_link(child_parts, target)
+            emit(b"L", relative, mode, os.fsencode(target))
+        else:
+            fail(f"special file is forbidden: {os.fsdecode(relative)}")
+        try:
+            current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        except OSError as error:
+            fail(f"entry disappeared during read: {os.fsdecode(relative)}: {error}")
+        if identity(current) != identity(observed):
+            fail(f"entry changed during read: {os.fsdecode(relative)}")
+    after_names = sorted(
+        (entry.name for entry in os.scandir(directory)), key=os.fsencode
+    )
+    if after_names != names or identity(os.fstat(directory)) != identity(before):
+        label = os.fsdecode(relative_bytes(parts)) or "."
+        fail(f"directory changed during read: {label}")
+
+
+try:
+    root_descriptor = os.open(root, directory_flags)
+except OSError as error:
+    fail(f"cannot safely open cache root: {error}")
+try:
+    walk(root_descriptor)
+finally:
+    os.close(root_descriptor)
+print(f"{file_count}\t{total_size}\t{digest.hexdigest()}")
 PY
 }
 
@@ -396,7 +934,7 @@ if command -v python3 >/dev/null 2>&1 \
     cat >"$DT_BIN_DIR/dt-result" <<'DT_RESULT_HELPER'
 #!/usr/bin/env bash
 exec python3 -I "$DT_PAYLOAD_DIR/result.py" \
-    --output "$DT_OUTPUT_DIR/dt/result.json" "$@"
+    --output "$DT_EVIDENCE_DIR/result.json" "$@"
 DT_RESULT_HELPER
     chmod 700 "$DT_BIN_DIR/dt-result"
 fi
@@ -499,21 +1037,54 @@ if [ "${avail_kb:-0}" -lt $((DT_DISK_GIB * 1024 * 1024)) ]; then
 fi
 
 if [ -n "$DT_CACHE_SOURCE_JOB_ID" ] && [ "$DT_CACHE_MODE" = clone ]; then
-    if ! command -v unshare >/dev/null 2>&1; then
-        log "node-unfit: unshare required for isolated cache clones"
+    for cache_clone_tool in unshare mount umount timeout; do
+        if ! command -v "$cache_clone_tool" >/dev/null 2>&1; then
+            log "node-unfit: $cache_clone_tool required for isolated cache clones"
+            exit 15
+        fi
+    done
+    # A binary's presence does not prove that this kernel/sysctl permits an
+    # unprivileged user+mount namespace. Exercise the same namespace and bind
+    # operations before copying a potentially large cache, and restore the
+    # mount inside the private namespace before accepting the node.
+    cache_probe_root=$(mktemp -d "$DT_CONTROL_DIR/tmp/.cache-ns-probe.XXXXXX") || {
+        log "node-unfit: could not create cache namespace probe"
+        exit 15
+    }
+    mkdir "$cache_probe_root/source" "$cache_probe_root/target" || {
+        rm -rf -- "$cache_probe_root"
+        log "node-unfit: could not prepare cache namespace probe"
+        exit 15
+    }
+    printf '%s\n' "dt-cache-namespace-v1" >"$cache_probe_root/source/probe"
+    if ! timeout 10s unshare --user --map-root-user --mount -- \
+        bash -c '
+            set -eu
+            source_path=$1
+            target_path=$2
+            mount --bind "$source_path" "$target_path"
+            trap '\''umount -- "$target_path" >/dev/null 2>&1 || :'\'' EXIT
+            [ "$(cat "$target_path/probe")" = dt-cache-namespace-v1 ]
+            umount -- "$target_path"
+            trap - EXIT
+            [ ! -e "$target_path/probe" ]
+        ' dt-cache-probe "$cache_probe_root/source" "$cache_probe_root/target"; then
+        rm -rf -- "$cache_probe_root"
+        log "node-unfit: user mount namespace or bind mount is unavailable"
         exit 15
     fi
+    rm -rf -- "$cache_probe_root"
     cache_clone_started_ms=$(now_ms)
     cache_source_before=$(cache_metadata_manifest "$DT_REUSE_CACHE_PATH") || {
-        log "could not inventory cache source before clone"
-        exit 16
+        log "node-unfit: cache source failed safe content inventory"
+        exit 15
     }
     cache_clone_parent="$DT_JOB_DIR/outputs/.cache"
     cache_clone_path="$cache_clone_parent/dt-clone"
     mkdir -p "$cache_clone_parent"
     cache_clone_tmp=$(mktemp -d "$cache_clone_parent/.dt-clone.XXXXXX") || {
-        log "could not create private cache clone directory"
-        exit 16
+        log "node-unfit: could not create private cache clone directory"
+        exit 15
     }
     if cp --help 2>&1 | grep -q -- "--reflink"; then
         cp -a --reflink=auto "$DT_REUSE_CACHE_PATH/." "$cache_clone_tmp/"
@@ -523,30 +1094,30 @@ if [ -n "$DT_CACHE_SOURCE_JOB_ID" ] && [ "$DT_CACHE_MODE" = clone ]; then
     cache_clone_rc=$?
     if [ "$cache_clone_rc" -ne 0 ]; then
         rm -rf -- "$cache_clone_tmp"
-        log "private cache clone failed"
-        exit 16
+        log "node-unfit: private cache clone failed"
+        exit 15
     fi
     cache_source_after=$(cache_metadata_manifest "$DT_REUSE_CACHE_PATH") || {
         rm -rf -- "$cache_clone_tmp"
-        log "could not inventory cache source after clone"
-        exit 16
+        log "node-unfit: cache source changed or became unreadable during clone"
+        exit 15
     }
     cache_clone_manifest=$(cache_metadata_manifest "$cache_clone_tmp") || {
         rm -rf -- "$cache_clone_tmp"
-        log "could not verify private cache clone"
-        exit 16
+        log "node-unfit: private cache clone failed content verification"
+        exit 15
     }
     if [ "$cache_source_before" != "$cache_source_after" ] \
        || [ "$cache_source_before" != "$cache_clone_manifest" ]; then
         rm -rf -- "$cache_clone_tmp"
-        log "cache source changed during clone or clone metadata mismatched"
-        exit 16
+        log "node-unfit: cache source changed or clone content mismatched"
+        exit 15
     fi
     rm -rf -- "$cache_clone_path"
     mv "$cache_clone_tmp" "$cache_clone_path" || {
         rm -rf -- "$cache_clone_tmp"
-        log "could not publish private cache clone"
-        exit 16
+        log "node-unfit: could not publish private cache clone"
+        exit 15
     }
     IFS=$'\t' read -r DT_CACHE_CLONE_FILES DT_CACHE_CLONE_BYTES \
         DT_CACHE_SOURCE_MANIFEST_SHA256 <<<"$cache_source_before"
@@ -711,7 +1282,7 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
         # setup.sh (optional project hook, e.g. install local libs/ packages that
         # uv.lock cannot describe) runs under the same env lock, once per env per
         # setup content (marker), never editable - the job dir is disposable.
-        if ! flock "$DT_ENVS_DIR/$lockhash.lock" \
+        if ! flock --close "$DT_ENVS_DIR/$lockhash.lock" \
         env UV_PROJECT_ENVIRONMENT="$UV_ENV" UV_SYSTEM_CERTS=1 \
             UV_PYTHON_PREFERENCE=only-managed DT_JOB_DIR="$DT_JOB_DIR" UV_BIN="$UV_BIN" \
             DT_EXTRAS="${DT_EXTRAS:-}" \
@@ -832,7 +1403,9 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
                 smark="$UV_PROJECT_ENVIRONMENT/.dt-setup-$(sha256sum "$DT_CONTROL_DIR/setup.sh" | cut -c1-8)"
                 if [ ! -f "$smark" ]; then
                     echo "[launcher] running project setup hook"
-                    "$UV_BIN" run --no-sync bash -e "$DT_CONTROL_DIR/setup.sh" || exit 1
+                    env -u DT_EVIDENCE_DIR \
+                        "$UV_BIN" run --no-sync bash -e \
+                        "$DT_CONTROL_DIR/setup.sh" || exit 1
                     touch "$smark"
                     touch "$DT_JOB_DIR/logs/.setup-ran"
                 fi
@@ -962,8 +1535,35 @@ probe_ok() {
 run_tmux_new_session() {
     # setsid/nohup/tmux detach terminals, but they do not escape the cgroup of
     # an invoking systemd service.  A transient user scope gives the dedicated
-    # tmux server an independent lifetime.  Hosts without a usable user manager
-    # retain the portable direct-tmux behavior.
+    # tmux server an independent lifetime. GPU work may start only after that
+    # exact scope is observable; CPU work retains the explicitly unproven
+    # portable fallback.
+    local load_state active_state control_group linger_state rc
+    rm -f -- "$DT_STATE_DIR/runtime_containment"
+    if [ "$DT_GPUS" -gt 0 ]; then
+        linger_state="unavailable"
+        if command -v loginctl >/dev/null 2>&1; then
+            linger_state=$(timeout 3s loginctl show-user "$(id -u)" \
+                --property=Linger --value 2>/dev/null) || linger_state="unavailable"
+        fi
+        case "$linger_state" in
+            yes) : ;;
+            no) : ;;
+            *) linger_state="unavailable" ;;
+        esac
+        dt_publish_runtime_marker \
+            "$DT_STATE_DIR/runtime_linger" "$linger_state" || return 14
+        if [ "$linger_state" != yes ]; then
+            dt_publish_runtime_marker \
+                "$DT_STATE_DIR/result_state" "infra_failure" || return 14
+            dt_publish_runtime_marker "$DT_STATE_DIR/exit_code" "15" || return 14
+            log "node-unfit: GPU runtime requires loginctl Linger=yes (observed $linger_state)"
+            return 15
+        fi
+    else
+        dt_publish_runtime_marker \
+            "$DT_STATE_DIR/runtime_linger" "not_required" || return 14
+    fi
     if command -v systemd-run >/dev/null 2>&1 \
        && command -v systemctl >/dev/null 2>&1 \
        && timeout 3s systemctl --user show-environment >/dev/null 2>&1; then
@@ -971,18 +1571,55 @@ run_tmux_new_session() {
         # the start can then fail closed if the manager becomes unreachable.
         dt_publish_runtime_marker \
             "$DT_STATE_DIR/runtime_scope" "$DT_RUNTIME_SCOPE" || return 14
-        systemd-run --user --scope --quiet \
+        dt_publish_runtime_marker \
+            "$DT_STATE_DIR/runtime_containment" \
+            "systemd_scope_pending" || return 14
+        timeout 10s systemd-run --user --scope --quiet \
             --unit="${DT_RUNTIME_SCOPE%.scope}" -- tmux "$@"
-        local rc=$?
-        if [ "$rc" -ne 0 ]; then
-            rm -f -- "$DT_STATE_DIR/runtime_scope"
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            load_state=$(timeout 3s systemctl --user show "$DT_RUNTIME_SCOPE" \
+                --property=LoadState --value 2>/dev/null) || load_state=""
+            active_state=$(timeout 3s systemctl --user show "$DT_RUNTIME_SCOPE" \
+                --property=ActiveState --value 2>/dev/null) || active_state=""
+            control_group=$(timeout 3s systemctl --user show "$DT_RUNTIME_SCOPE" \
+                --property=ControlGroup --value 2>/dev/null) || control_group=""
+            if [ "$load_state" = loaded ] \
+               && { [ "$active_state" = active ] || [ "$active_state" = activating ]; } \
+               && [[ "$control_group" == /* ]] \
+               && [[ "$control_group" == */"$DT_RUNTIME_SCOPE" ]] \
+               && [[ "/$control_group/" != */../* ]] \
+               && dt_publish_runtime_marker \
+                    "$DT_STATE_DIR/runtime_containment" \
+                    "systemd_scope_verified"; then
+                return 0
+            fi
         fi
-        return "$rc"
+        # tmux may already have forked its server, but wrapper.sh is gated on
+        # runtime_containment and therefore has not entered the user runner.
+        tmux -L "$DT_TMUX_SOCKET" kill-session -t "$DT_SESSION" 2>/dev/null || true
+        timeout 3s systemctl --user stop "$DT_RUNTIME_SCOPE" >/dev/null 2>&1 || true
+        rm -f -- "$DT_STATE_DIR/runtime_scope" \
+            "$DT_STATE_DIR/runtime_containment"
+        log "runtime scope could not be created and observed"
     fi
-    # Portable fallback remains isolated from every other tmux server, but it
-    # intentionally has no scope marker: lifecycle probes then use the legacy
-    # process-group/capsule census rather than pretending cgroup coverage.
+
+    if [ "$DT_GPUS" -gt 0 ]; then
+        # Exit 15 lets placement try another node. Persist typed evidence for
+        # postmortem/recovery without claiming a complete wrapper lifecycle.
+        dt_publish_runtime_marker \
+            "$DT_STATE_DIR/result_state" "infra_failure" || return 14
+        dt_publish_runtime_marker "$DT_STATE_DIR/exit_code" "15" || return 14
+        log "node-unfit: GPU runtime requires an observable per-job systemd scope"
+        return 15
+    fi
+
+    # Portable CPU fallback remains isolated from every other tmux server, but
+    # it intentionally has no scope marker. The explicit containment marker
+    # prevents state readers from mistaking this for a proved cgroup boundary.
     rm -f -- "$DT_STATE_DIR/runtime_scope"
+    dt_publish_runtime_marker \
+        "$DT_STATE_DIR/runtime_containment" "portable_unproven" || return 14
     tmux "$@"
 }
 
@@ -1033,9 +1670,10 @@ start_session() {
         SSL_CERT_FILE SSL_CERT_DIR REQUESTS_CA_BUNDLE CURL_CA_BUNDLE \
         TMPDIR \
         DT_ROOT DT_WORKER_ROOT DT_JOB_DIR DT_OUTPUT_DIR DT_CONTROL_DIR \
+        DT_EVIDENCE_DIR \
         DT_PAYLOAD_DIR DT_STATE_DIR DT_META_PATH DT_COMMAND_PATH \
         DT_CANCEL_PATH DT_BIN_DIR DT_CACHE_ROOT DT_RUNTIME_ROOT \
-        DT_TMUX_SOCKET DT_RUNTIME_SCOPE \
+        DT_TMUX_SOCKET DT_RUNTIME_SCOPE DT_RUNTIME_ENV_PATH \
         DT_GPU_LEASE_ROOT DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST \
         DT_PREDECESSOR_JOB_ID DT_PREDECESSOR_JOB_DIR \
         DT_PREDECESSOR_OUTPUTS DT_PREDECESSOR_META_PATH \
@@ -1047,12 +1685,9 @@ start_session() {
         CUDA_VISIBLE_DEVICES DT_GPU_IDS DT_GPUS DT_GPU_ISOLATION DT_MAX_HOURS \
         DT_MIN_VRAM_MIB \
         DT_MAX_VRAM_MIB DT_MAX_JOB_MEMORY_MIB DT_ENV_MODE DT_UV DT_UV_ENV \
-        DT_WEBHOOK DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME DT_PROXY
+        DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME
     )
     for name in "${session_env_names[@]}"; do
-        dt_append_session_env "$name"
-    done
-    for name in "${DT_CUSTOM_ENV_NAMES[@]}"; do
         dt_append_session_env "$name"
     done
     dt_shell_quote "$DT_PAYLOAD_DIR/wrapper.sh"
@@ -1060,6 +1695,17 @@ start_session() {
     DT_SESSION_COMMAND+=" >> logs/stdout.log 2>&1"
     dt_publish_runtime_marker \
         "$DT_STATE_DIR/tmux_socket" "$DT_TMUX_SOCKET" || return 14
+    # Setup has finished. The tmux/systemd processes need only the one-shot
+    # runtime-file path; never let launch tokens, proxy credentials, webhook
+    # URLs, or custom values leak into their inherited environments.
+    unset DT_PROXY DT_WEBHOOK HTTP_PROXY HTTPS_PROXY \
+          http_proxy https_proxy
+    # Environment/setup work is complete and every path used below is
+    # absolute. Leave the job capsule before starting the detached wrapper:
+    # its completion census intentionally terminates non-ancestor processes
+    # whose cwd remains inside the capsule, and the local launcher is a
+    # systemd/tmux sibling rather than a wrapper ancestor.
+    cd / || return 14
     run_tmux_new_session -L "$DT_TMUX_SOCKET" new-session -d -s "$DT_SESSION" \
         "$DT_SESSION_COMMAND" \
         \; set-option -g exit-empty on \
@@ -1073,7 +1719,7 @@ GPU_PROBE_DURATION_MS=0
 SESSION_START_DURATION_MS=0
 launch_locked() {
     local chosen=()
-    local gpu_probe_started_ms session_start_started_ms attempt idx prior
+    local gpu_probe_started_ms session_start_started_ms attempt idx prior rc
     gpu_probe_started_ms=$(now_ms)
     if [ "$DT_GPUS" -gt 0 ]; then
         local candidates candidate_rows query_rc row total free_count
@@ -1153,12 +1799,21 @@ launch_locked() {
     rm -f "$DT_STATE_DIR/pgid" "$DT_STATE_DIR/gpus" \
           "$DT_STATE_DIR/boot_id" \
           "$DT_STATE_DIR/process_start_ticks" \
+          "$DT_STATE_DIR/runtime_scope" \
+          "$DT_STATE_DIR/runtime_containment" \
+          "$DT_STATE_DIR/runtime_gpus_requested" \
+          "$DT_STATE_DIR/runtime_linger" \
+          "$DT_STATE_DIR/tmux_socket" \
           "$DT_STATE_DIR/started_at" "$DT_STATE_DIR/finished_at" \
           "$DT_STATE_DIR/exit_code" "$DT_STATE_DIR"/exit_code.tmp.* \
           "$DT_STATE_DIR/result_state" "$DT_STATE_DIR"/result_state.tmp.* \
           "$DT_STATE_DIR"/process_start_ticks.tmp.*
+    dt_publish_runtime_marker \
+        "$DT_STATE_DIR/runtime_gpus_requested" "$DT_GPUS" || return 14
     session_start_started_ms=$(now_ms)
-    start_session "$ids" || return 14
+    start_session "$ids"
+    rc=$?
+    [ "$rc" -eq 0 ] || return "$rc"
     # Close the check→start race: cancellation may land after the pre-start
     # check but before tmux becomes visible to the dispatcher's kill command.
     if cancelled; then

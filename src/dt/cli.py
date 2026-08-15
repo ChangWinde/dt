@@ -40,9 +40,12 @@ from typing import (
 )
 
 import typer
+from typer import _click as click
+from typer._click.globals import get_current_context
 from rich.markup import escape
 
 from . import custom_env as custom_env_mod
+from . import diagnose as diagnose_mod
 from . import fork_repeat as fork_repeat_mod
 from . import jobs as jobs_mod
 from . import ps_query as ps_query_mod
@@ -66,6 +69,7 @@ from .dispatch import (
     RequestOutcomeUnknown,
     RequestRejected,
     RunSpec,
+    inspect_request_remote_proof,
     preview_submission,
     reconcile_submission_request,
     require_compatible_resident_agent,
@@ -89,7 +93,7 @@ from .layout import (
     rsync_destination,
 )
 from .monitoring import AUTOMATIC_TAIL_MAX_BYTES as AUTO_LOG_TAIL_MAX_BYTES
-from .monitoring import ResourceTelemetryQuery
+from .monitoring import ResourceTelemetryQuery, TELEMETRY_TRANSPORT_CAPTURE_BYTES
 from .monitoring import parse_resource_jsonl as _parse_resource_jsonl  # noqa: F401
 from .monitoring import safe_phase_name as _safe_phase_name
 from .monitoring import summarize_resources as _summarize_resources  # noqa: F401
@@ -100,7 +104,13 @@ from .private_state import (
     atomic_write_regular,
     read_bounded_regular,
 )
-from .probe import NodeStatus, probe_center, probe_node, status_as_dict
+from .probe import (
+    INTERACTIVE_PROBE_BUDGET_S,
+    NodeStatus,
+    probe_center,
+    probe_node,
+    status_as_dict,
+)
 from .redaction import redact_home_path
 from .remote import (
     center_worker_count,
@@ -124,6 +134,7 @@ from .render import (
 )
 from . import pull_relay
 from . import sync_relay
+from . import evidence as evidence_mod
 from .sshio import (
     MAX_TRANSFER_RETRIES,
     RSYNC_RETRYABLE_EXIT_CODES,
@@ -218,12 +229,49 @@ def _typed_cli_decorator(value: object) -> Callable[[CliFunction], CliFunction]:
     return cast(Callable[[CliFunction], CliFunction], value)
 
 
+def _argv_requests_json(argv: list[str]) -> bool:
+    """Recognize DT's JSON flag without inspecting the payload after ``--``."""
+    try:
+        boundary = argv.index("--")
+    except ValueError:
+        boundary = len(argv)
+    return "--json" in argv[:boundary]
+
+
+def _json_error_requested() -> bool:
+    """Return the parsed command's JSON preference, including nested groups."""
+    context = get_current_context(silent=True)
+    while context is not None:
+        if context.params.get("json_") is True or context.params.get("json") is True:
+            return True
+        context = context.parent
+    return _argv_requests_json(sys.argv[1:])
+
+
+def _emit_cli_error(kind: str, message: str, *, exit_code: int = 1) -> None:
+    """Emit one stable machine error or a human diagnostic, never both."""
+    safe = redact_home_path(" ".join(message.split()))
+    if _json_error_requested():
+        print(
+            json.dumps(
+                {
+                    "schema_version": "dt_cli_error_v1",
+                    "error": kind,
+                    "message": safe,
+                    "exit_code": exit_code,
+                }
+            )
+        )
+    else:
+        err.print(f"[red]{escape(kind)} error:[/red] {escape(safe)}")
+
+
 def _cfg() -> HeadConfig | LaptopConfig:
     try:
         return load()
     except ConfigError as e:
         operation_log_mod.mark_problem("configuration", e)
-        err.print(f"[red]config error:[/red] {escape(str(e))}")
+        _emit_cli_error("configuration", str(e))
         raise typer.Exit(1)
 
 
@@ -723,7 +771,7 @@ def _free_scheduler_context(
 
     try:
         damage: list[jobs_mod.RegistryDamage] = []
-        entries = jobs_mod.list_all(cfg, damage=damage)
+        entries = jobs_mod.active_entries(cfg, damage=damage)
         queued = sorted(
             (entry for entry in entries if entry.status == "queued"),
             key=lambda entry: entry.created_at,
@@ -1494,7 +1542,13 @@ def free(
         if isinstance(cfg, HeadConfig):
             rows = status_as_dict(
                 cfg.center,
-                probe_center(cfg, use_cache=not (watch or fresh)),
+                probe_center(
+                    cfg,
+                    use_cache=not (watch or fresh),
+                    soft_deadline_s=(
+                        None if watch or fresh else INTERACTIVE_PROBE_BUDGET_S
+                    ),
+                ),
             )
             # A drained node still probes as free; without the marker the
             # capacity view would advertise GPUs placement refuses to use.
@@ -1560,7 +1614,17 @@ def free(
                     print(json.dumps(payload), flush=True)
                     _sleep_for_poll_interval(refresh_started, poll)
             except KeyboardInterrupt:
-                return
+                print(
+                    json.dumps(
+                        {
+                            "schema_version": "dt_stream_event_v1",
+                            "event": "interrupted",
+                            "exit_code": 130,
+                        }
+                    ),
+                    flush=True,
+                )
+                raise typer.Exit(130)
         rows, errors = gather()
         payload = (
             _free_explain_payload(rows, pin_centers=pin_centers) if explain else rows
@@ -1595,7 +1659,7 @@ def free(
                         refresh=True,
                     )
         except KeyboardInterrupt:
-            return
+            raise typer.Exit(130)
     else:
         with err.status("probing nodes..."):
             rows, errors = gather()
@@ -1696,6 +1760,7 @@ def _forward_laptop_submission(
     stdin_bytes: bytes | None = None,
 ) -> tuple[int, str | None]:
     """Forward one submission without ever retrying an ambiguous mutation."""
+    operation_log_mod.bind_identity(request_id=request_id)
     recovery_action = (
         f"Do not change the intent; retry the exact command with --request-id "
         f"{request_id!r}, or query `dt request {request_id} --json`"
@@ -1737,6 +1802,7 @@ def _forward_laptop_submission(
         )
 
     job_id, payload = _captured_submission_identity(captured, json_=json_)
+    operation_log_mod.bind_identity(request_id=request_id, job_id=job_id)
     interrupted = rc in (
         255,
         -signal.SIGINT,
@@ -2149,6 +2215,10 @@ def _submission_payload(
     entry: jobs_mod.JobEntry,
     **extra: object,
 ) -> JsonDict:
+    operation_log_mod.bind_identity(
+        request_id=entry.request_id,
+        job_id=entry.job_id,
+    )
     payload: JsonDict = {
         "schema_version": "dt_submission_v1",
         "job_id": entry.job_id,
@@ -2551,11 +2621,28 @@ def run(
             else None
         )
         if center == "auto":
-            if request_id:
+            dependency_ref = after_success or after_complete or after_result
+            if dependency_ref is not None:
+                # A dependency is owned by exactly one head.  Route the
+                # dependent submission to that same authority before doing
+                # any capacity probing; choosing an unrelated freer center
+                # would make the head-local dependency impossible to resolve.
+                center, resolved_ref = _locate(cfg, dependency_ref, json_=json_)
+                if after_success is not None:
+                    after_success = resolved_ref
+                elif after_complete is not None:
+                    after_complete = resolved_ref
+                else:
+                    after_result = resolved_ref
+                err.print(
+                    f"[dim]dependency belongs to center "
+                    f"[bold]{escape(center)}[/bold][/dim]"
+                )
+            elif request_id and not plan:
                 # Retry-safe submission stores its receipt on one chosen head.
                 # `-c auto` re-runs center selection on every attempt, so a
                 # retry can land on a different center and start a second job.
-                # Refuse the combination until a global routing receipt exists.
+                # Read-only plans create no receipt and therefore remain safe.
                 _fail_submission(
                     kind="invalid_request",
                     message=(
@@ -2566,53 +2653,59 @@ def run(
                     exit_code=2,
                     json_=json_,
                 )
-            if require_path:
+            if dependency_ref is None and require_path:
                 err.print(
                     "[red]-c auto cannot honor --require-path: data lives in one "
                     "center, pick it explicitly[/red]"
                 )
                 raise typer.Exit(1)
-            from .remote import best_center
+            if dependency_ref is None:
+                from .remote import best_center
 
-            with err.status("probing all centers..."):
-                raw_rows, errors = fan_json(cfg, ["free", "--scheduler-context"])
-                rows = cast(list[JsonDict], raw_rows)
-            picked = best_center(
-                rows,
-                gpus,
-                require_disk_gib=require_disk_gib or 0,
-                min_vram_mib=min_vram_mib,
-                node=node,
-                require_scheduling_contract=True,
-            )
-            if picked is None:
-                if errors:
-                    code = _fan_failure_exit_code(errors)
+                with err.status("probing all centers..."):
+                    raw_rows, errors = fan_json(cfg, ["free", "--scheduler-context"])
+                    rows = cast(list[JsonDict], raw_rows)
+                picked = best_center(
+                    rows,
+                    gpus,
+                    require_disk_gib=require_disk_gib or 0,
+                    min_vram_mib=min_vram_mib,
+                    node=node,
+                    require_scheduling_contract=True,
+                )
+                if picked is None:
+                    if errors:
+                        code = _fan_failure_exit_code(errors)
+                        _fail_submission(
+                            kind=(
+                                "unreachable"
+                                if code == EXIT_UNREACHABLE
+                                else "capacity_probe_failed"
+                            ),
+                            message=(
+                                "cannot select a center: every capacity probe failed"
+                                if set(errors) == set(cfg.centers)
+                                else (
+                                    "cannot select a center: some capacity probes "
+                                    "failed"
+                                )
+                            ),
+                            reasons=errors,
+                            exit_code=code,
+                            json_=json_,
+                        )
                     _fail_submission(
-                        kind=(
-                            "unreachable"
-                            if code == EXIT_UNREACHABLE
-                            else "capacity_probe_failed"
-                        ),
+                        kind="no_capacity",
                         message=(
-                            "cannot select a center: every capacity probe failed"
-                            if set(errors) == set(cfg.centers)
-                            else ("cannot select a center: some capacity probes failed")
+                            f"no reachable center has {gpus} free card(s) on one node"
                         ),
-                        reasons=errors,
-                        exit_code=code,
+                        exit_code=EXIT_NO_GPU,
                         json_=json_,
                     )
-                _fail_submission(
-                    kind="no_capacity",
-                    message=(
-                        f"no reachable center has {gpus} free card(s) on one node"
-                    ),
-                    exit_code=EXIT_NO_GPU,
-                    json_=json_,
+                err.print(
+                    f"[dim]auto-selected center [bold]{escape(picked)}[/bold][/dim]"
                 )
-            err.print(f"[dim]auto-selected center [bold]{escape(picked)}[/bold][/dim]")
-            center = picked
+                center = picked
         route = (
             _head_command(cfg, center, "run")
             .option("-g", gpus)
@@ -5150,14 +5243,31 @@ def _gather_ps_rows(
         return _limit_ps_rows(rows, limit), errors
 
     registry_damage: list[jobs_mod.RegistryDamage] = []
-    entries = jobs_mod.list_all(cfg, damage=registry_damage)
-    display_refs = jobs_mod.compact_job_refs(entries)
+    entries = (
+        jobs_mod.active_entries(cfg, damage=registry_damage)
+        if active_only
+        else jobs_mod.list_all(cfg, damage=registry_damage)
+    )
+    # A compact ref computed from only active rows could collide with terminal
+    # history that was intentionally not decoded. Full ids remain globally
+    # resolvable without making the default active view scan all history.
+    display_refs = (
+        {entry.job_id: entry.job_id for entry in entries}
+        if active_only
+        else jobs_mod.compact_job_refs(entries)
+    )
     refresh_statuses = {"running", "lost"}
     if active_only:
         refresh_statuses = {"running"}
     elif status is not None:
         refresh_statuses &= {status}
-    stale = [entry for entry in entries if entry.status in refresh_statuses]
+    refresh_now = time.time()
+    stale = [
+        entry
+        for entry in entries
+        if entry.status in refresh_statuses
+        and (entry.status != "lost" or jobs_mod.occupies_quota(entry, now=refresh_now))
+    ]
     observations: dict[str, JsonDict] = {}
     configured_nodes = {node.name: node for node in cfg.nodes}
     node_statuses: dict[str, NodeStatus] = {}
@@ -5488,10 +5598,10 @@ def _gather_laptop_ps_query(
         summary_only=summary_only,
     )
     invalid_contract_centers: list[str] = []
-    for center, payload in list(data_by_center.items()):
+    for center, center_payload in list(data_by_center.items()):
         try:
             ps_query_mod.validate_payload_contract(
-                payload,
+                center_payload,
                 center=center,
                 expected_query=expected_query,
                 expected_fields=internal_fields,
@@ -5571,12 +5681,12 @@ def _gather_laptop_ps_query(
     partial_errors: dict[str, str] = {}
     eligible = 0
     for center in cfg.centers:
-        payload = data_by_center.get(center)
-        if payload is None:
+        center_payload = data_by_center.get(center)
+        if center_payload is None:
             continue
         try:
-            payload = ps_query_mod.validate_payload_contract(
-                payload,
+            center_payload = ps_query_mod.validate_payload_contract(
+                center_payload,
                 center=center,
                 expected_query=expected_query,
                 expected_fields=internal_fields,
@@ -5585,17 +5695,31 @@ def _gather_laptop_ps_query(
         except ps_query_mod.QueryError as exc:
             fan_errors[center] = str(exc)
             continue
-        summary = payload.get("summary")
-        page = payload.get("page")
-        jobs = payload.get("jobs")
+        summary = center_payload.get("summary")
+        page = center_payload.get("page")
+        jobs = center_payload.get("jobs")
         assert isinstance(summary, dict)
         assert isinstance(page, dict)
         assert isinstance(jobs, list)
         typed_jobs = cast(list[JsonDict], jobs)
+        center_eligible = int(page["eligible"])
+        center_returned = int(page["returned"])
+        if not summary_only and center_returned != min(limit, center_eligible):
+            # A single head can safely continue its own byte-fitted page, but
+            # that prefix is not enough to form a globally ordered page.  A
+            # row omitted behind this center's last visible row may sort above
+            # another center's global cursor and then disappear forever.
+            # Isolate the center and require the caller to retry the same
+            # input cursor with a smaller projection.
+            fan_errors[center] = (
+                "head ps page reached its serialized byte budget; "
+                "retry with fewer --fields"
+            )
+            continue
         summaries.append(cast(JsonDict, summary))
         candidates.extend(typed_jobs)
-        eligible += int(page["eligible"])
-        head_errors = payload["errors"]
+        eligible += center_eligible
+        head_errors = center_payload["errors"]
         assert isinstance(head_errors, dict)
         partial_errors.update(
             {
@@ -5633,7 +5757,7 @@ def _gather_laptop_ps_query(
             order=order,
         )
     failures = ps_query_mod.bounded_errors({**partial_errors, **fan_errors})
-    payload = {
+    payload: JsonDict = {
         "schema_version": ps_query_mod.SCHEMA_VERSION,
         "generated_at": time.time(),
         "center": "all",
@@ -5651,7 +5775,10 @@ def _gather_laptop_ps_query(
         "page": {
             "eligible": eligible,
             "returned": 0 if summary_only else len(global_page.rows),
-            "next_cursor": None if summary_only else next_cursor,
+            # A global cursor is safe only when every center contributed its
+            # page. Advancing after a partial fanout can jump permanently past
+            # newer rows from a center that recovers on the next request.
+            "next_cursor": (None if summary_only or failures else next_cursor),
         },
         "jobs": (
             []
@@ -5661,6 +5788,18 @@ def _gather_laptop_ps_query(
         "partial": bool(failures),
         "errors": failures,
     }
+    if not summary_only:
+        payload = ps_query_mod.fit_payload_page(
+            payload,
+            global_page.rows,
+            selected_fields=selected_fields,
+            digest=digest,
+            order=order,
+        )
+        if failures:
+            page = payload["page"]
+            assert isinstance(page, dict)
+            page["next_cursor"] = None
     return payload, fan_errors
 
 
@@ -6119,19 +6258,27 @@ def ps(
                 )
         else:
             query_rows, query_errors = gather(include_progress=with_progress)
-            payload = ps_query_mod.build_payload(
-                query_rows,
-                center=cfg.center,
-                status=status,
-                active_only=active,
-                issues_only=issues,
-                since=parsed_since,
-                selected_fields=selected_fields,
-                limit=query_limit,
-                cursor=cursor,
-                summary_only=summary,
-                errors=query_errors,
-            )
+            try:
+                payload = ps_query_mod.build_payload(
+                    query_rows,
+                    center=cfg.center,
+                    status=status,
+                    active_only=active,
+                    issues_only=issues,
+                    since=parsed_since,
+                    selected_fields=selected_fields,
+                    limit=query_limit,
+                    cursor=cursor,
+                    summary_only=summary,
+                    errors=query_errors,
+                )
+            except ps_query_mod.QueryError as exc:
+                _fail_submission(
+                    kind="query_too_large",
+                    message=str(exc),
+                    exit_code=1,
+                    json_=True,
+                )
         print(json.dumps(payload))
         return
 
@@ -6411,7 +6558,15 @@ def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
     )
     stdout_path = f"{entry.job_dir}/{primary_relative}"
     outputs_path = f"{entry.job_dir}/outputs"
-    resources_path = f"{outputs_path}/dt/resources.jsonl"
+    control_path = job_control_dir(entry.job_dir, entry.storage_layout)
+    resources_path = f"{control_path}/evidence/resources.jsonl"
+    resource_select = f"dt_resource_path={node_path_expression(resources_path)}; "
+    if entry.storage_layout != ROLE_LAYOUT:
+        legacy_resources = f"{outputs_path}/dt/resources.jsonl"
+        resource_select += (
+            'if [ ! -f "$dt_resource_path" ]; then '
+            f"dt_resource_path={node_path_expression(legacy_resources)}; fi; "
+        )
     return (
         f"dt_stdout={node_path_expression(stdout_path)}; "
         'dt_log_source="$dt_stdout"; '
@@ -6429,7 +6584,8 @@ def _job_log_tail_command(entry: jobs_mod.JobEntry, lines: int) -> str:
         'dt_log_source="$dt_nested"; '
         'dt_log_mtime="$dt_nested_mtime"; '
         "fi; fi; "
-        f"dt_resource_sample=$(tail -n 1 -- {node_path_expression(resources_path)} "
+        f"{resource_select}"
+        'dt_resource_sample=$(tail -n 1 -- "$dt_resource_path" '
         f"2>/dev/null | tail -c {AUTO_LOG_TAIL_MAX_BYTES} || true); "
         'dt_log_display="$dt_log_source"; '
         'case "$dt_log_display" in "$HOME"/*) '
@@ -8474,7 +8630,7 @@ def _watch_snapshot(
     last_dispatch_reason = None
     if entry.status == "queued":
         if queue_context is None:
-            queue_context = jobs_mod.queue_contexts(jobs_mod.list_all(cfg)).get(
+            queue_context = jobs_mod.queue_contexts(jobs_mod.active_entries(cfg)).get(
                 entry.job_id,
                 {},
             )
@@ -8534,7 +8690,7 @@ def _watch_group_snapshot(
     compact: bool = False,
 ) -> tuple[list[jobs_mod.JobEntry], list[JsonDict]]:
     """Collect independent job frames concurrently while preserving ref order."""
-    queue_contexts = jobs_mod.queue_contexts(jobs_mod.list_all(cfg))
+    queue_contexts = jobs_mod.queue_contexts(jobs_mod.active_entries(cfg))
 
     def collect(
         entry: jobs_mod.JobEntry,
@@ -8914,7 +9070,10 @@ def _job_resource_summary(
         return None
     if result.returncode != 0:
         return None
-    return query.summarize(result.text, include_identity=False)
+    try:
+        return query.summarize(result.text, include_identity=False)
+    except ValueError:
+        return None
 
 
 def _phase_spans_for_human(
@@ -9357,7 +9516,10 @@ def _phase_summary_from_text(
         "markers": timed,
         "invalid_lines": invalid,
         "tail_limit": tail_limit,
-        "path": display_node_path(f"{entry.job_dir}/outputs/dt/phases.jsonl"),
+        "path": display_node_path(
+            f"{job_control_dir(entry.job_dir, entry.storage_layout)}"
+            "/evidence/phases.jsonl"
+        ),
     }
 
 
@@ -9400,23 +9562,47 @@ def _info_live(
     job = node_path_expression(entry.job_dir)
     state = node_path_expression(job_state_dir(entry.job_dir, entry.storage_layout))
     control = node_path_expression(job_control_dir(entry.job_dir, entry.storage_layout))
+    evidence = f"{control}/evidence"
     resource_reader = ResourceTelemetryQuery(entry, resource_tail).command(
         require_file=False
     )
     marker = f"@@DT-{os.urandom(16).hex()}@@"
+    phase_reader = (
+        f"tail -n {INFO_PHASE_TAIL} {evidence}/phases.jsonl 2>/dev/null | "
+        f"tail -c {AUTO_LOG_TAIL_MAX_BYTES} || true"
+    )
+    guard_reader = f"cat {evidence}/resource-guard.json 2>/dev/null || true"
+    containment_reader = f"head -c 64 {state}/runtime_containment 2>/dev/null || true"
+    linger_reader = f"head -c 32 {state}/runtime_linger 2>/dev/null || true"
+    if entry.storage_layout != ROLE_LAYOUT:
+        phase_reader = (
+            f"if test -f {evidence}/phases.jsonl; then {phase_reader}; "
+            f"else tail -n {INFO_PHASE_TAIL} {job}/outputs/dt/phases.jsonl "
+            f"2>/dev/null | tail -c {AUTO_LOG_TAIL_MAX_BYTES} || true; fi"
+        )
+        guard_reader = (
+            f"if test -f {evidence}/resource-guard.json; then {guard_reader}; "
+            f"else cat {job}/outputs/dt/resource-guard.json 2>/dev/null || true; fi"
+        )
     probe = (
         f"cat {state}/started_at 2>/dev/null; echo {marker}; "
         f"cat {state}/finished_at 2>/dev/null; echo {marker}; "
         f"du -sh {job}/outputs 2>/dev/null | cut -f1; echo {marker}; "
         f"test -f {control}/code_dirty.patch && echo yes; echo {marker}; "
         f"{resource_reader}; "
-        f"echo {marker}; tail -n {INFO_PHASE_TAIL} "
-        f"{job}/outputs/dt/phases.jsonl 2>/dev/null | "
-        f"tail -c {AUTO_LOG_TAIL_MAX_BYTES} || true; echo {marker}; "
-        f"cat {job}/outputs/dt/resource-guard.json 2>/dev/null || true"
+        f"echo {marker}; {phase_reader}; echo {marker}; {guard_reader}; "
+        f"echo {marker}; {containment_reader}; echo {marker}; {linger_reader}"
     )
     try:
-        proc = run_on(entry.node, entry.node_local, probe, timeout=10)
+        proc = run_on(
+            entry.node,
+            entry.node_local,
+            probe,
+            timeout=10,
+            capture_limit_bytes=(
+                TELEMETRY_TRANSPORT_CAPTURE_BYTES + 2 * AUTO_LOG_TAIL_MAX_BYTES
+            ),
+        )
         if proc.returncode != 0:
             return {"unreachable": True}
         (
@@ -9427,17 +9613,25 @@ def _info_live(
             resource_text,
             phase_text,
             guard_text,
-        ) = _parse_marked(proc.stdout or "", 7, marker=marker)
+            runtime_containment,
+            runtime_linger,
+        ) = _parse_marked(proc.stdout or "", 9, marker=marker)
         resource_guard = None
         try:
             candidate = json.loads(guard_text)
             if (
                 isinstance(candidate, dict)
                 and candidate.get("schema_version") == "dt_resource_guard_v1"
-                and candidate.get("kind") in {"max_vram_mib", "max_job_memory_mib"}
+                and candidate.get("kind")
+                in {
+                    "max_vram_mib",
+                    "max_vram_mib_observation_failure",
+                    "max_job_memory_mib",
+                }
             ):
+                evidence_mod.validate_record("resource-guard.json", candidate)
                 resource_guard = candidate
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
         return {
             "started_at": _remote_timestamp(started),
@@ -9447,6 +9641,8 @@ def _info_live(
             "resource_text": resource_text,
             "phase_text": phase_text,
             "resource_guard": resource_guard,
+            "runtime_containment": runtime_containment.strip() or None,
+            "runtime_linger": runtime_linger.strip() or None,
         }
     except Exception:
         return {"unreachable": True}
@@ -9715,10 +9911,15 @@ def info(
             duration_domain,
         )
     )
-    resource_summary = ResourceTelemetryQuery(entry, metrics_tail).summarize(
-        str(live.get("resource_text") or ""),
-        include_identity=False,
-    )
+    resource_summary_error = None
+    try:
+        resource_summary = ResourceTelemetryQuery(entry, metrics_tail).summarize(
+            str(live.get("resource_text") or ""),
+            include_identity=False,
+        )
+    except ValueError:
+        resource_summary = None
+        resource_summary_error = "invalid_telemetry_summary_envelope"
     phase_summary = _phase_summary_from_text(
         entry,
         str(live.get("phase_text") or ""),
@@ -9809,6 +10010,8 @@ def info(
         "max_vram_mib": entry.max_vram_mib,
         "max_job_memory_mib": entry.max_job_memory_mib,
         "resource_guard": live.get("resource_guard"),
+        "runtime_containment": live.get("runtime_containment"),
+        "runtime_linger": live.get("runtime_linger"),
         "require_path": entry.require_path,
         "require_disk_gib": entry.require_disk_gib,
         "pin_node": entry.pin_node,
@@ -9816,6 +10019,7 @@ def info(
         "node_unreachable": live.get("unreachable", False),
         "resources": resources,
         "resource_summary": resource_summary,
+        "resource_summary_error": resource_summary_error,
         "phase_summary": phase_summary,
         **queue_context,
     }
@@ -9913,6 +10117,10 @@ def info(
         ("session", escape(entry.session)),
         ("env", entry.env_hash or "-"),
     ]
+    if data.get("runtime_containment"):
+        rows.append(("runtime containment", str(data["runtime_containment"])))
+    if data.get("runtime_linger"):
+        rows.append(("runtime linger", str(data["runtime_linger"])))
     if cross_clock_intervals_approximate:
         rows.append(
             (
@@ -10101,7 +10309,14 @@ def info(
     if isinstance(resource_guard, dict):
         phase = resource_guard.get("phase")
         phase_text = f" during {phase}" if _safe_phase_name(phase) else ""
-        if resource_guard.get("kind") == "max_job_memory_mib":
+        if resource_guard.get("kind") == "max_vram_mib_observation_failure":
+            guard_text = (
+                "VRAM telemetry unavailable for "
+                f"{resource_guard.get('consecutive_failures')} samples: "
+                f"{escape(str(resource_guard.get('reason') or 'unknown'))}"
+                f"{phase_text}"
+            )
+        elif resource_guard.get("kind") == "max_job_memory_mib":
             guard_text = (
                 f"job {resource_guard.get('observed_metric')} used "
                 f"{resource_guard.get('observed_mib')} MiB > "
@@ -10181,6 +10396,56 @@ def info(
     for k, v in rendered_rows:
         t.add_row(k, v)
     out.print(t)
+
+
+def diagnose(
+    ref: str = REF_ARG,
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Correlate bounded job, scheduler, node, and recovery evidence."""
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref, json_=json_)
+        route = HeadCommand.start(head, "diagnose", ref).flag("--json", json_)
+        raise typer.Exit(route.invoke(forward_call))
+
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        entry = _find_or_die(cfg, ref, json_=json_)
+    operation_log_mod.bind_identity(
+        request_id=entry.request_id,
+        job_id=entry.job_id,
+    )
+
+    def read_log(
+        item: jobs_mod.JobEntry,
+        lines: int,
+    ) -> tuple[subprocess.CompletedProcess[str], str, str, str]:
+        return _read_job_log_tail(
+            item,
+            lines,
+            timeout=diagnose_mod.REMOTE_READ_TIMEOUT_S,
+        )
+
+    try:
+        payload = diagnose_mod.collect(
+            cfg,
+            entry,
+            log_reader=read_log,
+            runner=run_on,
+            node_probe=probe_node,
+            status_refresher=jobs_mod.refresh_status,
+        )
+    except ValueError as exc:
+        _fail_submission(
+            kind="diagnosis_protocol",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if json_:
+        print(diagnose_mod.dumps(payload))
+        return
+    out.print(diagnose_mod.render(payload), markup=False)
 
 
 COMPARE_CONTROLS = (
@@ -11401,7 +11666,7 @@ def metrics(
             exit_code=exit_code,
             json_=json_,
         )
-    if result.returncode != 0:
+    if result.returncode != 0 and not result.text.strip():
         _fail_submission(
             kind="not_found",
             message=(
@@ -11411,7 +11676,15 @@ def metrics(
             exit_code=EXIT_NOT_FOUND,
             json_=json_,
         )
-    summary = query.summarize(result.text, include_identity=True)
+    try:
+        summary = query.summarize(result.text, include_identity=True)
+    except ValueError:
+        _fail_submission(
+            kind="telemetry_protocol",
+            message=f"{entry.job_id} returned an invalid telemetry summary",
+            exit_code=1,
+            json_=json_,
+        )
     if summary is None:
         _fail_submission(
             kind="not_found",
@@ -11421,9 +11694,16 @@ def metrics(
         )
     if json_:
         print(json.dumps(summary))
-        return
-    out.print(_metrics_table(entry, summary))
-    if summary["invalid_lines"]:
+    else:
+        out.print(_metrics_table(entry, summary))
+    if not summary.get("complete", False):
+        if not json_:
+            err.print(
+                "[red]telemetry summary is incomplete: "
+                f"{escape(str(summary.get('omission_reason') or 'unknown'))}[/red]"
+            )
+        raise typer.Exit(1)
+    if not json_ and summary["invalid_lines"]:
         err.print(
             "[yellow]ignored "
             f"{summary['invalid_lines']} incomplete telemetry line(s)[/yellow]"
@@ -12351,8 +12631,348 @@ LITE_PULL_EXCLUDES = [
     "**/profiler/*trace.json*",
 ]
 PULL_LARGE_OUTPUT_BYTES = 1024**3
-PULL_RESERVED_EXCLUDES = ["dt/job.json", "dt/*.log"]
+PULL_RESERVED_EXCLUDES = ["/dt/"]
 PULL_LOG_RESERVED_EXCLUDES = ["job.json", "resources.jsonl"]
+PULL_EVIDENCE_SCHEMAS = {
+    "result.json": frozenset({"dt_result_v1"}),
+    "resource-guard.json": frozenset({"dt_resource_guard_v1"}),
+    "cache-reuse.json": frozenset({"dt_cache_reuse_v1", "dt_cache_reuse_v2"}),
+    "lifecycle.jsonl": frozenset({"dt_lifecycle_v1"}),
+    "resources.jsonl": frozenset({"dt_resource_v1"}),
+    "phases.jsonl": frozenset({"dt_phase_v1"}),
+}
+PULL_LOG_RECORDS = frozenset({"stdout.log", "env.log", "telemetry.log"})
+PULL_EVIDENCE_JSON_MAX_BYTES = 1024 * 1024
+PULL_EVIDENCE_LINE_MAX_BYTES = 1024 * 1024
+PULL_EVIDENCE_FILE_MAX_BYTES = 4 * 1024**3
+PULL_EVIDENCE_MARK = "@@DT_EVIDENCE_V1@@"
+
+
+def _reject_symlink_ancestors(path: Path) -> None:
+    """Reject an existing symlink/non-directory anywhere above a pull root."""
+    absolute = path.absolute()
+    chain = [absolute, *absolute.parents]
+    for candidate in reversed(chain):
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise ValueError(
+                f"cannot inspect pull destination {candidate}: {exc}"
+            ) from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError(
+                f"pull destination traverses symbolic link {candidate}; "
+                "use its resolved path explicitly"
+            )
+        if candidate != absolute and not stat.S_ISDIR(info.st_mode):
+            raise ValueError(
+                f"pull destination ancestor {candidate} is not a directory"
+            )
+
+
+def _pull_evidence_probe(entry: jobs_mod.JobEntry) -> str:
+    control = job_control_dir(entry.job_dir, entry.storage_layout)
+    primary = node_path_expression(f"{control}/evidence")
+    selection = f"dt_evidence={primary}; dt_evidence_kind=control; "
+    if entry.storage_layout != ROLE_LAYOUT:
+        legacy = node_path_expression(f"{entry.job_dir}/outputs/dt")
+        selection += (
+            'if [ ! -d "$dt_evidence" ]; then '
+            f"dt_evidence={legacy}; dt_evidence_kind=legacy_unisolated; fi; "
+        )
+    names = " ".join(shlex.quote(name) for name in PULL_EVIDENCE_SCHEMAS)
+    return (
+        f"{selection}"
+        'if [ ! -e "$dt_evidence" ]; then exit 0; fi; '
+        'if [ -L "$dt_evidence" ] || [ ! -d "$dt_evidence" ]; then exit 70; fi; '
+        f"printf '%s\\t%s\\n' {shlex.quote(PULL_EVIDENCE_MARK)} "
+        '"$dt_evidence_kind"; '
+        f'for dt_name in {names}; do dt_path="$dt_evidence/$dt_name"; '
+        'if [ -e "$dt_path" ] || [ -L "$dt_path" ]; then '
+        'if [ -L "$dt_path" ] || [ ! -f "$dt_path" ]; then exit 70; fi; '
+        "printf '%s\\n' \"$dt_name\"; fi; done"
+    )
+
+
+def _parse_pulled_evidence_probe(text: str) -> tuple[str | None, list[str]]:
+    lines = text.splitlines()
+    if not lines:
+        return None, []
+    marker, separator, kind = lines[0].partition("\t")
+    if (
+        marker != PULL_EVIDENCE_MARK
+        or not separator
+        or kind
+        not in {
+            "control",
+            "legacy_unisolated",
+        }
+    ):
+        raise ValueError("invalid runtime evidence inventory")
+    names = lines[1:]
+    if len(names) != len(set(names)) or any(
+        name not in PULL_EVIDENCE_SCHEMAS for name in names
+    ):
+        raise ValueError("runtime evidence inventory contains an unknown record")
+    return kind, names
+
+
+def _reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"non-finite JSON number {value!r}")
+
+
+def _reject_duplicate_json_fields(
+    pairs: list[tuple[str, object]],
+) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON field {key!r}")
+        value[key] = item
+    return value
+
+
+def _strict_json_record(raw: bytes) -> object:
+    return json.loads(
+        raw,
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_reject_duplicate_json_fields,
+    )
+
+
+def _bounded_evidence_text(
+    value: object,
+    *,
+    field: str,
+    max_bytes: int = 4096,
+) -> str:
+    try:
+        encoded_size = len(value.encode("utf-8")) if isinstance(value, str) else -1
+    except UnicodeEncodeError as exc:
+        raise ValueError(
+            f"pulled evidence cache-reuse.json has invalid {field}"
+        ) from exc
+    if (
+        not isinstance(value, str)
+        or not value
+        or encoded_size > max_bytes
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError(f"pulled evidence cache-reuse.json has invalid {field}")
+    return value
+
+
+def _cache_output_path(value: object, *, field: str) -> str:
+    text = _bounded_evidence_text(value, field=field)
+    path = PurePosixPath(text)
+    if (
+        path.is_absolute()
+        or len(path.parts) < 2
+        or path.parts[0] != "outputs"
+        or ".." in path.parts
+        or str(path) != text
+    ):
+        raise ValueError(f"pulled evidence cache-reuse.json has invalid {field}")
+    return text
+
+
+def _cache_reuse_common_fields(value: JsonDict) -> None:
+    source_job_id = _bounded_evidence_text(
+        value.get("source_job_id"),
+        field="source_job_id",
+        max_bytes=jobs_mod.MAX_JOB_ID_LENGTH,
+    )
+    if jobs_mod.JOB_ID_RE.fullmatch(source_job_id) is None:
+        raise ValueError("pulled evidence cache-reuse.json has invalid source_job_id")
+    _cache_output_path(value.get("source_path"), field="source_path")
+    env_var = _bounded_evidence_text(
+        value.get("env_var"),
+        field="env_var",
+        max_bytes=256,
+    )
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", env_var) is None:
+        raise ValueError("pulled evidence cache-reuse.json has invalid env_var")
+    source_env_hash = value.get("source_env_hash")
+    if (
+        not isinstance(source_env_hash, str)
+        or jobs_mod.ENV_HASH_RE.fullmatch(source_env_hash) is None
+    ):
+        raise ValueError("pulled evidence cache-reuse.json has invalid source_env_hash")
+    source_snapshot = value.get("source_snapshot_sha256")
+    if (
+        not isinstance(source_snapshot, str)
+        or jobs_mod.SHA256_RE.fullmatch(source_snapshot) is None
+    ):
+        raise ValueError(
+            "pulled evidence cache-reuse.json has invalid source_snapshot_sha256"
+        )
+
+
+def _bounded_evidence_count(value: object, *, field: str) -> int:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        or value > 2**63 - 1
+    ):
+        raise ValueError(f"pulled evidence cache-reuse.json has invalid {field}")
+    return value
+
+
+def _validate_cache_reuse_evidence(value: JsonDict) -> None:
+    """Validate complete v1/shared and v2/private-clone receipt contracts."""
+    schema = value.get("schema_version")
+    common_fields = {
+        "schema_version",
+        "source_job_id",
+        "source_path",
+        "env_var",
+        "source_env_hash",
+        "source_snapshot_sha256",
+    }
+    if schema == "dt_cache_reuse_v1":
+        if set(value) != common_fields:
+            raise ValueError(
+                "pulled evidence cache-reuse.json has incomplete v1 fields"
+            )
+        _cache_reuse_common_fields(value)
+        return
+    v2_fields = common_fields | {
+        "mode",
+        "runtime_path",
+        "source_metadata_sha256",
+        "isolation",
+        "clone",
+    }
+    if schema != "dt_cache_reuse_v2" or set(value) != v2_fields:
+        raise ValueError("pulled evidence cache-reuse.json has incompatible schema")
+    _cache_reuse_common_fields(value)
+    if value.get("mode") != "clone":
+        raise ValueError("pulled evidence cache-reuse.json has invalid mode")
+    _cache_output_path(value.get("runtime_path"), field="runtime_path")
+    metadata_sha256 = value.get("source_metadata_sha256")
+    if (
+        not isinstance(metadata_sha256, str)
+        or jobs_mod.SHA256_RE.fullmatch(metadata_sha256) is None
+    ):
+        raise ValueError(
+            "pulled evidence cache-reuse.json has invalid source_metadata_sha256"
+        )
+    isolation = value.get("isolation")
+    if not isinstance(isolation, dict) or set(isolation) != {"kind", "source_path"}:
+        raise ValueError(
+            "pulled evidence cache-reuse.json has invalid isolation fields"
+        )
+    if isolation.get("kind") != "private_mount_namespace":
+        raise ValueError("pulled evidence cache-reuse.json has invalid isolation kind")
+    isolation_source = _bounded_evidence_text(
+        isolation.get("source_path"),
+        field="isolation.source_path",
+        max_bytes=16 * 1024,
+    )
+    isolation_path = PurePosixPath(isolation_source)
+    if (
+        not isolation_path.is_absolute()
+        or ".." in isolation_path.parts
+        or str(isolation_path) != isolation_source
+    ):
+        raise ValueError(
+            "pulled evidence cache-reuse.json has invalid isolation.source_path"
+        )
+    clone = value.get("clone")
+    if not isinstance(clone, dict) or set(clone) != {"files", "bytes", "duration_ms"}:
+        raise ValueError("pulled evidence cache-reuse.json has invalid clone fields")
+    for field in ("files", "bytes", "duration_ms"):
+        _bounded_evidence_count(clone.get(field), field=f"clone.{field}")
+
+
+def _validate_pulled_evidence(path: Path, name: str) -> None:
+    """Validate one materialized DT evidence file before claiming provenance."""
+    expected_schemas = PULL_EVIDENCE_SCHEMAS[name]
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"pulled evidence {name} is not a regular file")
+    if info.st_size > PULL_EVIDENCE_FILE_MAX_BYTES:
+        raise ValueError(f"pulled evidence {name} exceeds the 4 GiB limit")
+    if name.endswith(".json"):
+        if info.st_size > PULL_EVIDENCE_JSON_MAX_BYTES:
+            raise ValueError(f"pulled evidence {name} exceeds the 1 MiB record limit")
+        raw = path.read_bytes()
+        value = _strict_json_record(raw)
+        if not isinstance(value, dict) or value.get("schema_version") not in (
+            expected_schemas
+        ):
+            raise ValueError(f"pulled evidence {name} has an incompatible schema")
+        if name == "cache-reuse.json":
+            _validate_cache_reuse_evidence(value)
+        else:
+            evidence_mod.validate_record(name, value)
+        return
+    with path.open("rb") as stream:
+        number = 0
+        while True:
+            line = stream.readline(PULL_EVIDENCE_LINE_MAX_BYTES + 1)
+            if not line:
+                break
+            number += 1
+            if len(line) > PULL_EVIDENCE_LINE_MAX_BYTES:
+                raise ValueError(f"pulled evidence {name} line {number} exceeds 1 MiB")
+            value = _strict_json_record(line)
+            if not isinstance(value, dict) or value.get("schema_version") not in (
+                expected_schemas
+            ):
+                raise ValueError(
+                    f"pulled evidence {name} line {number} has an incompatible schema"
+                )
+            evidence_mod.validate_record(name, value)
+
+
+def _rsync_skipped_non_regular(proc: subprocess.CompletedProcess[str]) -> bool:
+    diagnostic = f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    return "skipping non-regular file" in diagnostic
+
+
+def _validate_materialized_pull_tree(root: Path) -> None:
+    """Accept only directories, regular files, and links confined to ``root``."""
+    boundary = root.resolve(strict=True)
+    pending = [root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except OSError as exc:
+            raise ValueError(
+                f"cannot inspect recovered path {directory}: {exc}"
+            ) from exc
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                if entry.is_symlink():
+                    target = Path(os.readlink(path))
+                    if target.is_absolute():
+                        raise ValueError(
+                            f"recovered link {path} has an absolute target"
+                        )
+                    resolved = (path.parent / target).resolve(strict=False)
+                    if not resolved.is_relative_to(boundary):
+                        raise ValueError(
+                            f"recovered link {path} escapes the result root"
+                        )
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                    continue
+                if entry.is_file(follow_symlinks=False):
+                    continue
+            except OSError as exc:
+                raise ValueError(
+                    f"cannot inspect recovered path {path}: {exc}"
+                ) from exc
+            raise ValueError(
+                f"recovered path {path} is not a regular file or directory"
+            )
 
 
 def _rsync_retry_observer(
@@ -12646,6 +13266,18 @@ def _pull_unlocked(
             else cfg.job_results_dir(entry.job_id)
         )
     ).absolute()
+    try:
+        _reject_symlink_ancestors(dst)
+    except ValueError as exc:
+        fail(
+            "destination_conflict",
+            str(exc),
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+            existing_job_id=None,
+        )
     if dst.is_symlink():
         fail(
             "destination_conflict",
@@ -12661,7 +13293,7 @@ def _pull_unlocked(
         existing_records_info = records_dir.lstat()
     except FileNotFoundError:
         existing_records_info = None
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         fail(
             "destination_conflict",
             f"cannot inspect {records_dir}: {exc}",
@@ -12704,17 +13336,20 @@ def _pull_unlocked(
                 )
                 if existing_result is None:
                     raise PrivateStateError("local job record disappeared")
-                existing_data = json.loads(existing_result[0])
+                existing_data = _strict_json_record(existing_result[0])
                 existing_job_id = (
                     existing_data.get("job_id")
                     if isinstance(existing_data, dict)
+                    and isinstance(existing_data.get("job_id"), str)
+                    and jobs_mod.JOB_ID_RE.fullmatch(existing_data["job_id"])
                     else None
                 )
             except (
                 PrivateStateError,
                 TypeError,
                 UnicodeError,
-                json.JSONDecodeError,
+                ValueError,
+                RecursionError,
             ):
                 existing_job_id = None
             if existing_job_id != entry.job_id:
@@ -12825,7 +13460,8 @@ def _pull_unlocked(
     try:
         dst.mkdir(parents=True, exist_ok=True)
         records_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
+        _reject_symlink_ancestors(dst)
+    except (OSError, ValueError) as exc:
         fail(
             "destination_unusable",
             f"cannot create local destination {dst}: {exc}",
@@ -12874,6 +13510,8 @@ def _pull_unlocked(
             destination=str(dst),
         )
     records = ["dt/job.json"]
+    evidence_records: list[str] = []
+    evidence_provenance: str | None = None
     cancel_kwargs: _RsyncCancelKwargs = (
         {"cancel_event": _cancel_event} if _cancel_event is not None else {}
     )
@@ -12881,11 +13519,6 @@ def _pull_unlocked(
     def confirmed_records(*, logs_recovered: bool = False) -> list[str]:
         """Inventory reserved top-level run records already present locally."""
         paths = ["dt/job.json"]
-        stdout_record = records_dir / "stdout.log"
-        if stdout_record.is_file() or (logs_recovered and outputs_present):
-            # A launched job always has stdout.log. The fallback keeps
-            # mocked/legacy pull behavior stable after a successful logs rsync.
-            paths.append("dt/stdout.log")
         try:
             record_files = sorted(records_dir.iterdir())
         except OSError as exc:
@@ -12897,11 +13530,16 @@ def _pull_unlocked(
                 node=entry.node,
                 destination=str(dst),
             )
-        paths.extend(
-            f"dt/{path.name}"
-            for path in record_files
-            if path.is_file() and path.name not in {"job.json", "stdout.log"}
-        )
+        for path in record_files:
+            if path.name not in PULL_LOG_RECORDS:
+                continue
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                paths.append(f"dt/{path.name}")
+        paths.extend(f"dt/{name}" for name in evidence_records)
         return paths
 
     pull_route = pull_relay.decide_pull_route(
@@ -13115,6 +13753,30 @@ def _pull_unlocked(
                 "[dim]partial data (if any) is kept; rerun dt pull to resume[/dim]"
             )
             raise typer.Exit(code)
+        if _rsync_skipped_non_regular(proc):
+            fail(
+                "unsafe_output",
+                "outputs contain a special file that DT refused to materialize",
+                1,
+                job_id=entry.job_id,
+                node=entry.node,
+                destination=str(dst),
+                records=confirmed_records(),
+                partial=True,
+            )
+        try:
+            _validate_materialized_pull_tree(dst)
+        except (OSError, ValueError) as exc:
+            fail(
+                "unsafe_output",
+                str(exc),
+                1,
+                job_id=entry.job_id,
+                node=entry.node,
+                destination=str(dst),
+                records=confirmed_records(),
+                partial=True,
+            )
     else:
         if not json_:
             err.print(
@@ -13186,6 +13848,161 @@ def _pull_unlocked(
             "rerun dt pull to resume[/dim]"
         )
         raise typer.Exit(code)
+    if _rsync_skipped_non_regular(logs_proc):
+        fail(
+            "unsafe_evidence",
+            "run logs contain a special file that DT refused to materialize",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+            records=confirmed_records(logs_recovered=True),
+            partial=True,
+        )
+
+    try:
+        evidence_probe = run_on(
+            entry.node,
+            entry.node_local,
+            _pull_evidence_probe(entry),
+            timeout=10,
+            cancel_event=_cancel_event,
+        )
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        detail = " ".join(str(exc).split()) or type(exc).__name__
+        fail(
+            "unreachable",
+            f"cannot inventory runtime evidence on {entry.node}: {detail}",
+            EXIT_UNREACHABLE,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+            records=confirmed_records(logs_recovered=True),
+            partial=True,
+        )
+    if evidence_probe.returncode != 0:
+        detail = " ".join(
+            (
+                evidence_probe.stderr
+                or evidence_probe.stdout
+                or f"evidence probe exited {evidence_probe.returncode}"
+            ).split()
+        )
+        fail(
+            (
+                "unreachable"
+                if evidence_probe.returncode == 255
+                else "evidence_unusable"
+            ),
+            f"cannot inventory runtime evidence on {entry.node}: {detail}",
+            (EXIT_UNREACHABLE if evidence_probe.returncode == 255 else 1),
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+            records=confirmed_records(logs_recovered=True),
+            partial=True,
+        )
+    try:
+        evidence_kind, evidence_names = _parse_pulled_evidence_probe(
+            evidence_probe.stdout or ""
+        )
+        evidence_provenance = (
+            "control_path" if evidence_kind == "control" else evidence_kind
+        )
+    except ValueError as exc:
+        fail(
+            "evidence_protocol",
+            str(exc),
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+            records=confirmed_records(logs_recovered=True),
+            partial=True,
+        )
+    if evidence_provenance is not None:
+        evidence_root = (
+            f"{job_control_dir(entry.job_dir, entry.storage_layout)}/evidence"
+            if evidence_provenance == "control_path"
+            else f"{entry.job_dir}/outputs/dt"
+        )
+        for evidence_name in evidence_names:
+            evidence_source = rsync_destination(
+                entry.node,
+                entry.node_local,
+                f"{evidence_root}/{evidence_name}",
+                directory=False,
+            )
+            evidence_destination = records_dir / evidence_name
+            evidence_proc = rsync(
+                evidence_source,
+                str(evidence_destination),
+                timeout=4 * 3600,
+                retries=retries,
+                safe_links=True,
+                private_destination=True,
+                bwlimit_kbps=effective_bwlimit,
+                on_retry=_rsync_retry_observer(ref, "run_evidence", retry_events),
+                **cancel_kwargs,
+            )
+            if evidence_proc.returncode != 0:
+                detail = (
+                    evidence_proc.stderr
+                    or f"evidence rsync exited {evidence_proc.returncode}"
+                ).strip()
+                fail(
+                    "evidence_transfer_failed",
+                    f"cannot recover {evidence_name}: {detail}",
+                    (
+                        EXIT_UNREACHABLE
+                        if evidence_proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES
+                        else 1
+                    ),
+                    job_id=entry.job_id,
+                    node=entry.node,
+                    destination=str(dst),
+                    records=confirmed_records(logs_recovered=True),
+                    partial=True,
+                )
+            if _rsync_skipped_non_regular(evidence_proc):
+                fail(
+                    "unsafe_evidence",
+                    f"runtime evidence {evidence_name} is not a regular file",
+                    1,
+                    job_id=entry.job_id,
+                    node=entry.node,
+                    destination=str(dst),
+                    records=confirmed_records(logs_recovered=True),
+                    partial=True,
+                )
+            try:
+                _validate_pulled_evidence(evidence_destination, evidence_name)
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                fail(
+                    "evidence_invalid",
+                    f"recovered {evidence_name} failed validation: {exc}",
+                    1,
+                    job_id=entry.job_id,
+                    node=entry.node,
+                    destination=str(dst),
+                    records=confirmed_records(logs_recovered=True),
+                    partial=True,
+                )
+            evidence_records.append(evidence_name)
+
+    try:
+        _validate_materialized_pull_tree(dst)
+    except (OSError, ValueError) as exc:
+        fail(
+            "unsafe_output",
+            str(exc),
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+            destination=str(dst),
+            records=confirmed_records(logs_recovered=True),
+            partial=True,
+        )
 
     records = confirmed_records(logs_recovered=True)
     payload = {
@@ -13213,7 +14030,8 @@ def _pull_unlocked(
             else {}
         ),
         "application_outputs_recovered": outputs_present,
-        "records_scope": "dt_reserved",
+        "records_scope": "dt_control_allowlist",
+        "evidence_provenance": evidence_provenance,
         **({"outputs_present": False} if not outputs_present else {}),
         **({"retry_events": retry_events} if retry_events else {}),
         "records": records,
@@ -14219,10 +15037,10 @@ def _managed_result_evidence(root: Path, result_dir: Path) -> _ManagedResult:
     )
     if record_result is None:
         raise PrivateStateError("managed result record disappeared")
-    payload = json.loads(record_result[0])
+    payload = _strict_json_record(record_result[0])
     job_id = payload.get("job_id") if isinstance(payload, dict) else None
-    if not isinstance(job_id, str):
-        raise PrivateStateError(f"managed result record has no job_id: {record}")
+    if not isinstance(job_id, str) or jobs_mod.JOB_ID_RE.fullmatch(job_id) is None:
+        raise PrivateStateError(f"managed result record has no valid job_id: {record}")
     final_info = result_dir.lstat()
     if (
         not stat.S_ISDIR(final_info.st_mode)
@@ -14268,8 +15086,8 @@ def _owned_managed_results(
 
 
 def clean(
-    before: str = typer.Option(
-        ..., "--before", help="YYYY-MM-DD; delete finished jobs older than this"
+    before: Optional[str] = typer.Option(
+        None, "--before", help="YYYY-MM-DD; delete finished jobs older than this"
     ),
     center: Optional[str] = typer.Option(
         None, "-c", "--center", help="(laptop) clean one center"
@@ -14307,6 +15125,26 @@ def clean(
         "--plan",
         help="preview eligible jobs and managed results without deleting anything",
     ),
+    apply_plan: Optional[str] = typer.Option(
+        None,
+        "--apply-plan",
+        help="apply one unexpired exact candidate plan created by --plan",
+    ),
+    inspect_plan: Optional[str] = typer.Option(
+        None,
+        "--inspect-plan",
+        help="inspect one durable plan without changing its authorization",
+    ),
+    offset: Optional[int] = typer.Option(
+        None,
+        "--offset",
+        help="first authorization identity returned by --inspect-plan",
+    ),
+    limit: Optional[int] = typer.Option(
+        None,
+        "--limit",
+        help="maximum authorization identities returned by --inspect-plan",
+    ),
     json_: bool = typer.Option(
         False,
         "--json",
@@ -14315,7 +15153,54 @@ def clean(
     yes: bool = typer.Option(False, "-y", "--yes"),
 ) -> None:
     """Delete old job snapshots + logs on nodes and their registry entries."""
-    if json_ and not plan and not yes:
+    selected_plan_modes = (
+        int(plan) + int(apply_plan is not None) + int(inspect_plan is not None)
+    )
+    if selected_plan_modes > 1:
+        _fail_submission(
+            kind="invalid_argument",
+            message="use only one of --plan, --inspect-plan, or --apply-plan",
+            exit_code=1,
+            json_=json_,
+        )
+    if (plan or apply_plan is not None or inspect_plan is not None) and (
+        envs or deployments
+    ):
+        _fail_submission(
+            kind="unsupported_plan_scope",
+            message=(
+                "durable clean plans currently authorize jobs and managed results; "
+                "environment and deployment sweeps require an immediate confirmation"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    if (apply_plan is not None or inspect_plan is not None) and any(
+        (before is not None, bool(project), results)
+    ):
+        _fail_submission(
+            kind="invalid_argument",
+            message="a stored plan restores its recorded scope; do not repeat scope options",
+            exit_code=1,
+            json_=json_,
+        )
+    if inspect_plan is None and (offset is not None or limit is not None):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--offset and --limit are read-only --inspect-plan options",
+            exit_code=1,
+            json_=json_,
+        )
+    if apply_plan is None and inspect_plan is None and before is None:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "clean requires --before unless --inspect-plan or --apply-plan is used"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    if json_ and not plan and inspect_plan is None and not yes:
         _fail_submission(
             kind="confirmation_required",
             message="clean --json requires -y (or --plan)",
@@ -14352,6 +15237,10 @@ def clean(
             + (["--deployments"] if deployments else [])
             + (["--results"] if results else [])
             + (["--plan"] if plan else [])
+            + (["--apply-plan", apply_plan] if apply_plan is not None else [])
+            + (["--inspect-plan", inspect_plan] if inspect_plan is not None else [])
+            + (["--offset", str(offset)] if offset is not None else [])
+            + (["--limit", str(limit)] if limit is not None else [])
             + (["--json"] if json_ else [])
             + (["-y"] if yes else [])
         )
@@ -14367,71 +15256,251 @@ def clean(
         )
         for target_center, head in targets:
             err.print(f"[dim]cleaning {escape(target_center)}[/dim]")
-            rc |= forward_call(
-                head, ["clean", "--before", before, *argv_tail], tty=not yes
-            )
+            forwarded = ["clean"]
+            if before is not None:
+                forwarded += ["--before", before]
+            rc |= forward_call(head, [*forwarded, *argv_tail], tty=not (yes or json_))
         raise typer.Exit(rc)
 
     if center is not None or all_centers:
         err.print("[red]--center and --all-centers are laptop-only options[/red]")
         raise typer.Exit(1)
-    try:
-        cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
-    except ValueError:
-        _fail_submission(
-            kind="invalid_argument",
-            message=f"invalid --before {before!r}; expected a real YYYY-MM-DD date",
-            exit_code=1,
-            json_=json_,
-        )
     from .dispatch import clean_job_victims, clean_jobs
+    from .maintenance import (
+        CleanAuthorization,
+        CleanPlan,
+        CleanPlanError,
+        DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
+        MAX_CLEAN_PLAN_PAGE_BYTES,
+        clean_plan_page,
+        create_clean_plan,
+        load_clean_plan,
+    )
+
+    def plan_page_payload(
+        durable_plan: CleanPlan,
+        *,
+        page_offset: int,
+        page_limit: int,
+    ) -> JsonDict:
+        page = clean_plan_page(
+            durable_plan,
+            offset=page_offset,
+            limit=page_limit,
+        )
+        jobs: list[JsonDict] = []
+        managed: list[JsonDict] = []
+        for item in page.items:
+            rendered = {"index": item.index, "kind": item.kind, **item.identity}
+            if item.kind == "job":
+                job_dir = rendered.get("job_dir")
+                if isinstance(job_dir, str):
+                    rendered["job_dir"] = redact_home_path(job_dir)
+                jobs.append(rendered)
+            else:
+                path = rendered.get("path")
+                if isinstance(path, str):
+                    rendered["path"] = redact_home_path(path)
+                managed.append(rendered)
+        return {
+            "schema_version": "dt_clean_v1",
+            "plan_id": durable_plan.plan_id,
+            "expires_at": durable_plan.expires_at,
+            "eligible_jobs": len(durable_plan.jobs),
+            "managed_results_count": page.total - len(durable_plan.jobs),
+            "page": {
+                "offset": page.offset,
+                "limit": page.limit,
+                "returned": len(page.items),
+                "total": page.total,
+                "next_offset": page.next_offset,
+            },
+            "jobs": jobs,
+            "managed_results": managed,
+            "exit_code": 0,
+        }
+
+    if inspect_plan is not None:
+        try:
+            durable_plan = load_clean_plan(cfg, inspect_plan)
+            payload = plan_page_payload(
+                durable_plan,
+                page_offset=0 if offset is None else offset,
+                page_limit=(DEFAULT_CLEAN_PLAN_PAGE_ITEMS if limit is None else limit),
+            )
+        except CleanPlanError as exc:
+            _fail_submission(
+                kind="clean_plan_invalid",
+                message=str(exc),
+                exit_code=1,
+                json_=json_,
+            )
+        payload["mode"] = "inspect"
+        if json_:
+            encoded = json.dumps(payload)
+            if len(encoded.encode("utf-8")) > MAX_CLEAN_PLAN_PAGE_BYTES:
+                _fail_submission(
+                    kind="clean_plan_invalid",
+                    message="cleanup plan page exceeds its response size limit",
+                    exit_code=1,
+                    json_=True,
+                )
+            print(encoded)
+            return
+        page_data = payload["page"]
+        assert isinstance(page_data, dict)
+        err.print(
+            f"plan {inspect_plan}: {page_data['total']} authorization identities · "
+            f"offset {page_data['offset']} · returned {page_data['returned']}"
+        )
+        preview_limit = 20
+        rendered_items = [*payload["jobs"], *payload["managed_results"]]
+        for item in rendered_items[:preview_limit]:
+            assert isinstance(item, dict)
+            identity = item.get("job_id", "-")
+            detail = item.get("path", item.get("job_dir", ""))
+            err.print(
+                f"[dim]{escape(str(item.get('kind')))} {escape(str(identity))} · "
+                f"{escape(diagnostic_excerpt(str(detail), limit=300))}[/dim]"
+            )
+        omitted = len(rendered_items) - preview_limit
+        if omitted > 0:
+            err.print(f"[dim]... {omitted} more identities in this page[/dim]")
+        if page_data["next_offset"] is not None:
+            err.print(
+                "[dim]next: dt clean --inspect-plan "
+                f"{escape(inspect_plan)} --offset {page_data['next_offset']}[/dim]"
+            )
+        return
 
     projects = set(project) if project else None
-    victims = clean_job_victims(cfg, cutoff, projects=projects)
-    managed_results = (
-        _owned_managed_results(cfg, {entry.job_id for entry in victims})
-        if results
-        else []
-    )
+    preview_victims: list[jobs_mod.JobEntry] = []
+    if apply_plan is not None:
+        try:
+            durable_plan = load_clean_plan(cfg, apply_plan)
+            scope = durable_plan.managed_identity
+            scope_before = scope.get("before")
+            scope_cutoff = scope.get("cutoff_ts")
+            scope_projects = scope.get("projects")
+            scope_results = scope.get("results")
+            raw_results = scope.get("managed_results")
+            if (
+                not isinstance(scope_before, str)
+                or isinstance(scope_cutoff, bool)
+                or not isinstance(scope_cutoff, (int, float))
+                or scope_projects is not None
+                and (
+                    not isinstance(scope_projects, list)
+                    or any(not isinstance(item, str) for item in scope_projects)
+                )
+                or not isinstance(scope_results, bool)
+                or not isinstance(raw_results, list)
+            ):
+                raise CleanPlanError("cleanup plan scope is invalid")
+            before = scope_before
+            cutoff = float(scope_cutoff)
+            projects = set(scope_projects) if scope_projects is not None else None
+            results = scope_results
+            victims: list[jobs_mod.JobEntry | CleanAuthorization] = list(
+                durable_plan.jobs
+            )
+            managed_results = []
+            result_root = cfg.results_dir().resolve(strict=False)
+            for item in durable_plan.managed_results:
+                result_path = Path(item.path)
+                if (
+                    not result_path.is_absolute()
+                    or result_path == result_root
+                    or result_path != result_path.resolve(strict=False)
+                    or not result_path.is_relative_to(result_root)
+                ):
+                    raise CleanPlanError("cleanup plan result path is unmanaged")
+                managed_results.append(
+                    _ManagedResult(item.job_id, result_path, item.device, item.inode)
+                )
+        except CleanPlanError as exc:
+            _fail_submission(
+                kind="clean_plan_invalid",
+                message=str(exc),
+                exit_code=1,
+                json_=json_,
+            )
+    else:
+        assert before is not None
+        try:
+            cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
+        except ValueError:
+            _fail_submission(
+                kind="invalid_argument",
+                message=f"invalid --before {before!r}; expected a real YYYY-MM-DD date",
+                exit_code=1,
+                json_=json_,
+            )
+        preview_victims = clean_job_victims(cfg, cutoff, projects=projects)
+        victims = list(preview_victims)
+        managed_results = (
+            _owned_managed_results(cfg, {entry.job_id for entry in victims})
+            if results
+            else []
+        )
     n_victims = len(victims)
     if plan:
-        if json_:
-            print(
-                json.dumps(
-                    {
-                        "schema_version": "dt_clean_v1",
-                        "mode": "plan",
-                        "before": before,
-                        "projects": (
-                            sorted(projects) if projects is not None else None
-                        ),
-                        "eligible_jobs": n_victims,
-                        "jobs": [
-                            {
-                                "job_id": entry.job_id,
-                                "status": entry.status,
-                                "node": entry.node,
-                                "finished_at": entry.finished_at,
-                            }
-                            for entry in victims
-                        ],
-                        "managed_results": [
-                            {
-                                "job_id": managed_result.job_id,
-                                "path": redact_home_path(str(managed_result.path)),
-                            }
-                            for managed_result in managed_results
-                        ],
-                        "envs": envs,
-                        "deployments": deployments,
-                        "results": results,
-                        "exit_code": 0,
-                    }
-                )
+        assert before is not None
+        try:
+            durable_plan = create_clean_plan(
+                cfg,
+                preview_victims,
+                managed_identity={
+                    "before": before,
+                    "cutoff_ts": cutoff,
+                    "projects": sorted(projects) if projects is not None else None,
+                    "results": results,
+                    "managed_results": [
+                        {
+                            "job_id": item.job_id,
+                            "path": str(item.path),
+                            "device": item.device,
+                            "inode": item.inode,
+                        }
+                        for item in managed_results
+                    ],
+                },
             )
+        except CleanPlanError as exc:
+            _fail_submission(
+                kind="clean_plan_unavailable",
+                message=str(exc),
+                exit_code=1,
+                json_=json_,
+            )
+        if json_:
+            payload = plan_page_payload(
+                durable_plan,
+                page_offset=0,
+                page_limit=DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
+            )
+            payload.update(
+                {
+                    "mode": "plan",
+                    "before": before,
+                    "projects": (sorted(projects) if projects is not None else None),
+                    "envs": envs,
+                    "deployments": deployments,
+                    "results": results,
+                }
+            )
+            encoded = json.dumps(payload)
+            if len(encoded.encode("utf-8")) > MAX_CLEAN_PLAN_PAGE_BYTES:
+                _fail_submission(
+                    kind="clean_plan_unavailable",
+                    message="cleanup plan page exceeds its response size limit",
+                    exit_code=1,
+                    json_=True,
+                )
+            print(encoded)
             return
         err.print(
-            f"plan: {n_victims} ended job dirs"
+            f"plan {durable_plan.plan_id}: {n_victims} ended job dirs"
             f" + {len(managed_results)} identity-verified managed results"
             + (" + stale shared venvs" if envs else "")
             + (" + old release trees and installations" if deployments else "")
@@ -14442,18 +15511,19 @@ def clean(
             )
         )
         preview_limit = 20
-        for entry in victims[:preview_limit]:
-            err.print(f"[dim]job {escape(entry.job_id)} · {escape(entry.status)}[/dim]")
-        if len(victims) > preview_limit:
-            err.print(f"[dim]... {len(victims) - preview_limit} more jobs[/dim]")
-        for managed_result in managed_results[:preview_limit]:
+        preview_page = clean_plan_page(durable_plan, offset=0, limit=preview_limit)
+        for item in preview_page.items:
+            identity = item.identity.get("job_id", "-")
+            detail = item.identity.get("path", item.identity.get("job_dir", ""))
             err.print(
-                f"[dim]result {escape(managed_result.job_id)} · "
-                f"{escape(str(managed_result.path))}[/dim]"
+                f"[dim]{escape(item.kind)} {escape(str(identity))} · "
+                f"{escape(diagnostic_excerpt(str(detail), limit=300))}[/dim]"
             )
-        if len(managed_results) > preview_limit:
+        if preview_page.next_offset is not None:
             err.print(
-                f"[dim]... {len(managed_results) - preview_limit} more results[/dim]"
+                f"[dim]... {preview_page.total - len(preview_page.items)} more "
+                "identities · inspect with dt clean --inspect-plan "
+                f"{escape(durable_plan.plan_id)}[/dim]"
             )
         return
 
@@ -14469,6 +15539,7 @@ def clean(
         return {
             "schema_version": "dt_clean_v1",
             "mode": "apply",
+            "plan_id": apply_plan,
             "before": before,
             "projects": sorted(projects) if projects is not None else None,
             "eligible_jobs": eligible,
@@ -14612,6 +15683,16 @@ def events(
         "--operation-id",
         help="show one exact 32-character operation trace",
     ),
+    request_id: Optional[str] = typer.Option(
+        None,
+        "--request-id",
+        help="show operations correlated with one durable submission request",
+    ),
+    job_id: Optional[str] = typer.Option(
+        None,
+        "--job-id",
+        help="show operations correlated with one exact job id",
+    ),
     json_: bool = typer.Option(False, "--json"),
 ) -> None:
     """Inspect the private, redacted DT operation journal."""
@@ -14623,6 +15704,10 @@ def events(
             argv.append("--issues")
         if operation_id is not None:
             argv.extend(["--operation-id", operation_id])
+        if request_id is not None:
+            argv.extend(["--request-id", request_id])
+        if job_id is not None:
+            argv.extend(["--job-id", job_id])
         if json_:
             argv.append("--json")
         raise typer.Exit(forward_call(head, argv))
@@ -14641,6 +15726,8 @@ def events(
             limit=limit,
             issues_only=issues,
             operation_id=operation_id,
+            request_id=request_id,
+            job_id=job_id,
             exclude_operation_id=operation_log_mod.current_operation_id(),
         )
     except (ValueError, operation_log_mod.OperationJournalError) as exc:
@@ -15187,8 +16274,29 @@ agent_app = typer.Typer(
 
 @_typed_cli_decorator(agent_app.command("protocol", hidden=True))
 def agent_protocol() -> None:
-    """Emit the durable dispatch protocol for supervisor compatibility."""
-    print(jobs_mod.DISPATCH_PROTOCOL_VERSION)
+    """Emit bounded scheduling and registry compatibility capabilities."""
+    try:
+        cfg = load()
+    except ConfigError:
+        registry_state = "unproven"
+    else:
+        registry_state = (
+            jobs_mod.registry_authority_schema_state(cfg)
+            if isinstance(cfg, HeadConfig)
+            else "unproven"
+        )
+    print(
+        json.dumps(
+            {
+                "schema_version": jobs_mod.AGENT_PROTOCOL_SCHEMA_VERSION,
+                "dispatch_protocol": jobs_mod.DISPATCH_PROTOCOL_VERSION,
+                "registry_schema": jobs_mod.REGISTRY_SCHEMA_VERSION,
+                "registry_authority_state": registry_state,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
 
 
 def _agent_forward(argv: list[str], center: Optional[str]) -> None:
@@ -16697,7 +17805,206 @@ def topology(
             )
 
 
-def doctor(json_: bool = typer.Option(False, "--json")) -> None:
+_DOCTOR_DEPENDENCIES = (
+    "gpu",
+    "uv",
+    "tmux",
+    "rsync",
+    "flock",
+    "python3",
+    "timeout",
+    "dt",
+    "bash",
+    "supervisor",
+)
+
+
+def _doctor_contract(rows: list[JsonDict], *, exit_code: int) -> JsonDict:
+    """Derive machine actions from the same bounded facts rendered to humans."""
+    issues: list[JsonDict] = []
+    actions: list[JsonDict] = []
+    action_keys: set[str] = set()
+
+    def add(
+        *,
+        node: str,
+        kind: str,
+        severity: str,
+        check: str,
+        observed: str,
+        action: JsonDict | None = None,
+    ) -> None:
+        issues.append(
+            {
+                "node": node,
+                "kind": kind,
+                "severity": severity,
+                "facts": {"check": check, "observed": observed},
+            }
+        )
+        if action is None:
+            return
+        candidate = {"issue_kind": kind, "node": node, **action}
+        key = json.dumps(candidate, sort_keys=True, separators=(",", ":"))
+        if key not in action_keys:
+            action_keys.add(key)
+            actions.append(candidate)
+
+    for row in rows:
+        node = str(row.get("node") or "(unknown)")
+        checks = row.get("checks")
+        if not isinstance(checks, dict):
+            add(
+                node=node,
+                kind="invalid_health_record",
+                severity="error",
+                check="schema",
+                observed="checks missing",
+            )
+            continue
+        ssh = str(checks.get("ssh", "missing"))
+        if ssh != "ok":
+            add(
+                node=node,
+                kind=("unreachable" if row.get("unreachable", True) else "ssh_failure"),
+                severity="error",
+                check="ssh",
+                observed=ssh,
+                action={"type": "argv", "argv": ["ssh", node, "true"]},
+            )
+        for dependency in _DOCTOR_DEPENDENCIES:
+            observed = str(checks.get(dependency, ""))
+            if observed.startswith("missing") or (
+                dependency == "gpu" and observed.startswith("error")
+            ):
+                add(
+                    node=node,
+                    kind=(
+                        "gpu_driver_failure"
+                        if dependency == "gpu" and observed.startswith("error")
+                        else "missing_dependency"
+                    ),
+                    severity="error",
+                    check=dependency,
+                    observed=observed,
+                    action={"type": "install_dependency", "dependency": dependency},
+                )
+        agent = str(checks.get("agent", ""))
+        if agent.startswith(("fail", "off")):
+            add(
+                node=node,
+                kind="agent_unavailable",
+                severity="error",
+                check="agent",
+                observed=agent,
+                action={"type": "argv", "argv": ["dt", "agent", "status", "--json"]},
+            )
+        relay = str(checks.get("relay", ""))
+        if relay.startswith("fail"):
+            add(
+                node=node,
+                kind="relay_authentication_failure",
+                severity="error",
+                check="relay",
+                observed=relay,
+                action={"type": "inspect_gateway_credentials"},
+            )
+        lan = str(checks.get("lan", ""))
+        if lan.startswith("stale"):
+            add(
+                node=node,
+                kind="stale_lan_address",
+                severity="error",
+                check="lan",
+                observed=lan,
+                action={"type": "config_edit", "field": "nodes[].lan_address"},
+            )
+        network = str(checks.get("net", ""))
+        if network.startswith(("slow", "blocked")):
+            add(
+                node=node,
+                kind="network_degraded",
+                severity="warning",
+                check="net",
+                observed=network,
+                action={"type": "argv", "argv": ["dt", "seed", node, "--plan"]},
+            )
+        gpu = str(checks.get("gpu", ""))
+        linger = str(checks.get("linger", "unavailable"))
+        if gpu and not gpu.startswith(("missing", "error")) and linger != "yes":
+            add(
+                node=node,
+                kind="gpu_runtime_not_persistent",
+                severity="error",
+                check="linger",
+                observed=linger,
+                action={"type": "enable_linger"},
+            )
+        registry = str(checks.get("registry", ""))
+        if registry.startswith("large"):
+            add(
+                node=node,
+                kind="registry_growth",
+                severity="warning",
+                check="registry",
+                observed=registry,
+                action={"type": "argv", "argv": ["dt", "clean", "--plan"]},
+            )
+    errors = sum(issue["severity"] == "error" for issue in issues)
+    warnings = len(issues) - errors
+    return {
+        "schema_version": "dt_doctor_v2",
+        "summary": {
+            "healthy": exit_code == 0,
+            "nodes": len(rows),
+            "errors": errors,
+            "warnings": warnings,
+            "exit_code": exit_code,
+        },
+        "nodes": rows,
+        "issues": issues,
+        "actions": actions,
+    }
+
+
+def _render_doctor_actions(payload: JsonDict) -> None:
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        return
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict):
+            continue
+        prefix = "next:" if index == 0 else "     "
+        node = escape(str(action.get("node") or "(unknown)"))
+        action_type = action.get("type")
+        if action_type == "argv" and isinstance(action.get("argv"), list):
+            command = shlex.join([str(item) for item in action["argv"]])
+            err.print(f"[dim]{prefix} {escape(command)}[/dim]")
+        elif action_type == "config_edit":
+            err.print(
+                f"[dim]{prefix} update {escape(str(action.get('field')))} "
+                f"for {node} in the head configuration[/dim]"
+            )
+        elif action_type == "install_dependency":
+            err.print(
+                f"[dim]{prefix} install {escape(str(action.get('dependency')))} "
+                f"on {node}[/dim]"
+            )
+        elif action_type == "inspect_gateway_credentials":
+            err.print(
+                f"[dim]{prefix} verify gateway-local SSH credentials for {node}[/dim]"
+            )
+        elif action_type == "enable_linger":
+            err.print(
+                f"[dim]{prefix} ask an administrator to run "
+                f"loginctl enable-linger USER for {node}[/dim]"
+            )
+
+
+def doctor(
+    json_: bool = typer.Option(False, "--json"),
+    rows_json: bool = typer.Option(False, "--rows-json", hidden=True),
+) -> None:
     """Verify SSH, GPU, transfer tools, runtime contracts, and network."""
     cfg = _cfg()
     if isinstance(cfg, HeadConfig):
@@ -16800,7 +18107,7 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
             node_future = pool.submit(
                 fan_json,
                 cfg,
-                ["doctor"],
+                ["doctor", "--rows-json"],
                 120,
                 accept_nonzero_json=True,
                 unreachable_errors=unreachable_errors,
@@ -16821,18 +18128,7 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
     dependency_failure = any(
         str(row["checks"].get(key, "")).startswith("missing")
         for row in rows
-        for key in (
-            "gpu",
-            "uv",
-            "tmux",
-            "rsync",
-            "flock",
-            "python3",
-            "timeout",
-            "dt",
-            "bash",
-            "supervisor",
-        )
+        for key in _DOCTOR_DEPENDENCIES
     ) or any(
         # A present-but-broken driver reports "error: ..."; it must fail the
         # health check just like a missing dependency.
@@ -16854,63 +18150,35 @@ def doctor(json_: bool = typer.Option(False, "--json")) -> None:
         for row in rows
         if str(row["checks"].get("lan", "")).startswith("stale")
     ]
+    linger_failure = any(
+        bool(str(row["checks"].get("gpu", "")))
+        and not str(row["checks"].get("gpu", "")).startswith(("missing", "error"))
+        and str(row["checks"].get("linger", "unavailable")) != "yes"
+        for row in rows
+    )
     hard_fail = (
         bool(ssh_failures)
         or dependency_failure
         or agent_failure
         or relay_failure
         or bool(lan_stale_nodes)
+        or linger_failure
     )
-    if json_:
+    if unreachable_failure and not dependency_failure and not nontransport_ssh_failure:
+        exit_code = EXIT_UNREACHABLE
+    elif hard_fail:
+        exit_code = 1
+    else:
+        exit_code = 0
+    contract = _doctor_contract(rows, exit_code=exit_code)
+    if rows_json:
         print(json.dumps(rows))
+    elif json_:
+        print(json.dumps(contract))
     else:
         out.print(doctor_table(rows))
-        if isinstance(cfg, HeadConfig):
-            local_nodes = {node.name for node in cfg.nodes if node.local}
-            slow_nodes = [
-                str(row["node"])
-                for row in rows
-                if row["node"] not in local_nodes
-                and str(row["checks"].get("net", "")).startswith(("slow", "blocked"))
-            ]
-            if slow_nodes:
-                from rich.markup import escape
-
-                noun = "node" if len(slow_nodes) == 1 else "nodes"
-                err.print(
-                    f"[yellow]network slow/blocked on {len(slow_nodes)} {noun}[/yellow]"
-                )
-                for index, node_name in enumerate(slow_nodes):
-                    label = "next:" if index == 0 else "     "
-                    err.print(f"[dim]{label} dt seed {escape(node_name)} --plan[/dim]")
-            if relay_failure:
-                relay_detail = next(
-                    str(row["checks"]["relay"])
-                    for row in rows
-                    if str(row["checks"].get("relay", "")).startswith("fail")
-                )
-                err.print(f"[red]relay agent {escape(relay_detail)}[/red]")
-                err.print(
-                    "[dim]next: start a persistent ssh-agent holding the site "
-                    "node keys (docs/configuration.md, relay authentication)"
-                    "[/dim]"
-                )
-            if lan_stale_nodes:
-                noun = "node" if len(lan_stale_nodes) == 1 else "nodes"
-                err.print(
-                    f"[red]stale lan_address on {len(lan_stale_nodes)} {noun}[/red]"
-                )
-                for index, node_name in enumerate(lan_stale_nodes):
-                    label = "next:" if index == 0 else "     "
-                    err.print(
-                        f"[dim]{label} update nodes[].lan_address for "
-                        f"{escape(node_name)} in the head configuration[/dim]"
-                    )
-    if not hard_fail:
-        raise typer.Exit(0)
-    if unreachable_failure and not dependency_failure and not nontransport_ssh_failure:
-        raise typer.Exit(EXIT_UNREACHABLE)
-    raise typer.Exit(1)
+        _render_doctor_actions(contract)
+    raise typer.Exit(exit_code)
 
 
 def _find(ref: str) -> None:
@@ -16952,6 +18220,8 @@ def request_status(
             json_=json_,
         )
     inspection_in_progress = False
+    disposition: intent_mod.RequestDisposition | None = None
+    remote_proof: intent_mod.RemoteLaunchProof | None = None
     try:
         with intent_mod.lock(cfg, request_id, blocking=False) as acquired:
             inspection_in_progress = not acquired
@@ -16963,12 +18233,34 @@ def request_status(
                 )
             if record is not None and acquired:
                 record, entry = reconcile_submission_request(cfg, record)
+                if (
+                    entry is None
+                    and record.proof_requirement == "remote_launch_marker"
+                    and record.state not in {"confirmed", "rejected"}
+                ):
+                    remote_proof = inspect_request_remote_proof(cfg, record)
+                disposition = intent_mod.resolve_disposition(
+                    record,
+                    registry_job_present=entry is not None,
+                    remote_proof=remote_proof,
+                )
+                if disposition.disposition in {"safe_replay", "confirmed"}:
+                    converged = intent_mod.converge_disposition(record, disposition)
+                    if converged != record:
+                        intent_mod.save(cfg, converged)
+                        record = converged
             elif record is not None:
                 entry = jobs_mod.load(cfg, record.job_id)
+                disposition = intent_mod.resolve_disposition(
+                    record,
+                    registry_job_present=None,
+                )
             else:
                 entry = None
     except (
         OSError,
+        DispatchError,
+        jobs_mod.RegistryError,
         intent_mod.RequestRecordError,
         group_mod.GroupRequestError,
         ValueError,
@@ -17091,12 +18383,37 @@ def request_status(
             json_=json_,
         )
     payload: JsonDict = asdict(record)
+    # The durable receipt binds an exact remote capsule and token-derived
+    # identity, but those are internal verification material.  Public query
+    # output exposes only the proof kind and configured node; an absolute
+    # worker path or launch hash adds no recovery capability and may reveal
+    # private topology.
+    payload.pop("proof_job_dir", None)
+    payload.pop("launch_identity_sha256", None)
     # Every other agent surface names its contract key `schema_version`;
     # the durable record's internal field is `schema`. Emit both during the
     # convergence window so consumers can standardize on `schema_version`.
     payload["schema_version"] = payload.get("schema")
     payload["job_found"] = entry is not None
     payload["inspection_in_progress"] = inspection_in_progress
+    if disposition is None:
+        disposition = intent_mod.resolve_disposition(
+            record,
+            registry_job_present=None if inspection_in_progress else entry is not None,
+        )
+    payload["disposition"] = asdict(disposition)
+    payload["remote_proof"] = (
+        {"outcome": remote_proof.outcome, "node": remote_proof.node}
+        if remote_proof is not None
+        else None
+    )
+    next_commands: JsonDict = {
+        "request": ["dt", "request", request_id, "--json"],
+        "events": ["dt", "events", "--request-id", request_id, "--json"],
+    }
+    if entry is not None:
+        next_commands["info"] = ["dt", "info", entry.job_id, "--json"]
+    payload["next_commands"] = next_commands
     payload["job"] = (
         {
             "job_id": entry.job_id,
@@ -17114,6 +18431,7 @@ def request_status(
     state_style = {
         "confirmed": "green",
         "preparing": "yellow",
+        "replay_authorized": "cyan",
         "uncertain": "yellow",
         "rejected": "red",
     }[record.state]
@@ -17126,11 +18444,8 @@ def request_status(
             f"[dim]job: {escape(entry.status)} on {escape(entry.node)}"
             f"{f' · {escape(entry.reason)}' if entry.reason else ''}[/dim]"
         )
-    elif record.state in {"preparing", "uncertain"}:
-        err.print(
-            "[yellow]the launch outcome is not proven; do not submit this "
-            "request id again[/yellow]"
-        )
+    for action in disposition.actions:
+        err.print(f"[dim]{escape(action)}[/dim]")
 
 
 # --------------------------------------------------------------------------
@@ -17165,6 +18480,7 @@ app.command("l", hidden=True)(logs)
 app.command("attach", rich_help_panel="Operations")(attach)
 app.command("wait", rich_help_panel="Everyday")(wait)
 app.command("info", rich_help_panel="Everyday")(info)
+app.command("diagnose", rich_help_panel="Everyday")(diagnose)
 app.command("request", rich_help_panel="Everyday")(request_status)
 app.command("compare", rich_help_panel="Experiments")(compare)
 app.command(
@@ -17203,12 +18519,56 @@ app.command("_find", hidden=True)(_find)
 
 
 def main() -> None:
-    session = operation_log_mod.begin(sys.argv[1:])
+    argv = sys.argv[1:]
+    session = operation_log_mod.begin(argv)
     exit_code = 0
     status = "success"
     failure: BaseException | None = None
     try:
-        app()
+        # Typer's standalone mode owns stderr and maps every usage problem to
+        # exit 2. DT reserves 2 exclusively for a proven no-capacity outcome,
+        # so the outer boundary renders parsing failures itself as validation
+        # errors. An empty invocation is a successful help request.
+        effective_argv = argv if argv else ["--help"]
+        command_result = app(args=effective_argv, standalone_mode=False)
+        if isinstance(command_result, int) and command_result != 0:
+            exit_code = command_result
+            if exit_code == 130:
+                status = "interrupted"
+                operation_log_mod.mark_problem("interrupted")
+            else:
+                status = "failed"
+                operation_log_mod.mark_problem("command_failed")
+            raise SystemExit(exit_code)
+    except click.ClickException as exc:
+        exit_code = 1
+        status = "failed"
+        failure = exc
+        operation_log_mod.mark_problem("usage", exc)
+        if _argv_requests_json(argv):
+            print(
+                json.dumps(
+                    {
+                        "schema_version": "dt_cli_error_v1",
+                        "error": "usage",
+                        "message": " ".join(exc.format_message().split()),
+                        "exit_code": 1,
+                    }
+                )
+            )
+        else:
+            exc.show(file=sys.stderr)
+        raise SystemExit(1) from exc
+    except click.exceptions.Exit as exc:
+        exit_code = int(exc.exit_code)
+        failure = exc
+        if exit_code == 130:
+            status = "interrupted"
+            operation_log_mod.mark_problem("interrupted", exc)
+        elif exit_code:
+            status = "failed"
+            operation_log_mod.mark_problem("command_failed")
+        raise SystemExit(exit_code) from exc
     except RemoteError as e:
         exit_code = EXIT_UNREACHABLE
         status = "failed"
@@ -17220,7 +18580,10 @@ def main() -> None:
         failure = exc
         code = exc.code
         exit_code = code if isinstance(code, int) else (0 if code is None else 1)
-        if exit_code:
+        if exit_code == 130:
+            status = "interrupted"
+            operation_log_mod.mark_problem("interrupted", exc)
+        elif exit_code:
             status = "failed"
             operation_log_mod.mark_problem("command_failed")
         raise

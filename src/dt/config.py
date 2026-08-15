@@ -36,6 +36,7 @@ MAX_SITES = 256
 MAX_PROJECT_EXTRAS = 64
 MAX_SETUP_INPUTS = 256
 MAX_SNAPSHOT_EXCLUDES = 256
+MAX_SNAPSHOT_EXCLUDE_BYTES = 4096
 MAX_SSH_DESTINATION_LENGTH = 512
 MAX_QUEUE_POLL_S = 24 * 3600
 MAX_QUEUE_ACTIVE_POLL_S = 3600.0
@@ -110,7 +111,10 @@ def active_dt_command() -> Path:
         record = active_command_record_path()
         descriptor = os.open(
             record,
-            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
         )
         before = os.fstat(descriptor)
         if stat.S_ISREG(before.st_mode) and before.st_size <= 4096:
@@ -461,6 +465,18 @@ def _nonempty_string(value: object, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"`{label}` must be a non-empty string")
     return value.strip()
+
+
+def _snapshot_exclude(value: object) -> str:
+    """Validate one rsync exclusion as bounded, printable configuration data."""
+    pattern = _nonempty_string(value, "snapshot_excludes[]")
+    if len(pattern.encode("utf-8")) > MAX_SNAPSHOT_EXCLUDE_BYTES:
+        raise ConfigError(
+            "`snapshot_excludes[]` exceeds the 4096-byte per-pattern limit"
+        )
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in pattern):
+        raise ConfigError("`snapshot_excludes[]` must not contain control characters")
+    return pattern
 
 
 def _require_rooted_path(text: str, label: str) -> None:
@@ -1224,9 +1240,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 "snapshot_excludes",
                 MAX_SNAPSHOT_EXCLUDES,
             )
-            excludes = [
-                _nonempty_string(item, "snapshot_excludes[]") for item in raw_excludes
-            ]
+            excludes = [_snapshot_exclude(item) for item in raw_excludes]
         raw_webhook = data.get("webhook")
         webhook = _webhook_url(raw_webhook) if raw_webhook is not None else None
         raw_proxy = data.get("proxy")

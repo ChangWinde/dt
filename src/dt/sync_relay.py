@@ -96,7 +96,10 @@ def artifact_mirror_relative(project_name: str) -> str:
 
 def _relative_parent(relative: str) -> str:
     """The mirror-relative parent of one artifact, '' at the mirror root."""
-    parent = PurePosixPath(relative).parent
+    path = PurePosixPath(relative)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"unsafe artifact relative path: {relative!r}")
+    parent = path.parent
     return "" if str(parent) == "." else str(parent)
 
 
@@ -106,18 +109,36 @@ def prepare_artifact_mirror_command(project_name: str, relatives: list[str]) -> 
     One command for the whole sync: the parents are known up front, so the
     relay costs a single control round trip instead of one per artifact.
     """
-    mirror = shlex.quote(artifact_mirror_relative(project_name))
+    project = shlex.quote(sanitize_name(project_name))
     parents = sorted({_relative_parent(relative) for relative in relatives} - {""})
-    extra = "".join(f' "$mirror"/{shlex.quote(parent)}' for parent in parents)
+    prefixes = sorted(
+        {
+            "/".join(PurePosixPath(parent).parts[:depth])
+            for parent in parents
+            for depth in range(1, len(PurePosixPath(parent).parts) + 1)
+        },
+        key=lambda value: (len(PurePosixPath(value).parts), value),
+    )
+    nested = "".join(
+        f' dt_ensure_private_dir "$mirror"/{shlex.quote(prefix)};'
+        for prefix in prefixes
+    )
     script = (
         "umask 077; "
         'root="$HOME/.dt/sync-staging"; '
-        f'mirror="$HOME"/{mirror}; '
-        'test ! -L "$HOME/.dt" && test ! -L "$root" || exit 70; '
-        f'mkdir -p "$mirror"{extra}; '
-        'test -d "$mirror" && test ! -L "$mirror" '
-        '&& test ! -L "$(dirname -- "$mirror")" || exit 70; '
-        'chmod 700 "$HOME/.dt" "$root" "$(dirname -- "$mirror")" "$mirror"'
+        f'project="$root"/{project}; '
+        'mirror="$project/artifacts"; '
+        "dt_ensure_private_dir() { "
+        'candidate=$1; test ! -L "$candidate" || exit 70; '
+        'if test -e "$candidate"; then test -d "$candidate" || exit 70; '
+        'else mkdir -- "$candidate" || exit 70; fi; '
+        'test -d "$candidate" && test ! -L "$candidate" || exit 70; '
+        'chmod 700 "$candidate" || exit 70; }; '
+        'dt_ensure_private_dir "$HOME/.dt"; '
+        'dt_ensure_private_dir "$root"; '
+        'dt_ensure_private_dir "$project"; '
+        'dt_ensure_private_dir "$mirror";'
+        f"{nested}"
     )
     return f"bash -c {shlex.quote(script)}"
 
