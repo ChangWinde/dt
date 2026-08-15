@@ -236,6 +236,15 @@ class OperationsCfg:
     keep_files: int = 8
 
 
+@dataclass(frozen=True)
+class JobLogsCfg:
+    """Bounded worker-side application stdout/stderr retention."""
+
+    max_file_mib: int = 64
+    # Includes the current file. Four 64 MiB files bound each job to 256 MiB.
+    keep_files: int = 4
+
+
 @dataclass
 class HeadConfig:
     center: str
@@ -253,6 +262,7 @@ class HeadConfig:
     disk_min_gib: int = 10
     queue: QueueCfg = field(default_factory=QueueCfg)
     operations: OperationsCfg = field(default_factory=OperationsCfg)
+    job_logs: JobLogsCfg = field(default_factory=JobLogsCfg)
     sites: dict[str, Site] = field(default_factory=dict)
     webhook: str | None = None  # POST job-end notifications here
     snapshot_excludes: list[str] = field(default_factory=list)  # extra rsync excludes
@@ -984,6 +994,23 @@ def _parse_operations(data: dict[str, Any]) -> OperationsCfg:
     return OperationsCfg(max_file_mib=max_file_mib, keep_files=keep_files)
 
 
+def _parse_job_logs(data: dict[str, Any]) -> JobLogsCfg:
+    raw = _optional_mapping(data, "job_logs")
+    _reject_unknown(raw, {"max_file_mib", "keep_files"}, "job_logs")
+    max_file_mib = _integer(
+        raw.get("max_file_mib", 64),
+        "job_logs.max_file_mib",
+    )
+    keep_files = _integer(raw.get("keep_files", 4), "job_logs.keep_files")
+    if not 1 <= max_file_mib <= 256:
+        raise ConfigError("`job_logs.max_file_mib` must be between 1 and 256")
+    if not 1 <= keep_files <= 16:
+        raise ConfigError("`job_logs.keep_files` must be between 1 and 16")
+    if max_file_mib * keep_files > 4096:
+        raise ConfigError("job log retention must not exceed 4096 MiB per job")
+    return JobLogsCfg(max_file_mib=max_file_mib, keep_files=keep_files)
+
+
 def parse(data: object) -> HeadConfig | LaptopConfig:
     if not isinstance(data, dict) or not data:
         raise ConfigError("config file is empty or not a mapping")
@@ -1041,6 +1068,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 "disk_min_gib",
                 "queue",
                 "operations",
+                "job_logs",
                 "sites",
                 "webhook",
                 "snapshot_excludes",
@@ -1268,6 +1296,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             disk_min_gib=disk_min_gib,
             queue=queue,
             operations=_parse_operations(data),
+            job_logs=_parse_job_logs(data),
             sites=sites,
             webhook=webhook,
             snapshot_excludes=excludes,

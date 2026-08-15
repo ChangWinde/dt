@@ -34,7 +34,8 @@ for compatibility.
   an agent act without scraping terminal output.
 - **Durable recovery:** remote jobs survive client disconnection; `info`,
   `logs`, `metrics`, `wait`, `pull`, `rerun`, and `exec` recover their state or
-  continue work.
+  continue work. Application stdout/stderr is rotated under a configured disk
+  bound, while tails remain readable across retained generations.
 - **Experiment workflows:** `batch`, `chain`, typed results, cross-node
   dependencies, `fork`, and `compare` preserve lineage across iterations.
 - **Efficient transfer:** control and bulk-data SSH connections are isolated;
@@ -178,6 +179,13 @@ identity, lifecycle, result, evidence, and declared outputs. Hardware and paths
 may differ, and side effects outside declared outputs remain remote. A laptop
 client forwards intent to its configured head; it does not implicitly upload a
 laptop-only worktree.
+
+DT keeps its authoritative operation journal, application job logs, telemetry,
+and transfer evidence local and bounded. It does not require a central logging
+service.
+Operators that need fleet-wide search or alerts can feed the redacted
+`dt events --json` contract to their collector; raw application logs are never
+exported automatically.
 
 ## Scope and security
 

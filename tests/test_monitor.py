@@ -2,9 +2,11 @@ import json
 import io
 import os
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -13,6 +15,7 @@ from dt import cli, completion
 from dt.completion import CompletionSignals
 from dt.config import HeadConfig, LaptopConfig, Node
 from dt.jobs import JobEntry
+from dt.layout import LEGACY_LAYOUT, ROLE_LAYOUT, job_payload_dir
 from dt.monitoring import summarize_resource_text
 from dt.probe import Gpu, NodeStatus, SystemStats
 
@@ -2622,6 +2625,58 @@ def test_smart_log_tail_keeps_home_relative_display_separate_from_read_path(tmp_
     assert selected == "~/dt/worker/jobs/nested/outputs/registry/train.log"
     assert display == "outputs/registry/train.log"
     assert tail == "step 420 loss=0.05\n"
+
+
+@pytest.mark.parametrize("storage_layout", [ROLE_LAYOUT, LEGACY_LAYOUT])
+def test_smart_log_tail_reads_across_retained_stdout_generations(
+    tmp_path, storage_layout
+):
+    job_dir = tmp_path / "job"
+    payload_dir = Path(job_payload_dir(str(job_dir), storage_layout))
+    stdout = job_dir / "logs" / "stdout.log"
+    payload_dir.mkdir(parents=True)
+    stdout.parent.mkdir(parents=True)
+    helper = Path(__file__).parents[1] / "src" / "dt" / "payload" / "log_capture.py"
+    (payload_dir / "log_capture.py").write_bytes(helper.read_bytes())
+    captured = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(payload_dir / "log_capture.py"),
+            "capture",
+            "--path",
+            str(stdout),
+            "--max-bytes",
+            "14",
+            "--keep-files",
+            "4",
+        ],
+        input="line-1\nline-2\nline-3\nline-4\nline-5\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert captured.returncode == 0, captured.stderr
+    entry = JobEntry(
+        job_id="rotated-log",
+        name="rotated-log",
+        center="c",
+        project="p",
+        node="local",
+        node_local=True,
+        job_dir=str(job_dir),
+        session="dt_rotated_log",
+        cmd="true",
+        status="finished",
+        storage_layout=storage_layout,
+    )
+
+    proc, selected, display, tail = cli._read_job_log_tail(entry, 4)
+
+    assert proc.returncode == 0, proc.stderr
+    assert selected == str(stdout)
+    assert display == "logs/stdout.log"
+    assert tail == "line-2\nline-3\nline-4\nline-5\n"
 
 
 def test_logs_human_and_json_replace_nul_padding_at_shared_tail_boundary(

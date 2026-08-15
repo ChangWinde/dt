@@ -138,6 +138,10 @@ node.
 Write checkpoints and reports below `$DT_JOB_DIR/outputs/` so recovery commands
 can find them.
 
+New jobs rotate merged stdout/stderr under the head's bounded `job_logs`
+configuration. `dt logs` reads across retained generations; DT does not require
+or automatically send raw output to a centralized logging service.
+
 ## Reproducible comparisons
 
 ```bash

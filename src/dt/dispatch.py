@@ -3915,6 +3915,8 @@ def launch(
         "DT_NODE": node.name,
         "DT_ENV_MODE": spec.env_mode,
         "DT_PRIVATE_ENV_STDIN": "1",
+        "DT_JOB_LOG_MAX_BYTES": str(cfg.job_logs.max_file_mib * 1024 * 1024),
+        "DT_JOB_LOG_KEEP_FILES": str(cfg.job_logs.keep_files),
     }
     if spec.project:
         envs["DT_ARTIFACT_ROOT"] = artifact_root_rel(spec.project, cfg, node)

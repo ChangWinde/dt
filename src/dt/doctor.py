@@ -9,7 +9,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Mapping
 
-from .config import HeadConfig, Node
+from .config import ConfigError, HeadConfig, Node, revalidate_project_root
 from .redaction import redact_remote_detail
 from .sshio import RemoteError, run_on
 
@@ -84,6 +84,21 @@ echo "DT_ADDRS=$dt_addrs"
 wait "$dt_net_pid"
 """
 DOCTOR_MAX_WORKERS = 32
+
+
+def default_project_status(cfg: HeadConfig) -> str:
+    """Return a path-redacted health label for the implicit project."""
+    name = cfg.default_project
+    if name is None:
+        return "not configured"
+    project = cfg.projects.get(name)
+    if project is None:
+        return f"unavailable: {name}"
+    try:
+        revalidate_project_root(project.path, f"projects.{name}.path")
+    except ConfigError:
+        return f"unavailable: {name}"
+    return f"ok: {name}"
 
 
 def head_capability_checks() -> dict[str, str]:

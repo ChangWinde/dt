@@ -111,6 +111,9 @@ dt pull JOB --collection CAMPAIGN
 contains raw command arguments or exception text; follow the request or job ID
 into `diagnose` for one bounded, correlated evidence envelope, or query
 `info`, `logs`, and `agent status` separately for source-specific detail.
+New job stdout/stderr is size-rotated by the worker, and bounded `dt logs`
+reads across retained generations. For external aggregation, export the
+redacted events JSON; never assume raw application logs leave the worker.
 Use `dt events --request-id ID --json` or `dt events --job-id ID --json` to
 avoid scanning unrelated operations.
 

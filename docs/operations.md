@@ -120,6 +120,24 @@ dt logs JOB -f
 dt metrics JOB
 ```
 
+New jobs retain merged application stdout/stderr under the head's `job_logs`
+configuration (64 MiB × four files by default). `dt logs -n N` reads across a
+rotation boundary within its global 256 KiB automatic-read budget, and
+`dt logs -f` follows the current filename across cooperative rotations. A log
+storage failure remains visible in the original output path, but the capture
+helper continues draining, so logging alone cannot deliver SIGPIPE to the
+application.
+
+The redacted operation journal is the supported external aggregation seam:
+
+```bash
+dt events --json | jq -c '.events[]'
+```
+
+Feed that bounded output into an operator-managed collector when centralized
+search or alerts are required. DT deliberately has no mandatory Loki, ELK, or
+OpenTelemetry service, and raw job output is not exported by this command.
+
 `dt ps --watch` uses the same non-overlapping, start-to-start `--poll`
 semantics as `dt free --watch`.
 

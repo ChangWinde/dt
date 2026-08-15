@@ -182,6 +182,12 @@ their help by everyday use, scheduling safeguards, reproducibility, and output.
 Submission, log-follow, and wait receipts use recognizable names plus compact,
 routable references; the complete submitted job ID remains the last stdout line.
 
+`dt logs` reads at most 256 KiB automatically. For new jobs that bounded window
+spans the current and configured rotated `stdout.log` generations; older jobs
+fall back to their single file. `--follow` tracks the current filename across
+rotation and still returns the job's stable terminal exit code. Neither form
+uploads raw application output to an external service.
+
 `dt free` keeps its default scheduler line compact. Use `dt free --explain` to
 show the complete next-job ID and scheduler reason, or add `--json` for the
 structured explanation contract.

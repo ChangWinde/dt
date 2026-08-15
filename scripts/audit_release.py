@@ -40,6 +40,7 @@ REQUIRED_PAYLOADS = {
     "dt/payload/artifact_verify.py",
     "dt/payload/cuda_probe.py",
     "dt/payload/launcher.sh",
+    "dt/payload/log_capture.py",
     "dt/payload/phase.sh",
     "dt/payload/result.py",
     "dt/payload/telemetry.py",

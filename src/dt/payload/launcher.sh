@@ -1660,9 +1660,9 @@ start_session() {
     DT_UV_ENV=$UV_ENV
     DT_SHELL_QUOTED=""
     dt_shell_quote "$DT_JOB_DIR"
-    # The dt tmux server is deliberately persistent. Start from an empty
-    # environment so the first job cannot leak proxy/PYTHONPATH/LD_* state
-    # into every later session; append only the explicit runtime contract.
+    # The dedicated per-job tmux server inherits its initial environment.
+    # Start from an empty environment so launcher-only values cannot leak into
+    # the application session; append only the explicit runtime contract.
     DT_SESSION_COMMAND="cd $DT_SHELL_QUOTED && env -i"
     local name
     local -a session_env_names=(
@@ -1685,6 +1685,7 @@ start_session() {
         CUDA_VISIBLE_DEVICES DT_GPU_IDS DT_GPUS DT_GPU_ISOLATION DT_MAX_HOURS \
         DT_MIN_VRAM_MIB \
         DT_MAX_VRAM_MIB DT_MAX_JOB_MEMORY_MIB DT_ENV_MODE DT_UV DT_UV_ENV \
+        DT_JOB_LOG_MAX_BYTES DT_JOB_LOG_KEEP_FILES \
         DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME
     )
     for name in "${session_env_names[@]}"; do
