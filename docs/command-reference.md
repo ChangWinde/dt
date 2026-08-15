@@ -11,6 +11,7 @@ This page helps operators choose a command and handle its result. Run
 | `dt run` | Submit one command with automatic or pinned placement |
 | `dt ps` | Show active jobs; opt into recent, issue, or complete history |
 | `dt info` | Show one job's state, timeline, and next recovery action |
+| `dt diagnose` | Correlate bounded job, scheduler, node, and recovery evidence |
 | `dt logs` | Read or follow the active job, setup, or nested failure log |
 | `dt wait` | Wait through queue and execution; return the job result |
 | `dt pull` | Recover outputs with resumable and isolated transfers |
@@ -45,6 +46,11 @@ This page helps operators choose a command and handle its result. Run
 | `dt clean` | Delete explicitly scoped old jobs, results, environments, or deployment trees |
 | `dt sync` | Incrementally stage project code or explicit large inputs |
 | `dt seed` | Seed approved caches and Python runtimes on slow-network nodes |
+
+`dt doctor --json` reports whether a GPU worker has a usable persistent
+runtime. A GPU job requires a user systemd scope and `Linger=yes`; a missing or
+unknown proof is `gpu_runtime_not_persistent` with an administrator remediation
+action. CPU jobs (`-g 0`) retain the portable runtime path.
 
 `dt topology [--site SITE] --json` actively verifies configured directed data edges.
 Use `--source NODE` and/or `--destination NODE` to scope a large site. The
@@ -83,6 +89,17 @@ normalized intent returns the original job; a changed intent conflicts. If the
 client loses the response, query `dt request REQUEST_ID --json` instead of
 submitting a new job.
 
+The request response includes a typed disposition, facts, retry safety, and
+argv-form next actions. `safe_replay` is emitted only after DT proves that no
+registry row or identity-bound remote launch exists; missing or ambiguous
+proof remains `inspect_remote` and must not be retried blindly.
+
+Telemetry summaries are produced on the worker. A positive `--tail` reads a
+bounded suffix instead of rescanning all historical samples; `complete`,
+`omission_reason`, and `telemetry_counts.lines_total_complete` distinguish an
+exact window from a bounded or legacy observation. `--tail 0` explicitly
+requests a full single-pass history scan.
+
 Preview a submission without writing a snapshot, registry row, receipt, or
 remote state:
 
@@ -118,6 +135,13 @@ never claimed, but an `uncertain` child fails closed and blocks later items.
 Group receipts add `request_id` and `idempotent_replay`; `dt request
 REQUEST_ID --json` returns the parent state, submitted jobs, next index, and
 first unresolved child.
+
+For a single job, the query returns a typed `disposition` with bounded facts,
+recovery guidance, and whether a pre-launch outcome was proved safe to replay
+under a new request identity. If the receipt names a remote launch attempt,
+the head verifies its token-derived marker and runtime state without returning
+the marker hash or private capsule path. `next_commands` contains argv arrays
+for the correlated request, job, and operation evidence.
 
 The non-follow human contract writes progress to stderr and the bare job ID as
 the last stdout line:
@@ -181,6 +205,14 @@ action instead of a resubmission, because resubmitting an unproven-dead job
 can double-run the experiment. Agents must never execute a `destructive`
 action without explicit operator confirmation.
 
+`dt diagnose REF --json` emits `dt_diagnosis_v1`, a single 64 KiB envelope
+covering job, request, operation, agent, node, queue, log, telemetry, result,
+and transfer evidence. Every section declares completeness, freshness, and an
+omission reason. Facts and inferences are separate; actions are argv arrays and
+mark destructive behavior explicitly. Partial evidence remains a valid
+diagnosis and never masquerades as complete. The human view is rendered from
+the same envelope.
+
 `dt ps --json` returns complete history by default for compatibility. Explicit
 filters such as `--limit`, `--issues`, or `-s` narrow it. Human `dt ps`
 defaults to active work, uses a plain sentence for empty filters, and compacts
@@ -216,8 +248,20 @@ Use command-specific detail views when diagnosing:
 - `dt storage --details` for every managed storage class and path;
 - `dt ps --wide` for complete job IDs and commands.
 
-`dt metrics` omits a single phase that duplicates the complete sampling window,
-but retains phase rows when the application actually transitions between phases.
+`dt metrics` aggregates on the node with bounded memory. Its JSON reports
+`complete`, source counts, and an omission reason; a truncated or changing
+source never masquerades as a complete `--tail N` or `--tail 0` window. It
+omits a single phase that duplicates the complete sampling window, but retains
+phase rows when the application actually transitions between phases.
+
+`dt doctor --json` emits `dt_doctor_v2`: `nodes` contains bounded observations,
+while `issues`, severity, and typed `actions` let automation respond without
+parsing human check strings. Human hints are rendered from the same actions.
+
+`dt pull` treats application outputs as untrusted data: device nodes and
+special files are refused, `outputs/dt/` is excluded, and only a fixed
+schema-validated control-evidence allowlist is reported under
+`records_scope: "dt_control_allowlist"`.
 
 Streaming JSON commands use one object or a documented JSONL stream. Progress
 and reconnect notices remain on stderr.
@@ -229,6 +273,8 @@ Laptop-to-head calls share a parent operation ID. Query local evidence with:
 dt events --issues
 dt events --limit 50 --json
 dt events --operation-id OPERATION_ID --json
+dt events --request-id REQUEST_ID --json
+dt events --job-id JOB_ID --json
 dt events -c CENTER --issues --json  # laptop: query one head
 ```
 
@@ -260,7 +306,17 @@ codes above 125 clamp to 125), and `--json` always carries the untruncated
 ## Destructive commands
 
 `kill`, `clean`, and mutating `compact` require explicit confirmation for
-non-interactive use. Cleanup and compaction provide `--plan`. A TERM request
+non-interactive use. Cleanup and compaction provide `--plan`. `dt clean`
+persists an exact job/result plan for 24 hours; apply it with
+`dt clean --apply-plan PLAN_ID -y`. JSON previews return one bounded page, not
+the full authorization. Follow `page.next_offset` with `dt clean
+--inspect-plan PLAN_ID --offset OFFSET --limit LIMIT --json`; the immutable
+global `index` enumerates jobs followed by managed results without gaps. Page
+options are read-only and are rejected by apply. Apply may drop changed
+candidates but never adds newly eligible ones. Plans accept at most 200,000
+identities and 64 MiB of exact authority. Environment and deployment sweeps
+currently require immediate confirmation because they do not yet expose exact
+candidate identities. A TERM request
 that cannot verify process death returns failure; `--force` is a separate
 explicit escalation. `kill --sweep` additionally signals leftover processes
 of an already-terminal job without rewriting its recorded result.

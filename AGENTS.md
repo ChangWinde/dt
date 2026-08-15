@@ -99,6 +99,7 @@ dt ps --watch
 dt ps --issues
 dt ps --compact --issues --limit 50 --json
 dt info JOB
+dt diagnose JOB --json
 dt logs JOB -f
 dt metrics JOB
 dt wait JOB
@@ -108,7 +109,10 @@ dt pull JOB --collection CAMPAIGN
 `dt events --json` is the bounded, redacted operation index. On a laptop,
 `dt events -c CENTER --json` queries the correlated head journal. It never
 contains raw command arguments or exception text; follow the request or job ID
-into `info`, `logs`, and `agent status` for detailed evidence.
+into `diagnose` for one bounded, correlated evidence envelope, or query
+`info`, `logs`, and `agent status` separately for source-specific detail.
+Use `dt events --request-id ID --json` or `dt events --job-id ID --json` to
+avoid scanning unrelated operations.
 
 Pull retries and resumes interrupted transfers. Use `--lite` or repeatable
 `--exclude` filters when large checkpoints are not needed.
@@ -136,7 +140,8 @@ control routes, whose independent measurements otherwise run concurrently.
 
 Run `dt doctor --json` after upgrades, host or driver changes, or repeated
 unexplained launch failures: it verifies SSH, GPU runtime, transfer tools,
-agent health, and the control-route link class per node.
+agent health, and the control-route link class per node. Consume the
+`dt_doctor_v2.issues` and `actions` fields; do not parse human check strings.
 
 ## Resource safety
 
@@ -165,8 +170,11 @@ Preview maintenance first:
 ```bash
 dt compact --before YYYY-MM-DD --plan
 dt clean --before YYYY-MM-DD --plan
+dt clean --inspect-plan PLAN_ID --offset 0 --limit 100 --json
 ```
 
+Large clean previews are paginated; follow `page.next_offset` to review the
+complete immutable authorization before applying it. Pagination is read-only.
 Non-interactive mutation requires `-y`. `dt kill JOB -y` verifies process-group
 death; retry with `--force` only after TERM failure is reported. A kill that
 races a natural completion preserves the real result (`outcome: completed`).
@@ -195,7 +203,8 @@ and `--json` carries the untruncated `exit_code`.
 ## Development gate
 
 ```bash
-uv run --no-sync pytest -q -p no:cacheprovider
+uv run --no-sync pytest -q -p no:cacheprovider \
+  -W error::pytest.PytestUnhandledThreadExceptionWarning
 uv run --no-sync python scripts/docs.py
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .

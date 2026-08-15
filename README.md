@@ -40,7 +40,8 @@ for compatibility.
 - **Efficient transfer:** control and bulk-data SSH connections are isolated;
   verified site caches or direct same-site peers can avoid repeated transfer
   through slow ProxyJump or FRP routes.
-- **Safe operation:** maintenance is plan-first and identity-checked;
+- **Safe operation:** maintenance can persist an expiring, exact candidate
+  plan for later application and revalidates every identity before deletion;
   installation and deployment are checksum-verified, atomic, and rollbackable.
 
 AI-native describes the execution contract, not autonomous experiment design.
@@ -57,7 +58,11 @@ Install `dt` on one head machine. Workers receive the runtime payload with each
 job and do not require a separate installation.
 
 Requirements: Linux, Python 3.10 or 3.11, `uv`, OpenSSH, rsync, tmux, flock,
-and timeout. GPU workers also require NVIDIA drivers and `nvidia-smi`.
+and timeout. GPU workers also require NVIDIA drivers, `nvidia-smi`, a working
+user systemd manager with transient scopes, and `loginctl Linger=yes`; without
+that proven lifecycle DT accepts only CPU jobs (`-g 0`) on the node. Check with
+`loginctl show-user "$USER" -p Linger --value`; enabling linger may require an
+administrator to run `loginctl enable-linger USER`.
 
 ### Install
 
@@ -133,7 +138,7 @@ dt ps --compact --issues --fields job_id,status,node,reason --limit 50 --json
 |---|---|
 | Find capacity and routes | `dt free`, `dt doctor`, `dt topology` |
 | Submit work | `dt run`, `dt batch`, `dt chain`, `dt request` |
-| Observe work | `dt events`, `dt ps`, `dt info`, `dt logs`, `dt metrics` |
+| Observe work | `dt events`, `dt ps`, `dt info`, `dt diagnose`, `dt logs`, `dt metrics` |
 | Wait or recover | `dt wait`, `dt pull`, `dt attach` |
 | Iterate | `dt rerun`, `dt fork`, `dt exec`, `dt compare` |
 | Operate the service | `dt agent`, `dt storage`, `dt migrate`, `dt compact`, `dt clean`, `dt kill` |
@@ -152,7 +157,7 @@ flowchart LR
     HEAD -->|SSH control| NODE["Compute node"]
     STORE -->|verified data| SITE["Site cache or peer"]
     SITE -->|LAN or direct SSH| NODE
-    NODE --> EVIDENCE["State, logs, metrics, outputs"]
+    NODE --> EVIDENCE["Control-owned evidence and application outputs"]
     EVIDENCE --> HEAD
     HEAD --> CLI
 ```
@@ -198,7 +203,8 @@ Vulkan, EGL, OpenGL, or device files. Read the
 
 ```bash
 uv sync --locked --all-groups
-uv run --no-sync pytest -q -p no:cacheprovider
+uv run --no-sync pytest -q -p no:cacheprovider \
+  -W error::pytest.PytestUnhandledThreadExceptionWarning
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync python scripts/docs.py

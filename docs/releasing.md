@@ -132,9 +132,13 @@ global activation lock used by rollback. Reusing a version for different
 content is rejected. Before an upgrade changes the installed command, the
 current marker and retained predecessor must verify. The `current` marker
 changes only after the installed command reports the requested version; if
-activation fails, deployment reinstalls and verifies the predecessor while
-still returning failure. Explicit rollback uses the same checksum and
-atomic-marker contract. Activation and rollback also make a user-local
+activation fails, deployment reinstalls and verifies the predecessor only when
+that release's bounded wheel capability probe can read the current registry
+authority; otherwise it leaves the newer authority in place and fails closed.
+Explicit rollback uses the same checksum, capability, and atomic-marker
+contract. A retained release is therefore rollback-eligible only while its
+dispatch protocol and registry schema remain compatible with durable state.
+Activation and rollback also make a user-local
 `~/.local/bin/uv` visible to the verified bootstrap even when a
 non-interactive SSH session omits that directory from `PATH`.
 
