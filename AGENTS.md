@@ -207,7 +207,8 @@ and `--json` carries the untruncated `exit_code`.
 
 ```bash
 uv run --no-sync pytest -q -p no:cacheprovider \
-  -W error::pytest.PytestUnhandledThreadExceptionWarning
+  -W error::pytest.PytestUnhandledThreadExceptionWarning \
+  --cov=dt --cov-branch --cov-report=term-missing:skip-covered
 uv run --no-sync python scripts/docs.py
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .

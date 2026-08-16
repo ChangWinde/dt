@@ -1688,7 +1688,7 @@ def test_launch_propagates_exact_fork_cache_contract(tmp_path, monkeypatch):
 
 
 def test_wrapper_exports_verified_cache_and_writes_receipt(tmp_path):
-    from dt import cli
+    from dt import pull_evidence
 
     job = tmp_path / "job"
     code = job / "code"
@@ -1735,14 +1735,14 @@ def test_wrapper_exports_verified_cache_and_writes_receipt(tmp_path):
         "source_env_hash": "6fb61a247969",
         "source_snapshot_sha256": "a" * 64,
     }
-    cli._validate_pulled_evidence(
+    pull_evidence.validate_file(
         job / "evidence" / "cache-reuse.json",
         "cache-reuse.json",
     )
 
 
 def test_wrapper_exports_private_clone_and_writes_v2_receipt(tmp_path):
-    from dt import cli
+    from dt import pull_evidence
 
     job = tmp_path / "job"
     code = job / "code"
@@ -1836,7 +1836,7 @@ def test_wrapper_exports_private_clone_and_writes_v2_receipt(tmp_path):
             "duration_ms": 23,
         },
     }
-    cli._validate_pulled_evidence(
+    pull_evidence.validate_file(
         job / "evidence" / "cache-reuse.json",
         "cache-reuse.json",
     )

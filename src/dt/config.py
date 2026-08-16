@@ -490,7 +490,7 @@ def _snapshot_exclude(value: object) -> str:
 
 
 def _require_rooted_path(text: str, label: str) -> None:
-    if not (text.startswith("~/") or text.startswith("/")):
+    if not text.startswith(("~/", "/")):
         raise ConfigError(
             f"`{label}` must be absolute or start with ~/; a relative path "
             "resolves against the working directory and can snapshot the "

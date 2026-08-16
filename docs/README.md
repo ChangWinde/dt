@@ -54,5 +54,9 @@ Design rationale belongs in an ADR. A live validation or release claim belongs
 in an audit. Research runs must record hardware, software, configuration,
 runtime, metrics, and acceptance thresholds.
 
+This tracked documentation tree is the single maintained documentation source.
+The GitHub Wiki is intentionally disabled so operational guidance cannot drift
+outside versioned review and release gates.
+
 Do not store credentials, private keys, access tokens, datasets, model weights,
 raw job logs, or machine-specific configuration in this directory.

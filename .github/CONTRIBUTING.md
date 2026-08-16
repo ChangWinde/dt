@@ -4,6 +4,12 @@ DistTrainer operates real processes on shared GPU systems. Changes must
 preserve reproducibility, process safety, recoverability, and automation
 contracts.
 
+The repository is publicly visible but remains proprietary. External
+contributions require prior written invitation and do not acquire rights merely
+by opening an issue or pull request. Review the
+[governance policy](GOVERNANCE.md), [code of conduct](CODE_OF_CONDUCT.md), and
+[license](../LICENSE) before contributing.
+
 ## Development setup
 
 DistTrainer supports Python 3.10 and 3.11. Install the locked development
@@ -80,13 +86,16 @@ Run:
 
 ```bash
 uv run --no-sync pytest -q -p no:cacheprovider \
-  -W error::pytest.PytestUnhandledThreadExceptionWarning
+  -W error::pytest.PytestUnhandledThreadExceptionWarning \
+  --cov=dt --cov-branch --cov-report=term-missing:skip-covered
 uv run --no-sync python scripts/docs.py
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync mypy --strict --no-incremental \
   --cache-dir=/tmp/dt-mypy --follow-imports=skip \
-  src/dt scripts/audit_release.py scripts/release_contract.py
+  src/dt scripts/audit_release.py scripts/benchmark_control_plane.py \
+  scripts/benchmark_remote_plane.py scripts/docs.py \
+  scripts/release_contract.py scripts/repo_hygiene.py
 uv run --no-sync python scripts/repo_hygiene.py
 bash -n src/dt/payload/*.sh bootstrap.sh install.sh scripts/deploy.sh \
   scripts/package-check.sh scripts/release-check.sh scripts/security-check.sh
@@ -96,7 +105,11 @@ git diff --check
 
 Run tests on Python 3.10 and 3.11 before merging a release-impacting change.
 CI performs that matrix, isolated package qualification, and the pinned
-security gate. Formal release promotion remains a separate clean-commit gate.
+security gate. Python 3.11 also enforces the measured combined statement and
+branch coverage ratchet from `pyproject.toml`; subprocess-first payloads remain
+covered by behavioral integration tests even when their isolated interpreter
+does not contribute every executed line to the in-process measurement. Formal
+release promotion repeats the coverage gate from a clean source archive.
 
 ## Documentation
 

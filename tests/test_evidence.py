@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from dt import cli, evidence
+from dt import evidence, pull_evidence
 from dt.dispatch import PAYLOAD_DIR
 
 
@@ -91,11 +91,11 @@ def test_every_allowlisted_evidence_schema_accepts_its_exact_producer_shape(name
 def test_pull_materialization_uses_the_complete_evidence_contract(tmp_path, name):
     path = tmp_path / name
     path.write_text(json.dumps(_records()[name]) + "\n")
-    cli._validate_pulled_evidence(path, name)
+    pull_evidence.validate_file(path, name)
 
     path.write_text(json.dumps({"schema_version": _records()[name]["schema_version"]}))
     with pytest.raises(ValueError):
-        cli._validate_pulled_evidence(path, name)
+        pull_evidence.validate_file(path, name)
 
 
 @pytest.mark.parametrize("name", sorted(_records()))
@@ -180,7 +180,7 @@ def test_result_producer_and_pull_accept_json_escaped_controls(tmp_path):
         '{"multi\\nline":"valid\\tvalue"}',
     )
 
-    cli._validate_pulled_evidence(result_path, "result.json")
+    pull_evidence.validate_file(result_path, "result.json")
 
 
 def test_guard_and_resource_diagnostics_accept_multiline_stderr():
@@ -203,7 +203,7 @@ def test_guard_and_resource_diagnostics_accept_multiline_stderr():
 
 def test_jsonl_evidence_rejects_an_oversized_unterminated_line_boundedly(tmp_path):
     path = tmp_path / "resources.jsonl"
-    path.write_bytes(b"x" * (cli.PULL_EVIDENCE_LINE_MAX_BYTES + 1))
+    path.write_bytes(b"x" * (pull_evidence.PULL_EVIDENCE_LINE_MAX_BYTES + 1))
 
     with pytest.raises(ValueError, match="line 1 exceeds 1 MiB"):
-        cli._validate_pulled_evidence(path, "resources.jsonl")
+        pull_evidence.validate_file(path, "resources.jsonl")

@@ -28,7 +28,8 @@ import time
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from threading import Event
+from typing import Callable
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = ROOT / "src"
@@ -539,7 +540,7 @@ def _controlled_probe(
     cfg: HeadConfig,
     node: Node,
     *,
-    cancel_event: Any,
+    cancel_event: Event,
     delay_s: float,
 ) -> NodeStatus:
     del cfg
@@ -649,17 +650,22 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
         slow_cfg.nodes[-1] = Node(name="node-slow", probe_timeout_s=args.probe_delay_s)
         original = probe._probe_configured_node  # noqa: SLF001
 
-        def injected(config: HeadConfig, node: Node, *, cancel_event: Any = None):
+        def injected(
+            cfg: HeadConfig,
+            node: Node,
+            *,
+            cancel_event: Event | None = None,
+        ) -> NodeStatus:
             if cancel_event is None:
                 raise RuntimeError("ordinary soft-deadline probe lost cancellation")
             return _controlled_probe(
-                config,
+                cfg,
                 node,
                 cancel_event=cancel_event,
                 delay_s=args.probe_delay_s,
             )
 
-        probe._probe_configured_node = injected  # type: ignore[assignment]  # noqa: SLF001
+        probe._probe_configured_node = injected  # noqa: SLF001
         try:
 
             def action() -> None:
@@ -682,7 +688,7 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
                 samples=args.probe_samples,
             )
         finally:
-            probe._probe_configured_node = original  # type: ignore[assignment]  # noqa: SLF001
+            probe._probe_configured_node = original  # noqa: SLF001
         result["workload"] = (
             f"{args.nodes} nodes; one real {args.probe_delay_s:g}s child failure; "
             f"ordinary {args.probe_budget_s:g}s soft deadline; scheduler context included"

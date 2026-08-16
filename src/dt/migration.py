@@ -103,25 +103,6 @@ def _disk_bytes(path: Path) -> int | None:
     return None
 
 
-def _same_file(source: Path, destination: Path) -> bool:
-    try:
-        source_result = read_bounded_regular(
-            source,
-            max_bytes=MAX_JOB_RECORD_BYTES,
-        )
-        destination_result = read_bounded_regular(
-            destination,
-            max_bytes=MAX_JOB_RECORD_BYTES,
-        )
-        return (
-            source_result is not None
-            and destination_result is not None
-            and source_result[0] == destination_result[0]
-        )
-    except PrivateStateError:
-        return False
-
-
 def _registry_entry(path: Path, *, layout: str, job_id: str) -> JobEntry:
     result = read_bounded_regular(path, max_bytes=MAX_JOB_RECORD_BYTES)
     if result is None:
