@@ -129,7 +129,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   conduct expectations, protected-main and signed-tag policy, and the tracked
   documentation source of truth. Strict typing now covers every tracked Python
   quality, documentation, and benchmark script as well as the package. The
-  proprietary license and existing historical tags are unchanged.
+  PR workflow also avoids duplicating the same checks through a feature-branch
+  push event. The proprietary license and existing historical tags are unchanged.
 
 - Runtime evidence is separated under the control capsule's `.dt/evidence/`
   path, which is not exported to the application environment. Pull excludes
