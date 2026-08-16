@@ -461,10 +461,6 @@ def _safe_number(value: object) -> int | float | None:
     return value
 
 
-def _numbers(values: list[object]) -> list[int | float]:
-    return [n for value in values if (n := _safe_number(value)) is not None]
-
-
 def _valid_number(value: object) -> bool:
     return _safe_number(value) is not None
 

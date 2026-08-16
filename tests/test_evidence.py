@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from dt import cli, evidence, pull_evidence
+from dt import evidence, pull_evidence
 from dt.dispatch import PAYLOAD_DIR
 
 
@@ -207,12 +207,3 @@ def test_jsonl_evidence_rejects_an_oversized_unterminated_line_boundedly(tmp_pat
 
     with pytest.raises(ValueError, match="line 1 exceeds 1 MiB"):
         pull_evidence.validate_file(path, "resources.jsonl")
-
-
-def test_cli_preserves_the_pull_evidence_compatibility_seam():
-    assert cli._pull_evidence_probe is pull_evidence.inventory_command
-    assert cli._parse_pulled_evidence_probe is pull_evidence.parse_inventory
-    assert cli._validate_pulled_evidence is pull_evidence.validate_file
-    assert (
-        cli._validate_materialized_pull_tree is pull_evidence.validate_materialized_tree
-    )

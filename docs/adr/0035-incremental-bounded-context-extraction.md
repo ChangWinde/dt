@@ -32,12 +32,12 @@ execution, or command rendering.
 - Cons: measures debt without creating an enforceable ownership boundary; new
   domain logic would continue accumulating in the composition root.
 
-### Option C: Extract one bounded context at a time behind compatibility seams
+### Option C: Extract one bounded context at a time and migrate its callers
 
 - Pros: each move has a narrow contract, direct tests, import direction, and
   independently reviewable failure modes; public behavior remains stable.
-- Cons: temporary private aliases remain in the composition root while older
-  tests and internal callers migrate.
+- Cons: every internal caller and test double must migrate deliberately so the
+  new dependency direction is real rather than cosmetic.
 
 ## Decision
 
@@ -48,15 +48,14 @@ Choose Option C. Domain extraction requires all of the following:
 2. direct contract tests for the new module plus an integration test through
    the CLI;
 3. a one-way dependency from the composition root into the domain module;
-4. a temporary private compatibility seam when moving it immediately would
-   create unrelated churn;
+4. direct module-qualified calls after all in-repository callers migrate;
 5. no public CLI, JSON, exit-code, persistence, or security-contract change.
 
 `pull_evidence.py` is the first extraction. It owns the allowlisted evidence
 inventory, ambiguity-free JSON decoding, versioned evidence validation, and
 post-transfer tree safety. `cli.py` retains transfer sequencing, user-facing
-errors, and result rendering. The private aliases in `cli.py` preserve existing
-test and internal seams while new unit tests target the domain module directly.
+errors, and result rendering. All in-repository callers and test doubles use the
+domain module directly; the composition root does not re-export private aliases.
 
 Coverage and selected bug-oriented lint rules form ratchets, not a substitute
 for design review. The measured combined statement/branch threshold is set
@@ -70,6 +69,5 @@ attributed to the in-process coverage file.
 Security-sensitive evidence validation can be reviewed without navigating the
 CLI command graph, and subsequent extractions have an explicit acceptance
 template. The codebase will not become perfectly layered in one change; size
-alone is not a reason to move cohesive orchestration. Compatibility aliases are
-private debt and may be removed only after their callers are migrated with
-equivalent regression coverage.
+alone is not a reason to move cohesive orchestration. An extraction is incomplete
+while the composition root still mirrors the moved policy through private aliases.

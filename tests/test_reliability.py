@@ -23,7 +23,7 @@ import dt.lifecycle as lifecycle
 import dt.sshio as sshio
 from typer.testing import CliRunner
 
-from dt import cli
+from dt import cli, pull_evidence
 from dt.config import HeadConfig, LaptopConfig, Node, Project, QueueCfg
 from dt.dispatch import RunSpec, _try_nodes
 from dt.jobs import JobEntry
@@ -3088,7 +3088,7 @@ def test_pull_large_outputs_warns_before_transfer(
     def fake_run_on(_node, _local, command, **_kwargs):
         stdout = (
             ""
-            if cli.PULL_EVIDENCE_MARK in command
+            if pull_evidence.PULL_EVIDENCE_MARK in command
             else "16106127360\tdt/jobs/jid/outputs\n"
         )
         return subprocess.CompletedProcess([], 0, stdout, "")
@@ -3291,7 +3291,7 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
 
     def fake_run_on(_node, _local, command, **_kwargs):
         return subprocess.CompletedProcess(
-            [], 0 if cli.PULL_EVIDENCE_MARK in command else 1, "", ""
+            [], 0 if pull_evidence.PULL_EVIDENCE_MARK in command else 1, "", ""
         )
 
     monkeypatch.setattr(cli, "run_on", fake_run_on)
@@ -3392,7 +3392,7 @@ def test_pull_json_success_contract(tmp_path, monkeypatch):
     def fake_run_on(_node, _local, command, **_kwargs):
         stdout = (
             ""
-            if cli.PULL_EVIDENCE_MARK in command
+            if pull_evidence.PULL_EVIDENCE_MARK in command
             else "16106127360\tdt/jobs/jid/outputs\n"
         )
         return subprocess.CompletedProcess([], 0, stdout, "")
@@ -3470,7 +3470,7 @@ def test_single_pull_absolutizes_a_relative_destination(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
 
     def fake_run_on(_node, _local, command, **_kwargs):
-        stdout = "" if cli.PULL_EVIDENCE_MARK in command else "0\toutputs\n"
+        stdout = "" if pull_evidence.PULL_EVIDENCE_MARK in command else "0\toutputs\n"
         return subprocess.CompletedProcess([], 0, stdout, "")
 
     monkeypatch.setattr(cli, "run_on", fake_run_on)
@@ -3618,8 +3618,9 @@ def test_pull_recovers_only_validated_control_path_evidence(tmp_path, monkeypatc
 
     def fake_run_on(_node, _local, command, **_kwargs):
         stdout = (
-            f"{cli.PULL_EVIDENCE_MARK}\tcontrol\nresult.json\nresources.jsonl\n"
-            if cli.PULL_EVIDENCE_MARK in command
+            f"{pull_evidence.PULL_EVIDENCE_MARK}\tcontrol\n"
+            "result.json\nresources.jsonl\n"
+            if pull_evidence.PULL_EVIDENCE_MARK in command
             else "0\tdt/jobs/jid/outputs\n"
         )
         return subprocess.CompletedProcess([], 0, stdout, "")
@@ -3735,8 +3736,8 @@ def test_pull_accepts_the_real_v2_clone_cache_receipt(tmp_path, monkeypatch):
 
     def fake_run_on(_node, _local, command, **_kwargs):
         stdout = (
-            f"{cli.PULL_EVIDENCE_MARK}\tcontrol\ncache-reuse.json\n"
-            if cli.PULL_EVIDENCE_MARK in command
+            f"{pull_evidence.PULL_EVIDENCE_MARK}\tcontrol\ncache-reuse.json\n"
+            if pull_evidence.PULL_EVIDENCE_MARK in command
             else "0\tdt/jobs/jid/outputs\n"
         )
         return subprocess.CompletedProcess([], 0, stdout, "")
@@ -3789,7 +3790,7 @@ def test_pull_cache_reuse_receipts_fail_closed_on_incomplete_or_wrong_types(
     path.write_text(json.dumps(receipt) + "\n")
 
     with pytest.raises(ValueError, match="cache-reuse.json"):
-        cli._validate_pulled_evidence(path, "cache-reuse.json")
+        pull_evidence.validate_file(path, "cache-reuse.json")
 
 
 def test_pull_cache_reuse_v1_and_v2_receipts_both_validate(tmp_path):
@@ -3799,7 +3800,7 @@ def test_pull_cache_reuse_v1_and_v2_receipts_both_validate(tmp_path):
         _cache_reuse_v2_clone_receipt(tmp_path),
     ):
         path.write_text(json.dumps(receipt) + "\n")
-        cli._validate_pulled_evidence(path, "cache-reuse.json")
+        pull_evidence.validate_file(path, "cache-reuse.json")
 
 
 def test_pull_cache_reuse_receipt_rejects_duplicate_json_fields(tmp_path):
@@ -3813,7 +3814,7 @@ def test_pull_cache_reuse_receipt_rejects_duplicate_json_fields(tmp_path):
     )
 
     with pytest.raises(ValueError, match="duplicate JSON field"):
-        cli._validate_pulled_evidence(path, "cache-reuse.json")
+        pull_evidence.validate_file(path, "cache-reuse.json")
 
 
 def test_pull_reports_skipped_special_output_as_incomplete(tmp_path, monkeypatch):

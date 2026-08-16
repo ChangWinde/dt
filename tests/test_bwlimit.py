@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 import dt.dispatch as dispatch
 import dt.sync_relay as sync_relay
-from dt import cli
+from dt import cli, pull_evidence
 from dt.config import HeadConfig, Node, Site, head_bwlimit_kbps, parse
 from dt.jobs import JobEntry
 from dt.sshio import rsync
@@ -138,7 +138,7 @@ def test_pull_applies_the_site_default_and_flag_override(tmp_path, monkeypatch):
     def fake_run_on(_node, _local, command, **_kwargs):
         stdout = (
             ""
-            if cli.PULL_EVIDENCE_MARK in command
+            if pull_evidence.PULL_EVIDENCE_MARK in command
             else "1073741824\tdt/jobs/jid/outputs\n"
         )
         return subprocess.CompletedProcess([], 0, stdout, "")

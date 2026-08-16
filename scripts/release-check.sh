@@ -82,7 +82,9 @@ VIRTUAL_ENV="$QUALITY_ENV" uv sync --project "$SOURCE_TREE" \
     "$QUALITY_ENV/bin/ruff" format --check .
     "$QUALITY_ENV/bin/mypy" --strict --no-incremental \
         --cache-dir="$WORK_DIR/mypy" --follow-imports=skip \
-        src/dt scripts/audit_release.py scripts/release_contract.py
+        src/dt scripts/audit_release.py scripts/benchmark_control_plane.py \
+        scripts/benchmark_remote_plane.py scripts/docs.py \
+        scripts/release_contract.py scripts/repo_hygiene.py
     bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
         install.sh scripts/package-check.sh scripts/release-check.sh \
         scripts/security-check.sh

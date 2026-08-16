@@ -315,9 +315,10 @@ than empty tables. The full rationale and width contract are recorded in
 
 `src/dt/cli.py` is the Typer composition root. It preserves command names,
 stdout/stderr separation, JSON schemas, and stable exit codes. Cohesive domain
-policy moves out incrementally behind tested compatibility seams rather than by
-a wholesale command rewrite; [ADR 0035](adr/0035-incremental-bounded-context-extraction.md)
-defines the boundary and acceptance criteria.
+policy moves out incrementally through tested, module-qualified call-site
+migrations rather than by a wholesale command rewrite;
+[ADR 0035](adr/0035-incremental-bounded-context-extraction.md) defines the
+boundary and acceptance criteria.
 
 | Area | Modules |
 |---|---|

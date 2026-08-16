@@ -70,7 +70,7 @@ branch = true
 source = ["dt"]
 
 [tool.coverage.report]
-# The measured Python 3.11 baseline is 79.82% across statements and branches.
+# The measured Python 3.11 baseline is 79.85% across statements and branches.
 # Keep a platform margin while making any material regression fail CI. Raise
 # this ratchet only with focused behavioral tests, never exclusions for ordinary
 # production paths.

@@ -122,12 +122,14 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   safety now live in a bounded domain module instead of the CLI composition
   root. Public pull behavior remains compatible, while direct module tests,
   combined statement/branch coverage, and focused bug-oriented lint rules make
-  further modularization measurable and reviewable.
+  further modularization measurable and reviewable. Internal callers now use
+  that module directly instead of retaining duplicate CLI aliases.
 
 - Repository governance now records accountable ownership, contribution and
   conduct expectations, protected-main and signed-tag policy, and the tracked
-  documentation source of truth. The proprietary license and existing
-  historical tags are unchanged.
+  documentation source of truth. Strict typing now covers every tracked Python
+  quality, documentation, and benchmark script as well as the package. The
+  proprietary license and existing historical tags are unchanged.
 
 - Runtime evidence is separated under the control capsule's `.dt/evidence/`
   path, which is not exported to the application environment. Pull excludes

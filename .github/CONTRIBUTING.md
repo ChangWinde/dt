@@ -93,7 +93,9 @@ uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync mypy --strict --no-incremental \
   --cache-dir=/tmp/dt-mypy --follow-imports=skip \
-  src/dt scripts/audit_release.py scripts/release_contract.py
+  src/dt scripts/audit_release.py scripts/benchmark_control_plane.py \
+  scripts/benchmark_remote_plane.py scripts/docs.py \
+  scripts/release_contract.py scripts/repo_hygiene.py
 uv run --no-sync python scripts/repo_hygiene.py
 bash -n src/dt/payload/*.sh bootstrap.sh install.sh scripts/deploy.sh \
   scripts/package-check.sh scripts/release-check.sh scripts/security-check.sh

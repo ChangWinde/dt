@@ -182,16 +182,6 @@ JOB_REFS_MAX_BYTES = 2 * 1024 * 1024
 
 JsonDict: TypeAlias = dict[str, Any]
 
-# Private aliases keep the established CLI/test seam while the security-sensitive
-# pull evidence boundary lives in its own module.
-PULL_EVIDENCE_LINE_MAX_BYTES = pull_evidence_mod.PULL_EVIDENCE_LINE_MAX_BYTES
-PULL_EVIDENCE_MARK = pull_evidence_mod.PULL_EVIDENCE_MARK
-PULL_EVIDENCE_SCHEMAS = pull_evidence_mod.PULL_EVIDENCE_SCHEMAS
-_pull_evidence_probe = pull_evidence_mod.inventory_command
-_parse_pulled_evidence_probe = pull_evidence_mod.parse_inventory
-_validate_pulled_evidence = pull_evidence_mod.validate_file
-_validate_materialized_pull_tree = pull_evidence_mod.validate_materialized_tree
-
 
 def _read_bounded_text_input(path: Path, *, max_bytes: int) -> str:
     """Read an explicit CLI input without accepting unbounded or special files."""
@@ -13491,7 +13481,7 @@ def _pull_unlocked(
                 partial=True,
             )
         try:
-            _validate_materialized_pull_tree(dst)
+            pull_evidence_mod.validate_materialized_tree(dst)
         except (OSError, ValueError) as exc:
             fail(
                 "unsafe_output",
@@ -13590,7 +13580,7 @@ def _pull_unlocked(
         evidence_probe = run_on(
             entry.node,
             entry.node_local,
-            _pull_evidence_probe(entry),
+            pull_evidence_mod.inventory_command(entry),
             timeout=10,
             cancel_event=_cancel_event,
         )
@@ -13629,7 +13619,7 @@ def _pull_unlocked(
             partial=True,
         )
     try:
-        evidence_kind, evidence_names = _parse_pulled_evidence_probe(
+        evidence_kind, evidence_names = pull_evidence_mod.parse_inventory(
             evidence_probe.stdout or ""
         )
         evidence_provenance = (
@@ -13702,7 +13692,7 @@ def _pull_unlocked(
                     partial=True,
                 )
             try:
-                _validate_pulled_evidence(evidence_destination, evidence_name)
+                pull_evidence_mod.validate_file(evidence_destination, evidence_name)
             except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
                 fail(
                     "evidence_invalid",
@@ -13717,7 +13707,7 @@ def _pull_unlocked(
             evidence_records.append(evidence_name)
 
     try:
-        _validate_materialized_pull_tree(dst)
+        pull_evidence_mod.validate_materialized_tree(dst)
     except (OSError, ValueError) as exc:
         fail(
             "unsafe_output",

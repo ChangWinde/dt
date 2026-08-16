@@ -8,8 +8,7 @@ import threading
 import pytest
 from typer.testing import CliRunner
 
-from dt import cli
-from dt import pull_relay
+from dt import cli, pull_evidence, pull_relay
 from dt.config import HeadConfig, Node, Site
 from dt.jobs import JobEntry
 from dt.pull_relay import (
@@ -454,7 +453,7 @@ def _invoke_pull(cfg, monkeypatch, *, rsync_results, stage_results, argv=()):
     rsync_calls = []
 
     def fake_run_on(node, local, command, timeout=15, check=False, **kw):
-        if cli.PULL_EVIDENCE_MARK in command:
+        if pull_evidence.PULL_EVIDENCE_MARK in command:
             return subprocess.CompletedProcess([], 0, "", "")
         if "pull-staging" in command and "rsync" in command:
             staged.append((node, command))
