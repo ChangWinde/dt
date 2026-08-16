@@ -44,14 +44,24 @@ jobs:
 
       - name: Test
         env:
+          COVERAGE_FILE: ${{ runner.temp }}/dt-coverage
           DT_REQUIRE_RELAY_E2E: "1"
           TZ: UTC
           UV_PYTHON: ${{ matrix.python-version }}
         run: |
           set +e
+          coverage_args=()
+          if [[ "$UV_PYTHON" == "3.11" ]]; then
+            coverage_args+=(
+              --cov=dt
+              --cov-branch
+              --cov-report=term-missing:skip-covered
+            )
+          fi
           env -u FORCE_COLOR uv run --no-sync pytest -q --tb=short \
             -p no:cacheprovider \
             -W error::pytest.PytestUnhandledThreadExceptionWarning \
+            "${coverage_args[@]}" \
             2>&1 | tee "$RUNNER_TEMP/dt-pytest.log"
           test_status=${PIPESTATUS[0]}
           set -e

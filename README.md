@@ -212,7 +212,8 @@ Vulkan, EGL, OpenGL, or device files. Read the
 ```bash
 uv sync --locked --all-groups
 uv run --no-sync pytest -q -p no:cacheprovider \
-  -W error::pytest.PytestUnhandledThreadExceptionWarning
+  -W error::pytest.PytestUnhandledThreadExceptionWarning \
+  --cov=dt --cov-branch --cov-report=term-missing:skip-covered
 uv run --no-sync ruff check .
 uv run --no-sync ruff format --check .
 uv run --no-sync python scripts/docs.py
@@ -220,6 +221,9 @@ scripts/security-check.sh
 ```
 
 See [Contributing](.github/CONTRIBUTING.md) for the complete quality gate.
+Repository stewardship is defined by
+[Governance](.github/GOVERNANCE.md), [CODEOWNERS](.github/CODEOWNERS), and the
+[Code of conduct](.github/CODE_OF_CONDUCT.md).
 
 ## License
 

@@ -314,7 +314,10 @@ than empty tables. The full rationale and width contract are recorded in
 ## Source modules
 
 `src/dt/cli.py` is the Typer composition root. It preserves command names,
-stdout/stderr separation, JSON schemas, and stable exit codes.
+stdout/stderr separation, JSON schemas, and stable exit codes. Cohesive domain
+policy moves out incrementally behind tested compatibility seams rather than by
+a wholesale command rewrite; [ADR 0035](adr/0035-incremental-bounded-context-extraction.md)
+defines the boundary and acceptance criteria.
 
 | Area | Modules |
 |---|---|
@@ -322,13 +325,18 @@ stdout/stderr separation, JSON schemas, and stable exit codes.
 | Placement and queueing | `dispatch.py`, `agent.py`, `scheduler.py`, `probe.py`, `completion.py` |
 | Remote boundaries | `remote.py`, `forwarding.py`, `sshio.py`, `topology.py`, `artifact_distribution.py`, `lifecycle.py` |
 | Observation | `monitoring.py`, `ps_query.py`, `doctor.py`, `render.py` |
-| Data recovery and retention | `transfers.py`, `storage.py`, `migration.py`, `compact.py`, `maintenance.py` |
+| Data recovery and retention | `transfers.py`, `pull_evidence.py`, `storage.py`, `migration.py`, `compact.py`, `maintenance.py` |
 | Identity | `snapshot_hash.py`, `snapshot_store.py`, `payload_hash.py` |
 | Node runtime | `payload/` |
 
 Domain modules expose typed or pure boundaries where practical. Subprocess,
 SSH, filesystem, registry, and terminal rendering remain explicit seams so
 failure paths can be tested independently.
+
+Recovered runtime evidence is one such boundary. `pull_evidence.py` owns its
+fixed inventory, strict versioned validation, and safe materialization checks;
+the CLI owns transfer sequencing and presentation. The domain module therefore
+does not import Typer, Rich, SSH transport, or the CLI composition root.
 
 Destructive retention policy lives outside the dispatcher. It accepts explicit
 remote and local seams, validates each job directory against its exact registry
@@ -349,6 +357,9 @@ alternative are recorded in
 ```text
 dt/
 ├── .github/            Community policy, CI, and dependency automation
+│   ├── CODEOWNERS       Accountable review ownership
+│   ├── GOVERNANCE.md    Decision, contribution, and release governance
+│   ├── CODE_OF_CONDUCT.md  Collaboration expectations
 │   ├── CONTRIBUTING.md Contribution and verification contract
 │   ├── SECURITY.md     Trust boundary and vulnerability reporting
 │   └── SUPPORT.md      Supported platform and compatibility contract

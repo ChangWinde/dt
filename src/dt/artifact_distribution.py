@@ -1216,14 +1216,21 @@ class TransferExecutor:
         for route in routes:
             try:
                 with self._retain_peer_source(route, digest):
-                    transferred_bytes, transferred_files = self._verified_transfer(
-                        lambda checksum: self._p2p_transfer(
-                            route,
+
+                    def transfer(
+                        checksum: bool,
+                        selected_route: DiscoveredRoute = route,
+                    ) -> tuple[int, int | None]:
+                        return self._p2p_transfer(
+                            selected_route,
                             destination,
                             destination_code,
                             copy_dest,
                             checksum=checksum,
-                        ),
+                        )
+
+                    transferred_bytes, transferred_files = self._verified_transfer(
+                        transfer,
                         lambda: self.verifier.require(
                             destination,
                             destination_code,

@@ -1,0 +1,9 @@
+# DistTrainer currently has one accountable maintainer. Keep critical runtime,
+# release, workflow, and architectural changes routed through that owner.
+* @ChangWinde
+
+/src/dt/payload/ @ChangWinde
+/scripts/deploy.sh @ChangWinde
+/scripts/release-check.sh @ChangWinde
+/.github/workflows/ @ChangWinde
+/docs/adr/ @ChangWinde

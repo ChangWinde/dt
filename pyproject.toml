@@ -32,6 +32,7 @@ dev = [
     "hatchling==1.31.0",
     "mypy==2.3.0",
     "pytest==9.1.1",
+    "pytest-cov==7.1.0",
     "ruff==0.16.0",
 ]
 security = [
@@ -62,4 +63,18 @@ extend-exclude = [".logs", "results"]
 [tool.ruff.lint]
 # Keep the lint contract stable across Ruff releases. New rule families are
 # adopted deliberately instead of changing implicitly on dependency updates.
-select = ["E4", "E7", "E9", "F"]
+select = ["E4", "E7", "E9", "F", "B023", "PIE810", "RUF012", "RUF200"]
+
+[tool.coverage.run]
+branch = true
+source = ["dt"]
+
+[tool.coverage.report]
+# The measured Python 3.11 baseline is 79.82% across statements and branches.
+# Keep a platform margin while making any material regression fail CI. Raise
+# this ratchet only with focused behavioral tests, never exclusions for ordinary
+# production paths.
+fail_under = 79
+precision = 2
+show_missing = true
+skip_covered = true

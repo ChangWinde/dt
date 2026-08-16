@@ -73,8 +73,10 @@ VIRTUAL_ENV="$QUALITY_ENV" uv sync --project "$SOURCE_TREE" \
 (
     cd "$SOURCE_TREE"
     export DT_REPO_HYGIENE_MANIFEST="$TRACKED_MANIFEST"
-    "$QUALITY_ENV/bin/pytest" -q -p no:cacheprovider \
-        -W error::pytest.PytestUnhandledThreadExceptionWarning
+    COVERAGE_FILE="$WORK_DIR/coverage" "$QUALITY_ENV/bin/pytest" -q \
+        -p no:cacheprovider \
+        -W error::pytest.PytestUnhandledThreadExceptionWarning \
+        --cov=dt --cov-branch --cov-report=term-missing:skip-covered
     "$QUALITY_ENV/bin/python" scripts/docs.py
     "$QUALITY_ENV/bin/ruff" check .
     "$QUALITY_ENV/bin/ruff" format --check .

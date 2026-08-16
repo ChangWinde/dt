@@ -84,11 +84,14 @@ verified bootstrap independently on both minors, and produces:
 python3 -m json.tool dist/release-audit.json
 python3 -m json.tool dist/release-manifest.json
 VERSION=$(uv version --short)
-git tag -a "v$VERSION" -m "DistTrainer $VERSION"
+git tag -s "v$VERSION" -m "DistTrainer $VERSION"
+git tag -v "v$VERSION"
 ```
 
 Deriving `VERSION` from the project metadata keeps the tag, the bundle
-filenames, and `pyproject.toml` from drifting apart.
+filenames, and `pyproject.toml` from drifting apart. New release tags must be
+signed by a maintainer identity configured before the release begins; never
+fall back to an unsigned tag because a signing key is unavailable.
 
 The manifest must report `git_dirty: false` and the intended release commit.
 Do not move or recreate a published tag.
