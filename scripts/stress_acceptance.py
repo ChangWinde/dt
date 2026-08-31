@@ -6,7 +6,7 @@ agree, so this drives the *installed* ``dt`` binary end to end: a resident
 agent, a burst of concurrent submissions, and an optional agent restart in the
 middle. It fails when any job records the historical mis-cancellation
 signature (``cancelled by dispatcher`` with no started_at and no GPUs) or ends
-in any state other than success.
+in any state other than ``finished`` with exit code 0.
 
 Run it against a real but idle node, for example:
 
@@ -50,27 +50,38 @@ def _submit(dt: str, args: argparse.Namespace, name: str) -> tuple[str, str, str
         str(args.gpus),
         "-n",
         name,
+        "--request-id",
+        f"{name}-acceptance",
         "--json",
     ]
     if args.project:
         argv += ["-p", args.project]
     argv += ["--", "bash", "-c", "sleep 1; echo stress-ok"]
-    proc = _run(argv, timeout=args.submit_timeout)
-    stdout = proc.stdout.strip()
-    job_id = ""
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        job_id = str(payload.get("job_id") or "")
-        if job_id:
-            break
-    detail = stdout if proc.returncode == 0 else (proc.stderr.strip() or stdout)
-    return name, job_id, "" if proc.returncode == 0 else detail
+    # The stable request id makes retries idempotent, so a submission that
+    # lands inside the deliberate agent-restart window (fail-closed rejection)
+    # is retried instead of counted as a dispatch defect.
+    detail = ""
+    for attempt in range(3):
+        if attempt:
+            time.sleep(3)
+        proc = _run(argv, timeout=args.submit_timeout)
+        stdout = proc.stdout.strip()
+        job_id = ""
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            job_id = str(payload.get("job_id") or "")
+            if job_id:
+                break
+        if proc.returncode == 0:
+            return name, job_id, ""
+        detail = proc.stderr.strip() or stdout
+    return name, "", detail
 
 
 def _job_rows(dt: str, prefix: str) -> dict[str, dict[str, object]]:
@@ -143,7 +154,7 @@ def main() -> int:
 
     deadline = time.monotonic() + args.settle_timeout
     rows: dict[str, dict[str, object]] = {}
-    terminal = {"success", "failed", "killed", "skipped", "lost"}
+    terminal = {"finished", "failed", "killed", "skipped", "lost"}
     while time.monotonic() < deadline:
         rows = _job_rows(dt, prefix)
         pending = [
@@ -169,8 +180,11 @@ def main() -> int:
             miscancelled.append(f"{name} ({job_id}): {reason[:160]}")
         if status not in terminal:
             unfinished.append(f"{name} ({job_id}): still {status}")
-        elif status != "success":
-            unsuccessful.append(f"{name} ({job_id}): {status}: {reason[:160]}")
+        elif status != "finished" or row.get("exit_code") != 0:
+            exit_code = row.get("exit_code")
+            unsuccessful.append(
+                f"{name} ({job_id}): {status}/{exit_code}: {reason[:160]}"
+            )
 
     for label, lines in (
         ("submission", failures),
