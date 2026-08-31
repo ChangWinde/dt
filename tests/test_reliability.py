@@ -995,7 +995,7 @@ def test_launch_drop_fails_over_to_next_node(tmp_path, monkeypatch):
         lambda node, job_dir, session, **kwargs: cancelled.append(node.name),
     )
 
-    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0):
+    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
         if node.name == "n1":
             raise RemoteError("n1", "timed out after 3600s")
         return 0, {"gpus": [0], "pgid": 42}
@@ -1017,6 +1017,43 @@ def test_launch_drop_fails_over_to_next_node(tmp_path, monkeypatch):
     assert "launch dropped" in reasons["n1"]
     assert entry.placement_failures == {"n1": reasons["n1"]}
     assert cancelled == ["n1"]  # orphan cleanup ran for the dropped node
+
+
+def test_identity_conflict_stops_failover_without_cancel_or_failure(
+    tmp_path, monkeypatch
+):
+    """A live foreign launch identity must not trigger a second-node attempt."""
+    cfg = _cfg(tmp_path)
+    attempted: list[str] = []
+    cancelled: list[str] = []
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda node, job_dir, session, **kwargs: cancelled.append(node.name),
+    )
+
+    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
+        attempted.append(node.name)
+        return 18, "a different launch identity owns this job directory"
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+    entry, reasons, fatal, failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda m: None,
+    )
+
+    assert entry is None
+    assert not fatal  # the queued row must stay queued, not become failed
+    assert attempted == ["n1"]  # no failover to n2: it could double-launch
+    assert cancelled == []  # the foreign attempt is not ours to cancel
+    assert "identity-conflict" in reasons["n1"]
+    assert "identity-conflict" in failure_kinds
 
 
 def test_successful_launch_records_payload_identity(tmp_path, monkeypatch):
@@ -1050,7 +1087,7 @@ def test_successful_launch_records_stage_timings_and_environment_state(
 ):
     cfg = _cfg(tmp_path)
 
-    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
         return 0, {
             "gpus": [0],
             "pgid": 42,
@@ -1143,7 +1180,7 @@ def test_launch_drop_stops_failover_when_orphan_cancel_is_unverified(
     cfg = _cfg(tmp_path)
     launched = []
 
-    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
         launched.append(node.name)
         if node.name == "n1":
             raise RemoteError("n1", "connection dropped")
@@ -1186,7 +1223,7 @@ def test_unknown_launcher_exit_cancels_orphan_then_fails_over(tmp_path, monkeypa
         lambda node, job_dir, session, **kwargs: cancelled.append(node.name),
     )
 
-    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
         if node.name == "n1":
             return 255, "ssh: connection reset during launch"
         return 0, {"gpus": [0], "pgid": 42}
@@ -1216,7 +1253,7 @@ def test_unknown_launcher_exit_stops_failover_when_cancel_unverified(
     cfg = _cfg(tmp_path)
     launched: list[str] = []
 
-    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
         launched.append(node.name)
         return 255, "ssh: connection reset during launch"
 
@@ -1256,7 +1293,7 @@ def test_zero_exit_with_unparsable_output_cancels_before_failover(
         lambda node, job_dir, session, **kwargs: cancelled.append(node.name),
     )
 
-    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
         if node.name == "n1":
             return 0, "launcher stdout was not json"
         return 0, {"gpus": [0], "pgid": 42}
@@ -1350,7 +1387,7 @@ def test_retryable_launcher_exit_fails_over_without_cancel(tmp_path, monkeypatch
         ),
     )
 
-    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0):
+    def fake_launch(cfg_, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
         if node.name == "n1":
             return 10, "busy"
         return 0, {"gpus": [0], "pgid": 42}
@@ -1598,7 +1635,7 @@ def test_snapshot_failure_fails_over(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     launched: list[str] = []
 
-    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0):
+    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
         launched.append(node.name)
         return 0, {"gpus": [0], "pgid": 42}
 
@@ -1649,7 +1686,7 @@ def test_all_snapshot_link_failures_are_classified_unreachable(tmp_path):
 def test_env_fail_still_aborts(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
 
-    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0):
+    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
         return 13, "uv sync failed, see logs/env.log"
 
     monkeypatch.setattr(dispatch, "launch", fake_launch)
@@ -1670,7 +1707,7 @@ def test_env_fail_still_aborts(tmp_path, monkeypatch):
 def test_payload_integrity_failure_aborts_before_failover(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
 
-    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0):
+    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
         return 17, (
             "payload-integrity: expected " + "a" * 64 + ", observed " + "b" * 64
         )
@@ -2175,6 +2212,14 @@ def test_pull_multiple_json_recovers_jobs_concurrently_into_isolated_dirs(
         "finished",
         "finished",
     ]
+    for job in payload["jobs"]:
+        destination = batch.absolute() / str(job["job_id"])
+        # Landing contract: outputs/ contents merge directly into the
+        # job-level root, so outputs_root equals destination_root and
+        # automation must not append another outputs/ segment.
+        assert job["destination_root"] == str(destination)
+        assert job["outputs_root"] == str(destination)
+        assert job["files"] == ["dt/", "result.txt"]
     assert result.stdout.count("\n") == 1
     for entry in entries.values():
         destination = batch / entry.job_id
@@ -3341,6 +3386,9 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
         "job_status": "failed",
         "node": "n1",
         "destination": str(destination),
+        "destination_root": str(destination),
+        "outputs_root": None,
+        "files": ["dt/"],
         "lite": True,
         "excludes": [
             "checkpoints/",
@@ -3427,6 +3475,9 @@ def test_pull_json_success_contract(tmp_path, monkeypatch):
         "job_status": "running",
         "node": "n1",
         "destination": str(destination),
+        "destination_root": str(destination),
+        "outputs_root": str(destination),
+        "files": ["dt/"],
         "lite": True,
         "excludes": [
             "checkpoints/",

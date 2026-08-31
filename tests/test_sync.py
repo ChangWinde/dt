@@ -27,6 +27,50 @@ def _cfg(tmp_path):
     )
 
 
+def _sparse_file(path, size):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as stream:
+        if size:
+            stream.seek(size - 1)
+            stream.write(b"\0")
+
+
+def test_snapshot_size_warning_names_offenders_and_artifact_flow(tmp_path):
+    cfg = _cfg(tmp_path)
+    code = tmp_path / "code"
+    _sparse_file(code / "exp" / "result" / "run1" / "ckpt.bin", 3 * 2**30)
+    _sparse_file(code / "data" / "raw.gif", 2**30)
+    _sparse_file(code / "train.py", 512)
+    stdout = "Total transferred file size: 4,294,967,808 bytes\n"
+    lines: list[str] = []
+
+    dispatch._warn_snapshot_size(cfg, stdout, lines.append, tree=code)
+
+    assert any("snapshot transferred 4.0 GiB" in line for line in lines)
+    offenders = [line for line in lines if "GiB  " in line]
+    assert "exp/result/" in offenders[0]
+    assert "data/" in offenders[1]
+    suggestion = next(line for line in lines if "snapshot_excludes:" in line)
+    assert '"exp/result/"' in suggestion and '"data/"' in suggestion
+    assert any("--artifact-manifest" in line for line in lines)
+
+
+def test_snapshot_size_warning_stays_silent_below_threshold(tmp_path):
+    cfg = _cfg(tmp_path)
+    code = tmp_path / "code"
+    _sparse_file(code / "train.py", 512)
+    lines: list[str] = []
+
+    dispatch._warn_snapshot_size(
+        cfg,
+        "Total transferred file size: 1,024 bytes\n",
+        lines.append,
+        tree=code,
+    )
+
+    assert lines == []
+
+
 def test_durable_object_publish_fails_closed_on_unknown_tree_durability(
     tmp_path, monkeypatch
 ):

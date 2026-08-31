@@ -676,6 +676,120 @@ def test_role_queue_references_immutable_objects_without_copying_source(tmp_path
     assert (cfg.payloads_dir() / payload_digest / "launcher.sh").is_file()
 
 
+def _role_queue_fixture(tmp_path):
+    """Stage a role-layout queue bundle plus its authoritative registry row."""
+    from dt.dispatch import _ensure_role_queue_bundle  # noqa: F401
+
+    cfg = _cfg(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "train.py").write_text("print('queued')\n")
+    stored = capture_snapshot(cfg, "p", project)
+    runtime = _runtime_payload_files()
+    payload_digest = payload_sha256(runtime)
+    _stored_payload_dir(cfg, payload_digest, runtime)
+    spec = RunSpec(
+        name="queued",
+        gpus=1,
+        cmd=["python", "train.py"],
+        project="p",
+        payload_sha256=payload_digest,
+    )
+    staged = _stage(
+        cfg,
+        stored.code_dir,
+        "queued-job",
+        spec,
+        {"job_id": "queued-job", "project": "p"},
+        stored=stored,
+        runtime_files=runtime,
+    )
+    entry = JobEntry(
+        job_id="queued-job",
+        name="queued",
+        center="test",
+        project="p",
+        node="-",
+        node_local=False,
+        job_dir="dt/jobs/queued-job",
+        session="dt_queued-job",
+        cmd="python train.py",
+        status="queued",
+        gpus_requested=1,
+        snapshot_sha256=stored.sha256,
+        payload_sha256=payload_digest,
+        storage_layout=ROLE_LAYOUT,
+    )
+    return cfg, entry, spec, staged, stored
+
+
+def test_role_queue_bundle_rebuilds_a_lost_source_reference(tmp_path):
+    from dt import dispatch
+
+    cfg, entry, spec, staged, stored = _role_queue_fixture(tmp_path)
+    (staged / ".dt" / "source.json").unlink()
+    (staged / ".dt" / "command.sh").unlink()
+    logs: list[str] = []
+
+    dispatch._ensure_role_queue_bundle(  # noqa: SLF001
+        cfg, entry, spec, staged, stored.code_dir, logs.append
+    )
+
+    reference = json.loads((staged / ".dt" / "source.json").read_text())
+    assert reference == {
+        "schema_version": "dt_queue_source_v1",
+        "snapshot_sha256": stored.sha256,
+        "payload_sha256": entry.payload_sha256,
+    }
+    assert (staged / ".dt" / "command.sh").read_text() == "python train.py\n"
+    meta = json.loads((staged / ".dt" / "meta.json").read_text())
+    assert meta["job_id"] == "queued-job"
+    assert meta["snapshot_sha256"] == stored.sha256
+    assert any("rebuilt queued control bundle" in line for line in logs)
+
+
+def test_role_queue_bundle_replaces_a_symlinked_source_reference(tmp_path):
+    from dt import dispatch
+
+    cfg, entry, spec, staged, stored = _role_queue_fixture(tmp_path)
+    source_ref = staged / ".dt" / "source.json"
+    source_ref.unlink()
+    source_ref.symlink_to(tmp_path / "outside")
+    logs: list[str] = []
+
+    dispatch._ensure_role_queue_bundle(  # noqa: SLF001
+        cfg, entry, spec, staged, stored.code_dir, logs.append
+    )
+
+    assert not source_ref.is_symlink()
+    reference = json.loads(source_ref.read_text())
+    assert reference["snapshot_sha256"] == stored.sha256
+
+
+def test_role_queue_bundle_leaves_an_intact_bundle_untouched(tmp_path):
+    from dt import dispatch
+
+    cfg, entry, spec, staged, stored = _role_queue_fixture(tmp_path)
+    before = {
+        path.name: path.read_bytes()
+        for path in (staged / ".dt").iterdir()
+        if path.is_file()
+    }
+    logs: list[str] = []
+
+    dispatch._ensure_role_queue_bundle(  # noqa: SLF001
+        cfg, entry, spec, staged, stored.code_dir, logs.append
+    )
+
+    after = {
+        path.name: path.read_bytes()
+        for path in (staged / ".dt").iterdir()
+        if path.is_file()
+    }
+    assert after == before
+    assert logs == []
+
+
 def test_runtime_payload_store_self_heals_from_attested_source(tmp_path):
     cfg = _cfg(tmp_path)
     runtime = _runtime_payload_files()

@@ -203,6 +203,7 @@ _OPTIONAL_NUMBER_FIELDS = frozenset(
 _TEXT_LIST_FIELDS = frozenset({"extras", "after_result_states", "custom_env_keys"})
 _OPTIONAL_TEXT_LIST_FIELDS = frozenset({"setup_inputs"})
 _TEXT_MAP_FIELDS = frozenset({"placement_failures", "worker_roots"})
+_OPTIONAL_TEXT_MAP_FIELDS = frozenset({"submodule_commits", "artifact_targets"})
 _NUMBER_MAP_FIELDS = frozenset({"launch_phases_s"})
 _STRUCTURED_FIELDS = frozenset({"progress", "resources"})
 _PROJECTED_CONTRACT_FIELDS = frozenset().union(
@@ -217,6 +218,7 @@ _PROJECTED_CONTRACT_FIELDS = frozenset().union(
     _TEXT_LIST_FIELDS,
     _OPTIONAL_TEXT_LIST_FIELDS,
     _TEXT_MAP_FIELDS,
+    _OPTIONAL_TEXT_MAP_FIELDS,
     _NUMBER_MAP_FIELDS,
     _STRUCTURED_FIELDS,
     {"gpus"},
@@ -409,7 +411,9 @@ def _valid_projected_field(name: str, value: object) -> bool:
             and len(value) <= MAX_JOB_COLLECTION_ITEMS
             and all(_bounded_text(item) for item in value)
         )
-    if name in _TEXT_MAP_FIELDS:
+    if name in _TEXT_MAP_FIELDS or name in _OPTIONAL_TEXT_MAP_FIELDS:
+        if value is None and name in _OPTIONAL_TEXT_MAP_FIELDS:
+            return True
         return (
             isinstance(value, dict)
             and len(value) <= MAX_JOB_COLLECTION_ITEMS

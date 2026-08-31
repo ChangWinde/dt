@@ -209,9 +209,14 @@ class JobEntry:
     exit_code: int | None = None
     git_sha: str | None = None
     git_dirty: bool = False
+    # Bounded submit-time {submodule_path: sha}; None when unproven.
+    submodule_commits: dict[str, str] | None = None
     snapshot_sha256: str | None = None
     payload_sha256: str | None = None  # exact dt node-runtime content identity
     artifact_manifest: str | None = None  # frozen shared-input content identity
+    # Declarative workspace links {code-relative target: artifact-root
+    # relative source}, materialized by the launcher after verification.
+    artifact_targets: dict[str, str] | None = None
     max_hours: float | None = None
     min_vram_mib: int | None = None  # minimum total memory on every selected GPU
     max_vram_mib: int | None = None  # per-selected-GPU device-memory guard
@@ -229,6 +234,12 @@ class JobEntry:
     # is cleared only after the attempt is proven absent or adopted.
     dispatch_node: str | None = None
     dispatch_token: str | None = None
+    # Head-local process identity (boot:pid:start-ticks) of the dispatcher
+    # holding the claim, and when it claimed. Recovery may cancel a claim only
+    # when its owner is provably gone or the claim has clearly gone stale;
+    # otherwise a live concurrent dispatch would be misread as interrupted.
+    dispatch_owner: str | None = None
+    dispatch_claimed_at: float | None = None
     placement_failures: dict[str, str] = field(default_factory=dict)
     env_hash: str | None = None  # shared reproducible venv identity (12 hex)
     snapshot_duration_s: float | None = None  # successful node snapshot transfer
@@ -414,7 +425,14 @@ _JOB_ENTRY_FIELDS = frozenset(
     item.name for item in fields(JobEntry) if item.name not in _INTERNAL_JOB_FIELDS
 )
 PRIVATE_JOB_FIELDS = frozenset(
-    {"custom_env", "dispatch_node", "dispatch_token", *_INTERNAL_JOB_FIELDS}
+    {
+        "custom_env",
+        "dispatch_node",
+        "dispatch_token",
+        "dispatch_owner",
+        "dispatch_claimed_at",
+        *_INTERNAL_JOB_FIELDS,
+    }
 )
 
 
@@ -671,6 +689,7 @@ def _decode_entry(
         entry.finished_at,
         entry.updated_at,
         entry.terminal_finalized_at,
+        entry.dispatch_claimed_at,
     )
     if entry.created_at is None or any(
         value is not None
@@ -697,6 +716,24 @@ def _decode_entry(
         raise ValueError("job registry has invalid worker roots")
     if len(entry.worker_roots) > MAX_JOB_COLLECTION_ITEMS:
         raise ValueError("job registry has too many worker roots")
+    if entry.submodule_commits is not None and (
+        not isinstance(entry.submodule_commits, dict)
+        or len(entry.submodule_commits) > MAX_JOB_COLLECTION_ITEMS
+        or any(
+            not isinstance(path, str) or not isinstance(sha, str)
+            for path, sha in entry.submodule_commits.items()
+        )
+    ):
+        raise ValueError("job registry has invalid submodule commits")
+    if entry.artifact_targets is not None and (
+        not isinstance(entry.artifact_targets, dict)
+        or len(entry.artifact_targets) > MAX_JOB_COLLECTION_ITEMS
+        or any(
+            not isinstance(target, str) or not isinstance(source, str)
+            for target, source in entry.artifact_targets.items()
+        )
+    ):
+        raise ValueError("job registry has invalid artifact targets")
     if (
         not isinstance(entry.extras, list)
         or len(entry.extras) > MAX_PROJECT_EXTRAS
@@ -756,6 +793,21 @@ def _decode_entry(
         raise ValueError("job registry has an incomplete dispatch attempt identity")
     if entry.dispatch_node is not None and entry.status != "queued":
         raise ValueError("only queued jobs may retain a dispatch attempt identity")
+    if entry.dispatch_owner is not None and (
+        not isinstance(entry.dispatch_owner, str)
+        or re.fullmatch(
+            r"[A-Za-z0-9-]{1,64}:[0-9]{1,10}:[0-9]{1,20}",
+            entry.dispatch_owner,
+        )
+        is None
+    ):
+        raise ValueError("job registry has an invalid dispatch owner identity")
+    if entry.dispatch_token is None:
+        # The owner identity lives and dies with its claim token. Normalize
+        # instead of rejecting so a partial historical clear can never make a
+        # row unreadable.
+        entry.dispatch_owner = None
+        entry.dispatch_claimed_at = None
     digest_fields = (
         entry.snapshot_sha256,
         entry.payload_sha256,
@@ -2311,6 +2363,16 @@ def occupies_quota(entry: JobEntry, *, now: float | None = None) -> bool:
         entry.dispatch_node is not None or entry.dispatch_token is not None
     ):
         return True
+    return lost_reconciling(entry, now=now)
+
+
+def lost_reconciling(entry: JobEntry, *, now: float | None = None) -> bool:
+    """Whether a lost verdict is still inside its evidence recovery window.
+
+    Within :data:`LOST_RECHECK_S` a fresh RUNNING probe may still rescue the
+    row, so consumers should present the loss as identity reconciliation
+    rather than a settled terminal outcome.
+    """
     if entry.status != "lost" or entry.terminal_finalized_at is not None:
         return False
     observed_at = entry.finished_at or entry.updated_at or entry.created_at
@@ -2696,6 +2758,62 @@ def queue_contexts(entries: list[JobEntry]) -> dict[str, dict[str, object]]:
         }
         for index, entry in enumerate(queue)
     }
+
+
+def queue_eligible_nodes(cfg: HeadConfig, entry: JobEntry) -> list[str]:
+    """Configured nodes that could statically accept this queued job.
+
+    Query-surface projection only: it applies what the configuration alone
+    can prove -- the drain switch and an explicit pin. GPU count, VRAM, disk,
+    and required paths are probed at dispatch time, so they never statically
+    exclude a node here. Placement decisions do not read this.
+    """
+    names = [node.name for node in cfg.nodes if not node.drained]
+    if entry.pin_node is not None:
+        return [name for name in names if name == entry.pin_node]
+    return names
+
+
+def queue_placement_contexts(
+    cfg: HeadConfig,
+    entries: list[JobEntry],
+) -> dict[str, dict[str, object]]:
+    """Explain each queued job's wait beyond its global FIFO position.
+
+    The global position counts every queued job, so a job pinned to a busy
+    node can sit at position 1 while later jobs are free to start on other
+    nodes. ``contention_position`` counts only earlier queued jobs whose
+    statically eligible node sets intersect this job's -- the queue the job
+    actually competes in -- and is null when no configured node is eligible.
+    ``last_attempt_at`` projects the private dispatch claim time as a plain
+    observability timestamp; the claim's owner and token stay private.
+    Purely additive display data: dispatch never reads it.
+    """
+    queue = sorted(
+        (entry for entry in entries if entry.status == "queued"),
+        key=lambda entry: entry.created_at,
+    )
+    eligible = {entry.job_id: queue_eligible_nodes(cfg, entry) for entry in queue}
+    contexts: dict[str, dict[str, object]] = {}
+    for index, entry in enumerate(queue):
+        nodes = set(eligible[entry.job_id])
+        contention = (
+            1
+            + sum(
+                1 for earlier in queue[:index] if nodes & set(eligible[earlier.job_id])
+            )
+            if nodes
+            else None
+        )
+        contexts[entry.job_id] = {
+            "global_position": index + 1,
+            "pinned_node": entry.pin_node,
+            "eligible_nodes": eligible[entry.job_id],
+            "contention_position": contention,
+            "blocked_reason": entry.reason,
+            "last_attempt_at": entry.dispatch_claimed_at,
+        }
+    return contexts
 
 
 def _scope_ref(cfg: HeadConfig, ref: str) -> str | None:

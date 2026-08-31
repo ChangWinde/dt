@@ -1020,6 +1020,191 @@ def test_successful_dependency_releases_normal_dispatch(tmp_path, monkeypatch):
     assert persisted.reason is None
 
 
+def _handoff_cfg(tmp_path: Path) -> HeadConfig:
+    # Remote-only nodes keep every rsync endpoint a literal "node:path"
+    # string instead of an environment-dependent local expansion.
+    return HeadConfig(
+        center="test",
+        nodes=[Node(name="n1"), Node(name="n2"), Node(name="n3")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+        queue=QueueCfg(),
+    )
+
+
+def _handoff_mocks(monkeypatch, *, probe_stdout="2048\n", fail_push_to=()):
+    """Patch the dispatch seams around _try_nodes and record every call."""
+    calls = {"run_on": [], "rsync": [], "launch": []}
+
+    def fake_run_on(name, local, command, timeout=None, **kwargs):
+        calls["run_on"].append((name, command))
+        if "du -s -b" in command:
+            return subprocess.CompletedProcess([], 0, probe_stdout, "")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    def fake_rsync(src, dst, **kwargs):
+        calls["rsync"].append((src, dst, kwargs))
+        if any(dst.startswith(f"{node}:") for node in fail_push_to):
+            return subprocess.CompletedProcess([], 30, "", "rsync timeout")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    def fake_launch(cfg_, node_, job_id_, job_dir_, session_, spec_, reserve_, **kw):
+        calls["launch"].append({"node": node_.name, **kw})
+        return 0, {"gpus": [], "pgid": 123, "env": "envhash", "boot_id": "boot-1"}
+
+    monkeypatch.setattr(dispatch_mod, "run_on", fake_run_on)
+    monkeypatch.setattr(dispatch_mod, "rsync", fake_rsync)
+    monkeypatch.setattr(dispatch_mod, "launch", fake_launch)
+    return calls
+
+
+def _handoff_try_nodes(cfg, candidates):
+    spec = RunSpec(name="eval", gpus=0, cmd=["true"], after_success="pred")
+    return dispatch_mod._try_nodes(
+        cfg,
+        candidates,
+        spec,
+        "eval-job",
+        "dt/jobs/eval-job",
+        "dt_eval-job",
+        lambda node: "a" * 64,
+        lambda message: None,
+    )
+
+
+def test_cross_node_predecessor_outputs_materialize_before_launch(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _handoff_cfg(tmp_path)
+    save(cfg, _entry("pred", "finished", created_at=1.0, node="n3", exit_code=0))
+    calls = _handoff_mocks(monkeypatch)
+
+    entry, reasons, fatal, kinds = _handoff_try_nodes(cfg, [Node(name="n1")])
+
+    assert entry is not None and entry.node == "n1"
+    assert reasons == {} and fatal is False and kinds == set()
+    pull, push = calls["rsync"]
+    assert pull[0] == "n3:dt/jobs/pred/outputs/"
+    assert pull[1].startswith(str(cfg.queue_dir()))
+    assert pull[2]["timeout"] == dispatch_mod.BULK_TRANSFER_TIMEOUT_S
+    assert pull[2]["retries"] == 2
+    assert pull[2]["safe_links"] is True
+    assert push[0] == pull[1]
+    assert push[1] == "n1:dt/jobs/eval-job/.dt/predecessor-outputs/"
+    assert push[2]["delete"] is True
+    assert push[2]["private_destination"] is True
+    assert push[2]["retries"] == 2
+    prepared = [
+        command
+        for name, command in calls["run_on"]
+        if name == "n1" and "predecessor-outputs" in command
+    ]
+    assert prepared and "chmod 700" in prepared[0]
+    assert [launch["node"] for launch in calls["launch"]] == ["n1"]
+    assert (
+        calls["launch"][0]["predecessor_outputs_dir"]
+        == "dt/jobs/eval-job/.dt/predecessor-outputs"
+    )
+    # The head-side relay staging never survives the attempt.
+    assert list(cfg.queue_dir().glob(".predecessor-*")) == []
+
+
+def test_predecessor_outputs_failure_skips_candidate_without_launch(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _handoff_cfg(tmp_path)
+    save(cfg, _entry("pred", "finished", created_at=1.0, node="n3", exit_code=0))
+    calls = _handoff_mocks(monkeypatch, fail_push_to=("n1",))
+
+    entry, reasons, fatal, kinds = _handoff_try_nodes(cfg, [Node(name="n1")])
+
+    assert entry is None and fatal is False
+    assert kinds == {"retryable"}
+    assert reasons["n1"].startswith("predecessor outputs unavailable:")
+    assert "rsync timeout" in reasons["n1"]
+    assert calls["launch"] == []
+    cleanup = [
+        command
+        for name, command in calls["run_on"]
+        if name == "n1" and command.startswith("rm -rf")
+    ]
+    assert cleanup and "predecessor-outputs" in cleanup[0]
+
+
+def test_predecessor_outputs_failure_fails_over_to_next_candidate(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _handoff_cfg(tmp_path)
+    save(cfg, _entry("pred", "finished", created_at=1.0, node="n3", exit_code=0))
+    calls = _handoff_mocks(monkeypatch, fail_push_to=("n1",))
+
+    entry, reasons, fatal, kinds = _handoff_try_nodes(
+        cfg,
+        [Node(name="n1"), Node(name="n2")],
+    )
+
+    assert entry is not None and entry.node == "n2"
+    assert fatal is False and "retryable" in kinds
+    assert reasons["n1"].startswith("predecessor outputs unavailable:")
+    assert [launch["node"] for launch in calls["launch"]] == ["n2"]
+    assert entry.placement_failures["n1"] == reasons["n1"]
+
+
+@pytest.mark.parametrize("probe_stdout", ["ABSENT\n", "EMPTY\n"])
+def test_predecessor_without_outputs_launches_with_identity_only(
+    tmp_path,
+    monkeypatch,
+    probe_stdout,
+):
+    cfg = _handoff_cfg(tmp_path)
+    save(cfg, _entry("pred", "finished", created_at=1.0, node="n3", exit_code=0))
+    calls = _handoff_mocks(monkeypatch, probe_stdout=probe_stdout)
+
+    entry, reasons, fatal, kinds = _handoff_try_nodes(cfg, [Node(name="n1")])
+
+    assert entry is not None and entry.node == "n1"
+    assert reasons == {} and fatal is False and kinds == set()
+    assert calls["rsync"] == []
+    assert calls["launch"][0]["predecessor_outputs_dir"] is None
+
+
+def test_same_node_predecessor_never_materializes(tmp_path, monkeypatch):
+    cfg = _handoff_cfg(tmp_path)
+    save(cfg, _entry("pred", "finished", created_at=1.0, node="n1", exit_code=0))
+    calls = _handoff_mocks(monkeypatch)
+
+    entry, reasons, fatal, kinds = _handoff_try_nodes(cfg, [Node(name="n1")])
+
+    assert entry is not None and entry.node == "n1"
+    assert reasons == {} and fatal is False and kinds == set()
+    assert calls["rsync"] == []
+    assert all("du -s -b" not in command for _name, command in calls["run_on"])
+    assert calls["launch"][0]["predecessor_outputs_dir"] is None
+
+
+def test_oversized_predecessor_outputs_refuse_materialization(
+    tmp_path,
+    monkeypatch,
+):
+    cfg = _handoff_cfg(tmp_path)
+    save(cfg, _entry("pred", "finished", created_at=1.0, node="n3", exit_code=0))
+    over_limit = dispatch_mod.PREDECESSOR_OUTPUTS_MAX_GIB * 1024**3 + 1
+    calls = _handoff_mocks(monkeypatch, probe_stdout=f"{over_limit}\n")
+
+    entry, reasons, fatal, kinds = _handoff_try_nodes(cfg, [Node(name="n1")])
+
+    assert entry is None and fatal is False
+    assert kinds == {"retryable"}
+    assert "above the 64 GiB handoff limit" in reasons["n1"]
+    assert calls["rsync"] == []
+    assert calls["launch"] == []
+
+
 def test_scientific_rejection_does_not_satisfy_after_success(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     predecessor = _entry(
@@ -3151,6 +3336,7 @@ def test_dispatch_queued_replays_setup_extras_and_fork_lineage(tmp_path, monkeyp
         created_at=None,
         payload_sha256=None,
         before_attempt=None,
+        **kwargs,
     ):
         seen["spec"] = spec
         seen["created_at"] = created_at
@@ -3231,6 +3417,7 @@ def test_concurrent_dispatchers_cannot_replace_an_active_attempt(tmp_path, monke
         created_at=None,
         payload_sha256=None,
         before_attempt=None,
+        **kwargs,
     ):
         assert before_attempt is not None
         owned = before_attempt(candidates[0], job_dir)
@@ -3508,6 +3695,11 @@ def test_dispatch_queued_never_replays_after_identity_marker_without_runtime_sta
     tmp_path,
     monkeypatch,
 ):
+    """MATCH+NONE may only retire the attempt through a verified cancellation.
+
+    Here the termination probe cannot verify death, so the entry must stay
+    blocked with its claim intact instead of being replayed or failed.
+    """
     import dt.dispatch as dispatch
 
     cfg = _cfg(tmp_path)
@@ -3546,12 +3738,174 @@ def test_dispatch_queued_never_replays_after_identity_marker_without_runtime_sta
     outcome, detail = dispatch.dispatch_queued(cfg, entry, lambda _message: None)
 
     assert outcome == "blocked"
-    assert detail is not None and "runtime state is unproven" in detail
+    assert detail is not None and "dispatch recovery unverified on n1" in detail
     current = load(cfg, entry.job_id)
     assert current is not None
     assert current.status == "queued"
     assert current.dispatch_node == "n1"
     assert current.dispatch_token == "b" * 32
+
+
+def test_dispatch_queued_recovers_a_marker_only_attempt_after_verified_cancel(
+    tmp_path,
+    monkeypatch,
+):
+    """MATCH+NONE with a DEAD cancellation verdict must release the claim.
+
+    A launcher that published its identity and then died before starting any
+    session used to block the job forever; the token-bound cancel plus the
+    complete census proves retiring it is safe.
+    """
+    import dt.dispatch as dispatch
+
+    cfg = _cfg(tmp_path)
+    entry = _entry(
+        "q-recover-marker-dead",
+        "queued",
+        created_at=1.0,
+        dispatch_node="n1",
+        dispatch_token="b" * 32,
+    )
+    (dispatch.stage_dir(cfg, entry.job_id) / "code").mkdir(parents=True)
+    save(cfg, entry)
+    recovery = "\n".join(
+        [
+            dispatch.REQUEST_REMOTE_PROOF_MARK,
+            "MATCH",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            dispatch.LAUNCH_RECOVERY_MARK,
+            "NONE",
+            "",
+        ]
+    )
+
+    def fake_run_on(node, local, command, **kwargs):
+        if "DT_KCANCEL" in command:
+            return subprocess.CompletedProcess([], 0, "DEAD\n", "")
+        return subprocess.CompletedProcess([], 0, recovery, "")
+
+    monkeypatch.setattr(dispatch, "run_on", fake_run_on)
+    monkeypatch.setattr(dispatch, "probe_center", lambda *args, **kwargs: [])
+
+    outcome, detail = dispatch.dispatch_queued(cfg, entry, lambda _message: None)
+
+    assert outcome == "busy"
+    current = load(cfg, entry.job_id)
+    assert current is not None
+    assert current.status == "queued"
+    assert current.dispatch_node is None
+    assert current.dispatch_token is None
+
+
+def test_dispatch_queued_waits_for_a_live_dispatcher_instead_of_cancelling(
+    tmp_path,
+    monkeypatch,
+):
+    """A claim owned by a live head process must never be probed or cancelled.
+
+    The owner may be mid-rsync or mid-launch with no remote evidence yet;
+    treating that window as an interrupted attempt is exactly the historical
+    "cancelled by dispatcher; not starting" incident.
+    """
+    import dt.dispatch as dispatch
+
+    cfg = _cfg(tmp_path)
+    owner = subprocess.Popen(["sleep", "60"])
+    try:
+        ticks = dispatch._process_start_ticks(owner.pid)
+        assert ticks is not None
+        entry = _entry(
+            "q-live-owner",
+            "queued",
+            created_at=1.0,
+            dispatch_node="n1",
+            dispatch_token="b" * 32,
+            dispatch_owner=(f"{dispatch._current_head_boot_id()}:{owner.pid}:{ticks}"),
+            dispatch_claimed_at=time.time(),
+        )
+        (dispatch.stage_dir(cfg, entry.job_id) / "code").mkdir(parents=True)
+        save(cfg, entry)
+        monkeypatch.setattr(
+            dispatch,
+            "run_on",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("a live claim must not be probed remotely")
+            ),
+        )
+        monkeypatch.setattr(
+            dispatch,
+            "probe_center",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("a live claim must not reach placement")
+            ),
+        )
+
+        outcome, detail = dispatch.dispatch_queued(cfg, entry, lambda _m: None)
+
+        assert outcome == "waiting"
+        assert detail is not None and "dispatch in progress" in detail
+        current = load(cfg, entry.job_id)
+        assert current is not None
+        assert current.status == "queued"
+        assert current.dispatch_node == "n1"
+        assert current.dispatch_token == "b" * 32
+    finally:
+        owner.kill()
+        owner.wait()
+
+
+def test_dispatch_queued_recovers_a_claim_whose_owner_died(
+    tmp_path,
+    monkeypatch,
+):
+    """A dead owner's claim goes through the proven-absent recovery protocol."""
+    import dt.dispatch as dispatch
+
+    cfg = _cfg(tmp_path)
+    owner = subprocess.Popen(["sleep", "60"])
+    ticks = dispatch._process_start_ticks(owner.pid)
+    assert ticks is not None
+    owner_identity = f"{dispatch._current_head_boot_id()}:{owner.pid}:{ticks}"
+    owner.kill()
+    owner.wait()
+    entry = _entry(
+        "q-dead-owner",
+        "queued",
+        created_at=1.0,
+        dispatch_node="n1",
+        dispatch_token="b" * 32,
+        dispatch_owner=owner_identity,
+        dispatch_claimed_at=time.time(),
+    )
+    (dispatch.stage_dir(cfg, entry.job_id) / "code").mkdir(parents=True)
+    save(cfg, entry)
+    recovery = "\n".join(
+        [
+            dispatch.REQUEST_REMOTE_PROOF_MARK,
+            "ABSENT",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            dispatch.LAUNCH_RECOVERY_MARK,
+            "NONE",
+            "",
+        ]
+    )
+
+    def fake_run_on(node, local, command, **kwargs):
+        if "DT_KCANCEL" in command:
+            return subprocess.CompletedProcess([], 0, "DEAD\n", "")
+        return subprocess.CompletedProcess([], 0, recovery, "")
+
+    monkeypatch.setattr(dispatch, "run_on", fake_run_on)
+    monkeypatch.setattr(dispatch, "probe_center", lambda *args, **kwargs: [])
+
+    outcome, detail = dispatch.dispatch_queued(cfg, entry, lambda _m: None)
+
+    assert outcome == "busy"
+    current = load(cfg, entry.job_id)
+    assert current is not None
+    assert current.status == "queued"
+    assert current.dispatch_node is None
+    assert current.dispatch_token is None
 
 
 def test_dispatch_queued_treats_zero_effective_disk_floor_as_unset(

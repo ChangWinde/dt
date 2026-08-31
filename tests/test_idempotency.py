@@ -382,6 +382,175 @@ def test_claimed_action_failure_is_durably_rejected_without_launch(
     assert launches == 0
 
 
+def test_interrupted_claimed_action_reopens_and_reruns_preparation(
+    tmp_path, monkeypatch
+):
+    """A dropped artifact transfer resumes under the same request id."""
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    actions = 0
+
+    class InterruptedTransfer(Exception):
+        retry_safe = True
+
+    def flaky_action() -> None:
+        nonlocal actions
+        actions += 1
+        if actions == 1:
+            raise InterruptedTransfer("[n1] artifact sync failed: tunnel dropped")
+
+    def submit_once(cfg_, spec_, **kwargs):
+        return _entry(cfg_, spec_, kwargs["allocated_job_id"], kwargs["submitted_at"])
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", submit_once)
+    spec = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        artifact_manifest="a" * 64,
+        request_id="agent-artifact-resume",
+    )
+
+    def submit() -> JobEntry:
+        return dispatch._submit_prepared(
+            cfg,
+            spec,
+            source_factory=lambda: source,
+            git_sha=None,
+            git_dirty=False,
+            git_diff=None,
+            log=lambda _message: None,
+            no_queue=False,
+            claimed_action=flaky_action,
+        )
+
+    with pytest.raises(InterruptedTransfer):
+        submit()
+    rejected = intent_mod.load(cfg, "agent-artifact-resume")
+    assert rejected is not None
+    assert rejected.state == "rejected"
+    assert rejected.error_kind == "claimed_action_interrupted"
+
+    entry = submit()
+
+    assert actions == 2
+    assert entry.job_id == rejected.job_id
+    confirmed = intent_mod.load(cfg, "agent-artifact-resume")
+    assert confirmed is not None
+    assert confirmed.state == "confirmed"
+
+
+def test_unreachable_rejection_reopens_for_the_same_request_id(tmp_path, monkeypatch):
+    """An interrupted transfer must not poison its request id forever."""
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    attempts = 0
+
+    def flaky_submit_once(cfg_, spec_, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise dispatch.NoReachableNode(
+                {"n1": "snapshot failed: [n1] sync failed: tunnel dropped"}
+            )
+        return _entry(cfg_, spec_, kwargs["allocated_job_id"], kwargs["submitted_at"])
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", flaky_submit_once)
+    spec = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        request_id="agent-transfer-retry",
+    )
+
+    with pytest.raises(dispatch.NoReachableNode):
+        _submit(cfg, spec, source)
+    rejected = intent_mod.load(cfg, "agent-transfer-retry")
+    assert rejected is not None
+    assert rejected.state == "rejected"
+    assert rejected.error_kind == "NoReachableNode"
+
+    entry = _submit(cfg, spec, source)
+
+    assert attempts == 2
+    assert entry.job_id == rejected.job_id
+    confirmed = intent_mod.load(cfg, "agent-transfer-retry")
+    assert confirmed is not None
+    assert confirmed.state == "confirmed"
+    assert confirmed.job_id == rejected.job_id
+
+
+def test_deterministic_rejection_stays_terminal(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    source = _source(tmp_path)
+    attempts = 0
+
+    def failing_submit_once(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise dispatch.DispatchError("run spec rejected by policy")
+
+    monkeypatch.setattr(dispatch, "_submit_prepared_once", failing_submit_once)
+    spec = RunSpec(
+        name="train",
+        gpus=1,
+        cmd=["true"],
+        project="p",
+        request_id="agent-terminal-rejection",
+    )
+
+    with pytest.raises(dispatch.DispatchError, match="rejected by policy"):
+        _submit(cfg, spec, source)
+    with pytest.raises(RequestRejected, match="already rejected"):
+        _submit(cfg, spec, source)
+
+    assert attempts == 1
+
+
+def test_retryable_rejection_disposition_requires_proven_registry_absence():
+    record = intent_mod.RequestRecord(
+        schema=intent_mod.REQUEST_SCHEMA,
+        request_id="agent-transfer-retry",
+        intent_sha256="c" * 64,
+        job_id="20260831-1200_train_0001",
+        state="rejected",
+        created_at=1.0,
+        updated_at=2.0,
+        error_kind="NoReachableNode",
+        error_message="sync failed: tunnel dropped",
+    )
+
+    absent = intent_mod.resolve_disposition(record, registry_job_present=False)
+    assert absent.disposition == "safe_replay"
+    assert absent.retry_safe is True
+    assert "durable_receipt=retryable_rejection" in absent.facts
+
+    unchecked = intent_mod.resolve_disposition(record, registry_job_present=None)
+    assert unchecked.disposition == "rejected"
+    assert unchecked.retry_safe is False
+
+    terminal = intent_mod.RequestRecord(
+        schema=intent_mod.REQUEST_SCHEMA,
+        request_id="agent-terminal",
+        intent_sha256="c" * 64,
+        job_id="20260831-1200_train_0002",
+        state="rejected",
+        created_at=1.0,
+        updated_at=2.0,
+        error_kind="DispatchError",
+        error_message="run spec rejected by policy",
+    )
+    assert (
+        intent_mod.resolve_disposition(
+            terminal,
+            registry_job_present=False,
+        ).disposition
+        == "rejected"
+    )
+
+
 def test_post_publish_claim_fsync_failure_is_outcome_unknown_and_fail_closed(
     tmp_path, monkeypatch
 ):

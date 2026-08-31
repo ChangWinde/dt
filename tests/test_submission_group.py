@@ -159,6 +159,50 @@ def test_claimed_action_failure_is_durably_rejected_and_never_retried(tmp_path):
     assert actions == 1
 
 
+def test_interrupted_group_preparation_reopens_and_reruns_the_action(tmp_path):
+    """A dropped group artifact transfer resumes under the same request id."""
+    cfg = _cfg(tmp_path)
+    request_id = "agent-batch-artifact:resume"
+    intent = "b" * 64
+    actions = 0
+
+    class InterruptedTransfer(Exception):
+        retry_safe = True
+
+    def flaky_action() -> None:
+        nonlocal actions
+        actions += 1
+        if actions == 1:
+            raise InterruptedTransfer("[n1] artifact sync failed: tunnel dropped")
+
+    def claim():
+        return group_mod.locked_claim(
+            cfg,
+            request_id,
+            intent,
+            operation="batch",
+            requested=2,
+            claimed_action=flaky_action,
+        )
+
+    with pytest.raises(InterruptedTransfer):
+        claim()
+    rejected = group_mod.load(cfg, request_id)
+    assert rejected is not None
+    assert rejected.state == "rejected"
+    assert rejected.error_kind == "claimed_action_interrupted"
+    assert rejected.submitted == 0
+
+    record = claim()
+
+    assert actions == 2
+    assert record.state == "prepared"
+    durable = group_mod.load(cfg, request_id)
+    assert durable is not None
+    assert durable.state == "prepared"
+    assert durable.error_kind is None
+
+
 def test_claimed_action_receipt_failure_is_unknown_and_action_is_not_retried(
     tmp_path, monkeypatch
 ):

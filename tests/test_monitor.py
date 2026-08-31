@@ -226,6 +226,7 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
         max_vram_mib=20000,
         max_job_memory_mib=20000,
         placement_failures={"n0": "path-missing: /data/libero"},
+        submodule_commits={"third_party/x": "b" * 40},
     )
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
@@ -328,6 +329,7 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
     assert data["rerun_of"] == "failed-parent"
     assert data["rerun_source_snapshot_sha256"] == "f" * 64
     assert data["rerun_snapshot_changed"] is True
+    assert data["submodule_commits"] == {"third_party/x": "b" * 40}
     assert data["placement_failures"] == {"n0": "path-missing: /data/libero"}
     assert data["timestamp_domains"] == {
         "queued_at": "head",
@@ -645,6 +647,14 @@ def test_info_queued_job_reports_fifo_context_in_json_and_human_output(
     assert data["queue_head_job_id"] == "queue-head"
     assert data["queue_predecessor_job_id"] == "queue-head"
     assert data["after_success"] == "queue-head"
+    assert data["queue"] == {
+        "global_position": 2,
+        "pinned_node": None,
+        "eligible_nodes": ["n1"],
+        "contention_position": 2,
+        "blocked_reason": "waiting: no free GPU",
+        "last_attempt_at": None,
+    }
     assert human.exit_code == 0, human.output
     normalized = " ".join(human.output.split())
     assert "queue 2/3 · 1 ahead" in normalized
@@ -1630,6 +1640,137 @@ def test_ps_queued_rows_report_fifo_position_depth_and_predecessor(
     assert "queued #3/3" in normalized
 
 
+def test_ps_queued_rows_explain_static_contention_beyond_global_position(
+    tmp_path, monkeypatch
+):
+    """The global FIFO number alone misleads: a job pinned to a busy node can
+    hold position 1 while a later job pinned elsewhere could start at once.
+    The queue object must expose the statically eligible nodes and the
+    position within the actually contended queue."""
+    cfg = HeadConfig(
+        center="c",
+        nodes=[
+            Node(name="busy"),
+            Node(name="idle"),
+            Node(name="parked", drained=True),
+        ],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    queued = (
+        ("pinned-busy", "busy", 1.0, "waiting: no free GPU", 111.5),
+        ("pinned-idle", "idle", 2.0, None, None),
+        ("anywhere", None, 3.0, None, None),
+        ("pinned-parked", "parked", 4.0, None, None),
+    )
+    for job_id, pin, created_at, reason, claimed_at in queued:
+        # A claim time only survives the registry as part of a complete
+        # dispatch claim (node + token + owner); decode clears strays.
+        claim = (
+            {
+                "dispatch_node": pin,
+                "dispatch_token": "0123456789abcdef0123456789abcdef",
+                "dispatch_owner": "boot-1:4242:12345",
+                "dispatch_claimed_at": claimed_at,
+            }
+            if claimed_at is not None
+            else {}
+        )
+        cli.jobs_mod.save(
+            cfg,
+            JobEntry(
+                job_id=job_id,
+                name=job_id,
+                center="c",
+                project="p",
+                node="-",
+                node_local=False,
+                job_dir=f"dt/jobs/{job_id}",
+                session=f"dt_{job_id}",
+                cmd="python train.py",
+                status="queued",
+                reason=reason,
+                created_at=created_at,
+                pin_node=pin,
+                gpus_requested=2 if job_id == "anywhere" else 1,
+                min_vram_mib=40960 if job_id == "anywhere" else None,
+                **claim,
+            ),
+        )
+    cli.jobs_mod.save(
+        cfg,
+        JobEntry(
+            job_id="already-running",
+            name="already-running",
+            center="c",
+            project="p",
+            node="busy",
+            node_local=False,
+            job_dir="dt/jobs/already-running",
+            session="dt_already_running",
+            cmd="python train.py",
+            status="running",
+            pgid=4242,
+            created_at=0.5,
+        ),
+    )
+    monkeypatch.setattr(
+        cli.jobs_mod,
+        "refresh_status",
+        lambda _cfg, entry, **_kwargs: entry,
+    )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    result = CliRunner().invoke(cli.app, ["ps", "--active", "--json"])
+
+    assert result.exit_code == 0, result.output
+    rows = {row["job_id"]: row for row in json.loads(result.stdout)}
+    assert rows["pinned-busy"]["queue_position"] == 1
+    assert rows["pinned-busy"]["queue"] == {
+        "global_position": 1,
+        "pinned_node": "busy",
+        "eligible_nodes": ["busy"],
+        "contention_position": 1,
+        "blocked_reason": "waiting: no free GPU",
+        "last_attempt_at": 111.5,
+    }
+    # Globally second, yet first in its own contention queue: no earlier
+    # queued job can land on the idle node.
+    assert rows["pinned-idle"]["queue_position"] == 2
+    assert rows["pinned-idle"]["queue"] == {
+        "global_position": 2,
+        "pinned_node": "idle",
+        "eligible_nodes": ["idle"],
+        "contention_position": 1,
+        "blocked_reason": None,
+        "last_attempt_at": None,
+    }
+    # The unpinned job competes with both earlier pins; runtime-probed
+    # requests (GPU count, VRAM) never statically shrink eligible_nodes,
+    # and the drained node is excluded.
+    assert rows["anywhere"]["queue"] == {
+        "global_position": 3,
+        "pinned_node": None,
+        "eligible_nodes": ["busy", "idle"],
+        "contention_position": 3,
+        "blocked_reason": None,
+        "last_attempt_at": None,
+    }
+    # A pin onto a drained node leaves no eligible node, so there is no
+    # contention queue to rank it in.
+    assert rows["pinned-parked"]["queue"] == {
+        "global_position": 4,
+        "pinned_node": "parked",
+        "eligible_nodes": [],
+        "contention_position": None,
+        "blocked_reason": None,
+        "last_attempt_at": None,
+    }
+    assert rows["already-running"]["queue"] is None
+
+
 def test_info_json_marks_unreachable_job_over_max_hours(tmp_path, monkeypatch):
     cfg = HeadConfig(
         center="c",
@@ -1784,6 +1925,72 @@ def test_watch_queued_tail_reports_live_fifo_reason_and_preserves_last_probe(
     rendered = " ".join(console.export_text().split())
     assert "queued #2/2" in rendered
     assert "waiting: FIFO behind queue-head (1 ahead)" in rendered
+
+
+def test_watch_presents_lost_within_recovery_window_as_reconciling(
+    tmp_path, monkeypatch
+):
+    """An unfinalized lost verdict is identity reconciliation, not a terminal."""
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    now = time.time()
+
+    def lost_entry(job_id: str, finalized: float | None) -> JobEntry:
+        return JobEntry(
+            job_id=job_id,
+            name=job_id,
+            center="c",
+            project="p",
+            node="n1",
+            node_local=False,
+            job_dir=f"dt/jobs/{job_id}",
+            session=f"dt_{job_id}",
+            cmd="python train.py",
+            gpus=[0],
+            pgid=123,
+            status="lost",
+            reason="wrapper pid 123 is not running and exit_code is missing",
+            started_at=now - 600.0,
+            finished_at=now - 60.0,
+            terminal_finalized_at=finalized,
+        )
+
+    monkeypatch.setattr(
+        cli.jobs_mod, "refresh_status", lambda cfg_, entry_, **kw: entry_
+    )
+    monkeypatch.setattr(cli, "_job_resources", lambda cfg_, entry_: None)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+
+    reconciling = lost_entry("lost-fresh", None)
+    assert cli.jobs_mod.lost_reconciling(reconciling) is True
+    _current, snapshot = cli._watch_snapshot(cfg, reconciling, lines=5)
+    assert snapshot["lost_reconciling"] is True
+
+    from rich.console import Console
+
+    console = Console(width=120, record=True, color_system=None)
+    console.print(cli._watch_view(snapshot))
+    rendered = " ".join(console.export_text().split())
+    assert "lost? reconciling" in rendered
+
+    settled = lost_entry("lost-settled", now - 30.0)
+    assert cli.jobs_mod.lost_reconciling(settled) is False
+    _current, settled_snapshot = cli._watch_snapshot(cfg, settled, lines=5)
+    assert settled_snapshot["lost_reconciling"] is False
+    console = Console(width=120, record=True, color_system=None)
+    console.print(cli._watch_view(settled_snapshot))
+    rendered = " ".join(console.export_text().split())
+    assert "lost? reconciling" not in rendered
 
 
 def test_watch_reports_selected_log_age_without_an_extra_remote_probe(

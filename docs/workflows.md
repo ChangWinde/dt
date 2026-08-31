@@ -88,6 +88,49 @@ dt pull --file lr-sweep.jobs --collection lr-sweep
 Batch captures one source snapshot. Every item remains an independent job.
 Runtime failure continues to the next item.
 
+## Declarative research matrix
+
+Use `dt matrix` when the sweep is a parameter grid rather than a hand-written
+command list. One YAML or JSON spec declares axes, exclusions, explicit
+units, per-unit overrides, and a stable matrix-level request id:
+
+```yaml
+# sweep.yaml
+request_id: agent-lr-sweep-2026a
+name_prefix: sweep
+project: policy
+axes:
+  lr: [1e-3, 3e-4]
+  seed: [0, 1, 2]
+exclude:
+  - { lr: 1e-3, seed: 2 }
+unit:
+  - match: { lr: 3e-4 }
+    overrides: { gpus: 2 }
+command: "python train.py --lr {lr} --seed {seed}"
+```
+
+```bash
+dt matrix plan sweep.yaml          # preview every expanded unit, no submission
+dt matrix run sweep.yaml --json    # submit; prints one receipt for all units
+dt matrix status agent-lr-sweep-2026a --json
+```
+
+Expansion is deterministic: units are ordered by their sorted axis-value key,
+each unit gets the child request id derived from the matrix request id and
+its index, and numeric spellings such as `3e-4` reach the command unchanged.
+Submission is a strict prefix under one durable group receipt. Rerunning
+`dt matrix run` with the same spec resumes after the confirmed prefix:
+already-registered units are reported instead of resubmitted, a transient
+placement failure (`no_capacity`, `unreachable`) leaves the request open for
+the same request id, and a changed spec under the same request id is a
+conflict, never a silent overwrite. `dt matrix status` reports per-unit
+job ids, states, exit codes, and nodes with summary counts.
+
+With `artifacts:` the spec must pin `node:`; the transfer runs once before
+any unit is registered, and an interrupted transfer records a retryable
+rejection so rerunning the same matrix resumes it.
+
 ## Success-gated pipeline
 
 Use `chain` when a stage is valid only after its predecessor succeeds:
@@ -117,6 +160,18 @@ On the same node, a successful predecessor exposes:
 $DT_PREDECESSOR_OUTPUTS
 $DT_PREDECESSOR_META_PATH
 ```
+
+When the dependent stage is placed on a different node, dispatch first copies
+the predecessor's `outputs/` tree onto that node through the head (two
+resumable rsync legs, retried twice) into a job-private
+`predecessor-outputs/` directory inside the new job, and `dt` sets both
+`$DT_PREDECESSOR_OUTPUTS` and the explicit `$DT_PREDECESSOR_OUTPUTS_DIR` to
+that copy. A candidate node that cannot receive the outputs is skipped, so an
+`--after-success` stage never starts without its declared inputs. Missing or
+empty predecessor outputs hand off nothing, matching the same-node contract.
+Trees above 64 GiB are refused; move results that large through the artifact
+flow instead. `--after-complete` and `--after-result` stages do not receive
+outputs on another node because the predecessor need not have succeeded.
 
 Waiting stages do not probe or lease GPUs. A failed, killed, lost, or nonzero
 predecessor makes dependent stages `skipped / dependency_skipped`; a missing
@@ -208,7 +263,8 @@ dt run --node gpu-node-1 \
   -- python evaluate.py
 ```
 
-For reuse across multiple submissions:
+The two-phase form is the recommended path for large or repeated inputs,
+especially over weak links:
 
 ```bash
 dt sync gpu-node-1 \
@@ -221,8 +277,35 @@ dt run --node gpu-node-1 \
   -- python evaluate.py
 ```
 
+Separating transfer from submission keeps each phase independently
+recoverable: `dt sync` resumes an interrupted transfer on rerun, and the
+submission only binds the already-verified manifest. The single-phase
+`dt run --artifact` form also survives a dropped transfer — the interruption
+is recorded as retryable and rerunning the same `--request-id` resumes the
+transfer instead of replaying a rejection — but the two-phase form gives the
+transfer its own retry loop and keeps submission latency predictable.
+
 The content manifest is verified before setup and execution. Drift fails before
 start rather than silently evaluating a different input.
+
+Programs that expect repo-relative paths do not need hand-rolled symlink
+bridges from `$DT_ARTIFACT_ROOT`. Declare the workspace link instead:
+
+```bash
+dt run --node gpu-node-1 \
+  --artifact-manifest MANIFEST_SHA256 \
+  --artifact-target third_party/data \
+  --artifact-target checkpoints/base.pt=outputs/pretrained/model.pt \
+  -n evaluation \
+  -- python evaluate.py
+```
+
+Each `TARGET[=SOURCE]` links the code-relative TARGET to the artifact-root
+relative SOURCE (SOURCE defaults to TARGET). Links are created only after the
+manifest verifies, and the launch fails closed before the job starts if a
+target already exists in the snapshot, a source is missing, or a declaration
+is unsafe. Targets persist with the job: queued dispatch, `fork`, and `rerun`
+recreate the same links.
 
 ## Compare evidence
 

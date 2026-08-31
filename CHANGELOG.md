@@ -6,7 +6,79 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.11.0 — 2026-08-31
+
 ### Added
+
+- `dt run --artifact-target TARGET[=SOURCE]` (repeatable) declares workspace
+  links for verified artifact content: after manifest verification the
+  launcher symlinks each code-relative TARGET to the artifact-root relative
+  SOURCE (defaulting to TARGET), replacing the hand-rolled symlink bridges
+  projects kept between `$DT_ARTIFACT_ROOT` and repo-relative paths.
+  Declarations are validated at submission (normalized relative paths, no
+  traversal, no `.dt`, no overlaps), persist in the registry, survive queued
+  dispatch, fork, and rerun, and fail closed on the node before the job
+  starts when a target is occupied, a source is missing, or a row is unsafe.
+
+- `dt matrix plan|run|status` submit declarative research sweeps: one YAML or
+  JSON spec declares axes (Cartesian product), `exclude`/`include` units,
+  per-unit `gpus`/`max_hours` overrides, and a `{axis}` command template with
+  numeric spellings preserved exactly. Expansion is deterministic and capped
+  at 1,000 units, every unit submits under a child request id derived from
+  the matrix-level request id, and submission is a strict prefix under one
+  durable group receipt: rerunning the same spec resumes after the confirmed
+  prefix, transient placement failures leave the request id open for
+  resumption, and a changed spec under the same request id is a conflict.
+  `dt matrix status` reports per-unit job ids, states, exit codes, nodes, and
+  summary counts.
+
+- `--after-success` stages placed on a different node than their predecessor
+  now receive the predecessor's outputs automatically: dispatch relays the
+  finished `outputs/` tree through the head into a job-private
+  `predecessor-outputs/` directory on the target node (bounded at 64 GiB,
+  retried, cleaned up on failure) and exposes it as
+  `DT_PREDECESSOR_OUTPUTS` plus the new `DT_PREDECESSOR_OUTPUTS_DIR`. A
+  candidate that cannot receive the outputs is skipped instead of starting
+  the job without its declared inputs; same-node handoff, `--after-complete`,
+  and `--after-result` behavior are unchanged.
+
+- Oversized snapshot warnings now name the largest first- and second-level
+  contributors with sizes, print a paste-ready `snapshot_excludes`
+  suggestion, and point large read-only inputs at the two-phase artifact
+  flow (`dt sync --artifact` then `dt run --artifact-manifest`), which the
+  workflow guide now documents as the recommended path for weak links.
+
+- Watch views now present a lost job inside its evidence recovery window as
+  `lost? reconciling` instead of a bare terminal `lost`, and the snapshot
+  payload carries `lost_reconciling` so callers can distinguish an
+  uncertain identity from a proven loss.
+
+- Submissions now record bounded submodule provenance next to the existing
+  main-repository commit: `git submodule status --recursive` is captured at
+  submit time into the job registry, `meta.json`, and a new
+  `.dt/source-manifest.json` (`dt_source_manifest_v1`) control file. Jobs see
+  `DT_SOURCE_COMMIT`, `DT_SOURCE_DIRTY`, and `DT_SUBMODULE_COMMITS` in their
+  environment, and `dt info --json` exposes `submodule_commits`, so experiment
+  records stay attached to exact main and submodule commits even though the
+  snapshot ships without `.git`.
+
+- `dt pull --json` now states its landing contract explicitly:
+  `destination_root` is the job-level directory the pull wrote,
+  `outputs_root` is the recovered application-outputs subtree (the same
+  directory, because outputs/ contents merge directly into the root; null
+  for records-only recoveries), and `files` lists the recovered top-level
+  entries with directories marked by a trailing slash. Both the single-job
+  and the per-job multi-pull objects carry the fields; existing fields are
+  unchanged.
+
+- Queued jobs in `dt info --json` and `dt ps --json` carry a `queue` object
+  that explains the wait beyond the misleading global FIFO number:
+  `global_position`, `pinned_node`, `eligible_nodes` (statically satisfiable
+  from configuration only -- explicit pin and drain switch; never a remote
+  probe), `contention_position` (1-based rank among earlier queued jobs
+  whose eligible nodes overlap, null when no node is eligible),
+  `blocked_reason`, and `last_attempt_at`. Existing queue fields are
+  unchanged, and dispatch decisions do not read the new projection.
 
 - New jobs bound merged application stdout/stderr with configurable
   `job_logs.max_file_mib` and `job_logs.keep_files` retention. The attested
@@ -118,6 +190,18 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Changed
 
+- `dt --version` now identifies the installed content, not only the packaged
+  version: `dt X.Y.Z (git <sha>, install <digest>, payload <digest>)`. The
+  `install` digest covers every installed source and payload file and the
+  `payload` digest is the shipped node-runtime identity, so two installs that
+  report the same version but run different bytes (hot patches, half-finished
+  upgrades) become distinguishable. Fields are omitted when unavailable and
+  the `dt X.Y.Z (` prefix stays compatible with deploy verification. Head
+  `dt doctor --json` reports the same digests as `install` and `payload`
+  checks; laptop `dt doctor` compares each same-version head's digests
+  against the local install and reports a typed `head_content_mismatch`
+  warning when the content differs.
+
 - Runtime-evidence inventory, strict schema validation, and recovered-tree
   safety now live in a bounded domain module instead of the CLI composition
   root. Public pull behavior remains compatible, while direct module tests,
@@ -195,6 +279,36 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   paths are rejected.
 
 ### Fixed
+
+- A queued task claimed by one dispatcher can no longer be mis-cancelled by a
+  concurrent one. Dispatch claims record a durable owner identity (head boot
+  id, PID, and process start ticks); a second dispatcher that observes a live
+  owner waits instead of treating the in-flight launch as interrupted, while
+  claims whose owner provably died stay recoverable. On the worker, a launcher
+  that meets a foreign launch identity exits with a distinct retryable
+  conflict instead of overwriting the marker, and a launcher whose own
+  identity was provably cancelled before start supersedes the stale marker
+  instead of failing the fresh attempt. Dispatch treats that conflict as
+  stop-failover: the job stays queued for the next recovery probe instead of
+  being launched on a second node while the first attempt may be starting.
+
+- A corrupt immutable snapshot object detected during validation is moved to a
+  `.corrupt-*` quarantine path instead of permanently failing every job that
+  references its digest; the digest becomes rebuildable from the project tree
+  or a node backfill, and the error names the recovery.
+
+- Role-layout queued jobs rebuild a lost or symlinked queue source reference
+  from the authoritative registry row and validated content stores instead of
+  terminating with `queued source reference is unsafe or missing`; the queue
+  control bundle is derived state and self-heals at dispatch time.
+
+- An interrupted pre-launch transfer no longer poisons its stable request id.
+  Placement failures that provably never reached a remote launcher
+  (`NoCapacity`, `NoReachableNode`) and artifact-sync interruptions marked
+  retry-safe (a dropped tunnel mid-rsync, for single jobs and for batch
+  groups) record a retryable rejection: retrying the same request id resumes
+  the transfer and submission instead of replaying the old rejection.
+  Deterministic rejections stay terminal.
 
 - Registry-envelope compatibility now participates in the dispatch protocol.
   Deployment and rollback inspect the verified target wheel before activation,

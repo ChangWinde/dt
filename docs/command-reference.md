@@ -21,6 +21,7 @@ This page helps operators choose a command and handle its result. Run
 | Command | Purpose |
 |---|---|
 | `dt batch` | Submit independent same-node, same-snapshot items |
+| `dt matrix` | Expand a declarative YAML/JSON sweep into retry-safe per-unit submissions |
 | `dt chain` | Submit stages gated on predecessor success |
 | `dt fork` | Submit from an exact historical snapshot |
 | `dt rerun` | Submit the historical command with current project code |
