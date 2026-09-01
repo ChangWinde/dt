@@ -11234,6 +11234,8 @@ def info(
         "after success",
         "rerun of",
         "rerun code",
+        "retry",
+        "retried by",
         "failure log",
         "guard trip",
         "phase timeline",
