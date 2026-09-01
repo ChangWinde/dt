@@ -77,6 +77,8 @@ from .maintenance import (
 from .jobs import (
     DISPATCH_PROTOCOL_VERSION,
     LOST_RECHECK_S,
+    MAX_RETRY_LIMIT,
+    RETRY_ON_MODES,
     CANCEL_UNVERIFIED_PREFIX,
     UNCERTAIN_LAUNCH_PREFIX,
     RESULT_STATES,
@@ -141,6 +143,11 @@ from .sshio import (
 
 PAYLOAD_DIR = Path(__file__).parent / "payload"
 GPU_PULSE_MEMORY_MIB = 512
+# Cross-node predecessor handoff copies a finished dependency's outputs onto
+# the launch candidate through the head. Refuse trees above this apparent
+# size: results that large belong in the explicit artifact flow, not an
+# implicit per-dispatch relay.
+PREDECESSOR_OUTPUTS_MAX_GIB = 64
 SNAPSHOT_METADATA_MAX_BYTES = 64 * 1024
 LINKDEST_STATE_MAX_BYTES = 4 * 1024 * 1024
 MAX_GIT_DIFF_BYTES = 4 * 1024 * 1024
@@ -187,7 +194,13 @@ RETRYABLE = {
     12: "disk-full",
     15: "node-unfit",
     16: "cache-missing",
+    18: "identity-conflict",
 }
+# A live foreign launch identity for the same job. Unlike the other retryable
+# refusals this is not a property of the node: another attempt of this job may
+# be starting right there, so failing over to a different node could run the
+# experiment twice.
+EXIT_IDENTITY_CONFLICT = 18
 FATAL = {
     13: "env-fail",
     14: "internal",
@@ -300,18 +313,72 @@ def transferred_files(rsync_stdout: str) -> int | None:
     return rsync_stat_total(_TRANSFERRED_FILES_RE, rsync_stdout)
 
 
+_SNAPSHOT_SCAN_MAX_ENTRIES = 200_000
+
+
+def _snapshot_size_offenders(tree: Path, limit: int = 3) -> list[tuple[int, str]]:
+    """Largest immediate contributors to a captured tree, best effort.
+
+    Sizes aggregate to first- and second-level directories so the suggestion
+    names a concrete excludable path instead of one deep file. The walk is
+    bounded and never fails the capture.
+    """
+    totals: dict[str, int] = {}
+    entries = 0
+    try:
+        for root, _dirs, files in os.walk(tree, onerror=lambda _exc: None):
+            for name in files:
+                entries += 1
+                if entries > _SNAPSHOT_SCAN_MAX_ENTRIES:
+                    raise StopIteration
+                path = Path(root) / name
+                try:
+                    size = path.lstat().st_size
+                except OSError:
+                    continue
+                relative = path.relative_to(tree)
+                directories = relative.parts[:-1]
+                key = "/".join(directories[:2]) if directories else relative.parts[0]
+                totals[key] = totals.get(key, 0) + size
+    except StopIteration:
+        pass
+    ranked = sorted(
+        ((size, name) for name, size in totals.items()),
+        reverse=True,
+    )
+    return ranked[:limit]
+
+
 def _warn_snapshot_size(
     cfg: HeadConfig,
     stdout: str,
     log: Callable[[str], None],
+    tree: Path | None = None,
 ) -> None:
     gib = transferred_gib(stdout)
-    if gib is not None and gib > cfg.snapshot_warn_gib:
-        log(
-            f"warning: snapshot transferred {gib:.1f} GiB "
-            f"(> {cfg.snapshot_warn_gib:g} GiB) - if unintended, add the "
-            f"offending dirs to snapshot_excludes in ~/.config/dt/config.yaml"
-        )
+    if gib is None or gib <= cfg.snapshot_warn_gib:
+        return
+    log(
+        f"warning: snapshot transferred {gib:.1f} GiB "
+        f"(> {cfg.snapshot_warn_gib:g} GiB) - if unintended, add the "
+        f"offending dirs to snapshot_excludes in ~/.config/dt/config.yaml"
+    )
+    if tree is None or not tree.is_dir():
+        return
+    offenders = _snapshot_size_offenders(tree)
+    if not offenders:
+        return
+    patterns = [
+        f"{name}/" if (tree / name).is_dir() else name for _size, name in offenders
+    ]
+    for (size, _name), pattern in zip(offenders, patterns):
+        log(f"  {size / 2**30:5.1f} GiB  {pattern}")
+    suggestion = ", ".join(f'"{pattern}"' for pattern in patterns)
+    log(f"  suggested config: snapshot_excludes: [{suggestion}]")
+    log(
+        "  large read-only inputs belong in the artifact flow instead: "
+        "`dt sync <node> --artifact <dir>` then `dt run --artifact-manifest`"
+    )
 
 
 def _retry_logger(
@@ -1678,7 +1745,18 @@ class RunSpec:
     request_id: str | None = None  # optional retry-safe caller intent
     rerun_of: str | None = None  # current-code retry lineage
     rerun_source_snapshot_sha256: str | None = None
+    # Automatic retry policy: additional attempts the agent may submit after a
+    # retryable terminal failure, and this attempt's ordinal/lineage.
+    retry_limit: int = 0
+    retry_on: str | None = None  # "infra" (default) or "always"
+    retry_count: int = 0
+    retry_of: str | None = None
     artifact_manifest: str | None = None  # shared-input manifest SHA-256
+    # Declarative workspace links: {workspace-relative target: artifact-root
+    # relative source}. The launcher materializes each as a symlink inside
+    # the job's code tree after manifest verification, replacing hand-rolled
+    # symlink bridges between $DT_ARTIFACT_ROOT and repo-relative paths.
+    artifact_targets: dict[str, str] | None = None
     cache_source_job: str | None = None
     cache_source_job_dir: str | None = None
     cache_source_path: str | None = None
@@ -1688,6 +1766,73 @@ class RunSpec:
     cache_mode: str | None = None
     # Internal expected identity for the head-supplied remote attestation.
     payload_sha256: str | None = None
+
+
+ARTIFACT_TARGET_MAX_PATH_CHARS = 1024
+
+
+def _artifact_target_path_error(path: str, *, side: str) -> str | None:
+    """Return why one artifact-target path is unsafe, or None when clean.
+
+    Both sides travel through an environment variable (newline-separated,
+    tab-split rows) into a shell that joins them onto trusted roots, so the
+    character set is strict and traversal is rejected outright.
+    """
+    if not path or not path.strip():
+        return f"artifact target {side} must be a non-empty relative path"
+    if len(path) > ARTIFACT_TARGET_MAX_PATH_CHARS:
+        return (
+            f"artifact target {side} is longer than "
+            f"{ARTIFACT_TARGET_MAX_PATH_CHARS} characters"
+        )
+    if path != path.strip():
+        return f"artifact target {side} must not start or end with whitespace"
+    if any(ord(character) < 32 or ord(character) == 127 for character in path):
+        return f"artifact target {side} must not contain control characters"
+    if "\\" in path:
+        return f"artifact target {side} must use forward slashes"
+    if path.startswith(("/", "~")):
+        return f"artifact target {side} must be a relative path"
+    # The launcher rejects any ".." substring (glob *..*), so refuse the same
+    # spelling here: a declaration must fail at submission, not on the node.
+    if ".." in path:
+        return f"artifact target {side} must not contain '..'"
+    parts = path.split("/")
+    if any(part in {"", "."} for part in parts):
+        return (
+            f"artifact target {side} must be a normalized relative path "
+            "without empty or '.' components"
+        )
+    if parts[0] == ".dt":
+        return f"artifact target {side} must not enter the private .dt tree"
+    return None
+
+
+def validate_artifact_targets(targets: Mapping[str, str]) -> dict[str, str]:
+    """Validate declarative workspace links and return them in sorted order.
+
+    Raises ``ConfigError`` so both the CLI boundary and the dispatcher reject
+    the same inputs identically.
+    """
+    validated: dict[str, str] = {}
+    for target in sorted(targets):
+        source = targets[target]
+        for side, path in (("path", target), ("source", source)):
+            problem = _artifact_target_path_error(path, side=side)
+            if problem is not None:
+                raise ConfigError(f"{problem}: {path!r}")
+        for existing in validated:
+            if (
+                existing == target
+                or target.startswith(existing + "/")
+                or existing.startswith(target + "/")
+            ):
+                raise ConfigError(
+                    f"artifact targets {existing!r} and {target!r} overlap; "
+                    "each workspace link must be independent"
+                )
+        validated[target] = source
+    return validated
 
 
 def _validate_run_spec(spec: RunSpec) -> None:
@@ -1762,11 +1907,43 @@ def _validate_run_spec(spec: RunSpec) -> None:
         is None
     ):
         raise ConfigError("artifact_manifest must be a lowercase SHA-256 digest")
+    if spec.artifact_targets:
+        if spec.artifact_manifest is None:
+            raise ConfigError(
+                "artifact targets require an artifact manifest: the links "
+                "must point at verified content"
+            )
+        spec.artifact_targets = validate_artifact_targets(spec.artifact_targets)
     if spec.rerun_of is not None and (
         not isinstance(spec.rerun_of, str)
         or re.fullmatch(r"[A-Za-z0-9_-]+", spec.rerun_of) is None
     ):
         raise ConfigError("rerun_of must be a safe job identity")
+    for ordinal_name, ordinal in (
+        ("retry", spec.retry_limit),
+        ("retry ordinal", spec.retry_count),
+    ):
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or not 0 <= ordinal <= MAX_RETRY_LIMIT
+        ):
+            raise ConfigError(
+                f"{ordinal_name} must be an integer between 0 and {MAX_RETRY_LIMIT}"
+            )
+    if spec.retry_on is not None and spec.retry_on not in RETRY_ON_MODES:
+        raise ConfigError("retry_on must be one of: infra, always")
+    if spec.retry_on is not None and spec.retry_limit == 0:
+        raise ConfigError("retry_on requires a positive --retry budget")
+    # --no-queue promises an immediate, final capacity verdict the caller can
+    # branch on; a background retry would silently contradict that contract.
+    # The check lives in submit()/CLI rather than here because no_queue is a
+    # call argument, not a RunSpec field.
+    if spec.retry_of is not None and (
+        not isinstance(spec.retry_of, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", spec.retry_of) is None
+    ):
+        raise ConfigError("retry_of must be a safe job identity")
     if spec.after_success is not None and (
         not isinstance(spec.after_success, str)
         or re.fullmatch(r"[A-Za-z0-9_-]+", spec.after_success) is None
@@ -1955,6 +2132,9 @@ def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
         rerun_of=entry.job_id,
         rerun_source_snapshot_sha256=entry.snapshot_sha256,
         artifact_manifest=entry.artifact_manifest,
+        artifact_targets=(
+            dict(entry.artifact_targets) if entry.artifact_targets else None
+        ),
     )
 
 
@@ -2028,6 +2208,9 @@ def fork_spec_from_entry(
         extras=list(entry.extras) if entry.extras else None,
         custom_env=dict(entry.custom_env),
         artifact_manifest=artifact_manifest or entry.artifact_manifest,
+        artifact_targets=(
+            dict(entry.artifact_targets) if entry.artifact_targets else None
+        ),
         forked_from=entry.job_id,
         cache_source_job=entry.job_id if requested_cache else None,
         cache_source_job_dir=entry.job_dir if requested_cache else None,
@@ -2041,6 +2224,32 @@ def fork_spec_from_entry(
         ),
         cache_mode=("clone" if clone_cache else "shared" if reuse_cache else None),
     )
+
+
+def retry_spec_from_entry(entry: JobEntry) -> RunSpec:
+    """Build the automatic-retry resubmission spec for one failed attempt.
+
+    Retries reuse the exact snapshot, command, resources, and environment
+    overlay (fork semantics), but placement deliberately returns to the
+    *original* pin intent instead of the failed attempt's actual node: with a
+    free pin the failed node may itself be the fault, and the scheduler should
+    choose again.
+
+    The derived request id makes the resubmission idempotent: an agent
+    restart or a concurrent tick replays the same intent instead of creating
+    a second job.  Job ids are bounded well below the request-id limit
+    (timestamp + 64-char name cap + 16-hex suffix), so the composition
+    always fits.
+    """
+    ordinal = entry.retry_count + 1
+    spec = fork_spec_from_entry(entry, name=entry.name)
+    spec.node = entry.pin_node
+    spec.request_id = f"{entry.job_id}:retry:{ordinal}"
+    spec.retry_limit = entry.retry_limit
+    spec.retry_on = entry.retry_on
+    spec.retry_count = ordinal
+    spec.retry_of = entry.job_id
+    return spec
 
 
 def environment_reuse_spec_from_entry(
@@ -2375,6 +2584,26 @@ def pick_candidates(
 # --------------------------------------------------------------------------
 
 
+def _quarantine_corrupt_snapshot(root: Path) -> Path | None:
+    """Move a proven-corrupt store object aside so its digest path frees up.
+
+    A corrupt object left in place poisons every later use of that digest:
+    dispatch retries, reruns, and identical-content resubmissions all keep
+    re-reading the same bad bytes. Renaming it to a ``.corrupt-*`` sibling
+    lets the next capture or node backfill republish verified content while
+    the evidence stays on disk for inspection.
+    """
+    quarantine = root.parent / f".corrupt-{root.name}-{uuid.uuid4().hex}"
+    try:
+        os.replace(root, quarantine)
+    except OSError:
+        # A concurrent validator already moved it, or the store is on a
+        # filesystem that refuses the rename; the raise below still reports
+        # the corruption either way.
+        return None
+    return quarantine
+
+
 def _validate_stored_snapshot(cfg: HeadConfig, digest: str) -> StoredSnapshot:
     code = _snapshot_path(cfg, digest)
     root = code.parent
@@ -2387,23 +2616,40 @@ def _validate_stored_snapshot(cfg: HeadConfig, digest: str) -> StoredSnapshot:
         or not meta.is_file()
     ):
         raise DispatchError(f"exact snapshot {digest} is not archived on this head")
+
+    def corrupt(detail: str, cause: Exception | None = None) -> DispatchError:
+        quarantine = _quarantine_corrupt_snapshot(root)
+        note = (
+            f"; quarantined to {quarantine.name} pending rebuild"
+            if quarantine is not None
+            else ""
+        )
+        error = DispatchError(f"{detail}{note}")
+        if cause is not None:
+            error.__cause__ = cause
+        return error
+
     try:
         meta_result = read_bounded(meta, max_bytes=SNAPSHOT_METADATA_MAX_BYTES)
         if meta_result is None:
             raise PrivateStateError("snapshot metadata disappeared")
         identity = json.loads(meta_result[0])
     except (PrivateStateError, UnicodeError, json.JSONDecodeError) as exc:
-        raise DispatchError(
-            f"exact snapshot {digest} metadata cannot be read: {exc}"
+        raise corrupt(
+            f"exact snapshot {digest} metadata cannot be read: {exc}",
+            exc,
         ) from exc
     if not isinstance(identity, dict) or identity.get("snapshot_sha256") != digest:
-        raise DispatchError(f"exact snapshot {digest} metadata identity mismatched")
+        raise corrupt(f"exact snapshot {digest} metadata identity mismatched")
     try:
         observed = tree_sha256(code)
     except (OSError, ValueError) as exc:
-        raise DispatchError(f"exact snapshot {digest} cannot be read: {exc}") from exc
+        raise corrupt(
+            f"exact snapshot {digest} cannot be read: {exc}",
+            exc,
+        ) from exc
     if observed != digest:
-        raise DispatchError(
+        raise corrupt(
             f"exact snapshot store is corrupt: expected {digest}, observed {observed}"
         )
     return StoredSnapshot(digest, code)
@@ -2461,29 +2707,11 @@ def _repair_queued_snapshot(
     if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
         return
     if entry.storage_layout == ROLE_LAYOUT:
+        # The queue control bundle (source reference and support files) is
+        # derived state; ``_ensure_role_queue_bundle`` rebuilds it from the
+        # registry row and the validated stores. Only store integrity is
+        # authoritative here.
         _validate_stored_snapshot(cfg, expected)
-        source_ref = staging / ".dt" / "source.json"
-        if source_ref.is_symlink() or not source_ref.is_file():
-            raise DispatchError("queued source reference is unsafe or missing")
-        try:
-            source_result = read_bounded(
-                source_ref,
-                max_bytes=SNAPSHOT_METADATA_MAX_BYTES,
-            )
-            if source_result is None:
-                raise PrivateStateError("queued source reference disappeared")
-            reference = json.loads(source_result[0])
-        except (PrivateStateError, UnicodeError, json.JSONDecodeError) as exc:
-            raise DispatchError(
-                f"queued source reference cannot be read: {exc}"
-            ) from exc
-        if (
-            not isinstance(reference, dict)
-            or reference.get("schema_version") != "dt_queue_source_v1"
-            or reference.get("snapshot_sha256") != expected
-            or reference.get("payload_sha256") != entry.payload_sha256
-        ):
-            raise DispatchError("queued source reference identity mismatch")
         return
     staged_code = staging / "code"
     try:
@@ -2520,6 +2748,163 @@ def _repair_queued_snapshot(
             f"expected {expected}, observed {repaired}"
         )
     log(f"{entry.job_id} · restored queued code from exact snapshot {expected}")
+
+
+_QUEUE_SOURCE_SCHEMA = "dt_queue_source_v1"
+
+
+def _queue_source_reference_document(entry: JobEntry) -> dict[str, object]:
+    return {
+        "schema_version": _QUEUE_SOURCE_SCHEMA,
+        "snapshot_sha256": entry.snapshot_sha256,
+        "payload_sha256": entry.payload_sha256,
+    }
+
+
+def _read_queue_source_reference(source_ref: Path) -> dict[str, object] | None:
+    """Best-effort read; any unsafe or unreadable reference is rebuilt."""
+    if source_ref.is_symlink() or not source_ref.is_file():
+        return None
+    try:
+        source_result = read_bounded(
+            source_ref,
+            max_bytes=SNAPSHOT_METADATA_MAX_BYTES,
+        )
+        if source_result is None:
+            return None
+        reference = json.loads(source_result[0])
+    except (PrivateStateError, UnicodeError, json.JSONDecodeError):
+        return None
+    return reference if isinstance(reference, dict) else None
+
+
+def _rebuilt_queue_meta(entry: JobEntry) -> dict[str, object]:
+    """Reconstruct the submit-time job metadata from the authoritative row."""
+    return {
+        "job_id": entry.job_id,
+        "name": entry.name,
+        "project": entry.project,
+        "cmd": entry.cmd,
+        "gpus_requested": entry.gpus_requested,
+        "gpu_isolation": entry.gpu_isolation,
+        "require_disk_gib": entry.require_disk_gib,
+        "git_sha": entry.git_sha,
+        "git_dirty": entry.git_dirty,
+        "payload_sha256": entry.payload_sha256,
+        "max_hours": entry.max_hours,
+        "min_vram_mib": entry.min_vram_mib,
+        "max_vram_mib": entry.max_vram_mib,
+        "max_job_memory_mib": entry.max_job_memory_mib,
+        "artifact_manifest": entry.artifact_manifest,
+        "forked_from": entry.forked_from,
+        "after_success": entry.after_success,
+        "after_complete": entry.after_complete,
+        "after_result": entry.after_result,
+        "after_result_states": list(entry.after_result_states),
+        "request_id": entry.request_id,
+        "environment": {
+            "mode": entry.env_mode,
+            "identity": entry.env_hash if entry.env_mode == "reuse" else None,
+            "source_job_id": entry.env_source_job,
+            "variables": (
+                sorted(entry.custom_env)
+                if entry.custom_env_loaded
+                else list(entry.custom_env_keys)
+            ),
+        },
+        "rerun_of": entry.rerun_of,
+        "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
+        "cache_reuse": (
+            {
+                "source_job_id": entry.cache_source_job,
+                "source_job_dir": entry.cache_source_job_dir,
+                "source_path": entry.cache_source_path,
+                "env_var": entry.cache_env,
+                "source_env_hash": entry.cache_source_env_hash,
+                "mode": entry.cache_mode or "shared",
+            }
+            if entry.cache_source_job
+            else None
+        ),
+        "snapshot_sha256": entry.snapshot_sha256,
+        "rerun_snapshot_changed": entry.rerun_snapshot_changed,
+    }
+
+
+def _ensure_role_queue_bundle(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    spec: RunSpec,
+    staging: Path,
+    snapshot_code_dir: Path,
+    log: Callable[[str], None],
+) -> None:
+    """Self-heal a role-layout queue control bundle from durable identities.
+
+    The registry row plus the validated snapshot/payload stores contain every
+    identity needed to re-derive the bundle. A reference or support file lost
+    to an interrupted submission, a state-directory move, or manual cleanup
+    must therefore never terminate the job; it is rebuilt in place. Only the
+    dirty-source patch is unrecoverable evidence, and its loss is logged
+    instead of failing the launch (the snapshot content itself is exact).
+    """
+    source_ref = staging / ".dt" / "source.json"
+    expected_reference = _queue_source_reference_document(entry)
+    reference = _read_queue_source_reference(source_ref)
+    env_key = (
+        entry.env_hash
+        if entry.env_mode == "reuse" and entry.env_hash
+        else environment_key(
+            snapshot_code_dir,
+            spec.extras,
+            spec.setup,
+            entry.snapshot_sha256 or "",
+            spec.setup_inputs,
+        )
+    )
+    required = [staging / ".dt" / "command.sh", staging / ".dt" / "meta.json"]
+    if spec.setup:
+        required.append(staging / ".dt" / "setup.sh")
+    if env_key:
+        required.append(staging / ".dt" / "env-key")
+    intact = reference == expected_reference and all(
+        path.is_file() and not path.is_symlink() for path in required
+    )
+    if intact:
+        return
+    if source_ref.is_symlink():
+        try:
+            source_ref.unlink()
+        except OSError as exc:
+            raise DispatchError(
+                f"unsafe queued source reference cannot be replaced: {exc}"
+            ) from exc
+    try:
+        ensure_private_directory(staging)
+        ensure_private_directory(staging / "logs")
+        support = _support_files(
+            shlex.split(entry.cmd),
+            _rebuilt_queue_meta(entry),
+            spec.setup,
+            env_key,
+            custom_env=None,
+            runtime_files={},
+            layout=ROLE_LAYOUT,
+        )
+        support[".dt/source.json"] = json.dumps(expected_reference, indent=1)
+        _write_support_files(staging, support)
+    except (OSError, PrivateStateError) as exc:
+        raise DispatchError(f"queued control bundle rebuild failed: {exc}") from exc
+    if entry.git_dirty and not (staging / ".dt" / "code_dirty.patch").is_file():
+        log(
+            f"{entry.job_id} · dirty-source patch was lost with the queue "
+            "bundle and cannot be reconstructed; the exact snapshot content "
+            "is unaffected"
+        )
+    log(
+        f"{entry.job_id} · rebuilt queued control bundle from registry "
+        "identity and content stores"
+    )
 
 
 def _commit_snapshot_dir(
@@ -2667,7 +3052,7 @@ def capture_snapshot(
                 raise DispatchError(
                     f"head snapshot capture failed: {proc.stderr.strip()}"
                 )
-            _warn_snapshot_size(cfg, proc.stdout, log)
+            _warn_snapshot_size(cfg, proc.stdout, log, tree=code)
             try:
                 digest = tree_sha256(code)
             except (OSError, ValueError) as exc:
@@ -2748,7 +3133,7 @@ def resolve_snapshot(
             raise DispatchError(
                 f"exact snapshot backfill from {entry.node} failed: {detail}"
             )
-        _warn_snapshot_size(cfg, proc.stdout, log)
+        _warn_snapshot_size(cfg, proc.stdout, log, tree=temp_code)
         observed = tree_sha256(temp_code)
         if observed != digest:
             raise DispatchError(
@@ -3100,6 +3485,19 @@ def _support_files(
     if meta.get("git_dirty") and isinstance(diff, str) and diff:
         files[f"{control_prefix}code_dirty.patch"] = diff
     files[f"{control_prefix}meta.json"] = json.dumps(meta, indent=1)
+    # Source provenance for in-job consumers (the snapshot ships without .git,
+    # so `git rev-parse HEAD` cannot answer there). Control-plane only: it must
+    # never enter code/ or it would perturb the snapshot tree hash.
+    files[f"{control_prefix}source-manifest.json"] = json.dumps(
+        {
+            "schema_version": "dt_source_manifest_v1",
+            "git_commit": meta.get("git_sha"),
+            "git_dirty": meta.get("git_dirty"),
+            "submodule_commits": meta.get("submodule_commits"),
+            "snapshot_sha256": meta.get("snapshot_sha256"),
+        },
+        indent=1,
+    )
     return files
 
 
@@ -3883,8 +4281,21 @@ def launch(
     session: str,
     spec: RunSpec,
     reserve: int = 0,
+    *,
+    git_sha: str | None = None,
+    git_dirty: bool = False,
+    submodule_commits: dict[str, str] | None = None,
+    predecessor_outputs_dir: str | None = None,
 ) -> tuple[int, dict[str, object] | str]:
-    """Returns (exit_code, parsed-json-or-stderr)."""
+    """Returns (exit_code, parsed-json-or-stderr).
+
+    Source provenance arrives as explicit arguments rather than ``RunSpec``
+    fields: the spec is serialized into the idempotency intent digest, where
+    mutable git bookkeeping must never turn a safe retry into a conflict.
+    ``predecessor_outputs_dir`` is the node-local path the dispatcher
+    materialized for a cross-node ``after_success`` predecessor; it is
+    per-attempt placement state, so it also stays out of the spec.
+    """
     control_dir = job_control_dir(job_dir, cfg.layout)
     payload_dir = job_payload_dir(job_dir, cfg.layout)
     state_dir = job_state_dir(job_dir, cfg.layout)
@@ -3922,6 +4333,13 @@ def launch(
         envs["DT_ARTIFACT_ROOT"] = artifact_root_rel(spec.project, cfg, node)
     if spec.artifact_manifest:
         envs["DT_ARTIFACT_MANIFEST"] = spec.artifact_manifest
+    if spec.artifact_targets:
+        # Newline-separated "target<TAB>source" rows in sorted order; both
+        # sides were validated as normalized relative paths at submission.
+        envs["DT_ARTIFACT_TARGETS"] = "\n".join(
+            f"{target}\t{source}"
+            for target, source in sorted(spec.artifact_targets.items())
+        )
     if spec.extras:
         envs["DT_EXTRAS"] = " ".join(spec.extras)
     if spec.require_path:
@@ -3932,14 +4350,22 @@ def launch(
             predecessor is not None
             and predecessor.status == "finished"
             and predecessor.exit_code == 0
-            and predecessor.node == node.name
         ):
-            envs.update(
-                {
-                    "DT_PREDECESSOR_JOB_ID": predecessor.job_id,
-                    "DT_PREDECESSOR_JOB_DIR": predecessor.job_dir,
-                }
-            )
+            if predecessor.node == node.name:
+                envs.update(
+                    {
+                        "DT_PREDECESSOR_JOB_ID": predecessor.job_id,
+                        "DT_PREDECESSOR_JOB_DIR": predecessor.job_dir,
+                    }
+                )
+            else:
+                # Cross-node: the predecessor job dir does not exist on this
+                # node. The dispatcher already materialized the outputs (or
+                # proved there is nothing to hand off, in which case only the
+                # identity is exposed, matching the same-node contract).
+                envs["DT_PREDECESSOR_JOB_ID"] = predecessor.job_id
+                if predecessor_outputs_dir is not None:
+                    envs["DT_PREDECESSOR_OUTPUTS_DIR"] = predecessor_outputs_dir
     if spec.cache_source_job:
         envs.update(
             {
@@ -3960,6 +4386,17 @@ def launch(
         envs["DT_MAX_VRAM_MIB"] = str(spec.max_vram_mib)
     if spec.max_job_memory_mib:
         envs["DT_MAX_JOB_MEMORY_MIB"] = str(spec.max_job_memory_mib)
+    if git_sha:
+        # Absent provenance stays absent: without a commit there is nothing
+        # for a dirty bit to describe, so neither variable is exported.
+        envs["DT_SOURCE_COMMIT"] = git_sha
+        envs["DT_SOURCE_DIRTY"] = "1" if git_dirty else "0"
+    if submodule_commits:
+        envs["DT_SUBMODULE_COMMITS"] = json.dumps(
+            submodule_commits,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     env_str = " ".join(f"{k}={shlex.quote(v)}" for k, v in envs.items())
     attestation = ""
     if spec.payload_sha256:
@@ -4225,6 +4662,12 @@ def _probe_interrupted_queued_launch(
         raise DispatchError(
             "queued launch recovery marker is missing, unsafe, or mismatched"
         )
+    if recovered.state == "NONE":
+        # The marker proves our own interrupted attempt published its
+        # identity, and a complete census proves no surviving process. The
+        # token-bound cancellation path may safely retire it; the next
+        # launcher supersedes the cancelled marker on publish.
+        return recovered
     if recovered.state not in {"RUNNING", "FINISHED", "UNPROVEN"}:
         raise DispatchError(
             "queued launch crossed the remote boundary but runtime state is unproven"
@@ -4292,6 +4735,8 @@ def _adopt_interrupted_queued_launch(
         reason=None,
         dispatch_node=None,
         dispatch_token=None,
+        dispatch_owner=None,
+        dispatch_claimed_at=None,
         env_hash=recovered.env_hash or entry.env_hash,
         boot_id=recovered.boot_id,
         started_at=recovered.started_at,
@@ -4408,6 +4853,178 @@ def _record_cancelled_inflight_launch(
         return current
 
 
+def _predecessor_outputs_destination(job_dir: str, layout: str | None) -> str:
+    """Job-private landing path for cross-node predecessor outputs."""
+    control = job_control_dir(job_dir, layout)
+    base = control if layout == ROLE_LAYOUT else f"{job_dir}/.dt"
+    return f"{base}/predecessor-outputs"
+
+
+def _predecessor_outputs_probe(outputs_dir: str) -> str:
+    """One remote probe printing ABSENT, EMPTY, or the apparent byte size."""
+    quoted = node_path_expression(outputs_dir)
+    return (
+        f"if ! test -d {quoted}; then echo ABSENT; "
+        f'elif [ -z "$(find {quoted} -mindepth 1 -print -quit 2>/dev/null)" ]; '
+        "then echo EMPTY; "
+        f"else {{ timeout 60s du -s -b --count-links -- {quoted} 2>/dev/null "
+        "|| true; } | awk 'NR == 1 {print $1}'; fi"
+    )
+
+
+def _materialize_predecessor_outputs(
+    cfg: HeadConfig,
+    predecessor: JobEntry,
+    node: Node,
+    node_job_dir: str,
+    log: Callable[[str], None],
+) -> tuple[str | None, str | None]:
+    """Copy a finished predecessor's outputs onto the launch candidate.
+
+    Returns ``(destination, None)`` after a completed head-relayed copy,
+    ``(None, None)`` when there is nothing to hand off (a missing or empty
+    outputs tree matches the same-node contract, which only proves the exit
+    code and never requires outputs to exist), and ``(None, reason)`` when
+    this candidate must be skipped. The head relays the copy in two rsync
+    legs because head-to-node reachability is the one transport DT
+    guarantees; worker-to-worker connectivity is never assumed.
+    """
+    source_node = next(
+        (candidate for candidate in cfg.nodes if candidate.name == predecessor.node),
+        None,
+    )
+    if source_node is None:
+        return None, f"predecessor node {predecessor.node!r} is no longer configured"
+    outputs_dir = f"{predecessor.job_dir}/outputs"
+    try:
+        probe = run_on(
+            source_node.name,
+            source_node.local,
+            _predecessor_outputs_probe(outputs_dir),
+            timeout=90,
+        )
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        detail = " ".join(str(exc).split()) or type(exc).__name__
+        return None, (
+            f"predecessor outputs probe on {source_node.name} failed: {detail}"
+        )
+    if probe.returncode != 0:
+        detail = diagnostic_excerpt(
+            probe.stderr,
+            probe.stdout,
+            fallback=f"probe exited {probe.returncode}",
+        )
+        return None, (
+            f"predecessor outputs probe on {source_node.name} failed: {detail}"
+        )
+    lines = (probe.stdout or "").strip().splitlines()
+    marker = lines[0].strip() if lines else ""
+    if marker in {"ABSENT", "EMPTY"}:
+        return None, None
+    if not marker.isdigit():
+        # Fail closed: du timing out or printing nothing means the tree is
+        # too opaque to bound, and an unbounded implicit copy is refused.
+        return None, (
+            f"predecessor outputs size on {source_node.name} could not be measured"
+        )
+    size_bytes = int(marker)
+    limit_bytes = PREDECESSOR_OUTPUTS_MAX_GIB * 1024**3
+    if size_bytes > limit_bytes:
+        return None, (
+            f"predecessor outputs occupy {size_bytes} bytes on "
+            f"{source_node.name}, above the {PREDECESSOR_OUTPUTS_MAX_GIB} GiB "
+            "handoff limit; move large results through the artifact flow"
+        )
+    destination = _predecessor_outputs_destination(node_job_dir, cfg.layout)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".predecessor-{predecessor.job_id}-",
+            dir=cfg.queue_dir(),
+        )
+    )
+
+    def cleanup_destination() -> None:
+        try:
+            run_on(
+                node.name,
+                node.local,
+                f"rm -rf -- {node_path_expression(destination)}",
+                timeout=60,
+            )
+        except (RemoteError, subprocess.TimeoutExpired, OSError):
+            log(f"orphaned partial predecessor outputs on {node.name}")
+
+    try:
+        pulled = rsync(
+            rsync_destination(
+                source_node.name,
+                source_node.local,
+                outputs_dir,
+                directory=True,
+            ),
+            f"{staging}/",
+            timeout=BULK_TRANSFER_TIMEOUT_S,
+            retries=2,
+            safe_links=True,
+            on_retry=_retry_logger(
+                log,
+                source_node.name,
+                "predecessor outputs pull",
+            ),
+        )
+        if pulled.returncode != 0:
+            detail = diagnostic_excerpt(
+                pulled.stderr,
+                pulled.stdout,
+                fallback=f"rsync exited {pulled.returncode}",
+            )
+            return None, (
+                f"predecessor outputs pull from {source_node.name} failed: {detail}"
+            )
+        try:
+            prepared = run_on(
+                node.name,
+                node.local,
+                _private_remote_directories(destination),
+                timeout=15,
+            )
+        except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+            detail = " ".join(str(exc).split()) or type(exc).__name__
+            return None, (
+                f"predecessor outputs staging on {node.name} failed: {detail}"
+            )
+        if prepared.returncode != 0:
+            detail = diagnostic_excerpt(
+                prepared.stderr,
+                prepared.stdout,
+                fallback=f"mkdir exited {prepared.returncode}",
+            )
+            return None, (
+                f"predecessor outputs staging on {node.name} failed: {detail}"
+            )
+        pushed = rsync(
+            f"{staging}/",
+            rsync_destination(node.name, node.local, destination, directory=True),
+            delete=True,
+            timeout=BULK_TRANSFER_TIMEOUT_S,
+            retries=2,
+            private_destination=True,
+            safe_links=True,
+            on_retry=_retry_logger(log, node.name, "predecessor outputs push"),
+        )
+        if pushed.returncode != 0:
+            cleanup_destination()
+            detail = diagnostic_excerpt(
+                pushed.stderr,
+                pushed.stdout,
+                fallback=f"rsync exited {pushed.returncode}",
+            )
+            return None, (f"predecessor outputs push to {node.name} failed: {detail}")
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return destination, None
+
+
 def _try_nodes(
     cfg: HeadConfig,
     candidates: list[Node],
@@ -4421,11 +5038,16 @@ def _try_nodes(
     created_at: float | None = None,
     payload_sha256: str | None = None,
     before_attempt: Callable[[Node, str], bool] | None = None,
+    git_sha: str | None = None,
+    git_dirty: bool = False,
+    submodule_commits: dict[str, str] | None = None,
 ) -> tuple[JobEntry | None, dict[str, str], bool, set[str]]:
     """Shared candidate loop. Returns (entry, reasons, fatal, failure_kinds).
 
     A single node failing (unreachable, snapshot error, launch timeout) must
     never sink the submission: record the reason and try the next candidate.
+    A candidate that cannot receive the predecessor's outputs is skipped the
+    same way: the job must never start without its declared inputs.
     Env-fail aborts because the environment is most likely broken center-wide.
     A dropped launch also aborts when its remote cancellation is unverified:
     continuing could run the same experiment on two nodes."""
@@ -4433,6 +5055,13 @@ def _try_nodes(
     spec.payload_sha256 = payload_sha256
     reasons: dict[str, str] = {}
     failure_kinds: set[str] = set()
+    # The predecessor is terminal here (dependencies gate dispatch), so one
+    # load outside the loop observes the same row every candidate would.
+    handoff_predecessor: JobEntry | None = None
+    if spec.after_success:
+        loaded = load(cfg, spec.after_success)
+        if loaded is not None and loaded.status == "finished" and loaded.exit_code == 0:
+            handoff_predecessor = loaded
 
     def cancel_launch_orphan(node: Node, node_job_dir: str) -> str | None:
         if cfg.layout == ROLE_LAYOUT:
@@ -4470,6 +5099,21 @@ def _try_nodes(
             log(f"{node.name} snapshot failed, trying next node")
             continue
         snapshot_duration_s = max(0.0, time.perf_counter() - snapshot_started)
+        predecessor_outputs_dir: str | None = None
+        if handoff_predecessor is not None and handoff_predecessor.node != node.name:
+            log(f"materializing predecessor outputs on {node.name}")
+            predecessor_outputs_dir, handoff_error = _materialize_predecessor_outputs(
+                cfg,
+                handoff_predecessor,
+                node,
+                node_job_dir,
+                log,
+            )
+            if handoff_error is not None:
+                failure_kinds.add("retryable")
+                reasons[node.name] = f"predecessor outputs unavailable: {handoff_error}"
+                log(f"{node.name} predecessor outputs unavailable, trying next node")
+                continue
         log(f"launching on {node.name}")
         launch_started = time.perf_counter()
         try:
@@ -4481,6 +5125,10 @@ def _try_nodes(
                 session,
                 spec,
                 _reserve_for(cfg, spec),
+                git_sha=git_sha,
+                git_dirty=git_dirty,
+                submodule_commits=submodule_commits,
+                predecessor_outputs_dir=predecessor_outputs_dir,
             )
         except RemoteError as e:
             failure_kinds.add("unreachable")
@@ -4560,6 +5208,9 @@ def _try_nodes(
                 snapshot_sha256=snapshot_sha256,
                 payload_sha256=payload_sha256,
                 artifact_manifest=spec.artifact_manifest,
+                artifact_targets=(
+                    dict(spec.artifact_targets) if spec.artifact_targets else None
+                ),
                 created_at=submission_time,
                 started_at=time.time(),
                 placement_failures=dict(reasons),
@@ -4574,6 +5225,10 @@ def _try_nodes(
                 after_result=spec.after_result,
                 after_result_states=list(spec.after_result_states),
                 request_id=spec.request_id,
+                retry_limit=spec.retry_limit,
+                retry_on=spec.retry_on,
+                retry_count=spec.retry_count,
+                retry_of=spec.retry_of,
                 rerun_of=spec.rerun_of,
                 rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
                 rerun_snapshot_changed=_rerun_snapshot_changed(
@@ -4595,6 +5250,19 @@ def _try_nodes(
         reasons[node.name] = (
             f"{reason}: {result}" if isinstance(result, str) else reason
         )
+        if code == EXIT_IDENTITY_CONFLICT:
+            # Our launcher exited without touching the foreign marker or
+            # starting a session, so there is nothing of ours to cancel; the
+            # concurrent attempt it met may still be starting on this node.
+            # Stop the candidate loop instead of failing over: the job stays
+            # queued and the next dispatch probe adopts or supersedes the
+            # marker once its runtime state is provable.
+            failure_kinds.add("identity-conflict")
+            log(
+                f"{node.name} {reason}; stopping failover until dispatch "
+                "recovery probes the foreign launch identity"
+            )
+            return None, reasons, False, failure_kinds
         if code in FATAL:
             failure_kinds.add("fatal")
             return None, reasons, True, failure_kinds
@@ -4638,6 +5306,11 @@ def submit(
     after the request has a durable claim and never executes on replay or
     conflict.
     """
+    if no_queue and spec.retry_limit > 0:
+        raise ConfigError(
+            "retry cannot be combined with no_queue: an immediate capacity "
+            "verdict and a background resubmission contradict each other"
+        )
     project_name, project = resolve_project(cfg, spec.project, cwd)
     project_dir = revalidate_project_root(
         project.path,
@@ -4654,6 +5327,7 @@ def submit(
         spec.extras = project.extras
 
     sha, dirty, diff = git_info(project_dir)
+    submodules = git_provenance_mod.submodule_commits(project_dir)
     return _submit_prepared(
         cfg,
         spec,
@@ -4661,6 +5335,7 @@ def submit(
         git_sha=sha,
         git_dirty=dirty,
         git_diff=diff,
+        submodule_commits=submodules,
         log=log,
         no_queue=no_queue,
         claimed_action=claimed_action,
@@ -4830,6 +5505,11 @@ def _submit_fork_locked(
         git_sha=source.git_sha,
         git_dirty=source.git_dirty,
         git_diff=None,
+        submodule_commits=(
+            dict(source.submodule_commits)
+            if source.submodule_commits is not None
+            else None
+        ),
         log=log,
         no_queue=no_queue,
         force_queue=force_queue,
@@ -4846,6 +5526,7 @@ def _submit_prepared(
     git_sha: str | None,
     git_dirty: bool,
     git_diff: str | None,
+    submodule_commits: dict[str, str] | None = None,
     log: Callable[[str], None],
     no_queue: bool,
     force_queue: bool = False,
@@ -4872,6 +5553,7 @@ def _submit_prepared(
                 git_sha=git_sha,
                 git_dirty=git_dirty,
                 git_diff=git_diff,
+                submodule_commits=submodule_commits,
                 log=log,
                 no_queue=no_queue,
                 force_queue=force_queue,
@@ -4914,6 +5596,7 @@ def _submit_prepared(
             git_sha=git_sha,
             git_dirty=git_dirty,
             git_diff=git_diff,
+            submodule_commits=submodule_commits,
             log=log,
             no_queue=no_queue,
             force_queue=force_queue,
@@ -5012,10 +5695,22 @@ def _submit_prepared(
                     "refusing a duplicate submission"
                 )
             if record.state == "rejected":
-                detail = record.error_message or "submission was rejected"
-                raise RequestRejected(
-                    f"request {request_id!r} was already rejected: {detail}"
+                disposition = intent_mod.resolve_disposition(
+                    record,
+                    registry_job_present=existing is not None,
                 )
+                if disposition.retry_safe:
+                    # The rejection provably never crossed the launch boundary
+                    # (placement refusal, unreachable transport, or an
+                    # interrupted bulk transfer). Reopen the same identity via
+                    # the normal replay path instead of replaying a terminal
+                    # receipt forever.
+                    record = intent_mod.authorize_replay(record, disposition)
+                else:
+                    detail = record.error_message or "submission was rejected"
+                    raise RequestRejected(
+                        f"request {request_id!r} was already rejected: {detail}"
+                    )
             if record.state != "replay_authorized":
                 raise RequestOutcomeUnknown(
                     request_id,
@@ -5087,6 +5782,7 @@ def _submit_prepared(
                 git_sha=git_sha,
                 git_dirty=git_dirty,
                 git_diff=git_diff,
+                submodule_commits=submodule_commits,
                 log=log,
                 no_queue=no_queue,
                 force_queue=force_queue,
@@ -5100,11 +5796,17 @@ def _submit_prepared(
             except (RegistryError, ValueError):
                 existing = None
             if claimed_action_in_progress:
-                # The compute launch boundary has not been crossed. The
-                # callback may have partially changed its remote destination,
-                # so reject this identity durably and never run it again.
+                # The compute launch boundary has not been crossed. A callback
+                # that marked its failure retry-safe (an interrupted transfer
+                # into convergent remote state) may reopen this identity; any
+                # other callback may have partially changed its remote
+                # destination, so reject durably and never run it again.
                 state = "rejected"
-                error_kind = "claimed_action_failed"
+                error_kind = (
+                    "claimed_action_interrupted"
+                    if getattr(exc, "retry_safe", False)
+                    else "claimed_action_failed"
+                )
             elif isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 state = "uncertain"
                 error_kind = "interrupted"
@@ -5178,6 +5880,7 @@ def _submit_prepared_once(
     git_sha: str | None,
     git_dirty: bool,
     git_diff: str | None,
+    submodule_commits: dict[str, str] | None = None,
     log: Callable[[str], None],
     no_queue: bool,
     force_queue: bool = False,
@@ -5229,6 +5932,7 @@ def _submit_prepared_once(
         "require_disk_gib": spec.require_disk_gib,
         "git_sha": git_sha,
         "git_dirty": git_dirty,
+        "submodule_commits": submodule_commits,
         "payload_sha256": runtime_sha256,
         "max_hours": spec.max_hours,
         "min_vram_mib": spec.min_vram_mib,
@@ -5303,6 +6007,9 @@ def _submit_prepared_once(
             status="queued",
             git_sha=git_sha,
             git_dirty=git_dirty,
+            submodule_commits=(
+                dict(submodule_commits) if submodule_commits is not None else None
+            ),
             max_hours=spec.max_hours,
             min_vram_mib=spec.min_vram_mib,
             max_vram_mib=spec.max_vram_mib,
@@ -5310,6 +6017,9 @@ def _submit_prepared_once(
             snapshot_sha256=staged_snapshot_sha256,
             payload_sha256=runtime_sha256,
             artifact_manifest=spec.artifact_manifest,
+            artifact_targets=(
+                dict(spec.artifact_targets) if spec.artifact_targets else None
+            ),
             gpus_requested=spec.gpus,
             gpu_isolation=spec.gpu_isolation,
             require_path=spec.require_path,
@@ -5332,6 +6042,10 @@ def _submit_prepared_once(
             after_result=spec.after_result,
             after_result_states=list(spec.after_result_states),
             request_id=spec.request_id,
+            retry_limit=spec.retry_limit,
+            retry_on=spec.retry_on,
+            retry_count=spec.retry_count,
+            retry_of=spec.retry_of,
             rerun_of=spec.rerun_of,
             rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
             rerun_snapshot_changed=_rerun_snapshot_changed(
@@ -5370,8 +6084,14 @@ def _submit_prepared_once(
             result_state="dependency_skipped",
             git_sha=git_sha,
             git_dirty=git_dirty,
+            submodule_commits=(
+                dict(submodule_commits) if submodule_commits is not None else None
+            ),
             payload_sha256=runtime_sha256,
             artifact_manifest=spec.artifact_manifest,
+            artifact_targets=(
+                dict(spec.artifact_targets) if spec.artifact_targets else None
+            ),
             max_hours=spec.max_hours,
             min_vram_mib=spec.min_vram_mib,
             max_vram_mib=spec.max_vram_mib,
@@ -5399,6 +6119,10 @@ def _submit_prepared_once(
             after_result=spec.after_result,
             after_result_states=list(spec.after_result_states),
             request_id=spec.request_id,
+            retry_limit=spec.retry_limit,
+            retry_on=spec.retry_on,
+            retry_count=spec.retry_count,
+            retry_of=spec.retry_of,
             rerun_of=spec.rerun_of,
             rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
             cache_source_job=spec.cache_source_job,
@@ -5861,7 +6585,92 @@ def _existing_dispatch_outcome(entry: JobEntry) -> tuple[str, str | None]:
         return "failed", entry.reason or "dispatch failed"
     if entry.status == "skipped":
         return "skipped", entry.reason or "dependency predicate was false"
+    if entry.status == "queued":
+        # A concurrent dispatcher owns the queued attempt; that is a normal
+        # wait, not a failure of this job.
+        detail = entry.reason or "another dispatcher owns the queued attempt"
+        return "waiting", detail.removeprefix("waiting: ")
     return "failed", f"job is already {entry.status}"
+
+
+# A live dispatcher may legitimately hold one claim through a slow first-time
+# environment sync (the launch ssh alone allows 3600 s). Beyond this bound a
+# claim is treated as wedged and the proven-absent recovery protocol takes
+# over; every cancellation it issues remains token-bound and census-verified.
+DISPATCH_CLAIM_STALE_S = 4 * 3600.0
+_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+
+
+def _current_head_boot_id() -> str:
+    try:
+        value = _BOOT_ID_PATH.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return "unknown"
+    if re.fullmatch(r"[A-Za-z0-9-]{1,64}", value) is None:
+        return "unknown"
+    return value
+
+
+def _process_start_ticks(pid: int) -> int | None:
+    """Field 22 of /proc/<pid>/stat: start time in clock ticks since boot."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (OSError, UnicodeError):
+        return None
+    # The comm field may contain spaces and parentheses; parse after the
+    # last ')' so a hostile process name cannot shift the field offsets.
+    _, _, tail = stat_text.rpartition(")")
+    fields = tail.split()
+    if len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def dispatch_owner_identity() -> str:
+    """Bind a queued claim to this exact dispatcher process incarnation."""
+    ticks = _process_start_ticks(os.getpid())
+    return (
+        f"{_current_head_boot_id()}:{os.getpid()}:{ticks if ticks is not None else 0}"
+    )
+
+
+def _dispatch_claim_hold_reason(entry: JobEntry) -> str | None:
+    """Reason to leave a queued claim alone, or ``None`` when recovery may run.
+
+    The claim owner is a process on this head (`dt run` inline dispatch or the
+    resident agent). While it is provably alive and the claim is fresh, a
+    second dispatcher must not probe or cancel: the owner may be mid-rsync or
+    mid-launch with no remote evidence yet, and cancelling would discard a
+    valid in-flight attempt.
+    """
+    owner = entry.dispatch_owner
+    if owner is None:
+        return None  # legacy claim without owner identity: recover as before
+    parts = owner.split(":")
+    if len(parts) != 3:
+        return None
+    boot_id, pid_text, ticks_text = parts
+    try:
+        pid = int(pid_text)
+        ticks = int(ticks_text)
+    except ValueError:
+        return None
+    if pid == os.getpid():
+        return None  # our own stale claim; single-threaded dispatch may recover
+    if boot_id != _current_head_boot_id():
+        return None  # head rebooted: the owner is gone
+    observed_ticks = _process_start_ticks(pid)
+    if observed_ticks is None:
+        return None  # process gone (or unreadable): owner not alive
+    if ticks != 0 and observed_ticks != ticks:
+        return None  # pid was reused by an unrelated process
+    claimed_at = entry.dispatch_claimed_at
+    if claimed_at is not None and time.time() - claimed_at > DISPATCH_CLAIM_STALE_S:
+        return None  # owner alive but wedged beyond any legitimate dispatch
+    return f"dispatch in progress on {entry.dispatch_node} by live dispatcher pid {pid}"
 
 
 def _commit_queued_transition(
@@ -5912,6 +6721,8 @@ def _commit_queued_transition(
                 finished_at=time.time(),
                 dispatch_node=None,
                 dispatch_token=None,
+                dispatch_owner=None,
+                dispatch_claimed_at=None,
             )
         if current.status != "queued":
             return current
@@ -5985,6 +6796,8 @@ def _claim_queued_dispatch_attempt(
                     return False
                 current.dispatch_node = node.name
                 current.dispatch_token = token
+                current.dispatch_owner = dispatch_owner_identity()
+                current.dispatch_claimed_at = time.time()
                 current.reason = f"dispatching: {node.name}"
                 save(cfg, current)
                 entry.__dict__.update(current.__dict__)
@@ -6325,9 +7138,16 @@ def _dispatch_queued_active(
         after_result=entry.after_result,
         after_result_states=list(entry.after_result_states),
         request_id=entry.request_id,
+        retry_limit=entry.retry_limit,
+        retry_on=entry.retry_on,
+        retry_count=entry.retry_count,
+        retry_of=entry.retry_of,
         rerun_of=entry.rerun_of,
         rerun_source_snapshot_sha256=entry.rerun_source_snapshot_sha256,
         artifact_manifest=entry.artifact_manifest,
+        artifact_targets=(
+            dict(entry.artifact_targets) if entry.artifact_targets else None
+        ),
         cache_source_job=entry.cache_source_job,
         cache_source_job_dir=entry.cache_source_job_dir,
         cache_source_path=entry.cache_source_path,
@@ -6350,6 +7170,16 @@ def _dispatch_queued_active(
         if interrupted is not None:
             return interrupted
         return "failed", entry.reason
+    if entry.storage_layout == ROLE_LAYOUT:
+        try:
+            _ensure_role_queue_bundle(cfg, entry, spec, staging, staged_code, log)
+        except DispatchError as exc:
+            entry.status, entry.reason = "failed", str(exc)
+            interrupted = commit()
+            remove_staging(cfg, entry.job_id)
+            if interrupted is not None:
+                return interrupted
+            return "failed", entry.reason
 
     def job_dir_for_node(node: Node) -> str:
         if entry.storage_layout == ROLE_LAYOUT:
@@ -6358,6 +7188,11 @@ def _dispatch_queued_active(
 
     def finish_placement(placed: JobEntry) -> tuple[str, str | None]:
         placed.git_sha, placed.git_dirty = entry.git_sha, entry.git_dirty
+        placed.submodule_commits = (
+            dict(entry.submodule_commits)
+            if entry.submodule_commits is not None
+            else None
+        )
         current = _commit_queued_transition(
             cfg,
             placed,
@@ -6402,6 +7237,13 @@ def _dispatch_queued_active(
         return _existing_dispatch_outcome(placed)
 
     if entry.dispatch_node is not None:
+        hold_reason = _dispatch_claim_hold_reason(entry)
+        if hold_reason is not None:
+            # The claim owner is alive on this head and the claim is fresh.
+            # Probing now could observe a no-evidence window (mkdir/rsync/ssh
+            # setup) and cancel a perfectly valid in-flight launch. Leave the
+            # row untouched; the owner will finish or its death unblocks us.
+            return "waiting", hold_reason
         configured = next(
             (node for node in cfg.nodes if node.name == entry.dispatch_node),
             None,
@@ -6443,6 +7285,8 @@ def _dispatch_queued_active(
         recovered_attempt = (entry.dispatch_node, entry.dispatch_token)
         entry.dispatch_node = None
         entry.dispatch_token = None
+        entry.dispatch_owner = None
+        entry.dispatch_claimed_at = None
         entry.reason = None
         current = _commit_queued_transition(
             cfg,
@@ -6706,6 +7550,9 @@ def _dispatch_queued_active(
             created_at=entry.created_at,
             payload_sha256=entry.payload_sha256,
             before_attempt=record_attempt,
+            git_sha=entry.git_sha,
+            git_dirty=entry.git_dirty,
+            submodule_commits=entry.submodule_commits,
         )
     except DispatchError as e:
         entry.status, entry.reason = "failed", str(e)
@@ -6731,6 +7578,8 @@ def _dispatch_queued_active(
     owned_attempt = (entry.dispatch_node, entry.dispatch_token)
     entry.dispatch_node = None
     entry.dispatch_token = None
+    entry.dispatch_owner = None
+    entry.dispatch_claimed_at = None
     spec.dispatch_token = None
     if fatal:
         bad = "; ".join(f"{n}: {r}" for n, r in reasons.items())

@@ -158,10 +158,12 @@ from .submission import (
     SubmissionRequest,
     SubmissionValidationError,
     derive_task_name as _derived_task_name,
+    parse_artifact_targets,
     validate_resources,
     validate_workflow,
 )
 from . import submission_intent as intent_mod
+from . import matrix as matrix_mod
 from . import operation_log as operation_log_mod
 from .transfers import collection_parts as _collection_parts
 from .transfers import ensure_collection_root as _ensure_collection_root
@@ -169,7 +171,8 @@ from .transfers import collection_root as _collection_root
 from .transfers import pull_job_record as _pull_job_record
 from .transfers import pull_outputs_probe_bytes as _pull_outputs_probe_bytes
 from .transfers import pull_outputs_probe_command as _pull_outputs_probe_command
-from .version import version_text
+from .install_identity import install_digest, payload_digest
+from .version import parse_version_identity, version_text
 
 EXIT_NO_GPU = 2
 EXIT_ENV = 3
@@ -293,7 +296,7 @@ def _root(
         "-V",
         callback=_version_cb,
         is_eager=True,
-        help="show version (+ git sha when running from a repo)",
+        help="show version plus git, install, and payload content identity",
     ),
 ) -> None:
     """dt: run local projects on idle SSH-accessible compute."""
@@ -2480,6 +2483,16 @@ def run(
         ),
         rich_help_panel="Reproducibility",
     ),
+    artifact_target: Optional[list[str]] = typer.Option(
+        None,
+        "--artifact-target",
+        help=(
+            "link TARGET (or TARGET=SOURCE) inside the job workspace to the "
+            "verified artifact content, replacing hand-rolled symlink bridges "
+            "(repeatable; requires --artifact or --artifact-manifest)"
+        ),
+        rich_help_panel="Reproducibility",
+    ),
     after_success: Optional[str] = typer.Option(
         None,
         "--after-success",
@@ -2509,6 +2522,27 @@ def run(
         "--request-id",
         help="retry-safe caller identity; reuse returns the original job",
         rich_help_panel="Reproducibility",
+    ),
+    retry: int = typer.Option(
+        0,
+        "--retry",
+        min=0,
+        max=10,
+        help=(
+            "automatic retries after a retryable terminal failure: the agent "
+            "resubmits the exact snapshot up to N more times"
+        ),
+        rich_help_panel="Scheduling & safety",
+    ),
+    retry_on: Optional[str] = typer.Option(
+        None,
+        "--retry-on",
+        help=(
+            "what a retry covers: 'infra' (default) retries only "
+            "infrastructure failures, 'always' also retries nonzero "
+            "application exits"
+        ),
+        rich_help_panel="Scheduling & safety",
     ),
     environment: Optional[list[str]] = typer.Option(
         None,
@@ -2608,7 +2642,45 @@ def run(
         artifact_manifest=artifact_manifest,
         json_=json_,
     )
+    try:
+        artifact_targets = parse_artifact_targets(
+            artifact_target or [],
+            artifacts=artifacts,
+            artifact_manifest=artifact_manifest,
+        )
+    except SubmissionValidationError as exc:
+        _fail_submission(
+            kind="invalid_argument",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
     _validate_submission_request_id(request_id, json_=json_)
+    if retry_on is not None and retry_on not in ("infra", "always"):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--retry-on must be 'infra' or 'always'",
+            exit_code=1,
+            json_=json_,
+        )
+    if retry_on is not None and retry == 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--retry-on requires a positive --retry budget",
+            exit_code=1,
+            json_=json_,
+        )
+    if retry > 0 and no_queue:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "--retry cannot be combined with --no-queue: an immediate "
+                "capacity verdict and a background resubmission contradict "
+                "each other"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
     if plan and follow:
         _fail_submission(
             kind="invalid_argument",
@@ -2724,11 +2796,17 @@ def run(
             .option("--max-job-memory-mib", max_job_memory_mib)
             .option("--artifact-manifest", artifact_manifest or None)
             .repeat("--artifact", artifacts)
+            .repeat(
+                "--artifact-target",
+                [f"{target}={source}" for target, source in artifact_targets.items()],
+            )
             .option("--after-success", after_success or None)
             .option("--after-complete", after_complete or None)
             .option("--after-result", after_result or None)
             .repeat("--when-result", result_states)
             .option("--request-id", request_id or None)
+            .option("--retry", retry or None)
+            .option("--retry-on", retry_on or None)
             .flag("--env-envelope-stdin", env_envelope is not None)
             .flag("--no-queue", no_queue)
             .flag("--plan", plan)
@@ -2774,11 +2852,14 @@ def run(
         max_vram_mib=max_vram_mib,
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
+        artifact_targets=tuple(artifact_targets.items()),
         after_success=after_success,
         after_complete=after_complete,
         after_result=after_result,
         after_result_states=tuple(result_states),
         request_id=request_id,
+        retry_limit=retry,
+        retry_on=retry_on,
         custom_env=tuple(custom_env.items()),
     )
     if plan:
@@ -2939,7 +3020,13 @@ def _watch_interrupted(
 
 
 class _OperationFailure(Exception):
-    """Structured internal failure that callers may render in their own schema."""
+    """Structured internal failure that callers may render in their own schema.
+
+    ``retry_safe`` marks failures whose remote effects are provably resumable
+    (an interrupted rsync into a content-addressed cache); the durable request
+    receipt uses it to allow the same request id to retry instead of replaying
+    a terminal rejection.
+    """
 
     def __init__(
         self,
@@ -2948,12 +3035,14 @@ class _OperationFailure(Exception):
         exit_code: int,
         *,
         reasons: dict[str, str] | None = None,
+        retry_safe: bool = False,
     ):
         super().__init__(message)
         self.kind = kind
         self.message = message
         self.exit_code = exit_code
         self.reasons = reasons or {}
+        self.retry_safe = retry_safe
 
 
 def _sync_task_artifacts_raw(
@@ -3008,10 +3097,14 @@ def _sync_task_artifacts_raw(
         unreachable = (
             exc.exit_code is None or exc.exit_code in RSYNC_UNREACHABLE_EXIT_CODES
         )
+        # An interrupted transfer into the per-project artifact cache is
+        # resumable: the manifest identity was frozen before any bytes moved
+        # and a retry re-syncs then re-verifies the same content.
         raise _OperationFailure(
             "unreachable" if unreachable else "artifact_sync_failed",
             str(exc),
             EXIT_UNREACHABLE if unreachable else 1,
+            retry_safe=unreachable,
         ) from exc
     except DispatchError as exc:
         raise _OperationFailure(
@@ -4876,6 +4969,728 @@ def chain(
 
 
 # --------------------------------------------------------------------------
+# matrix (declarative multi-unit submission)
+# --------------------------------------------------------------------------
+
+matrix_app = typer.Typer(
+    no_args_is_help=True,
+    help=(
+        "Declarative unit matrix: expand one YAML/JSON spec into retry-safe "
+        "per-unit submissions."
+    ),
+)
+
+
+def _load_matrix_spec(
+    spec_file: Path,
+    *,
+    json_: bool,
+) -> tuple[str, matrix_mod.MatrixSpec]:
+    """Read and expand one spec, returning its exact text for forwarding."""
+    try:
+        text = _read_bounded_text_input(
+            spec_file,
+            max_bytes=matrix_mod.MATRIX_MAX_SPEC_BYTES,
+        )
+    except (OSError, UnicodeError, ValueError, PrivateStateError) as exc:
+        _fail_submission(
+            kind="invalid_argument",
+            message=f"cannot read matrix spec {str(spec_file)!r}: {exc}",
+            exit_code=1,
+            json_=json_,
+        )
+    try:
+        return text, matrix_mod.load_spec(text)
+    except matrix_mod.MatrixSpecError as exc:
+        _fail_submission(
+            kind="invalid_argument",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+
+
+def _emit_matrix_human(receipt: JsonDict, *, emit_job_ids: bool) -> None:
+    units = receipt.get("units")
+    if emit_job_ids and isinstance(units, list):
+        for row in units:
+            if isinstance(row, dict) and isinstance(row.get("job_id"), str):
+                print(row["job_id"])
+    error = receipt.get("error")
+    if isinstance(error, dict):
+        err.print(
+            f"[red]matrix {escape(str(receipt['status']))}[/red]  "
+            f"{receipt['submitted']}/{receipt['requested']} registered · "
+            f"{escape(str(error.get('message', 'submission failed')))}"
+        )
+    elif receipt.get("idempotent_replay"):
+        err.print(
+            f"[green]matrix already submitted[/green]  "
+            f"{receipt['submitted']}/{receipt['requested']} units confirmed "
+            "by the durable receipt"
+        )
+    else:
+        err.print(
+            f"[green]matrix submitted[/green]  {receipt['submitted']} units · "
+            f"{receipt['running']} running · {receipt['queued']} queued"
+        )
+    request_id = receipt.get("request_id")
+    if isinstance(request_id, str):
+        err.print(
+            f"[dim]next: {escape(shlex.join(['dt', 'matrix', 'status', request_id]))}"
+            "[/dim]"
+        )
+
+
+def _forward_laptop_matrix_run(
+    head: str,
+    spec_text: str,
+    *,
+    request_id: str,
+    json_: bool,
+) -> int:
+    """Forward one matrix spec over stdin without retrying ambiguous state."""
+    recovery = (
+        f"Retry the exact command; matrix request {request_id!r} resumes from "
+        f"its durably confirmed prefix. Query `dt matrix status {request_id} "
+        "--json`."
+    )
+    try:
+        rc, captured = forward_capture_stdout(
+            head,
+            ["matrix", "run", "-", "--json"],
+            tty=False,
+            emit_stdout=False,
+            stdin_bytes=spec_text.encode("utf-8"),
+        )
+    except KeyboardInterrupt:
+        _fail_submission(
+            kind="matrix_submission_unknown",
+            message=f"matrix submission interrupted; outcome unknown. {recovery}",
+            exit_code=130,
+            json_=json_,
+        )
+    try:
+        payload = json.loads(captured)
+    except json.JSONDecodeError:
+        payload = None
+    if (
+        isinstance(payload, dict)
+        and payload.get("schema_version") == matrix_mod.MATRIX_RECEIPT_SCHEMA
+        and isinstance(payload.get("exit_code"), int)
+    ):
+        if json_:
+            print(json.dumps(payload))
+        else:
+            _emit_matrix_human(payload, emit_job_ids=True)
+        return int(payload["exit_code"])
+    if rc in (255, -signal.SIGINT, 128 + signal.SIGINT):
+        _fail_submission(
+            kind="matrix_submission_unknown",
+            message=(
+                "link ended before a complete matrix receipt arrived; "
+                f"outcome unknown. {recovery}"
+            ),
+            exit_code=EXIT_UNREACHABLE if rc == 255 else 130,
+            json_=json_,
+        )
+    _fail_submission(
+        kind="submission_protocol",
+        message=(
+            f"head returned no complete {matrix_mod.MATRIX_RECEIPT_SCHEMA} "
+            f"receipt (exit {rc}); query `dt matrix status {request_id} --json`"
+        ),
+        exit_code=1,
+        json_=json_,
+    )
+
+
+def _matrix_run_head(
+    cfg: HeadConfig,
+    spec: matrix_mod.MatrixSpec,
+    *,
+    json_: bool,
+) -> None:
+    """Submit expanded units in strict prefix order under one group claim."""
+    try:
+        require_compatible_resident_agent(cfg)
+    except ConfigError as exc:
+        _fail_submission(
+            kind="agent_incompatible",
+            message=str(exc),
+            exit_code=EXIT_ENV,
+            json_=json_,
+        )
+
+    request_id = spec.request_id
+    requested = len(spec.units)
+    project = spec.project
+    artifact_manifest: str | None = None
+    artifact_sync: JsonDict | None = None
+    artifact_action: Callable[[], None] | None = None
+    failure: JsonDict | None = None
+    failure_code = 0
+    if spec.artifacts:
+        artifact_node = spec.node
+        if artifact_node is None:
+            raise AssertionError("matrix artifacts require a pinned node")
+        try:
+            from .dispatch import artifact_manifest_identity, resolve_project
+
+            project, project_cfg = resolve_project(cfg, project, Path.cwd())
+            artifact_manifest = artifact_manifest_identity(
+                project,
+                project_cfg.path,
+                list(spec.artifacts),
+            )
+        except (ConfigError, DispatchError) as exc:
+            failure, failure_code, _entry = _batch_error(
+                exc,
+                item_label="matrix unit",
+            )
+        else:
+
+            def publish_artifacts() -> None:
+                nonlocal artifact_sync
+                synced_project, synced_manifest, row = _sync_task_artifacts_raw(
+                    cfg,
+                    server=artifact_node,
+                    project=project,
+                    artifacts=list(spec.artifacts),
+                    expected_manifest_sha256=artifact_manifest,
+                )
+                if synced_project != project or synced_manifest != artifact_manifest:
+                    raise _OperationFailure(
+                        "artifact_sync_failed",
+                        "artifact sync returned an identity different from "
+                        "the claimed group intent",
+                        1,
+                    )
+                artifact_sync = row
+
+            artifact_action = publish_artifacts
+
+    intent_sha256 = matrix_mod.intent_sha256(
+        spec,
+        center=cfg.center,
+        artifact_manifest=artifact_manifest,
+    )
+    entries: list[jobs_mod.JobEntry] = []
+    group_record: group_mod.GroupRequestRecord | None = None
+    group_terminal_replay = False
+    if failure is None:
+        try:
+            group_record = group_mod.locked_claim(
+                cfg,
+                request_id,
+                intent_sha256,
+                operation=matrix_mod.MATRIX_OPERATION,
+                requested=requested,
+                claimed_action=artifact_action,
+            )
+            if (
+                artifact_sync is not None
+                and artifact_manifest is not None
+                and spec.node is not None
+                and not json_
+            ):
+                _emit_task_artifact_sync_success(
+                    spec.node,
+                    artifact_manifest,
+                    artifact_sync,
+                )
+            entries = group_mod.load_entries_or_fail(cfg, group_record)
+            if group_record.state == "confirmed":
+                group_terminal_replay = True
+                failure = _group_failure(group_record)
+                failure_code = group_record.exit_code or 0
+        except _OperationFailure as exc:
+            failure, failure_code, _failed = _batch_error(
+                exc,
+                item_label="matrix unit",
+            )
+        except KeyboardInterrupt:
+            failure = {
+                "kind": "matrix_artifact_sync_interrupted",
+                "message": (
+                    "matrix artifact sync interrupted before job submission; "
+                    "no jobs were registered. The request was durably "
+                    "rejected; inspect the partial transfer and use a new "
+                    "request id to try again."
+                ),
+                "reasons": {"request_id": request_id},
+                "exit_code": 130,
+            }
+            failure_code = 130
+        except group_mod.GroupRequestConflict as exc:
+            failure = {
+                "kind": "idempotency_conflict",
+                "message": str(exc),
+                "reasons": {"request_id": request_id},
+                "exit_code": 1,
+            }
+            failure_code = 1
+        except group_mod.GroupRequestRejected as exc:
+            group_record = exc.record
+            if group_record is not None:
+                failure = _group_failure(group_record)
+                failure_code = int(failure["exit_code"]) if failure is not None else 1
+            else:
+                failure = {
+                    "kind": "submission_rejected",
+                    "message": str(exc),
+                    "reasons": {"request_id": request_id},
+                    "exit_code": EXIT_ENV,
+                }
+                failure_code = EXIT_ENV
+        except group_mod.GroupRequestOutcomeUnknown as exc:
+            group_record = exc.record
+            failure = {
+                "kind": "submission_unknown",
+                "message": str(exc),
+                "reasons": {"request_id": request_id},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+        except intent_mod.RequestLockError as exc:
+            failure = {
+                "kind": "submission_rejected",
+                "message": (
+                    f"request {request_id!r} was not advanced because its "
+                    f"durable lock could not be acquired: {exc}"
+                ),
+                "reasons": {"request_id": request_id},
+                "exit_code": EXIT_ENV,
+            }
+            failure_code = EXIT_ENV
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} has unreadable durable group "
+                    "state; refusing to submit any additional jobs"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+
+    agent_started: bool | None = None
+    agent_checked = False
+
+    def ensure_agent(entry: jobs_mod.JobEntry) -> None:
+        nonlocal agent_checked, agent_started
+        if entry.status != "queued" or agent_checked:
+            return
+        from . import agent as agent_mod
+
+        agent_checked = True
+        if agent_mod.alive_pid(cfg) is None:
+            agent_started = agent_mod.start_detached(cfg)
+
+    resumed = len(entries)
+    for existing_index, existing_entry in enumerate(entries, start=1):
+        ensure_agent(existing_entry)
+        if not json_:
+            print(existing_entry.job_id, flush=True)
+            err.print(
+                f"[dim]matrix {existing_index}/{requested}: already submitted "
+                f"{escape(existing_entry.job_id)}[/dim]"
+            )
+
+    if failure is None and not group_terminal_replay:
+        for index in range(len(entries) + 1, requested + 1):
+            unit = spec.units[index - 1]
+
+            def log(message: str, *, item: int = index) -> None:
+                err.print(f"[dim]matrix {item}/{requested}: {escape(message)}[/dim]")
+
+            run_spec = RunSpec(
+                name=unit.name,
+                gpus=unit.gpus,
+                cmd=["bash", "-c", unit.command],
+                project=project,
+                node=spec.node,
+                max_hours=unit.max_hours,
+                artifact_manifest=artifact_manifest,
+                request_id=group_mod.item_request_id(request_id, index),
+            )
+            try:
+                entry = submit(cfg, run_spec, Path.cwd(), log)
+                group_record = group_mod.locked_record_job(
+                    cfg,
+                    request_id,
+                    intent_sha256=intent_sha256,
+                    index=index,
+                    job_id=entry.job_id,
+                )
+            except KeyboardInterrupt:
+                confirmed = len(entries)
+                noun = "registration" if confirmed == 1 else "registrations"
+                failure = {
+                    "kind": "matrix_submission_interrupted",
+                    "message": (
+                        f"matrix submission interrupted after {confirmed} "
+                        f"confirmed {noun}; unit {index} outcome unknown. "
+                        "Confirmed jobs were not cancelled. Rerun "
+                        "`dt matrix run` with the same spec to reconcile "
+                        "this exact unit."
+                    ),
+                    "reasons": {"request_id": request_id},
+                    "exit_code": 130,
+                    "confirmed_submitted": confirmed,
+                    "uncertain_unit_index": index,
+                }
+                failure_code = 130
+                break
+            except (
+                FailedBeforeStart,
+                NoReachableNode,
+                NoCapacity,
+                DispatchError,
+                ConfigError,
+            ) as exc:
+                failure, failure_code, failed_entry = _batch_error(
+                    exc,
+                    item_label="matrix unit",
+                )
+                if failed_entry is not None:
+                    # An uncertain launch may still be running on the node,
+                    # so it is not part of the durably confirmed prefix (see
+                    # the batch path for the full rationale).
+                    if failure.get("kind") != "uncertain_launch":
+                        try:
+                            group_record = group_mod.locked_record_job(
+                                cfg,
+                                request_id,
+                                intent_sha256=intent_sha256,
+                                index=index,
+                                job_id=failed_entry.job_id,
+                            )
+                        except (
+                            OSError,
+                            ValueError,
+                            intent_mod.RequestRecordError,
+                            group_mod.GroupRequestError,
+                        ) as persistence_exc:
+                            failure = {
+                                "kind": "submission_unknown",
+                                "message": (
+                                    f"job {failed_entry.job_id} was registered "
+                                    f"but request {request_id!r} progress "
+                                    "could not be persisted"
+                                ),
+                                "reasons": {
+                                    "request_id": request_id,
+                                    "job_id": failed_entry.job_id,
+                                    "detail": str(persistence_exc),
+                                },
+                                "exit_code": EXIT_UNREACHABLE,
+                            }
+                            failure_code = EXIT_UNREACHABLE
+                    entries.append(failed_entry)
+                    ensure_agent(failed_entry)
+                    if not json_:
+                        print(failed_entry.job_id, flush=True)
+                break
+            except (
+                OSError,
+                ValueError,
+                intent_mod.RequestRecordError,
+                group_mod.GroupRequestError,
+            ) as exc:
+                failure = {
+                    "kind": "submission_unknown",
+                    "message": (
+                        f"matrix unit {index} did not produce a complete "
+                        "durable group receipt; retry only with the same "
+                        "request id"
+                    ),
+                    "reasons": {"request_id": request_id, "detail": str(exc)},
+                    "exit_code": EXIT_UNREACHABLE,
+                }
+                failure_code = EXIT_UNREACHABLE
+                break
+            entries.append(entry)
+            ensure_agent(entry)
+            if not json_:
+                print(entry.job_id, flush=True)
+
+    # Transient placement failures (every candidate busy or unreachable) keep
+    # the group open on purpose: no unit outcome is ambiguous and nothing was
+    # partially launched, so the same request id must resume from the
+    # confirmed prefix once capacity or connectivity returns instead of
+    # replaying a terminal rejection. This is the per-unit recovery contract
+    # research sweeps rely on.
+    transient = bool(failure and failure.get("kind") in {"no_capacity", "unreachable"})
+    if (
+        group_record is not None
+        and not group_terminal_replay
+        and not transient
+        and group_record.state != "rejected"
+    ):
+        uncertain = bool(
+            failure
+            and failure.get("kind")
+            in {
+                "matrix_submission_interrupted",
+                "submission_unknown",
+                "idempotency_conflict",
+                "uncertain_launch",
+            }
+        )
+        try:
+            group_record = group_mod.locked_transition(
+                cfg,
+                request_id,
+                intent_sha256=intent_sha256,
+                state="uncertain" if uncertain else "confirmed",
+                exit_code=None if uncertain else failure_code,
+                error_kind=(str(failure["kind"]) if failure is not None else None),
+                error_message=(
+                    str(failure.get("message")) if failure is not None else None
+                ),
+            )
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} did not produce a durable final "
+                    "group receipt; retry only with the same request id"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+
+    receipt = matrix_mod.run_receipt(
+        spec,
+        entries=entries,
+        resumed=resumed,
+        error=failure,
+        exit_code=failure_code,
+        idempotent_replay=group_terminal_replay,
+        artifact_manifest=artifact_manifest,
+        artifact_sync=artifact_sync,
+        agent_started=agent_started,
+    )
+    if json_:
+        print(json.dumps(receipt))
+    else:
+        _emit_matrix_human(receipt, emit_job_ids=False)
+    if failure_code:
+        raise typer.Exit(failure_code)
+
+
+@_typed_cli_decorator(matrix_app.command("plan"))
+def matrix_plan(
+    spec_file: Path = typer.Argument(
+        ...,
+        metavar="SPEC",
+        help="YAML/JSON matrix spec; '-' reads stdin",
+    ),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Expand a matrix spec and preview every unit without submitting."""
+    _text, spec = _load_matrix_spec(spec_file, json_=json_)
+    payload = matrix_mod.plan_payload(spec)
+    if json_:
+        print(json.dumps(payload))
+        return
+    from rich.table import Table
+
+    table = Table(
+        title=(
+            f"matrix {spec.request_id} · {len(spec.units)} units · "
+            f"node {spec.node or 'queued placement'}"
+        ),
+        header_style="bold",
+    )
+    table.add_column("#", justify="right")
+    table.add_column("name")
+    table.add_column("gpus", justify="right")
+    table.add_column("max_hours", justify="right")
+    table.add_column("command")
+    for unit in spec.units:
+        table.add_row(
+            str(unit.index),
+            unit.name,
+            str(unit.gpus),
+            "-" if unit.max_hours is None else f"{unit.max_hours:g}",
+            unit.command,
+        )
+    out.print(table)
+    err.print("[dim]submit with: dt matrix run SPEC[/dim]")
+
+
+@_typed_cli_decorator(matrix_app.command("run"))
+def matrix_run(
+    spec_file: Path = typer.Argument(
+        ...,
+        metavar="SPEC",
+        help="YAML/JSON matrix spec; '-' reads stdin",
+    ),
+    center: Optional[str] = typer.Option(
+        None,
+        "-c",
+        "--center",
+        help="(laptop) which center",
+    ),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Submit every expanded unit under one retry-safe matrix request id."""
+    text, spec = _load_matrix_spec(spec_file, json_=json_)
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        raise typer.Exit(
+            _forward_laptop_matrix_run(
+                cfg.centers[_laptop_center(cfg, center)],
+                text,
+                request_id=spec.request_id,
+                json_=json_,
+            )
+        )
+    if center is not None:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--center is a laptop-only option",
+            exit_code=1,
+            json_=json_,
+        )
+    _matrix_run_head(cfg, spec, json_=json_)
+
+
+@_typed_cli_decorator(matrix_app.command("status"))
+def matrix_status(
+    request_id: str = typer.Argument(
+        ...,
+        help="matrix-level request id declared in the spec",
+    ),
+    center: Optional[str] = typer.Option(
+        None,
+        "-c",
+        "--center",
+        help="(laptop) which center",
+    ),
+    json_: bool = typer.Option(False, "--json"),
+) -> None:
+    """Summarize every matrix unit's durable receipt and registry row."""
+    _validate_submission_request_id(request_id, json_=json_)
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        argv = ["matrix", "status", request_id]
+        if json_:
+            argv.append("--json")
+        raise typer.Exit(
+            forward_call(cfg.centers[_laptop_center(cfg, center)], argv, tty=False)
+        )
+    if center is not None:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--center is a laptop-only option",
+            exit_code=1,
+            json_=json_,
+        )
+    try:
+        record = group_mod.load(cfg, request_id)
+    except group_mod.GroupRequestError as exc:
+        _fail_submission(
+            kind="request_state_damaged",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if record is None:
+        _fail_submission(
+            kind="not_found",
+            message=f"no matrix request matching {request_id!r}",
+            exit_code=EXIT_NOT_FOUND,
+            json_=json_,
+        )
+    if record.operation != matrix_mod.MATRIX_OPERATION:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"request {request_id!r} is a {record.operation} group; "
+                f"inspect it with `dt request {request_id} --json`"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    try:
+        payload = matrix_mod.status_payload(cfg, record)
+    except (
+        OSError,
+        ValueError,
+        intent_mod.RequestRecordError,
+        jobs_mod.RegistryError,
+        group_mod.GroupRequestError,
+    ) as exc:
+        _fail_submission(
+            kind="request_state_damaged",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if json_:
+        print(json.dumps(payload))
+        return
+    from rich.table import Table
+
+    state_style = {
+        "confirmed": "green",
+        "prepared": "cyan",
+        "preparing": "yellow",
+        "rejected": "red",
+        "uncertain": "yellow",
+    }[record.state]
+    counts = payload["counts"]
+    out.print(
+        f"[{state_style}]{record.state}[/{state_style}] "
+        f"{escape(record.request_id)} · matrix · "
+        f"{payload['submitted']}/{payload['requested']} submitted"
+    )
+    out.print(
+        f"queued {counts['queued']} · running {counts['running']} · "
+        f"success {counts['success']} · failed {counts['failed']} · "
+        f"missing {counts['missing']}"
+    )
+    table = Table(header_style="bold")
+    table.add_column("#", justify="right")
+    table.add_column("state")
+    table.add_column("job")
+    table.add_column("name")
+    table.add_column("node")
+    table.add_column("exit", justify="right")
+    for row in payload["units"]:
+        exit_code = row.get("exit_code")
+        table.add_row(
+            str(row["index"]),
+            str(row["unit_state"]),
+            str(row.get("job_id") or "-"),
+            str(row.get("name") or "-"),
+            str(row.get("node") or "-"),
+            "-" if exit_code is None else str(exit_code),
+        )
+    out.print(table)
+    if payload["retry_with_same_request_id"]:
+        err.print(
+            "[yellow]rerun `dt matrix run` with the same spec to resume "
+            "from the confirmed prefix[/yellow]"
+        )
+
+
+# --------------------------------------------------------------------------
 # ps
 # --------------------------------------------------------------------------
 
@@ -5349,6 +6164,7 @@ def _gather_ps_rows(
         }
         entries = [refreshed_by_id.get(entry.job_id, entry) for entry in entries]
     queue_contexts = jobs_mod.queue_contexts(entries)
+    queue_placements = jobs_mod.queue_placement_contexts(cfg, entries)
     if status:
         entries = [entry for entry in entries if entry.status == status]
     elif active_only:
@@ -5371,6 +6187,7 @@ def _gather_ps_rows(
             }
         )
         row.update(queue_contexts.get(entry.job_id, {}))
+        row["queue"] = queue_placements.get(entry.job_id)
         observation = observations.get(entry.job_id, {})
         row["node_unreachable"] = bool(observation.get("node_unreachable", False))
         row["status_probe_error"] = observation.get("status_probe_error")
@@ -8522,6 +9339,7 @@ def _compact_watch_snapshot(snapshot: JsonDict) -> JsonDict:
         "max_hours_overdue_s",
         "node_unreachable",
         "status_probe_error",
+        "lost_reconciling",
         "exit_code",
         "resources",
         "log_source",
@@ -8696,6 +9514,7 @@ def _watch_snapshot(
         "max_hours_overdue_s": max_hours_overdue,
         "node_unreachable": bool(status_observation.get("node_unreachable", False)),
         "status_probe_error": status_observation.get("status_probe_error"),
+        "lost_reconciling": jobs_mod.lost_reconciling(entry),
         "exit_code": entry.exit_code,
         "resources": resources,
         "resource_summary": resource_summary,
@@ -8816,6 +9635,9 @@ def _watch_view(snapshot: JsonDict) -> Any:
     if status == "running" and snapshot.get("max_hours_exceeded"):
         display_status += " >max"
         style = "yellow"
+    if status == "lost" and snapshot.get("lost_reconciling"):
+        display_status = "lost? reconciling"
+        style = "yellow"
     if (
         status == "queued"
         and isinstance(snapshot.get("queue_position"), int)
@@ -8933,6 +9755,9 @@ def _watch_group_view(payload: JsonDict) -> Any:
             style = "yellow"
         if status == "running" and snapshot.get("max_hours_exceeded"):
             display_status += " >max"
+            style = "yellow"
+        if status == "lost" and snapshot.get("lost_reconciling"):
+            display_status = "lost? reconciling"
             style = "yellow"
         if (
             status == "queued"
@@ -9958,11 +10783,16 @@ def info(
         "queue_ahead_count": None,
         "queue_head_job_id": None,
         "queue_predecessor_job_id": None,
+        "queue": None,
     }
     if entry.status == "queued":
         queue_context.update(
             jobs_mod.queue_contexts(registry_snapshot).get(entry.job_id, {})
         )
+        queue_context["queue"] = jobs_mod.queue_placement_contexts(
+            cfg,
+            registry_snapshot,
+        ).get(entry.job_id)
 
     data = {
         "schema_version": "dt_job_info_v1",
@@ -9979,6 +10809,11 @@ def info(
         "project": entry.project,
         "git_sha": entry.git_sha,
         "git_dirty": entry.git_dirty,
+        "submodule_commits": (
+            dict(entry.submodule_commits)
+            if entry.submodule_commits is not None
+            else None
+        ),
         "snapshot_sha256": entry.snapshot_sha256,
         "payload_sha256": entry.payload_sha256,
         "artifact_manifest": entry.artifact_manifest,
@@ -10245,6 +11080,23 @@ def info(
                     ),
                 )
             )
+    if entry.retry_of:
+        rows.insert(
+            7,
+            (
+                "retry",
+                f"attempt {entry.retry_count}/{entry.retry_limit} of "
+                f"{display_refs.get(entry.retry_of, entry.retry_of)}",
+            ),
+        )
+    if entry.retried_by:
+        rows.insert(
+            7,
+            (
+                "retried by",
+                display_refs.get(entry.retried_by, entry.retried_by),
+            ),
+        )
     if entry.forked_from:
         rows.insert(
             7,
@@ -10393,6 +11245,8 @@ def info(
         "after success",
         "rerun of",
         "rerun code",
+        "retry",
+        "retried by",
         "failure log",
         "guard trip",
         "phase timeline",
@@ -13732,6 +14586,14 @@ def _pull_unlocked(
         "job_status": entry.status,
         "node": entry.node,
         "destination": str(dst),
+        # Explicit landing contract: pull merges the remote outputs/ contents
+        # directly into the job-level root, so automation must not append
+        # another outputs/ segment. `outputs_root` is therefore the same
+        # directory as `destination_root` when application outputs were
+        # recovered, and null for records-only recoveries.
+        "destination_root": str(dst),
+        "outputs_root": str(dst) if outputs_present else None,
+        "files": _pull_top_level_entries(dst),
         "lite": lite,
         "excludes": excludes,
         "route": pull_route.route,
@@ -13759,6 +14621,28 @@ def _pull_unlocked(
         print(json.dumps(payload))
     else:
         print(dst)
+
+
+def _pull_top_level_entries(destination: Path) -> list[str]:
+    """List the recovered top-level entries relative to the destination root.
+
+    Directories carry a trailing slash so automation can tell them from
+    files without another stat pass. The manifest is intentionally shallow:
+    recovered checkpoint trees can hold tens of thousands of files, and the
+    single-line JSON contract must stay bounded.
+    """
+    try:
+        children = sorted(destination.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return []
+    entries: list[str] = []
+    for child in children:
+        try:
+            is_directory = child.is_dir() and not child.is_symlink()
+        except OSError:
+            is_directory = False
+        entries.append(f"{child.name}/" if is_directory else child.name)
+    return entries
 
 
 def _pull_group_payload(
@@ -17535,6 +18419,37 @@ _DOCTOR_DEPENDENCIES = (
 )
 
 
+def _install_identity_checks() -> dict[str, str]:
+    """Expose this install's content digests for upgrade acceptance."""
+    checks: dict[str, str] = {}
+    install = install_digest()
+    if install is not None:
+        checks["install"] = install
+    payload = payload_digest()
+    if payload is not None:
+        checks["payload"] = payload
+    return checks
+
+
+def _head_content_mismatch(local: dict[str, str], remote: dict[str, str]) -> str | None:
+    """Explain a same-version head whose installed content differs from ours.
+
+    A differing version number is already visible in the ``dt`` check. The
+    dangerous case is an identical version hiding hot-patched or stale files,
+    which only the content digests can reveal.
+    """
+    if not remote or remote.get("version") != local.get("version"):
+        return None
+    diffs = [
+        f"{field} local {local[field]} != head {remote[field]}"
+        for field in ("install", "payload")
+        if field in local and field in remote and local[field] != remote[field]
+    ]
+    if not diffs:
+        return None
+    return "mismatch: same version, different content: " + "; ".join(diffs)
+
+
 def _doctor_contract(rows: list[JsonDict], *, exit_code: int) -> JsonDict:
     """Derive machine actions from the same bounded facts rendered to humans."""
     issues: list[JsonDict] = []
@@ -17689,6 +18604,15 @@ def _doctor_contract(rows: list[JsonDict], *, exit_code: int) -> JsonDict:
                 observed=registry,
                 action={"type": "argv", "argv": ["dt", "clean", "--plan"]},
             )
+        dt_content = str(checks.get("dt_content", ""))
+        if dt_content.startswith("mismatch"):
+            add(
+                node=node,
+                kind="head_content_mismatch",
+                severity="warning",
+                check="dt_content",
+                observed=dt_content,
+            )
     errors = sum(issue["severity"] == "error" for issue in issues)
     warnings = len(issues) - errors
     return {
@@ -17765,6 +18689,7 @@ def doctor(
         )
         registry_label = registry_growth_status(cfg)
         capability_checks = head_capability_checks()
+        identity_checks = _install_identity_checks()
         project_status = default_project_status(cfg)
         local_names = {n.name for n in cfg.nodes if n.local}
         drained_names = {n.name for n in cfg.nodes if n.drained}
@@ -17776,6 +18701,7 @@ def doctor(
                 r["checks"]["agent"] = agent_label
                 r["checks"]["registry"] = registry_label
                 r["checks"].update(capability_checks)
+                r["checks"].update(identity_checks)
                 r["checks"]["default_project"] = project_status
                 if relay_status is not None:
                     r["checks"]["relay"] = relay_status
@@ -17790,12 +18716,16 @@ def doctor(
                 "agent": agent_label,
                 "registry": registry_label,
                 **capability_checks,
+                **identity_checks,
                 "default_project": project_status,
             }
             if relay_status is not None:
                 checks["relay"] = relay_status
             rows.append({"node": "(head)", "checks": checks, "unreachable": False})
     else:
+        # Computed once: every head is compared against this laptop's own
+        # installed content, not merely its version number.
+        local_identity = parse_version_identity(version_text())
 
         def check_head(item: tuple[str, str]) -> JsonDict:
             center, head = item
@@ -17820,17 +18750,24 @@ def doctor(
                 )
                 head_unreachable = proc.returncode == 255
             ver = proc.stdout.strip() if proc and proc.returncode == 0 else "missing"
+            checks: dict[str, str] = {
+                "ssh": ("ok" if ver != "missing" else (detail or "fail")),
+                "dt": (
+                    ver.replace("dt ", "") or "missing"
+                    if ver != "missing"
+                    else ("unknown" if head_unreachable else "missing")
+                ),
+            }
+            if ver != "missing":
+                mismatch = _head_content_mismatch(
+                    local_identity, parse_version_identity(ver)
+                )
+                if mismatch is not None:
+                    checks["dt_content"] = mismatch
             return {
                 "center": center,
                 "node": f"{head} (head)",
-                "checks": {
-                    "ssh": ("ok" if ver != "missing" else (detail or "fail")),
-                    "dt": (
-                        ver.replace("dt ", "") or "missing"
-                        if ver != "missing"
-                        else ("unknown" if head_unreachable else "missing")
-                    ),
-                },
+                "checks": checks,
                 "unreachable": head_unreachable,
             }
 
@@ -17919,6 +18856,13 @@ def doctor(
         print(json.dumps(contract))
     else:
         out.print(doctor_table(rows))
+        for row in rows:
+            mismatch = str(row.get("checks", {}).get("dt_content", ""))
+            if mismatch.startswith("mismatch"):
+                err.print(
+                    f"[yellow]warning:[/yellow] {escape(str(row.get('node')))}: "
+                    f"{escape(mismatch)}"
+                )
         _render_doctor_actions(contract)
     raise typer.Exit(exit_code)
 
@@ -18255,6 +19199,7 @@ app.command("sync", rich_help_panel="Operations")(sync)
 app.command("seed", rich_help_panel="Operations")(seed)
 app.command("topology", rich_help_panel="Operations")(topology)
 app.command("doctor", rich_help_panel="Operations")(doctor)
+app.add_typer(matrix_app, name="matrix", rich_help_panel="Experiments")
 app.add_typer(agent_app, name="agent", rich_help_panel="Operations")
 app.add_typer(migrate_app, name="migrate", rich_help_panel="Operations")
 app.command("_find", hidden=True)(_find)

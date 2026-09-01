@@ -21,6 +21,7 @@ This page helps operators choose a command and handle its result. Run
 | Command | Purpose |
 |---|---|
 | `dt batch` | Submit independent same-node, same-snapshot items |
+| `dt matrix` | Expand a declarative YAML/JSON sweep into retry-safe per-unit submissions |
 | `dt chain` | Submit stages gated on predecessor success |
 | `dt fork` | Submit from an exact historical snapshot |
 | `dt rerun` | Submit the historical command with current project code |
@@ -88,6 +89,12 @@ For automated callers, add a stable `--request-id`. A retry with the same
 normalized intent returns the original job; a changed intent conflicts. If the
 client loses the response, query `dt request REQUEST_ID --json` instead of
 submitting a new job.
+
+`--retry N` lets the resident agent resubmit a retryable terminal failure up
+to N times as an exact-snapshot fork. The default covers infrastructure
+failures; `--retry-on always` extends it to nonzero application exits.
+Cancelled, skipped, uncertain, and still-reconciling lost jobs are never
+retried; `dt info` shows the attempt lineage in both directions.
 
 The request response includes a typed disposition, facts, retry safety, and
 argv-form next actions. `safe_replay` is emitted only after DT proves that no

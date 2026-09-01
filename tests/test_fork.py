@@ -185,6 +185,30 @@ def test_unchanged_capture_self_heals_a_tampered_store(tmp_path):
     )
 
 
+def test_corrupt_store_object_is_quarantined_on_detection(tmp_path):
+    """A poisoned digest path must free itself instead of failing forever."""
+    cfg = _cfg(tmp_path)
+    project = cfg.projects["p"].path
+    (project / "train.py").write_text("print('v1')\n")
+
+    first = dispatch.capture_snapshot(cfg, "p", project)
+    (first.code_dir / "train.py").write_text("mutated in store\n")
+
+    with pytest.raises(dispatch.DispatchError, match="quarantined"):
+        dispatch._validate_stored_snapshot(cfg, first.sha256)  # noqa: SLF001
+
+    root = cfg.snapshots_dir() / first.sha256
+    assert not root.exists()
+    quarantined = list(cfg.snapshots_dir().glob(f".corrupt-{first.sha256}-*"))
+    assert len(quarantined) == 1
+    assert (quarantined[0] / "code" / "train.py").read_text() == "mutated in store\n"
+
+    # The freed digest path repopulates from the authoritative source tree.
+    rebuilt = dispatch.capture_snapshot(cfg, "p", project)
+    assert rebuilt.sha256 == first.sha256
+    assert tree_sha256(rebuilt.code_dir) == first.sha256
+
+
 def test_capture_snapshot_wraps_unsupported_tree_entries(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     project = cfg.projects["p"].path

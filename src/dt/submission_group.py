@@ -22,7 +22,7 @@ GROUP_REQUEST_STATES = frozenset(
     {"preparing", "prepared", "confirmed", "rejected", "uncertain"}
 )
 GROUP_TERMINAL_STATES = frozenset({"confirmed", "rejected"})
-GROUP_OPERATIONS = frozenset({"batch", "chain", "fork_repeat"})
+GROUP_OPERATIONS = frozenset({"batch", "chain", "fork_repeat", "matrix"})
 _RECORD_FIELDS = frozenset(
     {
         "schema",
@@ -472,11 +472,34 @@ def locked_claim(
             ) from exc
         if not created:
             if record.state == "rejected":
-                detail = record.error_message or "group preparation failed"
-                raise GroupRequestRejected(
-                    f"request {request_id!r} was already rejected: {detail}",
-                    record=record,
+                # A retry-safe preparation interruption (dropped transfer into
+                # convergent remote state) with zero submitted children is a
+                # durable proof that re-running the callback is safe. Anything
+                # else stays terminally rejected.
+                reopenable = (
+                    record.error_kind == "claimed_action_interrupted"
+                    and record.submitted == 0
                 )
+                if not reopenable:
+                    detail = record.error_message or "group preparation failed"
+                    raise GroupRequestRejected(
+                        f"request {request_id!r} was already rejected: {detail}",
+                        record=record,
+                    )
+                try:
+                    record = transition(cfg, record, "preparing")
+                except (
+                    OSError,
+                    ValueError,
+                    intent_mod.RequestRecordError,
+                    GroupRequestError,
+                ) as exc:
+                    raise GroupRequestOutcomeUnknown(
+                        f"request {request_id!r} reopen durability is unknown; "
+                        f"inspect `dt request {request_id} --json` before retrying"
+                    ) from exc
+                created = True
+        if not created:
             if claimed_action is None or record.state in {"prepared", "confirmed"}:
                 return record
             raise GroupRequestOutcomeUnknown(
@@ -494,7 +517,11 @@ def locked_claim(
                     cfg,
                     record,
                     "rejected",
-                    error_kind="claimed_action_failed",
+                    error_kind=(
+                        "claimed_action_interrupted"
+                        if getattr(exc, "retry_safe", False)
+                        else "claimed_action_failed"
+                    ),
                     error_message=str(exc) or type(exc).__name__,
                 )
             except (

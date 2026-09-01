@@ -35,6 +35,17 @@ REMOTE_LAUNCH_MARKER_NAME = "launch-identity.sha256"
 REQUEST_DISPOSITIONS = frozenset(
     {"in_progress", "safe_replay", "inspect_remote", "confirmed", "rejected"}
 )
+# Rejections whose contract proves no remote launcher ever observed the
+# attempt and whose remote side effects are convergent, so the same request
+# identity may retry instead of being poisoned:
+# - NoCapacity/NoReachableNode: every candidate refused before start or
+#   failed at the transport boundary and was verifiably cancelled.
+# - claimed_action_interrupted: the pre-launch preparation callback failed
+#   with an explicit retry-safe marker (an interrupted transfer into
+#   content-addressed remote state that a retry resumes and re-verifies).
+RETRYABLE_REJECTION_KINDS = frozenset(
+    {"NoCapacity", "NoReachableNode", "claimed_action_interrupted"}
+)
 MAX_REQUEST_RECORD_BYTES = 64 * 1024
 _V1_RECORD_FIELDS = frozenset(
     {
@@ -454,7 +465,9 @@ def authorize_replay(
         raise ValueError("submission request lacks an exact safe-replay disposition")
     if record.state == "replay_authorized":
         return record
-    if record.state not in {"preparing", "uncertain"}:
+    if record.state not in {"preparing", "uncertain"} and not rejection_is_retryable(
+        record
+    ):
         raise ValueError(
             f"submission request state {record.state!r} cannot authorize replay"
         )
@@ -491,6 +504,20 @@ def reclaim_replay(
         state="preparing",
         created_at=record.created_at,
         updated_at=timestamp,
+    )
+
+
+def rejection_is_retryable(record: RequestRecord) -> bool:
+    """True only when a rejection provably never crossed the launch boundary.
+
+    ``proof_requirement == "none"`` certifies that no remote launch marker was
+    ever bound to this record, so combined with a placement-refusal error kind
+    the attempt cannot have started anywhere.
+    """
+    return (
+        record.state == "rejected"
+        and record.error_kind in RETRYABLE_REJECTION_KINDS
+        and record.proof_requirement == "none"
     )
 
 
@@ -562,6 +589,22 @@ def resolve_disposition(
             (f"inspect retained history for job {record.job_id}",),
         )
     if record.state == "rejected":
+        if rejection_is_retryable(record) and registry_job_present is False:
+            return RequestDisposition(
+                "dt_request_disposition_v1",
+                "safe_replay",
+                record.request_id,
+                record.job_id,
+                True,
+                tuple(
+                    [
+                        *facts,
+                        "registry_job=absent",
+                        "durable_receipt=retryable_rejection",
+                    ]
+                ),
+                ("retry the exact original command with this request id",),
+            )
         return RequestDisposition(
             "dt_request_disposition_v1",
             "rejected",

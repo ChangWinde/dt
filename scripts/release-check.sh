@@ -169,8 +169,15 @@ for release_python in 3.10 3.11; do
         --python "$INSTALL_ENV/bin/python" \
         --no-deps "$BUILD_A/$WHEEL_NAME" >/dev/null
     uv --no-config pip check --python "$INSTALL_ENV/bin/python" >/dev/null
-    EXPECTED_VERSION_OUTPUT="dt $RELEASE_VERSION (${SOURCE_COMMIT:0:12})"
-    [[ "$("$INSTALL_ENV/bin/dt" --version)" == "$EXPECTED_VERSION_OUTPUT" ]]
+    # Release installs report the baked commit plus install/payload content
+    # digests; the digests are content-derived, so assert the shape here and
+    # exact equality between the pip and bootstrap installs below.
+    VERSION_OUTPUT="$("$INSTALL_ENV/bin/dt" --version)"
+    [[ "$VERSION_OUTPUT" == \
+       "dt $RELEASE_VERSION (git ${SOURCE_COMMIT:0:12}, install "*", payload "*")" ]] || {
+        echo "release-check: unexpected version identity: $VERSION_OUTPUT" >&2
+        exit 1
+    }
     "$INSTALL_ENV/bin/dt" --help >/dev/null
     for command in init free run ps logs wait info request pull batch chain compare \
         watch metrics rerun exec fork attach kill clean events storage compact sync \
@@ -192,7 +199,7 @@ for release_python in 3.10 3.11; do
     fi
     env "${BOOTSTRAP_ENV[@]}" bash "$OUT_DIR/bootstrap.sh" \
         "$OUT_DIR/$WHEEL_NAME" "$OUT_DIR/runtime-constraints.txt" >/dev/null
-    [[ "$("$TOOL_BIN_DIR/dt" --version)" == "$EXPECTED_VERSION_OUTPUT" ]]
+    [[ "$("$TOOL_BIN_DIR/dt" --version)" == "$VERSION_OUTPUT" ]]
     [[ "$(<"$ACTIVATION_ROOT/active-command")" == "$TOOL_BIN_DIR/dt" ]]
     [[ ! -e "$CONFIG_PATH" ]]
     echo "release-check: Python $release_python wheel/bootstrap PASS"

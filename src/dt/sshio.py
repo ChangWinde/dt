@@ -1216,6 +1216,13 @@ def _run_rsync_attempt(
             )
 
 
+def _rsync_endpoint_is_remote(endpoint: str) -> bool:
+    """Whether rsync will treat this endpoint as HOST:PATH (rsync's own rule:
+    a colon before the first slash)."""
+    head, separator, _ = endpoint.partition(":")
+    return bool(separator) and "/" not in head
+
+
 def rsync(
     src: str,
     dst: str,
@@ -1265,6 +1272,15 @@ def rsync(
         # The caller's uplink budget: dt applies it to legs that touch the
         # head (the constrained WAN hop), never to intra-site LAN replays.
         cmd.append(f"--bwlimit={bwlimit_kbps}")
+    if _rsync_endpoint_is_remote(src) or _rsync_endpoint_is_remote(dst):
+        # Every remote leg crosses an SSH hop where DT deployments are
+        # routinely bandwidth-bound (observed 80-130 KB/s WAN workers), so
+        # compression is pure win there. Plain -z lets both ends negotiate
+        # the best mutually supported codec (zstd on rsync 3.2+) and keeps
+        # rsync's default already-compressed suffix skip list. Local copies
+        # never pay the CPU cost: rsync ignores compression without a remote
+        # shell, and this guard keeps the intent explicit.
+        cmd.append("-z")
     if checksum:
         cmd.append("--checksum")
     if dry_run:

@@ -896,9 +896,58 @@ def test_launcher_never_overwrites_a_different_launch_identity(tmp_path):
         private_env={"DT_LAUNCH_TOKEN": "b" * 32},
     )
 
-    assert proc.returncode == 14
+    # A foreign identity without a matching cancel sentinel may belong to a
+    # live attempt: refuse retryably (18) so the dispatcher's recovery probe
+    # classifies the owner instead of terminating the job.
+    assert proc.returncode == 18
     assert b"different launch" in proc.stderr
     assert marker.read_text() == original
+
+
+def test_launcher_supersedes_a_provably_cancelled_launch_identity(tmp_path):
+    """A marker whose token the dispatcher cancelled must not poison retries."""
+    job = tmp_path / "job"
+    job.mkdir()
+    marker = job / "launch-identity.sha256"
+    cancelled_token = "a" * 32
+    marker.write_text(hashlib.sha256(cancelled_token.encode()).hexdigest() + "\n")
+    marker.chmod(0o600)
+    cancel_path = job / "cancel"
+    cancel_path.write_text(cancelled_token + "\n")
+
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={"DT_CANCEL_PATH": str(cancel_path)},
+        private_env={"DT_LAUNCH_TOKEN": "b" * 32},
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert marker.read_text() == hashlib.sha256(("b" * 32).encode()).hexdigest() + "\n"
+
+
+def test_launcher_does_not_publish_identity_for_a_cancelled_attempt(tmp_path):
+    """A cancel sentinel for this exact token must stop the launch pre-publish."""
+    proof_state = tmp_path / "proof-state"
+    proof_state.mkdir(mode=0o700)
+    marker = proof_state / "launch-identity.sha256"
+    token = "c" * 32
+    cancel_path = tmp_path / ".dt-cancel"
+    cancel_path.write_text(token + "\n")
+
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={
+            "DT_STATE_DIR": str(proof_state),
+            "DT_CANCEL_PATH": str(cancel_path),
+        },
+        private_env={"DT_LAUNCH_TOKEN": token},
+    )
+
+    assert proc.returncode == 14
+    assert b"cancelled by dispatcher; not starting" in proc.stderr
+    assert not marker.exists()
 
 
 def test_launcher_refuses_a_symlinked_launch_identity_marker(tmp_path):
@@ -1628,6 +1677,148 @@ def test_launch_exposes_successful_same_node_predecessor_outputs(tmp_path, monke
     assert "DT_PREDECESSOR_META_PATH" in _tmux_session_env_names()
 
 
+def _cross_node_predecessor_cfg(tmp_path):
+    from dt.config import HeadConfig, Node
+
+    nodes = [Node(name="n1"), Node(name="n2")]
+    cfg = HeadConfig(
+        center="test-center",
+        nodes=nodes,
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    cfg.registry_dir().mkdir(parents=True, exist_ok=True)
+    return cfg, nodes
+
+
+def test_launch_exposes_cross_node_materialized_predecessor_outputs(
+    tmp_path, monkeypatch
+):
+    import dt.dispatch as dispatch
+    from dt.jobs import save
+
+    cfg, (node, _other) = _cross_node_predecessor_cfg(tmp_path)
+    predecessor = JobEntry(
+        job_id="guard",
+        name="guard",
+        center=cfg.center,
+        project="p",
+        node="n2",
+        node_local=False,
+        job_dir="dt/jobs/guard",
+        session="dt_guard",
+        cmd="true",
+        status="finished",
+        exit_code=0,
+    )
+    save(cfg, predecessor)
+    commands = []
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda name, local, command, timeout, **kwargs: (
+            commands.append(command)
+            or subprocess.CompletedProcess([], 0, '{"gpus": [], "pgid": 123}\n', "")
+        ),
+    )
+
+    rc, _ = dispatch.launch(
+        cfg,
+        node,
+        "evaluate",
+        "dt/jobs/evaluate",
+        "dt_evaluate",
+        RunSpec(
+            name="evaluate",
+            gpus=0,
+            cmd=["true"],
+            after_success=predecessor.job_id,
+        ),
+        predecessor_outputs_dir="dt/jobs/evaluate/.dt/predecessor-outputs",
+    )
+
+    assert rc == 0
+    assert "DT_PREDECESSOR_JOB_ID=guard" in commands[0]
+    assert (
+        "DT_PREDECESSOR_OUTPUTS_DIR=dt/jobs/evaluate/.dt/predecessor-outputs"
+        in commands[0]
+    )
+    assert "DT_PREDECESSOR_JOB_DIR=" not in commands[0]
+
+
+def test_launch_cross_node_predecessor_without_outputs_exposes_identity_only(
+    tmp_path, monkeypatch
+):
+    import dt.dispatch as dispatch
+    from dt.jobs import save
+
+    cfg, (node, _other) = _cross_node_predecessor_cfg(tmp_path)
+    predecessor = JobEntry(
+        job_id="guard",
+        name="guard",
+        center=cfg.center,
+        project="p",
+        node="n2",
+        node_local=False,
+        job_dir="dt/jobs/guard",
+        session="dt_guard",
+        cmd="true",
+        status="finished",
+        exit_code=0,
+    )
+    save(cfg, predecessor)
+    commands = []
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda name, local, command, timeout, **kwargs: (
+            commands.append(command)
+            or subprocess.CompletedProcess([], 0, '{"gpus": [], "pgid": 123}\n', "")
+        ),
+    )
+
+    rc, _ = dispatch.launch(
+        cfg,
+        node,
+        "evaluate",
+        "dt/jobs/evaluate",
+        "dt_evaluate",
+        RunSpec(
+            name="evaluate",
+            gpus=0,
+            cmd=["true"],
+            after_success=predecessor.job_id,
+        ),
+    )
+
+    assert rc == 0
+    assert "DT_PREDECESSOR_JOB_ID=guard" in commands[0]
+    assert "DT_PREDECESSOR_OUTPUTS_DIR=" not in commands[0]
+    assert "DT_PREDECESSOR_JOB_DIR=" not in commands[0]
+
+
+def test_launcher_prefers_head_materialized_predecessor_outputs():
+    # set -u safe default before any use.
+    assert 'DT_PREDECESSOR_OUTPUTS_DIR="${DT_PREDECESSOR_OUTPUTS_DIR:-}"' in LAUNCHER
+    # Head-relative paths are absolutized on the node they refer to.
+    assert (
+        'DT_PREDECESSOR_OUTPUTS_DIR=$(dt_absolutize "$DT_PREDECESSOR_OUTPUTS_DIR")'
+        in LAUNCHER
+    )
+    # The materialized copy wins over same-node derivation, which stays the
+    # fallback for the existing single-node contract.
+    cross = LAUNCHER.index('DT_PREDECESSOR_OUTPUTS="$DT_PREDECESSOR_OUTPUTS_DIR"')
+    same = LAUNCHER.index('DT_PREDECESSOR_OUTPUTS="$DT_PREDECESSOR_JOB_DIR/outputs"')
+    assert 0 < cross < same
+    assert (
+        'if [ -n "$DT_PREDECESSOR_OUTPUTS_DIR" ] \\\n'
+        '   && [ -d "$DT_PREDECESSOR_OUTPUTS_DIR" ]; then'
+    ) in LAUNCHER
+    assert "DT_PREDECESSOR_OUTPUTS_DIR" in _tmux_session_env_names()
+
+
 def test_launch_propagates_exact_fork_cache_contract(tmp_path, monkeypatch):
     import dt.dispatch as dispatch
     from dt.config import HeadConfig, Node
@@ -1992,6 +2183,62 @@ def test_artifact_verifier_detects_content_drift(tmp_path):
     drifted = subprocess.run(command, capture_output=True, text=True, timeout=5)
     assert drifted.returncode == 1
     assert "artifact verification failed" in drifted.stderr
+    assert "mismatch" in drifted.stderr
+
+
+def test_artifact_verifier_handles_directory_artifacts_in_isolated_mode(tmp_path):
+    """Directory manifests need tree_sha256 from the sibling snapshot_hash.py.
+
+    Regression for the fleet failure where ``python3 -I`` could not import
+    ``snapshot_hash`` as a bare module name and every ``--artifact-manifest``
+    job with a directory artifact died with exit code 3 before starting.
+    """
+    import dt.dispatch as dispatch
+
+    root = tmp_path / "artifacts"
+    dataset = root / "third_party" / "data"
+    dataset.mkdir(parents=True)
+    (dataset / "shard-0.bin").write_bytes(b"a" * 32)
+    (dataset / "shard-1.bin").write_bytes(b"b" * 32)
+    sources = dispatch._artifact_sources(  # noqa: SLF001
+        root,
+        ["third_party/data"],
+    )
+    manifest_bytes, manifest_sha256 = dispatch._artifact_manifest(  # noqa: SLF001
+        "omni",
+        sources,
+    )
+    assert json.loads(manifest_bytes)["artifacts"][0]["kind"] == "directory"
+    manifest = root / ".dt" / "manifests" / f"{manifest_sha256}.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(manifest_bytes)
+
+    # Exactly the compute-node layout: two standalone files, no package.
+    job = tmp_path / "job"
+    job.mkdir()
+    support = _support_files(["true"], {})
+    (job / "artifact_verify.py").write_text(support["artifact_verify.py"])
+    (job / "snapshot_hash.py").write_text(support["snapshot_hash.py"])
+    command = [
+        "python3",
+        "-I",
+        str(job / "artifact_verify.py"),
+        "--root",
+        str(root),
+        "--manifest",
+        str(manifest),
+        "--expected-sha256",
+        manifest_sha256,
+    ]
+
+    valid = subprocess.run(command, capture_output=True, text=True, timeout=5)
+    assert valid.returncode == 0, valid.stderr
+    assert json.loads(valid.stdout)["artifacts"] == 1
+    assert "ModuleNotFoundError" not in valid.stderr
+
+    (dataset / "shard-1.bin").write_bytes(b"drift")
+    drifted = subprocess.run(command, capture_output=True, text=True, timeout=5)
+    assert drifted.returncode == 1
     assert "mismatch" in drifted.stderr
 
 
@@ -3572,6 +3819,16 @@ def test_support_files_ship_setup_hook():
     assert "env-key" not in files_no
 
 
+def test_launcher_exports_source_provenance_to_the_user_process():
+    # The head may omit provenance entirely (non-git project); under set -u
+    # every variable needs an explicit empty default before first use.
+    assert 'DT_SOURCE_COMMIT="${DT_SOURCE_COMMIT:-}"' in LAUNCHER
+    assert 'DT_SOURCE_DIRTY="${DT_SOURCE_DIRTY:-}"' in LAUNCHER
+    assert 'DT_SUBMODULE_COMMITS="${DT_SUBMODULE_COMMITS:-}"' in LAUNCHER
+    names = _tmux_session_env_names()
+    assert {"DT_SOURCE_COMMIT", "DT_SOURCE_DIRTY", "DT_SUBMODULE_COMMITS"} <= names
+
+
 def test_payload_sha256_is_order_independent_and_content_addressed():
     first = {
         "launcher.sh": "launch-v1\n",
@@ -3892,3 +4149,135 @@ def test_rerun_replays_setup_hook():
     )
     assert spec_from_entry(e).setup == "uv pip install --no-deps ./libs/CleanDiffuser"
     assert spec_from_entry(e).setup_inputs == ["libs/CleanDiffuser"]
+
+
+def _artifact_root_with_verified_manifest(tmp_path: Path) -> tuple[Path, str]:
+    """Build an artifact root whose manifest matches its published content."""
+    from dt.dispatch import _artifact_manifest, _artifact_sources
+
+    artifact_root = tmp_path / "artifact-root"
+    dataset = artifact_root / "third_party" / "data"
+    dataset.mkdir(parents=True)
+    (dataset / "train.txt").write_text("verified artifact content\n")
+    sources = _artifact_sources(artifact_root, ["third_party/data"])
+    manifest_bytes, manifest_sha256 = _artifact_manifest("p", sources)
+    manifest_dir = artifact_root / ".dt" / "manifests"
+    manifest_dir.mkdir(parents=True)
+    (manifest_dir / f"{manifest_sha256}.json").write_bytes(manifest_bytes)
+    return artifact_root, manifest_sha256
+
+
+def test_launcher_links_artifact_targets_after_verification(tmp_path):
+    artifact_root, manifest = _artifact_root_with_verified_manifest(tmp_path)
+    payload_dir = _stage_runtime_payload(tmp_path / "payload")
+
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        env_overrides={
+            "DT_PAYLOAD_DIR": str(payload_dir),
+            "DT_ARTIFACT_ROOT": str(artifact_root),
+            "DT_ARTIFACT_MANIFEST": manifest,
+            "DT_ARTIFACT_TARGETS": (
+                "third_party/data\tthird_party/data\n"
+                "inputs/train.txt\tthird_party/data/train.txt"
+            ),
+        },
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    directory_link = tmp_path / "job" / "code" / "third_party" / "data"
+    file_link = tmp_path / "job" / "code" / "inputs" / "train.txt"
+    assert directory_link.is_symlink()
+    assert directory_link.resolve() == (artifact_root / "third_party" / "data")
+    assert file_link.is_symlink()
+    assert (
+        file_link.read_text() == "verified artifact content\n"
+    )  # resolves through the link
+
+
+def _run_launcher_for_artifact_targets(
+    tmp_path: Path,
+    *,
+    targets: str,
+    artifact_root: Path,
+    manifest: str,
+    payload_dir: Path,
+) -> subprocess.CompletedProcess:
+    """Drive the real launcher just far enough to reach the link block.
+
+    The block sits between manifest verification and every later phase, so a
+    fail-closed exit 13 proves no environment sync or session work started.
+    """
+    job = tmp_path / "job"
+    (job / "code").mkdir(parents=True, exist_ok=True)
+    (job / "logs").mkdir(exist_ok=True)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir(exist_ok=True)
+    return subprocess.run(
+        ["bash", str(PAYLOAD / "launcher.sh")],
+        env={
+            **os.environ,
+            "HOME": str(fake_home),
+            "DT_JOB_DIR": str(job),
+            "DT_GPUS": "0",
+            "DT_SESSION": "dt_artifact_targets",
+            "DT_ENVS_DIR": str(tmp_path / "envs"),
+            "DT_PAYLOAD_DIR": str(payload_dir),
+            "DT_ARTIFACT_ROOT": str(artifact_root),
+            "DT_ARTIFACT_MANIFEST": manifest,
+            "DT_ARTIFACT_TARGETS": targets,
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def test_launcher_refuses_artifact_target_over_existing_snapshot_path(tmp_path):
+    artifact_root, manifest = _artifact_root_with_verified_manifest(tmp_path)
+    payload_dir = _stage_runtime_payload(tmp_path / "payload")
+    occupied = tmp_path / "job" / "code" / "third_party" / "data"
+    occupied.mkdir(parents=True)
+    occupied = occupied / "train.txt"
+    occupied.write_text("snapshot content the link must never replace\n")
+
+    proc = _run_launcher_for_artifact_targets(
+        tmp_path,
+        targets="third_party/data/train.txt\tthird_party/data/train.txt",
+        artifact_root=artifact_root,
+        manifest=manifest,
+        payload_dir=payload_dir,
+    )
+
+    assert proc.returncode == 13, proc.stderr
+    assert "already exists in the snapshot" in proc.stderr
+    assert not occupied.is_symlink()
+    assert occupied.read_text() == "snapshot content the link must never replace\n"
+
+
+def test_launcher_refuses_unsafe_or_missing_artifact_target_rows(tmp_path):
+    artifact_root, manifest = _artifact_root_with_verified_manifest(tmp_path)
+    payload_dir = _stage_runtime_payload(tmp_path / "payload")
+
+    escape = _run_launcher_for_artifact_targets(
+        tmp_path,
+        targets="../escape\tthird_party/data",
+        artifact_root=artifact_root,
+        manifest=manifest,
+        payload_dir=payload_dir,
+    )
+    assert escape.returncode == 13, escape.stderr
+    assert "unsafe artifact target path" in escape.stderr
+    assert not (tmp_path / "escape").exists()
+
+    missing = _run_launcher_for_artifact_targets(
+        tmp_path,
+        targets="inputs/gone\tdoes/not/exist",
+        artifact_root=artifact_root,
+        manifest=manifest,
+        payload_dir=payload_dir,
+    )
+    assert missing.returncode == 13, missing.stderr
+    assert "artifact target source missing" in missing.stderr
+    assert not (tmp_path / "job" / "code" / "inputs").exists()

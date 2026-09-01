@@ -203,6 +203,65 @@ def _git_info_two_step(
     return sha, True, _bounded_head_diff(project_dir, max_diff_bytes)
 
 
+# Submodule provenance is convenience metadata like the rest of this module:
+# a capped capture that may hide entries is unusable rather than partially
+# true, so overruns surface as ``None`` instead of an incomplete mapping.
+SUBMODULE_STATUS_MAX_BYTES = 256 * 1024
+MAX_SUBMODULE_ENTRIES = 1024
+
+# ``git submodule status --recursive`` emits one line per submodule:
+# a state prefix (space = in sync, ``-`` = uninitialized, ``+`` = checked-out
+# sha differs from the index, ``U`` = merge conflict), the recorded sha, the
+# display path, and an optional trailing ``(describe)`` annotation.
+_SUBMODULE_STATUS_LINE_RE = re.compile(
+    r"^[ \-+U]([0-9a-fA-F]{7,64}) (.+?)(?: \([^()]*\))?$"
+)
+
+
+def parse_submodule_status(text: str) -> dict[str, str] | None:
+    """Parse ``git submodule status --recursive`` output into ``{path: sha}``.
+
+    Any non-empty line that does not match the porcelain shape proves the
+    capture cannot be trusted, so the whole parse returns ``None`` rather than
+    a mapping that silently dropped entries.
+    """
+    commits: dict[str, str] = {}
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        match = _SUBMODULE_STATUS_LINE_RE.match(line)
+        if match is None:
+            return None
+        commits[match.group(2)] = match.group(1)
+    return dict(sorted(commits.items()))
+
+
+def submodule_commits(project_dir: Path) -> dict[str, str] | None:
+    """Return bounded ``{submodule_path: sha}`` provenance for one repository.
+
+    ``None`` means submodule state could not be proven (not a git repository,
+    the query failed or timed out, the capture exceeded its byte budget, or
+    the repository has implausibly many submodules); an empty dict is a
+    positive claim that the repository has no submodules.  Uninitialized
+    (``-``) submodules still contribute the sha recorded in the superproject
+    index, matching what a checkout would produce.
+    """
+    try:
+        rc, text, exceeded = git_capture_bounded(
+            project_dir,
+            ("submodule", "status", "--recursive"),
+            max_bytes=SUBMODULE_STATUS_MAX_BYTES,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if rc != 0 or exceeded:
+        return None
+    commits = parse_submodule_status(text)
+    if commits is not None and len(commits) > MAX_SUBMODULE_ENTRIES:
+        return None
+    return commits
+
+
 def git_info(
     project_dir: Path,
     *,

@@ -8,7 +8,8 @@ import shlex
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .dispatch import RunSpec
+from .config import ConfigError
+from .dispatch import RunSpec, validate_artifact_targets
 from .jobs import RESULT_STATES
 
 
@@ -139,6 +140,45 @@ def validate_workflow(
         )
 
 
+def parse_artifact_targets(
+    raw: list[str],
+    *,
+    artifacts: list[str],
+    artifact_manifest: str | None,
+) -> dict[str, str]:
+    """Parse repeatable ``TARGET[=SOURCE]`` workspace-link declarations.
+
+    ``TARGET`` is the code-relative path programs expect; ``SOURCE`` is the
+    artifact-root relative path holding the verified content and defaults to
+    ``TARGET`` (the common same-path bridge). Validation matches the
+    dispatcher's, so a bad value fails here before any remote work.
+    """
+    if raw and not artifacts and artifact_manifest is None:
+        raise SubmissionValidationError(
+            "--artifact-target requires --artifact or --artifact-manifest: "
+            "links must point at verified artifact content"
+        )
+    targets: dict[str, str] = {}
+    for declaration in raw:
+        target, separator, source = declaration.partition("=")
+        target = target.strip()
+        source = source.strip() if separator else target
+        if not target or (separator and not source):
+            raise SubmissionValidationError(
+                "--artifact-target must be TARGET or TARGET=SOURCE with "
+                f"non-empty paths, got {declaration!r}"
+            )
+        if target in targets and targets[target] != source:
+            raise SubmissionValidationError(
+                f"--artifact-target declares {target!r} twice with different sources"
+            )
+        targets[target] = source
+    try:
+        return validate_artifact_targets(targets)
+    except ConfigError as exc:
+        raise SubmissionValidationError(str(exc)) from exc
+
+
 @dataclass(frozen=True, slots=True)
 class SubmissionRequest:
     """Normalized user intent before head-side dependency/artifact resolution."""
@@ -155,11 +195,14 @@ class SubmissionRequest:
     max_vram_mib: int | None = None
     max_job_memory_mib: int | None = None
     artifact_manifest: str | None = None
+    artifact_targets: tuple[tuple[str, str], ...] = ()
     after_success: str | None = None
     after_complete: str | None = None
     after_result: str | None = None
     after_result_states: tuple[str, ...] = ()
     request_id: str | None = None
+    retry_limit: int = 0
+    retry_on: str | None = None
     custom_env: tuple[tuple[str, str], ...] = ()
 
     def resolved(
@@ -198,10 +241,15 @@ class SubmissionRequest:
             max_vram_mib=self.max_vram_mib,
             max_job_memory_mib=self.max_job_memory_mib,
             artifact_manifest=self.artifact_manifest,
+            artifact_targets=(
+                dict(self.artifact_targets) if self.artifact_targets else None
+            ),
             after_success=self.after_success,
             after_complete=self.after_complete,
             after_result=self.after_result,
             after_result_states=list(self.after_result_states),
             request_id=self.request_id,
+            retry_limit=self.retry_limit,
+            retry_on=self.retry_on,
             custom_env=dict(self.custom_env),
         )

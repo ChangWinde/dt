@@ -5,12 +5,14 @@
 #                     [DT_MIN_VRAM_MIB] [DT_MAX_VRAM_MIB]
 #                     [DT_MAX_JOB_MEMORY_MIB]
 #                     [DT_WEBHOOK DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME]
-#                     [DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST]
+#                     [DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST DT_ARTIFACT_TARGETS]
 #                     [DT_ENV_MODE=sync|reuse]
 #                     [DT_GPU_ISOLATION=advisory]
 #                     [DT_PRIVATE_ENV_STDIN=1] [DT_CUSTOM_ENV_PATH]
 #                     [DT_PAYLOAD_ATTEST_MS]
 #                     [DT_PREDECESSOR_JOB_ID DT_PREDECESSOR_JOB_DIR]
+#                     [DT_PREDECESSOR_OUTPUTS_DIR]
+#                     [DT_SOURCE_COMMIT DT_SOURCE_DIRTY DT_SUBMODULE_COMMITS]
 #                     [DT_CACHE_SOURCE_JOB_ID DT_CACHE_SOURCE_JOB_DIR
 #                      DT_CACHE_SOURCE_RELPATH DT_CACHE_ENV
 #                      DT_CACHE_SOURCE_ENV DT_CACHE_SOURCE_SNAPSHOT
@@ -18,6 +20,7 @@
 # Exit codes:         0 ok | 10 busy | 11 path-missing | 12 disk-full
 #                     13 env-fail | 14 internal | 15 node-unfit
 #                     16 cache-missing | 17 payload-integrity
+#                     18 identity-conflict (retryable: foreign live marker)
 # On success prints one JSON line with placement, environment cache state,
 # setup execution, and node boot identity.
 set -u
@@ -96,8 +99,14 @@ DT_REQUIRE_PATH="${DT_REQUIRE_PATH:-}"
 DT_REQUIRE_PATH="${DT_REQUIRE_PATH/#\~/$HOME}"
 DT_ARTIFACT_ROOT="${DT_ARTIFACT_ROOT:-}"
 DT_ARTIFACT_MANIFEST="${DT_ARTIFACT_MANIFEST:-}"
+DT_ARTIFACT_TARGETS="${DT_ARTIFACT_TARGETS:-}"
 DT_PREDECESSOR_JOB_ID="${DT_PREDECESSOR_JOB_ID:-}"
 DT_PREDECESSOR_JOB_DIR="${DT_PREDECESSOR_JOB_DIR:-}"
+DT_PREDECESSOR_OUTPUTS_DIR="${DT_PREDECESSOR_OUTPUTS_DIR:-}"
+# Head-recorded source provenance; the snapshot itself ships without .git.
+DT_SOURCE_COMMIT="${DT_SOURCE_COMMIT:-}"
+DT_SOURCE_DIRTY="${DT_SOURCE_DIRTY:-}"
+DT_SUBMODULE_COMMITS="${DT_SUBMODULE_COMMITS:-}"
 DT_PREDECESSOR_OUTPUTS=""
 DT_PREDECESSOR_META_PATH=""
 DT_CACHE_SOURCE_JOB_ID="${DT_CACHE_SOURCE_JOB_ID:-}"
@@ -126,6 +135,10 @@ esac
 case "$DT_PREDECESSOR_JOB_DIR" in
     "") : ;;
     *) DT_PREDECESSOR_JOB_DIR=$(dt_absolutize "$DT_PREDECESSOR_JOB_DIR") ;;
+esac
+case "$DT_PREDECESSOR_OUTPUTS_DIR" in
+    "") : ;;
+    *) DT_PREDECESSOR_OUTPUTS_DIR=$(dt_absolutize "$DT_PREDECESSOR_OUTPUTS_DIR") ;;
 esac
 case "$DT_CACHE_SOURCE_JOB_DIR" in
     "") : ;;
@@ -401,10 +414,49 @@ NAME = "launch-identity.sha256"
 TOKEN = re.compile(rb"[0-9a-f]{32}")
 DIGEST = re.compile(rb"[0-9a-f]{64}\n")
 
+# Exit contract consumed by the launcher: 0 published/already ours,
+# 3 marker owned by a different, not-provably-cancelled attempt (retryable),
+# 4 this attempt is already cancelled (do not start), 1 structural failure.
+EXIT_FOREIGN_MARKER = 3
+EXIT_CANCELLED = 4
+
 
 def fail(message):
     print(f"launch identity marker rejected: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def read_cancel_sentinel():
+    """Return the dispatcher cancel sentinel value, or None when absent.
+
+    Mirrors the shell ``cancelled()`` contract: unsafe metadata or oversized
+    content fails toward cancellation, and command-substitution semantics
+    strip trailing newlines from the stored value.
+    """
+    path = sys.argv[2] if len(sys.argv) > 2 else ""
+    if not path:
+        return None
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return b""
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 65:
+            return b""
+        payload = os.read(descriptor, 66)
+    except OSError:
+        return b""
+    finally:
+        os.close(descriptor)
+    while payload.endswith((b"\n", b"\r")):
+        payload = payload[:-1]
+    return payload
 
 
 def file_identity(info):
@@ -482,15 +534,41 @@ token = sys.stdin.buffer.read(65)
 if TOKEN.fullmatch(token) is None:
     fail("launch token is invalid")
 expected = hashlib.sha256(token).hexdigest().encode("ascii") + b"\n"
+sentinel = read_cancel_sentinel()
+if sentinel is not None and (sentinel in (b"", b"*") or sentinel == token):
+    # The dispatcher already gave up on this exact attempt (or cancelled the
+    # job globally). Never publish an identity for a launch that must not
+    # start; a marker here would poison every later retry of this job.
+    print("launch already cancelled by dispatcher", file=sys.stderr)
+    raise SystemExit(EXIT_CANCELLED)
 directory = open_directory_nofollow(os.path.dirname(os.path.abspath(sys.argv[1])))
 temporary = f".{NAME}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
 descriptor = -1
 try:
     existing = read_existing(directory)
     if existing is not None:
-        if not hmac.compare_digest(existing, expected):
-            fail("existing marker belongs to a different launch")
-        raise SystemExit(0)
+        if hmac.compare_digest(existing, expected):
+            raise SystemExit(0)
+        cancelled_digest = (
+            hashlib.sha256(sentinel).hexdigest().encode("ascii") + b"\n"
+            if sentinel is not None and TOKEN.fullmatch(sentinel)
+            else None
+        )
+        if cancelled_digest is not None and hmac.compare_digest(
+            existing,
+            cancelled_digest,
+        ):
+            # The marker belongs to the attempt the dispatcher provably
+            # cancelled (its token is in the cancel sentinel). Supersede it
+            # so a poisoned capsule never terminates the job.
+            os.unlink(NAME, dir_fd=directory)
+        else:
+            print(
+                "launch identity marker rejected: existing marker belongs "
+                "to a different launch",
+                file=sys.stderr,
+            )
+            raise SystemExit(EXIT_FOREIGN_MARKER)
     descriptor = os.open(
         temporary,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -520,7 +598,12 @@ try:
     except FileExistsError:
         existing = read_existing(directory)
         if existing is None or not hmac.compare_digest(existing, expected):
-            fail("racing marker belongs to a different launch")
+            print(
+                "launch identity marker rejected: racing marker belongs "
+                "to a different launch",
+                file=sys.stderr,
+            )
+            raise SystemExit(EXIT_FOREIGN_MARKER)
     os.fsync(directory)
 finally:
     if descriptor >= 0:
@@ -531,15 +614,36 @@ finally:
         pass
     os.close(directory)
 PY
-    if ! printf '%s' "$DT_LAUNCH_TOKEN" \
-        | python3 -I -c "$publisher" "$marker"; then
-        log "cannot publish launch identity"
-        return 1
+    printf '%s' "$DT_LAUNCH_TOKEN" \
+        | python3 -I -c "$publisher" "$marker" "${DT_CANCEL_PATH:-}"
+    local publish_rc=$?
+    if [ "$publish_rc" -eq 0 ]; then
+        export -n DT_LAUNCH_TOKEN 2>/dev/null || true
+        return 0
     fi
-    export -n DT_LAUNCH_TOKEN 2>/dev/null || true
+    if [ "$publish_rc" -eq 3 ] || [ "$publish_rc" -eq 4 ]; then
+        return "$publish_rc"
+    fi
+    log "cannot publish launch identity"
+    return 1
 }
 
-dt_publish_launch_identity || exit 14
+dt_publish_launch_identity
+case $? in
+    0) ;;
+    3)
+        # Another attempt's identity is bound to this capsule and is not
+        # provably cancelled. Refuse retryably: the dispatcher's recovery
+        # probe classifies the live owner instead of failing the job.
+        log "launch identity is bound to a different active attempt"
+        exit 18
+        ;;
+    4)
+        log "cancelled by dispatcher; not starting"
+        exit 14
+        ;;
+    *) exit 14 ;;
+esac
 
 dt_custom_env_reject() {
     local path=$1 reason=$2
@@ -668,7 +772,13 @@ lease_available() {
     [ ! -e "$lock" ] || flock -n "$lock" -c true
 }
 
-if [ -n "$DT_PREDECESSOR_JOB_ID" ]; then
+if [ -n "$DT_PREDECESSOR_OUTPUTS_DIR" ] \
+   && [ -d "$DT_PREDECESSOR_OUTPUTS_DIR" ]; then
+    # Cross-node handoff: the head verified the predecessor and materialized
+    # its outputs into this job-private copy. Same-node derivation does not
+    # apply because the predecessor job directory lives on another node.
+    DT_PREDECESSOR_OUTPUTS="$DT_PREDECESSOR_OUTPUTS_DIR"
+elif [ -n "$DT_PREDECESSOR_JOB_ID" ]; then
     predecessor_state="$DT_PREDECESSOR_JOB_DIR/.dt/state"
     predecessor_meta="$DT_PREDECESSOR_JOB_DIR/.dt/meta.json"
     [ -d "$predecessor_state" ] || predecessor_state="$DT_PREDECESSOR_JOB_DIR"
@@ -719,6 +829,15 @@ cancelled() {
     case "$value" in ""|"*") return 0;; esac
     [ -n "${DT_LAUNCH_TOKEN:-}" ] && [ "$value" = "$DT_LAUNCH_TOKEN" ]
 }
+
+# A cancellation that raced in between the identity publication above and
+# this point must stop the launch before any expensive environment work; a
+# cancelled launcher that keeps running widens the window in which its
+# workspace writes overlap the successor attempt.
+if cancelled; then
+    log "cancelled by dispatcher; not starting"
+    exit 14
+fi
 
 # A tmux client cannot move an already-running server into a new cgroup. Use a
 # deterministic per-job socket so the server created below is necessarily new
@@ -1151,6 +1270,48 @@ if [ -n "$DT_ARTIFACT_MANIFEST" ]; then
         exit 13
     fi
     ARTIFACT_VERIFY_DURATION_MS=$(($(now_ms) - artifact_verify_started_ms))
+fi
+
+# Declarative workspace links: newline-separated "target<TAB>source" rows.
+# Each becomes a symlink inside the code tree pointing at verified artifact
+# content, so programs keep their repo-relative paths without hand-rolled
+# bridges. Links are only created after manifest verification above; any
+# unsafe row or an occupied target fails closed before the job starts.
+if [ -n "$DT_ARTIFACT_TARGETS" ]; then
+    if [ -z "$DT_ARTIFACT_MANIFEST" ] || [ -z "$DT_ARTIFACT_ROOT" ]; then
+        log "artifact targets require a verified artifact manifest"
+        exit 13
+    fi
+    while IFS=$'\t' read -r link_target link_source; do
+        [ -n "$link_target" ] || continue
+        if [ -z "$link_source" ]; then
+            log "malformed artifact target row for '$link_target'"
+            exit 13
+        fi
+        case "$link_target" in
+            /*|~*|*..*|.dt/*|.dt) log "unsafe artifact target path: $link_target"; exit 13 ;;
+        esac
+        case "$link_source" in
+            /*|~*|*..*|.dt/*|.dt) log "unsafe artifact target source: $link_source"; exit 13 ;;
+        esac
+        if [ ! -e "$DT_ARTIFACT_ROOT/$link_source" ]; then
+            log "artifact target source missing under artifact root: $link_source"
+            exit 13
+        fi
+        link_path="$DT_JOB_DIR/code/$link_target"
+        if [ -L "$link_path" ] || [ -e "$link_path" ]; then
+            log "artifact target already exists in the snapshot: $link_target"
+            exit 13
+        fi
+        if ! mkdir -p "$(dirname "$link_path")" \
+           || ! ln -s "$DT_ARTIFACT_ROOT/$link_source" "$link_path"; then
+            log "artifact target link failed: $link_target"
+            exit 13
+        fi
+        log "artifact target $link_target -> \$DT_ARTIFACT_ROOT/$link_source"
+    done <<DT_EOF_ARTIFACT_TARGETS
+$DT_ARTIFACT_TARGETS
+DT_EOF_ARTIFACT_TARGETS
 fi
 
 # -- 1b. cheap busy pre-check, BEFORE the env sync ---------------------------
@@ -1675,8 +1836,11 @@ start_session() {
         DT_CANCEL_PATH DT_BIN_DIR DT_CACHE_ROOT DT_RUNTIME_ROOT \
         DT_TMUX_SOCKET DT_RUNTIME_SCOPE DT_RUNTIME_ENV_PATH \
         DT_GPU_LEASE_ROOT DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST \
+        DT_ARTIFACT_TARGETS \
         DT_PREDECESSOR_JOB_ID DT_PREDECESSOR_JOB_DIR \
+        DT_PREDECESSOR_OUTPUTS_DIR \
         DT_PREDECESSOR_OUTPUTS DT_PREDECESSOR_META_PATH \
+        DT_SOURCE_COMMIT DT_SOURCE_DIRTY DT_SUBMODULE_COMMITS \
         DT_REUSE_CACHE_PATH DT_REUSE_CACHE_ENV DT_CACHE_SOURCE_PATH \
         DT_CACHE_SOURCE_JOB_ID DT_CACHE_SOURCE_RELPATH DT_CACHE_SOURCE_ENV \
         DT_CACHE_SOURCE_SNAPSHOT DT_CACHE_MODE DT_CACHE_RUNTIME_RELPATH \

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
 from . import __version__
 from ._provenance import SOURCE_COMMIT
+from .install_identity import install_digest, payload_digest
 
 
 def repository_sha() -> str | None:
@@ -42,6 +44,40 @@ def repository_sha() -> str | None:
 
 
 def version_text() -> str:
-    """Render the stable public version string without loading the full CLI."""
+    """Render the stable public version string without loading the full CLI.
+
+    The ``dt X.Y.Z (`` prefix is a compatibility surface matched by deploy
+    verification (`scripts/deploy.sh`). Identity fields inside the parentheses
+    are keyed so parsers survive any field being independently absent.
+    """
     sha = SOURCE_COMMIT[:12] if SOURCE_COMMIT else repository_sha()
-    return f"dt {__version__}" + (f" ({sha})" if sha else "")
+    fields = [f"git {sha}"] if sha else []
+    install = install_digest()
+    if install:
+        fields.append(f"install {install}")
+    payload = payload_digest()
+    if payload:
+        fields.append(f"payload {payload}")
+    return f"dt {__version__}" + (f" ({', '.join(fields)})" if fields else "")
+
+
+_IDENTITY_KEYS = ("git", "install", "payload")
+
+
+def parse_version_identity(text: str) -> dict[str, str]:
+    """Parse a ``dt X.Y.Z (git ..., install ..., payload ...)`` line.
+
+    Older builds emit ``dt X.Y.Z (abc123)`` or no parentheses at all; both
+    yield only the version, letting callers distinguish "verified identical"
+    from "too old to carry a content identity".
+    """
+    match = re.fullmatch(r"dt (\S+)(?: \(([^)]*)\))?", text.strip())
+    if match is None:
+        return {}
+    identity = {"version": match.group(1)}
+    for item in (match.group(2) or "").split(","):
+        key, _, value = item.strip().partition(" ")
+        value = value.strip()
+        if key in _IDENTITY_KEYS and value:
+            identity[key] = value
+    return identity

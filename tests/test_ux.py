@@ -71,11 +71,16 @@ def test_version_prefers_installed_source_commit(monkeypatch):
 
     monkeypatch.setattr(version, "SOURCE_COMMIT", "a" * 40)
     monkeypatch.setattr(version, "repository_sha", lambda: "wrong")
+    monkeypatch.setattr(version, "install_digest", lambda: "b" * 12)
+    monkeypatch.setattr(version, "payload_digest", lambda: "c" * 12)
 
     result = CliRunner().invoke(cli.app, ["--version"])
 
     assert result.exit_code == 0, result.output
-    assert result.output == f"dt {__version__} (aaaaaaaaaaaa)\n"
+    assert result.output == (
+        f"dt {__version__} (git aaaaaaaaaaaa, "
+        "install bbbbbbbbbbbb, payload cccccccccccc)\n"
+    )
 
 
 def test_repository_sha_ignores_ancestor_git_when_installed(monkeypatch, tmp_path):
