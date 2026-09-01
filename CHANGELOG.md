@@ -6,6 +6,14 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.12.1 — 2026-09-01
+
+### Fixed
+
+- The compact `dt info` view now shows retry lineage (`retry attempt K/N of
+  REF`, `retried by REF`); the rows previously appeared only with
+  `--verbose`.
+
 ## 0.12.0 — 2026-09-01
 
 ### Added
