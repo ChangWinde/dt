@@ -6,6 +6,16 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.11.1 — 2026-09-01
+
+### Fixed
+
+- `--artifact-target` declarations containing a `..` substring inside a path
+  component (for example `results.v1..final`) are now rejected at submission.
+  The head validator previously accepted them while the node-side launcher
+  refused every `..` spelling, so such a job failed only on the node after
+  dispatch instead of immediately at the CLI boundary.
+
 ## 0.11.0 — 2026-08-31
 
 ### Added

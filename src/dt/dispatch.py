@@ -1785,11 +1785,15 @@ def _artifact_target_path_error(path: str, *, side: str) -> str | None:
         return f"artifact target {side} must use forward slashes"
     if path.startswith(("/", "~")):
         return f"artifact target {side} must be a relative path"
+    # The launcher rejects any ".." substring (glob *..*), so refuse the same
+    # spelling here: a declaration must fail at submission, not on the node.
+    if ".." in path:
+        return f"artifact target {side} must not contain '..'"
     parts = path.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
+    if any(part in {"", "."} for part in parts):
         return (
             f"artifact target {side} must be a normalized relative path "
-            "without empty, '.', or '..' components"
+            "without empty or '.' components"
         )
     if parts[0] == ".dt":
         return f"artifact target {side} must not enter the private .dt tree"

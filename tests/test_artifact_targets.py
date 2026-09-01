@@ -70,6 +70,7 @@ def test_parse_rejects_conflicting_duplicate_targets():
         "/absolute/path",
         "~home/path",
         "up/../escape",
+        "results.v1..final",
         ".dt/private",
         "trailing/",
         "data=/abs/source",
