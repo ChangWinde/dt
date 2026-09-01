@@ -1935,6 +1935,10 @@ def _validate_run_spec(spec: RunSpec) -> None:
         raise ConfigError("retry_on must be one of: infra, always")
     if spec.retry_on is not None and spec.retry_limit == 0:
         raise ConfigError("retry_on requires a positive --retry budget")
+    # --no-queue promises an immediate, final capacity verdict the caller can
+    # branch on; a background retry would silently contradict that contract.
+    # The check lives in submit()/CLI rather than here because no_queue is a
+    # call argument, not a RunSpec field.
     if spec.retry_of is not None and (
         not isinstance(spec.retry_of, str)
         or re.fullmatch(r"[A-Za-z0-9_-]+", spec.retry_of) is None
@@ -5302,6 +5306,11 @@ def submit(
     after the request has a durable claim and never executes on replay or
     conflict.
     """
+    if no_queue and spec.retry_limit > 0:
+        raise ConfigError(
+            "retry cannot be combined with no_queue: an immediate capacity "
+            "verdict and a background resubmission contradict each other"
+        )
     project_name, project = resolve_project(cfg, spec.project, cwd)
     project_dir = revalidate_project_root(
         project.path,

@@ -6,6 +6,21 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.12.2 — 2026-09-01
+
+### Fixed
+
+- Automatic retries of `lost` jobs now write the same irreversibility fence
+  that dependency release uses (`finalize_dependency_terminal`) before
+  resubmitting. Previously a retry submitted after the evidence recovery
+  window could race a late `RUNNING` probe (for example a manual `dt info`
+  refresh) that resurrected the original row, double-running the experiment.
+  The agent fences an expired lost verdict itself; unfenced rows stay
+  visible in the active snapshot until fenced and retried.
+- `--retry` combined with `--no-queue` is now rejected at submission: an
+  immediate capacity verdict and a background resubmission contradict each
+  other.
+
 ## 0.12.1 — 2026-09-01
 
 ### Fixed

@@ -2424,8 +2424,13 @@ def retry_blocked_reason(entry: JobEntry, *, now: float | None = None) -> str | 
         return "not a retryable terminal state"
     if is_uncertain_launch(entry):
         return "launch outcome is uncertain; a retry could double-run"
-    if lost_reconciling(entry, now=now):
-        return "lost verdict is still inside its evidence recovery window"
+    if entry.status == "lost" and entry.terminal_finalized_at is None:
+        # A resubmission is an irreversible decision, exactly like releasing
+        # a dependent.  Until :func:`finalize_dependency_terminal` fences the
+        # provisional verdict, a late RUNNING probe may still rescue the row,
+        # and a retry submitted before the fence could double-run it.  The
+        # agent fences an expired window itself before rechecking.
+        return "lost verdict is not yet fenced for irreversible consumers"
     result = effective_result_state(entry)
     if result == "infra_failure":
         return None
@@ -2437,13 +2442,33 @@ def retry_blocked_reason(entry: JobEntry, *, now: float | None = None) -> str | 
     return f"result {result!r} is not retryable"
 
 
+def retry_pending_fence(entry: JobEntry) -> bool:
+    """A lost row whose unconsumed retry budget still awaits its fence.
+
+    The agent must see these rows to call
+    :func:`finalize_dependency_terminal` before resubmitting; they are not
+    yet retry-eligible but must not drop out of the active snapshot.
+    """
+    return (
+        entry.status == "lost"
+        and entry.terminal_finalized_at is None
+        and entry.retry_limit > 0
+        and entry.retried_by is None
+        and entry.retry_count < entry.retry_limit
+    )
+
+
 def _active_index_member(entry: JobEntry, *, now: float) -> bool:
     if entry.status == "queued" or occupies_quota(entry, now=now):
         return True
     # A terminal attempt with an unconsumed retry budget stays visible to the
     # agent's active snapshot until its automatic retry is submitted; the
-    # ``retried_by`` marker then retires it from the index.
-    return retry_blocked_reason(entry, now=now) is None
+    # ``retried_by`` marker then retires it from the index.  A lost row
+    # waiting for its irreversibility fence stays visible for the same
+    # reason: the agent fences it first, then retries.
+    if retry_blocked_reason(entry, now=now) is None:
+        return True
+    return retry_pending_fence(entry)
 
 
 def _stream_active_registry(

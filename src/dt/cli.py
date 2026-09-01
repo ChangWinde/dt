@@ -2670,6 +2670,17 @@ def run(
             exit_code=1,
             json_=json_,
         )
+    if retry > 0 and no_queue:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "--retry cannot be combined with --no-queue: an immediate "
+                "capacity verdict and a background resubmission contradict "
+                "each other"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
     if plan and follow:
         _fail_submission(
             kind="invalid_argument",

@@ -104,16 +104,26 @@ def test_uncertain_launch_blocks_even_with_budget():
     assert "double-run" in retry_blocked_reason(entry)
 
 
-def test_lost_waits_for_the_evidence_recovery_window():
+def test_lost_requires_the_irreversibility_fence():
+    """An unfenced lost verdict may still be rescued by a late RUNNING probe,
+    so a retry (an irreversible consumer) must wait for the fence."""
     fresh = _entry("j1", "lost", retry_limit=2, finished_at=time.time())
-    assert "recovery window" in retry_blocked_reason(fresh)
-    settled = _entry(
+    assert "not yet fenced" in retry_blocked_reason(fresh)
+    expired_unfenced = _entry(
         "j2",
         "lost",
         retry_limit=2,
         finished_at=time.time() - LOST_RECHECK_S - 5,
     )
-    assert retry_blocked_reason(settled) is None
+    assert "not yet fenced" in retry_blocked_reason(expired_unfenced)
+    fenced = _entry(
+        "j3",
+        "lost",
+        retry_limit=2,
+        finished_at=time.time() - LOST_RECHECK_S - 5,
+        terminal_finalized_at=time.time(),
+    )
+    assert retry_blocked_reason(fenced) is None
 
 
 def test_application_exit_needs_retry_on_always():
@@ -283,6 +293,66 @@ def test_one_failing_retry_submission_does_not_starve_the_rest(tmp_path, monkeyp
     assert any("automatic retry failed to submit" in m for m in messages)
 
 
+def _real_snapshot_entry(cfg: HeadConfig, job_id: str, **kw) -> JobEntry:
+    """A failed attempt whose exact snapshot really exists in the store."""
+    from dt.snapshot_hash import tree_sha256
+
+    staging = cfg.snapshots_dir() / ".staging-test"
+    code = staging / "code"
+    code.mkdir(parents=True)
+    (code / "train.py").write_text("print('hi')\n")
+    digest = tree_sha256(code)
+    final = cfg.snapshots_dir() / digest
+    staging.rename(final)
+    (final / "meta.json").write_text(json.dumps({"snapshot_sha256": digest}))
+    return _entry(
+        job_id,
+        "failed",
+        snapshot_sha256=digest,
+        exit_code=None,
+        reason="node rebooted mid-run",
+        **kw,
+    )
+
+
+def test_marker_loss_replays_the_same_retry_without_a_second_job(tmp_path):
+    """The idempotent self-healing loop, end to end with no dispatch mocks.
+
+    submit_fork runs its real request claim, staging, and enqueue. After the
+    first retry we erase the ``retried_by`` marker (simulating a crash between
+    the fork and the marker write); the next tick must replay the durable
+    request, receive the *same* replacement job, and rewrite the marker
+    instead of creating a second retry.
+    """
+    cfg = _cfg(tmp_path)
+    failed = _real_snapshot_entry(
+        cfg, "20260901-0100_train_aaaabbbbccccdddd", retry_limit=1
+    )
+    save(cfg, failed)
+
+    assert agent_mod._submit_retries(cfg, active_entries(cfg), lambda m: None) == 1
+    first_marker = load(cfg, failed.job_id).retried_by
+    assert first_marker is not None
+    replacement = load(cfg, first_marker)
+    assert replacement.status == "queued"
+    assert replacement.retry_of == failed.job_id
+    assert replacement.retry_count == 1
+
+    # Crash window: the fork was durably confirmed but the marker was lost.
+    damaged = load(cfg, failed.job_id)
+    damaged.retried_by = None
+    save(cfg, damaged)
+
+    assert agent_mod._submit_retries(cfg, active_entries(cfg), lambda m: None) == 1
+
+    healed = load(cfg, failed.job_id)
+    assert healed.retried_by == first_marker
+    from dt.jobs import list_all
+
+    retries = [entry for entry in list_all(cfg) if entry.retry_of == failed.job_id]
+    assert [entry.job_id for entry in retries] == [first_marker]
+
+
 def test_retry_spec_passes_the_real_fork_submission_gate(tmp_path, monkeypatch):
     """End to end through submit_fork's real validation, locks, and identity
     checks; only the final prepared-submission step is stubbed."""
@@ -320,6 +390,99 @@ def test_retry_spec_passes_the_real_fork_submission_gate(tmp_path, monkeypatch):
     assert load(cfg, failed.job_id).retried_by == (
         "20260901-0200_train_eeeeffff00001111"
     )
+
+
+def test_agent_fences_an_expired_lost_verdict_before_retrying(tmp_path, monkeypatch):
+    """The retry itself closes the resurrection window: after the fence a
+    late RUNNING probe can no longer reopen the row the retry replaced."""
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry(
+            "lost1",
+            "lost",
+            retry_limit=1,
+            finished_at=time.time() - LOST_RECHECK_S - 5,
+        ),
+    )
+    calls = _fake_submit_fork(monkeypatch)
+
+    submitted = agent_mod._submit_retries(cfg, active_entries(cfg), lambda m: None)
+
+    assert submitted == 1
+    assert calls == [("lost1", "lost1:retry:1")]
+    fenced = load(cfg, "lost1")
+    assert fenced.terminal_finalized_at is not None
+    assert fenced.retried_by == "lost1-r1"
+
+
+def test_agent_leaves_a_lost_verdict_inside_its_rescue_window(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("lost2", "lost", retry_limit=1, finished_at=time.time()))
+    calls = _fake_submit_fork(monkeypatch)
+
+    submitted = agent_mod._submit_retries(cfg, active_entries(cfg), lambda m: None)
+
+    assert submitted == 0
+    assert calls == []
+    fresh = load(cfg, "lost2")
+    assert fresh.terminal_finalized_at is None  # fence is a no-op in-window
+    assert fresh.retried_by is None
+    # It must stay visible so a later tick can fence and retry it.
+    assert [entry.job_id for entry in active_entries(cfg)] == ["lost2"]
+
+
+def test_retry_chain_stops_when_the_budget_is_exhausted(tmp_path, monkeypatch):
+    """A(limit=2) -> R1 -> R2, then the chain must end."""
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("a0", "failed", retry_limit=2))
+    calls = _fake_submit_fork(monkeypatch)
+
+    def tick() -> int:
+        return agent_mod._submit_retries(cfg, active_entries(cfg), lambda m: None)
+
+    assert tick() == 1  # a0 -> a0-r1
+    replacement = load(cfg, "a0").retried_by
+    assert replacement == "a0-r1"
+    # The first retry fails too.
+    save(
+        cfg,
+        _entry(
+            "a0-r1",
+            "failed",
+            retry_limit=2,
+            retry_count=1,
+            retry_of="a0",
+        ),
+    )
+    assert tick() == 1  # a0-r1 -> a0-r1-r2
+    # The second retry exhausts the budget.
+    save(
+        cfg,
+        _entry(
+            "a0-r1-r2",
+            "failed",
+            retry_limit=2,
+            retry_count=2,
+            retry_of="a0-r1",
+        ),
+    )
+    assert tick() == 0
+    assert [c[0] for c in calls] == ["a0", "a0-r1"]
+
+
+def test_no_queue_refuses_a_retry_budget(tmp_path):
+    from dt.dispatch import RunSpec, submit
+
+    cfg = _cfg(tmp_path)
+    with pytest.raises(dispatch_mod.ConfigError, match="no_queue"):
+        submit(
+            cfg,
+            RunSpec(name="x", gpus=0, cmd=["true"], retry_limit=1),
+            tmp_path,
+            lambda m: None,
+            no_queue=True,
+        )
 
 
 # ---------------------------------------------------------------------------

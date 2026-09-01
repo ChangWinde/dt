@@ -60,6 +60,7 @@ from .jobs import (
     agent_wake_path,
     effective_result_state,
     enable_registry_decode_cache,
+    finalize_dependency_terminal,
     job_lock,
     list_all,
     load as load_job,
@@ -68,6 +69,7 @@ from .jobs import (
     refresh_status,
     registry_row_count,
     retry_blocked_reason,
+    retry_pending_fence,
     save as save_job,
 )
 from .private_state import (
@@ -772,7 +774,21 @@ def _submit_retries(
     attempt from the active snapshot.
     """
     submitted = 0
-    for entry in entries:
+    for snapshot_entry in entries:
+        entry = snapshot_entry
+        if retry_pending_fence(entry):
+            # A retry is an irreversible consumer of the lost verdict: fence
+            # it first (a no-op inside the rescue window) so a late RUNNING
+            # probe can no longer resurrect the row after we resubmit.
+            try:
+                fenced = finalize_dependency_terminal(cfg, entry.job_id)
+            except Exception as exc:
+                detail = " ".join(str(exc).split())[:512] or type(exc).__name__
+                log(f"{entry.job_id} lost-verdict fence failed: {detail}")
+                continue
+            if fenced is None:
+                continue
+            entry = fenced
         if retry_blocked_reason(entry) is not None:
             continue
         if submitted >= RETRY_SUBMITS_PER_TICK:
