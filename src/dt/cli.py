@@ -19246,7 +19246,10 @@ def main() -> None:
         else:
             exc.show(file=sys.stderr)
         raise SystemExit(1) from exc
-    except click.exceptions.Exit as exc:
+    except typer.Exit as exc:
+        # typer 0.27.2 moved Exit off the vendored click exceptions module and
+        # onto a plain-RuntimeError base, so the public typer.Exit is the only
+        # spelling that catches the CLI exit flow on every supported version.
         exit_code = int(exc.exit_code)
         failure = exc
         if exit_code == 130:

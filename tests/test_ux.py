@@ -4494,3 +4494,47 @@ def test_fmt_duration():
     assert _fmt_duration(125) == "2m05s"
     assert _fmt_duration(3700) == "1h01m"
     assert _fmt_duration(-20) == "-20s"
+
+
+# -- entrypoint exit handling -------------------------------------------------
+
+
+def test_main_wrapper_translates_a_clean_typer_exit(monkeypatch, capsys):
+    """CliRunner bypasses main(), so the real wrapper must be driven directly:
+    typer 0.27.2 rebased typer.Exit off the vendored click exceptions module
+    (so it now propagates out of standalone_mode=False instead of being
+    swallowed into a return code), and only this path proves the CLI still
+    exits 0 instead of crashing with an AttributeError inside its own
+    exception handler."""
+    import sys
+
+    from dt import cli
+
+    monkeypatch.setattr(sys, "argv", ["dt", "--version"])
+    code = 0
+    try:
+        cli.main()
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 1
+    assert code == 0
+    assert capsys.readouterr().out.startswith("dt ")
+
+
+def test_main_wrapper_translates_a_failing_typer_exit(monkeypatch, capsys):
+    import json
+    import sys
+
+    import pytest
+
+    from dt import cli
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["dt", "run", "--retry-on", "infra", "--json", "--", "true"],
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+    assert excinfo.value.code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert "--retry" in payload["message"]
