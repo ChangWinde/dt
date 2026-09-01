@@ -42,7 +42,12 @@ from typing import Callable
 
 from . import completion as completion_mod
 from .config import HeadConfig, active_dt_command
-from .dispatch import clean_jobs, dispatch_queued
+from .dispatch import (
+    clean_jobs,
+    dispatch_queued,
+    retry_spec_from_entry,
+    submit_fork,
+)
 from .jobs import (
     AGENT_PROTOCOL_SCHEMA_VERSION,
     DISPATCH_PROTOCOL_VERSION,
@@ -55,11 +60,15 @@ from .jobs import (
     agent_wake_path,
     effective_result_state,
     enable_registry_decode_cache,
+    job_lock,
     list_all,
+    load as load_job,
     occupies_quota,
     quota_occupancy,
     refresh_status,
     registry_row_count,
+    retry_blocked_reason,
+    save as save_job,
 )
 from .private_state import (
     PrivateStateError,
@@ -744,6 +753,82 @@ def _reconcile_jobs(
     return entries
 
 
+# Bound automatic-retry resubmissions per tick so one failing sweep cannot
+# monopolize a tick with snapshot staging while queued work waits.
+RETRY_SUBMITS_PER_TICK = 4
+
+
+def _submit_retries(
+    cfg: HeadConfig,
+    entries: list[JobEntry],
+    log: Callable[[str], None],
+) -> int:
+    """Resubmit terminal attempts whose retry budget is still unconsumed.
+
+    Each resubmission is an exact-snapshot fork under a request id derived
+    from the failed attempt, so an agent restart or a crash between the fork
+    and the ``retried_by`` marker replays the same intent instead of creating
+    a second job.  The marker write is the commit point that retires the old
+    attempt from the active snapshot.
+    """
+    submitted = 0
+    for entry in entries:
+        if retry_blocked_reason(entry) is not None:
+            continue
+        if submitted >= RETRY_SUBMITS_PER_TICK:
+            break
+        try:
+            spec = retry_spec_from_entry(entry)
+            replacement = submit_fork(
+                cfg,
+                entry,
+                spec,
+                log,
+                force_queue=True,
+                force_queue_label="retry",
+            )
+        except Exception as exc:
+            detail = " ".join(str(exc).split())[:512] or type(exc).__name__
+            log(f"{entry.job_id} automatic retry failed to submit: {detail}")
+            continue
+        submitted += 1
+        try:
+            with job_lock(cfg, entry.job_id):
+                current = load_job(cfg, entry.job_id)
+                if current is not None and current.retried_by is None:
+                    current.retried_by = replacement.job_id
+                    save_job(cfg, current)
+        except Exception as exc:
+            # The derived request id keeps a rewrite failure safe: the next
+            # tick replays the fork, receives this same replacement job, and
+            # attempts the marker again.
+            detail = " ".join(str(exc).split())[:512] or type(exc).__name__
+            log(f"{entry.job_id} retry marker write failed: {detail}")
+        entry.retried_by = replacement.job_id
+        log(
+            f"{entry.job_id} ({effective_result_state(entry)}) -> automatic "
+            f"retry {replacement.retry_count}/{entry.retry_limit} as "
+            f"{replacement.job_id}"
+        )
+        notify(
+            cfg,
+            {
+                "event": "retry",
+                "job_id": entry.job_id,
+                "name": entry.name,
+                "center": entry.center,
+                "node": entry.node,
+                "exit_code": entry.exit_code,
+                "result_state": effective_result_state(entry),
+                "retry_job_id": replacement.job_id,
+                "retry_count": replacement.retry_count,
+                "retry_limit": entry.retry_limit,
+            },
+            log,
+        )
+    return submitted
+
+
 BLOCKED_BACKOFF_BASE_S = 5.0
 BLOCKED_BACKOFF_CAP_S = 300.0
 
@@ -803,6 +888,7 @@ def _process_once_with_snapshot(
             f"registry entry {item.path} is unreadable ({item.detail}); "
             "counting it as a running job until it is repaired"
         )
+    _submit_retries(cfg, entries, log)
     queue = sorted(
         (entry for entry in entries if entry.status == "queued"),
         key=lambda entry: entry.created_at,

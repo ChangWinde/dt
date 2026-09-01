@@ -77,6 +77,8 @@ from .maintenance import (
 from .jobs import (
     DISPATCH_PROTOCOL_VERSION,
     LOST_RECHECK_S,
+    MAX_RETRY_LIMIT,
+    RETRY_ON_MODES,
     CANCEL_UNVERIFIED_PREFIX,
     UNCERTAIN_LAUNCH_PREFIX,
     RESULT_STATES,
@@ -1743,6 +1745,12 @@ class RunSpec:
     request_id: str | None = None  # optional retry-safe caller intent
     rerun_of: str | None = None  # current-code retry lineage
     rerun_source_snapshot_sha256: str | None = None
+    # Automatic retry policy: additional attempts the agent may submit after a
+    # retryable terminal failure, and this attempt's ordinal/lineage.
+    retry_limit: int = 0
+    retry_on: str | None = None  # "infra" (default) or "always"
+    retry_count: int = 0
+    retry_of: str | None = None
     artifact_manifest: str | None = None  # shared-input manifest SHA-256
     # Declarative workspace links: {workspace-relative target: artifact-root
     # relative source}. The launcher materializes each as a symlink inside
@@ -1911,6 +1919,27 @@ def _validate_run_spec(spec: RunSpec) -> None:
         or re.fullmatch(r"[A-Za-z0-9_-]+", spec.rerun_of) is None
     ):
         raise ConfigError("rerun_of must be a safe job identity")
+    for ordinal_name, ordinal in (
+        ("retry", spec.retry_limit),
+        ("retry ordinal", spec.retry_count),
+    ):
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or not 0 <= ordinal <= MAX_RETRY_LIMIT
+        ):
+            raise ConfigError(
+                f"{ordinal_name} must be an integer between 0 and {MAX_RETRY_LIMIT}"
+            )
+    if spec.retry_on is not None and spec.retry_on not in RETRY_ON_MODES:
+        raise ConfigError("retry_on must be one of: infra, always")
+    if spec.retry_on is not None and spec.retry_limit == 0:
+        raise ConfigError("retry_on requires a positive --retry budget")
+    if spec.retry_of is not None and (
+        not isinstance(spec.retry_of, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", spec.retry_of) is None
+    ):
+        raise ConfigError("retry_of must be a safe job identity")
     if spec.after_success is not None and (
         not isinstance(spec.after_success, str)
         or re.fullmatch(r"[A-Za-z0-9_-]+", spec.after_success) is None
@@ -2191,6 +2220,32 @@ def fork_spec_from_entry(
         ),
         cache_mode=("clone" if clone_cache else "shared" if reuse_cache else None),
     )
+
+
+def retry_spec_from_entry(entry: JobEntry) -> RunSpec:
+    """Build the automatic-retry resubmission spec for one failed attempt.
+
+    Retries reuse the exact snapshot, command, resources, and environment
+    overlay (fork semantics), but placement deliberately returns to the
+    *original* pin intent instead of the failed attempt's actual node: with a
+    free pin the failed node may itself be the fault, and the scheduler should
+    choose again.
+
+    The derived request id makes the resubmission idempotent: an agent
+    restart or a concurrent tick replays the same intent instead of creating
+    a second job.  Job ids are bounded well below the request-id limit
+    (timestamp + 64-char name cap + 16-hex suffix), so the composition
+    always fits.
+    """
+    ordinal = entry.retry_count + 1
+    spec = fork_spec_from_entry(entry, name=entry.name)
+    spec.node = entry.pin_node
+    spec.request_id = f"{entry.job_id}:retry:{ordinal}"
+    spec.retry_limit = entry.retry_limit
+    spec.retry_on = entry.retry_on
+    spec.retry_count = ordinal
+    spec.retry_of = entry.job_id
+    return spec
 
 
 def environment_reuse_spec_from_entry(
@@ -5166,6 +5221,10 @@ def _try_nodes(
                 after_result=spec.after_result,
                 after_result_states=list(spec.after_result_states),
                 request_id=spec.request_id,
+                retry_limit=spec.retry_limit,
+                retry_on=spec.retry_on,
+                retry_count=spec.retry_count,
+                retry_of=spec.retry_of,
                 rerun_of=spec.rerun_of,
                 rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
                 rerun_snapshot_changed=_rerun_snapshot_changed(
@@ -5974,6 +6033,10 @@ def _submit_prepared_once(
             after_result=spec.after_result,
             after_result_states=list(spec.after_result_states),
             request_id=spec.request_id,
+            retry_limit=spec.retry_limit,
+            retry_on=spec.retry_on,
+            retry_count=spec.retry_count,
+            retry_of=spec.retry_of,
             rerun_of=spec.rerun_of,
             rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
             rerun_snapshot_changed=_rerun_snapshot_changed(
@@ -6047,6 +6110,10 @@ def _submit_prepared_once(
             after_result=spec.after_result,
             after_result_states=list(spec.after_result_states),
             request_id=spec.request_id,
+            retry_limit=spec.retry_limit,
+            retry_on=spec.retry_on,
+            retry_count=spec.retry_count,
+            retry_of=spec.retry_of,
             rerun_of=spec.rerun_of,
             rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
             cache_source_job=spec.cache_source_job,
@@ -7062,6 +7129,10 @@ def _dispatch_queued_active(
         after_result=entry.after_result,
         after_result_states=list(entry.after_result_states),
         request_id=entry.request_id,
+        retry_limit=entry.retry_limit,
+        retry_on=entry.retry_on,
+        retry_count=entry.retry_count,
+        retry_of=entry.retry_of,
         rerun_of=entry.rerun_of,
         rerun_source_snapshot_sha256=entry.rerun_source_snapshot_sha256,
         artifact_manifest=entry.artifact_manifest,

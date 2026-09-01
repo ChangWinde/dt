@@ -201,6 +201,8 @@ class SubmissionRequest:
     after_result: str | None = None
     after_result_states: tuple[str, ...] = ()
     request_id: str | None = None
+    retry_limit: int = 0
+    retry_on: str | None = None
     custom_env: tuple[tuple[str, str], ...] = ()
 
     def resolved(
@@ -247,5 +249,7 @@ class SubmissionRequest:
             after_result=self.after_result,
             after_result_states=list(self.after_result_states),
             request_id=self.request_id,
+            retry_limit=self.retry_limit,
+            retry_on=self.retry_on,
             custom_env=dict(self.custom_env),
         )

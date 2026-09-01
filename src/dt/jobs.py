@@ -98,6 +98,10 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}")
 ENV_HASH_RE = re.compile(r"[0-9a-f]{12}")
 REGISTRY_SCHEMA_VERSION = "dt_job_registry_v1"
 REGISTRY_AUTHORITY_STATES = frozenset({"absent", "present", "unproven"})
+# Automatic retry: "infra" retries only DT-responsibility failures
+# (infra_failure), "always" additionally retries nonzero application exits.
+RETRY_ON_MODES = frozenset({"infra", "always"})
+MAX_RETRY_LIMIT = 10
 MAX_REGISTRY_AUTHORITY_PROBE_ROWS = 4096
 ACTIVE_INDEX_SCHEMA_VERSION = "dt_job_active_index_v1"
 MAX_ACTIVE_INDEX_BYTES = 8 * 1024 * 1024
@@ -270,6 +274,16 @@ class JobEntry:
     request_id: str | None = None  # durable caller intent identity
     result_state: str | None = None  # typed terminal meaning, not just exit code
     rerun_of: str | None = None  # current-code retry parent (`dt rerun`)
+    # Automatic retry policy and lineage.  ``retry_limit`` is the total number
+    # of automatic attempts allowed after the original one; ``retry_count`` is
+    # this attempt's ordinal (0 = original submission).  ``retried_by`` marks a
+    # consumed terminal attempt so the agent never resubmits it twice, and
+    # ``retry_of`` points back at the attempt this job replaced.
+    retry_limit: int = 0
+    retry_on: str | None = None  # "infra" (default) or "always"
+    retry_count: int = 0
+    retry_of: str | None = None
+    retried_by: str | None = None
     rerun_source_snapshot_sha256: str | None = None
     rerun_snapshot_changed: bool | None = None
     # Opt-in exact-fork cache provenance. The source directory stays owned by
@@ -771,9 +785,20 @@ def _decode_entry(
         entry.storage_layout,
         entry.worker_root,
         entry.job_relpath,
+        entry.retry_of,
+        entry.retried_by,
     )
     if any(value is not None and not isinstance(value, str) for value in optional_text):
         raise ValueError("job registry has invalid optional text fields")
+    for ordinal in (entry.retry_limit, entry.retry_count):
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or not 0 <= ordinal <= MAX_RETRY_LIMIT
+        ):
+            raise ValueError("job registry has an invalid retry policy")
+    if entry.retry_on is not None and entry.retry_on not in RETRY_ON_MODES:
+        raise ValueError("job registry has an invalid retry trigger")
     if entry.legacy_cleanup_pending and (
         entry.storage_layout != ROLE_LAYOUT
         or entry.status not in {"finished", "killed"}
@@ -2379,8 +2404,46 @@ def lost_reconciling(entry: JobEntry, *, now: float | None = None) -> bool:
     return (time.time() if now is None else now) - observed_at <= LOST_RECHECK_S
 
 
+def retry_blocked_reason(entry: JobEntry, *, now: float | None = None) -> str | None:
+    """Why an automatic retry must not fire, or ``None`` when it may.
+
+    The gate is deliberately conservative: only settled terminal outcomes that
+    DT can prove dead are retried.  A cancelled job encodes operator intent, a
+    dependency skip will repeat deterministically, an uncertain launch may
+    still own live remote processes (resubmitting could double-run the
+    experiment), and a lost row inside its evidence recovery window may still
+    be rescued as running.
+    """
+    if entry.retry_limit <= 0:
+        return "no retry budget"
+    if entry.retried_by is not None:
+        return f"already retried by {entry.retried_by}"
+    if entry.retry_count >= entry.retry_limit:
+        return f"retry budget exhausted ({entry.retry_count}/{entry.retry_limit})"
+    if entry.status not in {"failed", "lost", "finished"}:
+        return "not a retryable terminal state"
+    if is_uncertain_launch(entry):
+        return "launch outcome is uncertain; a retry could double-run"
+    if lost_reconciling(entry, now=now):
+        return "lost verdict is still inside its evidence recovery window"
+    result = effective_result_state(entry)
+    if result == "infra_failure":
+        return None
+    if result == "execution_failure":
+        mode = entry.retry_on or "infra"
+        if mode == "always":
+            return None
+        return "application exit is excluded by retry_on=infra"
+    return f"result {result!r} is not retryable"
+
+
 def _active_index_member(entry: JobEntry, *, now: float) -> bool:
-    return entry.status == "queued" or occupies_quota(entry, now=now)
+    if entry.status == "queued" or occupies_quota(entry, now=now):
+        return True
+    # A terminal attempt with an unconsumed retry budget stays visible to the
+    # agent's active snapshot until its automatic retry is submitted; the
+    # ``retried_by`` marker then retires it from the index.
+    return retry_blocked_reason(entry, now=now) is None
 
 
 def _stream_active_registry(

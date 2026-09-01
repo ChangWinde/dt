@@ -143,6 +143,9 @@ _OPTIONAL_TEXT_FIELDS = frozenset(
         "request_id",
         "result_state",
         "rerun_of",
+        "retry_on",
+        "retry_of",
+        "retried_by",
         "rerun_source_snapshot_sha256",
         "cache_source_job",
         "cache_source_job_dir",
@@ -172,7 +175,7 @@ _REQUIRED_BOOL_FIELDS = frozenset(
 _OPTIONAL_BOOL_FIELDS = frozenset(
     {"env_preexisting", "setup_ran", "rerun_snapshot_changed"}
 )
-_REQUIRED_INT_FIELDS = frozenset({"gpus_requested"})
+_REQUIRED_INT_FIELDS = frozenset({"gpus_requested", "retry_limit", "retry_count"})
 _OPTIONAL_INT_FIELDS = frozenset(
     {
         "pgid",

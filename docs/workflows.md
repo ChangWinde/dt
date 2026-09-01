@@ -57,6 +57,26 @@ behavior, while public output exposes names only. The value remains stored
 under the trusted Unix identity; use an external secret manager when that
 persistence contract is not acceptable.
 
+Let the resident agent resubmit transient failures automatically:
+
+```bash
+dt run -g 1 -n resilient --retry 2 -- python train.py
+dt run -g 1 -n flaky-sim --retry 3 --retry-on always -- python collect.py
+```
+
+`--retry N` allows up to N automatic resubmissions after a retryable terminal
+failure. The default trigger retries only infrastructure failures (node
+rebooted, launch lost); `--retry-on always` additionally retries nonzero
+application exits, which suits stochastic simulators but not deterministic
+bugs. Each retry reuses the exact snapshot, command, resources, and private
+environment overlay under a request id derived from the failed attempt, so
+retries are idempotent across agent restarts. Placement returns to the
+original pin intent: with a free pin the scheduler chooses again instead of
+returning to the failed node. Cancelled jobs, dependency skips, and uncertain
+launches (which might still be running) are never retried, and a lost job is
+retried only after its evidence recovery window closes. `dt info` shows the
+lineage on both sides (`retried by`, `retry attempt K/N of REF`).
+
 ## Independent sweep
 
 Use `batch` for commands that may run in order on one node but do not depend on

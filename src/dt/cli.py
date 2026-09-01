@@ -2523,6 +2523,27 @@ def run(
         help="retry-safe caller identity; reuse returns the original job",
         rich_help_panel="Reproducibility",
     ),
+    retry: int = typer.Option(
+        0,
+        "--retry",
+        min=0,
+        max=10,
+        help=(
+            "automatic retries after a retryable terminal failure: the agent "
+            "resubmits the exact snapshot up to N more times"
+        ),
+        rich_help_panel="Scheduling & safety",
+    ),
+    retry_on: Optional[str] = typer.Option(
+        None,
+        "--retry-on",
+        help=(
+            "what a retry covers: 'infra' (default) retries only "
+            "infrastructure failures, 'always' also retries nonzero "
+            "application exits"
+        ),
+        rich_help_panel="Scheduling & safety",
+    ),
     environment: Optional[list[str]] = typer.Option(
         None,
         "--env",
@@ -2635,6 +2656,20 @@ def run(
             json_=json_,
         )
     _validate_submission_request_id(request_id, json_=json_)
+    if retry_on is not None and retry_on not in ("infra", "always"):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--retry-on must be 'infra' or 'always'",
+            exit_code=1,
+            json_=json_,
+        )
+    if retry_on is not None and retry == 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--retry-on requires a positive --retry budget",
+            exit_code=1,
+            json_=json_,
+        )
     if plan and follow:
         _fail_submission(
             kind="invalid_argument",
@@ -2759,6 +2794,8 @@ def run(
             .option("--after-result", after_result or None)
             .repeat("--when-result", result_states)
             .option("--request-id", request_id or None)
+            .option("--retry", retry or None)
+            .option("--retry-on", retry_on or None)
             .flag("--env-envelope-stdin", env_envelope is not None)
             .flag("--no-queue", no_queue)
             .flag("--plan", plan)
@@ -2810,6 +2847,8 @@ def run(
         after_result=after_result,
         after_result_states=tuple(result_states),
         request_id=request_id,
+        retry_limit=retry,
+        retry_on=retry_on,
         custom_env=tuple(custom_env.items()),
     )
     if plan:
@@ -11030,6 +11069,23 @@ def info(
                     ),
                 )
             )
+    if entry.retry_of:
+        rows.insert(
+            7,
+            (
+                "retry",
+                f"attempt {entry.retry_count}/{entry.retry_limit} of "
+                f"{display_refs.get(entry.retry_of, entry.retry_of)}",
+            ),
+        )
+    if entry.retried_by:
+        rows.insert(
+            7,
+            (
+                "retried by",
+                display_refs.get(entry.retried_by, entry.retried_by),
+            ),
+        )
     if entry.forked_from:
         rows.insert(
             7,

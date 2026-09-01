@@ -6,6 +6,28 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.12.0 — 2026-09-01
+
+### Added
+
+- `dt run --retry N [--retry-on infra|always]`: the resident agent
+  automatically resubmits a retryable terminal failure as an exact-snapshot
+  fork (same code, command, resources, and private environment overlay).
+  The default trigger covers infrastructure failures only; `always` extends
+  it to nonzero application exits. Retries are idempotent across agent
+  restarts through a request id derived from the failed attempt, placement
+  returns to the original pin intent rather than the failed node, and
+  cancelled jobs, dependency skips, uncertain launches, and lost jobs still
+  inside their evidence recovery window are never retried. Lineage is
+  recorded on both rows (`retry_of`/`retried_by`) and shown by `dt info`.
+
+### Changed
+
+- Every rsync leg that crosses an SSH hop now negotiates stream compression
+  (zstd on rsync 3.2+), cutting source-snapshot and artifact transfer times
+  on bandwidth-bound workers (observed 80-130 KB/s links); local copies are
+  unaffected.
+
 ## 0.11.1 — 2026-09-01
 
 ### Fixed
