@@ -2194,3 +2194,53 @@ def test_fork_repeat_member_name_pads_to_max_index_width():
     names = [fork_repeat._member_name("exp", i, 1000) for i in (2, 999, 1000)]
     assert names == ["exp-0002", "exp-0999", "exp-1000"]
     assert sorted(names) == names
+
+
+# -- submission -> registry field threading --------------------------------------
+
+
+def test_every_registry_facing_run_spec_field_is_threaded_once(tmp_path):
+    """Placed, queued, and skipped rows share `_spec_entry_fields`, so a new
+    RunSpec field must be added there exactly once. This guard fails when a
+    RunSpec field with a registry counterpart is missing from the shared
+    mapping, which is how a field used to silently vanish on one path."""
+    import dataclasses
+
+    from dt.config import HeadConfig, Node
+    from dt.jobs import JobEntry
+
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    spec = dispatch.RunSpec(name="x", gpus=1, cmd=["python", "train.py"])
+    fields = dispatch._spec_entry_fields(  # noqa: SLF001
+        cfg, spec, git_sha="a" * 40, git_dirty=True, submodule_commits={"s": "b" * 40}
+    )
+    registry_fields = {f.name for f in dataclasses.fields(JobEntry)}
+    # Every emitted key must be a real registry column.
+    assert set(fields) <= registry_fields
+    # RunSpec fields that map onto the registry under a different name, or
+    # that are deliberately per-lifecycle (set by each construction site).
+    renamed = {"gpus": "gpus_requested", "node": "pin_node"}
+    per_site_or_internal = {
+        "dispatch_token",  # private queued-attempt nonce, never persisted here
+        "env_hash_override",  # becomes env_hash, chosen per lifecycle path
+        "payload_sha256",  # per-site: staged vs observed
+        "cache_source_snapshot_sha256",  # validation-only identity
+    }
+    for spec_field in dataclasses.fields(dispatch.RunSpec):
+        name = renamed.get(spec_field.name, spec_field.name)
+        if spec_field.name in per_site_or_internal:
+            continue
+        assert name in fields, (
+            f"RunSpec.{spec_field.name} is not threaded to the registry"
+        )
+    # Provenance rides with every row at construction, not as a later patch.
+    assert fields["git_sha"] == "a" * 40 and fields["git_dirty"] is True
+    assert fields["submodule_commits"] == {"s": "b" * 40}
+    assert fields["gpus_requested"] == 1 and fields["pin_node"] is None

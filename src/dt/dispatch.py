@@ -30,7 +30,7 @@ from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from threading import Event
-from typing import Callable, Mapping, cast
+from typing import Any, Callable, Mapping, cast
 
 from . import custom_env as custom_env_mod
 from . import private_env as private_env_mod
@@ -5045,6 +5045,75 @@ def _materialize_predecessor_outputs(
     return destination, None
 
 
+def _spec_entry_fields(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    *,
+    git_sha: str | None,
+    git_dirty: bool,
+    submodule_commits: dict[str, str] | None,
+) -> dict[str, Any]:
+    """Every registry field that is a pure function of the submission.
+
+    A placed, queued, or dependency-skipped row differs only in lifecycle
+    state (node, status, timestamps, launch telemetry).  Sharing this mapping
+    threads a new ``RunSpec`` field into the registry exactly once instead of
+    across three near-identical constructions, where a missed site silently
+    dropped the field for one lifecycle path.
+    """
+    return {
+        "name": spec.name,
+        "center": cfg.center,
+        "project": spec.project or "?",
+        "cmd": shlex.join(spec.cmd),
+        "gpus_requested": spec.gpus,
+        "gpu_isolation": spec.gpu_isolation,
+        "require_path": spec.require_path,
+        "require_disk_gib": spec.require_disk_gib,
+        "pin_node": spec.node,
+        "max_hours": spec.max_hours,
+        "min_vram_mib": spec.min_vram_mib,
+        "max_vram_mib": spec.max_vram_mib,
+        "max_job_memory_mib": spec.max_job_memory_mib,
+        "setup": spec.setup,
+        "setup_inputs": (
+            list(spec.setup_inputs) if spec.setup_inputs is not None else None
+        ),
+        "extras": list(spec.extras or []),
+        "env_mode": spec.env_mode,
+        "env_source_job": spec.env_source_job,
+        "custom_env": dict(spec.custom_env),
+        "git_sha": git_sha,
+        "git_dirty": git_dirty,
+        "submodule_commits": (
+            dict(submodule_commits) if submodule_commits is not None else None
+        ),
+        "artifact_manifest": spec.artifact_manifest,
+        "artifact_targets": (
+            dict(spec.artifact_targets) if spec.artifact_targets else None
+        ),
+        "forked_from": spec.forked_from,
+        "after_success": spec.after_success,
+        "after_complete": spec.after_complete,
+        "after_result": spec.after_result,
+        "after_result_states": list(spec.after_result_states),
+        "request_id": spec.request_id,
+        "retry_limit": spec.retry_limit,
+        "retry_on": spec.retry_on,
+        "retry_count": spec.retry_count,
+        "retry_of": spec.retry_of,
+        "rerun_of": spec.rerun_of,
+        "rerun_source_snapshot_sha256": spec.rerun_source_snapshot_sha256,
+        "cache_source_job": spec.cache_source_job,
+        "cache_source_job_dir": spec.cache_source_job_dir,
+        "cache_source_path": spec.cache_source_path,
+        "cache_env": spec.cache_env,
+        "cache_source_env_hash": spec.cache_source_env_hash,
+        "cache_mode": spec.cache_mode,
+        "storage_layout": cfg.layout,
+    }
+
+
 def _try_nodes(
     cfg: HeadConfig,
     candidates: list[Node],
@@ -5194,25 +5263,19 @@ def _try_nodes(
             boot_id_value = result.get("boot_id")
             entry = JobEntry(
                 job_id=job_id,
-                name=spec.name,
-                center=cfg.center,
-                project=spec.project or "?",
+                **_spec_entry_fields(
+                    cfg,
+                    spec,
+                    git_sha=git_sha,
+                    git_dirty=git_dirty,
+                    submodule_commits=submodule_commits,
+                ),
                 node=node.name,
                 node_local=node.local,
                 job_dir=node_job_dir,
                 session=session,
-                cmd=shlex.join(spec.cmd),
                 gpus=[int(g) for g in gpu_values if isinstance(g, (str, int))],
                 pgid=int(pgid_value),
-                gpus_requested=spec.gpus,
-                gpu_isolation=spec.gpu_isolation,
-                require_path=spec.require_path,
-                require_disk_gib=spec.require_disk_gib,
-                pin_node=spec.node,
-                max_hours=spec.max_hours,
-                min_vram_mib=spec.min_vram_mib,
-                max_vram_mib=spec.max_vram_mib,
-                max_job_memory_mib=spec.max_job_memory_mib,
                 env_hash=env_value if isinstance(env_value, str) else None,
                 snapshot_duration_s=snapshot_duration_s,
                 launch_duration_s=launch_duration_s,
@@ -5221,47 +5284,16 @@ def _try_nodes(
                     env_preexisting if isinstance(env_preexisting, bool) else None
                 ),
                 setup_ran=(setup_ran if isinstance(setup_ran, bool) else None),
-                env_mode=spec.env_mode,
-                env_source_job=spec.env_source_job,
-                custom_env=dict(spec.custom_env),
                 boot_id=boot_id_value if isinstance(boot_id_value, str) else None,
                 snapshot_sha256=snapshot_sha256,
                 payload_sha256=payload_sha256,
-                artifact_manifest=spec.artifact_manifest,
-                artifact_targets=(
-                    dict(spec.artifact_targets) if spec.artifact_targets else None
-                ),
                 created_at=submission_time,
                 started_at=time.time(),
                 placement_failures=dict(reasons),
-                setup=spec.setup,
-                setup_inputs=(
-                    list(spec.setup_inputs) if spec.setup_inputs is not None else None
-                ),
-                extras=list(spec.extras or []),
-                forked_from=spec.forked_from,
-                after_success=spec.after_success,
-                after_complete=spec.after_complete,
-                after_result=spec.after_result,
-                after_result_states=list(spec.after_result_states),
-                request_id=spec.request_id,
-                retry_limit=spec.retry_limit,
-                retry_on=spec.retry_on,
-                retry_count=spec.retry_count,
-                retry_of=spec.retry_of,
-                rerun_of=spec.rerun_of,
-                rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
                 rerun_snapshot_changed=_rerun_snapshot_changed(
                     spec,
                     snapshot_sha256,
                 ),
-                cache_source_job=spec.cache_source_job,
-                cache_source_job_dir=spec.cache_source_job_dir,
-                cache_source_path=spec.cache_source_path,
-                cache_env=spec.cache_env,
-                cache_source_env_hash=spec.cache_source_env_hash,
-                cache_mode=spec.cache_mode,
-                storage_layout=cfg.layout,
                 worker_root=cfg.worker_root_for(node),
                 job_relpath=f"jobs/{job_id}",
             )
@@ -6014,71 +6046,29 @@ def _submit_prepared_once(
             raise DispatchError("staging completed without a snapshot identity")
         entry = JobEntry(
             job_id=job_id,
-            name=spec.name,
-            center=cfg.center,
-            project=project_name,
+            **_spec_entry_fields(
+                cfg,
+                spec,
+                git_sha=git_sha,
+                git_dirty=git_dirty,
+                submodule_commits=submodule_commits,
+            ),
             node="-",
             node_local=False,
             job_dir=job_dir,
             session=session,
-            cmd=shlex.join(spec.cmd),
             gpus=[],
             pgid=None,
             status="queued",
-            git_sha=git_sha,
-            git_dirty=git_dirty,
-            submodule_commits=(
-                dict(submodule_commits) if submodule_commits is not None else None
-            ),
-            max_hours=spec.max_hours,
-            min_vram_mib=spec.min_vram_mib,
-            max_vram_mib=spec.max_vram_mib,
-            max_job_memory_mib=spec.max_job_memory_mib,
             snapshot_sha256=staged_snapshot_sha256,
             payload_sha256=runtime_sha256,
-            artifact_manifest=spec.artifact_manifest,
-            artifact_targets=(
-                dict(spec.artifact_targets) if spec.artifact_targets else None
-            ),
-            gpus_requested=spec.gpus,
-            gpu_isolation=spec.gpu_isolation,
-            require_path=spec.require_path,
-            require_disk_gib=spec.require_disk_gib,
-            pin_node=spec.node,
             reason=reason,
             created_at=submitted_at,
-            setup=spec.setup,
-            setup_inputs=(
-                list(spec.setup_inputs) if spec.setup_inputs is not None else None
-            ),
-            extras=list(spec.extras or []),
             env_hash=spec.env_hash_override,
-            env_mode=spec.env_mode,
-            env_source_job=spec.env_source_job,
-            custom_env=dict(spec.custom_env),
-            forked_from=spec.forked_from,
-            after_success=spec.after_success,
-            after_complete=spec.after_complete,
-            after_result=spec.after_result,
-            after_result_states=list(spec.after_result_states),
-            request_id=spec.request_id,
-            retry_limit=spec.retry_limit,
-            retry_on=spec.retry_on,
-            retry_count=spec.retry_count,
-            retry_of=spec.retry_of,
-            rerun_of=spec.rerun_of,
-            rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
             rerun_snapshot_changed=_rerun_snapshot_changed(
                 spec,
                 staged_snapshot_sha256,
             ),
-            cache_source_job=spec.cache_source_job,
-            cache_source_job_dir=spec.cache_source_job_dir,
-            cache_source_path=spec.cache_source_path,
-            cache_env=spec.cache_env,
-            cache_source_env_hash=spec.cache_source_env_hash,
-            cache_mode=spec.cache_mode,
-            storage_layout=cfg.layout,
             worker_root=submit_worker_root,
             worker_roots=dict(submit_worker_roots),
             job_relpath=job_relpath,
@@ -6092,66 +6082,24 @@ def _submit_prepared_once(
         finished_at = time.time()
         entry = JobEntry(
             job_id=job_id,
-            name=spec.name,
-            center=cfg.center,
-            project=project_name,
+            **_spec_entry_fields(
+                cfg,
+                spec,
+                git_sha=git_sha,
+                git_dirty=git_dirty,
+                submodule_commits=submodule_commits,
+            ),
             node="-",
             node_local=False,
             job_dir=job_dir,
             session=session,
-            cmd=shlex.join(spec.cmd),
             status="skipped",
             result_state="dependency_skipped",
-            git_sha=git_sha,
-            git_dirty=git_dirty,
-            submodule_commits=(
-                dict(submodule_commits) if submodule_commits is not None else None
-            ),
             payload_sha256=runtime_sha256,
-            artifact_manifest=spec.artifact_manifest,
-            artifact_targets=(
-                dict(spec.artifact_targets) if spec.artifact_targets else None
-            ),
-            max_hours=spec.max_hours,
-            min_vram_mib=spec.min_vram_mib,
-            max_vram_mib=spec.max_vram_mib,
-            max_job_memory_mib=spec.max_job_memory_mib,
             created_at=submitted_at,
             finished_at=finished_at,
-            gpus_requested=spec.gpus,
-            gpu_isolation=spec.gpu_isolation,
-            require_path=spec.require_path,
-            require_disk_gib=spec.require_disk_gib,
-            pin_node=spec.node,
             reason=reason,
-            setup=spec.setup,
-            setup_inputs=(
-                list(spec.setup_inputs) if spec.setup_inputs is not None else None
-            ),
-            extras=list(spec.extras or []),
             env_hash=spec.env_hash_override,
-            env_mode=spec.env_mode,
-            env_source_job=spec.env_source_job,
-            custom_env=dict(spec.custom_env),
-            forked_from=spec.forked_from,
-            after_success=spec.after_success,
-            after_complete=spec.after_complete,
-            after_result=spec.after_result,
-            after_result_states=list(spec.after_result_states),
-            request_id=spec.request_id,
-            retry_limit=spec.retry_limit,
-            retry_on=spec.retry_on,
-            retry_count=spec.retry_count,
-            retry_of=spec.retry_of,
-            rerun_of=spec.rerun_of,
-            rerun_source_snapshot_sha256=spec.rerun_source_snapshot_sha256,
-            cache_source_job=spec.cache_source_job,
-            cache_source_job_dir=spec.cache_source_job_dir,
-            cache_source_path=spec.cache_source_path,
-            cache_env=spec.cache_env,
-            cache_source_env_hash=spec.cache_source_env_hash,
-            cache_mode=spec.cache_mode,
-            storage_layout=cfg.layout,
             worker_root=submit_worker_root,
             worker_roots=dict(submit_worker_roots),
             job_relpath=job_relpath,
