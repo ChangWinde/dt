@@ -6,6 +6,41 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.0 — 2026-09-02
+
+### Added
+
+- Automatic code-copy compaction. The resident agent now reclaims each
+  terminal job's node-side `code/` copy once the job has been terminal for
+  `queue.auto_compact_hours` (default 24; `false` disables), sweeping every
+  six hours with the same guarded procedure as `dt compact`: the head's
+  immutable snapshot archive is re-hashed first, a process-identity liveness
+  census refuses anything still running, only the exact `code/` path is
+  removed, and a durable `code-pruned.json` receipt is written. Logs,
+  outputs, checkpoints, and registry rows are untouched, and `dt fork`,
+  `dt exec`, and exact-snapshot recovery keep working from the head archive.
+  A research node had accumulated 75 GB of dead 500-750 MB repository
+  copies across 153 jobs whose logs and outputs together were under 50 MB.
+- Compaction retains the newest dispatched job per project and node
+  (`skipped.transfer_baseline`): its `code/` is the rsync copy baseline
+  that keeps the next snapshot transfer incremental, so reclaiming it would
+  silently turn that transfer into a full network copy over links measured
+  at 80-130 KB/s. Hard-linking job code trees was deliberately not adopted:
+  jobs may write inside their workdir, and a shared inode would let one job
+  mutate another's source.
+- `JobEntry.code_pruned_at` records on the head that a job's code copy is
+  gone (compacted, receipt repaired, or the job directory itself absent
+  while the worker's jobs root is present). Later sweeps skip those rows
+  without re-hashing their archives, so sweep cost tracks new work rather
+  than history. `dt info` shows `code copy: not on the node since ...` with
+  the `dt fork` recovery path; `dt info --json` exposes `code_pruned_at` and
+  the retry lineage block that was missing from the explicit payload.
+- Code trees removed by hand without dt are reconciled by the next sweep:
+  the missing receipt is written and the memo recorded instead of failing.
+- `compact_jobs(..., anchor="terminal")` measures age from the job's end
+  time; `dt compact --before DATE` keeps its submission-date semantics.
+  `lost` rows still inside their evidence recovery window are never planned.
+
 ## 0.12.3 — 2026-09-02
 
 ### Fixed

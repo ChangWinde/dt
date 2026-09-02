@@ -40,6 +40,12 @@ MAX_SNAPSHOT_EXCLUDE_BYTES = 4096
 MAX_SSH_DESTINATION_LENGTH = 512
 MAX_QUEUE_POLL_S = 24 * 3600
 MAX_QUEUE_ACTIVE_POLL_S = 3600.0
+# Node-side code copies are recoverable from the head's immutable snapshot, so
+# they are reclaimed by default one day after a job ends.  Research nodes have
+# accumulated tens of gigabytes of dead 500-750 MB repository copies while the
+# logs and outputs they sat beside totalled under 50 MB.
+DEFAULT_AUTO_COMPACT_HOURS = 24.0
+MAX_AUTO_COMPACT_HOURS = 24.0 * 365
 SITE_ARTIFACT_POLICIES = frozenset({"direct", "site-cache-first", "topology-aware"})
 _SSH_DESTINATION_RE = re.compile(r"^[A-Za-z0-9_.@:%+\[\]-]+$")
 # lan_address is spliced into `address:path` rsync/ssh targets, so unlike a
@@ -222,6 +228,10 @@ class QueueCfg:
     auto_clean_days: float | None = (
         None  # agent daily-cleans jobs+envs older than N days
     )
+    # The agent removes a terminal job's node-side ``code/`` copy once the job
+    # has been terminal for this long; the head's immutable snapshot remains
+    # the recovery source (dt fork / exact snapshot).  ``None`` disables.
+    auto_compact_hours: float | None = DEFAULT_AUTO_COMPACT_HOURS
 
 
 @dataclass(frozen=True)
@@ -1189,11 +1199,13 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 "max_my_jobs",
                 "reserve_free_per_node",
                 "auto_clean_days",
+                "auto_compact_hours",
             },
             "queue",
         )
         max_jobs = qraw.get("max_my_jobs")
         auto_clean = qraw.get("auto_clean_days")
+        auto_compact_raw = qraw.get("auto_compact_hours", DEFAULT_AUTO_COMPACT_HOURS)
         poll_s = _integer(qraw.get("poll_s", 60), "queue.poll_s")
         active_poll_s = _finite_number(
             qraw.get("active_poll_s", 2.0), "queue.active_poll_s"
@@ -1227,12 +1239,32 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             raise ConfigError(
                 "queue `auto_clean_days` must be a finite positive number"
             )
+        # ``false`` is the explicit opt-out; a number is the terminal age after
+        # which node-side code copies are reclaimed.
+        parsed_auto_compact: float | None
+        if auto_compact_raw is False:
+            parsed_auto_compact = None
+        elif auto_compact_raw is True:
+            raise ConfigError(
+                "queue `auto_compact_hours` takes the terminal age in hours "
+                f"(default {DEFAULT_AUTO_COMPACT_HOURS:g}) or `false`, not `true`"
+            )
+        else:
+            parsed_auto_compact = _finite_number(
+                auto_compact_raw, "queue.auto_compact_hours"
+            )
+            if not 0 < parsed_auto_compact <= MAX_AUTO_COMPACT_HOURS:
+                raise ConfigError(
+                    "queue `auto_compact_hours` must be `false` or a finite "
+                    f"positive number no greater than {MAX_AUTO_COMPACT_HOURS:g}"
+                )
         queue = QueueCfg(
             poll_s=poll_s,
             active_poll_s=active_poll_s,
             max_my_jobs=parsed_max_jobs,
             reserve_free_per_node=reserve_free,
             auto_clean_days=parsed_auto_clean,
+            auto_compact_hours=parsed_auto_compact,
         )
         default_project = data.get("default_project")
         if default_project is not None:

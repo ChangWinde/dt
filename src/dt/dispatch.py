@@ -3202,13 +3202,33 @@ def _save_linkdest(cfg: HeadConfig, state: dict[str, str]) -> None:
         raise DispatchError("link-dest state cannot be published safely") from exc
 
 
+def _linkdest_job_id(value: str) -> str | None:
+    # legacy format stored "dt/jobs/<id>/code"; new format stores the bare id
+    job_id = Path(value).parent.name if "/" in value else value
+    return job_id if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", job_id) else None
+
+
 def _prev_job_id(cfg: HeadConfig, project_name: str, node: Node) -> str | None:
     val = _load_linkdest(cfg).get(f"{project_name}@{node.name}")
     if not val:
         return None
-    # legacy format stored "dt/jobs/<id>/code"; new format stores the bare id
-    job_id = Path(val).parent.name if "/" in val else val
-    return job_id if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", job_id) else None
+    return _linkdest_job_id(val)
+
+
+def transfer_baseline_job_ids(cfg: HeadConfig) -> set[str]:
+    """Jobs whose node-side ``code/`` is the next snapshot's copy baseline.
+
+    :func:`_snapshot_baselines` copies unchanged files locally from the most
+    recently dispatched job of the same project on the same node instead of
+    transferring them again.  Removing that one code tree per (project, node)
+    would silently turn the next dispatch into a full network transfer, so
+    compaction must retain it.
+    """
+    return {
+        job_id
+        for value in _load_linkdest(cfg).values()
+        if (job_id := _linkdest_job_id(value)) is not None
+    }
 
 
 def _snapshot_baselines(

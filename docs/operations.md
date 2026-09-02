@@ -405,6 +405,18 @@ dt compact --before 2026-07-01 -y
 It retains job metadata, outputs, logs, checkpoints, payloads, and registry
 entries. Identity or recovery mismatch rejects the candidate.
 
+The resident agent runs the same procedure automatically every six hours for
+jobs that have been terminal for longer than `queue.auto_compact_hours`
+(default 24; `false` disables). The sweep skips the newest dispatched job per
+project and node (`skipped.transfer_baseline`), because that code tree is the
+local copy baseline that keeps the next snapshot transfer incremental, and it
+skips rows the head already knows are pruned (`skipped.already_pruned`). A
+code tree removed by hand without dt is reconciled on the next sweep: the
+missing `code-pruned.json` receipt is written and the registry row records
+`code_pruned_at`, which `dt info` shows as `code copy: reclaimed ...`. Manual
+`dt compact --before DATE` keeps its submission-date semantics and applies the
+same baseline protection.
+
 ## Safe cleanup
 
 Cleanup removes old terminal jobs and optional managed data:

@@ -89,6 +89,10 @@ _stop_completion_watcher = completion_mod.stop_completion_watcher
 CRON_MARK = "# dt-agent"
 SYSTEMD_UNIT = "disttrainer-agent.service"
 AUTOCLEAN_EVERY_S = 24 * 3600
+# Compaction only touches reclaimable code copies and its preflight cost is
+# bounded by the head's deduplicated snapshot store, so it can sweep more
+# often than the destructive daily clean.
+AUTOCOMPACT_EVERY_S = 6 * 3600
 LOST_RECHECK_S = jobs_lost_recheck_s
 AGENT_LOG_MAX_BYTES = 10 * 1024 * 1024
 AGENT_LOG_BACKUPS = 2
@@ -1229,6 +1233,65 @@ def _maybe_autoclean(cfg: HeadConfig, log: Callable[[str], None]) -> None:
         )
 
 
+def _maybe_autocompact(cfg: HeadConfig, log: Callable[[str], None]) -> None:
+    """Config-gated sweep (queue.auto_compact_hours): reclaim the node-side
+    ``code/`` copy of jobs that have been terminal for at least N hours.
+
+    Compaction is recoverable - the head's immutable snapshot stays the
+    authority for ``dt fork``/exact recovery - and the sweep retains the copy
+    baseline each (project, node) pair needs for cheap future transfers.
+    """
+    hours = cfg.queue.auto_compact_hours
+    if hours is None:
+        return
+    if not math.isfinite(hours) or hours <= 0:
+        log(f"auto-compact disabled: invalid retention {hours!r} hours")
+        return
+    stamp = cfg.agent_dir() / "last_autocompact"
+    try:
+        prior = read_bounded(stamp, max_bytes=128)
+    except PrivateStateError as exc:
+        log(f"auto-compact skipped: unsafe sweep state ({type(exc).__name__})")
+        return
+    if prior is not None and time.time() - prior[1].st_mtime < AUTOCOMPACT_EVERY_S:
+        return
+    try:
+        # Stamp first: a failing sweep must not retry every tick.
+        atomic_write(stamp, f"{time.time():.6f}\n".encode("ascii"))
+    except PrivateStateError as exc:
+        log(f"auto-compact skipped: sweep state unavailable ({type(exc).__name__})")
+        return
+    from .compact import compact_jobs
+
+    started = time.monotonic()
+    cutoff = time.time() - hours * 3600
+    report = compact_jobs(
+        cfg,
+        cutoff,
+        before=f"terminal>{hours:g}h",
+        apply=True,
+        anchor="terminal",
+    )
+    payload = report.payload
+    skipped = payload.get("skipped")
+    baselines = skipped.get("transfer_baseline", 0) if isinstance(skipped, dict) else 0
+    freed = payload.get("planned_code_bytes")
+    freed_text = (
+        f"{int(freed) / 2**30:.1f} GiB" if isinstance(freed, int) and freed else "0 B"
+    )
+    log(
+        f"auto-compact: reclaimed code of {payload.get('compacted_jobs', 0)} job(s) "
+        f"({freed_text}) terminal for over {hours:g}h; retained "
+        f"{baselines} transfer baseline(s); {time.monotonic() - started:.1f}s"
+    )
+    failed = payload.get("failed_jobs")
+    errors = payload.get("preflight_errors")
+    if isinstance(failed, int) and failed:
+        log(f"auto-compact: {failed} job(s) could not be compacted safely")
+    if isinstance(errors, list) and errors:
+        log(f"auto-compact: refused, recovery archive problem: {errors[0]}")
+
+
 def _consume_agent_wake(cfg: HeadConfig) -> bool:
     try:
         agent_wake_path(cfg).unlink()
@@ -1466,6 +1529,7 @@ def run_loop(cfg: HeadConfig) -> int:
                 )
                 queue_active = any(entry.status == "queued" for entry in entries)
                 _maybe_autoclean(cfg, log)
+                _maybe_autocompact(cfg, log)
                 rotate_log()
             except Exception as e:  # keep the loop alive, always
                 tick_failure = e
@@ -2235,6 +2299,7 @@ def status(cfg: HeadConfig) -> dict[str, object]:
         "max_my_jobs": cfg.queue.max_my_jobs,
         "reserve_free_per_node": cfg.queue.reserve_free_per_node,
         "auto_clean_days": cfg.queue.auto_clean_days,
+        "auto_compact_hours": cfg.queue.auto_compact_hours,
         "webhook": bool(cfg.webhook),
         "log": _public_path(str(log_path(cfg))),
         "log_bytes": log_bytes,

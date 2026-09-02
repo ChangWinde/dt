@@ -141,11 +141,17 @@ def build_config(
 _HEAD_RETENTION_HINT = """
 # Optional: retire ended jobs older than N days. This deletes each ended
 # job's node workdir (including never-pulled outputs), its registry row,
-# and unused shared environments. dt never enables retention on its own;
-# without it, history grows until `dt clean` runs (dt doctor reports the
-# registry size). Uncomment to opt in:
+# and unused shared environments. dt never enables this irreversible
+# retention on its own; without it, history grows until `dt clean` runs
+# (dt doctor reports the registry size). Uncomment to opt in:
 # queue:
 #   auto_clean_days: 30
+#
+# Separately, the agent reclaims each ended job's node-side code copy 24h
+# after the job ends (queue.auto_compact_hours, default 24). This is
+# recoverable: the exact snapshot stays archived on the head for `dt fork`,
+# and logs/outputs are never touched. Set `auto_compact_hours: false` to
+# keep every code copy until `dt compact` runs.
 """
 
 

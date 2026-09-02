@@ -195,6 +195,9 @@ def test_init_head_scaffold_documents_retention_without_enabling_it(tmp_path):
     assert "# queue:" in text
     assert "#   auto_clean_days: 30" in text
     assert "never-pulled outputs" in text
+    # The recoverable default is disclosed next to the irreversible opt-in.
+    assert "auto_compact_hours, default 24" in text
+    assert "auto_compact_hours: false" in text
     parsed = yaml.safe_load(text)
     assert "queue" not in parsed
 
