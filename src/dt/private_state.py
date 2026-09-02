@@ -390,15 +390,6 @@ def fsync_dir(path: Path) -> None:
         os.close(descriptor)
 
 
-def best_effort_fsync_dir(path: Path) -> bool:
-    """Attempt a non-authoritative cleanup barrier without masking its outcome."""
-    try:
-        fsync_dir(path)
-    except PrivateStateError:
-        return False
-    return True
-
-
 def _syncfs_tree(root: Path) -> bool:
     """Flush the whole filesystem holding ``root`` with one syscall.
 
@@ -498,15 +489,6 @@ def fsync_tree(root: Path) -> None:
         raise
     except OSError as exc:
         raise PrivateStateError(f"cannot persist directory tree: {root}") from exc
-
-
-def best_effort_fsync_tree(root: Path) -> bool:
-    """Attempt a non-authoritative tree barrier and expose whether it worked."""
-    try:
-        fsync_tree(root)
-    except PrivateStateError:
-        return False
-    return True
 
 
 def atomic_write(path: Path, payload: bytes, *, mode: int = 0o600) -> None:

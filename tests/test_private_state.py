@@ -240,7 +240,7 @@ def test_fsync_tree_falls_back_to_the_per_file_walk(tmp_path, monkeypatch):
     assert len(flushed) >= 4
 
 
-def test_fsync_dir_and_best_effort_helper_do_not_hide_eio(tmp_path, monkeypatch):
+def test_fsync_dir_does_not_hide_eio(tmp_path, monkeypatch):
     def fail_fsync(_descriptor):
         raise OSError(errno.EIO, "injected writeback failure")
 
@@ -248,7 +248,6 @@ def test_fsync_dir_and_best_effort_helper_do_not_hide_eio(tmp_path, monkeypatch)
 
     with pytest.raises(PrivateStateError, match="cannot persist directory entries"):
         private_state_mod.fsync_dir(tmp_path)
-    assert private_state_mod.best_effort_fsync_dir(tmp_path) is False
 
 
 def test_fsync_tree_does_not_fallback_after_syncfs_reports_eio(tmp_path, monkeypatch):
@@ -262,7 +261,6 @@ def test_fsync_tree_does_not_fallback_after_syncfs_reports_eio(tmp_path, monkeyp
 
     with pytest.raises(PrivateStateError, match="cannot persist directory tree"):
         private_state_mod.fsync_tree(tmp_path)
-    assert private_state_mod.best_effort_fsync_tree(tmp_path) is False
 
 
 def test_syncfs_helper_flushes_a_real_directory():

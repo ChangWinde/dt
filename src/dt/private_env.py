@@ -114,13 +114,3 @@ def decode(payload: bytes) -> dict[str, str]:
             )
         decoded[name] = value
     return _normalize(cast(Mapping[object, object], decoded))
-
-
-def runtime_values(values: Mapping[object, object]) -> dict[str, str]:
-    """Return the validated subset which the wrapper may receive."""
-    normalized = _normalize(values)
-    return {
-        name: value
-        for name, value in normalized.items()
-        if name not in LAUNCHER_ONLY_NAMES
-    }
