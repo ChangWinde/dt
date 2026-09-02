@@ -4105,7 +4105,7 @@ class _InventoryPlan:
 
 
 @dataclass
-class _InventoryOutcome:
+class _GroupOutcome:
     """Mutable progress of one batch/chain submission across its phases."""
 
     project: str | None
@@ -4142,11 +4142,12 @@ class _InventoryOutcome:
         self.failure, self.failure_code, _entry = _batch_error(exc, **kwargs)
 
 
-def _inventory_ensure_agent(
+def _group_ensure_agent(
     cfg: HeadConfig,
-    outcome: _InventoryOutcome,
+    outcome: _GroupOutcome,
     entry: jobs_mod.JobEntry,
 ) -> None:
+    """Start the resident agent once if a group member is queued."""
     if entry.status != "queued" or outcome.agent_checked:
         return
     from . import agent as agent_mod
@@ -4156,54 +4157,95 @@ def _inventory_ensure_agent(
         outcome.agent_started = agent_mod.start_detached(cfg)
 
 
-def _inventory_record_job(
+def _record_group_job(
     cfg: HeadConfig,
-    plan: _InventoryPlan,
-    outcome: _InventoryOutcome,
+    outcome: _GroupOutcome,
+    *,
+    request_id: str,
     index: int,
     entry: jobs_mod.JobEntry,
 ) -> None:
-    if plan.request_id is None or outcome.group_intent_sha256 is None:
+    if outcome.group_intent_sha256 is None:
         return
     outcome.group_record = group_mod.locked_record_job(
         cfg,
-        plan.request_id,
+        request_id,
         intent_sha256=outcome.group_intent_sha256,
         index=index,
         job_id=entry.job_id,
     )
 
 
-def _inventory_claim_group(
+def _artifact_publisher(
     cfg: HeadConfig,
-    plan: _InventoryPlan,
-    outcome: _InventoryOutcome,
+    outcome: _GroupOutcome,
     *,
+    server: str,
+    project: str,
+    artifacts: list[str],
+    manifest: str,
+) -> Callable[[], None]:
+    """The claimed action that publishes shared artifacts for a group.
+
+    Runs only after the durable group claim exists and verifies the synced
+    identity matches the claimed intent before recording the sync receipt.
+    """
+
+    def publish_artifacts() -> None:
+        synced_project, synced_manifest, row = _sync_task_artifacts_raw(
+            cfg,
+            server=server,
+            project=project,
+            artifacts=artifacts,
+            expected_manifest_sha256=manifest,
+        )
+        if synced_project != project or synced_manifest != manifest:
+            raise _OperationFailure(
+                "artifact_sync_failed",
+                "artifact sync returned an identity different from the "
+                "claimed group intent",
+                1,
+            )
+        outcome.artifact_sync = row
+
+    return publish_artifacts
+
+
+def _claim_group_request(
+    cfg: HeadConfig,
+    outcome: _GroupOutcome,
+    *,
+    request_id: str,
+    intent_sha256: str,
+    operation: str,
+    requested: int,
     artifact_action: Callable[[], None] | None,
+    artifact_manifest: str | None,
+    artifact_node: str | None,
+    item_label: str | None,
     json_: bool,
 ) -> None:
-    """Claim (or resume) the durable multi-job request for this plan."""
-    request_id = plan.request_id
-    if request_id is None:
-        return
-    outcome.group_intent_sha256 = plan.intent_sha256(cfg.center)
+    """Claim (or resume) the durable multi-job request shared by batch,
+    chain, and matrix; every outcome lands on ``outcome``."""
+    outcome.group_intent_sha256 = intent_sha256
     try:
         outcome.group_record = group_mod.locked_claim(
             cfg,
             request_id,
-            outcome.group_intent_sha256,
-            operation=plan.policy.command,
-            requested=len(plan.items),
+            intent_sha256,
+            operation=operation,
+            requested=requested,
             claimed_action=artifact_action,
         )
         if (
             outcome.artifact_sync is not None
-            and plan.artifact_manifest is not None
+            and artifact_manifest is not None
+            and artifact_node is not None
             and not json_
         ):
             _emit_task_artifact_sync_success(
-                plan.server,
-                plan.artifact_manifest,
+                artifact_node,
+                artifact_manifest,
                 outcome.artifact_sync,
             )
         outcome.entries = group_mod.load_entries_or_fail(cfg, outcome.group_record)
@@ -4212,12 +4254,12 @@ def _inventory_claim_group(
             outcome.failure = _group_failure(outcome.group_record)
             outcome.failure_code = outcome.group_record.exit_code or 0
     except _OperationFailure as exc:
-        outcome.fail_from(exc)
+        outcome.fail_from(exc, item_label=item_label)
     except KeyboardInterrupt:
         outcome.fail(
-            f"{plan.policy.command}_artifact_sync_interrupted",
+            f"{operation}_artifact_sync_interrupted",
             (
-                f"{plan.policy.command} artifact sync interrupted before job "
+                f"{operation} artifact sync interrupted before job "
                 "submission; no jobs were registered. The request was "
                 "durably rejected; inspect the partial transfer and use "
                 "a new request id to try again."
@@ -4278,10 +4320,123 @@ def _inventory_claim_group(
         )
 
 
+def _finalize_group_request(
+    cfg: HeadConfig,
+    outcome: _GroupOutcome,
+    *,
+    request_id: str,
+    interrupted_kind: str,
+    transient: bool = False,
+) -> None:
+    """Write the durable final group receipt (confirmed or uncertain).
+
+    ``transient`` keeps the group open on purpose: no unit outcome is
+    ambiguous and nothing was partially launched, so the same request id
+    must resume from the confirmed prefix once capacity or connectivity
+    returns instead of replaying a terminal rejection.
+    """
+    if (
+        outcome.group_record is None
+        or outcome.group_intent_sha256 is None
+        or outcome.group_terminal_replay
+        or transient
+        or outcome.group_record.state == "rejected"
+    ):
+        return
+    failure = outcome.failure
+    uncertain = bool(
+        failure
+        and failure.get("kind")
+        in {
+            interrupted_kind,
+            "submission_unknown",
+            "idempotency_conflict",
+            # An unverified orphan cancel means the item may be running;
+            # confirming the group would invite a duplicate under a new
+            # request id (audit H4).
+            "uncertain_launch",
+        }
+    )
+    try:
+        outcome.group_record = group_mod.locked_transition(
+            cfg,
+            request_id,
+            intent_sha256=outcome.group_intent_sha256,
+            state="uncertain" if uncertain else "confirmed",
+            exit_code=None if uncertain else outcome.failure_code,
+            error_kind=(str(failure["kind"]) if failure is not None else None),
+            error_message=(
+                str(failure.get("message")) if failure is not None else None
+            ),
+        )
+    except (
+        OSError,
+        ValueError,
+        intent_mod.RequestRecordError,
+        group_mod.GroupRequestError,
+    ) as exc:
+        outcome.fail(
+            "submission_unknown",
+            (
+                f"request {request_id!r} did not produce a durable final "
+                "group receipt; retry only with the same request id"
+            ),
+            EXIT_UNREACHABLE,
+            reasons={"request_id": request_id, "detail": str(exc)},
+        )
+
+
+def _inventory_ensure_agent(
+    cfg: HeadConfig,
+    outcome: _GroupOutcome,
+    entry: jobs_mod.JobEntry,
+) -> None:
+    _group_ensure_agent(cfg, outcome, entry)
+
+
+def _inventory_record_job(
+    cfg: HeadConfig,
+    plan: _InventoryPlan,
+    outcome: _GroupOutcome,
+    index: int,
+    entry: jobs_mod.JobEntry,
+) -> None:
+    if plan.request_id is None:
+        return
+    _record_group_job(
+        cfg, outcome, request_id=plan.request_id, index=index, entry=entry
+    )
+
+
+def _inventory_claim_group(
+    cfg: HeadConfig,
+    plan: _InventoryPlan,
+    outcome: _GroupOutcome,
+    *,
+    artifact_action: Callable[[], None] | None,
+    json_: bool,
+) -> None:
+    if plan.request_id is None:
+        return
+    _claim_group_request(
+        cfg,
+        outcome,
+        request_id=plan.request_id,
+        intent_sha256=plan.intent_sha256(cfg.center),
+        operation=plan.policy.command,
+        requested=len(plan.items),
+        artifact_action=artifact_action,
+        artifact_manifest=plan.artifact_manifest,
+        artifact_node=plan.server,
+        item_label=None,
+        json_=json_,
+    )
+
+
 def _inventory_verify_terminal_replay(
     cfg: HeadConfig,
     plan: _InventoryPlan,
-    outcome: _InventoryOutcome,
+    outcome: _GroupOutcome,
     *,
     json_: bool,
 ) -> None:
@@ -4347,7 +4502,7 @@ def _inventory_verify_terminal_replay(
 def _inventory_submit_items(
     cfg: HeadConfig,
     plan: _InventoryPlan,
-    outcome: _InventoryOutcome,
+    outcome: _GroupOutcome,
     *,
     json_: bool,
 ) -> None:
@@ -4489,59 +4644,16 @@ def _inventory_submit_items(
 def _inventory_finalize_group(
     cfg: HeadConfig,
     plan: _InventoryPlan,
-    outcome: _InventoryOutcome,
+    outcome: _GroupOutcome,
 ) -> None:
-    """Write the durable final group receipt (confirmed or uncertain)."""
-    request_id = plan.request_id
-    if (
-        request_id is None
-        or outcome.group_record is None
-        or outcome.group_intent_sha256 is None
-        or outcome.group_terminal_replay
-        or outcome.group_record.state == "rejected"
-    ):
+    if plan.request_id is None:
         return
-    failure = outcome.failure
-    uncertain = bool(
-        failure
-        and failure.get("kind")
-        in {
-            f"{plan.policy.command}_submission_interrupted",
-            "submission_unknown",
-            "idempotency_conflict",
-            # An unverified orphan cancel means the item may be running;
-            # confirming the group would invite a duplicate under a new
-            # request id (audit H4).
-            "uncertain_launch",
-        }
+    _finalize_group_request(
+        cfg,
+        outcome,
+        request_id=plan.request_id,
+        interrupted_kind=f"{plan.policy.command}_submission_interrupted",
     )
-    try:
-        outcome.group_record = group_mod.locked_transition(
-            cfg,
-            request_id,
-            intent_sha256=outcome.group_intent_sha256,
-            state="uncertain" if uncertain else "confirmed",
-            exit_code=None if uncertain else outcome.failure_code,
-            error_kind=(str(failure["kind"]) if failure is not None else None),
-            error_message=(
-                str(failure.get("message")) if failure is not None else None
-            ),
-        )
-    except (
-        OSError,
-        ValueError,
-        intent_mod.RequestRecordError,
-        group_mod.GroupRequestError,
-    ) as exc:
-        outcome.fail(
-            "submission_unknown",
-            (
-                f"request {request_id!r} did not produce a durable final "
-                "group receipt; retry only with the same request id"
-            ),
-            EXIT_UNREACHABLE,
-            reasons={"request_id": request_id, "detail": str(exc)},
-        )
 
 
 def _inventory_command(
@@ -4726,7 +4838,7 @@ def _inventory_command(
             json_=json_,
         )
 
-    outcome = _InventoryOutcome(project=project)
+    outcome = _GroupOutcome(project=project)
     artifact_action: Callable[[], None] | None = None
     if artifacts:
         try:
@@ -4741,30 +4853,14 @@ def _inventory_command(
         except (ConfigError, DispatchError) as exc:
             outcome.fail_from(exc)
         else:
-            resolved_project = project
-            resolved_manifest = artifact_manifest
-
-            def publish_artifacts() -> None:
-                synced_project, synced_manifest, row = _sync_task_artifacts_raw(
-                    cfg,
-                    server=server,
-                    project=resolved_project,
-                    artifacts=artifacts,
-                    expected_manifest_sha256=resolved_manifest,
-                )
-                if (
-                    synced_project != resolved_project
-                    or synced_manifest != resolved_manifest
-                ):
-                    raise _OperationFailure(
-                        "artifact_sync_failed",
-                        "artifact sync returned an identity different from the "
-                        "claimed group intent",
-                        1,
-                    )
-                outcome.artifact_sync = row
-
-            artifact_action = publish_artifacts
+            artifact_action = _artifact_publisher(
+                cfg,
+                outcome,
+                server=server,
+                project=project,
+                artifacts=artifacts,
+                manifest=artifact_manifest,
+            )
 
     plan = _InventoryPlan(
         policy=policy,
@@ -5231,10 +5327,8 @@ def _matrix_run_head(
     requested = len(spec.units)
     project = spec.project
     artifact_manifest: str | None = None
-    artifact_sync: JsonDict | None = None
     artifact_action: Callable[[], None] | None = None
-    failure: JsonDict | None = None
-    failure_code = 0
+    outcome = _GroupOutcome(project=project)
     if spec.artifacts:
         artifact_node = spec.node
         if artifact_node is None:
@@ -5249,158 +5343,41 @@ def _matrix_run_head(
                 list(spec.artifacts),
             )
         except (ConfigError, DispatchError) as exc:
-            failure, failure_code, _entry = _batch_error(
-                exc,
-                item_label="matrix unit",
-            )
+            outcome.fail_from(exc, item_label="matrix unit")
         else:
-
-            def publish_artifacts() -> None:
-                nonlocal artifact_sync
-                synced_project, synced_manifest, row = _sync_task_artifacts_raw(
-                    cfg,
-                    server=artifact_node,
-                    project=project,
-                    artifacts=list(spec.artifacts),
-                    expected_manifest_sha256=artifact_manifest,
-                )
-                if synced_project != project or synced_manifest != artifact_manifest:
-                    raise _OperationFailure(
-                        "artifact_sync_failed",
-                        "artifact sync returned an identity different from "
-                        "the claimed group intent",
-                        1,
-                    )
-                artifact_sync = row
-
-            artifact_action = publish_artifacts
+            artifact_action = _artifact_publisher(
+                cfg,
+                outcome,
+                server=artifact_node,
+                project=project,
+                artifacts=list(spec.artifacts),
+                manifest=artifact_manifest,
+            )
 
     intent_sha256 = matrix_mod.intent_sha256(
         spec,
         center=cfg.center,
         artifact_manifest=artifact_manifest,
     )
-    entries: list[jobs_mod.JobEntry] = []
-    group_record: group_mod.GroupRequestRecord | None = None
-    group_terminal_replay = False
-    if failure is None:
-        try:
-            group_record = group_mod.locked_claim(
-                cfg,
-                request_id,
-                intent_sha256,
-                operation=matrix_mod.MATRIX_OPERATION,
-                requested=requested,
-                claimed_action=artifact_action,
-            )
-            if (
-                artifact_sync is not None
-                and artifact_manifest is not None
-                and spec.node is not None
-                and not json_
-            ):
-                _emit_task_artifact_sync_success(
-                    spec.node,
-                    artifact_manifest,
-                    artifact_sync,
-                )
-            entries = group_mod.load_entries_or_fail(cfg, group_record)
-            if group_record.state == "confirmed":
-                group_terminal_replay = True
-                failure = _group_failure(group_record)
-                failure_code = group_record.exit_code or 0
-        except _OperationFailure as exc:
-            failure, failure_code, _failed = _batch_error(
-                exc,
-                item_label="matrix unit",
-            )
-        except KeyboardInterrupt:
-            failure = {
-                "kind": "matrix_artifact_sync_interrupted",
-                "message": (
-                    "matrix artifact sync interrupted before job submission; "
-                    "no jobs were registered. The request was durably "
-                    "rejected; inspect the partial transfer and use a new "
-                    "request id to try again."
-                ),
-                "reasons": {"request_id": request_id},
-                "exit_code": 130,
-            }
-            failure_code = 130
-        except group_mod.GroupRequestConflict as exc:
-            failure = {
-                "kind": "idempotency_conflict",
-                "message": str(exc),
-                "reasons": {"request_id": request_id},
-                "exit_code": 1,
-            }
-            failure_code = 1
-        except group_mod.GroupRequestRejected as exc:
-            group_record = exc.record
-            if group_record is not None:
-                failure = _group_failure(group_record)
-                failure_code = int(failure["exit_code"]) if failure is not None else 1
-            else:
-                failure = {
-                    "kind": "submission_rejected",
-                    "message": str(exc),
-                    "reasons": {"request_id": request_id},
-                    "exit_code": EXIT_ENV,
-                }
-                failure_code = EXIT_ENV
-        except group_mod.GroupRequestOutcomeUnknown as exc:
-            group_record = exc.record
-            failure = {
-                "kind": "submission_unknown",
-                "message": str(exc),
-                "reasons": {"request_id": request_id},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
-        except intent_mod.RequestLockError as exc:
-            failure = {
-                "kind": "submission_rejected",
-                "message": (
-                    f"request {request_id!r} was not advanced because its "
-                    f"durable lock could not be acquired: {exc}"
-                ),
-                "reasons": {"request_id": request_id},
-                "exit_code": EXIT_ENV,
-            }
-            failure_code = EXIT_ENV
-        except (
-            OSError,
-            ValueError,
-            intent_mod.RequestRecordError,
-            group_mod.GroupRequestError,
-        ) as exc:
-            failure = {
-                "kind": "submission_unknown",
-                "message": (
-                    f"request {request_id!r} has unreadable durable group "
-                    "state; refusing to submit any additional jobs"
-                ),
-                "reasons": {"request_id": request_id, "detail": str(exc)},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
-
-    agent_started: bool | None = None
-    agent_checked = False
-
-    def ensure_agent(entry: jobs_mod.JobEntry) -> None:
-        nonlocal agent_checked, agent_started
-        if entry.status != "queued" or agent_checked:
-            return
-        from . import agent as agent_mod
-
-        agent_checked = True
-        if agent_mod.alive_pid(cfg) is None:
-            agent_started = agent_mod.start_detached(cfg)
+    if outcome.failure is None:
+        _claim_group_request(
+            cfg,
+            outcome,
+            request_id=request_id,
+            intent_sha256=intent_sha256,
+            operation=matrix_mod.MATRIX_OPERATION,
+            requested=requested,
+            artifact_action=artifact_action,
+            artifact_manifest=artifact_manifest,
+            artifact_node=spec.node,
+            item_label="matrix unit",
+            json_=json_,
+        )
+    entries = outcome.entries
 
     resumed = len(entries)
     for existing_index, existing_entry in enumerate(entries, start=1):
-        ensure_agent(existing_entry)
+        _group_ensure_agent(cfg, outcome, existing_entry)
         if not json_:
             print(existing_entry.job_id, flush=True)
             err.print(
@@ -5408,7 +5385,7 @@ def _matrix_run_head(
                 f"{escape(existing_entry.job_id)}[/dim]"
             )
 
-    if failure is None and not group_terminal_replay:
+    if outcome.failure is None and not outcome.group_terminal_replay:
         for index in range(len(entries) + 1, requested + 1):
             unit = spec.units[index - 1]
 
@@ -5427,31 +5404,26 @@ def _matrix_run_head(
             )
             try:
                 entry = submit(cfg, run_spec, Path.cwd(), log)
-                group_record = group_mod.locked_record_job(
-                    cfg,
-                    request_id,
-                    intent_sha256=intent_sha256,
-                    index=index,
-                    job_id=entry.job_id,
+                _record_group_job(
+                    cfg, outcome, request_id=request_id, index=index, entry=entry
                 )
             except KeyboardInterrupt:
                 confirmed = len(entries)
                 noun = "registration" if confirmed == 1 else "registrations"
-                failure = {
-                    "kind": "matrix_submission_interrupted",
-                    "message": (
+                outcome.fail(
+                    "matrix_submission_interrupted",
+                    (
                         f"matrix submission interrupted after {confirmed} "
                         f"confirmed {noun}; unit {index} outcome unknown. "
                         "Confirmed jobs were not cancelled. Rerun "
                         "`dt matrix run` with the same spec to reconcile "
                         "this exact unit."
                     ),
-                    "reasons": {"request_id": request_id},
-                    "exit_code": 130,
-                    "confirmed_submitted": confirmed,
-                    "uncertain_unit_index": index,
-                }
-                failure_code = 130
+                    130,
+                    reasons={"request_id": request_id},
+                    confirmed_submitted=confirmed,
+                    uncertain_unit_index=index,
+                )
                 break
             except (
                 FailedBeforeStart,
@@ -5460,7 +5432,7 @@ def _matrix_run_head(
                 DispatchError,
                 ConfigError,
             ) as exc:
-                failure, failure_code, failed_entry = _batch_error(
+                outcome.failure, outcome.failure_code, failed_entry = _batch_error(
                     exc,
                     item_label="matrix unit",
                 )
@@ -5468,14 +5440,14 @@ def _matrix_run_head(
                     # An uncertain launch may still be running on the node,
                     # so it is not part of the durably confirmed prefix (see
                     # the batch path for the full rationale).
-                    if failure.get("kind") != "uncertain_launch":
+                    if outcome.failure.get("kind") != "uncertain_launch":
                         try:
-                            group_record = group_mod.locked_record_job(
+                            _record_group_job(
                                 cfg,
-                                request_id,
-                                intent_sha256=intent_sha256,
+                                outcome,
+                                request_id=request_id,
                                 index=index,
-                                job_id=failed_entry.job_id,
+                                entry=failed_entry,
                             )
                         except (
                             OSError,
@@ -5483,23 +5455,22 @@ def _matrix_run_head(
                             intent_mod.RequestRecordError,
                             group_mod.GroupRequestError,
                         ) as persistence_exc:
-                            failure = {
-                                "kind": "submission_unknown",
-                                "message": (
+                            outcome.fail(
+                                "submission_unknown",
+                                (
                                     f"job {failed_entry.job_id} was registered "
                                     f"but request {request_id!r} progress "
                                     "could not be persisted"
                                 ),
-                                "reasons": {
+                                EXIT_UNREACHABLE,
+                                reasons={
                                     "request_id": request_id,
                                     "job_id": failed_entry.job_id,
                                     "detail": str(persistence_exc),
                                 },
-                                "exit_code": EXIT_UNREACHABLE,
-                            }
-                            failure_code = EXIT_UNREACHABLE
+                            )
                     entries.append(failed_entry)
-                    ensure_agent(failed_entry)
+                    _group_ensure_agent(cfg, outcome, failed_entry)
                     if not json_:
                         print(failed_entry.job_id, flush=True)
                 break
@@ -5509,92 +5480,55 @@ def _matrix_run_head(
                 intent_mod.RequestRecordError,
                 group_mod.GroupRequestError,
             ) as exc:
-                failure = {
-                    "kind": "submission_unknown",
-                    "message": (
+                outcome.fail(
+                    "submission_unknown",
+                    (
                         f"matrix unit {index} did not produce a complete "
                         "durable group receipt; retry only with the same "
                         "request id"
                     ),
-                    "reasons": {"request_id": request_id, "detail": str(exc)},
-                    "exit_code": EXIT_UNREACHABLE,
-                }
-                failure_code = EXIT_UNREACHABLE
+                    EXIT_UNREACHABLE,
+                    reasons={"request_id": request_id, "detail": str(exc)},
+                )
                 break
             entries.append(entry)
-            ensure_agent(entry)
+            _group_ensure_agent(cfg, outcome, entry)
             if not json_:
                 print(entry.job_id, flush=True)
 
     # Transient placement failures (every candidate busy or unreachable) keep
-    # the group open on purpose: no unit outcome is ambiguous and nothing was
-    # partially launched, so the same request id must resume from the
-    # confirmed prefix once capacity or connectivity returns instead of
-    # replaying a terminal rejection. This is the per-unit recovery contract
-    # research sweeps rely on.
-    transient = bool(failure and failure.get("kind") in {"no_capacity", "unreachable"})
-    if (
-        group_record is not None
-        and not group_terminal_replay
-        and not transient
-        and group_record.state != "rejected"
-    ):
-        uncertain = bool(
-            failure
-            and failure.get("kind")
-            in {
-                "matrix_submission_interrupted",
-                "submission_unknown",
-                "idempotency_conflict",
-                "uncertain_launch",
-            }
-        )
-        try:
-            group_record = group_mod.locked_transition(
-                cfg,
-                request_id,
-                intent_sha256=intent_sha256,
-                state="uncertain" if uncertain else "confirmed",
-                exit_code=None if uncertain else failure_code,
-                error_kind=(str(failure["kind"]) if failure is not None else None),
-                error_message=(
-                    str(failure.get("message")) if failure is not None else None
-                ),
-            )
-        except (
-            OSError,
-            ValueError,
-            intent_mod.RequestRecordError,
-            group_mod.GroupRequestError,
-        ) as exc:
-            failure = {
-                "kind": "submission_unknown",
-                "message": (
-                    f"request {request_id!r} did not produce a durable final "
-                    "group receipt; retry only with the same request id"
-                ),
-                "reasons": {"request_id": request_id, "detail": str(exc)},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
+    # the group open on purpose so the same request id resumes from the
+    # confirmed prefix once capacity or connectivity returns; this is the
+    # per-unit recovery contract research sweeps rely on.
+    transient = bool(
+        outcome.failure
+        and outcome.failure.get("kind") in {"no_capacity", "unreachable"}
+    )
+    _finalize_group_request(
+        cfg,
+        outcome,
+        request_id=request_id,
+        interrupted_kind="matrix_submission_interrupted",
+        transient=transient,
+    )
 
     receipt = matrix_mod.run_receipt(
         spec,
         entries=entries,
         resumed=resumed,
-        error=failure,
-        exit_code=failure_code,
-        idempotent_replay=group_terminal_replay,
+        error=outcome.failure,
+        exit_code=outcome.failure_code,
+        idempotent_replay=outcome.group_terminal_replay,
         artifact_manifest=artifact_manifest,
-        artifact_sync=artifact_sync,
-        agent_started=agent_started,
+        artifact_sync=outcome.artifact_sync,
+        agent_started=outcome.agent_started,
     )
     if json_:
         print(json.dumps(receipt))
     else:
         _emit_matrix_human(receipt, emit_job_ids=False)
-    if failure_code:
-        raise typer.Exit(failure_code)
+    if outcome.failure_code:
+        raise typer.Exit(outcome.failure_code)
 
 
 @_typed_cli_decorator(matrix_app.command("plan"))
