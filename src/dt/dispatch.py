@@ -2100,27 +2100,45 @@ class StoredSnapshot:
     code_dir: Path
 
 
+def _resource_spec_kwargs(entry: JobEntry) -> dict[str, Any]:
+    """The registry fields every derived submission replays verbatim.
+
+    Rerun, exact fork, and queued re-dispatch all rebuild a ``RunSpec`` from a
+    row; they differ in lineage, dependencies, placement, and cache semantics,
+    which each caller states explicitly.  The resource, setup, environment,
+    and artifact-link core is copied identically everywhere, so it lives here
+    once: a new placement constraint such as ``min_vram_mib`` had to be threaded
+    through every one of these paths by hand.
+    """
+    return {
+        "gpus": entry.gpus_requested,
+        "project": entry.project,
+        "require_path": entry.require_path,
+        "require_disk_gib": entry.require_disk_gib or None,
+        "max_hours": entry.max_hours,
+        "min_vram_mib": entry.min_vram_mib,
+        "max_vram_mib": entry.max_vram_mib,
+        "max_job_memory_mib": entry.max_job_memory_mib,
+        "setup": entry.setup,
+        "setup_inputs": (
+            list(entry.setup_inputs) if entry.setup_inputs is not None else None
+        ),
+        "extras": list(entry.extras) if entry.extras else None,
+        "custom_env": dict(entry.custom_env),
+        "artifact_targets": (
+            dict(entry.artifact_targets) if entry.artifact_targets else None
+        ),
+    }
+
+
 def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
     """Rebuild a submission spec from a registry entry (dt rerun). The rerun
     snapshots the project's *current* code; only cmd/resources are replayed."""
     return RunSpec(
         name=name or entry.name,
-        gpus=entry.gpus_requested,
         cmd=shlex.split(entry.cmd),
-        project=entry.project,
         node=entry.pin_node,
-        require_path=entry.require_path,
-        require_disk_gib=entry.require_disk_gib or None,
-        max_hours=entry.max_hours,
-        min_vram_mib=entry.min_vram_mib,
-        max_vram_mib=entry.max_vram_mib,
-        max_job_memory_mib=entry.max_job_memory_mib,
-        setup=entry.setup,
-        setup_inputs=(
-            list(entry.setup_inputs) if entry.setup_inputs is not None else None
-        ),
-        extras=list(entry.extras) if entry.extras else None,
-        custom_env=dict(entry.custom_env),
+        **_resource_spec_kwargs(entry),
         # A rerun snapshots today's project code. Carrying exact-snapshot
         # fork provenance would both lie about that source identity and keep
         # the fresh run coupled to a source row that normal cleanup may remove.
@@ -2132,9 +2150,6 @@ def spec_from_entry(entry: JobEntry, name: str | None = None) -> RunSpec:
         rerun_of=entry.job_id,
         rerun_source_snapshot_sha256=entry.snapshot_sha256,
         artifact_manifest=entry.artifact_manifest,
-        artifact_targets=(
-            dict(entry.artifact_targets) if entry.artifact_targets else None
-        ),
     )
 
 
@@ -2191,26 +2206,10 @@ def fork_spec_from_entry(
         fork_command = _unwrap_dt_cold_fork(fork_command)
     return RunSpec(
         name=name or f"{entry.name}-fork",
-        gpus=entry.gpus_requested,
         cmd=fork_command,
-        project=entry.project,
         node=actual_node,
-        require_path=entry.require_path,
-        require_disk_gib=entry.require_disk_gib or None,
-        max_hours=entry.max_hours,
-        min_vram_mib=entry.min_vram_mib,
-        max_vram_mib=entry.max_vram_mib,
-        max_job_memory_mib=entry.max_job_memory_mib,
-        setup=entry.setup,
-        setup_inputs=(
-            list(entry.setup_inputs) if entry.setup_inputs is not None else None
-        ),
-        extras=list(entry.extras) if entry.extras else None,
-        custom_env=dict(entry.custom_env),
+        **_resource_spec_kwargs(entry),
         artifact_manifest=artifact_manifest or entry.artifact_manifest,
-        artifact_targets=(
-            dict(entry.artifact_targets) if entry.artifact_targets else None
-        ),
         forked_from=entry.job_id,
         cache_source_job=entry.job_id if requested_cache else None,
         cache_source_job_dir=entry.job_dir if requested_cache else None,
@@ -7081,25 +7080,12 @@ def _dispatch_queued_active(
 
     spec = RunSpec(
         name=entry.name,
-        gpus=entry.gpus_requested,
         cmd=shlex.split(entry.cmd),
-        project=entry.project,
         node=entry.pin_node,
-        require_path=entry.require_path,
-        require_disk_gib=entry.require_disk_gib or None,
-        max_hours=entry.max_hours,
-        min_vram_mib=entry.min_vram_mib,
-        max_vram_mib=entry.max_vram_mib,
-        max_job_memory_mib=entry.max_job_memory_mib,
-        setup=entry.setup,
-        setup_inputs=(
-            list(entry.setup_inputs) if entry.setup_inputs is not None else None
-        ),
-        extras=list(entry.extras) if entry.extras else None,
+        **_resource_spec_kwargs(entry),
         env_mode=entry.env_mode or "sync",
         env_hash_override=(entry.env_hash if entry.env_mode == "reuse" else None),
         env_source_job=entry.env_source_job,
-        custom_env=dict(entry.custom_env),
         forked_from=entry.forked_from,
         after_success=entry.after_success,
         after_complete=entry.after_complete,
@@ -7113,9 +7099,6 @@ def _dispatch_queued_active(
         rerun_of=entry.rerun_of,
         rerun_source_snapshot_sha256=entry.rerun_source_snapshot_sha256,
         artifact_manifest=entry.artifact_manifest,
-        artifact_targets=(
-            dict(entry.artifact_targets) if entry.artifact_targets else None
-        ),
         cache_source_job=entry.cache_source_job,
         cache_source_job_dir=entry.cache_source_job_dir,
         cache_source_path=entry.cache_source_path,

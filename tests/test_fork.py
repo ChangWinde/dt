@@ -2244,3 +2244,41 @@ def test_every_registry_facing_run_spec_field_is_threaded_once(tmp_path):
     assert fields["git_sha"] == "a" * 40 and fields["git_dirty"] is True
     assert fields["submodule_commits"] == {"s": "b" * 40}
     assert fields["gpus_requested"] == 1 and fields["pin_node"] is None
+
+
+def test_derived_specs_share_one_resource_core_and_keep_their_semantics():
+    """rerun, exact fork, and queued re-dispatch rebuild a RunSpec from a row
+    through `_resource_spec_kwargs`; their lineage/dependency/placement
+    differences stay explicit at each call site and must not regress."""
+    entry = _entry(
+        job_id="20260720-1200_src_abcd",
+        node="n2",
+        pin_node=None,
+        gpus_requested=2,
+        min_vram_mib=40_000,
+        require_disk_gib=80,
+        after_success="20260720-1100_pred_abcd",
+        artifact_targets={"third_party/data": "third_party/data"},
+        custom_env={"SPLIT": "val"},
+    )
+    core = dispatch._resource_spec_kwargs(entry)  # noqa: SLF001
+    assert core["gpus"] == 2 and core["min_vram_mib"] == 40_000
+    assert core["require_disk_gib"] == 80
+    assert core["artifact_targets"] == {"third_party/data": "third_party/data"}
+    assert core["custom_env"] == {"SPLIT": "val"}
+    # The resource core never carries lineage, dependencies, or placement:
+    # those are the per-path semantics each caller states on its own.
+    assert not {"node", "forked_from", "rerun_of", "after_success"} & set(core)
+
+    rerun = dispatch.spec_from_entry(entry)
+    fork = dispatch.fork_spec_from_entry(entry)
+    # Shared core reaches both...
+    for spec in (rerun, fork):
+        assert spec.gpus == 2 and spec.min_vram_mib == 40_000
+        assert spec.artifact_targets == {"third_party/data": "third_party/data"}
+    # ...while the deliberate differences hold.
+    assert rerun.node is None and rerun.forked_from is None
+    assert rerun.rerun_of == entry.job_id
+    assert rerun.after_success == "20260720-1100_pred_abcd"  # rerun keeps deps
+    assert fork.node == "n2" and fork.forked_from == entry.job_id  # actual node
+    assert fork.rerun_of is None and fork.after_success is None  # fork drops deps
