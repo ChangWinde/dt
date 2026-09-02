@@ -43,7 +43,7 @@ This page helps operators choose a command and handle its result. Run
 | `dt events` | Query the bounded, redacted operation journal on this host or a head |
 | `dt storage` | Inventory DistTrainer-managed storage |
 | `dt migrate layout` | Plan or apply identity-verified legacy runtime moves |
-| `dt compact` | Remove recoverable old code copies while retaining job evidence |
+| `dt compact` | Remove recoverable old code copies while retaining job evidence (the agent also sweeps automatically; see `queue.auto_compact_hours`) |
 | `dt clean` | Delete explicitly scoped old jobs, results, environments, or deployment trees |
 | `dt sync` | Incrementally stage project code or explicit large inputs |
 | `dt seed` | Seed approved caches and Python runtimes on slow-network nodes |

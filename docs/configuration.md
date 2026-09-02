@@ -92,6 +92,7 @@ queue:
   max_my_jobs: 4
   reserve_free_per_node: 0
   auto_clean_days: 14
+  auto_compact_hours: 24
 
 operations:
   max_file_mib: 16
@@ -280,11 +281,24 @@ paths, and `..` components are rejected.
 | `max_my_jobs` | unlimited | Maximum concurrent jobs owned by this DistTrainer identity |
 | `reserve_free_per_node` | 0 | GPUs to leave unused on each node |
 | `auto_clean_days` | disabled | Age threshold for daily job and unused-environment cleanup |
+| `auto_compact_hours` | 24 | Hours after a job ends before the agent reclaims its node-side `code/` copy; `false` disables |
 
 Polling values and `auto_clean_days` must be finite and positive. Cleanup age
 is measured from a terminal job's `finished_at`; legacy or damaged records
 without a completion timestamp are retained. Automatic cleanup should be
 enabled only after managed results and retention expectations are documented.
+
+Automatic compaction is on by default because it is recoverable: each job's
+exact snapshot stays archived on the head, so `dt fork`, `dt exec`, and
+snapshot recovery keep working after the node-side copy is removed, and
+logs, outputs, and completion evidence are never touched. Every six hours the
+agent runs the same guarded procedure as `dt compact` (archive re-hashed,
+liveness census, durable `code-pruned.json` receipt) against jobs terminal for
+longer than `auto_compact_hours`. It always retains the newest dispatched job
+per project and node, whose code is the local copy baseline for the next
+snapshot transfer; removing it would turn that transfer into a full network
+copy. Copies removed outside dt are reconciled the same way: the sweep writes
+the missing receipt instead of failing.
 
 ### Operation journal retention
 

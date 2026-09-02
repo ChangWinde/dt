@@ -10828,6 +10828,14 @@ def info(
         "rerun_of": entry.rerun_of,
         "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
         "rerun_snapshot_changed": entry.rerun_snapshot_changed,
+        "retry": {
+            "limit": entry.retry_limit,
+            "on": entry.retry_on or ("infra" if entry.retry_limit else None),
+            "attempt": entry.retry_count,
+            "retry_of": entry.retry_of,
+            "retried_by": entry.retried_by,
+        },
+        "code_pruned_at": entry.code_pruned_at,
         "cache_reuse": (
             {
                 "source_job_id": entry.cache_source_job,
@@ -10967,6 +10975,15 @@ def info(
         ("duration", _fmt_duration(duration) if duration is not None else "-"),
         ("exit code", "-" if entry.exit_code is None else str(entry.exit_code)),
         ("outputs", data["outputs_size"] or "-"),
+        (
+            "code copy",
+            (
+                f"not on the node since {_fmt_ts(entry.code_pruned_at)} · exact "
+                f"snapshot stays on the head (dt fork {display_ref})"
+                if entry.code_pruned_at is not None
+                else "-"
+            ),
+        ),
         (
             "job dir",
             (
@@ -11241,6 +11258,7 @@ def info(
         "duration",
         "exit code",
         "outputs",
+        "code copy",
         "forked from",
         "after success",
         "rerun of",
@@ -11267,7 +11285,7 @@ def info(
             and not (
                 row[1] == "-"
                 and (
-                    row[0] in {"exit code", "outputs"}
+                    row[0] in {"exit code", "outputs", "code copy"}
                     or row[0].startswith("finished (")
                 )
             )

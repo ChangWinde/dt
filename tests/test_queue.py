@@ -531,6 +531,91 @@ def test_agent_autoclean_refuses_symlinked_retention_state(tmp_path, monkeypatch
     assert outside.read_text() == "must survive\n"
 
 
+def test_agent_autocompact_sweeps_terminal_code_with_the_terminal_anchor(
+    tmp_path, monkeypatch
+):
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    cfg.queue.auto_compact_hours = 24
+    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
+    calls: list[dict[str, object]] = []
+
+    def fake_compact(cfg_, cutoff, *, before, apply, anchor):
+        calls.append(
+            {"cutoff": cutoff, "before": before, "apply": apply, "anchor": anchor}
+        )
+        import dt.compact as compact_mod
+
+        return compact_mod.CompactReport(
+            payload={
+                "compacted_jobs": 3,
+                "planned_code_bytes": 2 * 2**30,
+                "skipped": {"transfer_baseline": 2},
+                "failed_jobs": 0,
+                "preflight_errors": [],
+            },
+            exit_code=0,
+        )
+
+    import dt.compact as compact_mod
+
+    monkeypatch.setattr(compact_mod, "compact_jobs", fake_compact)
+    messages: list[str] = []
+
+    agent._maybe_autocompact(cfg, messages.append)
+
+    assert len(calls) == 1
+    assert calls[0]["apply"] is True
+    assert calls[0]["anchor"] == "terminal"
+    assert abs(float(calls[0]["cutoff"]) - (time.time() - 24 * 3600)) < 5
+    assert any(
+        "reclaimed code of 3 job(s) (2.0 GiB)" in m and "retained 2 transfer" in m
+        for m in messages
+    )
+    # Second call inside the sweep interval is a no-op (stamp gating).
+    agent._maybe_autocompact(cfg, messages.append)
+    assert len(calls) == 1
+
+
+def test_agent_autocompact_is_off_when_configured_false(tmp_path, monkeypatch):
+    import dt.agent as agent
+    import dt.compact as compact_mod
+
+    cfg = _cfg(tmp_path)
+    cfg.queue.auto_compact_hours = None
+    monkeypatch.setattr(
+        compact_mod,
+        "compact_jobs",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not sweep")),
+    )
+
+    agent._maybe_autocompact(cfg, lambda m: None)
+
+
+def test_agent_autocompact_refuses_symlinked_sweep_state(tmp_path, monkeypatch):
+    import dt.agent as agent
+    import dt.compact as compact_mod
+
+    cfg = _cfg(tmp_path)
+    cfg.queue.auto_compact_hours = 24
+    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
+    outside = tmp_path / "outside-autocompact-state"
+    outside.write_text("must survive\n")
+    (cfg.agent_dir() / "last_autocompact").symlink_to(outside)
+    monkeypatch.setattr(
+        compact_mod,
+        "compact_jobs",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not sweep")),
+    )
+    messages: list[str] = []
+
+    agent._maybe_autocompact(cfg, messages.append)
+
+    assert messages == ["auto-compact skipped: unsafe sweep state (PrivateStateError)"]
+    assert outside.read_text() == "must survive\n"
+
+
 def test_agent_state_reader_rejects_fifo_without_blocking(tmp_path):
     import dt.agent as agent
 

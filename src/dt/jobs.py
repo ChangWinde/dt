@@ -303,6 +303,11 @@ class JobEntry:
     worker_roots: dict[str, str] = field(default_factory=dict)
     job_relpath: str | None = None
     recovered_at: float | None = None
+    # Head-side memo that the node's ``code/`` copy was reclaimed (the durable
+    # ``code-pruned.json`` receipt on the node remains the remote authority).
+    # It lets compaction skip settled rows without re-hashing their archives
+    # and lets operators see why a workdir has no code tree.
+    code_pruned_at: float | None = None
     # Once a provisional lost result has released or skipped a dependent, late
     # worker evidence must not rewrite that irreversible history.
     terminal_finalized_at: float | None = None
@@ -704,6 +709,7 @@ def _decode_entry(
         entry.updated_at,
         entry.terminal_finalized_at,
         entry.dispatch_claimed_at,
+        entry.code_pruned_at,
     )
     if entry.created_at is None or any(
         value is not None

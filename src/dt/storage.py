@@ -378,6 +378,7 @@ def inventory(
         "managed_root": str(cfg.root),
         "results_root": str(results_root),
         "auto_clean_days": cfg.queue.auto_clean_days,
+        "auto_compact_hours": cfg.queue.auto_compact_hours,
         "head": head_rows,
         "nodes": node_rows,
         "total_bytes": total_bytes,

@@ -6,6 +6,70 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.2 — 2026-09-02
+
+### Fixed
+
+- Automatic and manual compaction no longer abort when a single recovery
+  archive cannot be verified. The affected jobs keep their code copy
+  (deletion is refused without a proven recovery source) and are reported as
+  `skipped.snapshot_unverified`, while every healthy job is still reclaimed.
+  A snapshot containing a dangling in-tree symlink had wedged the sweep so it
+  freed nothing on every run. The interactive command still exits non-zero
+  and lists the archive in `preflight_errors`.
+- The batched remote census is now packed by rendered byte size instead of a
+  fixed 40 jobs per batch. A single `bash -c <script>` argument is limited to
+  128 KiB by Linux `MAX_ARG_STRLEN` (independent of `ARG_MAX`), and 40 job
+  blocks rendered ~168 KiB, so compaction of a head with many eligible jobs
+  failed with `Argument list too long`. Batches now stay under a safe ceiling.
+
+Both fixes were found during on-head acceptance of 0.13.0/0.13.1 and are
+rolled into this single superseding release; 0.13.0 and 0.13.1 were never
+merged.
+
+## 0.13.0 — 2026-09-02
+
+### Added
+
+- Automatic code-copy compaction. The resident agent now reclaims each
+  terminal job's node-side `code/` copy once the job has been terminal for
+  `queue.auto_compact_hours` (default 24; `false` disables), sweeping every
+  six hours with the same guarded procedure as `dt compact`: the head's
+  immutable snapshot archive is re-hashed first, a process-identity liveness
+  census refuses anything still running, only the exact `code/` path is
+  removed, and a durable `code-pruned.json` receipt is written. Logs,
+  outputs, checkpoints, and registry rows are untouched, and `dt fork`,
+  `dt exec`, and exact-snapshot recovery keep working from the head archive.
+  A research node had accumulated 75 GB of dead 500-750 MB repository
+  copies across 153 jobs whose logs and outputs together were under 50 MB.
+- Compaction retains the newest dispatched job per project and node
+  (`skipped.transfer_baseline`): its `code/` is the rsync copy baseline
+  that keeps the next snapshot transfer incremental, so reclaiming it would
+  silently turn that transfer into a full network copy over links measured
+  at 80-130 KB/s. Hard-linking job code trees was deliberately not adopted:
+  jobs may write inside their workdir, and a shared inode would let one job
+  mutate another's source.
+- `JobEntry.code_pruned_at` records on the head that a job's code copy is
+  gone (compacted, receipt repaired, or the job directory itself absent
+  while the worker's jobs root is present). Later sweeps skip those rows
+  without re-hashing their archives, so sweep cost tracks new work rather
+  than history. `dt info` shows `code copy: not on the node since ...` with
+  the `dt fork` recovery path; `dt info --json` exposes `code_pruned_at` and
+  the retry lineage block that was missing from the explicit payload.
+- Code trees removed by hand without dt are reconciled by the next sweep:
+  the missing receipt is written and the memo recorded instead of failing.
+- `compact_jobs(..., anchor="terminal")` measures age from the job's end
+  time; `dt compact --before DATE` keeps its submission-date semantics.
+  `lost` rows still inside their evidence recovery window are never planned.
+- A single unverifiable recovery archive no longer aborts the whole
+  operation. The affected jobs keep their code copy (recovery is unproven,
+  so deletion is refused) and are reported as `skipped.snapshot_unverified`
+  with the detail in `preflight_errors`, while every healthy job is still
+  compacted. Previously one corrupt store object — for example a snapshot
+  containing a dangling in-tree symlink — wedged compaction center-wide and
+  the automatic sweep would free nothing on every run. The interactive
+  command still exits non-zero so the bad archive stays visible.
+
 ## 0.12.3 — 2026-09-02
 
 ### Fixed

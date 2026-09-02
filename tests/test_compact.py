@@ -306,8 +306,8 @@ def test_compact_apply_reloads_registry_and_skips_recovered_job(tmp_path, monkey
     save(cfg, entry)
     real_preflight = compact_mod.preflight
 
-    def racing_preflight(cfg_, cutoff_ts):
-        checked = real_preflight(cfg_, cutoff_ts)
+    def racing_preflight(cfg_, cutoff_ts, **kwargs):
+        checked = real_preflight(cfg_, cutoff_ts, **kwargs)
         current = load(cfg_, entry.job_id)
         assert current is not None
         current.status = "running"
@@ -424,6 +424,37 @@ def test_compact_refuses_corrupt_archive_before_contacting_node(tmp_path, monkey
     assert report.exit_code == 1
     assert report.payload["preflight_errors"]
     assert contacted is False
+
+
+def test_compact_isolates_a_corrupt_archive_and_still_frees_healthy_jobs(
+    tmp_path, monkeypatch
+):
+    """One unverifiable recovery archive must not wedge the whole sweep:
+    its job keeps its code (safe), while healthy jobs are still reclaimed."""
+    cfg = _cfg(tmp_path)
+    good_digest = _archive(cfg, text="print('good')\n")
+    bad_digest = _archive(cfg, text="print('bad')\n")
+    (cfg.snapshots_dir() / bad_digest / "code" / "train.py").write_text("corrupt\n")
+    healthy = _entry(good_digest, job_id="20260720-1200_healthy_abcd")
+    poisoned = _entry(bad_digest, job_id="20260720-1201_poisoned_abcd")
+    for entry in (healthy, poisoned):
+        save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    healthy_root = _workdir(node_home, healthy)
+    poisoned_root = _workdir(node_home, poisoned)
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg, cutoff_ts=100.0, before="1970-01-01", apply=True
+    )
+
+    # Fail-visible (a recovery archive could not be verified) but productive.
+    assert report.exit_code == 1
+    assert report.payload["preflight_errors"]
+    assert report.payload["skipped"]["snapshot_unverified"] == 1
+    assert report.payload["compacted_jobs"] == 1
+    assert not (healthy_root / "code").exists()
+    assert (poisoned_root / "code" / "train.py").is_file()
 
 
 def test_compact_preflight_rejects_oversized_snapshot_metadata(tmp_path):
@@ -544,3 +575,274 @@ def test_compact_laptop_forwards_to_one_explicit_center(monkeypatch):
             False,
         )
     ]
+
+
+# -- automatic retention: baselines, memo, terminal anchor -----------------------
+
+
+def _remember_baseline(cfg: HeadConfig, job_id: str) -> None:
+    from dt import dispatch
+
+    dispatch._remember_snapshot(cfg, "p", cfg.nodes[0], job_id)  # noqa: SLF001
+
+
+def test_compact_retains_the_transfer_baseline_per_project_node(tmp_path, monkeypatch):
+    """The newest dispatched job's code is the next snapshot's local copy
+    baseline; reclaiming it would force a full network re-transfer."""
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    older = _entry(digest, job_id="20260720-1200_older_abcd")
+    newest = _entry(digest, job_id="20260720-1300_newest_abcd", created_at=5.0)
+    for entry in (older, newest):
+        save(cfg, entry)
+    _remember_baseline(cfg, newest.job_id)
+    node_home = tmp_path / "node-home"
+    older_root = _workdir(node_home, older)
+    newest_root = _workdir(node_home, newest)
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg, cutoff_ts=100.0, before="1970-01-01", apply=True
+    )
+
+    assert report.exit_code == 0
+    assert report.payload["compacted_jobs"] == 1
+    assert report.payload["skipped"]["transfer_baseline"] == 1
+    assert not (older_root / "code").exists()
+    assert (newest_root / "code" / "train.py").is_file()
+
+
+def test_compact_baseline_becomes_eligible_once_replaced(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    previous = _entry(digest, job_id="20260720-1200_previous_abcd")
+    save(cfg, previous)
+    _remember_baseline(cfg, previous.job_id)
+    node_home = tmp_path / "node-home"
+    root = _workdir(node_home, previous)
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    first = compact_mod.compact_jobs(
+        cfg, cutoff_ts=100.0, before="1970-01-01", apply=True
+    )
+    assert first.payload["compacted_jobs"] == 0
+    assert (root / "code").is_dir()
+
+    _remember_baseline(cfg, "20260720-1400_replacement_abcd")
+    second = compact_mod.compact_jobs(
+        cfg, cutoff_ts=100.0, before="1970-01-01", apply=True
+    )
+    assert second.payload["compacted_jobs"] == 1
+    assert not (root / "code").exists()
+
+
+def test_compact_apply_records_a_head_memo_and_skips_it_next_time(
+    tmp_path, monkeypatch
+):
+    """The node receipt stays authoritative, but the head memo keeps a periodic
+    sweep from re-hashing every historical archive."""
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(digest)
+    save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    _workdir(node_home, entry)
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    first = compact_mod.compact_jobs(
+        cfg, cutoff_ts=100.0, before="1970-01-01", apply=True
+    )
+    assert first.payload["compacted_jobs"] == 1
+    memo = load(cfg, entry.job_id)
+    assert memo is not None and memo.code_pruned_at is not None
+
+    hashed: list[Path] = []
+    real_hash = compact_mod.tree_sha256
+    monkeypatch.setattr(
+        compact_mod, "tree_sha256", lambda path: hashed.append(path) or real_hash(path)
+    )
+    monkeypatch.setattr(
+        compact_mod,
+        "run_on",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no remote work")),
+    )
+    second = compact_mod.compact_jobs(
+        cfg, cutoff_ts=100.0, before="1970-01-01", apply=True
+    )
+    assert second.payload["eligible_jobs"] == 0
+    assert second.payload["skipped"]["already_pruned"] == 1
+    assert hashed == []
+
+
+def test_compact_memo_reconciles_code_removed_outside_dt(tmp_path, monkeypatch):
+    """An operator ``rm -rf`` of code/ without dt leaves no receipt; the next
+    apply repairs the receipt and records the memo instead of failing."""
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(digest)
+    save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    root = _workdir(node_home, entry)
+    import shutil
+
+    shutil.rmtree(root / "code")
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg, cutoff_ts=100.0, before="1970-01-01", apply=True
+    )
+
+    assert report.exit_code == 0
+    assert report.payload["repaired_receipts"] == 1
+    assert (root / "code-pruned.json").is_file()
+    memo = load(cfg, entry.job_id)
+    assert memo is not None and memo.code_pruned_at is not None
+    assert (root / "outputs" / "model.pt").read_bytes() == b"checkpoint"
+
+
+def test_compact_terminal_anchor_measures_time_since_the_job_ended(
+    tmp_path, monkeypatch
+):
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    # Submitted long ago but finished recently: not yet terminal for long.
+    recent_end = _entry(
+        digest,
+        job_id="20260720-1200_recentend_abcd",
+        created_at=1.0,
+        finished_at=900.0,
+    )
+    # Ended long ago.
+    old_end = _entry(
+        digest,
+        job_id="20260720-1201_oldend_abcd",
+        created_at=1.0,
+        finished_at=2.0,
+    )
+    for entry in (recent_end, old_end):
+        save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    recent_root = _workdir(node_home, recent_end)
+    old_root = _workdir(node_home, old_end)
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg,
+        cutoff_ts=100.0,
+        before="terminal>1h",
+        apply=True,
+        anchor="terminal",
+    )
+
+    assert report.payload["anchor"] == "terminal"
+    assert report.payload["compacted_jobs"] == 1
+    assert (recent_root / "code").is_dir()
+    assert not (old_root / "code").exists()
+
+
+def test_compact_skips_a_lost_job_inside_its_rescue_window(tmp_path, monkeypatch):
+    import time
+
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    fresh_lost = _entry(
+        digest,
+        job_id="20260720-1200_lost_abcd",
+        status="lost",
+        exit_code=None,
+        created_at=1.0,
+        finished_at=time.time(),
+    )
+    save(cfg, fresh_lost)
+    node_home = tmp_path / "node-home"
+    root = _workdir(node_home, fresh_lost)
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg, cutoff_ts=time.time() + 10, before="now", apply=True
+    )
+
+    assert report.payload["eligible_jobs"] == 0
+    assert report.payload["skipped"]["lost_reconciling"] == 1
+    assert (root / "code").is_dir()
+
+
+def test_compact_memoizes_a_vanished_job_dir_when_the_jobs_root_exists(
+    tmp_path, monkeypatch
+):
+    """Rows whose whole job directory is gone would otherwise be re-hashed on
+    every sweep; with the worker's jobs root present the absence is settled."""
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(digest)
+    save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    (node_home / "dt" / "jobs").mkdir(parents=True)  # jobs root, no job dir
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg, cutoff_ts=100.0, before="1970-01-01", apply=True
+    )
+
+    assert report.exit_code == 0
+    assert report.payload["missing_job_dirs"] == 1
+    memo = load(cfg, entry.job_id)
+    assert memo is not None and memo.code_pruned_at is not None
+
+
+def test_compact_refuses_to_settle_when_the_worker_jobs_root_is_unavailable(
+    tmp_path, monkeypatch
+):
+    """An unmounted or absent jobs root proves nothing about the job."""
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(digest)
+    save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    node_home.mkdir()  # no dt/jobs at all
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg, cutoff_ts=100.0, before="1970-01-01", apply=True
+    )
+
+    assert report.payload["state_changed_jobs"] == 1
+    assert report.payload["rows"][0]["detail"] == "worker_jobs_root_unavailable"
+    memo = load(cfg, entry.job_id)
+    assert memo is not None and memo.code_pruned_at is None
+
+
+def test_compact_batches_stay_under_the_single_argv_limit(tmp_path):
+    """A batch is delivered as one `bash -c <script>` argument; Linux caps a
+    single argv string at 128 KiB regardless of ARG_MAX. 40 job blocks used to
+    render ~168 KiB and fail with E2BIG, so batches are packed by byte size."""
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+
+    def candidate(index: int) -> compact_mod.CompactCandidate:
+        job_id = f"20260720-1200_scale{index:05d}_abcd1234"
+        entry = _entry(digest, job_id=job_id, created_at=float(index))
+        return compact_mod.CompactCandidate(
+            entry=entry,
+            node=cfg.nodes[0],
+            digest=digest,
+            archive_code=cfg.snapshots_dir() / digest / "code",
+        )
+
+    candidates = [candidate(i) for i in range(400)]
+    batches = compact_mod._pack_batches(candidates, now=1.0)  # noqa: SLF001
+
+    assert sum(len(batch) for batch in batches) == 400
+    assert all(batch for batch in batches)
+    for batch in batches:
+        command = compact_mod._remote_command(batch, apply=True, now=1.0)  # noqa: SLF001
+        # Real Linux MAX_ARG_STRLEN is 131072; require a safety margin below it.
+        assert len(command.encode()) < 128 * 1024
+
+
+def test_compact_rejects_an_unknown_anchor(tmp_path):
+    import pytest
+
+    cfg = _cfg(tmp_path)
+    with pytest.raises(ValueError, match="anchor"):
+        compact_mod.preflight(cfg, 1.0, anchor="whenever")
