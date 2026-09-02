@@ -13638,13 +13638,257 @@ def _pull_interrupted(
 
 class _PullPhaseError(Exception):
     """One pull phase failed; the orchestrator renders it with the shared
-    failure trailer (job identity, destination, confirmed records so far)."""
+    failure trailer (job identity, destination, confirmed records so far).
 
-    def __init__(self, kind: str, message: str, exit_code: int) -> None:
+    ``records_fresh`` selects whether the trailer re-inventories local records
+    or reports the list confirmed before the phase started.  ``human_plain``
+    reproduces the transfer-failure contract: outside ``--json`` the message
+    and ``hint`` are printed directly and the command exits, without the
+    structured ``fail`` payload.
+    """
+
+    def __init__(
+        self,
+        kind: str,
+        message: str,
+        exit_code: int,
+        *,
+        records_fresh: bool = True,
+        human_plain: bool = False,
+        hint: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.kind = kind
         self.message = message
         self.exit_code = exit_code
+        self.records_fresh = records_fresh
+        self.human_plain = human_plain
+        self.hint = hint
+
+
+def _transfer_outputs(
+    cfg: HeadConfig,
+    entry: jobs_mod.JobEntry,
+    *,
+    ref: str,
+    dst: Path,
+    outputs_rel: str,
+    excludes: list[str],
+    output_excludes: list[str],
+    lite: bool,
+    json_: bool,
+    remote_outputs_bytes: int | None,
+    retries: int,
+    effective_bwlimit: int | None,
+    retry_events: list[JsonDict],
+    cancel_kwargs: Mapping[str, Any],
+    cancel_event: Event | None,
+    pull_route: pull_relay.PullRoute,
+) -> tuple[pull_relay.PullRoute, str | None]:
+    """Recover ``outputs/`` over the decided route, degrading to direct.
+
+    Returns the route actually used and the relay error (if the gateway leg
+    was attempted and failed).  Both gateway legs (ADR 0025) fall back to the
+    unchanged direct pull so a relay problem never costs the user their data.
+    """
+    relay_error: str | None = None
+    src = rsync_destination(
+        entry.node,
+        entry.node_local,
+        outputs_rel,
+        directory=True,
+    )
+    if pull_route.route == "gateway" and pull_route.gateway is not None:
+        # Leg A: stage outputs onto the site gateway over the LAN so the slow
+        # head tunnel never carries the bulk bytes.
+        gateway_name = pull_route.gateway.name
+        try:
+            if json_:
+                pull_relay.stage_outputs(
+                    cfg,
+                    pull_route,
+                    entry.job_id,
+                    entry.job_dir,
+                    excludes=output_excludes,
+                    estimate_bytes=remote_outputs_bytes,
+                    cancel_event=cancel_event,
+                )
+            else:
+                with err.status(
+                    f"staging outputs {entry.node} -> {gateway_name} "
+                    "over the site LAN..."
+                ):
+                    pull_relay.stage_outputs(
+                        cfg,
+                        pull_route,
+                        entry.job_id,
+                        entry.job_dir,
+                        excludes=output_excludes,
+                        estimate_bytes=remote_outputs_bytes,
+                        cancel_event=cancel_event,
+                    )
+            src = (
+                f"{gateway_name}:"
+                + shlex.quote(pull_relay.staging_relative(entry.job_id) + "/outputs")
+                + "/"
+            )
+        except pull_relay.RelayError as exc:
+            relay_error = str(exc)
+            pull_route = pull_relay.PullRoute(
+                "direct",
+                None,
+                None,
+                None,
+                "gateway staging failed; recovered over the direct route",
+            )
+            if not json_:
+                err.print(
+                    f"[yellow]gateway relay failed:[/yellow] {escape(relay_error)}"
+                )
+                err.print("[dim]falling back to the direct route[/dim]")
+    # resilient by design: --partial + 2 retries resume where the link
+    # broke, with a 4h budget for multi-GB checkpoints.
+    if lite and not json_:
+        size_note = (
+            f"remote outputs {_format_transfer_bytes(remote_outputs_bytes)}; "
+            if remote_outputs_bytes is not None
+            else ""
+        )
+        err.print(
+            f"[dim]lite pull: {size_note}"
+            "skipping checkpoints, caches, and raw profiler traces "
+            "(omit --lite for full recovery)[/dim]"
+        )
+    elif (
+        not json_
+        and remote_outputs_bytes is not None
+        and remote_outputs_bytes >= PULL_LARGE_OUTPUT_BYTES
+    ):
+        filter_note = " before filters" if excludes else ""
+        err.print(
+            "[yellow]large pull:[/yellow] remote outputs occupy "
+            f"{_format_transfer_bytes(remote_outputs_bytes)}{filter_note}"
+        )
+        err.print(
+            "[dim]for quick evidence, use "
+            f"{escape(shlex.join(['dt', 'pull', _display_ref_for_entry(cfg, entry), '--lite']))}; "
+            "full pull remains resumable[/dim]"
+        )
+    pull_size = (
+        f"{_format_transfer_bytes(remote_outputs_bytes)} "
+        if remote_outputs_bytes is not None and not excludes
+        else ""
+    )
+
+    def run_outputs_rsync(
+        source: str,
+        label: str,
+        *,
+        stats: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        if json_:
+            return rsync(
+                source,
+                f"{dst}/",
+                excludes=output_excludes,
+                timeout=4 * 3600,
+                retries=retries,
+                safe_links=True,
+                stats=stats,
+                bwlimit_kbps=effective_bwlimit,
+                on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
+                **cancel_kwargs,
+            )
+        with err.status(f"pulling {pull_size}outputs from {label}..."):
+            return rsync(
+                source,
+                f"{dst}/",
+                excludes=output_excludes,
+                timeout=4 * 3600,
+                retries=retries,
+                safe_links=True,
+                stats=stats,
+                bwlimit_kbps=effective_bwlimit,
+                on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
+                **cancel_kwargs,
+            )
+
+    relayed = pull_route.route == "gateway" and pull_route.gateway is not None
+    source_label = (
+        f"{pull_route.gateway.name} (staged)"
+        if relayed and pull_route.gateway is not None
+        else entry.node
+    )
+    leg_started = time.monotonic()
+    proc = run_outputs_rsync(src, source_label, stats=relayed)
+    if relayed and proc.returncode == 0:
+        # Leg B succeeded: feed the evidence base and drop the capsule.
+        pull_relay.record_pull_leg(
+            cfg,
+            pull_route,
+            proc.stdout or "",
+            time.monotonic() - leg_started,
+        )
+        if not pull_relay.cleanup_staging(pull_route, entry.job_id):
+            if not json_:
+                err.print(
+                    "[dim]gateway staging cleanup deferred; the 7-day "
+                    "sweep will finish it[/dim]"
+                )
+    elif relayed and proc.returncode != 0:
+        # Leg B failed: the staged capsule stays for resume, but this pull
+        # still owes the user their data over the direct route.
+        relay_error = diagnostic_excerpt(
+            proc.stderr,
+            None,
+            fallback=f"staged transfer exited {proc.returncode}",
+        )
+        pull_route = pull_relay.PullRoute(
+            "direct",
+            None,
+            None,
+            None,
+            "gateway leg failed; recovered over the direct route",
+        )
+        if not json_:
+            err.print(f"[yellow]staged transfer failed:[/yellow] {escape(relay_error)}")
+            err.print("[dim]falling back to the direct route[/dim]")
+        src = rsync_destination(
+            entry.node,
+            entry.node_local,
+            outputs_rel,
+            directory=True,
+        )
+        proc = run_outputs_rsync(src, entry.node, stats=False)
+    if proc.returncode != 0:
+        detail = (proc.stderr or f"rsync exited {proc.returncode}").strip()
+        retry_note = (
+            " after retries"
+            if retries > 0 and proc.returncode in RSYNC_RETRYABLE_EXIT_CODES
+            else ""
+        )
+        code = (
+            EXIT_UNREACHABLE if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES else 1
+        )
+        raise _PullPhaseError(
+            "unreachable" if code == EXIT_UNREACHABLE else "transfer_failed",
+            f"rsync failed{retry_note}: {detail}",
+            code,
+            records_fresh=False,
+            human_plain=True,
+            hint="partial data (if any) is kept; rerun dt pull to resume",
+        )
+    if _rsync_skipped_non_regular(proc):
+        raise _PullPhaseError(
+            "unsafe_output",
+            "outputs contain a special file that DT refused to materialize",
+            1,
+        )
+    try:
+        pull_evidence_mod.validate_materialized_tree(dst)
+    except (OSError, ValueError) as exc:
+        raise _PullPhaseError("unsafe_output", str(exc), 1) from exc
+    return pull_route, relay_error
 
 
 def _recover_runtime_evidence(
@@ -14266,230 +14510,39 @@ def _pull_unlocked(
     effective_bwlimit = head_bwlimit_kbps(cfg, entry.node, bwlimit)
     relay_error: str | None = None
     if outputs_present:
-        src = rsync_destination(
-            entry.node,
-            entry.node_local,
-            outputs_rel,
-            directory=True,
-        )
-        if pull_route.route == "gateway" and pull_route.gateway is not None:
-            # Leg A (ADR 0025): stage outputs onto the site gateway over the
-            # LAN so the slow head tunnel never carries the bulk bytes. Any
-            # failure falls back to the unchanged direct pull below.
-            gateway_name = pull_route.gateway.name
-            try:
-                if json_:
-                    pull_relay.stage_outputs(
-                        cfg,
-                        pull_route,
-                        entry.job_id,
-                        entry.job_dir,
-                        excludes=output_excludes,
-                        estimate_bytes=remote_outputs_bytes,
-                        cancel_event=_cancel_event,
-                    )
-                else:
-                    with err.status(
-                        f"staging outputs {entry.node} -> {gateway_name} "
-                        "over the site LAN..."
-                    ):
-                        pull_relay.stage_outputs(
-                            cfg,
-                            pull_route,
-                            entry.job_id,
-                            entry.job_dir,
-                            excludes=output_excludes,
-                            estimate_bytes=remote_outputs_bytes,
-                            cancel_event=_cancel_event,
-                        )
-                src = (
-                    f"{gateway_name}:"
-                    + shlex.quote(
-                        pull_relay.staging_relative(entry.job_id) + "/outputs"
-                    )
-                    + "/"
-                )
-            except pull_relay.RelayError as exc:
-                relay_error = str(exc)
-                pull_route = pull_relay.PullRoute(
-                    "direct",
-                    None,
-                    None,
-                    None,
-                    "gateway staging failed; recovered over the direct route",
-                )
-                if not json_:
-                    err.print(
-                        f"[yellow]gateway relay failed:[/yellow] {escape(relay_error)}"
-                    )
-                    err.print("[dim]falling back to the direct route[/dim]")
-        # resilient by design: --partial + 2 retries resume where the link
-        # broke, with a 4h budget for multi-GB checkpoints.
-        if lite and not json_:
-            size_note = (
-                f"remote outputs {_format_transfer_bytes(remote_outputs_bytes)}; "
-                if remote_outputs_bytes is not None
-                else ""
-            )
-            err.print(
-                f"[dim]lite pull: {size_note}"
-                "skipping checkpoints, caches, and raw profiler traces "
-                "(omit --lite for full recovery)[/dim]"
-            )
-        elif (
-            not json_
-            and remote_outputs_bytes is not None
-            and remote_outputs_bytes >= PULL_LARGE_OUTPUT_BYTES
-        ):
-            filter_note = " before filters" if excludes else ""
-            err.print(
-                "[yellow]large pull:[/yellow] remote outputs occupy "
-                f"{_format_transfer_bytes(remote_outputs_bytes)}{filter_note}"
-            )
-            err.print(
-                "[dim]for quick evidence, use "
-                f"{escape(shlex.join(['dt', 'pull', _display_ref_for_entry(cfg, entry), '--lite']))}; "
-                "full pull remains resumable[/dim]"
-            )
-        pull_size = (
-            f"{_format_transfer_bytes(remote_outputs_bytes)} "
-            if remote_outputs_bytes is not None and not excludes
-            else ""
-        )
-
-        def run_outputs_rsync(
-            source: str,
-            label: str,
-            *,
-            stats: bool,
-        ) -> subprocess.CompletedProcess[str]:
-            if json_:
-                return rsync(
-                    source,
-                    f"{dst}/",
-                    excludes=output_excludes,
-                    timeout=4 * 3600,
-                    retries=retries,
-                    safe_links=True,
-                    stats=stats,
-                    bwlimit_kbps=effective_bwlimit,
-                    on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
-                    **cancel_kwargs,
-                )
-            with err.status(f"pulling {pull_size}outputs from {label}..."):
-                return rsync(
-                    source,
-                    f"{dst}/",
-                    excludes=output_excludes,
-                    timeout=4 * 3600,
-                    retries=retries,
-                    safe_links=True,
-                    stats=stats,
-                    bwlimit_kbps=effective_bwlimit,
-                    on_retry=_rsync_retry_observer(ref, "outputs", retry_events),
-                    **cancel_kwargs,
-                )
-
-        relayed = pull_route.route == "gateway" and pull_route.gateway is not None
-        source_label = (
-            f"{pull_route.gateway.name} (staged)"
-            if relayed and pull_route.gateway is not None
-            else entry.node
-        )
-        leg_started = time.monotonic()
-        proc = run_outputs_rsync(src, source_label, stats=relayed)
-        if relayed and proc.returncode == 0:
-            # Leg B succeeded: feed the evidence base and drop the capsule.
-            pull_relay.record_pull_leg(
-                cfg,
-                pull_route,
-                proc.stdout or "",
-                time.monotonic() - leg_started,
-            )
-            if not pull_relay.cleanup_staging(pull_route, entry.job_id):
-                if not json_:
-                    err.print(
-                        "[dim]gateway staging cleanup deferred; the 7-day "
-                        "sweep will finish it[/dim]"
-                    )
-        elif relayed and proc.returncode != 0:
-            # Leg B failed: the staged capsule stays for resume, but this
-            # pull still owes the user their data over the direct route.
-            relay_error = diagnostic_excerpt(
-                proc.stderr,
-                None,
-                fallback=f"staged transfer exited {proc.returncode}",
-            )
-            pull_route = pull_relay.PullRoute(
-                "direct",
-                None,
-                None,
-                None,
-                "gateway leg failed; recovered over the direct route",
-            )
-            if not json_:
-                err.print(
-                    f"[yellow]staged transfer failed:[/yellow] {escape(relay_error)}"
-                )
-                err.print("[dim]falling back to the direct route[/dim]")
-            src = rsync_destination(
-                entry.node,
-                entry.node_local,
-                outputs_rel,
-                directory=True,
-            )
-            proc = run_outputs_rsync(src, entry.node, stats=False)
-        if proc.returncode != 0:
-            detail = (proc.stderr or f"rsync exited {proc.returncode}").strip()
-            retry_note = (
-                " after retries"
-                if retries > 0 and proc.returncode in RSYNC_RETRYABLE_EXIT_CODES
-                else ""
-            )
-            message = f"rsync failed{retry_note}: {detail}"
-            code = (
-                EXIT_UNREACHABLE
-                if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES
-                else 1
-            )
-            if json_:
-                fail(
-                    ("unreachable" if code == EXIT_UNREACHABLE else "transfer_failed"),
-                    message,
-                    code,
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    destination=str(dst),
-                    records=records,
-                    partial=True,
-                )
-            err.print(f"[red]{escape(message)}[/red]")
-            err.print(
-                "[dim]partial data (if any) is kept; rerun dt pull to resume[/dim]"
-            )
-            raise typer.Exit(code)
-        if _rsync_skipped_non_regular(proc):
-            fail(
-                "unsafe_output",
-                "outputs contain a special file that DT refused to materialize",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-                destination=str(dst),
-                records=confirmed_records(),
-                partial=True,
-            )
         try:
-            pull_evidence_mod.validate_materialized_tree(dst)
-        except (OSError, ValueError) as exc:
+            pull_route, relay_error = _transfer_outputs(
+                cfg,
+                entry,
+                ref=ref,
+                dst=dst,
+                outputs_rel=outputs_rel,
+                excludes=excludes,
+                output_excludes=output_excludes,
+                lite=lite,
+                json_=json_,
+                remote_outputs_bytes=remote_outputs_bytes,
+                retries=retries,
+                effective_bwlimit=effective_bwlimit,
+                retry_events=retry_events,
+                cancel_kwargs=cancel_kwargs,
+                cancel_event=_cancel_event,
+                pull_route=pull_route,
+            )
+        except _PullPhaseError as phase:
+            if phase.human_plain and not json_:
+                err.print(f"[red]{escape(phase.message)}[/red]")
+                if phase.hint:
+                    err.print(f"[dim]{escape(phase.hint)}[/dim]")
+                raise typer.Exit(phase.exit_code)
             fail(
-                "unsafe_output",
-                str(exc),
-                1,
+                phase.kind,
+                phase.message,
+                phase.exit_code,
                 job_id=entry.job_id,
                 node=entry.node,
                 destination=str(dst),
-                records=confirmed_records(),
+                records=confirmed_records() if phase.records_fresh else records,
                 partial=True,
             )
     else:
