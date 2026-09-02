@@ -49,12 +49,11 @@ _TERMINAL_STATUSES = frozenset({"finished", "killed", "lost", "failed", "skipped
 _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 _SNAPSHOT_DIGEST = re.compile(r"[0-9a-f]{64}")
 _MARKER = "DT_COMPACT_V1"
+# The census program is delivered on stdin (bash -s), not argv, so batch size
+# only bounds the per-request timeout and captured output; it is not limited by
+# the Linux MAX_ARG_STRLEN (128 KiB) single-argument ceiling that made a
+# 40-block argv command fail with E2BIG.
 _BATCH_SIZE = 40
-# Linux caps a single argv string at MAX_ARG_STRLEN (32 * PAGE_SIZE = 128 KiB),
-# independent of the much larger ARG_MAX total.  The remote census is delivered
-# as one ``bash -c <script>`` argument, so a batch is packed to stay well under
-# that ceiling; 40 job blocks already rendered ~168 KiB and failed with E2BIG.
-_MAX_COMMAND_BYTES = 96 * 1024
 _SNAPSHOT_METADATA_MAX_BYTES = 64 * 1024
 # ``created_at`` keeps the historical ``dt compact --before DATE`` meaning;
 # ``terminal`` measures how long a job has been finished, which is what an
@@ -313,7 +312,15 @@ def _remote_command(
     apply: bool,
     now: float,
 ) -> str:
-    """Build a bounded shell program with no recursive broad-path deletion."""
+    """Return the census/prune shell program (no recursive broad-path delete).
+
+    The program is delivered to the node on stdin and executed with ``bash
+    -s``, so it never enters argv and cannot hit the Linux ``MAX_ARG_STRLEN``
+    (128 KiB) single-argument ceiling.  Running it under ``bash`` also pins
+    POSIX word splitting, which a zsh login shell would otherwise break in the
+    liveness census (collapsing multi-line pgrep/find output and misreporting
+    a live job as DEAD).
+    """
     lines = [
         "compact_rc=0",
         (
@@ -480,43 +487,7 @@ def _remote_command(
             lines.append('  emit planned "$job_id" "$bytes" code_would_be_removed')
         lines.append("fi")
     lines.append('exit "$compact_rc"')
-    # The liveness census depends on POSIX word splitting; running the raw
-    # script under a zsh login shell would collapse multi-line pgrep/find
-    # output and misreport a live job as DEAD. Pin bash like the kill probe.
-    script = "\n".join(lines)
-    return f"bash -c {shlex.quote(script)}"
-
-
-def _pack_batches(
-    candidates: list[CompactCandidate],
-    *,
-    now: float,
-) -> list[list[CompactCandidate]]:
-    """Group candidates so each rendered census stays under the argv limit.
-
-    ``apply=True`` renders the longest program (it carries the receipt writes),
-    so packing against it keeps the plan variant safe too.  A single candidate
-    that somehow exceeds the ceiling is still emitted alone: one job at a time
-    is the smallest a batch can be, and the node simply receives a large but
-    valid command.
-    """
-    batches: list[list[CompactCandidate]] = []
-    current: list[CompactCandidate] = []
-    for candidate in candidates:
-        trial = [*current, candidate]
-        if current and len(_remote_command(trial, apply=True, now=now)) > (
-            _MAX_COMMAND_BYTES
-        ):
-            batches.append(current)
-            current = [candidate]
-        else:
-            current = trial
-        if len(current) >= _BATCH_SIZE:
-            batches.append(current)
-            current = []
-    if current:
-        batches.append(current)
-    return batches
+    return "\n".join(lines)
 
 
 def _remote_rows(
@@ -536,7 +507,10 @@ def _remote_rows(
         grouped[(candidate.node.name, candidate.node.local)].append(candidate)
 
     for (node_name, node_local), node_candidates in sorted(grouped.items()):
-        for batch in _pack_batches(node_candidates, now=now):
+        # The census is delivered on stdin (bash -s), so batch size only bounds
+        # per-request timeout and captured output, not an argv length.
+        for offset in range(0, len(node_candidates), _BATCH_SIZE):
+            batch = node_candidates[offset : offset + _BATCH_SIZE]
             with ExitStack() as locks:
                 if apply:
                     for candidate in sorted(
@@ -588,15 +562,16 @@ def _remote_rows(
                 if not stable:
                     continue
 
-                command = _remote_command(stable, apply=apply, now=now)
+                script = _remote_command(stable, apply=apply, now=now)
                 try:
                     proc = run_on(
                         node_name,
                         node_local,
-                        command,
+                        "bash -s",
+                        stdin_bytes=script.encode("utf-8"),
                         timeout=max(120, 70 * len(stable)),
                     )
-                except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+                except (RemoteError, subprocess.TimeoutExpired) as exc:
                     message = " ".join(str(exc).split())
                     node_errors.append(message)
                     kind = "unreachable" if not node_local else "failed"
@@ -606,6 +581,27 @@ def _remote_rows(
                             "job_id": candidate.entry.job_id,
                             "node": node_name,
                             "status": kind,
+                            "code_bytes": None,
+                            "detail": message,
+                        }
+                        for candidate in stable
+                    )
+                    continue
+                except OSError as exc:
+                    # A local spawn failure (E2BIG, EMFILE, ENOMEM) is a
+                    # head-side problem, never node unreachability. Classifying
+                    # it as "unreachable" would mask a head defect as a node
+                    # outage and return exit 5; report it as a head failure.
+                    message = (
+                        f"head could not launch census: {' '.join(str(exc).split())}"
+                    )
+                    node_errors.append(message)
+                    failure_kinds.add("failed")
+                    rows.extend(
+                        {
+                            "job_id": candidate.entry.job_id,
+                            "node": node_name,
+                            "status": "failed",
                             "code_bytes": None,
                             "detail": message,
                         }
