@@ -13783,6 +13783,113 @@ def _validate_pull_destination(
     return records_dir
 
 
+def _probe_remote_outputs(
+    entry: jobs_mod.JobEntry,
+    outputs_rel: str,
+) -> tuple[bool, int | None, bool]:
+    """Ask the worker whether ``outputs/`` exists and how large it is.
+
+    Returns ``(outputs_present, remote_outputs_bytes, records_only)``.
+    ``records_only`` is a failed-before-start job with nothing but its run
+    record to recover; any other job without ``outputs/`` is a hard miss.
+    """
+    try:
+        check = run_on(
+            entry.node,
+            entry.node_local,
+            _pull_outputs_probe_command(outputs_rel),
+            timeout=10,
+        )
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        detail = " ".join(str(exc).split()) or type(exc).__name__
+        raise _PullPhaseError(
+            "unreachable",
+            f"cannot inspect outputs on {entry.node}: {detail}",
+            EXIT_UNREACHABLE,
+        ) from exc
+    if check.returncode not in (0, 1):
+        detail = " ".join(
+            (
+                check.stderr
+                or check.stdout
+                or f"outputs probe exited {check.returncode}"
+            ).split()
+        )
+        raise _PullPhaseError(
+            "unreachable",
+            f"cannot inspect outputs on {entry.node}: {detail}",
+            EXIT_UNREACHABLE,
+            human_plain=True,
+            hint=(
+                "the job and any partial local data are unchanged; "
+                "rerun dt pull when the node is reachable"
+            ),
+        )
+    records_only = (
+        check.returncode == 1
+        and entry.status == "failed"
+        and not _is_uncertain_launch(entry)
+        and entry.node != "-"
+    )
+    if check.returncode != 0 and not records_only:
+        raise _PullPhaseError(
+            "outputs_not_found",
+            f"{entry.job_id} has no outputs/ (script writes to $DT_JOB_DIR/outputs)",
+            EXIT_NOT_FOUND,
+            human_plain=True,
+        )
+    outputs_present = check.returncode == 0
+    return (
+        outputs_present,
+        _pull_outputs_probe_bytes(check.stdout) if outputs_present else None,
+        records_only,
+    )
+
+
+def _prepare_pull_records_dir(
+    dst: Path,
+    records_dir: Path,
+    entry: jobs_mod.JobEntry,
+) -> None:
+    """Create the destination and write the local ``dt/job.json`` record."""
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        records_dir.mkdir(parents=True, exist_ok=True)
+        _reject_symlink_ancestors(dst)
+    except (OSError, ValueError) as exc:
+        raise _PullPhaseError(
+            "destination_unusable",
+            f"cannot create local destination {dst}: {exc}",
+            1,
+        ) from exc
+    try:
+        records_info = records_dir.lstat()
+    except OSError as exc:
+        raise _PullPhaseError(
+            "destination_unusable",
+            f"cannot inspect local records directory {records_dir}: {exc}",
+            1,
+        ) from exc
+    if stat.S_ISLNK(records_info.st_mode) or not stat.S_ISDIR(records_info.st_mode):
+        raise _PullPhaseError(
+            "destination_unusable",
+            f"{records_dir} is not a safe records directory",
+            1,
+        )
+    record_path = records_dir / "job.json"
+    try:
+        record_payload = (
+            json.dumps(_pull_job_record(entry), indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        if len(record_payload) > LOCAL_JOB_RECORD_MAX_BYTES:
+            raise PrivateStateError(
+                f"local record exceeds its size limit: {record_path}"
+            )
+        atomic_write_regular(record_path, record_payload)
+    except PrivateStateError as exc:
+        raise _PullPhaseError("destination_unusable", str(exc), 1) from exc
+
+
 def _rsync_with_status(
     json_: bool,
     status: str,
@@ -14380,6 +14487,38 @@ def _pull_unlocked(
                 "outputs",
                 display_ref=_display_ref_for_entry(cfg, entry),
             )
+
+    def phase_failed(
+        phase: _PullPhaseError,
+        *,
+        destination: str | None = None,
+        logs_recovered: bool | None = None,
+    ) -> NoReturn:
+        """Render one phase failure with the trailer that phase owes.
+
+        ``logs_recovered`` marks a transfer phase: its trailer reports the
+        records confirmed so far (``records`` is read at call time on purpose:
+        the pre-transfer list before outputs land, the inventory afterwards).
+        A programmatic caller (``_result``) always receives the structured
+        payload; the plain human rendering is only for an interactive terminal.
+        """
+        if phase.human_plain and not json_ and _result is None:
+            err.print(f"[red]{escape(phase.message)}[/red]")
+            if phase.hint:
+                err.print(f"[dim]{escape(phase.hint)}[/dim]")
+            raise typer.Exit(phase.exit_code)
+        trailer: dict[str, object] = {"job_id": entry.job_id, "node": entry.node}
+        if destination is not None:
+            trailer["destination"] = destination
+        if logs_recovered is not None:
+            trailer["records"] = (
+                confirmed_records(logs_recovered=logs_recovered)
+                if phase.records_fresh
+                else records
+            )
+            trailer["partial"] = True
+        fail(phase.kind, phase.message, phase.exit_code, **trailer, **phase.fields)
+
     if _collection:
         try:
             collection_base = _ensure_collection_root(cfg, _collection)
@@ -14405,130 +14544,18 @@ def _pull_unlocked(
     try:
         records_dir = _validate_pull_destination(dst, entry, force=force)
     except _PullPhaseError as phase:
-        fail(
-            phase.kind,
-            phase.message,
-            phase.exit_code,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            **phase.fields,
-        )
+        phase_failed(phase, destination=str(dst))
     outputs_rel = f"{entry.job_dir}/outputs"
     try:
-        check = run_on(
-            entry.node,
-            entry.node_local,
-            _pull_outputs_probe_command(outputs_rel),
-            timeout=10,
+        outputs_present, remote_outputs_bytes, records_only = _probe_remote_outputs(
+            entry, outputs_rel
         )
-    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
-        detail = " ".join(str(exc).split()) or type(exc).__name__
-        fail(
-            "unreachable",
-            f"cannot inspect outputs on {entry.node}: {detail}",
-            EXIT_UNREACHABLE,
-            job_id=entry.job_id,
-            node=entry.node,
-        )
-    if check.returncode not in (0, 1):
-        detail = (
-            check.stderr or check.stdout or f"outputs probe exited {check.returncode}"
-        )
-        detail = " ".join(detail.split())
-        message = f"cannot inspect outputs on {entry.node}: {detail}"
-        if json_:
-            fail(
-                "unreachable",
-                message,
-                EXIT_UNREACHABLE,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
-        err.print(
-            f"[red]cannot inspect outputs on "
-            f"{escape(entry.node)}: {escape(detail)}[/red]"
-        )
-        err.print(
-            "[dim]the job and any partial local data are unchanged; "
-            "rerun dt pull when the node is reachable[/dim]"
-        )
-        raise typer.Exit(EXIT_UNREACHABLE)
-    records_only = (
-        check.returncode == 1
-        and entry.status == "failed"
-        and not _is_uncertain_launch(entry)
-        and entry.node != "-"
-    )
-    if check.returncode != 0 and not records_only:
-        message = (
-            f"{entry.job_id} has no outputs/ (script writes to $DT_JOB_DIR/outputs)"
-        )
-        if json_:
-            fail(
-                "outputs_not_found",
-                message,
-                EXIT_NOT_FOUND,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
-        err.print(f"[red]{escape(message)}[/red]")
-        raise typer.Exit(EXIT_NOT_FOUND)
-    outputs_present = check.returncode == 0
-    if outputs_present:
-        remote_outputs_bytes = _pull_outputs_probe_bytes(check.stdout)
+    except _PullPhaseError as phase:
+        phase_failed(phase)
     try:
-        dst.mkdir(parents=True, exist_ok=True)
-        records_dir.mkdir(parents=True, exist_ok=True)
-        _reject_symlink_ancestors(dst)
-    except (OSError, ValueError) as exc:
-        fail(
-            "destination_unusable",
-            f"cannot create local destination {dst}: {exc}",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-        )
-    try:
-        records_info = records_dir.lstat()
-    except OSError as exc:
-        fail(
-            "destination_unusable",
-            f"cannot inspect local records directory {records_dir}: {exc}",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-        )
-    if stat.S_ISLNK(records_info.st_mode) or not stat.S_ISDIR(records_info.st_mode):
-        fail(
-            "destination_unusable",
-            f"{records_dir} is not a safe records directory",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-        )
-    record_path = records_dir / "job.json"
-    try:
-        record_payload = (
-            json.dumps(_pull_job_record(entry), indent=2, sort_keys=True) + "\n"
-        ).encode("utf-8")
-        if len(record_payload) > LOCAL_JOB_RECORD_MAX_BYTES:
-            raise PrivateStateError(
-                f"local record exceeds its size limit: {record_path}"
-            )
-        atomic_write_regular(record_path, record_payload)
-    except PrivateStateError as exc:
-        fail(
-            "destination_unusable",
-            str(exc),
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-        )
+        _prepare_pull_records_dir(dst, records_dir, entry)
+    except _PullPhaseError as phase:
+        phase_failed(phase, destination=str(dst))
     records = ["dt/job.json"]
     evidence_records: list[str] = []
     evidence_provenance: str | None = None
@@ -14562,34 +14589,6 @@ def _pull_unlocked(
         paths.extend(f"dt/{name}" for name in evidence_records)
         return paths
 
-    def phase_failed(phase: _PullPhaseError, *, logs_recovered: bool) -> NoReturn:
-        """Render one phase failure with the shared trailer.
-
-        ``records`` is read at call time on purpose: before the outputs
-        phase it is the pre-transfer list, afterwards the confirmed inventory.
-        A programmatic caller (``_result``) always receives the structured
-        payload; the plain human rendering is only for an interactive terminal.
-        """
-        if phase.human_plain and not json_ and _result is None:
-            err.print(f"[red]{escape(phase.message)}[/red]")
-            if phase.hint:
-                err.print(f"[dim]{escape(phase.hint)}[/dim]")
-            raise typer.Exit(phase.exit_code)
-        fail(
-            phase.kind,
-            phase.message,
-            phase.exit_code,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            records=(
-                confirmed_records(logs_recovered=logs_recovered)
-                if phase.records_fresh
-                else records
-            ),
-            partial=True,
-        )
-
     pull_route = pull_relay.decide_pull_route(
         cfg,
         entry.node,
@@ -14619,7 +14618,7 @@ def _pull_unlocked(
                 pull_route=pull_route,
             )
         except _PullPhaseError as phase:
-            phase_failed(phase, logs_recovered=False)
+            phase_failed(phase, destination=str(dst), logs_recovered=False)
     else:
         if not json_:
             err.print(
@@ -14640,7 +14639,7 @@ def _pull_unlocked(
             cancel_kwargs=cancel_kwargs,
         )
     except _PullPhaseError as phase:
-        phase_failed(phase, logs_recovered=True)
+        phase_failed(phase, destination=str(dst), logs_recovered=True)
 
     try:
         evidence_provenance = _recover_runtime_evidence(
@@ -14655,7 +14654,7 @@ def _pull_unlocked(
             evidence_records=evidence_records,
         )
     except _PullPhaseError as phase:
-        phase_failed(phase, logs_recovered=True)
+        phase_failed(phase, destination=str(dst), logs_recovered=True)
 
     try:
         pull_evidence_mod.validate_materialized_tree(dst)
