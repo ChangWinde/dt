@@ -14566,8 +14566,10 @@ def _pull_unlocked(
 
         ``records`` is read at call time on purpose: before the outputs
         phase it is the pre-transfer list, afterwards the confirmed inventory.
+        A programmatic caller (``_result``) always receives the structured
+        payload; the plain human rendering is only for an interactive terminal.
         """
-        if phase.human_plain and not json_:
+        if phase.human_plain and not json_ and _result is None:
             err.print(f"[red]{escape(phase.message)}[/red]")
             if phase.hint:
                 err.print(f"[dim]{escape(phase.hint)}[/dim]")

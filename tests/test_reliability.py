@@ -3972,6 +3972,61 @@ def test_pull_falls_back_to_direct_when_staged_leg_fails(tmp_path, monkeypatch):
     assert not outputs_calls[1].startswith("gw:")
 
 
+def test_programmatic_pull_always_receives_a_transfer_failure_payload(
+    tmp_path, monkeypatch
+):
+    """A caller collecting results through ``_result`` must get the structured
+    error even when it did not ask for --json; the plain human rendering is
+    only for an interactive terminal."""
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+        status="finished",
+        exit_code=0,
+    )
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    monkeypatch.setattr(
+        cli,
+        "rsync",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 23, "", "disk full"),
+    )
+    result: dict[str, object] = {}
+
+    with pytest.raises(cli.typer.Exit) as excinfo:
+        cli._pull_unlocked(  # noqa: SLF001
+            "jid",
+            str(tmp_path / "result"),
+            None,
+            False,
+            False,
+            False,  # json_ off: the human path would otherwise swallow the payload
+            0,
+            route="auto",
+            bwlimit=None,
+            _cfg_override=cfg,
+            _result=result,
+        )
+
+    assert excinfo.value.exit_code == 1
+    assert result["status"] == "error"
+    assert result["error"] == "transfer_failed"
+    assert "disk full" in str(result["message"])
+    assert result["partial"] is True
+
+
 def test_pull_reports_skipped_special_output_as_incomplete(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     entry = JobEntry(
