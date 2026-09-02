@@ -13656,6 +13656,7 @@ class _PullPhaseError(Exception):
         records_fresh: bool = True,
         human_plain: bool = False,
         hint: str | None = None,
+        **fields: object,
     ) -> None:
         super().__init__(message)
         self.kind = kind
@@ -13664,6 +13665,122 @@ class _PullPhaseError(Exception):
         self.records_fresh = records_fresh
         self.human_plain = human_plain
         self.hint = hint
+        self.fields = fields
+
+
+def _validate_pull_destination(
+    dst: Path,
+    entry: jobs_mod.JobEntry,
+    *,
+    force: bool,
+) -> Path:
+    """Refuse an unsafe or foreign destination; return its DT records dir.
+
+    Symlinked ancestors, a symlinked destination, and a non-directory ``dt/``
+    records path are always refused.  Without ``--force`` a destination that
+    already holds another job's ``dt/job.json`` (or unreadable one), or is
+    non-empty without any record, is refused rather than merged into.
+    """
+    try:
+        _reject_symlink_ancestors(dst)
+    except ValueError as exc:
+        raise _PullPhaseError(
+            "destination_conflict", str(exc), 1, existing_job_id=None
+        ) from exc
+    if dst.is_symlink():
+        raise _PullPhaseError(
+            "destination_conflict",
+            f"{dst} is a symbolic link; choose its resolved directory explicitly",
+            1,
+            existing_job_id=None,
+        )
+    records_dir = dst / "dt"
+    try:
+        existing_records_info = records_dir.lstat()
+    except FileNotFoundError:
+        existing_records_info = None
+    except (OSError, ValueError) as exc:
+        raise _PullPhaseError(
+            "destination_conflict",
+            f"cannot inspect {records_dir}: {exc}",
+            1,
+            existing_job_id=None,
+        ) from exc
+    if existing_records_info is not None and (
+        stat.S_ISLNK(existing_records_info.st_mode)
+        or not stat.S_ISDIR(existing_records_info.st_mode)
+    ):
+        raise _PullPhaseError(
+            "destination_conflict",
+            f"{records_dir} is not a safe directory for DT-owned records",
+            1,
+            existing_job_id=None,
+        )
+    if force or not dst.exists():
+        return records_dir
+    if not dst.is_dir():
+        raise _PullPhaseError(
+            "destination_conflict",
+            f"{dst} exists and is not a directory",
+            1,
+            existing_job_id=None,
+        )
+    existing_record = records_dir / "job.json"
+    if existing_record.is_file():
+        try:
+            existing_result = read_bounded_regular(
+                existing_record,
+                max_bytes=LOCAL_JOB_RECORD_MAX_BYTES,
+            )
+            if existing_result is None:
+                raise PrivateStateError("local job record disappeared")
+            existing_data = decode_strict_json(existing_result[0])
+            existing_job_id = (
+                existing_data.get("job_id")
+                if isinstance(existing_data, dict)
+                and isinstance(existing_data.get("job_id"), str)
+                and jobs_mod.JOB_ID_RE.fullmatch(existing_data["job_id"])
+                else None
+            )
+        except (
+            PrivateStateError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            RecursionError,
+        ):
+            existing_job_id = None
+        if existing_job_id != entry.job_id:
+            message = (
+                f"{dst} belongs to job {existing_job_id}; "
+                "use --force to merge or overwrite files"
+                if existing_job_id
+                else (
+                    f"{dst} has an unreadable dt/job.json; "
+                    "use --force to merge or overwrite files"
+                )
+            )
+            raise _PullPhaseError(
+                "destination_conflict", message, 1, existing_job_id=existing_job_id
+            )
+        return records_dir
+    try:
+        destination_nonempty = any(dst.iterdir())
+    except OSError as exc:
+        raise _PullPhaseError(
+            "destination_unusable",
+            f"cannot inspect local destination {dst}: {exc}",
+            1,
+        ) from exc
+    if destination_nonempty:
+        raise _PullPhaseError(
+            "destination_conflict",
+            f"{dst} is non-empty and has no dt/job.json; "
+            "use --force to merge or overwrite files",
+            1,
+            existing_job_id=None,
+        )
+    return records_dir
 
 
 def _rsync_with_status(
@@ -14286,133 +14403,17 @@ def _pull_unlocked(
         )
     ).absolute()
     try:
-        _reject_symlink_ancestors(dst)
-    except ValueError as exc:
+        records_dir = _validate_pull_destination(dst, entry, force=force)
+    except _PullPhaseError as phase:
         fail(
-            "destination_conflict",
-            str(exc),
-            1,
+            phase.kind,
+            phase.message,
+            phase.exit_code,
             job_id=entry.job_id,
             node=entry.node,
             destination=str(dst),
-            existing_job_id=None,
+            **phase.fields,
         )
-    if dst.is_symlink():
-        fail(
-            "destination_conflict",
-            f"{dst} is a symbolic link; choose its resolved directory explicitly",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            existing_job_id=None,
-        )
-    records_dir = dst / "dt"
-    try:
-        existing_records_info = records_dir.lstat()
-    except FileNotFoundError:
-        existing_records_info = None
-    except (OSError, ValueError) as exc:
-        fail(
-            "destination_conflict",
-            f"cannot inspect {records_dir}: {exc}",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            existing_job_id=None,
-        )
-    if existing_records_info is not None and (
-        stat.S_ISLNK(existing_records_info.st_mode)
-        or not stat.S_ISDIR(existing_records_info.st_mode)
-    ):
-        fail(
-            "destination_conflict",
-            f"{records_dir} is not a safe directory for DT-owned records",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            existing_job_id=None,
-        )
-    existing_record = dst / "dt" / "job.json"
-    if not force and dst.exists():
-        if not dst.is_dir():
-            fail(
-                "destination_conflict",
-                f"{dst} exists and is not a directory",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-                destination=str(dst),
-                existing_job_id=None,
-            )
-        if existing_record.is_file():
-            try:
-                existing_result = read_bounded_regular(
-                    existing_record,
-                    max_bytes=LOCAL_JOB_RECORD_MAX_BYTES,
-                )
-                if existing_result is None:
-                    raise PrivateStateError("local job record disappeared")
-                existing_data = decode_strict_json(existing_result[0])
-                existing_job_id = (
-                    existing_data.get("job_id")
-                    if isinstance(existing_data, dict)
-                    and isinstance(existing_data.get("job_id"), str)
-                    and jobs_mod.JOB_ID_RE.fullmatch(existing_data["job_id"])
-                    else None
-                )
-            except (
-                PrivateStateError,
-                TypeError,
-                UnicodeError,
-                ValueError,
-                RecursionError,
-            ):
-                existing_job_id = None
-            if existing_job_id != entry.job_id:
-                message = (
-                    f"{dst} belongs to job {existing_job_id}; "
-                    "use --force to merge or overwrite files"
-                    if existing_job_id
-                    else (
-                        f"{dst} has an unreadable dt/job.json; "
-                        "use --force to merge or overwrite files"
-                    )
-                )
-                fail(
-                    "destination_conflict",
-                    message,
-                    1,
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    destination=str(dst),
-                    existing_job_id=existing_job_id,
-                )
-        else:
-            try:
-                destination_nonempty = any(dst.iterdir())
-            except OSError as exc:
-                fail(
-                    "destination_unusable",
-                    f"cannot inspect local destination {dst}: {exc}",
-                    1,
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    destination=str(dst),
-                )
-            if destination_nonempty:
-                fail(
-                    "destination_conflict",
-                    f"{dst} is non-empty and has no dt/job.json; "
-                    "use --force to merge or overwrite files",
-                    1,
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    destination=str(dst),
-                    existing_job_id=None,
-                )
     outputs_rel = f"{entry.job_dir}/outputs"
     try:
         check = run_on(
