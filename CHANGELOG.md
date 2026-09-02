@@ -6,6 +6,23 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.12.3 — 2026-09-02
+
+### Fixed
+
+- The CLI entrypoint now catches the public `typer.Exit` instead of the
+  vendored `click.exceptions.Exit`. typer 0.27.2 moved `Exit` onto its own
+  exceptions module with a RuntimeError base, so the old spelling raised
+  `AttributeError` inside the exception handler itself, crashing every CLI
+  exit path under the updated dependency. Regression tests now drive the
+  real entrypoint wrapper (CliRunner bypasses it, which is why the break
+  was invisible to the existing suite).
+
+### Changed
+
+- Runtime and toolchain dependencies: typer 0.27.2, hatchling 1.32.0,
+  mypy 2.3.1, ruff 0.16.5.
+
 ## 0.12.2 — 2026-09-01
 
 ### Fixed
