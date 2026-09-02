@@ -6,6 +6,24 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.3 — 2026-09-02
+
+### Fixed
+
+- Compaction delivers its per-node census/prune program on stdin and runs it
+  with `bash -s`, instead of concatenating it into a single `bash -c
+  <script>` argv element. Linux caps one argv string at `MAX_ARG_STRLEN`
+  (128 KiB) regardless of the larger `ARG_MAX`, so a 40-job batch rendered
+  ~168 KiB and failed with `[Errno 7] Argument list too long`; only the last
+  partial batch per node had succeeded. Stdin delivery removes the length
+  ceiling entirely (0.13.2's byte-size batch packing is no longer needed and
+  was removed). The 0.13.2 packing masked this on the local head; a busy
+  research head with hundreds of eligible jobs still hit it under `-y`.
+- A head-side spawn failure (`OSError`: E2BIG, EMFILE, ENOMEM) launching the
+  census is now reported as a head `failed` row, not as the node being
+  `unreachable` with exit 5. The old classification reported reachable nodes
+  as unreachable and masked a head defect as a node outage.
+
 ## 0.13.2 — 2026-09-02
 
 ### Fixed

@@ -71,13 +71,18 @@ def _node_runner(home: Path):
         command: str,
         timeout: float = 15,
         check: bool = False,
+        stdin_bytes: bytes | None = None,
+        **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         del node_name, is_local, check
+        # Mirror run_on: the census program is delivered on stdin and run with
+        # `bash -s`, never through argv.
         return subprocess.run(
             ["bash", "-c", command],
             cwd=home,
             capture_output=True,
             text=True,
+            input=stdin_bytes.decode("utf-8") if stdin_bytes is not None else None,
             timeout=timeout,
         )
 
@@ -263,7 +268,15 @@ def test_compact_retry_repairs_receipt_after_post_delete_fsync_failure(
     fake_sync.write_text("#!/bin/sh\nexit 1\n")
     fake_sync.chmod(0o700)
 
-    def failing_sync_runner(node_name, is_local, command, timeout=15, check=False):
+    def failing_sync_runner(
+        node_name,
+        is_local,
+        command,
+        timeout=15,
+        check=False,
+        stdin_bytes=None,
+        **_kwargs,
+    ):
         del node_name, is_local, check
         return subprocess.run(
             ["bash", "-c", command],
@@ -271,6 +284,7 @@ def test_compact_retry_repairs_receipt_after_post_delete_fsync_failure(
             env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
             capture_output=True,
             text=True,
+            input=stdin_bytes.decode("utf-8") if stdin_bytes is not None else None,
             timeout=timeout,
         )
 
@@ -812,32 +826,71 @@ def test_compact_refuses_to_settle_when_the_worker_jobs_root_is_unavailable(
     assert memo is not None and memo.code_pruned_at is None
 
 
-def test_compact_batches_stay_under_the_single_argv_limit(tmp_path):
-    """A batch is delivered as one `bash -c <script>` argument; Linux caps a
-    single argv string at 128 KiB regardless of ARG_MAX. 40 job blocks used to
-    render ~168 KiB and fail with E2BIG, so batches are packed by byte size."""
+def test_compact_delivers_the_census_over_stdin_never_argv(tmp_path, monkeypatch):
+    """A 40-block census once rendered ~168 KiB into a single `bash -c` argv
+    element and failed with E2BIG (Linux MAX_ARG_STRLEN is 128 KiB). It is now
+    delivered on stdin with `bash -s`, so the command argument stays tiny no
+    matter how many jobs a batch holds."""
     cfg = _cfg(tmp_path)
     digest = _archive(cfg)
+    node_home = tmp_path / "node-home"
+    captured: list[dict[str, object]] = []
+    real = _node_runner(node_home)
 
-    def candidate(index: int) -> compact_mod.CompactCandidate:
-        job_id = f"20260720-1200_scale{index:05d}_abcd1234"
-        entry = _entry(digest, job_id=job_id, created_at=float(index))
-        return compact_mod.CompactCandidate(
-            entry=entry,
-            node=cfg.nodes[0],
-            digest=digest,
-            archive_code=cfg.snapshots_dir() / digest / "code",
+    def recording_run_on(node_name, is_local, command, **kwargs):
+        captured.append({"command": command, "stdin_bytes": kwargs.get("stdin_bytes")})
+        return real(node_name, is_local, command, **kwargs)
+
+    for index in range(_BIG := 45):
+        entry = _entry(
+            digest,
+            job_id=f"20260720-1200_scale{index:05d}_abcd1234",
+            created_at=float(index),
         )
+        save(cfg, entry)
+        _workdir(node_home, entry)
+    monkeypatch.setattr(compact_mod, "run_on", recording_run_on)
 
-    candidates = [candidate(i) for i in range(400)]
-    batches = compact_mod._pack_batches(candidates, now=1.0)  # noqa: SLF001
+    report = compact_mod.compact_jobs(
+        cfg, cutoff_ts=1_000.0, before="1970-01-01", apply=True
+    )
 
-    assert sum(len(batch) for batch in batches) == 400
-    assert all(batch for batch in batches)
-    for batch in batches:
-        command = compact_mod._remote_command(batch, apply=True, now=1.0)  # noqa: SLF001
-        # Real Linux MAX_ARG_STRLEN is 131072; require a safety margin below it.
-        assert len(command.encode()) < 128 * 1024
+    assert report.exit_code == 0
+    assert report.payload["compacted_jobs"] == 45
+    # More than one batch (45 > _BATCH_SIZE) and every call used stdin.
+    assert len(captured) >= 2
+    for call in captured:
+        assert call["command"] == "bash -s"
+        assert isinstance(call["stdin_bytes"], bytes)
+        assert b"DT_COMPACT_V1" in call["stdin_bytes"]
+        # The census never rides in argv, so its length is irrelevant to E2BIG.
+        assert len(call["command"]) < 64
+
+
+def test_compact_local_spawn_error_is_a_head_failure_not_unreachable(
+    tmp_path, monkeypatch
+):
+    """A head-side OSError (E2BIG/EMFILE/ENOMEM launching the census) must be a
+    head failure, never reported as the node being unreachable with exit 5."""
+    cfg = _cfg(tmp_path)
+    digest = _archive(cfg)
+    entry = _entry(digest, node="psibot-ds", node_local=False)
+    save(cfg, entry)
+    cfg.nodes.append(Node(name="psibot-ds", local=False))
+
+    def boom(*args, **kwargs):
+        raise OSError(7, "Argument list too long")
+
+    monkeypatch.setattr(compact_mod, "run_on", boom)
+
+    report = compact_mod.compact_jobs(
+        cfg, cutoff_ts=100.0, before="1970-01-01", apply=True
+    )
+
+    assert report.exit_code == 1  # failed, not 5 (unreachable)
+    assert report.payload["failed_jobs"] == 1
+    assert report.payload["rows"][0]["status"] == "failed"
+    assert "head could not launch census" in report.payload["rows"][0]["detail"]
 
 
 def test_compact_rejects_an_unknown_anchor(tmp_path):

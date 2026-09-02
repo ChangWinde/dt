@@ -1296,13 +1296,19 @@ def test_clean_census_survives_a_zsh_login_shell(tmp_path):
 
 
 def test_compact_command_pins_bash_for_its_census():
-    """compact's remote script shares the word-splitting census, so it must
-    never execute under the raw login shell (QR-B3)."""
+    """compact's remote census shares the word-splitting logic, so it must
+    never execute under the raw login shell (QR-B3). The renderer now returns
+    the raw bash program (executed with `bash -s` on stdin, which pins bash
+    even under a zsh login shell) instead of an argv `bash -c` wrapper that
+    could hit the 128 KiB MAX_ARG_STRLEN limit. Stdin delivery is asserted in
+    tests/test_compact.py::test_compact_delivers_the_census_over_stdin_never_argv."""
     from dt.compact import _remote_command
 
-    command = _remote_command([], apply=False, now=100.0)
+    script = _remote_command([], apply=False, now=100.0)
 
-    assert command.startswith("bash -c ")
+    assert script.startswith("compact_rc=0")
+    assert not script.startswith("bash -c ")
+    assert "DT_COMPACT_V1" in script
 
 
 def test_clean_jobs_delete_command_pins_bash(tmp_path):
