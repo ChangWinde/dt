@@ -496,6 +496,37 @@ def test_auto_clean_days_must_be_a_finite_positive_number(days):
         )
 
 
+def test_auto_compact_defaults_on_at_one_day():
+    cfg = parse({"center": "c", "nodes": ["n1"]})
+    assert cfg.queue.auto_compact_hours == 24.0
+
+
+def test_auto_compact_false_disables_and_numbers_set_the_retention():
+    off = parse(
+        {"center": "c", "nodes": ["n1"], "queue": {"auto_compact_hours": False}}
+    )
+    assert off.queue.auto_compact_hours is None
+    custom = parse(
+        {"center": "c", "nodes": ["n1"], "queue": {"auto_compact_hours": 72}}
+    )
+    assert custom.queue.auto_compact_hours == 72.0
+
+
+@pytest.mark.parametrize(
+    "hours",
+    [0, -1, float("inf"), float("nan"), True, 24.0 * 366, "soon"],
+)
+def test_auto_compact_hours_rejects_unusable_values(hours):
+    with pytest.raises(ConfigError, match="auto_compact_hours"):
+        parse(
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "queue": {"auto_compact_hours": hours},
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "payload",
     [

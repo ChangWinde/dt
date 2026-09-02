@@ -570,6 +570,57 @@ def test_info_default_prioritizes_state_and_moves_internals_to_verbose(
 
     assert machine.exit_code == 0, machine.output
     assert json.loads(machine.stdout)["job_id"] == entry.job_id
+    # No reclaimed code copy: the row stays out of the compact view entirely.
+    assert "code copy" not in compact.output
+
+
+def test_info_shows_a_reclaimed_code_copy_with_its_recovery_path(tmp_path, monkeypatch):
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entry = JobEntry(
+        job_id="20260801-0100_exp_abcd",
+        name="exp",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="~/dt/worker/jobs/20260801-0100_exp_abcd",
+        session="dt_20260801-0100_exp_abcd",
+        cmd="python train.py",
+        status="finished",
+        exit_code=0,
+        created_at=100.0,
+        started_at=101.0,
+        finished_at=111.0,
+        snapshot_sha256="0123456789abcdef" * 4,
+        code_pruned_at=200_000.0,
+    )
+    cli.jobs_mod.save(cfg, entry)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "_info_live", lambda *args, **kwargs: {})
+
+    compact = CliRunner().invoke(cli.app, ["info", "abcd"], env={"COLUMNS": "120"})
+    machine = CliRunner().invoke(cli.app, ["info", "abcd", "--json"])
+
+    assert compact.exit_code == 0, compact.output
+    flat = " ".join(compact.output.split())
+    assert "code copy not on the node since" in flat
+    assert "dt fork abcd" in flat
+    payload = json.loads(machine.stdout)
+    assert payload["code_pruned_at"] == 200_000.0
+    assert payload["retry"] == {
+        "limit": 0,
+        "on": None,
+        "attempt": 0,
+        "retry_of": None,
+        "retried_by": None,
+    }
 
 
 def test_info_treats_registry_labels_as_literal_text(tmp_path, monkeypatch):

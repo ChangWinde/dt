@@ -199,6 +199,7 @@ _OPTIONAL_NUMBER_FIELDS = frozenset(
         "launch_duration_s",
         "started_at",
         "recovered_at",
+        "code_pruned_at",
         "terminal_finalized_at",
         "max_hours_overdue_s",
     }

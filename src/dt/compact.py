@@ -19,13 +19,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import HeadConfig, Node
+from .dispatch import transfer_baseline_job_ids
 from .jobs import (
     JobEntry,
     RegistryDamage,
+    RegistryError,
     is_uncertain_launch,
     job_lock,
     list_all,
     load,
+    lost_reconciling,
+    save,
 )
 from .layout import (
     LEGACY_LAYOUT,
@@ -46,7 +50,29 @@ _SAFE_JOB_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 _SNAPSHOT_DIGEST = re.compile(r"[0-9a-f]{64}")
 _MARKER = "DT_COMPACT_V1"
 _BATCH_SIZE = 40
+# Linux caps a single argv string at MAX_ARG_STRLEN (32 * PAGE_SIZE = 128 KiB),
+# independent of the much larger ARG_MAX total.  The remote census is delivered
+# as one ``bash -c <script>`` argument, so a batch is packed to stay well under
+# that ceiling; 40 job blocks already rendered ~168 KiB and failed with E2BIG.
+_MAX_COMMAND_BYTES = 96 * 1024
 _SNAPSHOT_METADATA_MAX_BYTES = 64 * 1024
+# ``created_at`` keeps the historical ``dt compact --before DATE`` meaning;
+# ``terminal`` measures how long a job has been finished, which is what an
+# automatic retention policy cares about.
+ANCHORS = frozenset({"created_at", "terminal"})
+# Remote outcomes proving the node no longer holds a code tree for the job:
+# a receipt was written or verified, or the job directory itself is gone while
+# the worker's jobs root is present (so the absence is not a missing mount).
+_PRUNED_OUTCOMES = frozenset(
+    {"compacted", "receipt_repaired", "already_compact", "missing"}
+)
+
+
+def anchor_timestamp(entry: JobEntry, anchor: str) -> float:
+    """The moment a cutoff is compared against for one registry row."""
+    if anchor == "created_at":
+        return entry.created_at
+    return entry.finished_at or entry.updated_at or entry.created_at
 
 
 @dataclass(frozen=True)
@@ -127,27 +153,56 @@ def _snapshot_candidate(
     return CompactCandidate(entry, node, digest, archive_code), None
 
 
-def preflight(cfg: HeadConfig, cutoff_ts: float) -> CompactPreflight:
+def preflight(
+    cfg: HeadConfig,
+    cutoff_ts: float,
+    *,
+    anchor: str = "created_at",
+) -> CompactPreflight:
     """Select old terminal jobs and attest every unique recovery snapshot.
 
     All hashes are checked before a caller can contact a compute node.  Missing
     or legacy identity makes an individual row ineligible; corruption of an
     otherwise matching archive aborts the complete operation.
     """
+    if anchor not in ANCHORS:
+        raise ValueError(f"unknown compaction anchor {anchor!r}")
     damage: list[RegistryDamage] = []
     entries = list_all(cfg, damage=damage)
     configured_nodes = {node.name: node for node in cfg.nodes}
+    baselines = transfer_baseline_job_ids(cfg)
     skipped: Counter[str] = Counter()
     candidates: list[CompactCandidate] = []
     seen_job_ids: set[str] = set()
 
     for entry in sorted(entries, key=lambda item: (item.created_at, item.job_id)):
-        if entry.created_at >= cutoff_ts or entry.status not in _TERMINAL_STATUSES:
+        if (
+            anchor_timestamp(entry, anchor) >= cutoff_ts
+            or entry.status not in _TERMINAL_STATUSES
+        ):
+            continue
+        if entry.code_pruned_at is not None:
+            # The head already recorded a node-side receipt for this row;
+            # re-attesting its archive every run would make the cost of a
+            # periodic sweep grow with history instead of with new work.
+            skipped["already_pruned"] += 1
             continue
         if is_uncertain_launch(entry):
             # A record whose remote launch was never proven dead may still own
             # the code tree; never prune it until a verified kill confirms death.
             skipped["uncertain_launch"] += 1
+            continue
+        if lost_reconciling(entry):
+            # A fresh lost verdict may still be rescued as running; the remote
+            # liveness census would refuse anyway, but do not even plan it.
+            skipped["lost_reconciling"] += 1
+            continue
+        if entry.job_id in baselines:
+            # The newest dispatched job per (project, node) is the local
+            # copy baseline for the next snapshot transfer.  Reclaiming its
+            # 500-750 MB would cost a full re-transfer over links measured at
+            # 80-130 KB/s; it becomes eligible once a newer job replaces it.
+            skipped["transfer_baseline"] += 1
             continue
         if _SAFE_JOB_ID.fullmatch(entry.job_id) is None:
             skipped["unsafe_job_id"] += 1
@@ -198,6 +253,7 @@ def preflight(cfg: HeadConfig, cutoff_ts: float) -> CompactPreflight:
         candidates.append(candidate)
 
     errors: list[str] = []
+    unverified: set[str] = set()
     by_digest: dict[str, CompactCandidate] = {}
     for candidate in candidates:
         by_digest.setdefault(candidate.digest, candidate)
@@ -206,15 +262,29 @@ def preflight(cfg: HeadConfig, cutoff_ts: float) -> CompactPreflight:
             observed = tree_sha256(candidate.archive_code)
         except (OSError, ValueError) as exc:
             errors.append(f"{digest}: recovery snapshot cannot be read: {exc}")
+            unverified.add(digest)
             continue
         if observed != digest:
             errors.append(
                 f"{digest}: recovery snapshot corrupt "
                 f"(expected {digest}, observed {observed})"
             )
+            unverified.add(digest)
+
+    # A single unverifiable archive must never delete a job's only remaining
+    # code copy, but it must also never wedge the whole sweep: one corrupt
+    # object would otherwise block every other node's reclaimable space
+    # forever.  Drop only the affected candidates, keep the rest, and surface
+    # the unverified archives so an operator can rebuild or quarantine them.
+    verified: list[CompactCandidate] = []
+    for candidate in candidates:
+        if candidate.digest in unverified:
+            skipped["snapshot_unverified"] += 1
+            continue
+        verified.append(candidate)
 
     return CompactPreflight(
-        candidates=tuple(candidates),
+        candidates=tuple(verified),
         skipped=dict(sorted(skipped.items())),
         registry_damage=tuple(damage),
         errors=tuple(errors),
@@ -293,11 +363,17 @@ def _remote_command(
                 f"job_id={job_id}",
                 'code="$root/code"',
                 'receipt_path="$control/code-pruned.json"',
+                'jobs_root=$(dirname -- "$root")',
                 (
                     'dt_live=$(dt_job_live_state "$root" '
                     f"{pgid} {boot_id} {identity_file})"
                 ),
-                'if [ ! -e "$root" ] && [ ! -L "$root" ]; then',
+                # An absent jobs root means the worker's storage is not
+                # mounted or not reachable in this shell, not that the job
+                # is gone; that verdict must never be memoized as settled.
+                'if [ ! -d "$jobs_root" ] || [ -L "$jobs_root" ]; then',
+                '  emit state_changed "$job_id" 0 worker_jobs_root_unavailable',
+                'elif [ ! -e "$root" ] && [ ! -L "$root" ]; then',
                 '  emit missing "$job_id" 0 job_dir_absent',
                 'elif [ -L "$root" ] || [ ! -d "$root" ]; then',
                 '  emit unsafe "$job_id" 0 unsafe_job_dir',
@@ -411,6 +487,38 @@ def _remote_command(
     return f"bash -c {shlex.quote(script)}"
 
 
+def _pack_batches(
+    candidates: list[CompactCandidate],
+    *,
+    now: float,
+) -> list[list[CompactCandidate]]:
+    """Group candidates so each rendered census stays under the argv limit.
+
+    ``apply=True`` renders the longest program (it carries the receipt writes),
+    so packing against it keeps the plan variant safe too.  A single candidate
+    that somehow exceeds the ceiling is still emitted alone: one job at a time
+    is the smallest a batch can be, and the node simply receives a large but
+    valid command.
+    """
+    batches: list[list[CompactCandidate]] = []
+    current: list[CompactCandidate] = []
+    for candidate in candidates:
+        trial = [*current, candidate]
+        if current and len(_remote_command(trial, apply=True, now=now)) > (
+            _MAX_COMMAND_BYTES
+        ):
+            batches.append(current)
+            current = [candidate]
+        else:
+            current = trial
+        if len(current) >= _BATCH_SIZE:
+            batches.append(current)
+            current = []
+    if current:
+        batches.append(current)
+    return batches
+
+
 def _remote_rows(
     cfg: HeadConfig,
     candidates: list[CompactCandidate],
@@ -418,6 +526,7 @@ def _remote_rows(
     apply: bool,
     now: float,
     cutoff_ts: float,
+    anchor: str = "created_at",
 ) -> tuple[list[dict[str, object]], list[str], set[str]]:
     rows: list[dict[str, object]] = []
     node_errors: list[str] = []
@@ -427,8 +536,7 @@ def _remote_rows(
         grouped[(candidate.node.name, candidate.node.local)].append(candidate)
 
     for (node_name, node_local), node_candidates in sorted(grouped.items()):
-        for offset in range(0, len(node_candidates), _BATCH_SIZE):
-            batch = node_candidates[offset : offset + _BATCH_SIZE]
+        for batch in _pack_batches(node_candidates, now=now):
             with ExitStack() as locks:
                 if apply:
                     for candidate in sorted(
@@ -437,6 +545,7 @@ def _remote_rows(
                     ):
                         locks.enter_context(job_lock(cfg, candidate.entry.job_id))
                 stable: list[CompactCandidate] = []
+                current_rows: dict[str, JobEntry] = {}
                 for candidate in batch:
                     current = (
                         load(cfg, candidate.entry.job_id) if apply else candidate.entry
@@ -455,7 +564,8 @@ def _remote_rows(
                         and (
                             current.status not in _TERMINAL_STATUSES
                             or is_uncertain_launch(current)
-                            or current.created_at >= cutoff_ts
+                            or lost_reconciling(current)
+                            or anchor_timestamp(current, anchor) >= cutoff_ts
                             or any(
                                 getattr(current, field)
                                 != getattr(candidate.entry, field)
@@ -474,6 +584,7 @@ def _remote_rows(
                         )
                         continue
                     stable.append(candidate)
+                    current_rows[candidate.entry.job_id] = current
                 if not stable:
                     continue
 
@@ -546,6 +657,22 @@ def _remote_rows(
                         failure_kinds.add("failed")
                     elif status == "unreachable":
                         failure_kinds.add("unreachable")
+                    elif apply and status in _PRUNED_OUTCOMES:
+                        # The node holds a durable receipt (or just wrote one);
+                        # memo it on the head under the job lock still held
+                        # for this batch so later sweeps skip the row cheaply.
+                        current = current_rows.get(candidate.entry.job_id)
+                        if current is not None and current.code_pruned_at is None:
+                            current.code_pruned_at = now
+                            try:
+                                save(cfg, current)
+                            except (OSError, RegistryError, PrivateStateError) as exc:
+                                # The receipt on the node is the authority;
+                                # a failed memo only costs a re-check later.
+                                node_errors.append(
+                                    f"{candidate.entry.job_id}: pruned memo "
+                                    f"not saved: {' '.join(str(exc).split())}"
+                                )
 
                 if proc.returncode != 0 and not any(
                     str(row["status"]) in {"unsafe", "failed", "unreachable"}
@@ -564,14 +691,16 @@ def compact_jobs(
     *,
     before: str,
     apply: bool,
+    anchor: str = "created_at",
 ) -> CompactReport:
     """Plan or apply safe workdir compaction and return a stable JSON model."""
-    checked = preflight(cfg, cutoff_ts)
+    checked = preflight(cfg, cutoff_ts, anchor=anchor)
     common: dict[str, object] = {
         "schema_version": "dt_compact_v1",
         "center": cfg.center,
         "before": before,
         "cutoff_ts": cutoff_ts,
+        "anchor": anchor,
         "mode": "apply" if apply else "plan",
         "eligible_jobs": len(checked.candidates),
         "eligible_snapshots": len(
@@ -584,30 +713,17 @@ def compact_jobs(
         ],
         "preflight_errors": list(checked.errors),
     }
-    if checked.errors:
-        return CompactReport(
-            payload={
-                **common,
-                "rows": [],
-                "planned_jobs": 0,
-                "compacted_jobs": 0,
-                "repaired_receipts": 0,
-                "already_compact_jobs": 0,
-                "missing_job_dirs": 0,
-                "state_changed_jobs": 0,
-                "failed_jobs": 0,
-                "planned_code_bytes": 0,
-                "node_errors": [],
-            },
-            exit_code=1,
-        )
-
+    # Unverifiable archives are already excluded from ``checked.candidates`` and
+    # surfaced in ``preflight_errors``; the healthy candidates still proceed so
+    # one corrupt object cannot wedge the sweep.  The error stays fail-visible
+    # through a non-zero exit for the interactive command.
     rows, node_errors, failure_kinds = _remote_rows(
         cfg,
         list(checked.candidates),
         apply=apply,
         now=time.time(),
         cutoff_ts=cutoff_ts,
+        anchor=anchor,
     )
     counts = Counter(str(row["status"]) for row in rows)
     planned_bytes = sum(
@@ -631,6 +747,8 @@ def compact_jobs(
         "node_errors": node_errors,
     }
     exit_code = (
-        1 if "failed" in failure_kinds else (5 if "unreachable" in failure_kinds else 0)
+        1
+        if "failed" in failure_kinds or checked.errors
+        else (5 if "unreachable" in failure_kinds else 0)
     )
     return CompactReport(payload=payload, exit_code=exit_code)
