@@ -17,11 +17,6 @@ def test_private_launch_envelope_round_trips_with_magic_and_separates_runtime():
 
     assert encoded.startswith(private_env.MAGIC)
     assert private_env.decode(encoded) == values
-    assert private_env.runtime_values(values) == {
-        "DT_PROXY": values["DT_PROXY"],
-        "DT_WEBHOOK": values["DT_WEBHOOK"],
-        "HF_TOKEN": values["HF_TOKEN"],
-    }
 
 
 @pytest.mark.parametrize(

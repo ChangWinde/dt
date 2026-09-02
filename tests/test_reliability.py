@@ -3868,6 +3868,110 @@ def test_pull_cache_reuse_receipt_rejects_duplicate_json_fields(tmp_path):
         pull_evidence.validate_file(path, "cache-reuse.json")
 
 
+def _relay_pull_fixture(tmp_path, monkeypatch):
+    """A finished job whose pull route decides on the site gateway."""
+    from dt.config import Node as _Node
+    from dt import pull_relay
+
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+        status="finished",
+        exit_code=0,
+    )
+    gateway = _Node(name="gw")
+    route = pull_relay.PullRoute("gateway", gateway, cfg.nodes[0], None, "lan ok")
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
+    )
+    monkeypatch.setattr(cli.pull_relay, "decide_pull_route", lambda *a, **k: route)
+    monkeypatch.setattr(cli.pull_relay, "record_pull_leg", lambda *a, **k: None)
+    monkeypatch.setattr(cli.pull_relay, "cleanup_staging", lambda *a, **k: True)
+    return cfg, entry, route
+
+
+def test_pull_falls_back_to_direct_when_gateway_staging_fails(tmp_path, monkeypatch):
+    """Leg A (stage onto the gateway) failing must not fail the pull: the
+    route degrades to direct, the relay error is reported, and the outputs
+    are still recovered from the worker itself."""
+    from dt import pull_relay
+
+    _cfg_, entry, _route = _relay_pull_fixture(tmp_path, monkeypatch)
+    sources: list[str] = []
+
+    def failing_stage(*args, **kwargs):
+        raise pull_relay.RelayError("gateway disk full")
+
+    monkeypatch.setattr(cli.pull_relay, "stage_outputs", failing_stage)
+
+    def fake_rsync(src, dst, **kwargs):
+        sources.append(src)
+        return subprocess.CompletedProcess([src, dst], 0, "", "")
+
+    monkeypatch.setattr(cli, "rsync", fake_rsync)
+    destination = tmp_path / "result"
+
+    result = CliRunner().invoke(
+        cli.app, ["pull", "jid", "--to", str(destination), "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["route"] == "direct"
+    assert payload["route_gateway"] is None
+    assert "gateway disk full" in payload["relay_error"]
+    assert payload["route_reason"].startswith("gateway staging failed")
+    # Outputs came straight from the worker, never from the gateway capsule.
+    assert sources and all(not s.startswith("gw:") for s in sources)
+
+
+def test_pull_falls_back_to_direct_when_staged_leg_fails(tmp_path, monkeypatch):
+    """Leg B (head <- gateway) failing keeps the staged capsule for resume but
+    still owes the user their data: retry over the direct route once."""
+    _cfg_, entry, _route = _relay_pull_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.pull_relay, "stage_outputs", lambda *a, **k: None)
+    calls: list[str] = []
+
+    def fake_rsync(src, dst, **kwargs):
+        calls.append(src)
+        if src.startswith("gw:"):
+            return subprocess.CompletedProcess(
+                [src, dst], 30, "", "rsync: connection unexpectedly closed"
+            )
+        return subprocess.CompletedProcess([src, dst], 0, "", "")
+
+    monkeypatch.setattr(cli, "rsync", fake_rsync)
+    destination = tmp_path / "result"
+
+    result = CliRunner().invoke(
+        cli.app, ["pull", "jid", "--to", str(destination), "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["route"] == "direct"
+    assert payload["route_gateway"] is None
+    assert payload["route_reason"].startswith("gateway leg failed")
+    # The staged leg's stderr excerpt is what the operator sees as the cause.
+    assert "connection unexpectedly closed" in payload["relay_error"]
+    # First attempt read the gateway capsule, the fallback read the worker.
+    outputs_calls = [c for c in calls if c.startswith("gw:") or "outputs" in c]
+    assert outputs_calls[0].startswith("gw:")
+    assert not outputs_calls[1].startswith("gw:")
+
+
 def test_pull_reports_skipped_special_output_as_incomplete(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     entry = JobEntry(
