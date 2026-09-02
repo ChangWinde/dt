@@ -10612,304 +10612,27 @@ def _info_actions(entry: jobs_mod.JobEntry) -> list[JsonDict]:
     return []
 
 
-def info(
-    ref: str = REF_ARG,
-    json_: bool = typer.Option(False, "--json"),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="show complete provenance, paths, launch details, and resource history",
-    ),
-    full_command: bool = typer.Option(
-        False,
-        "--full-command",
-        help="show the exact command in the human view",
-    ),
-    metrics_tail: int = typer.Option(
-        INFO_RESOURCE_TAIL,
-        "--metrics-tail",
-        help="include a summary of the last N resource samples (0 = all)",
-    ),
+def _render_info_table(
+    entry: jobs_mod.JobEntry,
+    data: JsonDict,
+    *,
+    display_ref: str,
+    display_refs: Mapping[str, str],
+    dirty_patch: bool,
+    verbose: bool,
+    full_command: bool,
 ) -> None:
-    """Show one job's state, progress, and recovery actions."""
-    if metrics_tail < 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--metrics-tail must be non-negative",
-            exit_code=1,
-            json_=json_,
-        )
-    cfg = _cfg()
-    if isinstance(cfg, LaptopConfig):
-        _, head = _locate(cfg, ref, json_=json_)
-        route = (
-            HeadCommand.start(head, "info", ref)
-            .flag("--json", json_)
-            .flag("--verbose", verbose)
-            .flag("--full-command", full_command)
-            .option(
-                "--metrics-tail",
-                metrics_tail if metrics_tail != INFO_RESOURCE_TAIL else None,
-            )
-        )
-        raise typer.Exit(route.invoke(forward_call))
-
-    # One registry decode serves ref resolution, display refs, and the queue
-    # context below; a partial ref used to trigger three full scans (QR-P3).
-    with jobs_mod.shared_resolution_snapshot(cfg):
-        if json_:
-            entry = jobs_mod.find(cfg, ref)
-            if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=EXIT_NOT_FOUND,
-                    json_=True,
-                )
-        else:
-            entry = _find_or_die(cfg, ref)
-        registry_snapshot = jobs_mod.resolution_entries(cfg)
-    display_refs = jobs_mod.compact_job_refs(registry_snapshot)
-    display_ref = display_refs.get(entry.job_id, entry.job_id)
-    initial_status = entry.status
-    placed_prestart_failure = (
-        initial_status == "failed"
-        and entry.node != "-"
-        and not _is_uncertain_launch(entry)
-        and _failed_start_has_env_log(entry)
-    )
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        status_future = (
-            pool.submit(jobs_mod.refresh_status, cfg, entry)
-            if initial_status in ("running", "lost")
-            else None
-        )
-        live_future = (
-            (
-                pool.submit(_info_live, entry)
-                if metrics_tail == INFO_RESOURCE_TAIL
-                else pool.submit(_info_live, entry, metrics_tail)
-            )
-            if entry.node != "-"
-            else None
-        )
-        resources_future = (
-            pool.submit(_job_resources, cfg, entry)
-            if initial_status == "running"
-            else None
-        )
-        failure_log_future = (
-            pool.submit(_read_failed_start_log, entry)
-            if placed_prestart_failure
-            else None
-        )
-        if status_future is not None:
-            entry = status_future.result()
-        live = live_future.result() if live_future is not None else {}
-        try:
-            resources = (
-                resources_future.result()
-                if resources_future is not None and entry.status == "running"
-                else None
-            )
-        except Exception as e:
-            resources = {"error": str(e)}
-        failure_log = (
-            failure_log_future.result() if failure_log_future is not None else None
-        )
-
-    live_started = live.get("started_at")
-    live_finished = live.get("finished_at")
-    started = live_started or entry.started_at
-    finished = live_finished or entry.finished_at
-    started_domain: str | None = (
-        "node"
-        if live_started is not None
-        else "registry"
-        if entry.started_at is not None
-        else None
-    )
-    finished_domain: str | None = (
-        "node"
-        if live_finished is not None
-        else "registry"
-        if entry.finished_at is not None
-        else None
-    )
-    duration_domain: str | None
-    if started and not finished and entry.status == "running":
-        duration = time.time() - started
-        duration_domain = "mixed"
-    elif started and finished:
-        duration = finished - started
-        duration_domain = (
-            started_domain if started_domain == finished_domain else "mixed"
-        )
-    else:
-        duration = None
-        duration_domain = None
-    timestamp_domains = {
-        "queued_at": "head",
-        "started_at": started_domain,
-        "finished_at": finished_domain,
-        "duration_s": duration_domain,
-    }
-    cross_clock_intervals_approximate = any(
-        domain in {"node", "registry", "mixed"}
-        for domain in (
-            timestamp_domains["started_at"],
-            timestamp_domains["finished_at"],
-            duration_domain,
-        )
-    )
-    resource_summary_error = None
-    try:
-        resource_summary = ResourceTelemetryQuery(entry, metrics_tail).summarize(
-            str(live.get("resource_text") or ""),
-            include_identity=False,
-        )
-    except ValueError:
-        resource_summary = None
-        resource_summary_error = "invalid_telemetry_summary_envelope"
-    phase_summary = _phase_summary_from_text(
-        entry,
-        str(live.get("phase_text") or ""),
-        finished_at=finished,
-        tail_limit=INFO_PHASE_TAIL,
-    )
-    queue_context: JsonDict = {
-        "queue_position": None,
-        "queue_depth": None,
-        "queue_ahead_count": None,
-        "queue_head_job_id": None,
-        "queue_predecessor_job_id": None,
-        "queue": None,
-    }
-    if entry.status == "queued":
-        queue_context.update(
-            jobs_mod.queue_contexts(registry_snapshot).get(entry.job_id, {})
-        )
-        queue_context["queue"] = jobs_mod.queue_placement_contexts(
-            cfg,
-            registry_snapshot,
-        ).get(entry.job_id)
-
-    data = {
-        "schema_version": "dt_job_info_v1",
-        "job_id": entry.job_id,
-        "name": entry.name,
-        "status": entry.status,
-        "reason": entry.reason,
-        "center": entry.center,
-        "node": entry.node,
-        "gpus": entry.gpus,
-        "gpus_requested": entry.gpus_requested,
-        "gpu_isolation": _gpu_isolation_contract(entry),
-        "cmd": entry.cmd,
-        "project": entry.project,
-        "git_sha": entry.git_sha,
-        "git_dirty": entry.git_dirty,
-        "submodule_commits": (
-            dict(entry.submodule_commits)
-            if entry.submodule_commits is not None
-            else None
-        ),
-        "snapshot_sha256": entry.snapshot_sha256,
-        "payload_sha256": entry.payload_sha256,
-        "artifact_manifest": entry.artifact_manifest,
-        "forked_from": entry.forked_from,
-        "request_id": entry.request_id,
-        "after_success": entry.after_success,
-        "after_complete": entry.after_complete,
-        "after_result": entry.after_result,
-        "after_result_states": list(entry.after_result_states),
-        "result_state": jobs_mod.effective_result_state(entry),
-        "actions": _info_actions(entry),
-        "rerun_of": entry.rerun_of,
-        "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
-        "rerun_snapshot_changed": entry.rerun_snapshot_changed,
-        "retry": {
-            "limit": entry.retry_limit,
-            "on": entry.retry_on or ("infra" if entry.retry_limit else None),
-            "attempt": entry.retry_count,
-            "retry_of": entry.retry_of,
-            "retried_by": entry.retried_by,
-        },
-        "code_pruned_at": entry.code_pruned_at,
-        "cache_reuse": (
-            {
-                "source_job_id": entry.cache_source_job,
-                "source_path": entry.cache_source_path,
-                "env_var": entry.cache_env,
-                "source_env_hash": entry.cache_source_env_hash,
-                "mode": entry.cache_mode or "shared",
-                **(
-                    {"runtime_path": "outputs/.cache/dt-clone"}
-                    if entry.cache_mode == "clone"
-                    else {}
-                ),
-            }
-            if entry.cache_source_job
-            else None
-        ),
-        "queued_at": entry.created_at,
-        "started_at": started,
-        "finished_at": finished,
-        "duration_s": duration,
-        "timestamp_domains": timestamp_domains,
-        "cross_clock_intervals_approximate": cross_clock_intervals_approximate,
-        "max_hours_exceeded": (
-            _max_hours_overdue(entry.max_hours, duration) is not None
-        ),
-        "max_hours_overdue_s": _max_hours_overdue(entry.max_hours, duration),
-        "exit_code": entry.exit_code,
-        "session": entry.session,
-        "job_dir": entry.job_dir,
-        "paths": _job_path_contract(cfg, entry),
-        "outputs_size": live.get("outputs_size"),
-        "env_hash": entry.env_hash,
-        "env_mode": entry.env_mode or "sync",
-        "env_source_job": entry.env_source_job,
-        "custom_env_keys": sorted(entry.custom_env),
-        "setup_inputs": entry.setup_inputs,
-        "extras": entry.extras,
-        "boot_id": entry.boot_id,
-        "max_hours": entry.max_hours,
-        "min_vram_mib": entry.min_vram_mib,
-        "max_vram_mib": entry.max_vram_mib,
-        "max_job_memory_mib": entry.max_job_memory_mib,
-        "resource_guard": live.get("resource_guard"),
-        "runtime_containment": live.get("runtime_containment"),
-        "runtime_linger": live.get("runtime_linger"),
-        "require_path": entry.require_path,
-        "require_disk_gib": entry.require_disk_gib,
-        "pin_node": entry.pin_node,
-        "placement_failures": dict(entry.placement_failures),
-        "node_unreachable": live.get("unreachable", False),
-        "resources": resources,
-        "resource_summary": resource_summary,
-        "resource_summary_error": resource_summary_error,
-        "phase_summary": phase_summary,
-        **queue_context,
-    }
-    for field in (
-        "snapshot_duration_s",
-        "launch_duration_s",
-        "env_preexisting",
-        "setup_ran",
-    ):
-        value = getattr(entry, field, None)
-        if value is not None:
-            data[field] = value
-    if entry.launch_phases_s:
-        data["launch_phases_s"] = dict(entry.launch_phases_s)
-    if failure_log is not None:
-        data["failure_log"] = failure_log
-    if json_:
-        print(json.dumps(data))
-        return
-
+    """Render the human ``dt info`` table from the same payload as --json."""
+    started = data["started_at"]
+    finished = data["finished_at"]
+    duration = data["duration_s"]
+    started_domain = data["timestamp_domains"]["started_at"]
+    finished_domain = data["timestamp_domains"]["finished_at"]
+    cross_clock_intervals_approximate = data["cross_clock_intervals_approximate"]
+    resources = data["resources"]
+    resource_summary = data["resource_summary"]
+    phase_summary = data["phase_summary"]
+    failure_log = data.get("failure_log")
     from rich.table import Table as RTable
     from rich.markup import escape
 
@@ -10938,11 +10661,7 @@ def info(
     else:
         gpus_txt = f"({entry.gpus_requested} wanted)"
     git_txt = (entry.git_sha or "-")[:12] + (
-        " +dirty.patch"
-        if live.get("dirty_patch")
-        else " (dirty)"
-        if entry.git_dirty
-        else ""
+        " +dirty.patch" if dirty_patch else " (dirty)" if entry.git_dirty else ""
     )
     rows = [
         ("name", escape(entry.name)),
@@ -11295,6 +11014,315 @@ def info(
     for k, v in rendered_rows:
         t.add_row(k, v)
     out.print(t)
+
+
+def info(
+    ref: str = REF_ARG,
+    json_: bool = typer.Option(False, "--json"),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="show complete provenance, paths, launch details, and resource history",
+    ),
+    full_command: bool = typer.Option(
+        False,
+        "--full-command",
+        help="show the exact command in the human view",
+    ),
+    metrics_tail: int = typer.Option(
+        INFO_RESOURCE_TAIL,
+        "--metrics-tail",
+        help="include a summary of the last N resource samples (0 = all)",
+    ),
+) -> None:
+    """Show one job's state, progress, and recovery actions."""
+    if metrics_tail < 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--metrics-tail must be non-negative",
+            exit_code=1,
+            json_=json_,
+        )
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref, json_=json_)
+        route = (
+            HeadCommand.start(head, "info", ref)
+            .flag("--json", json_)
+            .flag("--verbose", verbose)
+            .flag("--full-command", full_command)
+            .option(
+                "--metrics-tail",
+                metrics_tail if metrics_tail != INFO_RESOURCE_TAIL else None,
+            )
+        )
+        raise typer.Exit(route.invoke(forward_call))
+
+    # One registry decode serves ref resolution, display refs, and the queue
+    # context below; a partial ref used to trigger three full scans (QR-P3).
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        if json_:
+            entry = jobs_mod.find(cfg, ref)
+            if entry is None:
+                _fail_submission(
+                    kind="not_found",
+                    message=f"no job matching {ref!r}",
+                    exit_code=EXIT_NOT_FOUND,
+                    json_=True,
+                )
+        else:
+            entry = _find_or_die(cfg, ref)
+        registry_snapshot = jobs_mod.resolution_entries(cfg)
+    display_refs = jobs_mod.compact_job_refs(registry_snapshot)
+    display_ref = display_refs.get(entry.job_id, entry.job_id)
+    initial_status = entry.status
+    placed_prestart_failure = (
+        initial_status == "failed"
+        and entry.node != "-"
+        and not _is_uncertain_launch(entry)
+        and _failed_start_has_env_log(entry)
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        status_future = (
+            pool.submit(jobs_mod.refresh_status, cfg, entry)
+            if initial_status in ("running", "lost")
+            else None
+        )
+        live_future = (
+            (
+                pool.submit(_info_live, entry)
+                if metrics_tail == INFO_RESOURCE_TAIL
+                else pool.submit(_info_live, entry, metrics_tail)
+            )
+            if entry.node != "-"
+            else None
+        )
+        resources_future = (
+            pool.submit(_job_resources, cfg, entry)
+            if initial_status == "running"
+            else None
+        )
+        failure_log_future = (
+            pool.submit(_read_failed_start_log, entry)
+            if placed_prestart_failure
+            else None
+        )
+        if status_future is not None:
+            entry = status_future.result()
+        live = live_future.result() if live_future is not None else {}
+        try:
+            resources = (
+                resources_future.result()
+                if resources_future is not None and entry.status == "running"
+                else None
+            )
+        except Exception as e:
+            resources = {"error": str(e)}
+        failure_log = (
+            failure_log_future.result() if failure_log_future is not None else None
+        )
+
+    live_started = live.get("started_at")
+    live_finished = live.get("finished_at")
+    started = live_started or entry.started_at
+    finished = live_finished or entry.finished_at
+    started_domain: str | None = (
+        "node"
+        if live_started is not None
+        else "registry"
+        if entry.started_at is not None
+        else None
+    )
+    finished_domain: str | None = (
+        "node"
+        if live_finished is not None
+        else "registry"
+        if entry.finished_at is not None
+        else None
+    )
+    duration_domain: str | None
+    if started and not finished and entry.status == "running":
+        duration = time.time() - started
+        duration_domain = "mixed"
+    elif started and finished:
+        duration = finished - started
+        duration_domain = (
+            started_domain if started_domain == finished_domain else "mixed"
+        )
+    else:
+        duration = None
+        duration_domain = None
+    timestamp_domains = {
+        "queued_at": "head",
+        "started_at": started_domain,
+        "finished_at": finished_domain,
+        "duration_s": duration_domain,
+    }
+    cross_clock_intervals_approximate = any(
+        domain in {"node", "registry", "mixed"}
+        for domain in (
+            timestamp_domains["started_at"],
+            timestamp_domains["finished_at"],
+            duration_domain,
+        )
+    )
+    resource_summary_error = None
+    try:
+        resource_summary = ResourceTelemetryQuery(entry, metrics_tail).summarize(
+            str(live.get("resource_text") or ""),
+            include_identity=False,
+        )
+    except ValueError:
+        resource_summary = None
+        resource_summary_error = "invalid_telemetry_summary_envelope"
+    phase_summary = _phase_summary_from_text(
+        entry,
+        str(live.get("phase_text") or ""),
+        finished_at=finished,
+        tail_limit=INFO_PHASE_TAIL,
+    )
+    queue_context: JsonDict = {
+        "queue_position": None,
+        "queue_depth": None,
+        "queue_ahead_count": None,
+        "queue_head_job_id": None,
+        "queue_predecessor_job_id": None,
+        "queue": None,
+    }
+    if entry.status == "queued":
+        queue_context.update(
+            jobs_mod.queue_contexts(registry_snapshot).get(entry.job_id, {})
+        )
+        queue_context["queue"] = jobs_mod.queue_placement_contexts(
+            cfg,
+            registry_snapshot,
+        ).get(entry.job_id)
+
+    data = {
+        "schema_version": "dt_job_info_v1",
+        "job_id": entry.job_id,
+        "name": entry.name,
+        "status": entry.status,
+        "reason": entry.reason,
+        "center": entry.center,
+        "node": entry.node,
+        "gpus": entry.gpus,
+        "gpus_requested": entry.gpus_requested,
+        "gpu_isolation": _gpu_isolation_contract(entry),
+        "cmd": entry.cmd,
+        "project": entry.project,
+        "git_sha": entry.git_sha,
+        "git_dirty": entry.git_dirty,
+        "submodule_commits": (
+            dict(entry.submodule_commits)
+            if entry.submodule_commits is not None
+            else None
+        ),
+        "snapshot_sha256": entry.snapshot_sha256,
+        "payload_sha256": entry.payload_sha256,
+        "artifact_manifest": entry.artifact_manifest,
+        "forked_from": entry.forked_from,
+        "request_id": entry.request_id,
+        "after_success": entry.after_success,
+        "after_complete": entry.after_complete,
+        "after_result": entry.after_result,
+        "after_result_states": list(entry.after_result_states),
+        "result_state": jobs_mod.effective_result_state(entry),
+        "actions": _info_actions(entry),
+        "rerun_of": entry.rerun_of,
+        "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
+        "rerun_snapshot_changed": entry.rerun_snapshot_changed,
+        "retry": {
+            "limit": entry.retry_limit,
+            "on": entry.retry_on or ("infra" if entry.retry_limit else None),
+            "attempt": entry.retry_count,
+            "retry_of": entry.retry_of,
+            "retried_by": entry.retried_by,
+        },
+        "code_pruned_at": entry.code_pruned_at,
+        "cache_reuse": (
+            {
+                "source_job_id": entry.cache_source_job,
+                "source_path": entry.cache_source_path,
+                "env_var": entry.cache_env,
+                "source_env_hash": entry.cache_source_env_hash,
+                "mode": entry.cache_mode or "shared",
+                **(
+                    {"runtime_path": "outputs/.cache/dt-clone"}
+                    if entry.cache_mode == "clone"
+                    else {}
+                ),
+            }
+            if entry.cache_source_job
+            else None
+        ),
+        "queued_at": entry.created_at,
+        "started_at": started,
+        "finished_at": finished,
+        "duration_s": duration,
+        "timestamp_domains": timestamp_domains,
+        "cross_clock_intervals_approximate": cross_clock_intervals_approximate,
+        "max_hours_exceeded": (
+            _max_hours_overdue(entry.max_hours, duration) is not None
+        ),
+        "max_hours_overdue_s": _max_hours_overdue(entry.max_hours, duration),
+        "exit_code": entry.exit_code,
+        "session": entry.session,
+        "job_dir": entry.job_dir,
+        "paths": _job_path_contract(cfg, entry),
+        "outputs_size": live.get("outputs_size"),
+        "env_hash": entry.env_hash,
+        "env_mode": entry.env_mode or "sync",
+        "env_source_job": entry.env_source_job,
+        "custom_env_keys": sorted(entry.custom_env),
+        "setup_inputs": entry.setup_inputs,
+        "extras": entry.extras,
+        "boot_id": entry.boot_id,
+        "max_hours": entry.max_hours,
+        "min_vram_mib": entry.min_vram_mib,
+        "max_vram_mib": entry.max_vram_mib,
+        "max_job_memory_mib": entry.max_job_memory_mib,
+        "resource_guard": live.get("resource_guard"),
+        "runtime_containment": live.get("runtime_containment"),
+        "runtime_linger": live.get("runtime_linger"),
+        "require_path": entry.require_path,
+        "require_disk_gib": entry.require_disk_gib,
+        "pin_node": entry.pin_node,
+        "placement_failures": dict(entry.placement_failures),
+        "node_unreachable": live.get("unreachable", False),
+        "resources": resources,
+        "resource_summary": resource_summary,
+        "resource_summary_error": resource_summary_error,
+        "phase_summary": phase_summary,
+        **queue_context,
+    }
+    for field in (
+        "snapshot_duration_s",
+        "launch_duration_s",
+        "env_preexisting",
+        "setup_ran",
+    ):
+        value = getattr(entry, field, None)
+        if value is not None:
+            data[field] = value
+    if entry.launch_phases_s:
+        data["launch_phases_s"] = dict(entry.launch_phases_s)
+    if failure_log is not None:
+        data["failure_log"] = failure_log
+    if json_:
+        print(json.dumps(data))
+        return
+
+    _render_info_table(
+        entry,
+        data,
+        display_ref=display_ref,
+        display_refs=display_refs,
+        dirty_patch=bool(live.get("dirty_patch")),
+        verbose=verbose,
+        full_command=full_command,
+    )
 
 
 def diagnose(
@@ -13656,6 +13684,7 @@ class _PullPhaseError(Exception):
         records_fresh: bool = True,
         human_plain: bool = False,
         hint: str | None = None,
+        **fields: object,
     ) -> None:
         super().__init__(message)
         self.kind = kind
@@ -13664,6 +13693,229 @@ class _PullPhaseError(Exception):
         self.records_fresh = records_fresh
         self.human_plain = human_plain
         self.hint = hint
+        self.fields = fields
+
+
+def _validate_pull_destination(
+    dst: Path,
+    entry: jobs_mod.JobEntry,
+    *,
+    force: bool,
+) -> Path:
+    """Refuse an unsafe or foreign destination; return its DT records dir.
+
+    Symlinked ancestors, a symlinked destination, and a non-directory ``dt/``
+    records path are always refused.  Without ``--force`` a destination that
+    already holds another job's ``dt/job.json`` (or unreadable one), or is
+    non-empty without any record, is refused rather than merged into.
+    """
+    try:
+        _reject_symlink_ancestors(dst)
+    except ValueError as exc:
+        raise _PullPhaseError(
+            "destination_conflict", str(exc), 1, existing_job_id=None
+        ) from exc
+    if dst.is_symlink():
+        raise _PullPhaseError(
+            "destination_conflict",
+            f"{dst} is a symbolic link; choose its resolved directory explicitly",
+            1,
+            existing_job_id=None,
+        )
+    records_dir = dst / "dt"
+    try:
+        existing_records_info = records_dir.lstat()
+    except FileNotFoundError:
+        existing_records_info = None
+    except (OSError, ValueError) as exc:
+        raise _PullPhaseError(
+            "destination_conflict",
+            f"cannot inspect {records_dir}: {exc}",
+            1,
+            existing_job_id=None,
+        ) from exc
+    if existing_records_info is not None and (
+        stat.S_ISLNK(existing_records_info.st_mode)
+        or not stat.S_ISDIR(existing_records_info.st_mode)
+    ):
+        raise _PullPhaseError(
+            "destination_conflict",
+            f"{records_dir} is not a safe directory for DT-owned records",
+            1,
+            existing_job_id=None,
+        )
+    if force or not dst.exists():
+        return records_dir
+    if not dst.is_dir():
+        raise _PullPhaseError(
+            "destination_conflict",
+            f"{dst} exists and is not a directory",
+            1,
+            existing_job_id=None,
+        )
+    existing_record = records_dir / "job.json"
+    if existing_record.is_file():
+        try:
+            existing_result = read_bounded_regular(
+                existing_record,
+                max_bytes=LOCAL_JOB_RECORD_MAX_BYTES,
+            )
+            if existing_result is None:
+                raise PrivateStateError("local job record disappeared")
+            existing_data = decode_strict_json(existing_result[0])
+            existing_job_id = (
+                existing_data.get("job_id")
+                if isinstance(existing_data, dict)
+                and isinstance(existing_data.get("job_id"), str)
+                and jobs_mod.JOB_ID_RE.fullmatch(existing_data["job_id"])
+                else None
+            )
+        except (
+            PrivateStateError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            RecursionError,
+        ):
+            existing_job_id = None
+        if existing_job_id != entry.job_id:
+            message = (
+                f"{dst} belongs to job {existing_job_id}; "
+                "use --force to merge or overwrite files"
+                if existing_job_id
+                else (
+                    f"{dst} has an unreadable dt/job.json; "
+                    "use --force to merge or overwrite files"
+                )
+            )
+            raise _PullPhaseError(
+                "destination_conflict", message, 1, existing_job_id=existing_job_id
+            )
+        return records_dir
+    try:
+        destination_nonempty = any(dst.iterdir())
+    except OSError as exc:
+        raise _PullPhaseError(
+            "destination_unusable",
+            f"cannot inspect local destination {dst}: {exc}",
+            1,
+        ) from exc
+    if destination_nonempty:
+        raise _PullPhaseError(
+            "destination_conflict",
+            f"{dst} is non-empty and has no dt/job.json; "
+            "use --force to merge or overwrite files",
+            1,
+            existing_job_id=None,
+        )
+    return records_dir
+
+
+def _probe_remote_outputs(
+    entry: jobs_mod.JobEntry,
+    outputs_rel: str,
+) -> tuple[bool, int | None, bool]:
+    """Ask the worker whether ``outputs/`` exists and how large it is.
+
+    Returns ``(outputs_present, remote_outputs_bytes, records_only)``.
+    ``records_only`` is a failed-before-start job with nothing but its run
+    record to recover; any other job without ``outputs/`` is a hard miss.
+    """
+    try:
+        check = run_on(
+            entry.node,
+            entry.node_local,
+            _pull_outputs_probe_command(outputs_rel),
+            timeout=10,
+        )
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        detail = " ".join(str(exc).split()) or type(exc).__name__
+        raise _PullPhaseError(
+            "unreachable",
+            f"cannot inspect outputs on {entry.node}: {detail}",
+            EXIT_UNREACHABLE,
+        ) from exc
+    if check.returncode not in (0, 1):
+        detail = " ".join(
+            (
+                check.stderr
+                or check.stdout
+                or f"outputs probe exited {check.returncode}"
+            ).split()
+        )
+        raise _PullPhaseError(
+            "unreachable",
+            f"cannot inspect outputs on {entry.node}: {detail}",
+            EXIT_UNREACHABLE,
+            human_plain=True,
+            hint=(
+                "the job and any partial local data are unchanged; "
+                "rerun dt pull when the node is reachable"
+            ),
+        )
+    records_only = (
+        check.returncode == 1
+        and entry.status == "failed"
+        and not _is_uncertain_launch(entry)
+        and entry.node != "-"
+    )
+    if check.returncode != 0 and not records_only:
+        raise _PullPhaseError(
+            "outputs_not_found",
+            f"{entry.job_id} has no outputs/ (script writes to $DT_JOB_DIR/outputs)",
+            EXIT_NOT_FOUND,
+            human_plain=True,
+        )
+    outputs_present = check.returncode == 0
+    return (
+        outputs_present,
+        _pull_outputs_probe_bytes(check.stdout) if outputs_present else None,
+        records_only,
+    )
+
+
+def _prepare_pull_records_dir(
+    dst: Path,
+    records_dir: Path,
+    entry: jobs_mod.JobEntry,
+) -> None:
+    """Create the destination and write the local ``dt/job.json`` record."""
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        records_dir.mkdir(parents=True, exist_ok=True)
+        _reject_symlink_ancestors(dst)
+    except (OSError, ValueError) as exc:
+        raise _PullPhaseError(
+            "destination_unusable",
+            f"cannot create local destination {dst}: {exc}",
+            1,
+        ) from exc
+    try:
+        records_info = records_dir.lstat()
+    except OSError as exc:
+        raise _PullPhaseError(
+            "destination_unusable",
+            f"cannot inspect local records directory {records_dir}: {exc}",
+            1,
+        ) from exc
+    if stat.S_ISLNK(records_info.st_mode) or not stat.S_ISDIR(records_info.st_mode):
+        raise _PullPhaseError(
+            "destination_unusable",
+            f"{records_dir} is not a safe records directory",
+            1,
+        )
+    record_path = records_dir / "job.json"
+    try:
+        record_payload = (
+            json.dumps(_pull_job_record(entry), indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        if len(record_payload) > LOCAL_JOB_RECORD_MAX_BYTES:
+            raise PrivateStateError(
+                f"local record exceeds its size limit: {record_path}"
+            )
+        atomic_write_regular(record_path, record_payload)
+    except PrivateStateError as exc:
+        raise _PullPhaseError("destination_unusable", str(exc), 1) from exc
 
 
 def _rsync_with_status(
@@ -14263,6 +14515,38 @@ def _pull_unlocked(
                 "outputs",
                 display_ref=_display_ref_for_entry(cfg, entry),
             )
+
+    def phase_failed(
+        phase: _PullPhaseError,
+        *,
+        destination: str | None = None,
+        logs_recovered: bool | None = None,
+    ) -> NoReturn:
+        """Render one phase failure with the trailer that phase owes.
+
+        ``logs_recovered`` marks a transfer phase: its trailer reports the
+        records confirmed so far (``records`` is read at call time on purpose:
+        the pre-transfer list before outputs land, the inventory afterwards).
+        A programmatic caller (``_result``) always receives the structured
+        payload; the plain human rendering is only for an interactive terminal.
+        """
+        if phase.human_plain and not json_ and _result is None:
+            err.print(f"[red]{escape(phase.message)}[/red]")
+            if phase.hint:
+                err.print(f"[dim]{escape(phase.hint)}[/dim]")
+            raise typer.Exit(phase.exit_code)
+        trailer: dict[str, object] = {"job_id": entry.job_id, "node": entry.node}
+        if destination is not None:
+            trailer["destination"] = destination
+        if logs_recovered is not None:
+            trailer["records"] = (
+                confirmed_records(logs_recovered=logs_recovered)
+                if phase.records_fresh
+                else records
+            )
+            trailer["partial"] = True
+        fail(phase.kind, phase.message, phase.exit_code, **trailer, **phase.fields)
+
     if _collection:
         try:
             collection_base = _ensure_collection_root(cfg, _collection)
@@ -14286,248 +14570,20 @@ def _pull_unlocked(
         )
     ).absolute()
     try:
-        _reject_symlink_ancestors(dst)
-    except ValueError as exc:
-        fail(
-            "destination_conflict",
-            str(exc),
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            existing_job_id=None,
-        )
-    if dst.is_symlink():
-        fail(
-            "destination_conflict",
-            f"{dst} is a symbolic link; choose its resolved directory explicitly",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            existing_job_id=None,
-        )
-    records_dir = dst / "dt"
-    try:
-        existing_records_info = records_dir.lstat()
-    except FileNotFoundError:
-        existing_records_info = None
-    except (OSError, ValueError) as exc:
-        fail(
-            "destination_conflict",
-            f"cannot inspect {records_dir}: {exc}",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            existing_job_id=None,
-        )
-    if existing_records_info is not None and (
-        stat.S_ISLNK(existing_records_info.st_mode)
-        or not stat.S_ISDIR(existing_records_info.st_mode)
-    ):
-        fail(
-            "destination_conflict",
-            f"{records_dir} is not a safe directory for DT-owned records",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            existing_job_id=None,
-        )
-    existing_record = dst / "dt" / "job.json"
-    if not force and dst.exists():
-        if not dst.is_dir():
-            fail(
-                "destination_conflict",
-                f"{dst} exists and is not a directory",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-                destination=str(dst),
-                existing_job_id=None,
-            )
-        if existing_record.is_file():
-            try:
-                existing_result = read_bounded_regular(
-                    existing_record,
-                    max_bytes=LOCAL_JOB_RECORD_MAX_BYTES,
-                )
-                if existing_result is None:
-                    raise PrivateStateError("local job record disappeared")
-                existing_data = decode_strict_json(existing_result[0])
-                existing_job_id = (
-                    existing_data.get("job_id")
-                    if isinstance(existing_data, dict)
-                    and isinstance(existing_data.get("job_id"), str)
-                    and jobs_mod.JOB_ID_RE.fullmatch(existing_data["job_id"])
-                    else None
-                )
-            except (
-                PrivateStateError,
-                TypeError,
-                UnicodeError,
-                ValueError,
-                RecursionError,
-            ):
-                existing_job_id = None
-            if existing_job_id != entry.job_id:
-                message = (
-                    f"{dst} belongs to job {existing_job_id}; "
-                    "use --force to merge or overwrite files"
-                    if existing_job_id
-                    else (
-                        f"{dst} has an unreadable dt/job.json; "
-                        "use --force to merge or overwrite files"
-                    )
-                )
-                fail(
-                    "destination_conflict",
-                    message,
-                    1,
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    destination=str(dst),
-                    existing_job_id=existing_job_id,
-                )
-        else:
-            try:
-                destination_nonempty = any(dst.iterdir())
-            except OSError as exc:
-                fail(
-                    "destination_unusable",
-                    f"cannot inspect local destination {dst}: {exc}",
-                    1,
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    destination=str(dst),
-                )
-            if destination_nonempty:
-                fail(
-                    "destination_conflict",
-                    f"{dst} is non-empty and has no dt/job.json; "
-                    "use --force to merge or overwrite files",
-                    1,
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    destination=str(dst),
-                    existing_job_id=None,
-                )
+        records_dir = _validate_pull_destination(dst, entry, force=force)
+    except _PullPhaseError as phase:
+        phase_failed(phase, destination=str(dst))
     outputs_rel = f"{entry.job_dir}/outputs"
     try:
-        check = run_on(
-            entry.node,
-            entry.node_local,
-            _pull_outputs_probe_command(outputs_rel),
-            timeout=10,
+        outputs_present, remote_outputs_bytes, records_only = _probe_remote_outputs(
+            entry, outputs_rel
         )
-    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
-        detail = " ".join(str(exc).split()) or type(exc).__name__
-        fail(
-            "unreachable",
-            f"cannot inspect outputs on {entry.node}: {detail}",
-            EXIT_UNREACHABLE,
-            job_id=entry.job_id,
-            node=entry.node,
-        )
-    if check.returncode not in (0, 1):
-        detail = (
-            check.stderr or check.stdout or f"outputs probe exited {check.returncode}"
-        )
-        detail = " ".join(detail.split())
-        message = f"cannot inspect outputs on {entry.node}: {detail}"
-        if json_:
-            fail(
-                "unreachable",
-                message,
-                EXIT_UNREACHABLE,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
-        err.print(
-            f"[red]cannot inspect outputs on "
-            f"{escape(entry.node)}: {escape(detail)}[/red]"
-        )
-        err.print(
-            "[dim]the job and any partial local data are unchanged; "
-            "rerun dt pull when the node is reachable[/dim]"
-        )
-        raise typer.Exit(EXIT_UNREACHABLE)
-    records_only = (
-        check.returncode == 1
-        and entry.status == "failed"
-        and not _is_uncertain_launch(entry)
-        and entry.node != "-"
-    )
-    if check.returncode != 0 and not records_only:
-        message = (
-            f"{entry.job_id} has no outputs/ (script writes to $DT_JOB_DIR/outputs)"
-        )
-        if json_:
-            fail(
-                "outputs_not_found",
-                message,
-                EXIT_NOT_FOUND,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
-        err.print(f"[red]{escape(message)}[/red]")
-        raise typer.Exit(EXIT_NOT_FOUND)
-    outputs_present = check.returncode == 0
-    if outputs_present:
-        remote_outputs_bytes = _pull_outputs_probe_bytes(check.stdout)
+    except _PullPhaseError as phase:
+        phase_failed(phase)
     try:
-        dst.mkdir(parents=True, exist_ok=True)
-        records_dir.mkdir(parents=True, exist_ok=True)
-        _reject_symlink_ancestors(dst)
-    except (OSError, ValueError) as exc:
-        fail(
-            "destination_unusable",
-            f"cannot create local destination {dst}: {exc}",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-        )
-    try:
-        records_info = records_dir.lstat()
-    except OSError as exc:
-        fail(
-            "destination_unusable",
-            f"cannot inspect local records directory {records_dir}: {exc}",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-        )
-    if stat.S_ISLNK(records_info.st_mode) or not stat.S_ISDIR(records_info.st_mode):
-        fail(
-            "destination_unusable",
-            f"{records_dir} is not a safe records directory",
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-        )
-    record_path = records_dir / "job.json"
-    try:
-        record_payload = (
-            json.dumps(_pull_job_record(entry), indent=2, sort_keys=True) + "\n"
-        ).encode("utf-8")
-        if len(record_payload) > LOCAL_JOB_RECORD_MAX_BYTES:
-            raise PrivateStateError(
-                f"local record exceeds its size limit: {record_path}"
-            )
-        atomic_write_regular(record_path, record_payload)
-    except PrivateStateError as exc:
-        fail(
-            "destination_unusable",
-            str(exc),
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-        )
+        _prepare_pull_records_dir(dst, records_dir, entry)
+    except _PullPhaseError as phase:
+        phase_failed(phase, destination=str(dst))
     records = ["dt/job.json"]
     evidence_records: list[str] = []
     evidence_provenance: str | None = None
@@ -14561,32 +14617,6 @@ def _pull_unlocked(
         paths.extend(f"dt/{name}" for name in evidence_records)
         return paths
 
-    def phase_failed(phase: _PullPhaseError, *, logs_recovered: bool) -> NoReturn:
-        """Render one phase failure with the shared trailer.
-
-        ``records`` is read at call time on purpose: before the outputs
-        phase it is the pre-transfer list, afterwards the confirmed inventory.
-        """
-        if phase.human_plain and not json_:
-            err.print(f"[red]{escape(phase.message)}[/red]")
-            if phase.hint:
-                err.print(f"[dim]{escape(phase.hint)}[/dim]")
-            raise typer.Exit(phase.exit_code)
-        fail(
-            phase.kind,
-            phase.message,
-            phase.exit_code,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            records=(
-                confirmed_records(logs_recovered=logs_recovered)
-                if phase.records_fresh
-                else records
-            ),
-            partial=True,
-        )
-
     pull_route = pull_relay.decide_pull_route(
         cfg,
         entry.node,
@@ -14616,7 +14646,7 @@ def _pull_unlocked(
                 pull_route=pull_route,
             )
         except _PullPhaseError as phase:
-            phase_failed(phase, logs_recovered=False)
+            phase_failed(phase, destination=str(dst), logs_recovered=False)
     else:
         if not json_:
             err.print(
@@ -14637,7 +14667,7 @@ def _pull_unlocked(
             cancel_kwargs=cancel_kwargs,
         )
     except _PullPhaseError as phase:
-        phase_failed(phase, logs_recovered=True)
+        phase_failed(phase, destination=str(dst), logs_recovered=True)
 
     try:
         evidence_provenance = _recover_runtime_evidence(
@@ -14652,7 +14682,7 @@ def _pull_unlocked(
             evidence_records=evidence_records,
         )
     except _PullPhaseError as phase:
-        phase_failed(phase, logs_recovered=True)
+        phase_failed(phase, destination=str(dst), logs_recovered=True)
 
     try:
         pull_evidence_mod.validate_materialized_tree(dst)

@@ -6,6 +6,33 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.4 — 2026-09-03
+
+### Fixed
+
+- Programmatic `dt pull` callers (the multi-job pull path collecting results
+  through `_result`) now receive the structured error payload on a transfer
+  failure even without `--json`; previously that path printed the human hint
+  and exited with only an exit code, unlike every other pull phase.
+
+### Changed
+
+- Internal decomposition with no behavior change, guarded by the full suite
+  at every step: registry rows are built from one shared submission mapping
+  (`_spec_entry_fields`, with a guard test that fails if a registry-facing
+  `RunSpec` field is left out); rerun/fork spec builders share
+  `_resource_spec_kwargs`; `_pull_unlocked` shrinks from 1004 to 427 lines
+  across `_validate_pull_destination`, `_probe_remote_outputs`,
+  `_prepare_pull_records_dir`, `_transfer_outputs`, `_transfer_run_logs`,
+  `_recover_runtime_evidence`, and `_rsync_with_status`, with one
+  `_PullPhaseError` replacing 21 hand-copied failure trailers; `dt info`
+  splits into payload assembly (307 lines) and `_render_info_table`, which
+  now reads from the same payload `--json` emits. Three helpers kept alive
+  only by their own tests were removed.
+- New regression pins: both gateway-relay fallback paths of `dt pull`, and a
+  guard that fails if a submission-shaping `dt run` option is declared but
+  not mirrored into the laptop forwarding chain.
+
 ## 0.13.3 — 2026-09-02
 
 ### Fixed

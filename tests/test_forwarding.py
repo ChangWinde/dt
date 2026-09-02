@@ -37,3 +37,52 @@ def test_head_command_invoke_passes_a_fresh_mutable_argv():
     assert command.invoke(call) == 5
     assert seen == [("head", ["info", "job", "--json", "--mutated"])]
     assert command.argv() == ["info", "job", "--json"]
+
+
+# -- laptop forwarding must mirror every submission-shaping option ----------------
+
+
+def _forwarded_flags(command_name: str) -> set[str]:
+    """Long/short flags the laptop branch of a command forwards to the head.
+
+    Forwarding is written by hand (`_head_command(...).option("--x", ...)`),
+    so a new typer option that is not mirrored here silently vanishes when the
+    command runs from a laptop. This reads the actual chain from the source.
+    """
+    import inspect
+    import re
+
+    from dt import cli
+
+    source = inspect.getsource(getattr(cli, command_name))
+    chain = source[source.index("_head_command(") :]
+    chain = chain[: chain.index(".passthrough(") if ".passthrough(" in chain else None]
+    return set(
+        re.findall(r'\.(?:option|repeat|flag)\(\s*"(-{1,2}[a-z][a-z0-9-]*)"', chain)
+    )
+
+
+def test_run_forwards_every_submission_shaping_option():
+    import inspect
+
+    import typer
+
+    from dt import cli
+
+    # Options consumed on the laptop itself, never meant for the head.
+    laptop_local = {"center", "follow", "poll", "lines"}
+    # Options whose value travels by another channel than a flag.
+    other_channel = {"environment"}  # names go inside the private stdin envelope
+    forwarded = _forwarded_flags("run")
+    missing = []
+    for name, param in inspect.signature(cli.run).parameters.items():
+        if not isinstance(param.default, typer.models.OptionInfo):
+            continue
+        if name in laptop_local or name in other_channel:
+            continue
+        decls = set(param.default.param_decls or ())
+        if not decls & forwarded:
+            missing.append(f"{name} {sorted(decls)}")
+    assert not missing, (
+        f"declared on `dt run` but never forwarded to the head: {missing}"
+    )
