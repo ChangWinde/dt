@@ -31,6 +31,7 @@ from typing import (
     Any,
     Callable,
     Iterable,
+    Mapping,
     NoReturn,
     Optional,
     TypeAlias,
@@ -13635,6 +13636,132 @@ def _pull_interrupted(
     raise typer.Exit(130)
 
 
+class _PullPhaseError(Exception):
+    """One pull phase failed; the orchestrator renders it with the shared
+    failure trailer (job identity, destination, confirmed records so far)."""
+
+    def __init__(self, kind: str, message: str, exit_code: int) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+        self.exit_code = exit_code
+
+
+def _recover_runtime_evidence(
+    entry: jobs_mod.JobEntry,
+    *,
+    ref: str,
+    records_dir: Path,
+    retries: int,
+    effective_bwlimit: int | None,
+    retry_events: list[JsonDict],
+    cancel_kwargs: Mapping[str, Any],
+    cancel_event: Event | None,
+    evidence_records: list[str],
+) -> str | None:
+    """Inventory and recover the worker's dt control evidence into records/.
+
+    Returns the evidence provenance (``control_path``, ``outputs``, ...), or
+    ``None`` when the worker reports none.  Each recovered file name is
+    appended to ``evidence_records`` *before* the next transfer so a later
+    phase failure still reports every file that did land locally.
+    """
+    try:
+        evidence_probe = run_on(
+            entry.node,
+            entry.node_local,
+            pull_evidence_mod.inventory_command(entry),
+            timeout=10,
+            cancel_event=cancel_event,
+        )
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        detail = " ".join(str(exc).split()) or type(exc).__name__
+        raise _PullPhaseError(
+            "unreachable",
+            f"cannot inventory runtime evidence on {entry.node}: {detail}",
+            EXIT_UNREACHABLE,
+        ) from exc
+    if evidence_probe.returncode != 0:
+        detail = " ".join(
+            (
+                evidence_probe.stderr
+                or evidence_probe.stdout
+                or f"evidence probe exited {evidence_probe.returncode}"
+            ).split()
+        )
+        unreachable = evidence_probe.returncode == 255
+        raise _PullPhaseError(
+            "unreachable" if unreachable else "evidence_unusable",
+            f"cannot inventory runtime evidence on {entry.node}: {detail}",
+            EXIT_UNREACHABLE if unreachable else 1,
+        )
+    try:
+        evidence_kind, evidence_names = pull_evidence_mod.parse_inventory(
+            evidence_probe.stdout or ""
+        )
+    except ValueError as exc:
+        raise _PullPhaseError("evidence_protocol", str(exc), 1) from exc
+    evidence_provenance = (
+        "control_path" if evidence_kind == "control" else evidence_kind
+    )
+    if evidence_provenance is None:
+        return None
+    evidence_root = (
+        f"{job_control_dir(entry.job_dir, entry.storage_layout)}/evidence"
+        if evidence_provenance == "control_path"
+        else f"{entry.job_dir}/outputs/dt"
+    )
+    for evidence_name in evidence_names:
+        evidence_source = rsync_destination(
+            entry.node,
+            entry.node_local,
+            f"{evidence_root}/{evidence_name}",
+            directory=False,
+        )
+        evidence_destination = records_dir / evidence_name
+        evidence_proc = rsync(
+            evidence_source,
+            str(evidence_destination),
+            timeout=4 * 3600,
+            retries=retries,
+            safe_links=True,
+            private_destination=True,
+            bwlimit_kbps=effective_bwlimit,
+            on_retry=_rsync_retry_observer(ref, "run_evidence", retry_events),
+            **cancel_kwargs,
+        )
+        if evidence_proc.returncode != 0:
+            detail = (
+                evidence_proc.stderr
+                or f"evidence rsync exited {evidence_proc.returncode}"
+            ).strip()
+            raise _PullPhaseError(
+                "evidence_transfer_failed",
+                f"cannot recover {evidence_name}: {detail}",
+                (
+                    EXIT_UNREACHABLE
+                    if evidence_proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES
+                    else 1
+                ),
+            )
+        if _rsync_skipped_non_regular(evidence_proc):
+            raise _PullPhaseError(
+                "unsafe_evidence",
+                f"runtime evidence {evidence_name} is not a regular file",
+                1,
+            )
+        try:
+            pull_evidence_mod.validate_file(evidence_destination, evidence_name)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            raise _PullPhaseError(
+                "evidence_invalid",
+                f"recovered {evidence_name} failed validation: {exc}",
+                1,
+            ) from exc
+        evidence_records.append(evidence_name)
+    return evidence_provenance
+
+
 def _pull_unlocked(
     ref: str = REF_ARG,
     to: Optional[str] = typer.Option(
@@ -14449,134 +14576,28 @@ def _pull_unlocked(
         )
 
     try:
-        evidence_probe = run_on(
-            entry.node,
-            entry.node_local,
-            pull_evidence_mod.inventory_command(entry),
-            timeout=10,
+        evidence_provenance = _recover_runtime_evidence(
+            entry,
+            ref=ref,
+            records_dir=records_dir,
+            retries=retries,
+            effective_bwlimit=effective_bwlimit,
+            retry_events=retry_events,
+            cancel_kwargs=cancel_kwargs,
             cancel_event=_cancel_event,
+            evidence_records=evidence_records,
         )
-    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
-        detail = " ".join(str(exc).split()) or type(exc).__name__
+    except _PullPhaseError as phase:
         fail(
-            "unreachable",
-            f"cannot inventory runtime evidence on {entry.node}: {detail}",
-            EXIT_UNREACHABLE,
+            phase.kind,
+            phase.message,
+            phase.exit_code,
             job_id=entry.job_id,
             node=entry.node,
             destination=str(dst),
             records=confirmed_records(logs_recovered=True),
             partial=True,
         )
-    if evidence_probe.returncode != 0:
-        detail = " ".join(
-            (
-                evidence_probe.stderr
-                or evidence_probe.stdout
-                or f"evidence probe exited {evidence_probe.returncode}"
-            ).split()
-        )
-        fail(
-            (
-                "unreachable"
-                if evidence_probe.returncode == 255
-                else "evidence_unusable"
-            ),
-            f"cannot inventory runtime evidence on {entry.node}: {detail}",
-            (EXIT_UNREACHABLE if evidence_probe.returncode == 255 else 1),
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            records=confirmed_records(logs_recovered=True),
-            partial=True,
-        )
-    try:
-        evidence_kind, evidence_names = pull_evidence_mod.parse_inventory(
-            evidence_probe.stdout or ""
-        )
-        evidence_provenance = (
-            "control_path" if evidence_kind == "control" else evidence_kind
-        )
-    except ValueError as exc:
-        fail(
-            "evidence_protocol",
-            str(exc),
-            1,
-            job_id=entry.job_id,
-            node=entry.node,
-            destination=str(dst),
-            records=confirmed_records(logs_recovered=True),
-            partial=True,
-        )
-    if evidence_provenance is not None:
-        evidence_root = (
-            f"{job_control_dir(entry.job_dir, entry.storage_layout)}/evidence"
-            if evidence_provenance == "control_path"
-            else f"{entry.job_dir}/outputs/dt"
-        )
-        for evidence_name in evidence_names:
-            evidence_source = rsync_destination(
-                entry.node,
-                entry.node_local,
-                f"{evidence_root}/{evidence_name}",
-                directory=False,
-            )
-            evidence_destination = records_dir / evidence_name
-            evidence_proc = rsync(
-                evidence_source,
-                str(evidence_destination),
-                timeout=4 * 3600,
-                retries=retries,
-                safe_links=True,
-                private_destination=True,
-                bwlimit_kbps=effective_bwlimit,
-                on_retry=_rsync_retry_observer(ref, "run_evidence", retry_events),
-                **cancel_kwargs,
-            )
-            if evidence_proc.returncode != 0:
-                detail = (
-                    evidence_proc.stderr
-                    or f"evidence rsync exited {evidence_proc.returncode}"
-                ).strip()
-                fail(
-                    "evidence_transfer_failed",
-                    f"cannot recover {evidence_name}: {detail}",
-                    (
-                        EXIT_UNREACHABLE
-                        if evidence_proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES
-                        else 1
-                    ),
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    destination=str(dst),
-                    records=confirmed_records(logs_recovered=True),
-                    partial=True,
-                )
-            if _rsync_skipped_non_regular(evidence_proc):
-                fail(
-                    "unsafe_evidence",
-                    f"runtime evidence {evidence_name} is not a regular file",
-                    1,
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    destination=str(dst),
-                    records=confirmed_records(logs_recovered=True),
-                    partial=True,
-                )
-            try:
-                pull_evidence_mod.validate_file(evidence_destination, evidence_name)
-            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
-                fail(
-                    "evidence_invalid",
-                    f"recovered {evidence_name} failed validation: {exc}",
-                    1,
-                    job_id=entry.job_id,
-                    node=entry.node,
-                    destination=str(dst),
-                    records=confirmed_records(logs_recovered=True),
-                    partial=True,
-                )
-            evidence_records.append(evidence_name)
 
     try:
         pull_evidence_mod.validate_materialized_tree(dst)
