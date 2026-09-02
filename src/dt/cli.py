@@ -10612,304 +10612,27 @@ def _info_actions(entry: jobs_mod.JobEntry) -> list[JsonDict]:
     return []
 
 
-def info(
-    ref: str = REF_ARG,
-    json_: bool = typer.Option(False, "--json"),
-    verbose: bool = typer.Option(
-        False,
-        "--verbose",
-        "-v",
-        help="show complete provenance, paths, launch details, and resource history",
-    ),
-    full_command: bool = typer.Option(
-        False,
-        "--full-command",
-        help="show the exact command in the human view",
-    ),
-    metrics_tail: int = typer.Option(
-        INFO_RESOURCE_TAIL,
-        "--metrics-tail",
-        help="include a summary of the last N resource samples (0 = all)",
-    ),
+def _render_info_table(
+    entry: jobs_mod.JobEntry,
+    data: JsonDict,
+    *,
+    display_ref: str,
+    display_refs: Mapping[str, str],
+    dirty_patch: bool,
+    verbose: bool,
+    full_command: bool,
 ) -> None:
-    """Show one job's state, progress, and recovery actions."""
-    if metrics_tail < 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--metrics-tail must be non-negative",
-            exit_code=1,
-            json_=json_,
-        )
-    cfg = _cfg()
-    if isinstance(cfg, LaptopConfig):
-        _, head = _locate(cfg, ref, json_=json_)
-        route = (
-            HeadCommand.start(head, "info", ref)
-            .flag("--json", json_)
-            .flag("--verbose", verbose)
-            .flag("--full-command", full_command)
-            .option(
-                "--metrics-tail",
-                metrics_tail if metrics_tail != INFO_RESOURCE_TAIL else None,
-            )
-        )
-        raise typer.Exit(route.invoke(forward_call))
-
-    # One registry decode serves ref resolution, display refs, and the queue
-    # context below; a partial ref used to trigger three full scans (QR-P3).
-    with jobs_mod.shared_resolution_snapshot(cfg):
-        if json_:
-            entry = jobs_mod.find(cfg, ref)
-            if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=EXIT_NOT_FOUND,
-                    json_=True,
-                )
-        else:
-            entry = _find_or_die(cfg, ref)
-        registry_snapshot = jobs_mod.resolution_entries(cfg)
-    display_refs = jobs_mod.compact_job_refs(registry_snapshot)
-    display_ref = display_refs.get(entry.job_id, entry.job_id)
-    initial_status = entry.status
-    placed_prestart_failure = (
-        initial_status == "failed"
-        and entry.node != "-"
-        and not _is_uncertain_launch(entry)
-        and _failed_start_has_env_log(entry)
-    )
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        status_future = (
-            pool.submit(jobs_mod.refresh_status, cfg, entry)
-            if initial_status in ("running", "lost")
-            else None
-        )
-        live_future = (
-            (
-                pool.submit(_info_live, entry)
-                if metrics_tail == INFO_RESOURCE_TAIL
-                else pool.submit(_info_live, entry, metrics_tail)
-            )
-            if entry.node != "-"
-            else None
-        )
-        resources_future = (
-            pool.submit(_job_resources, cfg, entry)
-            if initial_status == "running"
-            else None
-        )
-        failure_log_future = (
-            pool.submit(_read_failed_start_log, entry)
-            if placed_prestart_failure
-            else None
-        )
-        if status_future is not None:
-            entry = status_future.result()
-        live = live_future.result() if live_future is not None else {}
-        try:
-            resources = (
-                resources_future.result()
-                if resources_future is not None and entry.status == "running"
-                else None
-            )
-        except Exception as e:
-            resources = {"error": str(e)}
-        failure_log = (
-            failure_log_future.result() if failure_log_future is not None else None
-        )
-
-    live_started = live.get("started_at")
-    live_finished = live.get("finished_at")
-    started = live_started or entry.started_at
-    finished = live_finished or entry.finished_at
-    started_domain: str | None = (
-        "node"
-        if live_started is not None
-        else "registry"
-        if entry.started_at is not None
-        else None
-    )
-    finished_domain: str | None = (
-        "node"
-        if live_finished is not None
-        else "registry"
-        if entry.finished_at is not None
-        else None
-    )
-    duration_domain: str | None
-    if started and not finished and entry.status == "running":
-        duration = time.time() - started
-        duration_domain = "mixed"
-    elif started and finished:
-        duration = finished - started
-        duration_domain = (
-            started_domain if started_domain == finished_domain else "mixed"
-        )
-    else:
-        duration = None
-        duration_domain = None
-    timestamp_domains = {
-        "queued_at": "head",
-        "started_at": started_domain,
-        "finished_at": finished_domain,
-        "duration_s": duration_domain,
-    }
-    cross_clock_intervals_approximate = any(
-        domain in {"node", "registry", "mixed"}
-        for domain in (
-            timestamp_domains["started_at"],
-            timestamp_domains["finished_at"],
-            duration_domain,
-        )
-    )
-    resource_summary_error = None
-    try:
-        resource_summary = ResourceTelemetryQuery(entry, metrics_tail).summarize(
-            str(live.get("resource_text") or ""),
-            include_identity=False,
-        )
-    except ValueError:
-        resource_summary = None
-        resource_summary_error = "invalid_telemetry_summary_envelope"
-    phase_summary = _phase_summary_from_text(
-        entry,
-        str(live.get("phase_text") or ""),
-        finished_at=finished,
-        tail_limit=INFO_PHASE_TAIL,
-    )
-    queue_context: JsonDict = {
-        "queue_position": None,
-        "queue_depth": None,
-        "queue_ahead_count": None,
-        "queue_head_job_id": None,
-        "queue_predecessor_job_id": None,
-        "queue": None,
-    }
-    if entry.status == "queued":
-        queue_context.update(
-            jobs_mod.queue_contexts(registry_snapshot).get(entry.job_id, {})
-        )
-        queue_context["queue"] = jobs_mod.queue_placement_contexts(
-            cfg,
-            registry_snapshot,
-        ).get(entry.job_id)
-
-    data = {
-        "schema_version": "dt_job_info_v1",
-        "job_id": entry.job_id,
-        "name": entry.name,
-        "status": entry.status,
-        "reason": entry.reason,
-        "center": entry.center,
-        "node": entry.node,
-        "gpus": entry.gpus,
-        "gpus_requested": entry.gpus_requested,
-        "gpu_isolation": _gpu_isolation_contract(entry),
-        "cmd": entry.cmd,
-        "project": entry.project,
-        "git_sha": entry.git_sha,
-        "git_dirty": entry.git_dirty,
-        "submodule_commits": (
-            dict(entry.submodule_commits)
-            if entry.submodule_commits is not None
-            else None
-        ),
-        "snapshot_sha256": entry.snapshot_sha256,
-        "payload_sha256": entry.payload_sha256,
-        "artifact_manifest": entry.artifact_manifest,
-        "forked_from": entry.forked_from,
-        "request_id": entry.request_id,
-        "after_success": entry.after_success,
-        "after_complete": entry.after_complete,
-        "after_result": entry.after_result,
-        "after_result_states": list(entry.after_result_states),
-        "result_state": jobs_mod.effective_result_state(entry),
-        "actions": _info_actions(entry),
-        "rerun_of": entry.rerun_of,
-        "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
-        "rerun_snapshot_changed": entry.rerun_snapshot_changed,
-        "retry": {
-            "limit": entry.retry_limit,
-            "on": entry.retry_on or ("infra" if entry.retry_limit else None),
-            "attempt": entry.retry_count,
-            "retry_of": entry.retry_of,
-            "retried_by": entry.retried_by,
-        },
-        "code_pruned_at": entry.code_pruned_at,
-        "cache_reuse": (
-            {
-                "source_job_id": entry.cache_source_job,
-                "source_path": entry.cache_source_path,
-                "env_var": entry.cache_env,
-                "source_env_hash": entry.cache_source_env_hash,
-                "mode": entry.cache_mode or "shared",
-                **(
-                    {"runtime_path": "outputs/.cache/dt-clone"}
-                    if entry.cache_mode == "clone"
-                    else {}
-                ),
-            }
-            if entry.cache_source_job
-            else None
-        ),
-        "queued_at": entry.created_at,
-        "started_at": started,
-        "finished_at": finished,
-        "duration_s": duration,
-        "timestamp_domains": timestamp_domains,
-        "cross_clock_intervals_approximate": cross_clock_intervals_approximate,
-        "max_hours_exceeded": (
-            _max_hours_overdue(entry.max_hours, duration) is not None
-        ),
-        "max_hours_overdue_s": _max_hours_overdue(entry.max_hours, duration),
-        "exit_code": entry.exit_code,
-        "session": entry.session,
-        "job_dir": entry.job_dir,
-        "paths": _job_path_contract(cfg, entry),
-        "outputs_size": live.get("outputs_size"),
-        "env_hash": entry.env_hash,
-        "env_mode": entry.env_mode or "sync",
-        "env_source_job": entry.env_source_job,
-        "custom_env_keys": sorted(entry.custom_env),
-        "setup_inputs": entry.setup_inputs,
-        "extras": entry.extras,
-        "boot_id": entry.boot_id,
-        "max_hours": entry.max_hours,
-        "min_vram_mib": entry.min_vram_mib,
-        "max_vram_mib": entry.max_vram_mib,
-        "max_job_memory_mib": entry.max_job_memory_mib,
-        "resource_guard": live.get("resource_guard"),
-        "runtime_containment": live.get("runtime_containment"),
-        "runtime_linger": live.get("runtime_linger"),
-        "require_path": entry.require_path,
-        "require_disk_gib": entry.require_disk_gib,
-        "pin_node": entry.pin_node,
-        "placement_failures": dict(entry.placement_failures),
-        "node_unreachable": live.get("unreachable", False),
-        "resources": resources,
-        "resource_summary": resource_summary,
-        "resource_summary_error": resource_summary_error,
-        "phase_summary": phase_summary,
-        **queue_context,
-    }
-    for field in (
-        "snapshot_duration_s",
-        "launch_duration_s",
-        "env_preexisting",
-        "setup_ran",
-    ):
-        value = getattr(entry, field, None)
-        if value is not None:
-            data[field] = value
-    if entry.launch_phases_s:
-        data["launch_phases_s"] = dict(entry.launch_phases_s)
-    if failure_log is not None:
-        data["failure_log"] = failure_log
-    if json_:
-        print(json.dumps(data))
-        return
-
+    """Render the human ``dt info`` table from the same payload as --json."""
+    started = data["started_at"]
+    finished = data["finished_at"]
+    duration = data["duration_s"]
+    started_domain = data["timestamp_domains"]["started_at"]
+    finished_domain = data["timestamp_domains"]["finished_at"]
+    cross_clock_intervals_approximate = data["cross_clock_intervals_approximate"]
+    resources = data["resources"]
+    resource_summary = data["resource_summary"]
+    phase_summary = data["phase_summary"]
+    failure_log = data.get("failure_log")
     from rich.table import Table as RTable
     from rich.markup import escape
 
@@ -10938,11 +10661,7 @@ def info(
     else:
         gpus_txt = f"({entry.gpus_requested} wanted)"
     git_txt = (entry.git_sha or "-")[:12] + (
-        " +dirty.patch"
-        if live.get("dirty_patch")
-        else " (dirty)"
-        if entry.git_dirty
-        else ""
+        " +dirty.patch" if dirty_patch else " (dirty)" if entry.git_dirty else ""
     )
     rows = [
         ("name", escape(entry.name)),
@@ -11295,6 +11014,315 @@ def info(
     for k, v in rendered_rows:
         t.add_row(k, v)
     out.print(t)
+
+
+def info(
+    ref: str = REF_ARG,
+    json_: bool = typer.Option(False, "--json"),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="show complete provenance, paths, launch details, and resource history",
+    ),
+    full_command: bool = typer.Option(
+        False,
+        "--full-command",
+        help="show the exact command in the human view",
+    ),
+    metrics_tail: int = typer.Option(
+        INFO_RESOURCE_TAIL,
+        "--metrics-tail",
+        help="include a summary of the last N resource samples (0 = all)",
+    ),
+) -> None:
+    """Show one job's state, progress, and recovery actions."""
+    if metrics_tail < 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--metrics-tail must be non-negative",
+            exit_code=1,
+            json_=json_,
+        )
+    cfg = _cfg()
+    if isinstance(cfg, LaptopConfig):
+        _, head = _locate(cfg, ref, json_=json_)
+        route = (
+            HeadCommand.start(head, "info", ref)
+            .flag("--json", json_)
+            .flag("--verbose", verbose)
+            .flag("--full-command", full_command)
+            .option(
+                "--metrics-tail",
+                metrics_tail if metrics_tail != INFO_RESOURCE_TAIL else None,
+            )
+        )
+        raise typer.Exit(route.invoke(forward_call))
+
+    # One registry decode serves ref resolution, display refs, and the queue
+    # context below; a partial ref used to trigger three full scans (QR-P3).
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        if json_:
+            entry = jobs_mod.find(cfg, ref)
+            if entry is None:
+                _fail_submission(
+                    kind="not_found",
+                    message=f"no job matching {ref!r}",
+                    exit_code=EXIT_NOT_FOUND,
+                    json_=True,
+                )
+        else:
+            entry = _find_or_die(cfg, ref)
+        registry_snapshot = jobs_mod.resolution_entries(cfg)
+    display_refs = jobs_mod.compact_job_refs(registry_snapshot)
+    display_ref = display_refs.get(entry.job_id, entry.job_id)
+    initial_status = entry.status
+    placed_prestart_failure = (
+        initial_status == "failed"
+        and entry.node != "-"
+        and not _is_uncertain_launch(entry)
+        and _failed_start_has_env_log(entry)
+    )
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        status_future = (
+            pool.submit(jobs_mod.refresh_status, cfg, entry)
+            if initial_status in ("running", "lost")
+            else None
+        )
+        live_future = (
+            (
+                pool.submit(_info_live, entry)
+                if metrics_tail == INFO_RESOURCE_TAIL
+                else pool.submit(_info_live, entry, metrics_tail)
+            )
+            if entry.node != "-"
+            else None
+        )
+        resources_future = (
+            pool.submit(_job_resources, cfg, entry)
+            if initial_status == "running"
+            else None
+        )
+        failure_log_future = (
+            pool.submit(_read_failed_start_log, entry)
+            if placed_prestart_failure
+            else None
+        )
+        if status_future is not None:
+            entry = status_future.result()
+        live = live_future.result() if live_future is not None else {}
+        try:
+            resources = (
+                resources_future.result()
+                if resources_future is not None and entry.status == "running"
+                else None
+            )
+        except Exception as e:
+            resources = {"error": str(e)}
+        failure_log = (
+            failure_log_future.result() if failure_log_future is not None else None
+        )
+
+    live_started = live.get("started_at")
+    live_finished = live.get("finished_at")
+    started = live_started or entry.started_at
+    finished = live_finished or entry.finished_at
+    started_domain: str | None = (
+        "node"
+        if live_started is not None
+        else "registry"
+        if entry.started_at is not None
+        else None
+    )
+    finished_domain: str | None = (
+        "node"
+        if live_finished is not None
+        else "registry"
+        if entry.finished_at is not None
+        else None
+    )
+    duration_domain: str | None
+    if started and not finished and entry.status == "running":
+        duration = time.time() - started
+        duration_domain = "mixed"
+    elif started and finished:
+        duration = finished - started
+        duration_domain = (
+            started_domain if started_domain == finished_domain else "mixed"
+        )
+    else:
+        duration = None
+        duration_domain = None
+    timestamp_domains = {
+        "queued_at": "head",
+        "started_at": started_domain,
+        "finished_at": finished_domain,
+        "duration_s": duration_domain,
+    }
+    cross_clock_intervals_approximate = any(
+        domain in {"node", "registry", "mixed"}
+        for domain in (
+            timestamp_domains["started_at"],
+            timestamp_domains["finished_at"],
+            duration_domain,
+        )
+    )
+    resource_summary_error = None
+    try:
+        resource_summary = ResourceTelemetryQuery(entry, metrics_tail).summarize(
+            str(live.get("resource_text") or ""),
+            include_identity=False,
+        )
+    except ValueError:
+        resource_summary = None
+        resource_summary_error = "invalid_telemetry_summary_envelope"
+    phase_summary = _phase_summary_from_text(
+        entry,
+        str(live.get("phase_text") or ""),
+        finished_at=finished,
+        tail_limit=INFO_PHASE_TAIL,
+    )
+    queue_context: JsonDict = {
+        "queue_position": None,
+        "queue_depth": None,
+        "queue_ahead_count": None,
+        "queue_head_job_id": None,
+        "queue_predecessor_job_id": None,
+        "queue": None,
+    }
+    if entry.status == "queued":
+        queue_context.update(
+            jobs_mod.queue_contexts(registry_snapshot).get(entry.job_id, {})
+        )
+        queue_context["queue"] = jobs_mod.queue_placement_contexts(
+            cfg,
+            registry_snapshot,
+        ).get(entry.job_id)
+
+    data = {
+        "schema_version": "dt_job_info_v1",
+        "job_id": entry.job_id,
+        "name": entry.name,
+        "status": entry.status,
+        "reason": entry.reason,
+        "center": entry.center,
+        "node": entry.node,
+        "gpus": entry.gpus,
+        "gpus_requested": entry.gpus_requested,
+        "gpu_isolation": _gpu_isolation_contract(entry),
+        "cmd": entry.cmd,
+        "project": entry.project,
+        "git_sha": entry.git_sha,
+        "git_dirty": entry.git_dirty,
+        "submodule_commits": (
+            dict(entry.submodule_commits)
+            if entry.submodule_commits is not None
+            else None
+        ),
+        "snapshot_sha256": entry.snapshot_sha256,
+        "payload_sha256": entry.payload_sha256,
+        "artifact_manifest": entry.artifact_manifest,
+        "forked_from": entry.forked_from,
+        "request_id": entry.request_id,
+        "after_success": entry.after_success,
+        "after_complete": entry.after_complete,
+        "after_result": entry.after_result,
+        "after_result_states": list(entry.after_result_states),
+        "result_state": jobs_mod.effective_result_state(entry),
+        "actions": _info_actions(entry),
+        "rerun_of": entry.rerun_of,
+        "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
+        "rerun_snapshot_changed": entry.rerun_snapshot_changed,
+        "retry": {
+            "limit": entry.retry_limit,
+            "on": entry.retry_on or ("infra" if entry.retry_limit else None),
+            "attempt": entry.retry_count,
+            "retry_of": entry.retry_of,
+            "retried_by": entry.retried_by,
+        },
+        "code_pruned_at": entry.code_pruned_at,
+        "cache_reuse": (
+            {
+                "source_job_id": entry.cache_source_job,
+                "source_path": entry.cache_source_path,
+                "env_var": entry.cache_env,
+                "source_env_hash": entry.cache_source_env_hash,
+                "mode": entry.cache_mode or "shared",
+                **(
+                    {"runtime_path": "outputs/.cache/dt-clone"}
+                    if entry.cache_mode == "clone"
+                    else {}
+                ),
+            }
+            if entry.cache_source_job
+            else None
+        ),
+        "queued_at": entry.created_at,
+        "started_at": started,
+        "finished_at": finished,
+        "duration_s": duration,
+        "timestamp_domains": timestamp_domains,
+        "cross_clock_intervals_approximate": cross_clock_intervals_approximate,
+        "max_hours_exceeded": (
+            _max_hours_overdue(entry.max_hours, duration) is not None
+        ),
+        "max_hours_overdue_s": _max_hours_overdue(entry.max_hours, duration),
+        "exit_code": entry.exit_code,
+        "session": entry.session,
+        "job_dir": entry.job_dir,
+        "paths": _job_path_contract(cfg, entry),
+        "outputs_size": live.get("outputs_size"),
+        "env_hash": entry.env_hash,
+        "env_mode": entry.env_mode or "sync",
+        "env_source_job": entry.env_source_job,
+        "custom_env_keys": sorted(entry.custom_env),
+        "setup_inputs": entry.setup_inputs,
+        "extras": entry.extras,
+        "boot_id": entry.boot_id,
+        "max_hours": entry.max_hours,
+        "min_vram_mib": entry.min_vram_mib,
+        "max_vram_mib": entry.max_vram_mib,
+        "max_job_memory_mib": entry.max_job_memory_mib,
+        "resource_guard": live.get("resource_guard"),
+        "runtime_containment": live.get("runtime_containment"),
+        "runtime_linger": live.get("runtime_linger"),
+        "require_path": entry.require_path,
+        "require_disk_gib": entry.require_disk_gib,
+        "pin_node": entry.pin_node,
+        "placement_failures": dict(entry.placement_failures),
+        "node_unreachable": live.get("unreachable", False),
+        "resources": resources,
+        "resource_summary": resource_summary,
+        "resource_summary_error": resource_summary_error,
+        "phase_summary": phase_summary,
+        **queue_context,
+    }
+    for field in (
+        "snapshot_duration_s",
+        "launch_duration_s",
+        "env_preexisting",
+        "setup_ran",
+    ):
+        value = getattr(entry, field, None)
+        if value is not None:
+            data[field] = value
+    if entry.launch_phases_s:
+        data["launch_phases_s"] = dict(entry.launch_phases_s)
+    if failure_log is not None:
+        data["failure_log"] = failure_log
+    if json_:
+        print(json.dumps(data))
+        return
+
+    _render_info_table(
+        entry,
+        data,
+        display_ref=display_ref,
+        display_refs=display_refs,
+        dirty_patch=bool(live.get("dirty_patch")),
+        verbose=verbose,
+        full_command=full_command,
+    )
 
 
 def diagnose(
