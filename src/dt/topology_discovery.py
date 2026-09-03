@@ -1169,6 +1169,109 @@ class TopologyDiscovery:
             )
         return sample
 
+    def _settle_endpoint_circuit(
+        self,
+        site: Site,
+        source: Node,
+        endpoint_key: str,
+        endpoint_prior: RouteCircuitDecision,
+        *,
+        candidate: DirectEndpoint,
+        healthy: bool,
+        kind: str,
+    ) -> str | None:
+        """Record one endpoint probe; return a half-open claim to carry forward."""
+        try:
+            if healthy:
+                if endpoint_prior.failures > 0 and (
+                    endpoint_prior.last_kind or ""
+                ).startswith("probe."):
+                    self.route_health.record_success(
+                        site,
+                        source.name,
+                        endpoint_key,
+                        endpoint_prior.reservation_token,
+                    )
+                    return None
+                # A control probe proves reachability, not sustained bulk
+                # health. Preserve a transfer-failure half-open claim until the
+                # selected artifact transfer settles this exact address.
+                return endpoint_prior.reservation_token
+            if kind in ROUTE_TRANSPORT_FAILURE_KINDS:
+                self.route_health.record_failure(
+                    site,
+                    source.name,
+                    endpoint_key,
+                    f"probe.{kind}",
+                    endpoint_prior.reservation_token,
+                )
+            else:
+                self.route_health.release_reservation(
+                    site,
+                    source.name,
+                    endpoint_key,
+                    endpoint_prior.reservation_token,
+                )
+        except RouteHealthError as exc:
+            raise TopologyDiscoveryError(
+                f"direct endpoint {candidate.destination} circuit update failed"
+            ) from exc
+        return None
+
+    def _settle_route_circuit(
+        self,
+        site: Site,
+        source: Node,
+        destination: Node,
+        prior: RouteCircuitDecision,
+        *,
+        healthy: bool,
+        kind: str,
+    ) -> str | None:
+        """Record the aggregate route outcome; return a claim to carry forward."""
+        try:
+            if healthy:
+                if prior.failures > 0 and (prior.last_kind or "").startswith("probe."):
+                    self.route_health.record_success(
+                        site,
+                        source.name,
+                        destination.name,
+                        prior.reservation_token,
+                    )
+                    return None
+                # A healthy probe does not erase a prior bulk-transfer failure,
+                # so decision()'s half-open claim stays held for the transfer
+                # expected to follow. Remember it: if this scope never runs
+                # that transfer, the claim must be released, or a read-only
+                # probe leaves a healthy edge circuit-open for a full cooldown.
+                return prior.reservation_token
+            if kind in ROUTE_TRANSPORT_FAILURE_KINDS:
+                self.route_health.record_failure(
+                    site,
+                    source.name,
+                    destination.name,
+                    f"probe.{kind}",
+                    prior.reservation_token,
+                )
+            elif prior.failures > 0:
+                # A half-open claimant temporarily renews open_until to exclude
+                # a retry herd. Reaching a deterministic auth or trust outcome
+                # proves that this is no longer a network-edge failure, so
+                # release that reservation and keep the actionable error
+                # visible to subsequent callers.
+                self.route_health.release_reservation(
+                    site,
+                    source.name,
+                    destination.name,
+                    prior.reservation_token,
+                )
+        except RouteHealthError as exc:
+            raise TopologyDiscoveryError(
+                f"direct route {source.name} -> {destination.name} circuit "
+                "update failed"
+            ) from exc
+        return None
+
     def _direct_route_probe(
         self,
         source: Node,
@@ -1259,44 +1362,15 @@ class TopologyDiscovery:
                 attempted = True
                 endpoint = candidate
                 healthy, latency_ms, kind = self.probe_route(source, candidate)
-                try:
-                    if healthy:
-                        if endpoint_prior.failures > 0 and (
-                            endpoint_prior.last_kind or ""
-                        ).startswith("probe."):
-                            self.route_health.record_success(
-                                site,
-                                source.name,
-                                endpoint_key,
-                                endpoint_prior.reservation_token,
-                            )
-                        elif endpoint_prior.reservation_token is not None:
-                            # A control probe proves reachability, not sustained
-                            # bulk health. Preserve a transfer-failure half-open
-                            # claim until the selected artifact transfer settles
-                            # this exact address.
-                            endpoint_reservation_token = (
-                                endpoint_prior.reservation_token
-                            )
-                    elif kind in ROUTE_TRANSPORT_FAILURE_KINDS:
-                        self.route_health.record_failure(
-                            site,
-                            source.name,
-                            endpoint_key,
-                            f"probe.{kind}",
-                            endpoint_prior.reservation_token,
-                        )
-                    else:
-                        self.route_health.release_reservation(
-                            site,
-                            source.name,
-                            endpoint_key,
-                            endpoint_prior.reservation_token,
-                        )
-                except RouteHealthError as exc:
-                    raise TopologyDiscoveryError(
-                        f"direct endpoint {candidate.destination} circuit update failed"
-                    ) from exc
+                endpoint_reservation_token = self._settle_endpoint_circuit(
+                    site,
+                    source,
+                    endpoint_key,
+                    endpoint_prior,
+                    candidate=candidate,
+                    healthy=healthy,
+                    kind=kind,
+                )
                 if healthy or kind not in ROUTE_TRANSPORT_FAILURE_KINDS:
                     break
             if not attempted:
@@ -1305,63 +1379,22 @@ class TopologyDiscovery:
                 # failure memory while this message remains route-oriented.
                 decision = max(endpoint_open, key=lambda item: item.retry_after_s)
                 raise RouteCircuitOpen(source.name, destination.name, decision)
-            try:
-                if healthy:
-                    if prior.failures > 0 and (prior.last_kind or "").startswith(
-                        "probe."
-                    ):
-                        self.route_health.record_success(
-                            site,
-                            source.name,
-                            destination.name,
-                            prior.reservation_token,
-                        )
-                    elif prior.reservation_token is not None:
-                        # A healthy probe does not erase a prior bulk-transfer
-                        # failure, so decision()'s half-open claim stays held
-                        # for the transfer expected to follow. Remember it:
-                        # if this scope never runs that transfer, the claim
-                        # must be released, or a read-only probe leaves a
-                        # healthy edge circuit-open for a full cooldown.
-                        aggregate_reservation_token = prior.reservation_token
-                elif kind in ROUTE_TRANSPORT_FAILURE_KINDS:
-                    self.route_health.record_failure(
-                        site,
-                        source.name,
-                        destination.name,
-                        f"probe.{kind}",
-                        prior.reservation_token,
+            aggregate_reservation_token = self._settle_route_circuit(
+                site, source, destination, prior, healthy=healthy, kind=kind
+            )
+            if (
+                aggregate_reservation_token is not None
+                or endpoint_reservation_token is not None
+            ):
+                with self._route_lock:
+                    self._carried_reservations[
+                        (site.name, source.name, destination.name)
+                    ] = _CarriedRouteReservations(
+                        site=site,
+                        aggregate_token=aggregate_reservation_token,
+                        endpoint_destination=endpoint_key,
+                        endpoint_token=endpoint_reservation_token,
                     )
-                elif prior.failures > 0:
-                    # A half-open claimant temporarily renews open_until to
-                    # exclude a retry herd. Reaching a deterministic auth or
-                    # trust outcome proves that this is no longer a network-
-                    # edge failure, so release that reservation and keep the
-                    # actionable error visible to subsequent callers.
-                    self.route_health.release_reservation(
-                        site,
-                        source.name,
-                        destination.name,
-                        prior.reservation_token,
-                    )
-                if (
-                    aggregate_reservation_token is not None
-                    or endpoint_reservation_token is not None
-                ):
-                    with self._route_lock:
-                        self._carried_reservations[
-                            (site.name, source.name, destination.name)
-                        ] = _CarriedRouteReservations(
-                            site=site,
-                            aggregate_token=aggregate_reservation_token,
-                            endpoint_destination=endpoint_key,
-                            endpoint_token=endpoint_reservation_token,
-                        )
-            except RouteHealthError as exc:
-                raise TopologyDiscoveryError(
-                    f"direct route {source.name} -> {destination.name} circuit "
-                    "update failed"
-                ) from exc
             result = (endpoint, healthy, latency_ms, kind)
         except BaseException as exc:
             # Any failure before the outer route decision is settled must not
