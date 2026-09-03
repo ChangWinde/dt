@@ -2140,12 +2140,7 @@ def _submit_entry(
     except (DispatchError, ConfigError) as e:
         _fail_from_submission_error(e, json_=json_)
 
-    agent_started = None
-    if entry.status == "queued":
-        from . import agent as agent_mod
-
-        if agent_mod.alive_pid(cfg) is None:
-            agent_started = agent_mod.start_detached(cfg)
+    agent_started = _ensure_agent_for(cfg, entry)
     return entry, agent_started
 
 
@@ -4152,6 +4147,20 @@ class _GroupOutcome:
         self.failure, self.failure_code, _entry = _batch_error(exc, **kwargs)
 
 
+def _ensure_agent_for(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> bool | None:
+    """Start the resident agent when ``entry`` queued behind none.
+
+    Returns None when no start was needed, else start_detached's verdict.
+    """
+    if entry.status != "queued":
+        return None
+    from . import agent as agent_mod
+
+    if agent_mod.alive_pid(cfg) is not None:
+        return None
+    return agent_mod.start_detached(cfg)
+
+
 def _group_ensure_agent(
     cfg: HeadConfig,
     outcome: _GroupOutcome,
@@ -4160,11 +4169,8 @@ def _group_ensure_agent(
     """Start the resident agent once if a group member is queued."""
     if entry.status != "queued" or outcome.agent_checked:
         return
-    from . import agent as agent_mod
-
     outcome.agent_checked = True
-    if agent_mod.alive_pid(cfg) is None:
-        outcome.agent_started = agent_mod.start_detached(cfg)
+    outcome.agent_started = _ensure_agent_for(cfg, entry)
 
 
 def _record_group_job(
@@ -13045,12 +13051,7 @@ def rerun(
     except (DispatchError, ConfigError) as e:
         _fail_from_submission_error(e, json_=json_)
 
-    agent_started = None
-    if entry.status == "queued":
-        from . import agent as agent_mod
-
-        if agent_mod.alive_pid(cfg) is None:
-            agent_started = agent_mod.start_detached(cfg)
+    agent_started = _ensure_agent_for(cfg, entry)
     if json_:
         extra = {}
         if agent_started is not None:
@@ -13220,12 +13221,7 @@ def exec_job(
             no_capacity_message="source node cannot take the diagnostic job",
         )
 
-    agent_started = None
-    if entry.status == "queued":
-        from . import agent as agent_mod
-
-        if agent_mod.alive_pid(cfg) is None:
-            agent_started = agent_mod.start_detached(cfg)
+    agent_started = _ensure_agent_for(cfg, entry)
     if json_:
         payload = _submission_payload(
             entry,
@@ -13646,12 +13642,7 @@ def fork(
     except (DispatchError, ConfigError) as exc:
         _fail_from_submission_error(exc, json_=json_)
 
-    agent_started = None
-    if entry.status == "queued":
-        from . import agent as agent_mod
-
-        if agent_mod.alive_pid(cfg) is None:
-            agent_started = agent_mod.start_detached(cfg)
+    agent_started = _ensure_agent_for(cfg, entry)
 
     exact = bool(old.snapshot_sha256 and entry.snapshot_sha256 == old.snapshot_sha256)
     if json_:
