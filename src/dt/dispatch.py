@@ -6026,6 +6026,30 @@ def _submit_prepared_once(
             stored = source_factory()
         return stored
 
+    def unplaced_entry(**outcome: Any) -> JobEntry:
+        """Registry row for a job that did not launch now (queued or skipped)."""
+        return JobEntry(
+            job_id=job_id,
+            **_spec_entry_fields(
+                cfg,
+                spec,
+                git_sha=git_sha,
+                git_dirty=git_dirty,
+                submodule_commits=submodule_commits,
+            ),
+            node="-",
+            node_local=False,
+            job_dir=job_dir,
+            session=session,
+            payload_sha256=runtime_sha256,
+            created_at=submitted_at,
+            env_hash=spec.env_hash_override,
+            worker_root=submit_worker_root,
+            worker_roots=dict(submit_worker_roots),
+            job_relpath=job_relpath,
+            **outcome,
+        )
+
     def enqueue(why: str, *, reason: str | None = None) -> JobEntry:
         log(f"{why}; queueing (agent retries automatically)")
         source = exact_source()
@@ -6043,34 +6067,14 @@ def _submit_prepared_once(
         if not isinstance(staged_snapshot_sha256, str):
             remove_staging(cfg, job_id)
             raise DispatchError("staging completed without a snapshot identity")
-        entry = JobEntry(
-            job_id=job_id,
-            **_spec_entry_fields(
-                cfg,
-                spec,
-                git_sha=git_sha,
-                git_dirty=git_dirty,
-                submodule_commits=submodule_commits,
-            ),
-            node="-",
-            node_local=False,
-            job_dir=job_dir,
-            session=session,
-            gpus=[],
-            pgid=None,
+        entry = unplaced_entry(
             status="queued",
             snapshot_sha256=staged_snapshot_sha256,
-            payload_sha256=runtime_sha256,
             reason=reason,
-            created_at=submitted_at,
-            env_hash=spec.env_hash_override,
             rerun_snapshot_changed=_rerun_snapshot_changed(
                 spec,
                 staged_snapshot_sha256,
             ),
-            worker_root=submit_worker_root,
-            worker_roots=dict(submit_worker_roots),
-            job_relpath=job_relpath,
         )
         save(cfg, entry)
         request_agent_wake(cfg)
@@ -6078,30 +6082,11 @@ def _submit_prepared_once(
 
     def skip_dependency(reason: str) -> JobEntry:
         """Record a false dependency predicate without staging runnable code."""
-        finished_at = time.time()
-        entry = JobEntry(
-            job_id=job_id,
-            **_spec_entry_fields(
-                cfg,
-                spec,
-                git_sha=git_sha,
-                git_dirty=git_dirty,
-                submodule_commits=submodule_commits,
-            ),
-            node="-",
-            node_local=False,
-            job_dir=job_dir,
-            session=session,
+        entry = unplaced_entry(
             status="skipped",
             result_state="dependency_skipped",
-            payload_sha256=runtime_sha256,
-            created_at=submitted_at,
-            finished_at=finished_at,
+            finished_at=time.time(),
             reason=reason,
-            env_hash=spec.env_hash_override,
-            worker_root=submit_worker_root,
-            worker_roots=dict(submit_worker_roots),
-            job_relpath=job_relpath,
         )
         save(cfg, entry)
         return entry
@@ -6985,6 +6970,233 @@ def _queued_node(cfg: HeadConfig, entry: JobEntry, node: Node) -> Node:
     )
 
 
+def _finish_queued_placement(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    placed: JobEntry,
+) -> tuple[str, str | None]:
+    """Publish a placed queued job, honouring a dequeue that raced the launch.
+
+    ``entry`` is updated in place to the registry's final row.
+    """
+    placed.git_sha, placed.git_dirty = entry.git_sha, entry.git_dirty
+    placed.submodule_commits = (
+        dict(entry.submodule_commits) if entry.submodule_commits is not None else None
+    )
+    current = _commit_queued_transition(
+        cfg,
+        placed,
+        expected_attempt=(entry.dispatch_node, entry.dispatch_token),
+    )
+    if current is not None and current.status == "killed":
+        if placed.status == "finished":
+            restored = _restore_finished_after_raced_dequeue(cfg, placed)
+            entry.__dict__.update(restored.__dict__)
+            remove_staging(cfg, entry.job_id)
+            return _existing_dispatch_outcome(restored)
+        # User dequeued mid-dispatch. Keep the fast CLI response, but only
+        # retain killed after a positive remote death verdict.
+        cancel_error = _cancel_placed_launch(placed)
+        if cancel_error is not None:
+            restored = _restore_running_after_cancel_failure(
+                cfg,
+                placed,
+                cancel_error,
+            )
+            entry.__dict__.update(restored.__dict__)
+            remove_staging(cfg, entry.job_id)
+            if restored.status == "running":
+                return "cancel-failed", f"{placed.node}: {cancel_error}"
+            return _existing_dispatch_outcome(restored)
+        recorded = _record_cancelled_inflight_launch(
+            cfg,
+            current,
+            placed,
+        )
+        entry.__dict__.update(recorded.__dict__)
+        remove_staging(cfg, entry.job_id)
+        if recorded.status == "killed":
+            return "killed", placed.node
+        return _existing_dispatch_outcome(recorded)
+    if current is not None:
+        entry.__dict__.update(current.__dict__)
+        remove_staging(cfg, entry.job_id)
+        return _existing_dispatch_outcome(current)
+    entry.__dict__.update(placed.__dict__)
+    remove_staging(cfg, entry.job_id)
+    return _existing_dispatch_outcome(placed)
+
+
+def _sync_queued_job_to_node(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    node: Node,
+    *,
+    node_job_dir: str,
+    staging: Path,
+    staged_code: Path,
+    staged_payload_dir: Path,
+    log: Callable[[str], None],
+) -> str:
+    """Ship a staged queued job to ``node`` and return its verified code identity."""
+    run_on(
+        node.name,
+        node.local,
+        _private_remote_directories(
+            node_job_dir,
+            f"{node_job_dir}/logs",
+        ),
+        timeout=15,
+        check=True,
+    )
+    role_layout = entry.storage_layout == ROLE_LAYOUT
+    verified_observed: str | None = None
+    link_dest, copy_dest = _snapshot_baselines(
+        cfg,
+        entry.project,
+        node,
+        whole_job=not role_layout,
+        job_dir=node_job_dir,
+    )
+    with _stable_snapshot_copy_dest(
+        cfg,
+        entry.project,
+        node,
+        copy_dest,
+        whole_job=not role_layout,
+        job_dir=node_job_dir,
+    ) as stable_copy_dest:
+        if copy_dest is not None and stable_copy_dest is None:
+            log(
+                f"sync cache busy on {node.name}; queued snapshot "
+                "continuing without cache baseline"
+            )
+        site = cfg.sites.get(node.site or "")
+        topology_delivery = (
+            role_layout
+            and entry.snapshot_sha256 is not None
+            and site is not None
+            and site.artifact_policy in {"site-cache-first", "topology-aware"}
+        )
+        if topology_delivery:
+            if entry.snapshot_sha256 is None or site is None:
+                raise DispatchError("invalid queued topology transfer state")
+            if link_dest is not None:
+                raise DispatchError(
+                    "site-cache transfer cannot use a hard-link baseline"
+                )
+            try:
+                TransferExecutor(cfg).ensure(
+                    staged_code,
+                    entry.snapshot_sha256,
+                    node,
+                    f"{node_job_dir}/code",
+                    copy_dest=stable_copy_dest,
+                    on_retry=_retry_logger(
+                        log,
+                        site.cache_node,
+                        "queued site cache upload",
+                    ),
+                    log=log,
+                )
+            except (DistributionError, ConfigError, OSError) as exc:
+                raise DispatchError(str(exc)) from exc
+            proc = subprocess.CompletedProcess([], 0, "", "")
+            verified_observed = entry.snapshot_sha256
+        elif role_layout:
+
+            def transfer_queued_code(
+                checksum: bool,
+            ) -> subprocess.CompletedProcess[str]:
+                return rsync(
+                    f"{staged_code}/",
+                    _code_endpoint(node, node_job_dir),
+                    link_dest=link_dest,
+                    copy_dest=stable_copy_dest,
+                    timeout=BULK_TRANSFER_TIMEOUT_S,
+                    retries=2,
+                    on_retry=_retry_logger(log, node.name, "queued snapshot"),
+                    checksum=checksum,
+                    delete=True,
+                )
+
+            proc, verified_observed = _verified_tree_transfer(
+                transfer_queued_code,
+                lambda: _remote_tree_sha256(node, f"{node_job_dir}/code"),
+                expected_sha256=entry.snapshot_sha256,
+                label=f"queued snapshot to {node.name}",
+                log=log,
+            )
+        else:
+            proc = rsync(
+                f"{staging}/",
+                _job_dst(node, node_job_dir),
+                link_dest=link_dest,
+                copy_dest=stable_copy_dest,
+                timeout=BULK_TRANSFER_TIMEOUT_S,
+                retries=2,
+                on_retry=_retry_logger(log, node.name, "queued snapshot"),
+                checksum=True,
+            )
+    if proc.returncode != 0:
+        raise DispatchError(f"snapshot to {node.name} failed: {proc.stderr.strip()}")
+    if role_layout:
+        proc = rsync(
+            f"{staging}/",
+            _job_dst(node, node_job_dir),
+            timeout=60,
+            retries=2,
+            on_retry=_retry_logger(log, node.name, "queued support"),
+            private_destination=True,
+        )
+        if proc.returncode == 0:
+            proc = rsync(
+                f"{staged_payload_dir}/",
+                rsync_destination(
+                    node.name,
+                    node.local,
+                    job_payload_dir(node_job_dir, ROLE_LAYOUT),
+                    directory=True,
+                ),
+                timeout=60,
+                retries=2,
+                on_retry=_retry_logger(log, node.name, "queued payload"),
+                private_destination=True,
+            )
+    else:
+        # A previous transfer attempt (or accidental inspection of the
+        # remote worktree) may have left generated files under code/.
+        proc = rsync(
+            f"{staging}/code/",
+            _code_endpoint(node, node_job_dir),
+            delete=True,
+            timeout=BULK_TRANSFER_TIMEOUT_S,
+            retries=2,
+            on_retry=_retry_logger(log, node.name, "queued code convergence"),
+            checksum=True,
+        )
+    if proc.returncode != 0:
+        raise DispatchError(
+            f"code convergence on {node.name} failed: {proc.stderr.strip()}"
+        )
+    observed = (
+        verified_observed
+        if role_layout
+        else _remote_tree_sha256(node, f"{node_job_dir}/code")
+    )
+    if observed is None:
+        raise DispatchError(
+            f"queued snapshot to {node.name} has no verified content identity"
+        )
+    if entry.snapshot_sha256 and observed != entry.snapshot_sha256:
+        raise DispatchError(
+            f"queued snapshot changed in transit to {node.name}: "
+            f"expected {entry.snapshot_sha256}, observed {observed}"
+        )
+    _remember_snapshot(cfg, entry.project, node, entry.job_id)
+    return observed
+
+
 def _dispatch_queued_active(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -7137,56 +7349,6 @@ def _dispatch_queued_active(
             return cfg.worker_job_dir(node, entry.job_id)
         return entry.job_dir
 
-    def finish_placement(placed: JobEntry) -> tuple[str, str | None]:
-        placed.git_sha, placed.git_dirty = entry.git_sha, entry.git_dirty
-        placed.submodule_commits = (
-            dict(entry.submodule_commits)
-            if entry.submodule_commits is not None
-            else None
-        )
-        current = _commit_queued_transition(
-            cfg,
-            placed,
-            expected_attempt=(entry.dispatch_node, entry.dispatch_token),
-        )
-        if current is not None and current.status == "killed":
-            if placed.status == "finished":
-                restored = _restore_finished_after_raced_dequeue(cfg, placed)
-                entry.__dict__.update(restored.__dict__)
-                remove_staging(cfg, entry.job_id)
-                return _existing_dispatch_outcome(restored)
-            # User dequeued mid-dispatch. Keep the fast CLI response, but only
-            # retain killed after a positive remote death verdict.
-            cancel_error = _cancel_placed_launch(placed)
-            if cancel_error is not None:
-                restored = _restore_running_after_cancel_failure(
-                    cfg,
-                    placed,
-                    cancel_error,
-                )
-                entry.__dict__.update(restored.__dict__)
-                remove_staging(cfg, entry.job_id)
-                if restored.status == "running":
-                    return "cancel-failed", f"{placed.node}: {cancel_error}"
-                return _existing_dispatch_outcome(restored)
-            recorded = _record_cancelled_inflight_launch(
-                cfg,
-                current,
-                placed,
-            )
-            entry.__dict__.update(recorded.__dict__)
-            remove_staging(cfg, entry.job_id)
-            if recorded.status == "killed":
-                return "killed", placed.node
-            return _existing_dispatch_outcome(recorded)
-        if current is not None:
-            entry.__dict__.update(current.__dict__)
-            remove_staging(cfg, entry.job_id)
-            return _existing_dispatch_outcome(current)
-        entry.__dict__.update(placed.__dict__)
-        remove_staging(cfg, entry.job_id)
-        return _existing_dispatch_outcome(placed)
-
     if entry.dispatch_node is not None:
         hold_reason = _dispatch_claim_hold_reason(entry)
         if hold_reason is not None:
@@ -7222,7 +7384,7 @@ def _dispatch_queued_active(
                 f"recovered {adopted.status} launch on {attempted_node.name} "
                 "before resynchronizing"
             )
-            return finish_placement(adopted)
+            return _finish_queued_placement(cfg, entry, adopted)
         if recovery_error is not None:
             detail = f"dispatch recovery unverified on {attempted_node.name}: {recovery_error}"
             entry.reason = f"blocked: {detail}"
@@ -7325,165 +7487,16 @@ def _dispatch_queued_active(
     candidates = [_queued_node(cfg, entry, node) for node in candidates]
 
     def sync_to_node(node: Node) -> str:
-        node_job_dir = job_dir_for_node(node)
-        run_on(
-            node.name,
-            node.local,
-            _private_remote_directories(
-                node_job_dir,
-                f"{node_job_dir}/logs",
-            ),
-            timeout=15,
-            check=True,
-        )
-        role_layout = entry.storage_layout == ROLE_LAYOUT
-        verified_observed: str | None = None
-        link_dest, copy_dest = _snapshot_baselines(
+        return _sync_queued_job_to_node(
             cfg,
-            entry.project,
+            entry,
             node,
-            whole_job=not role_layout,
-            job_dir=node_job_dir,
+            node_job_dir=job_dir_for_node(node),
+            staging=staging,
+            staged_code=staged_code,
+            staged_payload_dir=staged_payload_dir,
+            log=log,
         )
-        with _stable_snapshot_copy_dest(
-            cfg,
-            entry.project,
-            node,
-            copy_dest,
-            whole_job=not role_layout,
-            job_dir=node_job_dir,
-        ) as stable_copy_dest:
-            if copy_dest is not None and stable_copy_dest is None:
-                log(
-                    f"sync cache busy on {node.name}; queued snapshot "
-                    "continuing without cache baseline"
-                )
-            site = cfg.sites.get(node.site or "")
-            topology_delivery = (
-                role_layout
-                and entry.snapshot_sha256 is not None
-                and site is not None
-                and site.artifact_policy in {"site-cache-first", "topology-aware"}
-            )
-            if topology_delivery:
-                if entry.snapshot_sha256 is None or site is None:
-                    raise DispatchError("invalid queued topology transfer state")
-                if link_dest is not None:
-                    raise DispatchError(
-                        "site-cache transfer cannot use a hard-link baseline"
-                    )
-                try:
-                    TransferExecutor(cfg).ensure(
-                        staged_code,
-                        entry.snapshot_sha256,
-                        node,
-                        f"{node_job_dir}/code",
-                        copy_dest=stable_copy_dest,
-                        on_retry=_retry_logger(
-                            log,
-                            site.cache_node,
-                            "queued site cache upload",
-                        ),
-                        log=log,
-                    )
-                except (DistributionError, ConfigError, OSError) as exc:
-                    raise DispatchError(str(exc)) from exc
-                proc = subprocess.CompletedProcess([], 0, "", "")
-                verified_observed = entry.snapshot_sha256
-            elif role_layout:
-
-                def transfer_queued_code(
-                    checksum: bool,
-                ) -> subprocess.CompletedProcess[str]:
-                    return rsync(
-                        f"{staged_code}/",
-                        _code_endpoint(node, node_job_dir),
-                        link_dest=link_dest,
-                        copy_dest=stable_copy_dest,
-                        timeout=BULK_TRANSFER_TIMEOUT_S,
-                        retries=2,
-                        on_retry=_retry_logger(log, node.name, "queued snapshot"),
-                        checksum=checksum,
-                        delete=True,
-                    )
-
-                proc, verified_observed = _verified_tree_transfer(
-                    transfer_queued_code,
-                    lambda: _remote_tree_sha256(node, f"{node_job_dir}/code"),
-                    expected_sha256=entry.snapshot_sha256,
-                    label=f"queued snapshot to {node.name}",
-                    log=log,
-                )
-            else:
-                proc = rsync(
-                    f"{staging}/",
-                    _job_dst(node, node_job_dir),
-                    link_dest=link_dest,
-                    copy_dest=stable_copy_dest,
-                    timeout=BULK_TRANSFER_TIMEOUT_S,
-                    retries=2,
-                    on_retry=_retry_logger(log, node.name, "queued snapshot"),
-                    checksum=True,
-                )
-        if proc.returncode != 0:
-            raise DispatchError(
-                f"snapshot to {node.name} failed: {proc.stderr.strip()}"
-            )
-        if role_layout:
-            proc = rsync(
-                f"{staging}/",
-                _job_dst(node, node_job_dir),
-                timeout=60,
-                retries=2,
-                on_retry=_retry_logger(log, node.name, "queued support"),
-                private_destination=True,
-            )
-            if proc.returncode == 0:
-                proc = rsync(
-                    f"{staged_payload_dir}/",
-                    rsync_destination(
-                        node.name,
-                        node.local,
-                        job_payload_dir(node_job_dir, ROLE_LAYOUT),
-                        directory=True,
-                    ),
-                    timeout=60,
-                    retries=2,
-                    on_retry=_retry_logger(log, node.name, "queued payload"),
-                    private_destination=True,
-                )
-        else:
-            # A previous transfer attempt (or accidental inspection of the
-            # remote worktree) may have left generated files under code/.
-            proc = rsync(
-                f"{staging}/code/",
-                _code_endpoint(node, node_job_dir),
-                delete=True,
-                timeout=BULK_TRANSFER_TIMEOUT_S,
-                retries=2,
-                on_retry=_retry_logger(log, node.name, "queued code convergence"),
-                checksum=True,
-            )
-        if proc.returncode != 0:
-            raise DispatchError(
-                f"code convergence on {node.name} failed: {proc.stderr.strip()}"
-            )
-        observed = (
-            verified_observed
-            if role_layout
-            else _remote_tree_sha256(node, f"{node_job_dir}/code")
-        )
-        if observed is None:
-            raise DispatchError(
-                f"queued snapshot to {node.name} has no verified content identity"
-            )
-        if entry.snapshot_sha256 and observed != entry.snapshot_sha256:
-            raise DispatchError(
-                f"queued snapshot changed in transit to {node.name}: "
-                f"expected {entry.snapshot_sha256}, observed {observed}"
-            )
-        _remember_snapshot(cfg, entry.project, node, entry.job_id)
-        return observed
 
     def record_attempt(node: Node, node_job_dir: str) -> bool:
         return _claim_queued_dispatch_attempt(cfg, entry, spec, node, node_job_dir)
@@ -7514,7 +7527,7 @@ def _dispatch_queued_active(
         return "failed", entry.reason
 
     if placed:
-        return finish_placement(placed)
+        return _finish_queued_placement(cfg, entry, placed)
     if "interrupted" in failure_kinds:
         if entry.status == "queued":
             if entry.dispatch_node is not None:
