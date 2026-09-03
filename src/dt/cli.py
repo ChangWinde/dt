@@ -16783,6 +16783,215 @@ def _clean_emit_plan(
         )
 
 
+def _forward_clean_to_heads(
+    cfg: LaptopConfig,
+    *,
+    center: str | None,
+    all_centers: bool,
+    before: str | None,
+    project: list[str] | None,
+    envs: bool,
+    deployments: bool,
+    results: bool,
+    plan: bool,
+    apply_plan: str | None,
+    inspect_plan: str | None,
+    offset: int | None,
+    limit: int | None,
+    yes: bool,
+    json_: bool,
+) -> NoReturn:
+    """Laptop `dt clean`: replay the invocation on one or every center head."""
+    if all_centers and json_:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "clean --json reports one center; scope with --center "
+                "instead of --all-centers"
+            ),
+            exit_code=1,
+            json_=True,
+        )
+    rc = 0
+    argv_tail = (
+        [item for project_name in project or [] for item in ("--project", project_name)]
+        + (["--envs"] if envs else [])
+        + (["--deployments"] if deployments else [])
+        + (["--results"] if results else [])
+        + (["--plan"] if plan else [])
+        + (["--apply-plan", apply_plan] if apply_plan is not None else [])
+        + (["--inspect-plan", inspect_plan] if inspect_plan is not None else [])
+        + (["--offset", str(offset)] if offset is not None else [])
+        + (["--limit", str(limit)] if limit is not None else [])
+        + (["--json"] if json_ else [])
+        + (["-y"] if yes else [])
+    )
+    targets = (
+        list(cfg.centers.items())
+        if all_centers
+        else [
+            (
+                selected := _laptop_center(cfg, center),
+                cfg.centers[selected],
+            )
+        ]
+    )
+    for target_center, head in targets:
+        err.print(f"[dim]cleaning {escape(target_center)}[/dim]")
+        forwarded = ["clean"]
+        if before is not None:
+            forwarded += ["--before", before]
+        rc |= forward_call(head, [*forwarded, *argv_tail], tty=not (yes or json_))
+    raise typer.Exit(rc)
+
+
+def _clean_apply(
+    cfg: HeadConfig,
+    scope: _CleanScope,
+    *,
+    apply_plan: str | None,
+    envs: bool,
+    deployments: bool,
+    yes: bool,
+    json_: bool,
+) -> None:
+    """Confirm and execute the deletion scope; report and exit non-zero on failures."""
+    before = scope.before
+    cutoff = scope.cutoff
+    projects = scope.projects
+    results = scope.results
+    victims = scope.victims
+    managed_results = scope.managed_results
+    n_victims = len(victims)
+    from .dispatch import clean_jobs
+
+    removed_results = 0
+
+    def clean_apply_payload(
+        removed_jobs: int,
+        eligible: int,
+        failures: list[JsonDict],
+        removed_deployment_trees: int,
+        removed_envs: int,
+    ) -> JsonDict:
+        return {
+            "schema_version": "dt_clean_v1",
+            "mode": "apply",
+            "plan_id": apply_plan,
+            "before": before,
+            "projects": sorted(projects) if projects is not None else None,
+            "eligible_jobs": eligible,
+            "removed_jobs": removed_jobs,
+            "removed_envs": removed_envs if envs else None,
+            "removed_results": removed_results if results else None,
+            "removed_deployment_trees": (
+                removed_deployment_trees if deployments else None
+            ),
+            "failures": failures,
+            "exit_code": 1 if failures else 0,
+        }
+
+    if not n_victims and not envs and not deployments and not managed_results:
+        if json_:
+            print(json.dumps(clean_apply_payload(0, 0, [], 0, 0)))
+        else:
+            err.print("nothing to clean")
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            err.print("[red]non-interactive clean needs -y[/red]")
+            raise typer.Exit(1)
+        what = f"delete {n_victims} job dirs older than {before}"
+        if results:
+            what += f" + {len(managed_results)} verified managed results"
+        if envs:
+            what += " + stale shared venvs"
+        if deployments:
+            what += " + old release trees and installations"
+        typer.confirm(f"{what}?", abort=True)
+    managed_results_by_job: dict[str, list[_ManagedResult]] = {}
+    for managed_result in managed_results:
+        managed_results_by_job.setdefault(managed_result.job_id, []).append(
+            managed_result
+        )
+
+    def remove_managed_results(entry: jobs_mod.JobEntry) -> None:
+        nonlocal removed_results
+        for expected in managed_results_by_job.get(entry.job_id, []):
+            with jobs_mod.pull_destination_lock(cfg, expected.path):
+                observed = _managed_result_evidence(cfg.results_dir(), expected.path)
+                if (
+                    observed.job_id != expected.job_id
+                    or observed.device != expected.device
+                    or observed.inode != expected.inode
+                ):
+                    raise PrivateStateError(
+                        "managed result changed after ownership verification: "
+                        f"{expected.path}"
+                    )
+                shutil.rmtree(expected.path)
+                removed_results += 1
+
+    report = clean_jobs(
+        cfg,
+        cutoff,
+        envs=envs,
+        log=lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
+        projects=projects,
+        before_registry_remove=remove_managed_results if results else None,
+        authorized=victims,
+    )
+    removed_deployments = 0
+    deployment_failures = []
+    if deployments:
+        from .maintenance import clean_deployments
+
+        deployment_report = clean_deployments(
+            cfg,
+            cutoff,
+            lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
+            runner=run_on,
+        )
+        removed_deployments = deployment_report.removed
+        deployment_failures = deployment_report.failures
+    suffix = f" + {removed_results} managed results" if results else ""
+    if deployments:
+        suffix += f" + {removed_deployments} deployment trees"
+    err.print(f"cleaned {report.removed}/{report.eligible} jobs{suffix}")
+    all_failures = [*report.failures, *deployment_failures]
+    if json_:
+        print(
+            json.dumps(
+                clean_apply_payload(
+                    report.removed,
+                    report.eligible,
+                    [
+                        {
+                            "job_id": failure.job_id,
+                            "node": failure.node,
+                            "kind": failure.kind,
+                            "message": failure.message,
+                        }
+                        for failure in all_failures
+                    ],
+                    removed_deployments,
+                    report.removed_envs,
+                )
+            )
+        )
+    if all_failures:
+        err.print(
+            f"[red]{len(all_failures)} cleanup operation(s) incomplete; "
+            "rerun after fixing the reported cause[/red]"
+        )
+        for failure in all_failures:
+            err.print(
+                f"[red]{escape(failure.job_id)} · {escape(failure.kind)} · "
+                f"{escape(failure.message)}[/red]"
+            )
+        raise typer.Exit(1)
+
+
 def clean(
     before: Optional[str] = typer.Option(
         None, "--before", help="YYYY-MM-DD; delete finished jobs older than this"
@@ -16914,57 +17123,27 @@ def clean(
                 exit_code=1,
                 json_=json_,
             )
-        if all_centers and json_:
-            _fail_submission(
-                kind="invalid_argument",
-                message=(
-                    "clean --json reports one center; scope with --center "
-                    "instead of --all-centers"
-                ),
-                exit_code=1,
-                json_=True,
-            )
-        rc = 0
-        argv_tail = (
-            [
-                item
-                for project_name in project or []
-                for item in ("--project", project_name)
-            ]
-            + (["--envs"] if envs else [])
-            + (["--deployments"] if deployments else [])
-            + (["--results"] if results else [])
-            + (["--plan"] if plan else [])
-            + (["--apply-plan", apply_plan] if apply_plan is not None else [])
-            + (["--inspect-plan", inspect_plan] if inspect_plan is not None else [])
-            + (["--offset", str(offset)] if offset is not None else [])
-            + (["--limit", str(limit)] if limit is not None else [])
-            + (["--json"] if json_ else [])
-            + (["-y"] if yes else [])
+        _forward_clean_to_heads(
+            cfg,
+            center=center,
+            all_centers=all_centers,
+            before=before,
+            project=project,
+            envs=envs,
+            deployments=deployments,
+            results=results,
+            plan=plan,
+            apply_plan=apply_plan,
+            inspect_plan=inspect_plan,
+            offset=offset,
+            limit=limit,
+            yes=yes,
+            json_=json_,
         )
-        targets = (
-            list(cfg.centers.items())
-            if all_centers
-            else [
-                (
-                    selected := _laptop_center(cfg, center),
-                    cfg.centers[selected],
-                )
-            ]
-        )
-        for target_center, head in targets:
-            err.print(f"[dim]cleaning {escape(target_center)}[/dim]")
-            forwarded = ["clean"]
-            if before is not None:
-                forwarded += ["--before", before]
-            rc |= forward_call(head, [*forwarded, *argv_tail], tty=not (yes or json_))
-        raise typer.Exit(rc)
 
     if center is not None or all_centers:
         err.print("[red]--center and --all-centers are laptop-only options[/red]")
         raise typer.Exit(1)
-    from .dispatch import clean_jobs
-
     if inspect_plan is not None:
         _clean_inspect_plan(cfg, inspect_plan, offset=offset, limit=limit, json_=json_)
         return
@@ -16972,150 +17151,24 @@ def clean(
     projects = set(project) if project else None
     if apply_plan is not None:
         scope = _clean_scope_from_plan(cfg, apply_plan, json_=json_)
-        before, cutoff, projects, results = (
-            scope.before,
-            scope.cutoff,
-            scope.projects,
-            scope.results,
-        )
     else:
         assert before is not None
         scope = _clean_scope_before(
             cfg, before, projects=projects, results=results, json_=json_
         )
-        cutoff = scope.cutoff
-    victims = scope.victims
-    managed_results = scope.managed_results
-    n_victims = len(victims)
     if plan:
         _clean_emit_plan(cfg, scope, envs=envs, deployments=deployments, json_=json_)
         return
 
-    removed_results = 0
-
-    def clean_apply_payload(
-        removed_jobs: int,
-        eligible: int,
-        failures: list[JsonDict],
-        removed_deployment_trees: int,
-        removed_envs: int,
-    ) -> JsonDict:
-        return {
-            "schema_version": "dt_clean_v1",
-            "mode": "apply",
-            "plan_id": apply_plan,
-            "before": before,
-            "projects": sorted(projects) if projects is not None else None,
-            "eligible_jobs": eligible,
-            "removed_jobs": removed_jobs,
-            "removed_envs": removed_envs if envs else None,
-            "removed_results": removed_results if results else None,
-            "removed_deployment_trees": (
-                removed_deployment_trees if deployments else None
-            ),
-            "failures": failures,
-            "exit_code": 1 if failures else 0,
-        }
-
-    if not n_victims and not envs and not deployments and not managed_results:
-        if json_:
-            print(json.dumps(clean_apply_payload(0, 0, [], 0, 0)))
-        else:
-            err.print("nothing to clean")
-        return
-    if not yes:
-        if not sys.stdin.isatty():
-            err.print("[red]non-interactive clean needs -y[/red]")
-            raise typer.Exit(1)
-        what = f"delete {n_victims} job dirs older than {before}"
-        if results:
-            what += f" + {len(managed_results)} verified managed results"
-        if envs:
-            what += " + stale shared venvs"
-        if deployments:
-            what += " + old release trees and installations"
-        typer.confirm(f"{what}?", abort=True)
-    managed_results_by_job: dict[str, list[_ManagedResult]] = {}
-    for managed_result in managed_results:
-        managed_results_by_job.setdefault(managed_result.job_id, []).append(
-            managed_result
-        )
-
-    def remove_managed_results(entry: jobs_mod.JobEntry) -> None:
-        nonlocal removed_results
-        for expected in managed_results_by_job.get(entry.job_id, []):
-            with jobs_mod.pull_destination_lock(cfg, expected.path):
-                observed = _managed_result_evidence(cfg.results_dir(), expected.path)
-                if (
-                    observed.job_id != expected.job_id
-                    or observed.device != expected.device
-                    or observed.inode != expected.inode
-                ):
-                    raise PrivateStateError(
-                        "managed result changed after ownership verification: "
-                        f"{expected.path}"
-                    )
-                shutil.rmtree(expected.path)
-                removed_results += 1
-
-    report = clean_jobs(
+    _clean_apply(
         cfg,
-        cutoff,
+        scope,
+        apply_plan=apply_plan,
         envs=envs,
-        log=lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
-        projects=projects,
-        before_registry_remove=remove_managed_results if results else None,
-        authorized=victims,
+        deployments=deployments,
+        yes=yes,
+        json_=json_,
     )
-    removed_deployments = 0
-    deployment_failures = []
-    if deployments:
-        from .maintenance import clean_deployments
-
-        deployment_report = clean_deployments(
-            cfg,
-            cutoff,
-            lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
-            runner=run_on,
-        )
-        removed_deployments = deployment_report.removed
-        deployment_failures = deployment_report.failures
-    suffix = f" + {removed_results} managed results" if results else ""
-    if deployments:
-        suffix += f" + {removed_deployments} deployment trees"
-    err.print(f"cleaned {report.removed}/{report.eligible} jobs{suffix}")
-    all_failures = [*report.failures, *deployment_failures]
-    if json_:
-        print(
-            json.dumps(
-                clean_apply_payload(
-                    report.removed,
-                    report.eligible,
-                    [
-                        {
-                            "job_id": failure.job_id,
-                            "node": failure.node,
-                            "kind": failure.kind,
-                            "message": failure.message,
-                        }
-                        for failure in all_failures
-                    ],
-                    removed_deployments,
-                    report.removed_envs,
-                )
-            )
-        )
-    if all_failures:
-        err.print(
-            f"[red]{len(all_failures)} cleanup operation(s) incomplete; "
-            "rerun after fixing the reported cause[/red]"
-        )
-        for failure in all_failures:
-            err.print(
-                f"[red]{escape(failure.job_id)} · {escape(failure.kind)} · "
-                f"{escape(failure.message)}[/red]"
-            )
-        raise typer.Exit(1)
 
 
 def _local_tree_disk_bytes(path: Path) -> int | None:
