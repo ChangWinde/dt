@@ -34,6 +34,7 @@ import time
 import urllib.request
 from urllib.parse import urlsplit
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import Event, Thread
@@ -878,6 +879,110 @@ def _bump_blocked_backoff(
     blocked_backoff[job_id] = (min(retries + 1, 16), time.monotonic() + delay)
 
 
+_REPORTED_DISPATCH_OUTCOMES = frozenset(
+    {"started", "finished", "failed", "skipped", "killed", "cancel-failed"}
+)
+
+
+def _report_dispatch_outcome(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    outcome: str,
+    detail: str | None,
+    log: Callable[[str], None],
+) -> None:
+    """Log and notify one terminal or started dispatch outcome."""
+    if outcome == "started":
+        # The durable reservation was already included in occupancy; a
+        # successful transition to running must not consume a second slot.
+        log(f"{entry.job_id} -> {detail}")
+        notify(
+            cfg,
+            {
+                "event": "started",
+                "job_id": entry.job_id,
+                "name": entry.name,
+                "center": cfg.center,
+                "node": detail,
+                "exit_code": None,
+            },
+            log,
+        )
+    elif outcome == "finished":
+        log(
+            f"{entry.job_id} recovered completed launch on {entry.node} "
+            f"(exit {entry.exit_code})"
+        )
+        notify(
+            cfg,
+            {
+                "event": "finished",
+                "job_id": entry.job_id,
+                "name": entry.name,
+                "center": cfg.center,
+                "node": entry.node,
+                "exit_code": entry.exit_code,
+                "result_state": entry.result_state,
+                "recovered": True,
+            },
+            log,
+        )
+    elif outcome == "failed":
+        log(f"{entry.job_id} failed: {detail}")
+        notify(
+            cfg,
+            {
+                "event": "failed",
+                "job_id": entry.job_id,
+                "name": entry.name,
+                "center": cfg.center,
+                "node": None,
+                "exit_code": None,
+                "reason": detail,
+            },
+            log,
+        )
+    elif outcome == "skipped":
+        log(f"{entry.job_id} skipped: {detail}")
+        notify(
+            cfg,
+            {
+                "event": "skipped",
+                "job_id": entry.job_id,
+                "name": entry.name,
+                "center": cfg.center,
+                "node": None,
+                "exit_code": None,
+                "result_state": "dependency_skipped",
+                "reason": detail,
+            },
+            log,
+        )
+    elif outcome == "killed":
+        if detail:
+            log(f"{entry.job_id} was killed while dispatching; stopped it on {detail}")
+        else:
+            log(f"{entry.job_id} was dequeued before dispatch")
+    elif outcome == "cancel-failed":
+        # Cancellation failure restores the remote launch to running, so
+        # it consumes the same max_my_jobs budget as a normal start.
+        reason = entry.reason or detail or "launch cancellation unverified"
+        log(f"{entry.job_id} CANCEL FAILED: {reason}")
+        notify(
+            cfg,
+            {
+                "event": "cancel_failed",
+                "job_id": entry.job_id,
+                "name": entry.name,
+                "center": cfg.center,
+                "node": entry.node,
+                "exit_code": None,
+                "reason": reason,
+            },
+            log,
+        )
+
+
 def _process_once_with_snapshot(
     cfg: HeadConfig,
     log: Callable[[str], None],
@@ -980,98 +1085,8 @@ def _process_once_with_snapshot(
             # acquire or release quota, so a recovered terminal attempt does
             # not leave later runnable work capped until the next tick.
             running = quota_occupancy(cfg, entries=entries, damage=damage)
-        if outcome == "started":
-            # The durable reservation was already included in occupancy; a
-            # successful transition to running must not consume a second slot.
-            log(f"{entry.job_id} -> {detail}")
-            notify(
-                cfg,
-                {
-                    "event": "started",
-                    "job_id": entry.job_id,
-                    "name": entry.name,
-                    "center": cfg.center,
-                    "node": detail,
-                    "exit_code": None,
-                },
-                log,
-            )
-        elif outcome == "finished":
-            log(
-                f"{entry.job_id} recovered completed launch on {entry.node} "
-                f"(exit {entry.exit_code})"
-            )
-            notify(
-                cfg,
-                {
-                    "event": "finished",
-                    "job_id": entry.job_id,
-                    "name": entry.name,
-                    "center": cfg.center,
-                    "node": entry.node,
-                    "exit_code": entry.exit_code,
-                    "result_state": entry.result_state,
-                    "recovered": True,
-                },
-                log,
-            )
-        elif outcome == "failed":
-            log(f"{entry.job_id} failed: {detail}")
-            notify(
-                cfg,
-                {
-                    "event": "failed",
-                    "job_id": entry.job_id,
-                    "name": entry.name,
-                    "center": cfg.center,
-                    "node": None,
-                    "exit_code": None,
-                    "reason": detail,
-                },
-                log,
-            )
-        elif outcome == "skipped":
-            log(f"{entry.job_id} skipped: {detail}")
-            notify(
-                cfg,
-                {
-                    "event": "skipped",
-                    "job_id": entry.job_id,
-                    "name": entry.name,
-                    "center": cfg.center,
-                    "node": None,
-                    "exit_code": None,
-                    "result_state": "dependency_skipped",
-                    "reason": detail,
-                },
-                log,
-            )
-        elif outcome == "killed":
-            if detail:
-                log(
-                    f"{entry.job_id} was killed while dispatching; "
-                    f"stopped it on {detail}"
-                )
-            else:
-                log(f"{entry.job_id} was dequeued before dispatch")
-        elif outcome == "cancel-failed":
-            # Cancellation failure restores the remote launch to running, so
-            # it consumes the same max_my_jobs budget as a normal start.
-            reason = entry.reason or detail or "launch cancellation unverified"
-            log(f"{entry.job_id} CANCEL FAILED: {reason}")
-            notify(
-                cfg,
-                {
-                    "event": "cancel_failed",
-                    "job_id": entry.job_id,
-                    "name": entry.name,
-                    "center": cfg.center,
-                    "node": entry.node,
-                    "exit_code": None,
-                    "reason": reason,
-                },
-                log,
-            )
+        if outcome in _REPORTED_DISPATCH_OUTCOMES:
+            _report_dispatch_outcome(cfg, entry, outcome, detail, log)
         elif outcome == "blocked":
             blocked_detail = detail or "reason unavailable"
             if (
@@ -1416,6 +1431,107 @@ def _sleep_until_next_poll(
     return "stopped"
 
 
+@dataclass
+class _RestartWatch:
+    """What this agent image was born as, and whether a restart was refused."""
+
+    born_with: int | None
+    born_command_identity: tuple[str, str, int, int]
+    rejected_restart: tuple[int, float] | None = None
+    fd_released: bool = False
+
+
+def _maybe_restart_for_new_code(
+    cfg: HeadConfig,
+    watch: _RestartWatch,
+    *,
+    fd: int,
+    completion_watchers: dict[str, subprocess.Popen[bytes]],
+    log: Callable[[str], None],
+) -> str:
+    """Exec the replacement agent when dt's code or command changed.
+
+    Returns "none" when nothing changed (or teardown failed and the loop
+    should continue normally), "deferred" when the replacement failed
+    preflight and the loop should retry immediately, or "exit" when the
+    exec itself failed after the lock was released.
+    """
+    dt_bin: Path | None
+    try:
+        current_command_identity = _active_command_identity()
+        dt_bin = Path(current_command_identity[0])
+    except (OSError, RuntimeError) as exc:
+        # A supervisor with a stripped environment (no resolvable
+        # home) must not kill the queue loop; self-upgrade simply
+        # stays off until the environment is coherent again.
+        log(f"self-upgrade check skipped: {_bounded_exception(exc)}")
+        dt_bin = None
+        current_command_identity = watch.born_command_identity
+    current_fingerprint = _code_fingerprint()
+    now = time.monotonic()
+    command_changed = current_command_identity != watch.born_command_identity
+    code_changed = (
+        current_fingerprint is not None and current_fingerprint != watch.born_with
+    )
+    replacement_token = hash((current_fingerprint, current_command_identity))
+    if (
+        dt_bin is not None
+        and (command_changed or code_changed)
+        and not _latched(watch.rejected_restart, replacement_token, now)
+        and dt_bin.exists()
+    ):
+        # deploy/git pull happened: exec ourselves to run the new
+        # code (the exec drops our lock fd, the fresh image retakes it)
+        try:
+            ready, preflight_detail = _restart_preflight(dt_bin)
+        except Exception as exc:  # keep the loop alive, always
+            ready, preflight_detail = (
+                False,
+                f"preflight crashed: {_bounded_exception(exc)}",
+            )
+        if not ready:
+            watch.rejected_restart = (
+                replacement_token,
+                now + PREFLIGHT_RETRY_S,
+            )
+            log(
+                "dt code changed but replacement preflight failed; "
+                "keeping current agent alive, retrying within "
+                f"{PREFLIGHT_RETRY_S:g}s ({preflight_detail})"
+            )
+            return "deferred"
+        reason = "active command changed" if command_changed else "code changed"
+        log(f"dt {reason}; restarting agent")
+        try:
+            _stop_completion_watchers(completion_watchers)
+            _pid_path(cfg).unlink(missing_ok=True)
+        except OSError as exc:
+            log(f"agent restart deferred; teardown failed ({_bounded_exception(exc)})")
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+            watch.fd_released = True
+            try:
+                sys.stdout.flush()
+            except OSError:
+                pass
+            try:
+                os.execvp(str(dt_bin), [str(dt_bin), "agent", "run"])
+            except OSError as exc:
+                # The lock is already released and this image cannot
+                # exec its replacement (deploy race, unexecutable
+                # binary). Exit cleanly so the supervisor starts a
+                # fresh agent instead of dying with a traceback and
+                # leaving the queue driverless.
+                log(
+                    "agent restart exec failed "
+                    f"({_bounded_exception(exc)}); exiting so "
+                    "the supervisor can start a fresh agent"
+                )
+                return "exit"
+    return "none"
+
+
 def run_loop(cfg: HeadConfig) -> int:
     """Foreground loop (what crontab/nohup runs). Exit 1 if another agent
     already holds the lock."""
@@ -1471,16 +1587,16 @@ def run_loop(cfg: HeadConfig) -> int:
         f"agent up (pid {os.getpid()}, poll {cfg.queue.poll_s}s idle/"
         f"{cfg.queue.active_poll_s:g}s queued, completion wake on)"
     )
-    born_with = _code_fingerprint()
     born_identity = _runtime_identity(cfg)
-    born_command_identity = _active_command_identity()
-    _write_runtime_command(cfg, born_command_identity)
-    rejected_restart: tuple[int, float] | None = None
+    restart_watch = _RestartWatch(
+        born_with=_code_fingerprint(),
+        born_command_identity=_active_command_identity(),
+    )
+    _write_runtime_command(cfg, restart_watch.born_command_identity)
     completion_watchers: dict[str, subprocess.Popen[bytes]] = {}
     completion_watch_disabled: set[str] = set()
     blocked_log_state: dict[str, str] = {}
     blocked_backoff: dict[str, tuple[int, float]] = {}
-    fd_released = False
     heartbeat_stop = Event()
     heartbeat_thread = Thread(
         target=_heartbeat_pulse,
@@ -1548,82 +1664,17 @@ def run_loop(cfg: HeadConfig) -> int:
                 )
             except OSError as exc:
                 log(f"scheduler progress stamp unavailable: {_bounded_exception(exc)}")
-            dt_bin: Path | None
-            try:
-                current_command_identity = _active_command_identity()
-                dt_bin = Path(current_command_identity[0])
-            except (OSError, RuntimeError) as exc:
-                # A supervisor with a stripped environment (no resolvable
-                # home) must not kill the queue loop; self-upgrade simply
-                # stays off until the environment is coherent again.
-                log(f"self-upgrade check skipped: {_bounded_exception(exc)}")
-                dt_bin = None
-                current_command_identity = born_command_identity
-            current_fingerprint = _code_fingerprint()
-            now = time.monotonic()
-            command_changed = current_command_identity != born_command_identity
-            code_changed = (
-                current_fingerprint is not None and current_fingerprint != born_with
+            verdict = _maybe_restart_for_new_code(
+                cfg,
+                restart_watch,
+                fd=fd,
+                completion_watchers=completion_watchers,
+                log=log,
             )
-            replacement_token = hash((current_fingerprint, current_command_identity))
-            if (
-                dt_bin is not None
-                and (command_changed or code_changed)
-                and not _latched(rejected_restart, replacement_token, now)
-                and dt_bin.exists()
-            ):
-                # deploy/git pull happened: exec ourselves to run the new
-                # code (the exec drops our lock fd, the fresh image retakes it)
-                try:
-                    ready, preflight_detail = _restart_preflight(dt_bin)
-                except Exception as exc:  # keep the loop alive, always
-                    ready, preflight_detail = (
-                        False,
-                        f"preflight crashed: {_bounded_exception(exc)}",
-                    )
-                if not ready:
-                    rejected_restart = (
-                        replacement_token,
-                        now + PREFLIGHT_RETRY_S,
-                    )
-                    log(
-                        "dt code changed but replacement preflight failed; "
-                        "keeping current agent alive, retrying within "
-                        f"{PREFLIGHT_RETRY_S:g}s ({preflight_detail})"
-                    )
-                    continue
-                reason = "active command changed" if command_changed else "code changed"
-                log(f"dt {reason}; restarting agent")
-                try:
-                    _stop_completion_watchers(completion_watchers)
-                    _pid_path(cfg).unlink(missing_ok=True)
-                except OSError as exc:
-                    log(
-                        "agent restart deferred; teardown failed "
-                        f"({_bounded_exception(exc)})"
-                    )
-                else:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-                    os.close(fd)
-                    fd_released = True
-                    try:
-                        sys.stdout.flush()
-                    except OSError:
-                        pass
-                    try:
-                        os.execvp(str(dt_bin), [str(dt_bin), "agent", "run"])
-                    except OSError as exc:
-                        # The lock is already released and this image cannot
-                        # exec its replacement (deploy race, unexecutable
-                        # binary). Exit cleanly so the supervisor starts a
-                        # fresh agent instead of dying with a traceback and
-                        # leaving the queue driverless.
-                        log(
-                            "agent restart exec failed "
-                            f"({_bounded_exception(exc)}); exiting so "
-                            "the supervisor can start a fresh agent"
-                        )
-                        return AGENT_CONFIG_RESTART_EXIT
+            if verdict == "deferred":
+                continue
+            if verdict == "exit":
+                return AGENT_CONFIG_RESTART_EXIT
             _sleep_until_next_poll(
                 cfg,
                 stop,
@@ -1639,7 +1690,7 @@ def run_loop(cfg: HeadConfig) -> int:
         log("agent down")
         _pid_path(cfg).unlink(missing_ok=True)
         runtime_command_path(cfg).unlink(missing_ok=True)
-        if not fd_released:
+        if not restart_watch.fd_released:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
     return 0
