@@ -13502,6 +13502,233 @@ def _build_fork_spec(
     return item_spec
 
 
+def _validate_fork_options(
+    *,
+    request_id: str | None,
+    max_hours: float | None,
+    min_vram_mib: int | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+    artifact_manifest: str | None,
+    repeat: int,
+    inherit_cache: bool,
+    reuse_cache: str | None,
+    clone_cache: str | None,
+    no_queue: bool,
+    json_: bool,
+) -> None:
+    """Reject invalid or contradictory `dt fork` options before any I/O."""
+    _validate_submission_request_id(request_id, json_=json_)
+    if max_hours is not None and (not math.isfinite(max_hours) or max_hours <= 0):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--max-hours must be a finite positive number",
+            exit_code=1,
+            json_=json_,
+        )
+    if min_vram_mib is not None and min_vram_mib <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--min-vram-mib must be a positive integer",
+            exit_code=1,
+            json_=json_,
+        )
+    if max_vram_mib is not None and max_vram_mib <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--max-vram-mib must be a positive integer",
+            exit_code=1,
+            json_=json_,
+        )
+    if max_job_memory_mib is not None and max_job_memory_mib <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--max-job-memory-mib must be a positive integer",
+            exit_code=1,
+            json_=json_,
+        )
+    if (
+        artifact_manifest is not None
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            artifact_manifest,
+        )
+        is None
+    ):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--artifact-manifest must be a lowercase SHA-256 digest",
+            exit_code=1,
+            json_=json_,
+        )
+    if isinstance(repeat, bool) or repeat < 1 or repeat > BATCH_MAX_TASKS:
+        _fail_submission(
+            kind="invalid_argument",
+            message=f"--repeat must be between 1 and {BATCH_MAX_TASKS:,}",
+            exit_code=1,
+            json_=json_,
+        )
+    selected_cache_modes = sum(
+        bool(value) for value in (inherit_cache, reuse_cache, clone_cache)
+    )
+    if selected_cache_modes > 1:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "use only one of --inherit-cache, --reuse-cache, or --clone-cache"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    if repeat > 1 and no_queue:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--no-queue cannot be used with --repeat greater than 1",
+            exit_code=1,
+            json_=json_,
+        )
+
+
+def _forward_fork_to_head(
+    cfg: LaptopConfig,
+    ref: str,
+    *,
+    name: str | None,
+    repeat: int,
+    reuse_cache: str | None,
+    clone_cache: str | None,
+    cache_env: str,
+    inherit_cache: bool,
+    artifact_manifest: str | None,
+    max_hours: float | None,
+    min_vram_mib: int | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+    request_id: str | None,
+    no_queue: bool,
+    command: list[str],
+    json_: bool,
+) -> NoReturn:
+    """Laptop `dt fork`: replay the invocation on the head that owns ``ref``."""
+    _, head = _locate(cfg, ref, json_=json_)
+    route = (
+        HeadCommand.start(head, "fork", ref)
+        .option("-n", name or None)
+        .option("--repeat", repeat if repeat > 1 else None)
+        .option("--reuse-cache", reuse_cache or None)
+        .option("--cache-env", cache_env if reuse_cache else None)
+        .option("--clone-cache", clone_cache or None)
+        .option("--cache-env", cache_env if clone_cache else None)
+        .flag("--inherit-cache", inherit_cache)
+        .option("--artifact-manifest", artifact_manifest)
+        .option("--max-hours", max_hours)
+        .option("--min-vram-mib", min_vram_mib)
+        .option("--max-vram-mib", max_vram_mib)
+        .option("--max-job-memory-mib", max_job_memory_mib)
+        .option("--request-id", request_id or None)
+        .flag("--no-queue", no_queue)
+        # Repeat forwarding always consumes the head's durable group
+        # receipt, even when the laptop renders it for a human. Without
+        # this, the head prints bare job ids after creating every member
+        # and the laptop reports a protocol failure that invites a
+        # duplicate retry.
+        .flag("--json", json_ or repeat > 1)
+    )
+    if command:
+        route = route.passthrough(command)
+    argv = route.argv()
+    if repeat > 1:
+        prefix = jobs_mod.sanitize_name((name or f"{ref}-fork").strip())
+        raise typer.Exit(
+            fork_repeat_mod.forward_laptop(
+                _fork_repeat_host(),
+                route.head,
+                argv,
+                ref=ref,
+                name_prefix=prefix,
+                json_=json_,
+                request_id=request_id,
+            )
+        )
+    rc, _job_id = _forward_laptop_submission(
+        route.head,
+        argv,
+        action="fork",
+        recovery_label=(f"name {name!r}" if name else f"a new fork of {ref!r}"),
+        json_=json_,
+        request_id=request_id,
+    )
+    raise typer.Exit(rc)
+
+
+def _report_fork(
+    cfg: HeadConfig,
+    entry: jobs_mod.JobEntry,
+    *,
+    old: jobs_mod.JobEntry,
+    source: jobs_mod.JobEntry,
+    source_display_ref: str,
+    agent_started: bool | None,
+    json_: bool,
+) -> None:
+    """Print the fork submission result (JSON payload or human summary)."""
+    exact = bool(old.snapshot_sha256 and entry.snapshot_sha256 == old.snapshot_sha256)
+    if json_:
+        print(
+            json.dumps(
+                _submission_payload(
+                    entry,
+                    forked_from=entry.forked_from or source.job_id,
+                    max_hours=entry.max_hours,
+                    exact_snapshot=exact,
+                    **(
+                        {"agent_started": agent_started}
+                        if agent_started is not None
+                        else {}
+                    ),
+                )
+            )
+        )
+        return
+
+    display_ref = _display_ref_for_entry(cfg, entry)
+    if getattr(entry, "_request_replayed", False):
+        err.print(
+            f"[cyan]replayed durable request[/cyan] "
+            f"{escape(entry.request_id or '')} · no new job created"
+        )
+    if entry.status == "queued":
+        agent_note = ""
+        if agent_started:
+            agent_note = " · agent started"
+        elif agent_started is False:
+            agent_note = " · [red]agent failed[/red]"
+        err.print(
+            f"[cyan]queued[/cyan] {escape(entry.name)} · "
+            f"fork of {escape(source_display_ref)}{agent_note}"
+        )
+        if entry.reason:
+            err.print(f"[yellow]reason: {escape(entry.reason)}[/yellow]")
+        if agent_started is False:
+            err.print("[red]next: dt agent run[/red]")
+    else:
+        gpu_text = ",".join(map(str, entry.gpus)) or "cpu"
+        err.print(
+            f"[green]started[/green] {escape(entry.name)} · "
+            f"[bold]{escape(entry.node)}[/bold] · GPU {gpu_text} · "
+            f"fork of {escape(source_display_ref)}"
+        )
+    exact_snapshot = (entry.snapshot_sha256 or "unknown")[:12]
+    err.print(f"[dim]exact snapshot {exact_snapshot}[/dim]")
+    next_command = (
+        f"dt watch {display_ref}"
+        if entry.status == "queued"
+        else f"dt logs {display_ref} -f · dt wait {display_ref}"
+    )
+    err.print(f"[dim]next: {escape(next_command)}[/dim]")
+    print(entry.job_id)
+
+
 def fork(
     ctx: typer.Context,
     ref: str = REF_ARG,
@@ -13587,130 +13814,44 @@ def fork(
     command = list(ctx.args)
     while command and command[0] == "--":
         command = command[1:]
-    _validate_submission_request_id(request_id, json_=json_)
-    if max_hours is not None and (not math.isfinite(max_hours) or max_hours <= 0):
-        _fail_submission(
-            kind="invalid_argument",
-            message="--max-hours must be a finite positive number",
-            exit_code=1,
-            json_=json_,
-        )
-    if min_vram_mib is not None and min_vram_mib <= 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--min-vram-mib must be a positive integer",
-            exit_code=1,
-            json_=json_,
-        )
-    if max_vram_mib is not None and max_vram_mib <= 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--max-vram-mib must be a positive integer",
-            exit_code=1,
-            json_=json_,
-        )
-    if max_job_memory_mib is not None and max_job_memory_mib <= 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--max-job-memory-mib must be a positive integer",
-            exit_code=1,
-            json_=json_,
-        )
-    if (
-        artifact_manifest is not None
-        and re.fullmatch(
-            r"[0-9a-f]{64}",
-            artifact_manifest,
-        )
-        is None
-    ):
-        _fail_submission(
-            kind="invalid_argument",
-            message="--artifact-manifest must be a lowercase SHA-256 digest",
-            exit_code=1,
-            json_=json_,
-        )
-    if isinstance(repeat, bool) or repeat < 1 or repeat > BATCH_MAX_TASKS:
-        _fail_submission(
-            kind="invalid_argument",
-            message=f"--repeat must be between 1 and {BATCH_MAX_TASKS:,}",
-            exit_code=1,
-            json_=json_,
-        )
-    selected_cache_modes = sum(
-        bool(value) for value in (inherit_cache, reuse_cache, clone_cache)
+    _validate_fork_options(
+        request_id=request_id,
+        max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
+        max_vram_mib=max_vram_mib,
+        max_job_memory_mib=max_job_memory_mib,
+        artifact_manifest=artifact_manifest,
+        repeat=repeat,
+        inherit_cache=inherit_cache,
+        reuse_cache=reuse_cache,
+        clone_cache=clone_cache,
+        no_queue=no_queue,
+        json_=json_,
     )
-    if selected_cache_modes > 1:
-        _fail_submission(
-            kind="invalid_argument",
-            message=(
-                "use only one of --inherit-cache, --reuse-cache, or --clone-cache"
-            ),
-            exit_code=1,
-            json_=json_,
-        )
-    if repeat > 1 and no_queue:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--no-queue cannot be used with --repeat greater than 1",
-            exit_code=1,
-            json_=json_,
-        )
 
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
-        _, head = _locate(cfg, ref, json_=json_)
-        route = (
-            HeadCommand.start(head, "fork", ref)
-            .option("-n", name or None)
-            .option("--repeat", repeat if repeat > 1 else None)
-            .option("--reuse-cache", reuse_cache or None)
-            .option("--cache-env", cache_env if reuse_cache else None)
-            .option("--clone-cache", clone_cache or None)
-            .option("--cache-env", cache_env if clone_cache else None)
-            .flag("--inherit-cache", inherit_cache)
-            .option("--artifact-manifest", artifact_manifest)
-            .option("--max-hours", max_hours)
-            .option("--min-vram-mib", min_vram_mib)
-            .option("--max-vram-mib", max_vram_mib)
-            .option("--max-job-memory-mib", max_job_memory_mib)
-            .option("--request-id", request_id or None)
-            .flag("--no-queue", no_queue)
-            # Repeat forwarding always consumes the head's durable group
-            # receipt, even when the laptop renders it for a human. Without
-            # this, the head prints bare job ids after creating every member
-            # and the laptop reports a protocol failure that invites a
-            # duplicate retry.
-            .flag("--json", json_ or repeat > 1)
-        )
-        if command:
-            route = route.passthrough(command)
-        argv = route.argv()
-        if repeat > 1:
-            prefix = jobs_mod.sanitize_name((name or f"{ref}-fork").strip())
-            raise typer.Exit(
-                fork_repeat_mod.forward_laptop(
-                    _fork_repeat_host(),
-                    route.head,
-                    argv,
-                    ref=ref,
-                    name_prefix=prefix,
-                    json_=json_,
-                    request_id=request_id,
-                )
-            )
-        rc, _job_id = _forward_laptop_submission(
-            route.head,
-            argv,
-            action="fork",
-            recovery_label=(f"name {name!r}" if name else f"a new fork of {ref!r}"),
-            json_=json_,
+        _forward_fork_to_head(
+            cfg,
+            ref,
+            name=name,
+            repeat=repeat,
+            reuse_cache=reuse_cache,
+            clone_cache=clone_cache,
+            cache_env=cache_env,
+            inherit_cache=inherit_cache,
+            artifact_manifest=artifact_manifest,
+            max_hours=max_hours,
+            min_vram_mib=min_vram_mib,
+            max_vram_mib=max_vram_mib,
+            max_job_memory_mib=max_job_memory_mib,
             request_id=request_id,
+            no_queue=no_queue,
+            command=command,
+            json_=json_,
         )
-        raise typer.Exit(rc)
 
     from . import dispatch as dispatch_mod
-    from rich.markup import escape
 
     old = _find_or_die(cfg, ref, json_=json_)
     old_display_ref = _display_ref_for_entry(cfg, old)
@@ -13827,62 +13968,15 @@ def fork(
         _fail_from_submission_error(exc, json_=json_)
 
     agent_started = _ensure_agent_for(cfg, entry)
-
-    exact = bool(old.snapshot_sha256 and entry.snapshot_sha256 == old.snapshot_sha256)
-    if json_:
-        print(
-            json.dumps(
-                _submission_payload(
-                    entry,
-                    forked_from=entry.forked_from or source.job_id,
-                    max_hours=entry.max_hours,
-                    exact_snapshot=exact,
-                    **(
-                        {"agent_started": agent_started}
-                        if agent_started is not None
-                        else {}
-                    ),
-                )
-            )
-        )
-        return
-
-    display_ref = _display_ref_for_entry(cfg, entry)
-    if getattr(entry, "_request_replayed", False):
-        err.print(
-            f"[cyan]replayed durable request[/cyan] "
-            f"{escape(entry.request_id or '')} · no new job created"
-        )
-    if entry.status == "queued":
-        agent_note = ""
-        if agent_started:
-            agent_note = " · agent started"
-        elif agent_started is False:
-            agent_note = " · [red]agent failed[/red]"
-        err.print(
-            f"[cyan]queued[/cyan] {escape(entry.name)} · "
-            f"fork of {escape(source_display_ref)}{agent_note}"
-        )
-        if entry.reason:
-            err.print(f"[yellow]reason: {escape(entry.reason)}[/yellow]")
-        if agent_started is False:
-            err.print("[red]next: dt agent run[/red]")
-    else:
-        gpu_text = ",".join(map(str, entry.gpus)) or "cpu"
-        err.print(
-            f"[green]started[/green] {escape(entry.name)} · "
-            f"[bold]{escape(entry.node)}[/bold] · GPU {gpu_text} · "
-            f"fork of {escape(source_display_ref)}"
-        )
-    exact_snapshot = (entry.snapshot_sha256 or "unknown")[:12]
-    err.print(f"[dim]exact snapshot {exact_snapshot}[/dim]")
-    next_command = (
-        f"dt watch {display_ref}"
-        if entry.status == "queued"
-        else f"dt logs {display_ref} -f · dt wait {display_ref}"
+    _report_fork(
+        cfg,
+        entry,
+        old=old,
+        source=source,
+        source_display_ref=source_display_ref,
+        agent_started=agent_started,
+        json_=json_,
     )
-    err.print(f"[dim]next: {escape(next_command)}[/dim]")
-    print(entry.job_id)
 
 
 # --------------------------------------------------------------------------
