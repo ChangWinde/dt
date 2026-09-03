@@ -15091,6 +15091,144 @@ def _pull_success_payload(
     }
 
 
+@dataclass
+class _PullReport:
+    """Renders pull failures with their shared trailer.
+
+    The trailer grows as the pull progresses: the job once resolved, the
+    remote outputs size once probed, retry events as transfers record them,
+    and the records confirmed locally so far.  A programmatic caller
+    (``result``) always receives the structured payload; the plain human
+    rendering is only for an interactive terminal.
+    """
+
+    json_: bool
+    result: JsonDict | None
+    entry: jobs_mod.JobEntry | None = None
+    remote_outputs_bytes: int | None = None
+    retry_events: list[JsonDict] = dataclass_field(default_factory=list)
+    records: list[str] = dataclass_field(default_factory=lambda: ["dt/job.json"])
+    records_dir: Path | None = None
+    dst: Path | None = None
+    evidence_records: list[str] = dataclass_field(default_factory=list)
+
+    def fail(
+        self,
+        kind: str,
+        message: str,
+        exit_code: int,
+        **fields: object,
+    ) -> NoReturn:
+        payload = {
+            **fields,
+            **({"job_status": self.entry.status} if self.entry is not None else {}),
+            **(
+                {"remote_outputs_bytes": self.remote_outputs_bytes}
+                if self.remote_outputs_bytes is not None
+                else {}
+            ),
+            **({"retry_events": self.retry_events} if self.retry_events else {}),
+            "status": "error",
+            "error": kind,
+            "message": message,
+            "exit_code": exit_code,
+        }
+        if self.result is not None:
+            self.result.update(payload)
+        elif self.json_:
+            print(json.dumps(payload))
+        else:
+            err.print(f"[red]{escape(message)}[/red]")
+        raise typer.Exit(exit_code)
+
+    def confirmed_records(self) -> list[str]:
+        """Inventory reserved top-level run records already present locally."""
+        assert self.entry is not None and self.records_dir is not None
+        paths = ["dt/job.json"]
+        try:
+            record_files = sorted(self.records_dir.iterdir())
+        except OSError as exc:
+            self.fail(
+                "destination_unusable",
+                f"cannot inspect local records directory {self.records_dir}: {exc}",
+                1,
+                job_id=self.entry.job_id,
+                node=self.entry.node,
+                destination=str(self.dst),
+            )
+        for path in record_files:
+            if path.name not in PULL_LOG_RECORDS:
+                continue
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                paths.append(f"dt/{path.name}")
+        paths.extend(f"dt/{name}" for name in self.evidence_records)
+        return paths
+
+    def phase_failed(
+        self,
+        phase: _PullPhaseError,
+        *,
+        destination: str | None = None,
+        logs_recovered: bool | None = None,
+    ) -> NoReturn:
+        """Render one phase failure with the trailer that phase owes.
+
+        ``logs_recovered`` marks a transfer phase: its trailer reports the
+        records confirmed so far (``records`` is read at call time on purpose:
+        the pre-transfer list before outputs land, the inventory afterwards).
+        """
+        assert self.entry is not None
+        if phase.human_plain and not self.json_ and self.result is None:
+            err.print(f"[red]{escape(phase.message)}[/red]")
+            if phase.hint:
+                err.print(f"[dim]{escape(phase.hint)}[/dim]")
+            raise typer.Exit(phase.exit_code)
+        trailer: dict[str, object] = {
+            "job_id": self.entry.job_id,
+            "node": self.entry.node,
+        }
+        if destination is not None:
+            trailer["destination"] = destination
+        if logs_recovered is not None:
+            trailer["records"] = (
+                self.confirmed_records() if phase.records_fresh else self.records
+            )
+            trailer["partial"] = True
+        self.fail(phase.kind, phase.message, phase.exit_code, **trailer, **phase.fields)
+
+
+def _pull_destination(
+    cfg: HeadConfig,
+    entry: jobs_mod.JobEntry,
+    report: _PullReport,
+    *,
+    to: str | None,
+    collection: str | None,
+) -> Path:
+    """Where this job's outputs land: --to, a collection, or the managed root."""
+    collection_base: Path | None = None
+    if collection:
+        try:
+            collection_base = _ensure_collection_root(cfg, collection)
+        except ValueError as exc:
+            report.fail(
+                "destination_unusable",
+                str(exc),
+                1,
+                job_id=entry.job_id,
+                node=entry.node,
+            )
+    if to:
+        return Path(to).expanduser().absolute()
+    if collection_base is not None:
+        return (collection_base / entry.job_id).absolute()
+    return cfg.job_results_dir(entry.job_id).absolute()
+
+
 def _pull_unlocked(
     ref: str = REF_ARG,
     to: Optional[str] = typer.Option(
@@ -15183,43 +15321,12 @@ def _pull_unlocked(
             json_=json_,
         )
     output_excludes = list(dict.fromkeys([*PULL_RESERVED_EXCLUDES, *excludes]))
-    entry: jobs_mod.JobEntry | None = None
-    remote_outputs_bytes: int | None = None
-    retry_events: list[JsonDict] = []
-
-    def fail(
-        kind: str,
-        message: str,
-        exit_code: int,
-        **fields: object,
-    ) -> NoReturn:
-        payload = {
-            **fields,
-            **({"job_status": entry.status} if entry is not None else {}),
-            **(
-                {"remote_outputs_bytes": remote_outputs_bytes}
-                if remote_outputs_bytes is not None
-                else {}
-            ),
-            **({"retry_events": retry_events} if retry_events else {}),
-            "status": "error",
-            "error": kind,
-            "message": message,
-            "exit_code": exit_code,
-        }
-        if _result is not None:
-            _result.update(payload)
-        elif json_:
-            print(json.dumps(payload))
-        else:
-            err.print(f"[red]{escape(message)}[/red]")
-        raise typer.Exit(exit_code)
-
+    report = _PullReport(json_=json_, result=_result)
     if json_:
         try:
             entry = _pullable_entry(cfg, ref)
         except _PullPhaseError as phase:
-            fail(phase.kind, phase.message, phase.exit_code, **phase.fields)
+            report.fail(phase.kind, phase.message, phase.exit_code, **phase.fields)
     else:
         entry = _find_or_die(cfg, ref)
         if not (
@@ -15232,107 +15339,30 @@ def _pull_unlocked(
                 "outputs",
                 display_ref=_display_ref_for_entry(cfg, entry),
             )
+    report.entry = entry
 
-    def phase_failed(
-        phase: _PullPhaseError,
-        *,
-        destination: str | None = None,
-        logs_recovered: bool | None = None,
-    ) -> NoReturn:
-        """Render one phase failure with the trailer that phase owes.
-
-        ``logs_recovered`` marks a transfer phase: its trailer reports the
-        records confirmed so far (``records`` is read at call time on purpose:
-        the pre-transfer list before outputs land, the inventory afterwards).
-        A programmatic caller (``_result``) always receives the structured
-        payload; the plain human rendering is only for an interactive terminal.
-        """
-        if phase.human_plain and not json_ and _result is None:
-            err.print(f"[red]{escape(phase.message)}[/red]")
-            if phase.hint:
-                err.print(f"[dim]{escape(phase.hint)}[/dim]")
-            raise typer.Exit(phase.exit_code)
-        trailer: dict[str, object] = {"job_id": entry.job_id, "node": entry.node}
-        if destination is not None:
-            trailer["destination"] = destination
-        if logs_recovered is not None:
-            trailer["records"] = (
-                confirmed_records(logs_recovered=logs_recovered)
-                if phase.records_fresh
-                else records
-            )
-            trailer["partial"] = True
-        fail(phase.kind, phase.message, phase.exit_code, **trailer, **phase.fields)
-
-    if _collection:
-        try:
-            collection_base = _ensure_collection_root(cfg, _collection)
-        except ValueError as exc:
-            fail(
-                "destination_unusable",
-                str(exc),
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
-    else:
-        collection_base = None
-    dst = (
-        Path(to).expanduser()
-        if to
-        else (
-            collection_base / entry.job_id
-            if collection_base is not None
-            else cfg.job_results_dir(entry.job_id)
-        )
-    ).absolute()
+    dst = _pull_destination(cfg, entry, report, to=to, collection=_collection)
+    report.dst = dst
     try:
         records_dir = _validate_pull_destination(dst, entry, force=force)
     except _PullPhaseError as phase:
-        phase_failed(phase, destination=str(dst))
+        report.phase_failed(phase, destination=str(dst))
+    report.records_dir = records_dir
     outputs_rel = f"{entry.job_dir}/outputs"
     try:
         outputs_present, remote_outputs_bytes, records_only = _probe_remote_outputs(
             entry, outputs_rel
         )
     except _PullPhaseError as phase:
-        phase_failed(phase)
+        report.phase_failed(phase)
+    report.remote_outputs_bytes = remote_outputs_bytes
     try:
         _prepare_pull_records_dir(dst, records_dir, entry)
     except _PullPhaseError as phase:
-        phase_failed(phase, destination=str(dst))
-    records = ["dt/job.json"]
-    evidence_records: list[str] = []
-    evidence_provenance: str | None = None
+        report.phase_failed(phase, destination=str(dst))
     cancel_kwargs: _RsyncCancelKwargs = (
         {"cancel_event": _cancel_event} if _cancel_event is not None else {}
     )
-
-    def confirmed_records(*, logs_recovered: bool = False) -> list[str]:
-        """Inventory reserved top-level run records already present locally."""
-        paths = ["dt/job.json"]
-        try:
-            record_files = sorted(records_dir.iterdir())
-        except OSError as exc:
-            fail(
-                "destination_unusable",
-                f"cannot inspect local records directory {records_dir}: {exc}",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-                destination=str(dst),
-            )
-        for path in record_files:
-            if path.name not in PULL_LOG_RECORDS:
-                continue
-            try:
-                info = path.lstat()
-            except OSError:
-                continue
-            if stat.S_ISREG(info.st_mode):
-                paths.append(f"dt/{path.name}")
-        paths.extend(f"dt/{name}" for name in evidence_records)
-        return paths
 
     pull_route = pull_relay.decide_pull_route(
         cfg,
@@ -15357,20 +15387,19 @@ def _pull_unlocked(
                 remote_outputs_bytes=remote_outputs_bytes,
                 retries=retries,
                 effective_bwlimit=effective_bwlimit,
-                retry_events=retry_events,
+                retry_events=report.retry_events,
                 cancel_kwargs=cancel_kwargs,
                 cancel_event=_cancel_event,
                 pull_route=pull_route,
             )
         except _PullPhaseError as phase:
-            phase_failed(phase, destination=str(dst), logs_recovered=False)
-    else:
-        if not json_:
-            err.print(
-                "[dim]no outputs/ (job failed before start); "
-                "recovering job record and environment log[/dim]"
-            )
-    records = confirmed_records()
+            report.phase_failed(phase, destination=str(dst), logs_recovered=False)
+    elif not json_:
+        err.print(
+            "[dim]no outputs/ (job failed before start); "
+            "recovering job record and environment log[/dim]"
+        )
+    report.records = report.confirmed_records()
 
     try:
         _transfer_run_logs(
@@ -15380,11 +15409,11 @@ def _pull_unlocked(
             json_=json_,
             retries=retries,
             effective_bwlimit=effective_bwlimit,
-            retry_events=retry_events,
+            retry_events=report.retry_events,
             cancel_kwargs=cancel_kwargs,
         )
     except _PullPhaseError as phase:
-        phase_failed(phase, destination=str(dst), logs_recovered=True)
+        report.phase_failed(phase, destination=str(dst), logs_recovered=True)
 
     try:
         evidence_provenance = _recover_runtime_evidence(
@@ -15393,29 +15422,29 @@ def _pull_unlocked(
             records_dir=records_dir,
             retries=retries,
             effective_bwlimit=effective_bwlimit,
-            retry_events=retry_events,
+            retry_events=report.retry_events,
             cancel_kwargs=cancel_kwargs,
             cancel_event=_cancel_event,
-            evidence_records=evidence_records,
+            evidence_records=report.evidence_records,
         )
     except _PullPhaseError as phase:
-        phase_failed(phase, destination=str(dst), logs_recovered=True)
+        report.phase_failed(phase, destination=str(dst), logs_recovered=True)
 
     try:
         pull_evidence_mod.validate_materialized_tree(dst)
     except (OSError, ValueError) as exc:
-        fail(
+        report.fail(
             "unsafe_output",
             str(exc),
             1,
             job_id=entry.job_id,
             node=entry.node,
             destination=str(dst),
-            records=confirmed_records(logs_recovered=True),
+            records=report.confirmed_records(),
             partial=True,
         )
 
-    records = confirmed_records(logs_recovered=True)
+    records = report.confirmed_records()
     payload = _pull_success_payload(
         entry,
         dst=dst,
@@ -15426,7 +15455,7 @@ def _pull_unlocked(
         relay_error=relay_error,
         remote_outputs_bytes=remote_outputs_bytes,
         evidence_provenance=evidence_provenance,
-        retry_events=retry_events,
+        retry_events=report.retry_events,
         records=records,
     )
     if _result is not None:

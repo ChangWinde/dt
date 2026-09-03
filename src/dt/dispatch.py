@@ -6188,6 +6188,89 @@ def _retract_no_queue_row(
     raise NoCapacity(failure_reasons)
 
 
+def _gate_dependencies(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    *,
+    no_queue: bool,
+    log: Callable[[str], None],
+    enqueue: Callable[..., JobEntry],
+    skip: Callable[[str], JobEntry],
+) -> JobEntry | None:
+    """Apply --after-* gates; return the queued or skipped row if one applies."""
+    if spec.after_success:
+        if no_queue:
+            raise ConfigError("after_success requires queueing")
+        predecessor = load(cfg, spec.after_success)
+        dependency_ready_on_pin = (
+            predecessor is not None
+            and _job_succeeded(predecessor)
+            and predecessor.node != "-"
+            and predecessor.node == spec.node
+        )
+        if (
+            predecessor is not None
+            and _dependency_settled(predecessor)
+            and not _job_succeeded(predecessor)
+        ):
+            result = effective_result_state(predecessor) or predecessor.status
+            return skip(
+                f"dependency {spec.after_success} completed as {result}; "
+                "required success"
+            )
+        if dependency_ready_on_pin:
+            assert predecessor is not None
+            log(
+                f"dependency {spec.after_success} already succeeded on "
+                f"{predecessor.node}; placing immediately"
+            )
+        else:
+            return enqueue(
+                f"dependency {spec.after_success}",
+                reason=f"waiting: dependency {spec.after_success}",
+            )
+    if spec.after_complete:
+        if no_queue:
+            raise ConfigError("after_complete requires queueing")
+        predecessor = load(cfg, spec.after_complete)
+        if predecessor is not None and _dependency_settled(predecessor):
+            log(
+                f"dependency {spec.after_complete} already completed as "
+                f"{effective_result_state(predecessor) or predecessor.status}; "
+                "placing independently"
+            )
+        else:
+            return enqueue(
+                f"completion dependency {spec.after_complete}",
+                reason=f"waiting: completion dependency {spec.after_complete}",
+            )
+    if spec.after_result:
+        if no_queue:
+            raise ConfigError("after_result requires queueing")
+        predecessor = load(cfg, spec.after_result)
+        if predecessor is not None and _dependency_settled(predecessor):
+            result = effective_result_state(predecessor) or predecessor.status
+            if result not in spec.after_result_states:
+                expected = ",".join(spec.after_result_states)
+                return skip(
+                    f"dependency {spec.after_result} completed as {result}; "
+                    f"expected one of {expected}"
+                )
+            log(
+                f"dependency {spec.after_result} already completed as {result}; "
+                "result predicate matched"
+            )
+        else:
+            expected = ",".join(spec.after_result_states)
+            return enqueue(
+                f"result dependency {spec.after_result}",
+                reason=(
+                    f"waiting: result dependency {spec.after_result} in [{expected}]"
+                ),
+            )
+    return None
+
+
 def _submit_prepared_once(
     cfg: HeadConfig,
     spec: RunSpec,
@@ -6323,76 +6406,11 @@ def _submit_prepared_once(
             f"{force_queue_label} item",
             reason=f"waiting: {force_queue_label} FIFO",
         )
-    if spec.after_success:
-        if no_queue:
-            raise ConfigError("after_success requires queueing")
-        predecessor = load(cfg, spec.after_success)
-        dependency_ready_on_pin = (
-            predecessor is not None
-            and _job_succeeded(predecessor)
-            and predecessor.node != "-"
-            and predecessor.node == spec.node
-        )
-        if (
-            predecessor is not None
-            and _dependency_settled(predecessor)
-            and not _job_succeeded(predecessor)
-        ):
-            result = effective_result_state(predecessor) or predecessor.status
-            return skip_dependency(
-                f"dependency {spec.after_success} completed as {result}; "
-                "required success"
-            )
-        if dependency_ready_on_pin:
-            assert predecessor is not None
-            log(
-                f"dependency {spec.after_success} already succeeded on "
-                f"{predecessor.node}; placing immediately"
-            )
-        else:
-            return enqueue(
-                f"dependency {spec.after_success}",
-                reason=f"waiting: dependency {spec.after_success}",
-            )
-    if spec.after_complete:
-        if no_queue:
-            raise ConfigError("after_complete requires queueing")
-        predecessor = load(cfg, spec.after_complete)
-        if predecessor is not None and _dependency_settled(predecessor):
-            log(
-                f"dependency {spec.after_complete} already completed as "
-                f"{effective_result_state(predecessor) or predecessor.status}; "
-                "placing independently"
-            )
-        else:
-            return enqueue(
-                f"completion dependency {spec.after_complete}",
-                reason=f"waiting: completion dependency {spec.after_complete}",
-            )
-    if spec.after_result:
-        if no_queue:
-            raise ConfigError("after_result requires queueing")
-        predecessor = load(cfg, spec.after_result)
-        if predecessor is not None and _dependency_settled(predecessor):
-            result = effective_result_state(predecessor) or predecessor.status
-            if result not in spec.after_result_states:
-                expected = ",".join(spec.after_result_states)
-                return skip_dependency(
-                    f"dependency {spec.after_result} completed as {result}; "
-                    f"expected one of {expected}"
-                )
-            log(
-                f"dependency {spec.after_result} already completed as {result}; "
-                "result predicate matched"
-            )
-        else:
-            expected = ",".join(spec.after_result_states)
-            return enqueue(
-                f"result dependency {spec.after_result}",
-                reason=(
-                    f"waiting: result dependency {spec.after_result} in [{expected}]"
-                ),
-            )
+    gated = _gate_dependencies(
+        cfg, spec, no_queue=no_queue, log=log, enqueue=enqueue, skip=skip_dependency
+    )
+    if gated is not None:
+        return gated
 
     cap = cfg.queue.max_my_jobs
     if cap is not None and running_count(cfg) >= cap:
@@ -7474,6 +7492,140 @@ def _recover_claimed_dispatch(
     return None
 
 
+class _StageUnusable(Exception):
+    """The staged queued job cannot be dispatched; the row must fail."""
+
+    def __init__(self, detail: str, *, cleanup: bool = True) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.cleanup = cleanup
+
+
+class _StageInterrupted(Exception):
+    """A concurrent transition replaced the row while stage preparation ran."""
+
+
+@dataclass(frozen=True)
+class _QueuedStage:
+    staging: Path
+    staged_code: Path
+    staged_payload_dir: Path
+    spec: RunSpec
+
+
+def _prepare_queued_stage(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    log: Callable[[str], None],
+) -> _QueuedStage:
+    """Locate and verify the staged snapshot and payload; rebuild the spec."""
+    staging = stage_dir(cfg, entry.job_id)
+    staged_code = (
+        _snapshot_path(cfg, entry.snapshot_sha256 or "")
+        if entry.storage_layout == ROLE_LAYOUT
+        else staging / "code"
+    )
+    if staged_code.is_symlink() or not staged_code.is_dir():
+        detail = (
+            "staging snapshot is an unsafe symlink"
+            if staged_code.is_symlink()
+            else (
+                "archived queue snapshot missing"
+                if entry.storage_layout == ROLE_LAYOUT
+                else "staging snapshot missing"
+            )
+        )
+        raise _StageUnusable(detail, cleanup=False)
+    try:
+        _repair_queued_snapshot(cfg, entry, staging, log)
+    except DispatchError as exc:
+        raise _StageUnusable(str(exc))
+    try:
+        staged_payload_dir = (
+            _stored_payload_dir(cfg, entry.payload_sha256 or "")
+            if entry.storage_layout == ROLE_LAYOUT and entry.payload_sha256
+            else staging
+        )
+    except DispatchError as exc:
+        raise _StageUnusable(str(exc))
+    staged_payload_complete = all(
+        (staged_payload_dir / name).is_file() for name in RUNTIME_PAYLOAD_NAMES
+    )
+    if entry.payload_sha256 or staged_payload_complete:
+        try:
+            observed_payload = payload_sha256(
+                _payload_files_from_dir(staged_payload_dir)
+            )
+        except OSError as exc:
+            raise _StageUnusable(f"staged dt payload cannot be read: {exc}")
+        if (
+            entry.payload_sha256 is not None
+            and observed_payload != entry.payload_sha256
+        ):
+            raise _StageUnusable(
+                "staged dt payload changed after submission: "
+                f"expected {entry.payload_sha256}, observed {observed_payload}"
+            )
+        if entry.payload_sha256 is None:
+            entry.payload_sha256 = observed_payload
+            current = _commit_queued_transition(cfg, entry)
+            if current is not None:
+                entry.__dict__.update(current.__dict__)
+                raise _StageInterrupted()
+
+    spec = _queued_run_spec(entry)
+    effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    spec.require_disk_gib = effective_disk_floor or None
+    try:
+        _validate_run_spec(spec)
+    except ConfigError as exc:
+        raise _StageUnusable(str(exc))
+    if entry.storage_layout == ROLE_LAYOUT:
+        try:
+            _ensure_role_queue_bundle(cfg, entry, spec, staging, staged_code, log)
+        except DispatchError as exc:
+            raise _StageUnusable(str(exc))
+
+    return _QueuedStage(
+        staging=staging,
+        staged_code=staged_code,
+        staged_payload_dir=staged_payload_dir,
+        spec=spec,
+    )
+
+
+def _fail_queued_placement(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    candidates: list[Node],
+    reasons: dict[str, str],
+    *,
+    uncertain: bool,
+    owned_attempt: tuple[str | None, str | None],
+) -> tuple[str, str | None]:
+    """Record a fatal placement failure against the last node attempted."""
+    bad = "; ".join(f"{n}: {r}" for n, r in reasons.items())
+    entry.status = "failed"
+    node_name = list(reasons)[-1]
+    node = next(
+        (candidate for candidate in candidates if candidate.name == node_name),
+        Node(name=node_name),
+    )
+    entry.node = node_name
+    entry.node_local = node.local
+    if entry.storage_layout == ROLE_LAYOUT:
+        entry.worker_root = cfg.worker_root_for(node)
+        entry.job_dir = cfg.worker_job_dir(node, entry.job_id)
+    entry.finished_at = time.time()
+    entry.reason = f"{UNCERTAIN_LAUNCH_PREFIX}{bad}" if uncertain else bad
+    current = _commit_queued_transition(cfg, entry, expected_attempt=owned_attempt)
+    remove_staging(cfg, entry.job_id)
+    if current is not None:
+        entry.__dict__.update(current.__dict__)
+        return _existing_dispatch_outcome(current)
+    return "failed", entry.reason
+
+
 def _dispatch_queued_active(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -7506,73 +7658,20 @@ def _dispatch_queued_active(
             return interrupted
         return outcome
 
-    staging = stage_dir(cfg, entry.job_id)
-    staged_code = (
-        _snapshot_path(cfg, entry.snapshot_sha256 or "")
-        if entry.storage_layout == ROLE_LAYOUT
-        else staging / "code"
+    try:
+        stage = _prepare_queued_stage(cfg, entry, log)
+    except _StageUnusable as exc:
+        return fail(exc.detail, cleanup=exc.cleanup)
+    except _StageInterrupted:
+        # Recording the learned payload identity lost to a concurrent
+        # transition; ``entry`` already carries that row.
+        return _existing_dispatch_outcome(entry)
+    staging, staged_code, staged_payload_dir, spec = (
+        stage.staging,
+        stage.staged_code,
+        stage.staged_payload_dir,
+        stage.spec,
     )
-    if staged_code.is_symlink() or not staged_code.is_dir():
-        detail = (
-            "staging snapshot is an unsafe symlink"
-            if staged_code.is_symlink()
-            else (
-                "archived queue snapshot missing"
-                if entry.storage_layout == ROLE_LAYOUT
-                else "staging snapshot missing"
-            )
-        )
-        return fail(detail, cleanup=False)
-    try:
-        _repair_queued_snapshot(cfg, entry, staging, log)
-    except DispatchError as exc:
-        return fail(str(exc))
-    try:
-        staged_payload_dir = (
-            _stored_payload_dir(cfg, entry.payload_sha256 or "")
-            if entry.storage_layout == ROLE_LAYOUT and entry.payload_sha256
-            else staging
-        )
-    except DispatchError as exc:
-        return fail(str(exc))
-    staged_payload_complete = all(
-        (staged_payload_dir / name).is_file() for name in RUNTIME_PAYLOAD_NAMES
-    )
-    if entry.payload_sha256 or staged_payload_complete:
-        try:
-            observed_payload = payload_sha256(
-                _payload_files_from_dir(staged_payload_dir)
-            )
-        except OSError as exc:
-            return fail(f"staged dt payload cannot be read: {exc}")
-        if (
-            entry.payload_sha256 is not None
-            and observed_payload != entry.payload_sha256
-        ):
-            return fail(
-                (
-                    "staged dt payload changed after submission: "
-                    f"expected {entry.payload_sha256}, observed {observed_payload}"
-                )
-            )
-        if entry.payload_sha256 is None:
-            entry.payload_sha256 = observed_payload
-            interrupted = commit()
-            if interrupted is not None:
-                return interrupted
-
-    spec = _queued_run_spec(entry)
-    effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
-    spec.require_disk_gib = effective_disk_floor or None
-    try:
-        _validate_run_spec(spec)
-    except ConfigError as exc:
-        return fail(str(exc))
-    if entry.storage_layout == ROLE_LAYOUT:
-        try:
-            _ensure_role_queue_bundle(cfg, entry, spec, staging, staged_code, log)
-        except DispatchError as exc:
-            return fail(str(exc))
 
     def job_dir_for_node(node: Node) -> str:
         if entry.storage_layout == ROLE_LAYOUT:
@@ -7676,33 +7775,14 @@ def _dispatch_queued_active(
     entry.dispatch_claimed_at = None
     spec.dispatch_token = None
     if fatal:
-        bad = "; ".join(f"{n}: {r}" for n, r in reasons.items())
-        entry.status = "failed"
-        node_name = list(reasons)[-1]
-        node = next(
-            (candidate for candidate in candidates if candidate.name == node_name),
-            Node(name=node_name),
-        )
-        entry.node = node_name
-        entry.node_local = node.local
-        if entry.storage_layout == ROLE_LAYOUT:
-            entry.worker_root = cfg.worker_root_for(node)
-            entry.job_dir = cfg.worker_job_dir(node, entry.job_id)
-        entry.finished_at = time.time()
-        if "cancel-unverified" in failure_kinds:
-            entry.reason = f"{UNCERTAIN_LAUNCH_PREFIX}{bad}"
-        else:
-            entry.reason = bad
-        current = _commit_queued_transition(
+        return _fail_queued_placement(
             cfg,
             entry,
-            expected_attempt=owned_attempt,
+            candidates,
+            reasons,
+            uncertain="cancel-unverified" in failure_kinds,
+            owned_attempt=owned_attempt,
         )
-        remove_staging(cfg, entry.job_id)
-        if current is not None:
-            entry.__dict__.update(current.__dict__)
-            return _existing_dispatch_outcome(current)
-        return "failed", entry.reason
 
     def settle(reason: str, outcome: tuple[str, str | None]) -> tuple[str, str | None]:
         changed = entry.reason != reason or placement_failures_changed
