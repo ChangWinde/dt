@@ -13319,6 +13319,113 @@ def _fork_repeat_host() -> fork_repeat_mod.Host:
     )
 
 
+def _resolve_fork_cache(
+    cfg: HeadConfig,
+    old: jobs_mod.JobEntry,
+    *,
+    inherit_cache: bool,
+    reuse_cache: str | None,
+    clone_cache: str | None,
+    json_: bool,
+) -> tuple[jobs_mod.JobEntry, str | None, str | None]:
+    """Resolve the cache source and optional cold-cache wrapper for a fork.
+
+    Returns ``(source, cold_cache_env, cold_cache_script)``.
+    """
+    source = old
+    cold_cache_env: str | None = None
+    if inherit_cache:
+        if not old.cache_source_job:
+            _fail_submission(
+                kind="invalid_request",
+                message=f"{old.job_id} has no cache binding to inherit",
+                exit_code=EXIT_ENV,
+                json_=json_,
+            )
+        source = _find_or_die(cfg, old.cache_source_job, json_=json_)
+    elif old.cache_source_job and not reuse_cache and not clone_cache:
+        if (
+            not old.cache_env
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", old.cache_env) is None
+        ):
+            _fail_submission(
+                kind="environment",
+                message=(
+                    f"{old.job_id} has invalid cache environment provenance; "
+                    "cannot guarantee a cold fork"
+                ),
+                exit_code=EXIT_ENV,
+                json_=json_,
+            )
+        cold_cache_env = old.cache_env
+    cold_cache_script = (
+        'cache_dir="$DT_JOB_DIR/outputs/.cache/dt-cold"; '
+        'mkdir -p "$cache_dir"; '
+        f'export {cold_cache_env}="$cache_dir"; '
+        'exec "$@"'
+        if cold_cache_env
+        else None
+    )
+    return source, cold_cache_env, cold_cache_script
+
+
+def _build_fork_spec(
+    old: jobs_mod.JobEntry,
+    source: jobs_mod.JobEntry,
+    *,
+    item_name: str | None,
+    command: list[str] | None,
+    inherit_cache: bool,
+    reuse_cache: str | None,
+    clone_cache: str | None,
+    cache_env: str,
+    artifact_manifest: str | None,
+    cold_cache_script: str | None,
+    max_hours: float | None,
+    min_vram_mib: int | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+) -> RunSpec:
+    """Build one fork RunSpec, applying the cold-cache wrapper and overrides."""
+    from . import dispatch as dispatch_mod
+
+    if inherit_cache:
+        item_spec = dispatch_mod.inherited_cache_fork_spec_from_entry(
+            old,
+            source,
+            name=item_name,
+            cmd=command or None,
+            artifact_manifest=artifact_manifest,
+        )
+    else:
+        item_spec = dispatch_mod.fork_spec_from_entry(
+            old,
+            name=item_name,
+            cmd=command or None,
+            reuse_cache=reuse_cache,
+            clone_cache=clone_cache,
+            cache_env=cache_env,
+            artifact_manifest=artifact_manifest,
+        )
+    if cold_cache_script:
+        item_spec.cmd = [
+            "bash",
+            "-c",
+            cold_cache_script,
+            "dt-cold-fork",
+            *item_spec.cmd,
+        ]
+    if max_hours is not None:
+        item_spec.max_hours = max_hours
+    if min_vram_mib is not None:
+        item_spec.min_vram_mib = min_vram_mib
+    if max_vram_mib is not None:
+        item_spec.max_vram_mib = max_vram_mib
+    if max_job_memory_mib is not None:
+        item_spec.max_job_memory_mib = max_job_memory_mib
+    return item_spec
+
+
 def fork(
     ctx: typer.Context,
     ref: str = REF_ARG,
@@ -13545,81 +13652,33 @@ def fork(
             exit_code=1,
             json_=json_,
         )
-    source = old
-    cold_cache_env: str | None = None
-    if inherit_cache:
-        if not old.cache_source_job:
-            _fail_submission(
-                kind="invalid_request",
-                message=f"{old.job_id} has no cache binding to inherit",
-                exit_code=EXIT_ENV,
-                json_=json_,
-            )
-        source = _find_or_die(cfg, old.cache_source_job, json_=json_)
-    else:
-        if old.cache_source_job and not reuse_cache and not clone_cache:
-            if (
-                not old.cache_env
-                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", old.cache_env) is None
-            ):
-                _fail_submission(
-                    kind="environment",
-                    message=(
-                        f"{old.job_id} has invalid cache environment provenance; "
-                        "cannot guarantee a cold fork"
-                    ),
-                    exit_code=EXIT_ENV,
-                    json_=json_,
-                )
-            cold_cache_env = old.cache_env
-
+    source, cold_cache_env, cold_cache_script = _resolve_fork_cache(
+        cfg,
+        old,
+        inherit_cache=inherit_cache,
+        reuse_cache=reuse_cache,
+        clone_cache=clone_cache,
+        json_=json_,
+    )
     source_display_ref = _display_ref_for_entry(cfg, source)
 
-    cold_cache_script = (
-        'cache_dir="$DT_JOB_DIR/outputs/.cache/dt-cold"; '
-        'mkdir -p "$cache_dir"; '
-        f'export {cold_cache_env}="$cache_dir"; '
-        'exec "$@"'
-        if cold_cache_env
-        else None
-    )
-
     def build_spec(item_name: str | None) -> RunSpec:
-        if inherit_cache:
-            item_spec = dispatch_mod.inherited_cache_fork_spec_from_entry(
-                old,
-                source,
-                name=item_name,
-                cmd=command or None,
-                artifact_manifest=artifact_manifest,
-            )
-        else:
-            item_spec = dispatch_mod.fork_spec_from_entry(
-                old,
-                name=item_name,
-                cmd=command or None,
-                reuse_cache=reuse_cache,
-                clone_cache=clone_cache,
-                cache_env=cache_env,
-                artifact_manifest=artifact_manifest,
-            )
-        if cold_cache_script:
-            item_spec.cmd = [
-                "bash",
-                "-c",
-                cold_cache_script,
-                "dt-cold-fork",
-                *item_spec.cmd,
-            ]
-        if max_hours is not None:
-            item_spec.max_hours = max_hours
-        if min_vram_mib is not None:
-            item_spec.min_vram_mib = min_vram_mib
-        if max_vram_mib is not None:
-            item_spec.max_vram_mib = max_vram_mib
-        if max_job_memory_mib is not None:
-            item_spec.max_job_memory_mib = max_job_memory_mib
-        return item_spec
+        return _build_fork_spec(
+            old,
+            source,
+            item_name=item_name,
+            command=command or None,
+            inherit_cache=inherit_cache,
+            reuse_cache=reuse_cache,
+            clone_cache=clone_cache,
+            cache_env=cache_env,
+            artifact_manifest=artifact_manifest,
+            cold_cache_script=cold_cache_script,
+            max_hours=max_hours,
+            min_vram_mib=min_vram_mib,
+            max_vram_mib=max_vram_mib,
+            max_job_memory_mib=max_job_memory_mib,
+        )
 
     prefix = jobs_mod.sanitize_name((name or f"{old.name}-fork").strip())
     first_name = (
