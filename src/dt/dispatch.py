@@ -6109,6 +6109,17 @@ def _submission_meta(
     }
 
 
+def _probe_pinned_node(cfg: HeadConfig, pinned: Node) -> NodeStatus:
+    """Probe one pinned node, honouring the role layout's lease root."""
+    if cfg.layout == ROLE_LAYOUT:
+        return probe_node(
+            pinned,
+            cfg.mem_threshold_mib,
+            lease_root=cfg.lease_root_for(pinned),
+        )
+    return probe_node(pinned, cfg.mem_threshold_mib)
+
+
 def _probe_for_submission(
     cfg: HeadConfig,
     spec: RunSpec,
@@ -6125,17 +6136,7 @@ def _probe_for_submission(
             )
         log(f"probing {spec.node}")
         pinned = by_name[spec.node]
-        statuses = [
-            (
-                probe_node(
-                    pinned,
-                    cfg.mem_threshold_mib,
-                    lease_root=cfg.lease_root_for(pinned),
-                )
-                if cfg.layout == ROLE_LAYOUT
-                else probe_node(pinned, cfg.mem_threshold_mib)
-            )
-        ]
+        statuses = [_probe_pinned_node(cfg, pinned)]
     else:
         log(f"probing {cfg.center} nodes")
         statuses = probe_center(cfg, use_cache=False)
@@ -7358,100 +7359,9 @@ def _sync_queued_job_to_node(
     return observed
 
 
-def _dispatch_queued_active(
-    cfg: HeadConfig,
-    entry: JobEntry,
-    log: Callable[[str], None],
-) -> tuple[str, str | None]:
-    """Dispatch one queued entry with atomic, cancellation-aware transitions."""
-
-    def commit(*, persist: bool = True) -> tuple[str, str | None] | None:
-        current = _commit_queued_transition(cfg, entry, persist=persist)
-        if current is None:
-            return None
-        entry.__dict__.update(current.__dict__)
-        return _existing_dispatch_outcome(current)
-
-    staging = stage_dir(cfg, entry.job_id)
-    staged_code = (
-        _snapshot_path(cfg, entry.snapshot_sha256 or "")
-        if entry.storage_layout == ROLE_LAYOUT
-        else staging / "code"
-    )
-    if staged_code.is_symlink() or not staged_code.is_dir():
-        detail = (
-            "staging snapshot is an unsafe symlink"
-            if staged_code.is_symlink()
-            else (
-                "archived queue snapshot missing"
-                if entry.storage_layout == ROLE_LAYOUT
-                else "staging snapshot missing"
-            )
-        )
-        entry.status, entry.reason = "failed", detail
-        interrupted = commit()
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
-    try:
-        _repair_queued_snapshot(cfg, entry, staging, log)
-    except DispatchError as exc:
-        entry.status, entry.reason = "failed", str(exc)
-        interrupted = commit()
-        remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
-    try:
-        staged_payload_dir = (
-            _stored_payload_dir(cfg, entry.payload_sha256 or "")
-            if entry.storage_layout == ROLE_LAYOUT and entry.payload_sha256
-            else staging
-        )
-    except DispatchError as exc:
-        entry.status, entry.reason = "failed", str(exc)
-        interrupted = commit()
-        remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
-    staged_payload_complete = all(
-        (staged_payload_dir / name).is_file() for name in RUNTIME_PAYLOAD_NAMES
-    )
-    if entry.payload_sha256 or staged_payload_complete:
-        try:
-            observed_payload = payload_sha256(
-                _payload_files_from_dir(staged_payload_dir)
-            )
-        except OSError as exc:
-            entry.status = "failed"
-            entry.reason = f"staged dt payload cannot be read: {exc}"
-            interrupted = commit()
-            remove_staging(cfg, entry.job_id)
-            if interrupted is not None:
-                return interrupted
-            return "failed", entry.reason
-        if (
-            entry.payload_sha256 is not None
-            and observed_payload != entry.payload_sha256
-        ):
-            entry.status = "failed"
-            entry.reason = (
-                "staged dt payload changed after submission: "
-                f"expected {entry.payload_sha256}, observed {observed_payload}"
-            )
-            interrupted = commit()
-            remove_staging(cfg, entry.job_id)
-            if interrupted is not None:
-                return interrupted
-            return "failed", entry.reason
-        if entry.payload_sha256 is None:
-            entry.payload_sha256 = observed_payload
-            interrupted = commit()
-            if interrupted is not None:
-                return interrupted
-
-    spec = RunSpec(
+def _queued_run_spec(entry: JobEntry) -> RunSpec:
+    """Rebuild the exact submission contract a queued registry row carries."""
+    return RunSpec(
         name=entry.name,
         cmd=shlex.split(entry.cmd),
         node=entry.pin_node,
@@ -7483,27 +7393,182 @@ def _dispatch_queued_active(
         cache_mode=entry.cache_mode,
         payload_sha256=entry.payload_sha256,
     )
+
+
+def _recover_claimed_dispatch(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    *,
+    job_dir_for_node: Callable[[Node], str],
+    log: Callable[[str], None],
+) -> tuple[str, str | None] | None:
+    """Resolve a queued row that still carries a dispatch claim.
+
+    Returns the outcome to report when the row must not be re-placed yet (a
+    live owner, an unverifiable remote attempt, or a recovered launch), or
+    None once the stale claim has been cleared and placement may proceed.
+    """
+
+    def blocked(detail: str) -> tuple[str, str | None]:
+        entry.reason = f"blocked: {detail}"
+        current = _commit_queued_transition(cfg, entry)
+        if current is not None:
+            entry.__dict__.update(current.__dict__)
+            return _existing_dispatch_outcome(current)
+        return "blocked", detail
+
+    hold_reason = _dispatch_claim_hold_reason(entry)
+    if hold_reason is not None:
+        # The claim owner is alive on this head and the claim is fresh.
+        # Probing now could observe a no-evidence window (mkdir/rsync/ssh
+        # setup) and cancel a perfectly valid in-flight launch. Leave the
+        # row untouched; the owner will finish or its death unblocks us.
+        return "waiting", hold_reason
+    configured = next(
+        (node for node in cfg.nodes if node.name == entry.dispatch_node),
+        None,
+    )
+    if configured is None:
+        return blocked(
+            f"previous dispatch node {entry.dispatch_node!r} is no longer "
+            "configured; recovery cannot prove the remote attempt absent"
+        )
+    attempted_node = _queued_node(cfg, entry, configured)
+    adopted, recovery_error = _adopt_interrupted_queued_launch(
+        cfg,
+        entry,
+        attempted_node,
+        job_dir_for_node(attempted_node),
+    )
+    if adopted is not None:
+        log(
+            f"recovered {adopted.status} launch on {attempted_node.name} "
+            "before resynchronizing"
+        )
+        return _finish_queued_placement(cfg, entry, adopted)
+    if recovery_error is not None:
+        return blocked(
+            f"dispatch recovery unverified on {attempted_node.name}: {recovery_error}"
+        )
+    # The cancellation sentinel closed any in-progress launch race and a
+    # complete survivor census proved the old attempt absent. Only now may a
+    # retry overwrite support files or the immutable code projection.
+    recovered_attempt = (entry.dispatch_node, entry.dispatch_token)
+    entry.dispatch_node = None
+    entry.dispatch_token = None
+    entry.dispatch_owner = None
+    entry.dispatch_claimed_at = None
+    entry.reason = None
+    current = _commit_queued_transition(
+        cfg,
+        entry,
+        expected_attempt=recovered_attempt,
+    )
+    if current is not None:
+        entry.__dict__.update(current.__dict__)
+        return _existing_dispatch_outcome(current)
+    return None
+
+
+def _dispatch_queued_active(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    log: Callable[[str], None],
+) -> tuple[str, str | None]:
+    """Dispatch one queued entry with atomic, cancellation-aware transitions."""
+
+    def commit(*, persist: bool = True) -> tuple[str, str | None] | None:
+        current = _commit_queued_transition(cfg, entry, persist=persist)
+        if current is None:
+            return None
+        entry.__dict__.update(current.__dict__)
+        return _existing_dispatch_outcome(current)
+
+    def fail(detail: str, *, cleanup: bool = True) -> tuple[str, str | None]:
+        entry.status, entry.reason = "failed", detail
+        interrupted = commit()
+        if cleanup:
+            remove_staging(cfg, entry.job_id)
+        if interrupted is not None:
+            return interrupted
+        return "failed", entry.reason
+
+    def hold(reason: str, outcome: tuple[str, str | None]) -> tuple[str, str | None]:
+        changed = entry.reason != reason
+        if changed:
+            entry.reason = reason
+        interrupted = commit(persist=changed)
+        if interrupted is not None:
+            return interrupted
+        return outcome
+
+    staging = stage_dir(cfg, entry.job_id)
+    staged_code = (
+        _snapshot_path(cfg, entry.snapshot_sha256 or "")
+        if entry.storage_layout == ROLE_LAYOUT
+        else staging / "code"
+    )
+    if staged_code.is_symlink() or not staged_code.is_dir():
+        detail = (
+            "staging snapshot is an unsafe symlink"
+            if staged_code.is_symlink()
+            else (
+                "archived queue snapshot missing"
+                if entry.storage_layout == ROLE_LAYOUT
+                else "staging snapshot missing"
+            )
+        )
+        return fail(detail, cleanup=False)
+    try:
+        _repair_queued_snapshot(cfg, entry, staging, log)
+    except DispatchError as exc:
+        return fail(str(exc))
+    try:
+        staged_payload_dir = (
+            _stored_payload_dir(cfg, entry.payload_sha256 or "")
+            if entry.storage_layout == ROLE_LAYOUT and entry.payload_sha256
+            else staging
+        )
+    except DispatchError as exc:
+        return fail(str(exc))
+    staged_payload_complete = all(
+        (staged_payload_dir / name).is_file() for name in RUNTIME_PAYLOAD_NAMES
+    )
+    if entry.payload_sha256 or staged_payload_complete:
+        try:
+            observed_payload = payload_sha256(
+                _payload_files_from_dir(staged_payload_dir)
+            )
+        except OSError as exc:
+            return fail(f"staged dt payload cannot be read: {exc}")
+        if (
+            entry.payload_sha256 is not None
+            and observed_payload != entry.payload_sha256
+        ):
+            return fail(
+                (
+                    "staged dt payload changed after submission: "
+                    f"expected {entry.payload_sha256}, observed {observed_payload}"
+                )
+            )
+        if entry.payload_sha256 is None:
+            entry.payload_sha256 = observed_payload
+            interrupted = commit()
+            if interrupted is not None:
+                return interrupted
+
+    spec = _queued_run_spec(entry)
     effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
     spec.require_disk_gib = effective_disk_floor or None
     try:
         _validate_run_spec(spec)
     except ConfigError as exc:
-        entry.status, entry.reason = "failed", str(exc)
-        interrupted = commit()
-        remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
+        return fail(str(exc))
     if entry.storage_layout == ROLE_LAYOUT:
         try:
             _ensure_role_queue_bundle(cfg, entry, spec, staging, staged_code, log)
         except DispatchError as exc:
-            entry.status, entry.reason = "failed", str(exc)
-            interrupted = commit()
-            remove_staging(cfg, entry.job_id)
-            if interrupted is not None:
-                return interrupted
-            return "failed", entry.reason
+            return fail(str(exc))
 
     def job_dir_for_node(node: Node) -> str:
         if entry.storage_layout == ROLE_LAYOUT:
@@ -7511,87 +7576,17 @@ def _dispatch_queued_active(
         return entry.job_dir
 
     if entry.dispatch_node is not None:
-        hold_reason = _dispatch_claim_hold_reason(entry)
-        if hold_reason is not None:
-            # The claim owner is alive on this head and the claim is fresh.
-            # Probing now could observe a no-evidence window (mkdir/rsync/ssh
-            # setup) and cancel a perfectly valid in-flight launch. Leave the
-            # row untouched; the owner will finish or its death unblocks us.
-            return "waiting", hold_reason
-        configured = next(
-            (node for node in cfg.nodes if node.name == entry.dispatch_node),
-            None,
+        recovered = _recover_claimed_dispatch(
+            cfg, entry, job_dir_for_node=job_dir_for_node, log=log
         )
-        if configured is None:
-            detail = (
-                f"previous dispatch node {entry.dispatch_node!r} is no longer "
-                "configured; recovery cannot prove the remote attempt absent"
-            )
-            entry.reason = f"blocked: {detail}"
-            interrupted = commit()
-            if interrupted is not None:
-                return interrupted
-            return "blocked", detail
-        attempted_node = _queued_node(cfg, entry, configured)
-        attempted_job_dir = job_dir_for_node(attempted_node)
-        adopted, recovery_error = _adopt_interrupted_queued_launch(
-            cfg,
-            entry,
-            attempted_node,
-            attempted_job_dir,
-        )
-        if adopted is not None:
-            log(
-                f"recovered {adopted.status} launch on {attempted_node.name} "
-                "before resynchronizing"
-            )
-            return _finish_queued_placement(cfg, entry, adopted)
-        if recovery_error is not None:
-            detail = f"dispatch recovery unverified on {attempted_node.name}: {recovery_error}"
-            entry.reason = f"blocked: {detail}"
-            interrupted = commit()
-            if interrupted is not None:
-                return interrupted
-            return "blocked", detail
-        # The cancellation sentinel closed any in-progress launch race and a
-        # complete survivor census proved the old attempt absent. Only now may
-        # a retry overwrite support files or the immutable code projection.
-        recovered_attempt = (entry.dispatch_node, entry.dispatch_token)
-        entry.dispatch_node = None
-        entry.dispatch_token = None
-        entry.dispatch_owner = None
-        entry.dispatch_claimed_at = None
-        entry.reason = None
-        current = _commit_queued_transition(
-            cfg,
-            entry,
-            expected_attempt=recovered_attempt,
-        )
-        if current is not None:
-            entry.__dict__.update(current.__dict__)
-            return _existing_dispatch_outcome(current)
+        if recovered is not None:
+            return recovered
     if spec.node:
         by_name = {node.name: node for node in cfg.nodes}
         pinned = by_name.get(spec.node)
         if pinned is None:
-            entry.status = "failed"
-            entry.reason = f"unknown node {spec.node!r}; configured: {list(by_name)}"
-            interrupted = commit()
-            remove_staging(cfg, entry.job_id)
-            if interrupted is not None:
-                return interrupted
-            return "failed", entry.reason
-        statuses = [
-            (
-                probe_node(
-                    pinned,
-                    cfg.mem_threshold_mib,
-                    lease_root=cfg.lease_root_for(pinned),
-                )
-                if cfg.layout == ROLE_LAYOUT
-                else probe_node(pinned, cfg.mem_threshold_mib)
-            )
-        ]
+            return fail(f"unknown node {spec.node!r}; configured: {list(by_name)}")
+        statuses = [_probe_pinned_node(cfg, pinned)]
     else:
         statuses = probe_center(cfg, use_cache=False)
     probe_reasons = {
@@ -7601,26 +7596,15 @@ def _dispatch_queued_active(
     try:
         candidates = pick_candidates(statuses, cfg.nodes, spec, _reserve_for(cfg, spec))
     except ConfigError as e:
-        entry.status, entry.reason = "failed", str(e)
-        interrupted = commit()
-        remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
+        return fail(str(e))
     if statuses and all(status.unreachable for status in statuses):
-        waiting_reason = waiting_unreachable_reason(probe_reasons)
-        changed = entry.reason != waiting_reason
-        if changed:
-            entry.reason = waiting_reason
-        interrupted = commit(persist=changed)
-        if interrupted is not None:
-            return interrupted
-        if spec.node is not None:
-            detail = "; ".join(
-                f"{node}: {reason}" for node, reason in probe_reasons.items()
-            )
-            return "blocked", detail
-        return "busy", None
+        detail = "; ".join(
+            f"{node}: {reason}" for node, reason in probe_reasons.items()
+        )
+        return hold(
+            waiting_unreachable_reason(probe_reasons),
+            ("blocked", detail) if spec.node is not None else ("busy", None),
+        )
     if pin_is_busy(statuses, spec):
         candidates = []
     if not candidates:
@@ -7628,22 +7612,8 @@ def _dispatch_queued_active(
             detail = "; ".join(
                 f"{node}: {reason}" for node, reason in probe_reasons.items()
             )
-            blocked_reason = f"blocked: {detail}"
-            changed = entry.reason != blocked_reason
-            if changed:
-                entry.reason = blocked_reason
-            interrupted = commit(persist=changed)
-            if interrupted is not None:
-                return interrupted
-            return "blocked", detail
-        waiting_reason = waiting_capacity_reason(probe_reasons)
-        changed = entry.reason != waiting_reason
-        if changed:
-            entry.reason = waiting_reason
-        interrupted = commit(persist=changed)
-        if interrupted is not None:
-            return interrupted
-        return "busy", None
+            return hold(f"blocked: {detail}", ("blocked", detail))
+        return hold(waiting_capacity_reason(probe_reasons), ("busy", None))
 
     candidates = [_queued_node(cfg, entry, node) for node in candidates]
 
@@ -7680,12 +7650,7 @@ def _dispatch_queued_active(
             submodule_commits=entry.submodule_commits,
         )
     except DispatchError as e:
-        entry.status, entry.reason = "failed", str(e)
-        interrupted = commit()
-        remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
+        return fail(str(e))
 
     if placed:
         return _finish_queued_placement(cfg, entry, placed)
@@ -7734,11 +7699,11 @@ def _dispatch_queued_active(
             entry.__dict__.update(current.__dict__)
             return _existing_dispatch_outcome(current)
         return "failed", entry.reason
-    if failure_kinds == {"unreachable"}:
-        waiting_reason = waiting_unreachable_reason(reasons)
-        changed = entry.reason != waiting_reason or placement_failures_changed
+
+    def settle(reason: str, outcome: tuple[str, str | None]) -> tuple[str, str | None]:
+        changed = entry.reason != reason or placement_failures_changed
         if changed:
-            entry.reason = waiting_reason
+            entry.reason = reason
         current = _commit_queued_transition(
             cfg,
             entry,
@@ -7748,41 +7713,19 @@ def _dispatch_queued_active(
         if current is not None:
             entry.__dict__.update(current.__dict__)
             return _existing_dispatch_outcome(current)
-        return "busy", None
+        return outcome
+
+    if failure_kinds == {"unreachable"}:
+        return settle(waiting_unreachable_reason(reasons), ("busy", None))
     if blocked_not_busy(reasons):
         detail = "; ".join(f"{n}: {r}" for n, r in reasons.items())
-        blocked_reason = f"blocked: {detail}"
-        changed = entry.reason != blocked_reason or placement_failures_changed
-        if changed:
-            entry.reason = blocked_reason
-        current = _commit_queued_transition(
-            cfg,
-            entry,
-            persist=changed,
-            expected_attempt=owned_attempt,
-        )
-        if current is not None:
-            entry.__dict__.update(current.__dict__)
-            return _existing_dispatch_outcome(current)
-        return "blocked", detail
-    waiting_reason = (
+        return settle(f"blocked: {detail}", ("blocked", detail))
+    return settle(
         waiting_placement_failure_reason(reasons)
         if reasons
-        else waiting_capacity_reason(probe_reasons)
+        else waiting_capacity_reason(probe_reasons),
+        ("busy", None),
     )
-    changed = entry.reason != waiting_reason or placement_failures_changed
-    if changed:
-        entry.reason = waiting_reason
-    current = _commit_queued_transition(
-        cfg,
-        entry,
-        persist=changed,
-        expected_attempt=owned_attempt,
-    )
-    if current is not None:
-        entry.__dict__.update(current.__dict__)
-        return _existing_dispatch_outcome(current)
-    return "busy", None
 
 
 # --------------------------------------------------------------------------
