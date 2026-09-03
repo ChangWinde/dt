@@ -2431,6 +2431,99 @@ def _emit_submission(
     print(entry.job_id)  # bare id, last stdout line: agents rely on this
 
 
+def _emit_run_plan(
+    cfg: HeadConfig,
+    request: SubmissionRequest,
+    *,
+    artifacts: list[str],
+    artifact_manifest: str | None,
+    custom_env: Mapping[str, str] | None,
+    no_queue: bool,
+    json_: bool,
+) -> None:
+    """Resolve dependencies and print a `dt run --plan` preview; write nothing."""
+    node = request.node
+    after_success_id = None
+    if request.after_success:
+        after_success_id, node = _resolve_submission_dependency(
+            cfg,
+            request.after_success,
+            requested_node=node,
+            json_=json_,
+        )
+    after_complete_id = None
+    if request.after_complete:
+        after_complete_id = _resolve_completion_dependency(
+            cfg,
+            request.after_complete,
+            json_=json_,
+        )
+    after_result_id = None
+    if request.after_result:
+        after_result_id = _resolve_completion_dependency(
+            cfg,
+            request.after_result,
+            json_=json_,
+        )
+    resolved = request.resolved(
+        node=node,
+        project=request.project,
+        artifact_manifest=request.artifact_manifest,
+        after_success=after_success_id,
+        after_complete=after_complete_id,
+        after_result=after_result_id,
+    )
+    try:
+        payload = preview_submission(
+            cfg,
+            resolved.to_run_spec(),
+            Path.cwd(),
+            no_queue=no_queue,
+        )
+    except (DispatchError, ConfigError) as exc:
+        _fail_submission(
+            kind="plan_failed",
+            message=str(exc),
+            exit_code=EXIT_ENV,
+            json_=json_,
+        )
+    payload["artifacts"] = {
+        "requested": list(artifacts),
+        "sync_required": bool(artifacts),
+        "manifest": artifact_manifest,
+    }
+    if custom_env:
+        environment_row = cast(JsonDict, payload.setdefault("environment", {}))
+        environment_row["variables"] = sorted(custom_env)
+    if json_:
+        print(json.dumps(payload))
+        return
+    placement = cast(JsonDict, payload["placement"])
+    outcome = str(placement.get("outcome") or "unknown")
+    selected = placement.get("selected_node")
+    gpus_preview = placement.get("selected_gpus") or []
+    target = (
+        f"{selected} · GPU {','.join(map(str, gpus_preview)) or 'cpu'}"
+        if selected
+        else str(placement.get("reason") or "placement unresolved")
+    )
+    out.print(f"[bold]plan[/bold] {escape(outcome)} · {escape(target)}")
+    snapshot_row = cast(JsonDict, payload["snapshot"])
+    out.print(
+        f"snapshot {_format_transfer_bytes(snapshot_row['source_bytes'])} · "
+        "no state written"
+    )
+    environment_row = cast(JsonDict, payload["environment"])
+    out.print(
+        f"environment {escape(str(environment_row.get('status')))}"
+        + (
+            f" · {escape(str(environment_row.get('identity')))}"
+            if environment_row.get("identity")
+            else ""
+        )
+    )
+
+
 def _resolve_laptop_run_center(
     cfg: LaptopConfig,
     *,
@@ -2919,89 +3012,15 @@ def run(
         custom_env=tuple(custom_env.items()),
     )
     if plan:
-        node = request.node
-        after_success_id = None
-        if request.after_success:
-            after_success_id, node = _resolve_submission_dependency(
-                cfg,
-                request.after_success,
-                requested_node=node,
-                json_=json_,
-            )
-        after_complete_id = None
-        if request.after_complete:
-            after_complete_id = _resolve_completion_dependency(
-                cfg,
-                request.after_complete,
-                json_=json_,
-            )
-        after_result_id = None
-        if request.after_result:
-            after_result_id = _resolve_completion_dependency(
-                cfg,
-                request.after_result,
-                json_=json_,
-            )
-        resolved = request.resolved(
-            node=node,
-            project=request.project,
-            artifact_manifest=request.artifact_manifest,
-            after_success=after_success_id,
-            after_complete=after_complete_id,
-            after_result=after_result_id,
+        _emit_run_plan(
+            cfg,
+            request,
+            artifacts=artifacts,
+            artifact_manifest=artifact_manifest,
+            custom_env=custom_env,
+            no_queue=no_queue,
+            json_=json_,
         )
-        try:
-            payload = preview_submission(
-                cfg,
-                resolved.to_run_spec(),
-                Path.cwd(),
-                no_queue=no_queue,
-            )
-        except (DispatchError, ConfigError) as exc:
-            _fail_submission(
-                kind="plan_failed",
-                message=str(exc),
-                exit_code=EXIT_ENV,
-                json_=json_,
-            )
-        payload["artifacts"] = {
-            "requested": list(artifacts),
-            "sync_required": bool(artifacts),
-            "manifest": artifact_manifest,
-        }
-        if custom_env:
-            environment_row = cast(
-                JsonDict,
-                payload.setdefault("environment", {}),
-            )
-            environment_row["variables"] = sorted(custom_env)
-        if json_:
-            print(json.dumps(payload))
-        else:
-            placement = cast(JsonDict, payload["placement"])
-            outcome = str(placement.get("outcome") or "unknown")
-            selected = placement.get("selected_node")
-            gpus_preview = placement.get("selected_gpus") or []
-            target = (
-                f"{selected} · GPU {','.join(map(str, gpus_preview)) or 'cpu'}"
-                if selected
-                else str(placement.get("reason") or "placement unresolved")
-            )
-            out.print(f"[bold]plan[/bold] {escape(outcome)} · {escape(target)}")
-            snapshot_row = cast(JsonDict, payload["snapshot"])
-            out.print(
-                f"snapshot {_format_transfer_bytes(snapshot_row['source_bytes'])} · "
-                "no state written"
-            )
-            environment_row = cast(JsonDict, payload["environment"])
-            out.print(
-                f"environment {escape(str(environment_row.get('status')))}"
-                + (
-                    f" · {escape(str(environment_row.get('identity')))}"
-                    if environment_row.get("identity")
-                    else ""
-                )
-            )
         return
     entry, agent_started, artifact_sync = _submit_request(
         cfg,
@@ -5551,13 +5570,12 @@ def _matrix_run_head(
 
     def ensure_agent(entry: jobs_mod.JobEntry) -> None:
         nonlocal agent_checked, agent_started
-        if entry.status != "queued" or agent_checked:
+        if agent_checked:
             return
-        from . import agent as agent_mod
-
-        agent_checked = True
-        if agent_mod.alive_pid(cfg) is None:
-            agent_started = agent_mod.start_detached(cfg)
+        started = _ensure_agent_for(cfg, entry)
+        if entry.status == "queued":
+            agent_checked = True
+            agent_started = started
 
     resumed = len(entries)
     for existing_index, existing_entry in enumerate(entries, start=1):
@@ -10982,6 +11000,99 @@ def _info_actions(entry: jobs_mod.JobEntry) -> list[JsonDict]:
     return []
 
 
+def _info_resource_guard_text(resource_guard: Mapping[str, object]) -> str:
+    """Human text for one resource-guard trip recorded on the job."""
+    phase = resource_guard.get("phase")
+    phase_text = f" during {phase}" if _safe_phase_name(phase) else ""
+    if resource_guard.get("kind") == "max_vram_mib_observation_failure":
+        return (
+            "VRAM telemetry unavailable for "
+            f"{resource_guard.get('consecutive_failures')} samples: "
+            f"{escape(str(resource_guard.get('reason') or 'unknown'))}"
+            f"{phase_text}"
+        )
+    if resource_guard.get("kind") == "max_job_memory_mib":
+        return (
+            f"job {resource_guard.get('observed_metric')} used "
+            f"{resource_guard.get('observed_mib')} MiB > "
+            f"{resource_guard.get('limit_mib')} MiB{phase_text}"
+        )
+    return (
+        f"GPU {resource_guard.get('gpu_index')} used "
+        f"{resource_guard.get('observed_mib')} MiB > "
+        f"{resource_guard.get('limit_mib')} MiB{phase_text}"
+    )
+
+
+_INFO_COMPACT_LABELS = frozenset(
+    {
+        "name",
+        "ref",
+        "status",
+        "queue",
+        "queue head",
+        "previous",
+        "placement failures",
+        "where",
+        "gpus",
+        "cmd",
+        "project",
+        "submitted (head)",
+        "duration",
+        "exit code",
+        "outputs",
+        "code copy",
+        "forked from",
+        "after success",
+        "rerun of",
+        "rerun code",
+        "retry",
+        "retried by",
+        "failure log",
+        "guard trip",
+        "phase timeline",
+        "live gpu",
+        "live host",
+        "next",
+    }
+)
+
+
+def _print_info_table(
+    rows: list[tuple[str, Any]],
+    *,
+    verbose: bool,
+) -> None:
+    """Filter and print the human ``dt info`` two-column table."""
+    from rich.table import Table as RTable
+
+    rendered_rows = (
+        rows
+        if verbose
+        else [
+            row
+            for row in rows
+            if (
+                row[0] in _INFO_COMPACT_LABELS
+                or row[0].startswith(("started (", "finished ("))
+            )
+            and not (
+                row[1] == "-"
+                and (
+                    row[0] in {"exit code", "outputs", "code copy"}
+                    or row[0].startswith("finished (")
+                )
+            )
+        ]
+    )
+    table = RTable(show_header=False, box=None, pad_edge=False)
+    table.add_column(style="bold dim", justify="right")
+    table.add_column(overflow="fold", ratio=1)
+    for key, value in rendered_rows:
+        table.add_row(key, value)
+    out.print(table)
+
+
 def _render_info_table(
     entry: jobs_mod.JobEntry,
     data: JsonDict,
@@ -11003,12 +11114,8 @@ def _render_info_table(
     resource_summary = data["resource_summary"]
     phase_summary = data["phase_summary"]
     failure_log = data.get("failure_log")
-    from rich.table import Table as RTable
     from rich.markup import escape
 
-    t = RTable(show_header=False, box=None, pad_edge=False)
-    t.add_column(style="bold dim", justify="right")
-    t.add_column(overflow="fold", ratio=1)
     style = {
         "running": "bold green",
         "finished": "cyan",
@@ -11292,28 +11399,7 @@ def _render_info_table(
         rows.append(("max job memory", f"{entry.max_job_memory_mib:,} MiB"))
     resource_guard = data.get("resource_guard")
     if isinstance(resource_guard, dict):
-        phase = resource_guard.get("phase")
-        phase_text = f" during {phase}" if _safe_phase_name(phase) else ""
-        if resource_guard.get("kind") == "max_vram_mib_observation_failure":
-            guard_text = (
-                "VRAM telemetry unavailable for "
-                f"{resource_guard.get('consecutive_failures')} samples: "
-                f"{escape(str(resource_guard.get('reason') or 'unknown'))}"
-                f"{phase_text}"
-            )
-        elif resource_guard.get("kind") == "max_job_memory_mib":
-            guard_text = (
-                f"job {resource_guard.get('observed_metric')} used "
-                f"{resource_guard.get('observed_mib')} MiB > "
-                f"{resource_guard.get('limit_mib')} MiB{phase_text}"
-            )
-        else:
-            guard_text = (
-                f"GPU {resource_guard.get('gpu_index')} used "
-                f"{resource_guard.get('observed_mib')} MiB > "
-                f"{resource_guard.get('limit_mib')} MiB{phase_text}"
-            )
-        rows.append(("guard trip", guard_text))
+        rows.append(("guard trip", _info_resource_guard_text(resource_guard)))
     if entry.require_path:
         rows.append(("require", escape(entry.require_path)))
     if entry.require_disk_gib is not None:
@@ -11332,58 +11418,7 @@ def _render_info_table(
         else f"dt logs {display_ref} · dt pull {display_ref} --lite"
     )
     rows.append(("next", next_action))
-    compact_labels = {
-        "name",
-        "ref",
-        "status",
-        "queue",
-        "queue head",
-        "previous",
-        "placement failures",
-        "where",
-        "gpus",
-        "cmd",
-        "project",
-        "submitted (head)",
-        "duration",
-        "exit code",
-        "outputs",
-        "code copy",
-        "forked from",
-        "after success",
-        "rerun of",
-        "rerun code",
-        "retry",
-        "retried by",
-        "failure log",
-        "guard trip",
-        "phase timeline",
-        "live gpu",
-        "live host",
-        "next",
-    }
-    rendered_rows = (
-        rows
-        if verbose
-        else [
-            row
-            for row in rows
-            if (
-                row[0] in compact_labels
-                or row[0].startswith(("started (", "finished ("))
-            )
-            and not (
-                row[1] == "-"
-                and (
-                    row[0] in {"exit code", "outputs", "code copy"}
-                    or row[0].startswith("finished (")
-                )
-            )
-        ]
-    )
-    for k, v in rendered_rows:
-        t.add_row(k, v)
-    out.print(t)
+    _print_info_table(rows, verbose=verbose)
 
 
 def info(
@@ -13319,6 +13354,113 @@ def _fork_repeat_host() -> fork_repeat_mod.Host:
     )
 
 
+def _resolve_fork_cache(
+    cfg: HeadConfig,
+    old: jobs_mod.JobEntry,
+    *,
+    inherit_cache: bool,
+    reuse_cache: str | None,
+    clone_cache: str | None,
+    json_: bool,
+) -> tuple[jobs_mod.JobEntry, str | None, str | None]:
+    """Resolve the cache source and optional cold-cache wrapper for a fork.
+
+    Returns ``(source, cold_cache_env, cold_cache_script)``.
+    """
+    source = old
+    cold_cache_env: str | None = None
+    if inherit_cache:
+        if not old.cache_source_job:
+            _fail_submission(
+                kind="invalid_request",
+                message=f"{old.job_id} has no cache binding to inherit",
+                exit_code=EXIT_ENV,
+                json_=json_,
+            )
+        source = _find_or_die(cfg, old.cache_source_job, json_=json_)
+    elif old.cache_source_job and not reuse_cache and not clone_cache:
+        if (
+            not old.cache_env
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", old.cache_env) is None
+        ):
+            _fail_submission(
+                kind="environment",
+                message=(
+                    f"{old.job_id} has invalid cache environment provenance; "
+                    "cannot guarantee a cold fork"
+                ),
+                exit_code=EXIT_ENV,
+                json_=json_,
+            )
+        cold_cache_env = old.cache_env
+    cold_cache_script = (
+        'cache_dir="$DT_JOB_DIR/outputs/.cache/dt-cold"; '
+        'mkdir -p "$cache_dir"; '
+        f'export {cold_cache_env}="$cache_dir"; '
+        'exec "$@"'
+        if cold_cache_env
+        else None
+    )
+    return source, cold_cache_env, cold_cache_script
+
+
+def _build_fork_spec(
+    old: jobs_mod.JobEntry,
+    source: jobs_mod.JobEntry,
+    *,
+    item_name: str | None,
+    command: list[str] | None,
+    inherit_cache: bool,
+    reuse_cache: str | None,
+    clone_cache: str | None,
+    cache_env: str,
+    artifact_manifest: str | None,
+    cold_cache_script: str | None,
+    max_hours: float | None,
+    min_vram_mib: int | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+) -> RunSpec:
+    """Build one fork RunSpec, applying the cold-cache wrapper and overrides."""
+    from . import dispatch as dispatch_mod
+
+    if inherit_cache:
+        item_spec = dispatch_mod.inherited_cache_fork_spec_from_entry(
+            old,
+            source,
+            name=item_name,
+            cmd=command or None,
+            artifact_manifest=artifact_manifest,
+        )
+    else:
+        item_spec = dispatch_mod.fork_spec_from_entry(
+            old,
+            name=item_name,
+            cmd=command or None,
+            reuse_cache=reuse_cache,
+            clone_cache=clone_cache,
+            cache_env=cache_env,
+            artifact_manifest=artifact_manifest,
+        )
+    if cold_cache_script:
+        item_spec.cmd = [
+            "bash",
+            "-c",
+            cold_cache_script,
+            "dt-cold-fork",
+            *item_spec.cmd,
+        ]
+    if max_hours is not None:
+        item_spec.max_hours = max_hours
+    if min_vram_mib is not None:
+        item_spec.min_vram_mib = min_vram_mib
+    if max_vram_mib is not None:
+        item_spec.max_vram_mib = max_vram_mib
+    if max_job_memory_mib is not None:
+        item_spec.max_job_memory_mib = max_job_memory_mib
+    return item_spec
+
+
 def fork(
     ctx: typer.Context,
     ref: str = REF_ARG,
@@ -13545,81 +13687,33 @@ def fork(
             exit_code=1,
             json_=json_,
         )
-    source = old
-    cold_cache_env: str | None = None
-    if inherit_cache:
-        if not old.cache_source_job:
-            _fail_submission(
-                kind="invalid_request",
-                message=f"{old.job_id} has no cache binding to inherit",
-                exit_code=EXIT_ENV,
-                json_=json_,
-            )
-        source = _find_or_die(cfg, old.cache_source_job, json_=json_)
-    else:
-        if old.cache_source_job and not reuse_cache and not clone_cache:
-            if (
-                not old.cache_env
-                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", old.cache_env) is None
-            ):
-                _fail_submission(
-                    kind="environment",
-                    message=(
-                        f"{old.job_id} has invalid cache environment provenance; "
-                        "cannot guarantee a cold fork"
-                    ),
-                    exit_code=EXIT_ENV,
-                    json_=json_,
-                )
-            cold_cache_env = old.cache_env
-
+    source, cold_cache_env, cold_cache_script = _resolve_fork_cache(
+        cfg,
+        old,
+        inherit_cache=inherit_cache,
+        reuse_cache=reuse_cache,
+        clone_cache=clone_cache,
+        json_=json_,
+    )
     source_display_ref = _display_ref_for_entry(cfg, source)
 
-    cold_cache_script = (
-        'cache_dir="$DT_JOB_DIR/outputs/.cache/dt-cold"; '
-        'mkdir -p "$cache_dir"; '
-        f'export {cold_cache_env}="$cache_dir"; '
-        'exec "$@"'
-        if cold_cache_env
-        else None
-    )
-
     def build_spec(item_name: str | None) -> RunSpec:
-        if inherit_cache:
-            item_spec = dispatch_mod.inherited_cache_fork_spec_from_entry(
-                old,
-                source,
-                name=item_name,
-                cmd=command or None,
-                artifact_manifest=artifact_manifest,
-            )
-        else:
-            item_spec = dispatch_mod.fork_spec_from_entry(
-                old,
-                name=item_name,
-                cmd=command or None,
-                reuse_cache=reuse_cache,
-                clone_cache=clone_cache,
-                cache_env=cache_env,
-                artifact_manifest=artifact_manifest,
-            )
-        if cold_cache_script:
-            item_spec.cmd = [
-                "bash",
-                "-c",
-                cold_cache_script,
-                "dt-cold-fork",
-                *item_spec.cmd,
-            ]
-        if max_hours is not None:
-            item_spec.max_hours = max_hours
-        if min_vram_mib is not None:
-            item_spec.min_vram_mib = min_vram_mib
-        if max_vram_mib is not None:
-            item_spec.max_vram_mib = max_vram_mib
-        if max_job_memory_mib is not None:
-            item_spec.max_job_memory_mib = max_job_memory_mib
-        return item_spec
+        return _build_fork_spec(
+            old,
+            source,
+            item_name=item_name,
+            command=command or None,
+            inherit_cache=inherit_cache,
+            reuse_cache=reuse_cache,
+            clone_cache=clone_cache,
+            cache_env=cache_env,
+            artifact_manifest=artifact_manifest,
+            cold_cache_script=cold_cache_script,
+            max_hours=max_hours,
+            min_vram_mib=min_vram_mib,
+            max_vram_mib=max_vram_mib,
+            max_job_memory_mib=max_job_memory_mib,
+        )
 
     prefix = jobs_mod.sanitize_name((name or f"{old.name}-fork").strip())
     first_name = (
