@@ -129,6 +129,7 @@ from .probe import (
 )
 from .redaction import redact_home_path
 from .remote import (
+    FanErrors,
     center_worker_count,
     fan_json,
     fan_json_by_center,
@@ -973,6 +974,259 @@ def _free_submit_action(
     }
 
 
+@dataclass(frozen=True)
+class _CenterCapacity:
+    """GPU capacity summary of one center's reachable `dt free` rows."""
+
+    reachable: list[JsonDict]
+    total: int
+    physical_free_by_node: dict[str, int]
+    free_by_node: dict[str, int]
+    drained_nodes: list[str]
+    lease_owners: list[str]
+    gpu_inventory_errors: dict[str, str]
+
+    @property
+    def free_count(self) -> int:
+        return sum(self.free_by_node.values())
+
+    @property
+    def drained_free_count(self) -> int:
+        return sum(
+            self.physical_free_by_node.get(node, 0) for node in self.drained_nodes
+        )
+
+    def fitting_free_by_node(self, minimum: int | None) -> dict[str, int]:
+        """Free GPUs per node that also satisfy the queue head's VRAM floor."""
+        return {
+            str(row.get("node")): (
+                0
+                if row.get("drained")
+                else sum(
+                    _free_gpu_meets_minimum(gpu, minimum)
+                    for gpu in row.get("gpus") or []
+                )
+            )
+            for row in self.reachable
+        }
+
+    @classmethod
+    def from_rows(cls, rows: list[JsonDict]) -> "_CenterCapacity":
+        reachable = [row for row in rows if not row.get("error")]
+        physical_free_by_node = {
+            str(row.get("node")): sum(
+                bool(gpu.get("free")) for gpu in row.get("gpus") or []
+            )
+            for row in reachable
+        }
+        return cls(
+            reachable=reachable,
+            total=sum(len(row.get("gpus") or []) for row in reachable),
+            physical_free_by_node=physical_free_by_node,
+            free_by_node={
+                str(row.get("node")): (
+                    0
+                    if row.get("drained")
+                    else physical_free_by_node[str(row.get("node"))]
+                )
+                for row in reachable
+            },
+            drained_nodes=[
+                str(row.get("node")) for row in reachable if row.get("drained")
+            ],
+            lease_owners=list(
+                dict.fromkeys(
+                    str(gpu.get("lease_owner") or "unknown")
+                    for row in reachable
+                    for gpu in row.get("gpus") or []
+                    if gpu.get("leased")
+                )
+            ),
+            gpu_inventory_errors={
+                str(row.get("node")): str(row["gpu_inventory_error"])
+                for row in reachable
+                if row.get("gpu_inventory_error")
+            },
+        )
+
+
+def _free_center_verdict(
+    center: str,
+    cap: _CenterCapacity,
+    context: JsonDict,
+    *,
+    running: int,
+    queued: int,
+    pin_center: bool,
+) -> tuple[str, str, list[JsonDict]]:
+    """Classify one center's scheduler state; returns (state, message, actions)."""
+    reachable = cap.reachable
+    total = cap.total
+    free_count = cap.free_count
+    drained_free_count = cap.drained_free_count
+    lease_owners = cap.lease_owners
+    gpu_inventory_errors = cap.gpu_inventory_errors
+    actions: list[JsonDict] = []
+    if running == 0 and queued == 0:
+        if lease_owners:
+            state = "idle_with_dt_leases"
+            message = (
+                f"registry idle but {len(lease_owners)} dt GPU "
+                f"{'lease remains' if len(lease_owners) == 1 else 'leases remain'}"
+            )
+            actions.extend(
+                {
+                    "kind": "inspect_lease",
+                    "job_id": owner,
+                    "argv": ["dt", "info", owner],
+                }
+                for owner in lease_owners
+            )
+        elif gpu_inventory_errors:
+            details = ", ".join(
+                f"{node}: {message.removeprefix('GPU inventory incomplete: ')}"
+                for node, message in gpu_inventory_errors.items()
+            )
+            state = "gpu_inventory_incomplete"
+            message = f"GPU inventory incomplete: {details}"
+            if free_count:
+                best_node = str(_best_free_submit_node(reachable))
+                actions.append(
+                    _free_submit_action(
+                        "submit",
+                        best_node,
+                        center=center if pin_center else None,
+                    )
+                )
+        elif free_count:
+            best_node = str(_best_free_submit_node(reachable))
+            state = "idle_no_dt_work"
+            message = "GPU capacity is free and no dt work is queued"
+            actions.append(
+                _free_submit_action(
+                    "submit",
+                    best_node,
+                    center=center if pin_center else None,
+                )
+            )
+        elif drained_free_count:
+            state = "idle_capacity_drained"
+            message = (
+                f"{drained_free_count} physically free GPU "
+                f"{'is' if drained_free_count == 1 else 'are'} excluded by node drain"
+            )
+        elif total:
+            state = "idle_external_gpu_occupancy"
+            message = "no dt work is queued; GPUs are occupied outside dt"
+        else:
+            state = "no_gpu_inventory"
+            message = "no reachable GPU inventory"
+    elif queued and context.get("agent_alive") is False:
+        state = "queue_agent_stopped"
+        message = "queued work is stalled because the queue agent is stopped"
+        actions.append(
+            {
+                "kind": "start_agent",
+                "argv": [
+                    "dt",
+                    "agent",
+                    "start",
+                    *(["-c", center] if pin_center else []),
+                ],
+            }
+        )
+    elif queued and context.get("agent_heartbeat_stale") is True:
+        state = "queue_agent_stale"
+        message = "queued work is stalled because the agent heartbeat is stale"
+        actions.append(
+            {
+                "kind": "inspect_agent",
+                "argv": [
+                    "dt",
+                    "agent",
+                    "status",
+                    "--verbose",
+                    *(["-c", center] if pin_center else []),
+                ],
+            }
+        )
+    elif queued:
+        reason = context.get("queue_head_reason")
+        state = (
+            "queue_head_blocked"
+            if isinstance(reason, str) and reason.startswith("blocked:")
+            else "queued_waiting"
+        )
+        message = (
+            str(reason)
+            if isinstance(reason, str) and reason
+            else "queued work is waiting for dispatch"
+        )
+        head = context.get("queue_head_job_id")
+        if isinstance(head, str) and head:
+            actions.append(
+                {
+                    "kind": "inspect_queue_head",
+                    "job_id": head,
+                    "argv": ["dt", "info", head],
+                }
+            )
+    else:
+        running_nodes = context.get("running_nodes")
+        successor_node = (
+            running_nodes[0]
+            if isinstance(running_nodes, list)
+            and len(running_nodes) == 1
+            and isinstance(running_nodes[0], str)
+            else None
+        )
+        if free_count:
+            best_node = str(_best_free_submit_node(reachable))
+            state = "queue_runway_empty_with_free_capacity"
+            message = (
+                "running work has no queued successor and additional GPU "
+                "capacity is free now"
+            )
+            actions.append(
+                _free_submit_action(
+                    "submit_now",
+                    best_node,
+                    center=center if pin_center else None,
+                )
+            )
+            if successor_node is not None and successor_node != best_node:
+                actions.append(
+                    _free_submit_action(
+                        "queue_successor",
+                        successor_node,
+                        center=center if pin_center else None,
+                    )
+                )
+        else:
+            state = "queue_runway_empty"
+            message = (
+                f"queue ends after {running} running "
+                f"{'job' if running == 1 else 'jobs'}"
+            )
+            if successor_node is not None:
+                actions.append(
+                    _free_submit_action(
+                        "queue_successor",
+                        successor_node,
+                        center=center if pin_center else None,
+                    )
+                )
+            else:
+                actions.append(
+                    {
+                        "kind": "select_successor_node",
+                        "argv": None,
+                        "reason": "running jobs span zero or multiple known nodes",
+                    }
+                )
+    return state, message, actions
+
+
 def _free_center_explanation(
     center: str,
     rows: list[JsonDict],
@@ -980,39 +1234,16 @@ def _free_center_explanation(
     pin_center: bool = False,
 ) -> JsonDict:
     """Build a stable machine explanation for one center's capacity state."""
-    reachable = [row for row in rows if not row.get("error")]
+    cap = _CenterCapacity.from_rows(rows)
+    reachable = cap.reachable
     unavailable = [row for row in rows if row.get("error")]
-    total = sum(len(row.get("gpus") or []) for row in reachable)
-    physical_free_by_node = {
-        str(row.get("node")): sum(
-            bool(gpu.get("free")) for gpu in row.get("gpus") or []
-        )
-        for row in reachable
-    }
-    free_by_node = {
-        str(row.get("node")): (
-            0 if row.get("drained") else physical_free_by_node[str(row.get("node"))]
-        )
-        for row in reachable
-    }
-    free_count = sum(free_by_node.values())
-    drained_nodes = [str(row.get("node")) for row in reachable if row.get("drained")]
-    drained_free_count = sum(
-        physical_free_by_node.get(node, 0) for node in drained_nodes
-    )
-    gpu_inventory_errors = {
-        str(row.get("node")): str(row["gpu_inventory_error"])
-        for row in reachable
-        if row.get("gpu_inventory_error")
-    }
-    lease_owners = list(
-        dict.fromkeys(
-            str(gpu.get("lease_owner") or "unknown")
-            for row in reachable
-            for gpu in row.get("gpus") or []
-            if gpu.get("leased")
-        )
-    )
+    total = cap.total
+    free_by_node = cap.free_by_node
+    free_count = cap.free_count
+    drained_nodes = cap.drained_nodes
+    drained_free_count = cap.drained_free_count
+    gpu_inventory_errors = cap.gpu_inventory_errors
+    lease_owners = cap.lease_owners
     context = next(
         (row["_scheduler"] for row in rows if isinstance(row.get("_scheduler"), dict)),
         None,
@@ -1046,166 +1277,11 @@ def _free_center_explanation(
         result["message"] = str(context.get("error") or "scheduler state unavailable")
         return result
 
-    actions: list[JsonDict] = []
-    if running == 0 and queued == 0:
-        if lease_owners:
-            result["state"] = "idle_with_dt_leases"
-            result["message"] = (
-                f"registry idle but {len(lease_owners)} dt GPU "
-                f"{'lease remains' if len(lease_owners) == 1 else 'leases remain'}"
-            )
-            actions.extend(
-                {
-                    "kind": "inspect_lease",
-                    "job_id": owner,
-                    "argv": ["dt", "info", owner],
-                }
-                for owner in lease_owners
-            )
-        elif gpu_inventory_errors:
-            details = ", ".join(
-                f"{node}: {message.removeprefix('GPU inventory incomplete: ')}"
-                for node, message in gpu_inventory_errors.items()
-            )
-            result["state"] = "gpu_inventory_incomplete"
-            result["message"] = f"GPU inventory incomplete: {details}"
-            if free_count:
-                best_node = str(_best_free_submit_node(reachable))
-                actions.append(
-                    _free_submit_action(
-                        "submit",
-                        best_node,
-                        center=center if pin_center else None,
-                    )
-                )
-        elif free_count:
-            best_node = str(_best_free_submit_node(reachable))
-            result["state"] = "idle_no_dt_work"
-            result["message"] = "GPU capacity is free and no dt work is queued"
-            actions.append(
-                _free_submit_action(
-                    "submit",
-                    best_node,
-                    center=center if pin_center else None,
-                )
-            )
-        elif drained_free_count:
-            result["state"] = "idle_capacity_drained"
-            result["message"] = (
-                f"{drained_free_count} physically free GPU "
-                f"{'is' if drained_free_count == 1 else 'are'} excluded by node drain"
-            )
-        elif total:
-            result["state"] = "idle_external_gpu_occupancy"
-            result["message"] = "no dt work is queued; GPUs are occupied outside dt"
-        else:
-            result["state"] = "no_gpu_inventory"
-            result["message"] = "no reachable GPU inventory"
-    elif queued and context.get("agent_alive") is False:
-        result["state"] = "queue_agent_stopped"
-        result["message"] = "queued work is stalled because the queue agent is stopped"
-        actions.append(
-            {
-                "kind": "start_agent",
-                "argv": [
-                    "dt",
-                    "agent",
-                    "start",
-                    *(["-c", center] if pin_center else []),
-                ],
-            }
-        )
-    elif queued and context.get("agent_heartbeat_stale") is True:
-        result["state"] = "queue_agent_stale"
-        result["message"] = (
-            "queued work is stalled because the agent heartbeat is stale"
-        )
-        actions.append(
-            {
-                "kind": "inspect_agent",
-                "argv": [
-                    "dt",
-                    "agent",
-                    "status",
-                    "--verbose",
-                    *(["-c", center] if pin_center else []),
-                ],
-            }
-        )
-    elif queued:
-        reason = context.get("queue_head_reason")
-        result["state"] = (
-            "queue_head_blocked"
-            if isinstance(reason, str) and reason.startswith("blocked:")
-            else "queued_waiting"
-        )
-        result["message"] = (
-            str(reason)
-            if isinstance(reason, str) and reason
-            else "queued work is waiting for dispatch"
-        )
-        head = context.get("queue_head_job_id")
-        if isinstance(head, str) and head:
-            actions.append(
-                {
-                    "kind": "inspect_queue_head",
-                    "job_id": head,
-                    "argv": ["dt", "info", head],
-                }
-            )
-    else:
-        running_nodes = context.get("running_nodes")
-        successor_node = (
-            running_nodes[0]
-            if isinstance(running_nodes, list)
-            and len(running_nodes) == 1
-            and isinstance(running_nodes[0], str)
-            else None
-        )
-        if free_count:
-            best_node = str(_best_free_submit_node(reachable))
-            result["state"] = "queue_runway_empty_with_free_capacity"
-            result["message"] = (
-                "running work has no queued successor and additional GPU "
-                "capacity is free now"
-            )
-            actions.append(
-                _free_submit_action(
-                    "submit_now",
-                    best_node,
-                    center=center if pin_center else None,
-                )
-            )
-            if successor_node is not None and successor_node != best_node:
-                actions.append(
-                    _free_submit_action(
-                        "queue_successor",
-                        successor_node,
-                        center=center if pin_center else None,
-                    )
-                )
-        else:
-            result["state"] = "queue_runway_empty"
-            result["message"] = (
-                f"queue ends after {running} running "
-                f"{'job' if running == 1 else 'jobs'}"
-            )
-            if successor_node is not None:
-                actions.append(
-                    _free_submit_action(
-                        "queue_successor",
-                        successor_node,
-                        center=center if pin_center else None,
-                    )
-                )
-            else:
-                actions.append(
-                    {
-                        "kind": "select_successor_node",
-                        "argv": None,
-                        "reason": "running jobs span zero or multiple known nodes",
-                    }
-                )
+    state, message, actions = _free_center_verdict(
+        center, cap, context, running=running, queued=queued, pin_center=pin_center
+    )
+    result["state"] = state
+    result["message"] = message
     result["actions"] = actions
     return result
 
@@ -1267,6 +1343,165 @@ def _free_explain_payload(
     }
 
 
+def _free_action_text(
+    cap: _CenterCapacity,
+    context: JsonDict,
+    *,
+    running: int,
+    queued: int,
+    minimum: int | None,
+    explain: bool,
+    center_suffix: str,
+) -> str:
+    """The human next-action phrase for one center's scheduler state."""
+    reachable = cap.reachable
+    total = cap.total
+    free_by_node = cap.free_by_node
+    fitting_free_by_node = cap.fitting_free_by_node(minimum)
+    fitting_free_count = sum(fitting_free_by_node.values())
+    free_count = cap.free_count
+    drained_free_count = cap.drained_free_count
+    lease_owners = cap.lease_owners
+    gpu_inventory_errors = cap.gpu_inventory_errors
+    reason = context.get("queue_head_reason")
+    action = ""
+    if running == 0 and queued == 0:
+        if lease_owners:
+            owner = escape(lease_owners[0])
+            noun = "lease remains" if len(lease_owners) == 1 else "leases remain"
+            action = (
+                "[yellow]registry idle, but "
+                f"{len(lease_owners)} dt GPU {noun}[/yellow]"
+                f" · inspect: dt info {owner}"
+            )
+        elif free_count:
+            best_node = _best_free_submit_node(reachable)
+            action = (
+                "[green]idle: no dt work queued[/green]"
+                f" · submit: dt task {escape(str(best_node))} "
+                f"'COMMAND' -n NAME{center_suffix}"
+            )
+        elif drained_free_count:
+            action = (
+                f"[yellow]{drained_free_count} physically free GPU "
+                f"{'is' if drained_free_count == 1 else 'are'} drained[/yellow]"
+            )
+        elif total:
+            action = "idle: no dt work queued; GPUs are occupied outside dt"
+        elif gpu_inventory_errors:
+            nodes = ", ".join(gpu_inventory_errors)
+            action = f"[yellow]GPU inventory incomplete on {escape(nodes)}[/yellow]"
+        else:
+            action = "no reachable GPU inventory"
+    elif queued and context.get("agent_alive") is False:
+        action = (
+            "[red]stalled: queue agent is stopped[/red]"
+            f" · run: dt agent start{center_suffix}"
+        )
+    elif queued and context.get("agent_heartbeat_stale") is True:
+        action = (
+            "[red]stalled: queue agent heartbeat is stale[/red]"
+            f" · inspect: dt agent status -v{center_suffix}"
+        )
+    elif queued:
+        pin_node = context.get("queue_head_pin_node")
+        requested = context.get("queue_head_gpus_requested")
+        wanted = requested if isinstance(requested, int) and requested >= 0 else 1
+        gpu_word = "GPU" if wanted == 1 else "GPUs"
+        if isinstance(reason, str) and reason.startswith("blocked:"):
+            action = "[yellow]next is blocked by a job constraint[/yellow]"
+        elif isinstance(reason, str) and "max_my_jobs=" in reason:
+            action = "[yellow]next waits for dt concurrency quota[/yellow]"
+        elif isinstance(pin_node, str) and pin_node:
+            pin_free = fitting_free_by_node.get(pin_node)
+            if pin_free is None:
+                action = (
+                    f"[yellow]next waits for {escape(pin_node)}; "
+                    "node unavailable[/yellow]"
+                )
+            elif wanted == 0 or pin_free >= wanted:
+                action = f"[yellow]next is dispatching on {escape(pin_node)}[/yellow]"
+            else:
+                elsewhere = max(0, sum(fitting_free_by_node.values()) - pin_free)
+                action = (
+                    f"[yellow]next needs {wanted} {gpu_word} on "
+                    f"{escape(pin_node)}[/yellow]"
+                )
+                if elsewhere and explain:
+                    verb = "is" if elsewhere == 1 else "are"
+                    action += f" · {elsewhere} free elsewhere {verb} not eligible"
+        elif wanted == 0:
+            action = "[yellow]next CPU task is dispatching[/yellow]"
+        else:
+            reserve = context.get("reserve_free_per_node")
+            reserve_count = reserve if isinstance(reserve, int) and reserve > 0 else 0
+            effective = {
+                node: (
+                    fitting_free_by_node.get(node, 0)
+                    if count - wanted >= reserve_count
+                    else 0
+                )
+                for node, count in free_by_node.items()
+            }
+            best = max(effective.values(), default=0)
+            raw_best = max(fitting_free_by_node.values(), default=0)
+            if best >= wanted:
+                action = "[yellow]next is dispatching[/yellow]"
+            elif raw_best >= wanted and reserve_count:
+                action = (
+                    f"[yellow]next needs {wanted} {gpu_word}; "
+                    "capacity held in reserve[/yellow]"
+                )
+                if explain:
+                    action += f" · reserve_free_per_node={reserve_count}"
+            elif fitting_free_count:
+                free_label = (
+                    f"{fitting_free_count} fitting free"
+                    if minimum is not None
+                    else f"{fitting_free_count} free"
+                )
+                action = (
+                    f"[yellow]next needs {wanted} {gpu_word} together; "
+                    f"{free_label} "
+                    f"{'GPU is' if fitting_free_count == 1 else 'GPUs are'} "
+                    "split across nodes[/yellow]"
+                )
+            else:
+                action = f"next needs {wanted} {gpu_word} capacity"
+        if minimum is not None:
+            action += f" · ≥{minimum:,} MiB/GPU"
+    else:
+        running_nodes = context.get("running_nodes")
+        successor_node = "NODE"
+        if (
+            isinstance(running_nodes, list)
+            and len(running_nodes) == 1
+            and isinstance(running_nodes[0], str)
+        ):
+            successor_node = running_nodes[0]
+        if free_count:
+            best_node = _best_free_submit_node(reachable)
+            action = (
+                "[yellow]queue empty; additional GPU capacity is available "
+                "now[/yellow]"
+                f" · submit: dt task {escape(str(best_node))} "
+                f"'COMMAND' -n NAME{center_suffix}"
+            )
+            if successor_node != str(best_node):
+                action += (
+                    f" · keep busy: dt task {escape(successor_node)} "
+                    f"'COMMAND' -n NAME{center_suffix}"
+                )
+        else:
+            noun = "job" if running == 1 else "jobs"
+            action = (
+                f"[yellow]queue ends after {running} running {noun}[/yellow]"
+                f" · queue next: dt task {escape(successor_node)} "
+                f"'COMMAND' -n NAME{center_suffix}"
+            )
+    return action
+
+
 def _free_scheduler_table(
     rows: list[JsonDict],
     *,
@@ -1292,21 +1527,10 @@ def _free_scheduler_table(
     one_center = len(contexts) == 1
     for center, context in contexts.items():
         center_suffix = f" {escape(shlex.join(['-c', center]))}" if pin_centers else ""
-        center_rows = [row for row in rows if row.get("center") == center]
-        reachable = [row for row in center_rows if not row.get("error")]
-        total = sum(len(row.get("gpus") or []) for row in reachable)
-        physical_free_by_node = {
-            str(row.get("node")): sum(
-                bool(gpu.get("free")) for gpu in row.get("gpus") or []
-            )
-            for row in reachable
-        }
-        free_by_node = {
-            str(row.get("node")): (
-                0 if row.get("drained") else physical_free_by_node[str(row.get("node"))]
-            )
-            for row in reachable
-        }
+        cap = _CenterCapacity.from_rows(
+            [row for row in rows if row.get("center") == center]
+        )
+        total = cap.total
         minimum = context.get("queue_head_min_vram_mib")
         minimum = (
             minimum
@@ -1315,37 +1539,7 @@ def _free_scheduler_table(
             and minimum > 0
             else None
         )
-        fitting_free_by_node = {
-            str(row.get("node")): (
-                0
-                if row.get("drained")
-                else sum(
-                    _free_gpu_meets_minimum(gpu, minimum)
-                    for gpu in row.get("gpus") or []
-                )
-            )
-            for row in reachable
-        }
-        fitting_free_count = sum(fitting_free_by_node.values())
-        free_count = sum(free_by_node.values())
-        drained_free_count = sum(
-            physical_free_by_node[str(row.get("node"))]
-            for row in reachable
-            if row.get("drained")
-        )
-        lease_owners = list(
-            dict.fromkeys(
-                str(gpu.get("lease_owner") or "unknown")
-                for row in reachable
-                for gpu in row.get("gpus") or []
-                if gpu.get("leased")
-            )
-        )
-        gpu_inventory_errors = {
-            str(row.get("node")): str(row["gpu_inventory_error"])
-            for row in reachable
-            if row.get("gpu_inventory_error")
-        }
+        free_count = cap.free_count
         running = context.get("running")
         queued = context.get("queued")
         label = escape("dt" if one_center else center)
@@ -1355,146 +1549,16 @@ def _free_scheduler_table(
             continue
 
         counts = f"{free_count}/{total} GPU free · {running} running · {queued} queued"
-        action = ""
         reason = context.get("queue_head_reason")
-        if running == 0 and queued == 0:
-            if lease_owners:
-                owner = escape(lease_owners[0])
-                noun = "lease remains" if len(lease_owners) == 1 else "leases remain"
-                action = (
-                    "[yellow]registry idle, but "
-                    f"{len(lease_owners)} dt GPU {noun}[/yellow]"
-                    f" · inspect: dt info {owner}"
-                )
-            elif free_count:
-                best_node = _best_free_submit_node(reachable)
-                action = (
-                    "[green]idle: no dt work queued[/green]"
-                    f" · submit: dt task {escape(str(best_node))} "
-                    f"'COMMAND' -n NAME{center_suffix}"
-                )
-            elif drained_free_count:
-                action = (
-                    f"[yellow]{drained_free_count} physically free GPU "
-                    f"{'is' if drained_free_count == 1 else 'are'} drained[/yellow]"
-                )
-            elif total:
-                action = "idle: no dt work queued; GPUs are occupied outside dt"
-            elif gpu_inventory_errors:
-                nodes = ", ".join(gpu_inventory_errors)
-                action = f"[yellow]GPU inventory incomplete on {escape(nodes)}[/yellow]"
-            else:
-                action = "no reachable GPU inventory"
-        elif queued and context.get("agent_alive") is False:
-            action = (
-                "[red]stalled: queue agent is stopped[/red]"
-                f" · run: dt agent start{center_suffix}"
-            )
-        elif queued and context.get("agent_heartbeat_stale") is True:
-            action = (
-                "[red]stalled: queue agent heartbeat is stale[/red]"
-                f" · inspect: dt agent status -v{center_suffix}"
-            )
-        elif queued:
-            pin_node = context.get("queue_head_pin_node")
-            requested = context.get("queue_head_gpus_requested")
-            wanted = requested if isinstance(requested, int) and requested >= 0 else 1
-            gpu_word = "GPU" if wanted == 1 else "GPUs"
-            if isinstance(reason, str) and reason.startswith("blocked:"):
-                action = "[yellow]next is blocked by a job constraint[/yellow]"
-            elif isinstance(reason, str) and "max_my_jobs=" in reason:
-                action = "[yellow]next waits for dt concurrency quota[/yellow]"
-            elif isinstance(pin_node, str) and pin_node:
-                pin_free = fitting_free_by_node.get(pin_node)
-                if pin_free is None:
-                    action = (
-                        f"[yellow]next waits for {escape(pin_node)}; "
-                        "node unavailable[/yellow]"
-                    )
-                elif wanted == 0 or pin_free >= wanted:
-                    action = (
-                        f"[yellow]next is dispatching on {escape(pin_node)}[/yellow]"
-                    )
-                else:
-                    elsewhere = max(0, sum(fitting_free_by_node.values()) - pin_free)
-                    action = (
-                        f"[yellow]next needs {wanted} {gpu_word} on "
-                        f"{escape(pin_node)}[/yellow]"
-                    )
-                    if elsewhere and explain:
-                        verb = "is" if elsewhere == 1 else "are"
-                        action += f" · {elsewhere} free elsewhere {verb} not eligible"
-            elif wanted == 0:
-                action = "[yellow]next CPU task is dispatching[/yellow]"
-            else:
-                reserve = context.get("reserve_free_per_node")
-                reserve_count = (
-                    reserve if isinstance(reserve, int) and reserve > 0 else 0
-                )
-                effective = {
-                    node: (
-                        fitting_free_by_node.get(node, 0)
-                        if count - wanted >= reserve_count
-                        else 0
-                    )
-                    for node, count in free_by_node.items()
-                }
-                best = max(effective.values(), default=0)
-                raw_best = max(fitting_free_by_node.values(), default=0)
-                if best >= wanted:
-                    action = "[yellow]next is dispatching[/yellow]"
-                elif raw_best >= wanted and reserve_count:
-                    action = (
-                        f"[yellow]next needs {wanted} {gpu_word}; "
-                        "capacity held in reserve[/yellow]"
-                    )
-                    if explain:
-                        action += f" · reserve_free_per_node={reserve_count}"
-                elif fitting_free_count:
-                    free_label = (
-                        f"{fitting_free_count} fitting free"
-                        if minimum is not None
-                        else f"{fitting_free_count} free"
-                    )
-                    action = (
-                        f"[yellow]next needs {wanted} {gpu_word} together; "
-                        f"{free_label} "
-                        f"{'GPU is' if fitting_free_count == 1 else 'GPUs are'} "
-                        "split across nodes[/yellow]"
-                    )
-                else:
-                    action = f"next needs {wanted} {gpu_word} capacity"
-            if minimum is not None:
-                action += f" · ≥{minimum:,} MiB/GPU"
-        else:
-            running_nodes = context.get("running_nodes")
-            successor_node = "NODE"
-            if (
-                isinstance(running_nodes, list)
-                and len(running_nodes) == 1
-                and isinstance(running_nodes[0], str)
-            ):
-                successor_node = running_nodes[0]
-            if free_count:
-                best_node = _best_free_submit_node(reachable)
-                action = (
-                    "[yellow]queue empty; additional GPU capacity is available "
-                    "now[/yellow]"
-                    f" · submit: dt task {escape(str(best_node))} "
-                    f"'COMMAND' -n NAME{center_suffix}"
-                )
-                if successor_node != str(best_node):
-                    action += (
-                        f" · keep busy: dt task {escape(successor_node)} "
-                        f"'COMMAND' -n NAME{center_suffix}"
-                    )
-            else:
-                noun = "job" if running == 1 else "jobs"
-                action = (
-                    f"[yellow]queue ends after {running} running {noun}[/yellow]"
-                    f" · queue next: dt task {escape(successor_node)} "
-                    f"'COMMAND' -n NAME{center_suffix}"
-                )
+        action = _free_action_text(
+            cap,
+            context,
+            running=running,
+            queued=queued,
+            minimum=minimum,
+            explain=explain,
+            center_suffix=center_suffix,
+        )
 
         table.add_row(label, f"{counts} · {action}")
         head = context.get("queue_head_job_id")
@@ -6163,6 +6227,75 @@ def _max_hours_overdue(
     return overdue if overdue > 0 else None
 
 
+def _collect_ps_progress(entry: jobs_mod.JobEntry) -> JsonDict:
+    """Parse the job's log tail for progress; never raise, report the error."""
+    try:
+        proc, _path, source, tail = _read_job_log_tail(entry, 80)
+        if proc.returncode != 0 and LOG_SOURCE_MARK not in (proc.stdout or ""):
+            detail = (proc.stderr or proc.stdout or "log probe failed").strip()
+            raise RuntimeError(detail)
+        return {
+            "progress": _parse_log_progress(tail),
+            "log_source": source,
+            "progress_error": None,
+        }
+    except Exception as exc:
+        detail = " ".join(str(exc).split())
+        if len(detail) > 120:
+            detail = detail[:117] + "..."
+        return {
+            "progress": None,
+            "log_source": None,
+            "progress_error": detail or type(exc).__name__,
+        }
+
+
+def _attach_ps_live_columns(
+    rows: list[JsonDict],
+    entries: list[jobs_mod.JobEntry],
+    *,
+    progress_by_id: dict[str, JsonDict],
+    node_statuses: dict[str, NodeStatus],
+    configured_nodes: dict[str, Node],
+) -> None:
+    """Fill progress and live resource columns for running rows (--with-progress)."""
+    by_id = {row["job_id"]: row for row in rows}
+    for entry in entries:
+        if entry.status != "running":
+            continue
+        row = by_id[entry.job_id]
+        row.update(
+            progress_by_id.get(
+                entry.job_id,
+                {"progress": None, "log_source": None, "progress_error": None},
+            )
+        )
+        if entry.node not in configured_nodes:
+            row["resources"] = {"error": f"node {entry.node!r} is no longer configured"}
+            continue
+        node_status = node_statuses[entry.node]
+        if node_status.error:
+            row["resources"] = {"error": node_status.error}
+            continue
+        assigned = set(entry.gpus)
+        live_gpus = [asdict(gpu) for gpu in node_status.gpus if gpu.index in assigned]
+        missing = sorted(assigned - {gpu["index"] for gpu in live_gpus})
+        if missing:
+            row["resources"] = {
+                "error": f"assigned GPU(s) {missing} missing from node probe"
+            }
+            continue
+        row["resources"] = {
+            "gpus": live_gpus,
+            "system": (asdict(node_status.system) if node_status.system else None),
+        }
+    for row in rows:
+        row.setdefault("progress", None)
+        row.setdefault("log_source", None)
+        row.setdefault("progress_error", None)
+        row.setdefault("resources", None)
+
+
 def _gather_ps_rows(
     cfg: HeadConfig | LaptopConfig,
     status: str | None,
@@ -6233,27 +6366,6 @@ def _gather_ps_rows(
         )
         return entry.job_id, refreshed, observation
 
-    def collect_progress(entry: jobs_mod.JobEntry) -> JsonDict:
-        try:
-            proc, _path, source, tail = _read_job_log_tail(entry, 80)
-            if proc.returncode != 0 and LOG_SOURCE_MARK not in (proc.stdout or ""):
-                detail = (proc.stderr or proc.stdout or "log probe failed").strip()
-                raise RuntimeError(detail)
-            return {
-                "progress": _parse_log_progress(tail),
-                "log_source": source,
-                "progress_error": None,
-            }
-        except Exception as exc:
-            detail = " ".join(str(exc).split())
-            if len(detail) > 120:
-                detail = detail[:117] + "..."
-            return {
-                "progress": None,
-                "log_source": None,
-                "progress_error": detail or type(exc).__name__,
-            }
-
     if stale:
         node_names = (
             sorted({entry.node for entry in stale if entry.node in configured_nodes})
@@ -6274,7 +6386,10 @@ def _gather_ps_rows(
                 for node_name in node_names
             }
             progress_futures = (
-                {entry.job_id: pool.submit(collect_progress, entry) for entry in stale}
+                {
+                    entry.job_id: pool.submit(_collect_ps_progress, entry)
+                    for entry in stale
+                }
                 if include_progress
                 else {}
             )
@@ -6331,49 +6446,13 @@ def _gather_ps_rows(
         row["max_hours_overdue_s"] = overdue
         rows.append(row)
     if include_progress:
-        by_id = {row["job_id"]: row for row in rows}
-        running = [entry for entry in entries if entry.status == "running"]
-
-        for entry in running:
-            row = by_id[entry.job_id]
-            row.update(
-                progress_by_id.get(
-                    entry.job_id,
-                    {
-                        "progress": None,
-                        "log_source": None,
-                        "progress_error": None,
-                    },
-                )
-            )
-            if entry.node not in configured_nodes:
-                row["resources"] = {
-                    "error": f"node {entry.node!r} is no longer configured"
-                }
-                continue
-            node_status = node_statuses[entry.node]
-            if node_status.error:
-                row["resources"] = {"error": node_status.error}
-                continue
-            assigned = set(entry.gpus)
-            live_gpus = [
-                asdict(gpu) for gpu in node_status.gpus if gpu.index in assigned
-            ]
-            missing = sorted(assigned - {gpu["index"] for gpu in live_gpus})
-            if missing:
-                row["resources"] = {
-                    "error": f"assigned GPU(s) {missing} missing from node probe"
-                }
-                continue
-            row["resources"] = {
-                "gpus": live_gpus,
-                "system": (asdict(node_status.system) if node_status.system else None),
-            }
-        for row in rows:
-            row.setdefault("progress", None)
-            row.setdefault("log_source", None)
-            row.setdefault("progress_error", None)
-            row.setdefault("resources", None)
+        _attach_ps_live_columns(
+            rows,
+            entries,
+            progress_by_id=progress_by_id,
+            node_statuses=node_statuses,
+            configured_nodes=configured_nodes,
+        )
     if issues_only:
         # Filter before the newest-N window: otherwise the oldest failing
         # jobs silently vanish from --issues and the bounded-query envelope
@@ -6508,6 +6587,136 @@ def _legacy_ps_query_rows(
     return rows
 
 
+def _ps_query_legacy_fallback(
+    cfg: LaptopConfig,
+    fallback_centers: list[str],
+    *,
+    data_by_center: dict[str, object],
+    fan_errors: FanErrors,
+    status: str | None,
+    active_only: bool,
+    issues_only: bool,
+    with_progress: bool,
+    internal_fields: tuple[str, ...],
+    limit: int,
+    cursor: str | None,
+    summary_only: bool,
+) -> None:
+    """Re-query pre-query heads with plain `ps` and synthesize their pages."""
+    fallback_cfg = LaptopConfig(
+        centers={center: cfg.centers[center] for center in fallback_centers},
+        default_center=(
+            cfg.default_center if cfg.default_center in fallback_centers else None
+        ),
+    )
+    legacy_argv = ["ps"]
+    if status is not None:
+        legacy_argv.extend(["--status", status])
+    if active_only:
+        legacy_argv.append("--active")
+    if issues_only:
+        legacy_argv.append("--issues")
+    if with_progress:
+        legacy_argv.append("--with-progress")
+    fallback_data, fallback_errors = fan_json_by_center(fallback_cfg, legacy_argv)
+    for center in fallback_centers:
+        rows = _legacy_ps_query_rows(
+            fallback_data.get(center),
+            center=center,
+            status=status,
+            active_only=active_only,
+            issues_only=issues_only,
+        )
+        if rows is not None:
+            data_by_center[center] = ps_query_mod.build_payload(
+                rows,
+                center=center,
+                status=status,
+                active_only=active_only,
+                issues_only=issues_only,
+                since=None,
+                selected_fields=internal_fields,
+                limit=limit,
+                cursor=cursor,
+                summary_only=summary_only,
+            )
+            fan_errors.pop(center, None)
+            fan_errors.unreachable.discard(center)
+        elif center in fallback_errors:
+            fan_errors[center] = fallback_errors[center]
+            if center in fallback_errors.unreachable:
+                fan_errors.unreachable.add(center)
+        else:
+            fan_errors[center] = "invalid legacy ps response from head"
+
+
+def _ps_query_collect_centers(
+    cfg: LaptopConfig,
+    data_by_center: dict[str, object],
+    *,
+    fan_errors: FanErrors,
+    expected_query: JsonDict,
+    internal_fields: tuple[str, ...],
+    cursor: str | None,
+    limit: int,
+    summary_only: bool,
+) -> tuple[list[JsonDict], list[JsonDict], dict[str, str], int]:
+    """Validate each center page; return (summaries, rows, partial errors, eligible)."""
+    summaries: list[JsonDict] = []
+    candidates: list[JsonDict] = []
+    partial_errors: dict[str, str] = {}
+    eligible = 0
+    for center in cfg.centers:
+        center_payload = data_by_center.get(center)
+        if center_payload is None:
+            continue
+        try:
+            center_payload = ps_query_mod.validate_payload_contract(
+                center_payload,
+                center=center,
+                expected_query=expected_query,
+                expected_fields=internal_fields,
+                expected_cursor=cursor,
+            )
+        except ps_query_mod.QueryError as exc:
+            fan_errors[center] = str(exc)
+            continue
+        summary = center_payload.get("summary")
+        page = center_payload.get("page")
+        jobs = center_payload.get("jobs")
+        assert isinstance(summary, dict)
+        assert isinstance(page, dict)
+        assert isinstance(jobs, list)
+        typed_jobs = cast(list[JsonDict], jobs)
+        center_eligible = int(page["eligible"])
+        center_returned = int(page["returned"])
+        if not summary_only and center_returned != min(limit, center_eligible):
+            # A single head can safely continue its own byte-fitted page, but
+            # that prefix is not enough to form a globally ordered page.  A
+            # row omitted behind this center's last visible row may sort above
+            # another center's global cursor and then disappear forever.
+            # Isolate the center and require the caller to retry the same
+            # input cursor with a smaller projection.
+            fan_errors[center] = (
+                "head ps page reached its serialized byte budget; "
+                "retry with fewer --fields"
+            )
+            continue
+        summaries.append(cast(JsonDict, summary))
+        candidates.extend(typed_jobs)
+        eligible += center_eligible
+        head_errors = center_payload["errors"]
+        assert isinstance(head_errors, dict)
+        partial_errors.update(
+            {
+                f"{center}:{key}": value
+                for key, value in head_errors.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+        )
+    return summaries, candidates, partial_errors, eligible
+
+
 def _gather_laptop_ps_query(
     cfg: LaptopConfig,
     *,
@@ -6575,51 +6784,20 @@ def _gather_laptop_ps_query(
             if center not in fallback_centers
         )
     if fallback_centers and since is None:
-        fallback_cfg = LaptopConfig(
-            centers={center: cfg.centers[center] for center in fallback_centers},
-            default_center=(
-                cfg.default_center if cfg.default_center in fallback_centers else None
-            ),
+        _ps_query_legacy_fallback(
+            cfg,
+            fallback_centers,
+            data_by_center=data_by_center,
+            fan_errors=fan_errors,
+            status=status,
+            active_only=active_only,
+            issues_only=issues_only,
+            with_progress=with_progress,
+            internal_fields=internal_fields,
+            limit=limit,
+            cursor=cursor,
+            summary_only=summary_only,
         )
-        legacy_argv = ["ps"]
-        if status is not None:
-            legacy_argv.extend(["--status", status])
-        if active_only:
-            legacy_argv.append("--active")
-        if issues_only:
-            legacy_argv.append("--issues")
-        if with_progress:
-            legacy_argv.append("--with-progress")
-        fallback_data, fallback_errors = fan_json_by_center(fallback_cfg, legacy_argv)
-        for center in fallback_centers:
-            rows = _legacy_ps_query_rows(
-                fallback_data.get(center),
-                center=center,
-                status=status,
-                active_only=active_only,
-                issues_only=issues_only,
-            )
-            if rows is not None:
-                data_by_center[center] = ps_query_mod.build_payload(
-                    rows,
-                    center=center,
-                    status=status,
-                    active_only=active_only,
-                    issues_only=issues_only,
-                    since=None,
-                    selected_fields=internal_fields,
-                    limit=limit,
-                    cursor=cursor,
-                    summary_only=summary_only,
-                )
-                fan_errors.pop(center, None)
-                fan_errors.unreachable.discard(center)
-            elif center in fallback_errors:
-                fan_errors[center] = fallback_errors[center]
-                if center in fallback_errors.unreachable:
-                    fan_errors.unreachable.add(center)
-            else:
-                fan_errors[center] = "invalid legacy ps response from head"
     elif fallback_centers:
         for center in fallback_centers:
             fan_errors[center] = (
@@ -6627,58 +6805,16 @@ def _gather_laptop_ps_query(
                 "using --since"
             )
 
-    summaries: list[JsonDict] = []
-    candidates: list[JsonDict] = []
-    partial_errors: dict[str, str] = {}
-    eligible = 0
-    for center in cfg.centers:
-        center_payload = data_by_center.get(center)
-        if center_payload is None:
-            continue
-        try:
-            center_payload = ps_query_mod.validate_payload_contract(
-                center_payload,
-                center=center,
-                expected_query=expected_query,
-                expected_fields=internal_fields,
-                expected_cursor=cursor,
-            )
-        except ps_query_mod.QueryError as exc:
-            fan_errors[center] = str(exc)
-            continue
-        summary = center_payload.get("summary")
-        page = center_payload.get("page")
-        jobs = center_payload.get("jobs")
-        assert isinstance(summary, dict)
-        assert isinstance(page, dict)
-        assert isinstance(jobs, list)
-        typed_jobs = cast(list[JsonDict], jobs)
-        center_eligible = int(page["eligible"])
-        center_returned = int(page["returned"])
-        if not summary_only and center_returned != min(limit, center_eligible):
-            # A single head can safely continue its own byte-fitted page, but
-            # that prefix is not enough to form a globally ordered page.  A
-            # row omitted behind this center's last visible row may sort above
-            # another center's global cursor and then disappear forever.
-            # Isolate the center and require the caller to retry the same
-            # input cursor with a smaller projection.
-            fan_errors[center] = (
-                "head ps page reached its serialized byte budget; "
-                "retry with fewer --fields"
-            )
-            continue
-        summaries.append(cast(JsonDict, summary))
-        candidates.extend(typed_jobs)
-        eligible += center_eligible
-        head_errors = center_payload["errors"]
-        assert isinstance(head_errors, dict)
-        partial_errors.update(
-            {
-                f"{center}:{key}": value
-                for key, value in head_errors.items()
-                if isinstance(key, str) and isinstance(value, str)
-            }
-        )
+    summaries, candidates, partial_errors, eligible = _ps_query_collect_centers(
+        cfg,
+        data_by_center,
+        fan_errors=fan_errors,
+        expected_query=expected_query,
+        internal_fields=internal_fields,
+        cursor=cursor,
+        limit=limit,
+        summary_only=summary_only,
+    )
 
     try:
         merged_summary = ps_query_mod.merge_summaries(summaries)
@@ -10939,6 +11075,129 @@ def _print_info_table(
     out.print(table)
 
 
+_INFO_LAUNCH_PHASE_LABELS = (
+    ("payload_attestation", "payload"),
+    ("preflight", "preflight"),
+    ("artifact_verification", "artifact verify"),
+    ("environment", "env"),
+    ("launch_lock_wait", "lock"),
+    ("gpu_probe", "GPU probe"),
+    ("session_start", "session"),
+    ("remote_total", "remote total"),
+)
+
+
+def _info_launch_rows(entry: jobs_mod.JobEntry) -> list[tuple[str, Any]]:
+    """Stage timings and environment-preparation facts recorded at launch."""
+    rows: list[tuple[str, Any]] = []
+    snapshot_duration = getattr(entry, "snapshot_duration_s", None)
+    launch_duration = getattr(entry, "launch_duration_s", None)
+    if snapshot_duration is not None:
+        rows.append(("snapshot stage", _fmt_short_duration(snapshot_duration)))
+    if launch_duration is not None:
+        rows.append(("prepare stage", _fmt_short_duration(launch_duration)))
+    if entry.launch_phases_s:
+        phase_text = " · ".join(
+            f"{label} {_fmt_short_duration(entry.launch_phases_s[key])}"
+            for key, label in _INFO_LAUNCH_PHASE_LABELS
+            if key in entry.launch_phases_s
+        )
+        rows.append(("prepare phases", phase_text))
+    env_preexisting = getattr(entry, "env_preexisting", None)
+    if env_preexisting is not None:
+        rows.append(("env state", "existing" if env_preexisting else "new"))
+    setup_ran = getattr(entry, "setup_ran", None)
+    if entry.setup and setup_ran is not None:
+        rows.append(("setup hook", "ran" if setup_ran else "cached"))
+    if entry.setup_inputs is not None:
+        rows.append(
+            (
+                "setup inputs",
+                ", ".join(escape(item) for item in entry.setup_inputs) or "(none)",
+            )
+        )
+    if entry.extras:
+        rows.append(("extras", ", ".join(escape(item) for item in entry.extras)))
+    return rows
+
+
+def _info_provenance_rows(
+    entry: jobs_mod.JobEntry,
+    display_refs: Mapping[str, str],
+) -> list[tuple[str, Any]]:
+    """Lineage rows (rerun, dependencies, fork, retry) in display order."""
+    rows: list[tuple[str, Any]] = []
+    if entry.rerun_of:
+        rows.append(("rerun of", display_refs.get(entry.rerun_of, entry.rerun_of)))
+        if entry.rerun_snapshot_changed is True:
+            rows.append(
+                (
+                    "rerun code",
+                    "[yellow]changed[/yellow] "
+                    f"{(entry.rerun_source_snapshot_sha256 or 'unknown')[:12]} → "
+                    f"{(entry.snapshot_sha256 or 'unknown')[:12]}",
+                )
+            )
+        elif entry.rerun_snapshot_changed is False:
+            rows.append(
+                ("rerun code", f"unchanged {(entry.snapshot_sha256 or 'unknown')[:12]}")
+            )
+        else:
+            rows.append(("rerun code", "unknown (source snapshot unavailable)"))
+    if entry.after_result:
+        rows.append(
+            (
+                "after result",
+                f"{display_refs.get(entry.after_result, entry.after_result)} in "
+                f"[{', '.join(entry.after_result_states)}]",
+            )
+        )
+    if entry.after_complete:
+        rows.append(
+            (
+                "after complete",
+                display_refs.get(entry.after_complete, entry.after_complete),
+            )
+        )
+    if entry.after_success:
+        rows.append(
+            (
+                "after success",
+                display_refs.get(entry.after_success, entry.after_success),
+            )
+        )
+    if entry.forked_from:
+        rows.append(
+            ("forked from", display_refs.get(entry.forked_from, entry.forked_from))
+        )
+    if entry.retried_by:
+        rows.append(
+            ("retried by", display_refs.get(entry.retried_by, entry.retried_by))
+        )
+    if entry.retry_of:
+        rows.append(
+            (
+                "retry",
+                f"attempt {entry.retry_count}/{entry.retry_limit} of "
+                f"{display_refs.get(entry.retry_of, entry.retry_of)}",
+            )
+        )
+    return rows
+
+
+def _info_failure_log_rows(failure_log: JsonDict) -> list[tuple[str, Any]]:
+    """The pre-start failure log tail, or why it could not be read."""
+    from rich.text import Text
+
+    failure_tail = str(failure_log.get("tail") or "").rstrip()
+    failure_error = failure_log.get("error")
+    if failure_tail:
+        return [("failure log", Text(failure_tail, style="red"))]
+    if failure_error:
+        return [("failure log", Text(f"unavailable: {failure_error}", style="yellow"))]
+    return []
+
+
 def _render_info_table(
     entry: jobs_mod.JobEntry,
     data: JsonDict,
@@ -11085,139 +11344,10 @@ def _render_info_table(
             for node, reason in entry.placement_failures.items()
         )
         rows.insert(3, ("placement failures", placement_text))
-    snapshot_duration = getattr(entry, "snapshot_duration_s", None)
-    launch_duration = getattr(entry, "launch_duration_s", None)
-    if snapshot_duration is not None:
-        rows.append(("snapshot stage", _fmt_short_duration(snapshot_duration)))
-    if launch_duration is not None:
-        rows.append(("prepare stage", _fmt_short_duration(launch_duration)))
-    if entry.launch_phases_s:
-        phase_labels = (
-            ("payload_attestation", "payload"),
-            ("preflight", "preflight"),
-            ("artifact_verification", "artifact verify"),
-            ("environment", "env"),
-            ("launch_lock_wait", "lock"),
-            ("gpu_probe", "GPU probe"),
-            ("session_start", "session"),
-            ("remote_total", "remote total"),
-        )
-        phase_text = " · ".join(
-            f"{label} {_fmt_short_duration(entry.launch_phases_s[key])}"
-            for key, label in phase_labels
-            if key in entry.launch_phases_s
-        )
-        rows.append(("prepare phases", phase_text))
-    env_preexisting = getattr(entry, "env_preexisting", None)
-    if env_preexisting is not None:
-        rows.append(("env state", "existing" if env_preexisting else "new"))
-    setup_ran = getattr(entry, "setup_ran", None)
-    if entry.setup and setup_ran is not None:
-        rows.append(("setup hook", "ran" if setup_ran else "cached"))
-    if entry.setup_inputs is not None:
-        rows.append(
-            (
-                "setup inputs",
-                ", ".join(escape(item) for item in entry.setup_inputs) or "(none)",
-            )
-        )
-    if entry.extras:
-        rows.append(("extras", ", ".join(escape(item) for item in entry.extras)))
+    rows.extend(_info_launch_rows(entry))
     if failure_log is not None:
-        from rich.text import Text
-
-        failure_tail = str(failure_log.get("tail") or "").rstrip()
-        failure_error = failure_log.get("error")
-        if failure_tail:
-            rows.append(("failure log", Text(failure_tail, style="red")))
-        elif failure_error:
-            rows.append(
-                (
-                    "failure log",
-                    Text(
-                        f"unavailable: {failure_error}",
-                        style="yellow",
-                    ),
-                )
-            )
-    if entry.retry_of:
-        rows.insert(
-            7,
-            (
-                "retry",
-                f"attempt {entry.retry_count}/{entry.retry_limit} of "
-                f"{display_refs.get(entry.retry_of, entry.retry_of)}",
-            ),
-        )
-    if entry.retried_by:
-        rows.insert(
-            7,
-            (
-                "retried by",
-                display_refs.get(entry.retried_by, entry.retried_by),
-            ),
-        )
-    if entry.forked_from:
-        rows.insert(
-            7,
-            (
-                "forked from",
-                display_refs.get(entry.forked_from, entry.forked_from),
-            ),
-        )
-    if entry.after_success:
-        rows.insert(
-            7,
-            (
-                "after success",
-                display_refs.get(entry.after_success, entry.after_success),
-            ),
-        )
-    if entry.after_complete:
-        rows.insert(
-            7,
-            (
-                "after complete",
-                display_refs.get(entry.after_complete, entry.after_complete),
-            ),
-        )
-    if entry.after_result:
-        rows.insert(
-            7,
-            (
-                "after result",
-                f"{display_refs.get(entry.after_result, entry.after_result)} in "
-                f"[{', '.join(entry.after_result_states)}]",
-            ),
-        )
-    if entry.rerun_of:
-        rows.insert(
-            7,
-            (
-                "rerun of",
-                display_refs.get(entry.rerun_of, entry.rerun_of),
-            ),
-        )
-        if entry.rerun_snapshot_changed is True:
-            rows.insert(
-                8,
-                (
-                    "rerun code",
-                    "[yellow]changed[/yellow] "
-                    f"{(entry.rerun_source_snapshot_sha256 or 'unknown')[:12]} → "
-                    f"{(entry.snapshot_sha256 or 'unknown')[:12]}",
-                ),
-            )
-        elif entry.rerun_snapshot_changed is False:
-            rows.insert(
-                8,
-                (
-                    "rerun code",
-                    f"unchanged {(entry.snapshot_sha256 or 'unknown')[:12]}",
-                ),
-            )
-        else:
-            rows.insert(8, ("rerun code", "unknown (source snapshot unavailable)"))
+        rows.extend(_info_failure_log_rows(failure_log))
+    rows[7:7] = _info_provenance_rows(entry, display_refs)
     if entry.cache_source_job:
         cache_mode = entry.cache_mode or "shared"
         rows.append(
@@ -11265,6 +11395,246 @@ def _render_info_table(
     )
     rows.append(("next", next_action))
     _print_info_table(rows, verbose=verbose)
+
+
+@dataclass(frozen=True)
+class _InfoTiming:
+    """Resolved job timestamps and which clock domain each came from."""
+
+    started: float | None
+    finished: float | None
+    duration: float | None
+    timestamp_domains: dict[str, str | None]
+    cross_clock_intervals_approximate: bool
+
+
+def _info_timing(entry: jobs_mod.JobEntry, live: JsonDict) -> _InfoTiming:
+    """Prefer node-observed timestamps; fall back to the registry's."""
+    live_started = live.get("started_at")
+    live_finished = live.get("finished_at")
+    started = live_started or entry.started_at
+    finished = live_finished or entry.finished_at
+    started_domain: str | None = (
+        "node"
+        if live_started is not None
+        else "registry"
+        if entry.started_at is not None
+        else None
+    )
+    finished_domain: str | None = (
+        "node"
+        if live_finished is not None
+        else "registry"
+        if entry.finished_at is not None
+        else None
+    )
+    duration_domain: str | None
+    if started and not finished and entry.status == "running":
+        duration = time.time() - started
+        duration_domain = "mixed"
+    elif started and finished:
+        duration = finished - started
+        duration_domain = (
+            started_domain if started_domain == finished_domain else "mixed"
+        )
+    else:
+        duration = None
+        duration_domain = None
+    timestamp_domains = {
+        "queued_at": "head",
+        "started_at": started_domain,
+        "finished_at": finished_domain,
+        "duration_s": duration_domain,
+    }
+    return _InfoTiming(
+        started=started,
+        finished=finished,
+        duration=duration,
+        timestamp_domains=timestamp_domains,
+        cross_clock_intervals_approximate=any(
+            domain in {"node", "registry", "mixed"}
+            for domain in (started_domain, finished_domain, duration_domain)
+        ),
+    )
+
+
+def _info_gather(
+    cfg: HeadConfig,
+    entry: jobs_mod.JobEntry,
+    *,
+    metrics_tail: int,
+    placed_prestart_failure: bool,
+) -> tuple[jobs_mod.JobEntry, JsonDict, JsonDict | None, JsonDict | None]:
+    """Refresh status and fetch node-side evidence for one job in parallel.
+
+    Returns ``(entry, live, resources, failure_log)``.
+    """
+    initial_status = entry.status
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        status_future = (
+            pool.submit(jobs_mod.refresh_status, cfg, entry)
+            if initial_status in ("running", "lost")
+            else None
+        )
+        live_future = (
+            (
+                pool.submit(_info_live, entry)
+                if metrics_tail == INFO_RESOURCE_TAIL
+                else pool.submit(_info_live, entry, metrics_tail)
+            )
+            if entry.node != "-"
+            else None
+        )
+        resources_future = (
+            pool.submit(_job_resources, cfg, entry)
+            if initial_status == "running"
+            else None
+        )
+        failure_log_future = (
+            pool.submit(_read_failed_start_log, entry)
+            if placed_prestart_failure
+            else None
+        )
+        if status_future is not None:
+            entry = status_future.result()
+        live = live_future.result() if live_future is not None else {}
+        try:
+            resources = (
+                resources_future.result()
+                if resources_future is not None and entry.status == "running"
+                else None
+            )
+        except Exception as e:
+            resources = {"error": str(e)}
+        failure_log = (
+            failure_log_future.result() if failure_log_future is not None else None
+        )
+    return entry, live, resources, failure_log
+
+
+def _info_payload(
+    cfg: HeadConfig,
+    entry: jobs_mod.JobEntry,
+    *,
+    live: JsonDict,
+    timing: _InfoTiming,
+    resources: JsonDict | None,
+    resource_summary: JsonDict | None,
+    resource_summary_error: str | None,
+    phase_summary: JsonDict | None,
+    queue_context: JsonDict,
+) -> JsonDict:
+    """The dt_job_info_v1 payload shared by --json and the human table."""
+    data = {
+        "schema_version": "dt_job_info_v1",
+        "job_id": entry.job_id,
+        "name": entry.name,
+        "status": entry.status,
+        "reason": entry.reason,
+        "center": entry.center,
+        "node": entry.node,
+        "gpus": entry.gpus,
+        "gpus_requested": entry.gpus_requested,
+        "gpu_isolation": _gpu_isolation_contract(entry),
+        "cmd": entry.cmd,
+        "project": entry.project,
+        "git_sha": entry.git_sha,
+        "git_dirty": entry.git_dirty,
+        "submodule_commits": (
+            dict(entry.submodule_commits)
+            if entry.submodule_commits is not None
+            else None
+        ),
+        "snapshot_sha256": entry.snapshot_sha256,
+        "payload_sha256": entry.payload_sha256,
+        "artifact_manifest": entry.artifact_manifest,
+        "forked_from": entry.forked_from,
+        "request_id": entry.request_id,
+        "after_success": entry.after_success,
+        "after_complete": entry.after_complete,
+        "after_result": entry.after_result,
+        "after_result_states": list(entry.after_result_states),
+        "result_state": jobs_mod.effective_result_state(entry),
+        "actions": _info_actions(entry),
+        "rerun_of": entry.rerun_of,
+        "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
+        "rerun_snapshot_changed": entry.rerun_snapshot_changed,
+        "retry": {
+            "limit": entry.retry_limit,
+            "on": entry.retry_on or ("infra" if entry.retry_limit else None),
+            "attempt": entry.retry_count,
+            "retry_of": entry.retry_of,
+            "retried_by": entry.retried_by,
+        },
+        "code_pruned_at": entry.code_pruned_at,
+        "cache_reuse": (
+            {
+                "source_job_id": entry.cache_source_job,
+                "source_path": entry.cache_source_path,
+                "env_var": entry.cache_env,
+                "source_env_hash": entry.cache_source_env_hash,
+                "mode": entry.cache_mode or "shared",
+                **(
+                    {"runtime_path": "outputs/.cache/dt-clone"}
+                    if entry.cache_mode == "clone"
+                    else {}
+                ),
+            }
+            if entry.cache_source_job
+            else None
+        ),
+        "queued_at": entry.created_at,
+        "started_at": timing.started,
+        "finished_at": timing.finished,
+        "duration_s": timing.duration,
+        "timestamp_domains": timing.timestamp_domains,
+        "cross_clock_intervals_approximate": timing.cross_clock_intervals_approximate,
+        "max_hours_exceeded": (
+            _max_hours_overdue(entry.max_hours, timing.duration) is not None
+        ),
+        "max_hours_overdue_s": _max_hours_overdue(entry.max_hours, timing.duration),
+        "exit_code": entry.exit_code,
+        "session": entry.session,
+        "job_dir": entry.job_dir,
+        "paths": _job_path_contract(cfg, entry),
+        "outputs_size": live.get("outputs_size"),
+        "env_hash": entry.env_hash,
+        "env_mode": entry.env_mode or "sync",
+        "env_source_job": entry.env_source_job,
+        "custom_env_keys": sorted(entry.custom_env),
+        "setup_inputs": entry.setup_inputs,
+        "extras": entry.extras,
+        "boot_id": entry.boot_id,
+        "max_hours": entry.max_hours,
+        "min_vram_mib": entry.min_vram_mib,
+        "max_vram_mib": entry.max_vram_mib,
+        "max_job_memory_mib": entry.max_job_memory_mib,
+        "resource_guard": live.get("resource_guard"),
+        "runtime_containment": live.get("runtime_containment"),
+        "runtime_linger": live.get("runtime_linger"),
+        "require_path": entry.require_path,
+        "require_disk_gib": entry.require_disk_gib,
+        "pin_node": entry.pin_node,
+        "placement_failures": dict(entry.placement_failures),
+        "node_unreachable": live.get("unreachable", False),
+        "resources": resources,
+        "resource_summary": resource_summary,
+        "resource_summary_error": resource_summary_error,
+        "phase_summary": phase_summary,
+        **queue_context,
+    }
+    for field in (
+        "snapshot_duration_s",
+        "launch_duration_s",
+        "env_preexisting",
+        "setup_ran",
+    ):
+        value = getattr(entry, field, None)
+        if value is not None:
+            data[field] = value
+    if entry.launch_phases_s:
+        data["launch_phases_s"] = dict(entry.launch_phases_s)
+    return data
 
 
 def info(
@@ -11334,90 +11704,13 @@ def info(
         and not _is_uncertain_launch(entry)
         and _failed_start_has_env_log(entry)
     )
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        status_future = (
-            pool.submit(jobs_mod.refresh_status, cfg, entry)
-            if initial_status in ("running", "lost")
-            else None
-        )
-        live_future = (
-            (
-                pool.submit(_info_live, entry)
-                if metrics_tail == INFO_RESOURCE_TAIL
-                else pool.submit(_info_live, entry, metrics_tail)
-            )
-            if entry.node != "-"
-            else None
-        )
-        resources_future = (
-            pool.submit(_job_resources, cfg, entry)
-            if initial_status == "running"
-            else None
-        )
-        failure_log_future = (
-            pool.submit(_read_failed_start_log, entry)
-            if placed_prestart_failure
-            else None
-        )
-        if status_future is not None:
-            entry = status_future.result()
-        live = live_future.result() if live_future is not None else {}
-        try:
-            resources = (
-                resources_future.result()
-                if resources_future is not None and entry.status == "running"
-                else None
-            )
-        except Exception as e:
-            resources = {"error": str(e)}
-        failure_log = (
-            failure_log_future.result() if failure_log_future is not None else None
-        )
-
-    live_started = live.get("started_at")
-    live_finished = live.get("finished_at")
-    started = live_started or entry.started_at
-    finished = live_finished or entry.finished_at
-    started_domain: str | None = (
-        "node"
-        if live_started is not None
-        else "registry"
-        if entry.started_at is not None
-        else None
+    entry, live, resources, failure_log = _info_gather(
+        cfg,
+        entry,
+        metrics_tail=metrics_tail,
+        placed_prestart_failure=placed_prestart_failure,
     )
-    finished_domain: str | None = (
-        "node"
-        if live_finished is not None
-        else "registry"
-        if entry.finished_at is not None
-        else None
-    )
-    duration_domain: str | None
-    if started and not finished and entry.status == "running":
-        duration = time.time() - started
-        duration_domain = "mixed"
-    elif started and finished:
-        duration = finished - started
-        duration_domain = (
-            started_domain if started_domain == finished_domain else "mixed"
-        )
-    else:
-        duration = None
-        duration_domain = None
-    timestamp_domains = {
-        "queued_at": "head",
-        "started_at": started_domain,
-        "finished_at": finished_domain,
-        "duration_s": duration_domain,
-    }
-    cross_clock_intervals_approximate = any(
-        domain in {"node", "registry", "mixed"}
-        for domain in (
-            timestamp_domains["started_at"],
-            timestamp_domains["finished_at"],
-            duration_domain,
-        )
-    )
+    timing = _info_timing(entry, live)
     resource_summary_error = None
     try:
         resource_summary = ResourceTelemetryQuery(entry, metrics_tail).summarize(
@@ -11430,7 +11723,7 @@ def info(
     phase_summary = _phase_summary_from_text(
         entry,
         str(live.get("phase_text") or ""),
-        finished_at=finished,
+        finished_at=timing.finished,
         tail_limit=INFO_PHASE_TAIL,
     )
     queue_context: JsonDict = {
@@ -11450,115 +11743,17 @@ def info(
             registry_snapshot,
         ).get(entry.job_id)
 
-    data = {
-        "schema_version": "dt_job_info_v1",
-        "job_id": entry.job_id,
-        "name": entry.name,
-        "status": entry.status,
-        "reason": entry.reason,
-        "center": entry.center,
-        "node": entry.node,
-        "gpus": entry.gpus,
-        "gpus_requested": entry.gpus_requested,
-        "gpu_isolation": _gpu_isolation_contract(entry),
-        "cmd": entry.cmd,
-        "project": entry.project,
-        "git_sha": entry.git_sha,
-        "git_dirty": entry.git_dirty,
-        "submodule_commits": (
-            dict(entry.submodule_commits)
-            if entry.submodule_commits is not None
-            else None
-        ),
-        "snapshot_sha256": entry.snapshot_sha256,
-        "payload_sha256": entry.payload_sha256,
-        "artifact_manifest": entry.artifact_manifest,
-        "forked_from": entry.forked_from,
-        "request_id": entry.request_id,
-        "after_success": entry.after_success,
-        "after_complete": entry.after_complete,
-        "after_result": entry.after_result,
-        "after_result_states": list(entry.after_result_states),
-        "result_state": jobs_mod.effective_result_state(entry),
-        "actions": _info_actions(entry),
-        "rerun_of": entry.rerun_of,
-        "rerun_source_snapshot_sha256": entry.rerun_source_snapshot_sha256,
-        "rerun_snapshot_changed": entry.rerun_snapshot_changed,
-        "retry": {
-            "limit": entry.retry_limit,
-            "on": entry.retry_on or ("infra" if entry.retry_limit else None),
-            "attempt": entry.retry_count,
-            "retry_of": entry.retry_of,
-            "retried_by": entry.retried_by,
-        },
-        "code_pruned_at": entry.code_pruned_at,
-        "cache_reuse": (
-            {
-                "source_job_id": entry.cache_source_job,
-                "source_path": entry.cache_source_path,
-                "env_var": entry.cache_env,
-                "source_env_hash": entry.cache_source_env_hash,
-                "mode": entry.cache_mode or "shared",
-                **(
-                    {"runtime_path": "outputs/.cache/dt-clone"}
-                    if entry.cache_mode == "clone"
-                    else {}
-                ),
-            }
-            if entry.cache_source_job
-            else None
-        ),
-        "queued_at": entry.created_at,
-        "started_at": started,
-        "finished_at": finished,
-        "duration_s": duration,
-        "timestamp_domains": timestamp_domains,
-        "cross_clock_intervals_approximate": cross_clock_intervals_approximate,
-        "max_hours_exceeded": (
-            _max_hours_overdue(entry.max_hours, duration) is not None
-        ),
-        "max_hours_overdue_s": _max_hours_overdue(entry.max_hours, duration),
-        "exit_code": entry.exit_code,
-        "session": entry.session,
-        "job_dir": entry.job_dir,
-        "paths": _job_path_contract(cfg, entry),
-        "outputs_size": live.get("outputs_size"),
-        "env_hash": entry.env_hash,
-        "env_mode": entry.env_mode or "sync",
-        "env_source_job": entry.env_source_job,
-        "custom_env_keys": sorted(entry.custom_env),
-        "setup_inputs": entry.setup_inputs,
-        "extras": entry.extras,
-        "boot_id": entry.boot_id,
-        "max_hours": entry.max_hours,
-        "min_vram_mib": entry.min_vram_mib,
-        "max_vram_mib": entry.max_vram_mib,
-        "max_job_memory_mib": entry.max_job_memory_mib,
-        "resource_guard": live.get("resource_guard"),
-        "runtime_containment": live.get("runtime_containment"),
-        "runtime_linger": live.get("runtime_linger"),
-        "require_path": entry.require_path,
-        "require_disk_gib": entry.require_disk_gib,
-        "pin_node": entry.pin_node,
-        "placement_failures": dict(entry.placement_failures),
-        "node_unreachable": live.get("unreachable", False),
-        "resources": resources,
-        "resource_summary": resource_summary,
-        "resource_summary_error": resource_summary_error,
-        "phase_summary": phase_summary,
-        **queue_context,
-    }
-    for field in (
-        "snapshot_duration_s",
-        "launch_duration_s",
-        "env_preexisting",
-        "setup_ran",
-    ):
-        value = getattr(entry, field, None)
-        if value is not None:
-            data[field] = value
-    if entry.launch_phases_s:
-        data["launch_phases_s"] = dict(entry.launch_phases_s)
+    data = _info_payload(
+        cfg,
+        entry,
+        live=live,
+        timing=timing,
+        resources=resources,
+        resource_summary=resource_summary,
+        resource_summary_error=resource_summary_error,
+        phase_summary=phase_summary,
+        queue_context=queue_context,
+    )
     if failure_log is not None:
         data["failure_log"] = failure_log
     if json_:
