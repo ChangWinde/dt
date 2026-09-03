@@ -387,6 +387,121 @@ def _job_display_status(row: JsonRow) -> tuple[str, str]:
     return display_status, display_style
 
 
+def _live_resource_text(row: JsonRow, gpus: str) -> str:
+    """The live column: GPU util/mem/temp, or CPU load/RAM/IO for CPU jobs."""
+    status = row.get("status", "?")
+    assigned = row.get("gpus") or []
+    resources = row.get("resources")
+    if status != "running":
+        return gpus
+    if not isinstance(resources, dict):
+        return "cpu:…" if not assigned else gpus
+    if resources.get("error"):
+        return "[yellow]!probe[/yellow]"
+    if not assigned:
+        system = resources.get("system")
+        if not isinstance(system, dict):
+            return "cpu:…"
+        load = system.get("cpu_load1")
+        used = system.get("mem_used_mib")
+        io = system.get("io_pressure")
+        load_text = (
+            f"{float(load):.1f}"
+            if isinstance(load, (int, float)) and not isinstance(load, bool)
+            else "-"
+        )
+        ram_text = (
+            f"{_gib(float(used))}G"
+            if isinstance(used, (int, float)) and not isinstance(used, bool)
+            else "-"
+        )
+        io_text = (
+            f"{float(io):.1f}%"
+            if isinstance(io, (int, float)) and not isinstance(io, bool)
+            else "-"
+        )
+        return f"C{load_text}/R{ram_text}/I{io_text}"
+    live_gpus = [gpu for gpu in (resources.get("gpus") or []) if isinstance(gpu, dict)]
+    if not live_gpus:
+        return f"{gpus}:…"
+    indices = ",".join(str(gpu.get("index", "?")) for gpu in live_gpus)
+    utils = [
+        float(gpu["util"])
+        for gpu in live_gpus
+        if isinstance(gpu.get("util"), (int, float))
+    ]
+    used_mib = sum(float(gpu.get("mem_used", 0)) for gpu in live_gpus)
+    temperatures = [
+        int(gpu["temperature"])
+        for gpu in live_gpus
+        if isinstance(gpu.get("temperature"), int)
+    ]
+    reserved_label = _reserved_zero_util_label(live_gpus)
+    util_text = (
+        reserved_label
+        if reserved_label is not None and (not utils or max(utils) == 0)
+        else (f"{sum(utils) / len(utils):.0f}%" if utils else "-")
+    )
+    text = f"{indices}:{util_text}/{_gib(used_mib)}G"
+    if temperatures:
+        text += f"/{max(temperatures)}°"
+    return text
+
+
+def _progress_parts(row: JsonRow, *, wide: bool) -> list[str]:
+    """Step / percent / ETA / throughput fragments from a progress record."""
+    progress = row.get("progress")
+    parts: list[str] = []
+    if not isinstance(progress, dict):
+        return parts
+    status = row.get("status", "?")
+    step = progress.get("step")
+    total = progress.get("total_steps")
+    if isinstance(step, int):
+        step_text = f"{step:,}"
+        if isinstance(total, int):
+            step_text += f"/{total:,}"
+        parts.append(f"step {step_text}" if wide else step_text)
+    elif status == "running" and isinstance(total, int) and not isinstance(total, bool):
+        parts.append(f"pre-step · target {total:,}" if wide else f"pre-step /{total:,}")
+    percent = progress.get("percent")
+    if isinstance(percent, (int, float)) and not isinstance(percent, bool):
+        parts.append(f"{float(percent):g}%" if wide else f"{float(percent):.0f}%")
+    eta = progress.get("eta")
+    if isinstance(eta, str) and eta:
+        parts.append(f"ETA {escape(eta)}")
+    samples = progress.get("samples_per_sec")
+    if isinstance(samples, (int, float)) and not isinstance(samples, bool):
+        parts.append(f"{float(samples):g}/s")
+    return parts
+
+
+def _row_issue(row: JsonRow, *, display_ref: str) -> object:
+    """The one diagnostic worth a table cell for this row, if any."""
+    status = row.get("status", "?")
+    exit_code = row.get("exit_code")
+    reason_issue = (
+        row.get("reason") if status in ("queued", "failed", "lost", "skipped") else None
+    )
+    issue = row.get("progress_error") or reason_issue or row.get("status_probe_error")
+    if not issue and status == "lost":
+        # Old registries may predate persisted lost diagnostics. Keep the
+        # table actionable without inventing detail in machine output.
+        issue = "exit marker missing"
+    if (
+        not issue
+        and status == "finished"
+        and isinstance(exit_code, int)
+        and exit_code != 0
+    ):
+        # Keep --issues local and fast: tell the operator how to inspect the
+        # failure without adding one remote log fetch per table row.
+        issue = f"dt logs {display_ref}"
+    if not issue and row.get("max_hours_exceeded"):
+        issue = "max-hours exceeded"
+    return issue
+
+
 def ps_table(
     rows: list[JsonRow],
     wide: bool = False,
@@ -539,126 +654,11 @@ def ps_table(
             # queued: show how many cards the job wants
             gpus = f"want:{r.get('gpus_requested', '?')}" if status == "queued" else "-"
         if show_progress:
-            assigned = r.get("gpus") or []
-            resources = r.get("resources")
-            if status == "running" and isinstance(resources, dict):
-                if resources.get("error"):
-                    gpus = "[yellow]!probe[/yellow]"
-                elif not assigned:
-                    system = resources.get("system")
-                    if isinstance(system, dict):
-                        load = system.get("cpu_load1")
-                        used = system.get("mem_used_mib")
-                        io = system.get("io_pressure")
-                        load_text = (
-                            f"{float(load):.1f}"
-                            if isinstance(load, (int, float))
-                            and not isinstance(load, bool)
-                            else "-"
-                        )
-                        ram_text = (
-                            f"{_gib(float(used))}G"
-                            if isinstance(used, (int, float))
-                            and not isinstance(used, bool)
-                            else "-"
-                        )
-                        io_text = (
-                            f"{float(io):.1f}%"
-                            if isinstance(io, (int, float)) and not isinstance(io, bool)
-                            else "-"
-                        )
-                        gpus = f"C{load_text}/R{ram_text}/I{io_text}"
-                    else:
-                        gpus = "cpu:…"
-                else:
-                    live_gpus = [
-                        gpu
-                        for gpu in (resources.get("gpus") or [])
-                        if isinstance(gpu, dict)
-                    ]
-                    if live_gpus:
-                        indices = ",".join(
-                            str(gpu.get("index", "?")) for gpu in live_gpus
-                        )
-                        utils = [
-                            float(gpu["util"])
-                            for gpu in live_gpus
-                            if isinstance(gpu.get("util"), (int, float))
-                        ]
-                        used_mib = sum(
-                            float(gpu.get("mem_used", 0)) for gpu in live_gpus
-                        )
-                        temperatures = [
-                            int(gpu["temperature"])
-                            for gpu in live_gpus
-                            if isinstance(gpu.get("temperature"), int)
-                        ]
-                        reserved_label = _reserved_zero_util_label(live_gpus)
-                        util_text = (
-                            reserved_label
-                            if reserved_label is not None
-                            and (not utils or max(utils) == 0)
-                            else (f"{sum(utils) / len(utils):.0f}%" if utils else "-")
-                        )
-                        gpus = f"{indices}:{util_text}/{_gib(used_mib)}G"
-                        if temperatures:
-                            gpus += f"/{max(temperatures)}°"
-                    else:
-                        gpus = f"{gpus}:…"
-            elif not assigned and status == "running":
-                gpus = "cpu:…"
+            gpus = _live_resource_text(r, gpus)
         exit_code = r.get("exit_code")
         display_status, display_style = _job_display_status(r)
-        progress = r.get("progress")
-        progress_parts: list[str] = []
-        if isinstance(progress, dict):
-            step = progress.get("step")
-            total = progress.get("total_steps")
-            if isinstance(step, int):
-                step_text = f"{step:,}"
-                if isinstance(total, int):
-                    step_text += f"/{total:,}"
-                progress_parts.append(f"step {step_text}" if wide else step_text)
-            elif (
-                status == "running"
-                and isinstance(total, int)
-                and not isinstance(total, bool)
-            ):
-                progress_parts.append(
-                    f"pre-step · target {total:,}" if wide else f"pre-step /{total:,}"
-                )
-            percent = progress.get("percent")
-            if isinstance(percent, (int, float)) and not isinstance(percent, bool):
-                progress_parts.append(
-                    (f"{float(percent):g}%" if wide else f"{float(percent):.0f}%")
-                )
-            eta = progress.get("eta")
-            if isinstance(eta, str) and eta:
-                progress_parts.append(f"ETA {escape(eta)}")
-            samples = progress.get("samples_per_sec")
-            if isinstance(samples, (int, float)) and not isinstance(samples, bool):
-                progress_parts.append(f"{float(samples):g}/s")
-        reason_issue = (
-            r.get("reason")
-            if status in ("queued", "failed", "lost", "skipped")
-            else None
-        )
-        issue = r.get("progress_error") or reason_issue or r.get("status_probe_error")
-        if not issue and status == "lost":
-            # Old registries may predate persisted lost diagnostics. Keep the
-            # table actionable without inventing detail in machine output.
-            issue = "exit marker missing"
-        if (
-            not issue
-            and status == "finished"
-            and isinstance(exit_code, int)
-            and exit_code != 0
-        ):
-            # Keep --issues local and fast: tell the operator how to inspect
-            # the failure without adding one remote log fetch per table row.
-            issue = f"dt logs {display_ref}"
-        if not issue and r.get("max_hours_exceeded"):
-            issue = "max-hours exceeded"
+        progress_parts = _progress_parts(r, wide=wide)
+        issue = _row_issue(r, display_ref=display_ref)
         progress_text = (" · " if wide else " ").join(progress_parts)
         if not progress_text and issue:
             compact_issue = _compact_remote_error(issue)
