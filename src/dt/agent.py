@@ -1697,6 +1697,19 @@ def start_detached(cfg: HeadConfig) -> bool:
     return alive_pid(cfg) is not None
 
 
+def ensure_for_queued_job(cfg: HeadConfig, entry: JobEntry) -> bool | None:
+    """Start the resident agent when ``entry`` is queued and none is alive.
+
+    Returns None when no start was needed (not queued, or already alive),
+    else ``start_detached``'s verdict.
+    """
+    if entry.status != "queued":
+        return None
+    if alive_pid(cfg) is not None:
+        return None
+    return start_detached(cfg)
+
+
 def stop_agent(cfg: HeadConfig) -> bool:
     pid = alive_pid(cfg)
     if pid is None:
