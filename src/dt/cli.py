@@ -18037,6 +18037,225 @@ def sync(
         raise typer.Exit(1 if 1 in failure_codes else EXIT_UNREACHABLE)
 
 
+@dataclass(frozen=True)
+class _SeedRequest:
+    """What one `dt seed` run copies: the local cache components and options."""
+
+    components: list[JsonDict]
+    source_bytes: int
+    hf: bool
+    plan: bool
+    retries: int
+
+    def failure_row(
+        self,
+        name: str,
+        *,
+        message: str,
+        code: int,
+        completed: list[JsonDict] | None = None,
+        transferred: int = 0,
+        retry_events: list[JsonDict] | None = None,
+    ) -> JsonDict:
+        component_rows = completed or []
+        has_seeded = any(
+            component.get("status") == "seeded" for component in component_rows
+        )
+        return {
+            "node": name,
+            "status": "error",
+            "hf": self.hf,
+            "source_bytes": self.source_bytes,
+            "transferred_bytes": transferred,
+            "components": component_rows,
+            "error_kind": (
+                "interrupted"
+                if code == 130
+                else ("unreachable" if code == EXIT_UNREACHABLE else "seed_failed")
+            ),
+            "message": message,
+            "exit_code": code,
+            **({"partial": True} if has_seeded else {}),
+            **({"retry_events": retry_events} if retry_events else {}),
+        }
+
+    def seed_node(self, node: Node, *, cancel_event: Event) -> JsonDict:
+        from .dispatch import transferred_bytes
+
+        name = node.name
+        retry_events: list[JsonDict] = []
+        if cancel_event.is_set():
+            return self.failure_row(
+                name,
+                message="seed interrupted; partial cache data were retained",
+                code=130,
+            )
+        if node.local:
+            return {
+                "node": name,
+                "status": "skipped",
+                "hf": self.hf,
+                "reason": "node is this head",
+                "source_bytes": self.source_bytes,
+                "transferred_bytes": 0,
+                "components": [],
+            }
+        if not self.components:
+            return {
+                "node": name,
+                "status": "skipped",
+                "hf": self.hf,
+                "reason": "no local cache sources found",
+                "source_bytes": 0,
+                "transferred_bytes": 0,
+                "components": [],
+            }
+        if self.plan:
+            return {
+                "node": name,
+                "status": "planned",
+                "hf": self.hf,
+                "source_bytes": self.source_bytes,
+                "components": [
+                    {
+                        "name": component["name"],
+                        "destination": component["destination"],
+                        "status": "planned",
+                        "source_bytes": component["source_bytes"],
+                    }
+                    for component in self.components
+                ],
+            }
+        parents = sorted(
+            {str(component["remote_parent"]) for component in self.components}
+        )
+        prepare_parts = ["set -eu", "umask 077"]
+        for parent in parents:
+            rendered_parent = shlex.quote(parent)
+            prepare_parts.append(
+                f"if test -e {rendered_parent} || test -L {rendered_parent}; then "
+                f"test -d {rendered_parent} && test ! -L {rendered_parent}; "
+                f"else mkdir -p {rendered_parent}; fi"
+            )
+            prepare_parts.append(f"chmod 700 {rendered_parent}")
+        prepare_cmd = "; ".join(prepare_parts)
+        try:
+            prepared = run_on(
+                name,
+                False,
+                prepare_cmd,
+                timeout=15,
+                cancel_event=cancel_event,
+            )
+        except Exception as exc:
+            detail = " ".join(str(exc).split()) or type(exc).__name__
+            return self.failure_row(
+                name,
+                message=f"cache preparation failed: {detail}",
+                code=EXIT_UNREACHABLE,
+            )
+        if prepared.returncode != 0:
+            detail = (
+                prepared.stderr
+                or prepared.stdout
+                or f"mkdir exited {prepared.returncode}"
+            ).strip()
+            code = EXIT_UNREACHABLE if prepared.returncode == 255 else 1
+            return self.failure_row(
+                name,
+                message=f"cache preparation failed: {detail}",
+                code=code,
+            )
+
+        completed: list[JsonDict] = []
+        total = 0
+        failure_codes: list[int] = []
+        failure_messages: list[str] = []
+        for component in self.components:
+            component_name = str(component["name"])
+            try:
+                proc = rsync(
+                    str(component["src"]),
+                    f"{name}:{component['remote_parent']}/",
+                    timeout=4 * 3600,
+                    retries=self.retries,
+                    on_retry=_rsync_retry_observer(
+                        name,
+                        component_name,
+                        retry_events,
+                    ),
+                    stats=True,
+                    private_destination=True,
+                    cancel_event=cancel_event,
+                )
+            except Exception as exc:
+                detail = " ".join(str(exc).split()) or type(exc).__name__
+                code = EXIT_UNREACHABLE
+                proc = None
+            else:
+                assert proc is not None
+                detail = (
+                    proc.stderr or proc.stdout or f"rsync exited {proc.returncode}"
+                ).strip()
+                code = (
+                    EXIT_UNREACHABLE
+                    if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES
+                    else 1
+                )
+            if proc is not None and proc.returncode == 0:
+                size = transferred_bytes(proc.stdout)
+                size = size if size is not None else 0
+                total += size
+                completed.append(
+                    {
+                        "name": component_name,
+                        "destination": component["destination"],
+                        "status": "seeded",
+                        "source_bytes": component["source_bytes"],
+                        "transferred_bytes": size,
+                    }
+                )
+                continue
+            completed.append(
+                {
+                    "name": component_name,
+                    "destination": component["destination"],
+                    "status": "error",
+                    "source_bytes": component["source_bytes"],
+                    "error_kind": (
+                        "unreachable" if code == EXIT_UNREACHABLE else "seed_failed"
+                    ),
+                    "message": detail,
+                    "exit_code": code,
+                }
+            )
+            failure_codes.append(code)
+            failure_messages.append(f"{component_name} failed: {detail}")
+            if code == EXIT_UNREACHABLE:
+                break
+        if failure_codes:
+            code = 1 if 1 in failure_codes else EXIT_UNREACHABLE
+            return self.failure_row(
+                name,
+                message=failure_messages[0],
+                code=code,
+                completed=completed,
+                transferred=total,
+                retry_events=retry_events,
+            )
+        row: JsonDict = {
+            "node": name,
+            "status": "seeded",
+            "hf": self.hf,
+            "source_bytes": self.source_bytes,
+            "transferred_bytes": total,
+            "components": completed,
+        }
+        if retry_events:
+            row["retry_events"] = retry_events
+        return row
+
+
 def seed(
     nodes: list[str] = typer.Argument(
         ..., help="compute nodes (from this center's config)"
@@ -18136,7 +18355,7 @@ def seed(
     names = list(dict.fromkeys(nodes))
     cancel_event = Event()
 
-    from .dispatch import _seed_cache_lock, transferred_bytes
+    from .dispatch import _seed_cache_lock
 
     home = Path.home()
     components: list[JsonDict] = []
@@ -18173,215 +18392,20 @@ def seed(
         )
     source_bytes = sum(int(component["source_bytes"]) for component in components)
 
-    def failure_row(
-        name: str,
-        *,
-        message: str,
-        code: int,
-        completed: list[JsonDict] | None = None,
-        transferred: int = 0,
-        retry_events: list[JsonDict] | None = None,
-    ) -> JsonDict:
-        component_rows = completed or []
-        has_seeded = any(
-            component.get("status") == "seeded" for component in component_rows
-        )
-        return {
-            "node": name,
-            "status": "error",
-            "hf": hf,
-            "source_bytes": source_bytes,
-            "transferred_bytes": transferred,
-            "components": component_rows,
-            "error_kind": (
-                "interrupted"
-                if code == 130
-                else ("unreachable" if code == EXIT_UNREACHABLE else "seed_failed")
-            ),
-            "message": message,
-            "exit_code": code,
-            **({"partial": True} if has_seeded else {}),
-            **({"retry_events": retry_events} if retry_events else {}),
-        }
-
-    def seed_one_unlocked(name: str) -> JsonDict:
-        node = by_name[name]
-        retry_events: list[JsonDict] = []
-        if cancel_event.is_set():
-            return failure_row(
-                name,
-                message="seed interrupted; partial cache data were retained",
-                code=130,
-            )
-        if node.local:
-            return {
-                "node": name,
-                "status": "skipped",
-                "hf": hf,
-                "reason": "node is this head",
-                "source_bytes": source_bytes,
-                "transferred_bytes": 0,
-                "components": [],
-            }
-        if not components:
-            return {
-                "node": name,
-                "status": "skipped",
-                "hf": hf,
-                "reason": "no local cache sources found",
-                "source_bytes": 0,
-                "transferred_bytes": 0,
-                "components": [],
-            }
-        if plan:
-            return {
-                "node": name,
-                "status": "planned",
-                "hf": hf,
-                "source_bytes": source_bytes,
-                "components": [
-                    {
-                        "name": component["name"],
-                        "destination": component["destination"],
-                        "status": "planned",
-                        "source_bytes": component["source_bytes"],
-                    }
-                    for component in components
-                ],
-            }
-        parents = sorted({str(component["remote_parent"]) for component in components})
-        prepare_parts = ["set -eu", "umask 077"]
-        for parent in parents:
-            rendered_parent = shlex.quote(parent)
-            prepare_parts.append(
-                f"if test -e {rendered_parent} || test -L {rendered_parent}; then "
-                f"test -d {rendered_parent} && test ! -L {rendered_parent}; "
-                f"else mkdir -p {rendered_parent}; fi"
-            )
-            prepare_parts.append(f"chmod 700 {rendered_parent}")
-        prepare_cmd = "; ".join(prepare_parts)
-        try:
-            prepared = run_on(
-                name,
-                False,
-                prepare_cmd,
-                timeout=15,
-                cancel_event=cancel_event,
-            )
-        except Exception as exc:
-            detail = " ".join(str(exc).split()) or type(exc).__name__
-            return failure_row(
-                name,
-                message=f"cache preparation failed: {detail}",
-                code=EXIT_UNREACHABLE,
-            )
-        if prepared.returncode != 0:
-            detail = (
-                prepared.stderr
-                or prepared.stdout
-                or f"mkdir exited {prepared.returncode}"
-            ).strip()
-            code = EXIT_UNREACHABLE if prepared.returncode == 255 else 1
-            return failure_row(
-                name,
-                message=f"cache preparation failed: {detail}",
-                code=code,
-            )
-
-        completed: list[JsonDict] = []
-        total = 0
-        failure_codes: list[int] = []
-        failure_messages: list[str] = []
-        for component in components:
-            component_name = str(component["name"])
-            try:
-                proc = rsync(
-                    str(component["src"]),
-                    f"{name}:{component['remote_parent']}/",
-                    timeout=4 * 3600,
-                    retries=retries,
-                    on_retry=_rsync_retry_observer(
-                        name,
-                        component_name,
-                        retry_events,
-                    ),
-                    stats=True,
-                    private_destination=True,
-                    cancel_event=cancel_event,
-                )
-            except Exception as exc:
-                detail = " ".join(str(exc).split()) or type(exc).__name__
-                code = EXIT_UNREACHABLE
-                proc = None
-            else:
-                assert proc is not None
-                detail = (
-                    proc.stderr or proc.stdout or f"rsync exited {proc.returncode}"
-                ).strip()
-                code = (
-                    EXIT_UNREACHABLE
-                    if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES
-                    else 1
-                )
-            if proc is not None and proc.returncode == 0:
-                size = transferred_bytes(proc.stdout)
-                size = size if size is not None else 0
-                total += size
-                completed.append(
-                    {
-                        "name": component_name,
-                        "destination": component["destination"],
-                        "status": "seeded",
-                        "source_bytes": component["source_bytes"],
-                        "transferred_bytes": size,
-                    }
-                )
-                continue
-            completed.append(
-                {
-                    "name": component_name,
-                    "destination": component["destination"],
-                    "status": "error",
-                    "source_bytes": component["source_bytes"],
-                    "error_kind": (
-                        "unreachable" if code == EXIT_UNREACHABLE else "seed_failed"
-                    ),
-                    "message": detail,
-                    "exit_code": code,
-                }
-            )
-            failure_codes.append(code)
-            failure_messages.append(f"{component_name} failed: {detail}")
-            if code == EXIT_UNREACHABLE:
-                break
-        if failure_codes:
-            code = 1 if 1 in failure_codes else EXIT_UNREACHABLE
-            return failure_row(
-                name,
-                message=failure_messages[0],
-                code=code,
-                completed=completed,
-                transferred=total,
-                retry_events=retry_events,
-            )
-        row: JsonDict = {
-            "node": name,
-            "status": "seeded",
-            "hf": hf,
-            "source_bytes": source_bytes,
-            "transferred_bytes": total,
-            "components": completed,
-        }
-        if retry_events:
-            row["retry_events"] = retry_events
-        return row
+    request = _SeedRequest(
+        components=components,
+        source_bytes=source_bytes,
+        hf=hf,
+        plan=plan,
+        retries=retries,
+    )
 
     def seed_one(name: str) -> JsonDict:
         node = by_name[name]
         if node.local or not components or plan:
-            return seed_one_unlocked(name)
+            return request.seed_node(node, cancel_event=cancel_event)
         with _seed_cache_lock(cfg, node, cancel_event=cancel_event):
-            return seed_one_unlocked(name)
+            return request.seed_node(node, cancel_event=cancel_event)
 
     def run_all() -> list[JsonDict]:
         if len(names) == 1:
