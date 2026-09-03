@@ -14466,6 +14466,148 @@ def _recover_runtime_evidence(
     return evidence_provenance
 
 
+def _forward_pull_to_head(
+    cfg: LaptopConfig,
+    ref: str,
+    *,
+    to: str | None,
+    collection: str | None,
+    lite: bool,
+    excludes: list[str],
+    force: bool,
+    retries: int,
+    route: str,
+    bwlimit: int | None,
+    json_: bool,
+) -> NoReturn:
+    """Laptop `dt pull`: replay the invocation on the head that owns ``ref``."""
+    _, head = _locate(cfg, ref, json_=json_)
+    argv = ["pull", ref] + (["--to", to] if to else [])
+    if collection:
+        argv += ["--collection", collection]
+    if lite:
+        argv.append("--lite")
+    for pattern in excludes:
+        if lite and pattern in LITE_PULL_EXCLUDES:
+            continue  # the head expands --lite; avoid duplicate argv
+        argv += ["--exclude", pattern]
+    if force:
+        argv.append("--force")
+    if retries != 2:
+        argv += ["--retries", str(retries)]
+    if route != "auto":
+        argv += ["--route", route]
+    if bwlimit is not None:
+        argv += ["--bwlimit", str(bwlimit)]
+    if json_:
+        argv.append("--json")
+    else:
+        err.print("[dim]results land on the head node (projects live there)[/dim]")
+    rc = _forward_retryable_with_reconnect(head, argv, ref, operation="pull")
+    if rc is None:
+        _pull_interrupted(
+            message=(
+                "pull stopped locally; head-side and partial result data "
+                "were not deleted"
+            ),
+            resume=["dt", *argv],
+            json_=json_,
+        )
+    raise typer.Exit(rc)
+
+
+def _pullable_entry(cfg: HeadConfig, ref: str) -> jobs_mod.JobEntry:
+    """Resolve ``ref`` to a job whose outputs can exist; else raise the phase error."""
+    entry = jobs_mod.find(cfg, ref)
+    if entry is None:
+        raise _PullPhaseError("not_found", f"no job matching {ref!r}", EXIT_NOT_FOUND)
+    if entry.status == "queued":
+        raise _PullPhaseError(
+            "not_ready",
+            f"{entry.job_id} is still queued; no outputs yet",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+        )
+    if (
+        entry.status == "failed"
+        and not _is_uncertain_launch(entry)
+        and entry.node == "-"
+    ):
+        raise _PullPhaseError(
+            "failed_before_start",
+            f"{entry.job_id} failed before starting: {entry.reason}",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+        )
+    if entry.node == "-":
+        raise _PullPhaseError(
+            "not_started",
+            f"{entry.job_id} never started (status {entry.status}); no outputs exist",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+        )
+    return entry
+
+
+def _pull_success_payload(
+    entry: jobs_mod.JobEntry,
+    *,
+    dst: Path,
+    outputs_present: bool,
+    lite: bool,
+    excludes: list[str],
+    pull_route: pull_relay.RelayRoute,
+    relay_error: str | None,
+    remote_outputs_bytes: int | None,
+    evidence_provenance: str | None,
+    retry_events: list[JsonDict],
+    records: list[str],
+) -> JsonDict:
+    """The dt_pull_v1 success envelope."""
+    return {
+        "schema_version": "dt_pull_v1",
+        "job_id": entry.job_id,
+        # `outcome` is the canonical operation-result key (matching kill);
+        # `status` stays one release for compatibility, then only `outcome`
+        # and the lifecycle-`job_status` remain.
+        "outcome": "pulled",
+        "status": "pulled",
+        "job_status": entry.status,
+        "node": entry.node,
+        "destination": str(dst),
+        # Explicit landing contract: pull merges the remote outputs/ contents
+        # directly into the job-level root, so automation must not append
+        # another outputs/ segment. `outputs_root` is therefore the same
+        # directory as `destination_root` when application outputs were
+        # recovered, and null for records-only recoveries.
+        "destination_root": str(dst),
+        "outputs_root": str(dst) if outputs_present else None,
+        "files": _pull_top_level_entries(dst),
+        "lite": lite,
+        "excludes": excludes,
+        "route": pull_route.route,
+        "route_gateway": (
+            pull_route.gateway.name if pull_route.gateway is not None else None
+        ),
+        "route_reason": pull_route.reason,
+        **({"relay_error": relay_error} if relay_error is not None else {}),
+        **(
+            {"remote_outputs_bytes": remote_outputs_bytes}
+            if remote_outputs_bytes is not None
+            else {}
+        ),
+        "application_outputs_recovered": outputs_present,
+        "records_scope": "dt_control_allowlist",
+        "evidence_provenance": evidence_provenance,
+        **({"outputs_present": False} if not outputs_present else {}),
+        **({"retry_events": retry_events} if retry_events else {}),
+        "records": records,
+    }
+
+
 def _pull_unlocked(
     ref: str = REF_ARG,
     to: Optional[str] = typer.Option(
@@ -14544,44 +14686,19 @@ def _pull_unlocked(
     if lite:
         excludes = list(dict.fromkeys([*LITE_PULL_EXCLUDES, *excludes]))
     if isinstance(cfg, LaptopConfig):
-        _, head = _locate(cfg, ref, json_=json_)
-        argv = ["pull", ref] + (["--to", to] if to else [])
-        if _collection:
-            argv += ["--collection", _collection]
-        if lite:
-            argv.append("--lite")
-        for pattern in excludes:
-            if lite and pattern in LITE_PULL_EXCLUDES:
-                continue  # the head expands --lite; avoid duplicate argv
-            argv += ["--exclude", pattern]
-        if force:
-            argv.append("--force")
-        if retries != 2:
-            argv += ["--retries", str(retries)]
-        if route != "auto":
-            argv += ["--route", route]
-        if bwlimit is not None:
-            argv += ["--bwlimit", str(bwlimit)]
-        if json_:
-            argv.append("--json")
-        else:
-            err.print("[dim]results land on the head node (projects live there)[/dim]")
-        rc = _forward_retryable_with_reconnect(
-            head,
-            argv,
+        _forward_pull_to_head(
+            cfg,
             ref,
-            operation="pull",
+            to=to,
+            collection=_collection,
+            lite=lite,
+            excludes=excludes,
+            force=force,
+            retries=retries,
+            route=route,
+            bwlimit=bwlimit,
+            json_=json_,
         )
-        if rc is None:
-            _pull_interrupted(
-                message=(
-                    "pull stopped locally; head-side and partial result data "
-                    "were not deleted"
-                ),
-                resume=["dt", *argv],
-                json_=json_,
-            )
-        raise typer.Exit(rc)
     output_excludes = list(dict.fromkeys([*PULL_RESERVED_EXCLUDES, *excludes]))
     entry: jobs_mod.JobEntry | None = None
     remote_outputs_bytes: int | None = None
@@ -14616,41 +14733,10 @@ def _pull_unlocked(
         raise typer.Exit(exit_code)
 
     if json_:
-        entry = jobs_mod.find(cfg, ref)
-        if entry is None:
-            fail(
-                "not_found",
-                f"no job matching {ref!r}",
-                EXIT_NOT_FOUND,
-            )
-        if entry.status == "queued":
-            fail(
-                "not_ready",
-                f"{entry.job_id} is still queued; no outputs yet",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
-        if (
-            entry.status == "failed"
-            and not _is_uncertain_launch(entry)
-            and entry.node == "-"
-        ):
-            fail(
-                "failed_before_start",
-                f"{entry.job_id} failed before starting: {entry.reason}",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
-        if entry.node == "-":
-            fail(
-                "not_started",
-                f"{entry.job_id} never started (status {entry.status}); no outputs exist",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
+        try:
+            entry = _pullable_entry(cfg, ref)
+        except _PullPhaseError as phase:
+            fail(phase.kind, phase.message, phase.exit_code, **phase.fields)
     else:
         entry = _find_or_die(cfg, ref)
         if not (
@@ -14847,45 +14933,19 @@ def _pull_unlocked(
         )
 
     records = confirmed_records(logs_recovered=True)
-    payload = {
-        "schema_version": "dt_pull_v1",
-        "job_id": entry.job_id,
-        # `outcome` is the canonical operation-result key (matching kill);
-        # `status` stays one release for compatibility, then only `outcome`
-        # and the lifecycle-`job_status` remain.
-        "outcome": "pulled",
-        "status": "pulled",
-        "job_status": entry.status,
-        "node": entry.node,
-        "destination": str(dst),
-        # Explicit landing contract: pull merges the remote outputs/ contents
-        # directly into the job-level root, so automation must not append
-        # another outputs/ segment. `outputs_root` is therefore the same
-        # directory as `destination_root` when application outputs were
-        # recovered, and null for records-only recoveries.
-        "destination_root": str(dst),
-        "outputs_root": str(dst) if outputs_present else None,
-        "files": _pull_top_level_entries(dst),
-        "lite": lite,
-        "excludes": excludes,
-        "route": pull_route.route,
-        "route_gateway": (
-            pull_route.gateway.name if pull_route.gateway is not None else None
-        ),
-        "route_reason": pull_route.reason,
-        **({"relay_error": relay_error} if relay_error is not None else {}),
-        **(
-            {"remote_outputs_bytes": remote_outputs_bytes}
-            if remote_outputs_bytes is not None
-            else {}
-        ),
-        "application_outputs_recovered": outputs_present,
-        "records_scope": "dt_control_allowlist",
-        "evidence_provenance": evidence_provenance,
-        **({"outputs_present": False} if not outputs_present else {}),
-        **({"retry_events": retry_events} if retry_events else {}),
-        "records": records,
-    }
+    payload = _pull_success_payload(
+        entry,
+        dst=dst,
+        outputs_present=outputs_present,
+        lite=lite,
+        excludes=excludes,
+        pull_route=pull_route,
+        relay_error=relay_error,
+        remote_outputs_bytes=remote_outputs_bytes,
+        evidence_provenance=evidence_provenance,
+        retry_events=retry_events,
+        records=records,
+    )
     if _result is not None:
         _result.update(payload)
         _result["exit_code"] = 0
