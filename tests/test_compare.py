@@ -6,6 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from dt import cli
+from dt.cli.commands import compare as compare_cmd
 from dt.config import HeadConfig, LaptopConfig, Node, Project
 from dt.jobs import JobEntry, save
 
@@ -634,7 +635,7 @@ def test_compare_metric_reader_rejects_external_symlink_and_oversized_json(tmp_p
     outside = tmp_path / "outside.json"
     outside.write_text('{"score": 1}\n')
     metric.symlink_to(outside)
-    command = cli._compare_metric_command(entry, "metrics.json", "score")
+    command = compare_cmd._compare_metric_command(entry, "metrics.json", "score")
 
     symlink_result = subprocess.run(
         ["bash", "-c", command],

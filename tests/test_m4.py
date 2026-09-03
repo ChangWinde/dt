@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 
 from dt import cli
 from dt.cli.commands import clean as clean_cmd
+from dt.cli.commands import storage as storage_cmd
 from dt.agent import process_once
 from dt.config import HeadConfig, Node, QueueCfg, parse
 from dt.dispatch import blocked_not_busy, clean_jobs, spec_from_entry
@@ -2577,7 +2578,9 @@ def test_storage_defaults_to_scope_summary_and_keeps_details_explicit(
         "total_bytes": 1000,
     }
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "storage_inventory", lambda *args, **kwargs: payload)
+    monkeypatch.setattr(
+        storage_cmd, "storage_inventory", lambda *args, **kwargs: payload
+    )
 
     summary = CliRunner().invoke(cli.app, ["storage"])
     details = CliRunner().invoke(cli.app, ["storage", "--details"])
@@ -2609,7 +2612,7 @@ def test_storage_defaults_to_scope_summary_and_keeps_details_explicit(
 def test_storage_details_keep_complete_paths_at_60_columns():
     from rich.console import Console
 
-    from dt.cli import _storage_table
+    from dt.cli.commands.storage import _storage_table
 
     path = (
         "/srv/dt/results/a-very-long-research-project/"

@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import importlib
 import pkgutil
+import re
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,11 @@ from dt.cli import commands
 ROOT = Path(cli.__file__)
 
 
+_STUB_PATTERN = re.compile(r'monkeypatch\.setattr\(\s*cli\s*,\s*"([A-Za-z_]\w*)"')
+
+
 def _patchable_surface() -> set[str]:
+    """Names the test suite stubs through ``dt.cli`` plus the root's declared re-exports."""
     tree = ast.parse(ROOT.read_text())
     names: set[str] = set()
     for node in tree.body:
@@ -30,6 +35,8 @@ def _patchable_surface() -> set[str]:
             names.update(
                 alias.name for alias in node.names if alias.asname == alias.name
             )
+    for test_file in Path(__file__).parent.glob("*.py"):
+        names.update(_STUB_PATTERN.findall(test_file.read_text()))
     return names
 
 
