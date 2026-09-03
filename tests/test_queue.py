@@ -107,6 +107,27 @@ def test_agent_restart_preflight_keeps_live_agent_on_invalid_replacement(tmp_pat
     assert detail == "SyntaxError: broken update"
 
 
+def test_code_fingerprint_covers_subpackages_and_shipped_shell(monkeypatch, tmp_path):
+    """A deploy that only touches dt/shell/*.sh or a subpackage must restart the agent."""
+    import dt.agent as agent
+
+    package = tmp_path / "dt"
+    (package / "shell").mkdir(parents=True)
+    (package / "cli").mkdir()
+    (package / "agent.py").write_text("x = 1\n")
+    (package / "shell" / "liveness.sh").write_text("dt_job_live_state() { :; }\n")
+    (package / "cli" / "pull.py").write_text("y = 2\n")
+    monkeypatch.setattr(agent, "__file__", str(package / "agent.py"))
+
+    before = agent._code_fingerprint()
+    assert before is not None
+    newer = before + 1_000_000_000
+    for path in (package / "shell" / "liveness.sh", package / "cli" / "pull.py"):
+        os.utime(path, ns=(newer, newer))
+        assert agent._code_fingerprint() == newer
+        newer += 1_000_000_000
+
+
 def test_agent_restart_preflight_checks_lazy_package_module_syntax(tmp_path):
     valid = tmp_path / "valid-dt"
     valid.write_text("#!/bin/sh\nexit 0\n")

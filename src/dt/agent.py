@@ -1132,10 +1132,14 @@ def _code_fingerprint() -> int | None:
     """Max mtime over the dt package sources. Editable installs (and deploys)
     change files in place; the agent restarts itself to pick them up.
     Returns None when the package cannot be scanned at all, so a mid-deploy
-    unreadable directory pauses self-upgrade instead of killing the loop."""
+    unreadable directory pauses self-upgrade instead of killing the loop.
+
+    Every Python module and every shipped shell resource counts, including
+    subpackages: a probe library under ``shell/`` changes what the agent
+    executes on nodes just as much as a ``.py`` file does."""
     pkg = Path(__file__).parent
     try:
-        files = list(pkg.glob("*.py")) + list((pkg / "payload").glob("*.sh"))
+        files = list(pkg.rglob("*.py")) + list(pkg.rglob("*.sh"))
     except OSError:
         return None
     if not files:
