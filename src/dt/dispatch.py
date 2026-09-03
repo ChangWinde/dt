@@ -6026,6 +6026,30 @@ def _submit_prepared_once(
             stored = source_factory()
         return stored
 
+    def unplaced_entry(**outcome: Any) -> JobEntry:
+        """Registry row for a job that did not launch now (queued or skipped)."""
+        return JobEntry(
+            job_id=job_id,
+            **_spec_entry_fields(
+                cfg,
+                spec,
+                git_sha=git_sha,
+                git_dirty=git_dirty,
+                submodule_commits=submodule_commits,
+            ),
+            node="-",
+            node_local=False,
+            job_dir=job_dir,
+            session=session,
+            payload_sha256=runtime_sha256,
+            created_at=submitted_at,
+            env_hash=spec.env_hash_override,
+            worker_root=submit_worker_root,
+            worker_roots=dict(submit_worker_roots),
+            job_relpath=job_relpath,
+            **outcome,
+        )
+
     def enqueue(why: str, *, reason: str | None = None) -> JobEntry:
         log(f"{why}; queueing (agent retries automatically)")
         source = exact_source()
@@ -6043,34 +6067,14 @@ def _submit_prepared_once(
         if not isinstance(staged_snapshot_sha256, str):
             remove_staging(cfg, job_id)
             raise DispatchError("staging completed without a snapshot identity")
-        entry = JobEntry(
-            job_id=job_id,
-            **_spec_entry_fields(
-                cfg,
-                spec,
-                git_sha=git_sha,
-                git_dirty=git_dirty,
-                submodule_commits=submodule_commits,
-            ),
-            node="-",
-            node_local=False,
-            job_dir=job_dir,
-            session=session,
-            gpus=[],
-            pgid=None,
+        entry = unplaced_entry(
             status="queued",
             snapshot_sha256=staged_snapshot_sha256,
-            payload_sha256=runtime_sha256,
             reason=reason,
-            created_at=submitted_at,
-            env_hash=spec.env_hash_override,
             rerun_snapshot_changed=_rerun_snapshot_changed(
                 spec,
                 staged_snapshot_sha256,
             ),
-            worker_root=submit_worker_root,
-            worker_roots=dict(submit_worker_roots),
-            job_relpath=job_relpath,
         )
         save(cfg, entry)
         request_agent_wake(cfg)
@@ -6078,30 +6082,11 @@ def _submit_prepared_once(
 
     def skip_dependency(reason: str) -> JobEntry:
         """Record a false dependency predicate without staging runnable code."""
-        finished_at = time.time()
-        entry = JobEntry(
-            job_id=job_id,
-            **_spec_entry_fields(
-                cfg,
-                spec,
-                git_sha=git_sha,
-                git_dirty=git_dirty,
-                submodule_commits=submodule_commits,
-            ),
-            node="-",
-            node_local=False,
-            job_dir=job_dir,
-            session=session,
+        entry = unplaced_entry(
             status="skipped",
             result_state="dependency_skipped",
-            payload_sha256=runtime_sha256,
-            created_at=submitted_at,
-            finished_at=finished_at,
+            finished_at=time.time(),
             reason=reason,
-            env_hash=spec.env_hash_override,
-            worker_root=submit_worker_root,
-            worker_roots=dict(submit_worker_roots),
-            job_relpath=job_relpath,
         )
         save(cfg, entry)
         return entry
