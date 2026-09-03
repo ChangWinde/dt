@@ -46,15 +46,15 @@ from typer import _click as click
 from typer._click.globals import get_current_context
 from rich.markup import escape
 
-from . import custom_env as custom_env_mod
-from . import diagnose as diagnose_mod
-from . import fork_repeat as fork_repeat_mod
-from . import jobs as jobs_mod
-from . import ps_query as ps_query_mod
-from . import pull_evidence as pull_evidence_mod
-from . import submission_group as group_mod
-from .completion import CompletionSignals
-from .config import (
+from .. import custom_env as custom_env_mod
+from .. import diagnose as diagnose_mod
+from .. import fork_repeat as fork_repeat_mod
+from .. import jobs as jobs_mod
+from .. import ps_query as ps_query_mod
+from .. import pull_evidence as pull_evidence_mod
+from .. import submission_group as group_mod
+from ..completion import CompletionSignals
+from ..config import (
     ConfigError,
     HeadConfig,
     LaptopConfig,
@@ -64,7 +64,7 @@ from .config import (
     head_bwlimit_kbps,
     load,
 )
-from .dispatch import (
+from ..dispatch import (
     DispatchError,
     FailedBeforeStart,
     NoCapacity,
@@ -79,16 +79,16 @@ from .dispatch import (
     require_compatible_resident_agent,
     submit,
 )
-from .doctor import (
+from ..doctor import (
     default_project_status,
     doctor_center,
     head_capability_checks,
     registry_growth_status,
     relay_agent_status,
 )
-from .forwarding import HeadCommand
-from .lifecycle import runtime_identity, termination_probe, termination_verdict
-from .maintenance import (
+from ..forwarding import HeadCommand
+from ..lifecycle import runtime_identity, termination_probe, termination_verdict
+from ..maintenance import (
     DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
     MAX_CLEAN_PLAN_PAGE_BYTES,
     CleanAuthorization,
@@ -98,8 +98,8 @@ from .maintenance import (
     create_clean_plan,
     load_clean_plan,
 )
-from .jsonvalue import as_int, as_number
-from .layout import (
+from ..jsonvalue import as_int, as_number
+from ..layout import (
     ROLE_LAYOUT,
     display_node_path,
     job_control_dir,
@@ -109,28 +109,28 @@ from .layout import (
     node_path_expression,
     rsync_destination,
 )
-from .monitoring import AUTOMATIC_TAIL_MAX_BYTES as AUTO_LOG_TAIL_MAX_BYTES
-from .monitoring import ResourceTelemetryQuery, TELEMETRY_TRANSPORT_CAPTURE_BYTES
-from .monitoring import parse_resource_jsonl as _parse_resource_jsonl  # noqa: F401
-from .monitoring import safe_phase_name as _safe_phase_name
-from .monitoring import summarize_resources as _summarize_resources  # noqa: F401
-from .onboarding import InitError, build_config, render_config, write_config
-from .path_contract import job_path_contract as _job_path_contract
-from .private_state import (
+from ..monitoring import AUTOMATIC_TAIL_MAX_BYTES as AUTO_LOG_TAIL_MAX_BYTES
+from ..monitoring import ResourceTelemetryQuery, TELEMETRY_TRANSPORT_CAPTURE_BYTES
+from ..monitoring import parse_resource_jsonl as _parse_resource_jsonl  # noqa: F401
+from ..monitoring import safe_phase_name as _safe_phase_name
+from ..monitoring import summarize_resources as _summarize_resources  # noqa: F401
+from ..onboarding import InitError, build_config, render_config, write_config
+from ..path_contract import job_path_contract as _job_path_contract
+from ..private_state import (
     PrivateStateError,
     atomic_write_regular,
     decode_strict_json,
     read_bounded_regular,
 )
-from .probe import (
+from ..probe import (
     INTERACTIVE_PROBE_BUDGET_S,
     NodeStatus,
     probe_center,
     probe_node,
     status_as_dict,
 )
-from .redaction import redact_home_path
-from .remote import (
+from ..redaction import redact_home_path
+from ..remote import (
     FanErrors,
     center_worker_count,
     fan_json,
@@ -141,7 +141,7 @@ from .remote import (
     forward_exec,
     remote_dt,
 )
-from .render import (
+from ..render import (
     DISK_LOW_FREE_FRACTION,
     DISK_LOW_FREE_GIB,
     compact_path,
@@ -151,24 +151,24 @@ from .render import (
     out,
     ps_table,
 )
-from . import pull_relay
-from . import sync_relay
-from .link_metrics import (
+from .. import pull_relay
+from .. import sync_relay
+from ..link_metrics import (
     CONTROL_LINK_SCOPE,
     MIN_SAMPLE_SECONDS,
     LinkMetricsError,
     site_link_scope,
 )
-from . import topology_discovery as topology_discovery_mod
-from .topology_discovery import (
+from .. import topology_discovery as topology_discovery_mod
+from ..topology_discovery import (
     BANDWIDTH_PROBE_ESCALATE_UNDER_S,
     BANDWIDTH_PROBE_LARGE_BYTES,
     BANDWIDTH_PROBE_SMALL_BYTES,
     TopologyDiscovery,
     TopologyDiscoveryError,
 )
-from . import evidence as evidence_mod
-from .sshio import (
+from .. import evidence as evidence_mod
+from ..sshio import (
     MAX_TRANSFER_RETRIES,
     RSYNC_RETRYABLE_EXIT_CODES,
     RSYNC_UNREACHABLE_EXIT_CODES,
@@ -179,11 +179,11 @@ from .sshio import (
     rsync,
     run_on,
 )
-from .terminal import sanitize_terminal_text
-from .storage import deduplicated_storage_bytes
-from .storage import inventory as storage_inventory
-from .storage import local_tree_disk_bytes
-from .submission import (
+from ..terminal import sanitize_terminal_text
+from ..storage import deduplicated_storage_bytes
+from ..storage import inventory as storage_inventory
+from ..storage import local_tree_disk_bytes
+from ..submission import (
     SubmissionRequest,
     SubmissionValidationError,
     derive_task_name as _derived_task_name,
@@ -191,17 +191,17 @@ from .submission import (
     validate_resources,
     validate_workflow,
 )
-from . import submission_intent as intent_mod
-from . import matrix as matrix_mod
-from . import operation_log as operation_log_mod
-from .transfers import collection_parts as _collection_parts
-from .transfers import ensure_collection_root as _ensure_collection_root
-from .transfers import collection_root as _collection_root
-from .transfers import pull_job_record as _pull_job_record
-from .transfers import pull_outputs_probe_bytes as _pull_outputs_probe_bytes
-from .transfers import pull_outputs_probe_command as _pull_outputs_probe_command
-from .install_identity import install_digest, payload_digest
-from .version import parse_version_identity, version_text
+from .. import submission_intent as intent_mod
+from .. import matrix as matrix_mod
+from .. import operation_log as operation_log_mod
+from ..transfers import collection_parts as _collection_parts
+from ..transfers import ensure_collection_root as _ensure_collection_root
+from ..transfers import collection_root as _collection_root
+from ..transfers import pull_job_record as _pull_job_record
+from ..transfers import pull_outputs_probe_bytes as _pull_outputs_probe_bytes
+from ..transfers import pull_outputs_probe_command as _pull_outputs_probe_command
+from ..install_identity import install_digest, payload_digest
+from ..version import parse_version_identity, version_text
 
 EXIT_NO_GPU = 2
 EXIT_ENV = 3
@@ -803,7 +803,7 @@ def _free_scheduler_context(
     resources: list[JsonDict] | None = None,
 ) -> JsonDict:
     """One local registry read that explains dt-owned idle or queued capacity."""
-    from . import agent as agent_mod
+    from .. import agent as agent_mod
 
     try:
         damage: list[jobs_mod.RegistryDamage] = []
@@ -816,7 +816,7 @@ def _free_scheduler_context(
         head = queued[0] if queued else None
         agent_pid = agent_mod.alive_pid(cfg)
         health = agent_mod.heartbeat_health(cfg, alive=agent_pid is not None)
-        from .scheduler import scheduler_snapshot
+        from ..scheduler import scheduler_snapshot
 
         model = scheduler_snapshot(
             cfg,
@@ -2610,7 +2610,7 @@ def _resolve_laptop_run_center(
             "center, pick it explicitly[/red]"
         )
         raise typer.Exit(1)
-    from .remote import best_center
+    from ..remote import best_center
 
     with err.status("probing all centers..."):
         raw_rows, errors = fan_json(cfg, ["free", "--scheduler-context"])
@@ -3240,7 +3240,7 @@ def _sync_task_artifacts_raw(
     """Sync explicit inputs to one task node and return its immutable binding."""
     from rich.markup import escape
 
-    from .dispatch import resolve_project, sync_artifacts
+    from ..dispatch import resolve_project, sync_artifacts
 
     try:
         project_name, project_cfg = resolve_project(cfg, project, Path.cwd())
@@ -3375,7 +3375,7 @@ def _submit_request(
                 json_=json_,
             )
         artifact_node = node
-        from .dispatch import artifact_manifest_identity, resolve_project
+        from ..dispatch import artifact_manifest_identity, resolve_project
 
         try:
             project, project_cfg = resolve_project(cfg, project, Path.cwd())
@@ -4325,7 +4325,7 @@ def _ensure_agent_for(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> bool | None:
 
     Returns None when no start was needed, else start_detached's verdict.
     """
-    from . import agent as agent_mod
+    from .. import agent as agent_mod
 
     return agent_mod.ensure_for_queued_job(cfg, entry)
 
@@ -4692,7 +4692,7 @@ def _inventory_submit_items(
     json_: bool,
 ) -> None:
     """Submit every item not yet confirmed, forking from the first."""
-    from . import dispatch as dispatch_mod
+    from .. import dispatch as dispatch_mod
 
     entries = outcome.entries
     total = len(plan.items)
@@ -5097,7 +5097,7 @@ def _inventory_command(
     artifact_action: Callable[[], None] | None = None
     if artifacts:
         try:
-            from .dispatch import artifact_manifest_identity, resolve_project
+            from ..dispatch import artifact_manifest_identity, resolve_project
 
             project, project_cfg = resolve_project(cfg, project, Path.cwd())
             artifact_manifest = artifact_manifest_identity(
@@ -5698,7 +5698,7 @@ def _matrix_run_head(
         if artifact_node is None:
             raise AssertionError("matrix artifacts require a pinned node")
         try:
-            from .dispatch import artifact_manifest_identity, resolve_project
+            from ..dispatch import artifact_manifest_identity, resolve_project
 
             project, project_cfg = resolve_project(cfg, project, Path.cwd())
             outcome.project = project
@@ -13184,7 +13184,7 @@ def rerun(
         )
         raise typer.Exit(rc)
 
-    from .dispatch import spec_from_entry
+    from ..dispatch import spec_from_entry
     from rich.markup import escape
 
     old = _find_or_die(cfg, ref, json_=json_)
@@ -13356,7 +13356,7 @@ def exec_job(
         )
         raise typer.Exit(rc)
 
-    from . import dispatch as dispatch_mod
+    from .. import dispatch as dispatch_mod
 
     source = _find_or_die(cfg, ref, json_=json_)
     try:
@@ -13511,7 +13511,7 @@ def _build_fork_spec(
     max_job_memory_mib: int | None,
 ) -> RunSpec:
     """Build one fork RunSpec, applying the cold-cache wrapper and overrides."""
-    from . import dispatch as dispatch_mod
+    from .. import dispatch as dispatch_mod
 
     if inherit_cache:
         item_spec = dispatch_mod.inherited_cache_fork_spec_from_entry(
@@ -13899,7 +13899,7 @@ def fork(
             json_=json_,
         )
 
-    from . import dispatch as dispatch_mod
+    from .. import dispatch as dispatch_mod
 
     old = _find_or_die(cfg, ref, json_=json_)
     old_display_ref = _display_ref_for_entry(cfg, old)
@@ -16031,7 +16031,7 @@ def _kill_one(
             typer.confirm(
                 f"remove queued job {entry.job_id} from the queue?", abort=True
             )
-        from .dispatch import remove_staging
+        from ..dispatch import remove_staging
 
         with jobs_mod.job_lock(cfg, entry.job_id):
             # The queue agent may have started this job after our first read.
@@ -16587,7 +16587,7 @@ def _clean_scope_before(
     json_: bool,
 ) -> _CleanScope:
     """Select the live registry rows (and owned results) older than ``before``."""
-    from .dispatch import clean_job_victims
+    from ..dispatch import clean_job_victims
 
     try:
         cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
@@ -16777,7 +16777,7 @@ def _clean_apply(
     victims = scope.victims
     managed_results = scope.managed_results
     n_victims = len(victims)
-    from .dispatch import clean_jobs
+    from ..dispatch import clean_jobs
 
     removed_results = 0
 
@@ -16858,7 +16858,7 @@ def _clean_apply(
     removed_deployments = 0
     deployment_failures = []
     if deployments:
-        from .maintenance import clean_deployments
+        from ..maintenance import clean_deployments
 
         deployment_report = clean_deployments(
             cfg,
@@ -17523,7 +17523,7 @@ def compact(
             abort=True,
         )
 
-    from .compact import compact_jobs
+    from ..compact import compact_jobs
 
     report = compact_jobs(
         cfg,
@@ -17639,7 +17639,7 @@ def migrate_layout(
             json_=json_,
         )
 
-    from .migration import apply_layout, plan_layout
+    from ..migration import apply_layout, plan_layout
 
     payload = (
         apply_layout(
@@ -17746,7 +17746,7 @@ def agent_run(
 ) -> None:
     """Run the agent loop in the foreground (what crontab @reboot starts)."""
     _agent_forward(["run"], center)
-    from . import agent as agent_mod
+    from .. import agent as agent_mod
 
     raise typer.Exit(agent_mod.run_loop(_need_head(_cfg())))
 
@@ -17757,7 +17757,7 @@ def agent_start(
 ) -> None:
     """Start the agent in the background (log path is shown on success)."""
     _agent_forward(["start"], center)
-    from . import agent as agent_mod
+    from .. import agent as agent_mod
 
     cfg = _need_head(_cfg())
     if agent_mod.alive_pid(cfg) is not None:
@@ -17781,7 +17781,7 @@ def agent_stop(
 ) -> None:
     """Stop the running agent (queued jobs stay queued)."""
     _agent_forward(["stop"], center)
-    from . import agent as agent_mod
+    from .. import agent as agent_mod
 
     cfg = _need_head(_cfg())
     if agent_mod.stop_agent(cfg):
@@ -17813,7 +17813,7 @@ def agent_status(
                 + (["--json"] if json_ else []),
             )
         )
-    from . import agent as agent_mod
+    from .. import agent as agent_mod
 
     head_cfg = _need_head(cfg)
     st = agent_mod.status(head_cfg)
@@ -17961,7 +17961,7 @@ def agent_install(
 ) -> None:
     """Install a restartable user service (or a visible cron fallback)."""
     _agent_forward(["install"], center)
-    from . import agent as agent_mod
+    from .. import agent as agent_mod
 
     cfg = _need_head(_cfg())
     result = agent_mod.install_supervisor(cfg)
@@ -18078,7 +18078,7 @@ class _SyncRequest:
     ) -> tuple[JsonDict, int | None, list[str]]:
         """Sync one node; returns (row, failure exit code, human messages)."""
         # Resolved at call time so tests can stub dispatch.sync_* per case.
-        from .dispatch import sync_artifacts, sync_project
+        from ..dispatch import sync_artifacts, sync_project
 
         name = node.name
         messages: list[str] = []
@@ -18349,7 +18349,7 @@ def sync(
             )
         raise typer.Exit(rc)
 
-    from .dispatch import resolve_project
+    from ..dispatch import resolve_project
 
     def preflight_error(kind: str, message: str) -> NoReturn:
         if json_:
@@ -18494,7 +18494,7 @@ class _SeedRequest:
         }
 
     def seed_node(self, node: Node, *, cancel_event: Event) -> JsonDict:
-        from .dispatch import transferred_bytes
+        from ..dispatch import transferred_bytes
 
         name = node.name
         retry_events: list[JsonDict] = []
@@ -18769,7 +18769,7 @@ def seed(
     names = list(dict.fromkeys(nodes))
     cancel_event = Event()
 
-    from .dispatch import _seed_cache_lock
+    from ..dispatch import _seed_cache_lock
 
     home = Path.home()
     components: list[JsonDict] = []
@@ -19204,7 +19204,7 @@ def topology(
             json_=json_,
         )
 
-    from .topology import TopologyRegistry
+    from ..topology import TopologyRegistry
 
     discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
 
@@ -19579,7 +19579,7 @@ def doctor(
     cfg = _cfg()
     if isinstance(cfg, HeadConfig):
         rows = doctor_center(cfg)
-        from . import agent as agent_mod
+        from .. import agent as agent_mod
 
         n_queued = len(jobs_mod.queued_entries(cfg))
         agent_state = agent_mod.status(cfg)
