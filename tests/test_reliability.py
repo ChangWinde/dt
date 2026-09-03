@@ -5855,11 +5855,9 @@ def test_inflight_dequeue_restores_running_when_cancellation_is_unverified(
 
 
 def test_kill_uses_single_procfs_scan_instead_of_one_readlink_per_pid():
-    import inspect
+    probe = lifecycle.termination_probe("/home/u/dt/worker/jobs/j1", 1234, "TERM")
 
-    source = inspect.getsource(lifecycle.termination_probe)
-
-    assert "find /proc -mindepth 2 -maxdepth 2" in source
+    assert "find /proc -mindepth 2 -maxdepth 2" in probe
 
 
 def test_runtime_identity_is_deterministic_bounded_and_namespaced():
