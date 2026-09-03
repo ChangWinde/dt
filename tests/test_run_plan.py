@@ -5,6 +5,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from dt import cli, dispatch
+from dt.cli.commands import run as run_cmd
 from dt.config import HeadConfig, Node, Project
 from dt.jobs import JobEntry, save
 from dt.probe import Gpu, NodeStatus
@@ -225,7 +226,7 @@ def test_laptop_run_plan_forwards_plan_without_submission_recovery(
 
     monkeypatch.setattr(cli, "forward_call", fake_forward)
     monkeypatch.setattr(
-        cli,
+        run_cmd,
         "_forward_submission_workflow",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("a preview has no uncertain submission outcome")
