@@ -15,6 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 from dt import cli
+from dt.cli.commands import clean as clean_cmd
 from dt.agent import process_once
 from dt.config import HeadConfig, Node, QueueCfg, parse
 from dt.dispatch import blocked_not_busy, clean_jobs, spec_from_entry
@@ -1914,7 +1915,7 @@ def test_managed_result_invalid_identity_never_authorizes_deletion(tmp_path, rec
     (result / "dt" / "job.json").write_text(record)
     (result / "keep.txt").write_text("user data\n")
 
-    assert cli._owned_managed_results(cfg, {"old-done"}) == []
+    assert clean_cmd._owned_managed_results(cfg, {"old-done"}) == []
     assert result.is_dir()
     assert (result / "keep.txt").read_text() == "user data\n"
 
@@ -2317,7 +2318,7 @@ def test_clean_results_failure_retains_retryable_registry_record(tmp_path, monke
     (owned / "dt" / "job.json").write_text(json.dumps({"job_id": old.job_id}))
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli.shutil,
+        clean_cmd.shutil,
         "rmtree",
         lambda path: (_ for _ in ()).throw(OSError("read-only result")),
     )
@@ -2342,7 +2343,7 @@ def test_clean_results_refuses_path_replaced_after_ownership_scan(
     owned = cfg.results_dir() / old.job_id
     (owned / "dt").mkdir(parents=True)
     (owned / "dt" / "job.json").write_text(json.dumps({"job_id": old.job_id}))
-    original_scan = cli._owned_managed_results
+    original_scan = clean_cmd._owned_managed_results
 
     def replace_after_scan(cfg_, job_ids):
         scanned = original_scan(cfg_, job_ids)
@@ -2355,7 +2356,7 @@ def test_clean_results_refuses_path_replaced_after_ownership_scan(
         return scanned
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_owned_managed_results", replace_after_scan)
+    monkeypatch.setattr(clean_cmd, "_owned_managed_results", replace_after_scan)
 
     cleaned = CliRunner().invoke(
         cli.app,
@@ -2396,7 +2397,7 @@ def test_clean_results_holds_pull_destination_lock_while_deleting(
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "pull_destination_lock", destination_lock)
-    monkeypatch.setattr(cli.shutil, "rmtree", checked_rmtree)
+    monkeypatch.setattr(clean_cmd.shutil, "rmtree", checked_rmtree)
 
     cleaned = CliRunner().invoke(
         cli.app,
