@@ -14466,6 +14466,42 @@ def _recover_runtime_evidence(
     return evidence_provenance
 
 
+def _pull_argv(
+    refs: list[str],
+    *,
+    to: str | None,
+    collection: str | None,
+    lite: bool,
+    excludes: list[str],
+    force: bool,
+    retries: int,
+    route: str,
+    bwlimit: int | None,
+    json_: bool,
+) -> list[str]:
+    """The `dt pull` argv that reproduces this invocation (forward or resume)."""
+    argv = ["pull", *refs]
+    if to:
+        argv += ["--to", to]
+    if collection:
+        argv += ["--collection", collection]
+    if lite:
+        argv.append("--lite")
+    for pattern in excludes:
+        argv += ["--exclude", pattern]
+    if force:
+        argv.append("--force")
+    if retries != 2:
+        argv += ["--retries", str(retries)]
+    if route != "auto":
+        argv += ["--route", route]
+    if bwlimit is not None:
+        argv += ["--bwlimit", str(bwlimit)]
+    if json_:
+        argv.append("--json")
+    return argv
+
+
 def _forward_pull_to_head(
     cfg: LaptopConfig,
     ref: str,
@@ -14482,26 +14518,21 @@ def _forward_pull_to_head(
 ) -> NoReturn:
     """Laptop `dt pull`: replay the invocation on the head that owns ``ref``."""
     _, head = _locate(cfg, ref, json_=json_)
-    argv = ["pull", ref] + (["--to", to] if to else [])
-    if collection:
-        argv += ["--collection", collection]
-    if lite:
-        argv.append("--lite")
-    for pattern in excludes:
-        if lite and pattern in LITE_PULL_EXCLUDES:
-            continue  # the head expands --lite; avoid duplicate argv
-        argv += ["--exclude", pattern]
-    if force:
-        argv.append("--force")
-    if retries != 2:
-        argv += ["--retries", str(retries)]
-    if route != "auto":
-        argv += ["--route", route]
-    if bwlimit is not None:
-        argv += ["--bwlimit", str(bwlimit)]
-    if json_:
-        argv.append("--json")
-    else:
+    argv = _pull_argv(
+        [ref],
+        to=to,
+        collection=collection,
+        lite=lite,
+        # The head expands --lite itself; forwarding those patterns would
+        # only duplicate argv.
+        excludes=[p for p in excludes if not (lite and p in LITE_PULL_EXCLUDES)],
+        force=force,
+        retries=retries,
+        route=route,
+        bwlimit=bwlimit,
+        json_=json_,
+    )
+    if not json_:
         err.print("[dim]results land on the head node (projects live there)[/dim]")
     rc = _forward_retryable_with_reconnect(head, argv, ref, operation="pull")
     if rc is None:
@@ -15097,6 +15128,133 @@ def _pull_group_one(
     return result
 
 
+def _pull_group(
+    cfg: HeadConfig,
+    refs: list[str],
+    entries: list[jobs_mod.JobEntry | None],
+    *,
+    to: str | None,
+    collection: str | None,
+    exclude: list[str] | None,
+    lite: bool,
+    force: bool,
+    retries: int,
+    route: str,
+    bwlimit: int | None,
+    json_: bool,
+    resume_argv: Callable[[list[str]], list[str]],
+) -> NoReturn:
+    """Recover several jobs under one root, up to four at a time."""
+    try:
+        root = (
+            Path(to).expanduser()
+            if to
+            else (
+                _ensure_collection_root(cfg, collection)
+                if collection
+                else (
+                    cfg.results_dir() / "jobs"
+                    if cfg.layout == ROLE_LAYOUT
+                    else cfg.results_dir()
+                )
+            )
+        ).absolute()
+    except ValueError as exc:
+        _fail_submission(
+            kind="destination_unusable",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if root.exists() and not root.is_dir():
+        _fail_submission(
+            kind="destination_conflict",
+            message=f"{root} exists and is not a directory",
+            exit_code=1,
+            json_=json_,
+        )
+    cancel_event = Event()
+    ordered_results: list[JsonDict | None] = [None] * len(entries)
+    work_items: list[tuple[int, str, jobs_mod.JobEntry, Path]] = []
+    for index, (ref, entry) in enumerate(zip(refs, entries, strict=True)):
+        if entry is None:
+            ordered_results[index] = {
+                "ref": ref,
+                "job_id": None,
+                "name": None,
+                "node": None,
+                "status": "error",
+                "error": "not_found",
+                "message": f"no job matching {ref!r}",
+                "exit_code": EXIT_NOT_FOUND,
+            }
+            continue
+        work_items.append((index, ref, entry, root / entry.job_id))
+
+    pool = (
+        ThreadPoolExecutor(max_workers=min(4, len(work_items))) if work_items else None
+    )
+    futures = (
+        {
+            pool.submit(
+                _pull_group_one,
+                cfg,
+                ref,
+                entry,
+                destination,
+                exclude,
+                lite,
+                force,
+                retries,
+                route,
+                bwlimit,
+                cancel_event,
+            ): index
+            for index, ref, entry, destination in work_items
+        }
+        if pool is not None
+        else {}
+    )
+    try:
+        if json_:
+            for future in as_completed(futures):
+                ordered_results[futures[future]] = future.result()
+        elif futures:
+            count = (
+                f"{len(work_items)} jobs"
+                if len(work_items) == len(entries)
+                else f"{len(work_items)}/{len(entries)} resolved jobs"
+            )
+            with err.status(f"recovering {count} into {root} (up to 4 in parallel)..."):
+                for future in as_completed(futures):
+                    ordered_results[futures[future]] = future.result()
+    except KeyboardInterrupt:
+        cancel_event.set()
+        for future in futures:
+            future.cancel()
+        _pull_interrupted(
+            message=(
+                "pull stopped locally; completed and partial job directories were kept"
+            ),
+            resume=["dt", *resume_argv(refs)],
+            json_=json_,
+        )
+    finally:
+        cancel_event.set()
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    results = [result for result in ordered_results if result is not None]
+    group_payload = _pull_group_payload(root, results)
+    if json_:
+        print(json.dumps(group_payload))
+    else:
+        _render_pull_group(group_payload)
+    summary = group_payload["summary"]
+    assert isinstance(summary, dict)
+    raise typer.Exit(int(summary["aggregate_exit_code"]))
+
+
 def pull(
     refs: Optional[list[str]] = REFS_OPTIONAL_ARG,
     to: Optional[str] = typer.Option(
@@ -15209,21 +15367,39 @@ def pull(
             json_=json_,
         )
     cfg = _cfg()
+
+    def resume_argv(selected_refs: list[str]) -> list[str]:
+        return _pull_argv(
+            selected_refs,
+            to=to,
+            collection=collection,
+            lite=lite,
+            excludes=exclude or [],
+            force=force,
+            retries=retries,
+            route=route,
+            bwlimit=bwlimit,
+            json_=json_,
+        )
+
+    def pull_single(ref: str) -> None:
+        _pull_unlocked(
+            ref,
+            to,
+            exclude,
+            lite,
+            force,
+            json_,
+            retries,
+            route=route,
+            bwlimit=bwlimit,
+            _cfg_override=cfg,
+            _collection=collection,
+        )
+
     if isinstance(cfg, LaptopConfig):
         if len(refs) == 1:
-            _pull_unlocked(
-                refs[0],
-                to,
-                exclude,
-                lite,
-                force,
-                json_,
-                retries,
-                route=route,
-                bwlimit=bwlimit,
-                _cfg_override=cfg,
-                _collection=collection,
-            )
+            pull_single(refs[0])
             return
         locations = {ref: _locate(cfg, ref, json_=json_) for ref in refs}
         centers = {center for center, _head in locations.values()}
@@ -15239,26 +15415,8 @@ def pull(
                 json_=json_,
             )
         head = next(iter(locations.values()))[1]
-        argv = ["pull", *refs]
-        if to:
-            argv += ["--to", to]
-        if collection:
-            argv += ["--collection", collection]
-        if lite:
-            argv.append("--lite")
-        for pattern in exclude or []:
-            argv += ["--exclude", pattern]
-        if force:
-            argv.append("--force")
-        if retries != 2:
-            argv += ["--retries", str(retries)]
-        if route != "auto":
-            argv += ["--route", route]
-        if bwlimit is not None:
-            argv += ["--bwlimit", str(bwlimit)]
-        if json_:
-            argv.append("--json")
-        else:
+        argv = resume_argv(refs)
+        if not json_:
             err.print("[dim]results land on the head node (projects live there)[/dim]")
         rc = _forward_retryable_with_reconnect(
             head,
@@ -15280,19 +15438,7 @@ def pull(
     with jobs_mod.shared_resolution_snapshot(cfg):
         entries = [jobs_mod.find(cfg, ref) for ref in refs]
     if len(entries) == 1 and entries[0] is None:
-        _pull_unlocked(
-            refs[0],
-            to,
-            exclude,
-            lite,
-            force,
-            json_,
-            retries,
-            route=route,
-            bwlimit=bwlimit,
-            _cfg_override=cfg,
-            _collection=collection,
-        )
+        pull_single(refs[0])
         return
     resolved_entries = [entry for entry in entries if entry is not None]
     if len({entry.job_id for entry in resolved_entries}) != len(resolved_entries):
@@ -15317,173 +15463,30 @@ def pull(
         try:
             with jobs_mod.job_lock(cfg, entry.job_id):
                 with jobs_mod.pull_destination_lock(cfg, destination):
-                    _pull_unlocked(
-                        entry.job_id,
-                        to,
-                        exclude,
-                        lite,
-                        force,
-                        json_,
-                        retries,
-                        route=route,
-                        bwlimit=bwlimit,
-                        _cfg_override=cfg,
-                        _collection=collection,
-                    )
+                    pull_single(entry.job_id)
         except KeyboardInterrupt:
-            resume = ["dt", "pull", refs[0]]
-            if to:
-                resume += ["--to", to]
-            if collection:
-                resume += ["--collection", collection]
-            if lite:
-                resume.append("--lite")
-            for pattern in exclude or []:
-                resume += ["--exclude", pattern]
-            if force:
-                resume.append("--force")
-            if retries != 2:
-                resume += ["--retries", str(retries)]
-            if route != "auto":
-                resume += ["--route", route]
-            if bwlimit is not None:
-                resume += ["--bwlimit", str(bwlimit)]
-            if json_:
-                resume.append("--json")
             _pull_interrupted(
                 message=("pull stopped locally; partial result data were not deleted"),
-                resume=resume,
+                resume=["dt", *resume_argv([refs[0]])],
                 json_=json_,
             )
         return
 
-    try:
-        root = (
-            Path(to).expanduser()
-            if to
-            else (
-                _ensure_collection_root(cfg, collection)
-                if collection
-                else (
-                    cfg.results_dir() / "jobs"
-                    if cfg.layout == ROLE_LAYOUT
-                    else cfg.results_dir()
-                )
-            )
-        ).absolute()
-    except ValueError as exc:
-        _fail_submission(
-            kind="destination_unusable",
-            message=str(exc),
-            exit_code=1,
-            json_=json_,
-        )
-    if root.exists() and not root.is_dir():
-        _fail_submission(
-            kind="destination_conflict",
-            message=f"{root} exists and is not a directory",
-            exit_code=1,
-            json_=json_,
-        )
-    cancel_event = Event()
-    ordered_results: list[JsonDict | None] = [None] * len(entries)
-    work_items: list[tuple[int, str, jobs_mod.JobEntry, Path]] = []
-    for index, (ref, entry) in enumerate(zip(refs, entries, strict=True)):
-        if entry is None:
-            ordered_results[index] = {
-                "ref": ref,
-                "job_id": None,
-                "name": None,
-                "node": None,
-                "status": "error",
-                "error": "not_found",
-                "message": f"no job matching {ref!r}",
-                "exit_code": EXIT_NOT_FOUND,
-            }
-            continue
-        work_items.append((index, ref, entry, root / entry.job_id))
-
-    pool = (
-        ThreadPoolExecutor(max_workers=min(4, len(work_items))) if work_items else None
+    _pull_group(
+        cfg,
+        refs,
+        entries,
+        to=to,
+        collection=collection,
+        exclude=exclude,
+        lite=lite,
+        force=force,
+        retries=retries,
+        route=route,
+        bwlimit=bwlimit,
+        json_=json_,
+        resume_argv=resume_argv,
     )
-    futures = (
-        {
-            pool.submit(
-                _pull_group_one,
-                cfg,
-                ref,
-                entry,
-                destination,
-                exclude,
-                lite,
-                force,
-                retries,
-                route,
-                bwlimit,
-                cancel_event,
-            ): index
-            for index, ref, entry, destination in work_items
-        }
-        if pool is not None
-        else {}
-    )
-    try:
-        if json_:
-            for future in as_completed(futures):
-                ordered_results[futures[future]] = future.result()
-        elif futures:
-            count = (
-                f"{len(work_items)} jobs"
-                if len(work_items) == len(entries)
-                else f"{len(work_items)}/{len(entries)} resolved jobs"
-            )
-            with err.status(f"recovering {count} into {root} (up to 4 in parallel)..."):
-                for future in as_completed(futures):
-                    ordered_results[futures[future]] = future.result()
-    except KeyboardInterrupt:
-        cancel_event.set()
-        for future in futures:
-            future.cancel()
-        resume = ["dt", "pull", *refs]
-        if to:
-            resume += ["--to", to]
-        if collection:
-            resume += ["--collection", collection]
-        if lite:
-            resume.append("--lite")
-        for pattern in exclude or []:
-            resume += ["--exclude", pattern]
-        if force:
-            resume.append("--force")
-        if retries != 2:
-            resume += ["--retries", str(retries)]
-        if route != "auto":
-            resume += ["--route", route]
-        if bwlimit is not None:
-            resume += ["--bwlimit", str(bwlimit)]
-        if json_:
-            resume.append("--json")
-        _pull_interrupted(
-            message=(
-                "pull stopped locally; completed and partial job directories were kept"
-            ),
-            resume=resume,
-            json_=json_,
-        )
-    finally:
-        cancel_event.set()
-        if pool is not None:
-            pool.shutdown(wait=True, cancel_futures=True)
-
-    results = [result for result in ordered_results if result is not None]
-    group_payload = _pull_group_payload(root, results)
-    if json_:
-        print(json.dumps(group_payload))
-    else:
-        _render_pull_group(group_payload)
-    summary = group_payload["summary"]
-    assert isinstance(summary, dict)
-    raise typer.Exit(int(summary["aggregate_exit_code"]))
 
 
 def _kill_one(
