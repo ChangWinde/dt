@@ -129,6 +129,7 @@ from .probe import (
 )
 from .redaction import redact_home_path
 from .remote import (
+    FanErrors,
     center_worker_count,
     fan_json,
     fan_json_by_center,
@@ -6571,6 +6572,136 @@ def _legacy_ps_query_rows(
     return rows
 
 
+def _ps_query_legacy_fallback(
+    cfg: LaptopConfig,
+    fallback_centers: list[str],
+    *,
+    data_by_center: dict[str, object],
+    fan_errors: FanErrors,
+    status: str | None,
+    active_only: bool,
+    issues_only: bool,
+    with_progress: bool,
+    internal_fields: tuple[str, ...],
+    limit: int,
+    cursor: str | None,
+    summary_only: bool,
+) -> None:
+    """Re-query pre-query heads with plain `ps` and synthesize their pages."""
+    fallback_cfg = LaptopConfig(
+        centers={center: cfg.centers[center] for center in fallback_centers},
+        default_center=(
+            cfg.default_center if cfg.default_center in fallback_centers else None
+        ),
+    )
+    legacy_argv = ["ps"]
+    if status is not None:
+        legacy_argv.extend(["--status", status])
+    if active_only:
+        legacy_argv.append("--active")
+    if issues_only:
+        legacy_argv.append("--issues")
+    if with_progress:
+        legacy_argv.append("--with-progress")
+    fallback_data, fallback_errors = fan_json_by_center(fallback_cfg, legacy_argv)
+    for center in fallback_centers:
+        rows = _legacy_ps_query_rows(
+            fallback_data.get(center),
+            center=center,
+            status=status,
+            active_only=active_only,
+            issues_only=issues_only,
+        )
+        if rows is not None:
+            data_by_center[center] = ps_query_mod.build_payload(
+                rows,
+                center=center,
+                status=status,
+                active_only=active_only,
+                issues_only=issues_only,
+                since=None,
+                selected_fields=internal_fields,
+                limit=limit,
+                cursor=cursor,
+                summary_only=summary_only,
+            )
+            fan_errors.pop(center, None)
+            fan_errors.unreachable.discard(center)
+        elif center in fallback_errors:
+            fan_errors[center] = fallback_errors[center]
+            if center in fallback_errors.unreachable:
+                fan_errors.unreachable.add(center)
+        else:
+            fan_errors[center] = "invalid legacy ps response from head"
+
+
+def _ps_query_collect_centers(
+    cfg: LaptopConfig,
+    data_by_center: dict[str, object],
+    *,
+    fan_errors: FanErrors,
+    expected_query: JsonDict,
+    internal_fields: tuple[str, ...],
+    cursor: str | None,
+    limit: int,
+    summary_only: bool,
+) -> tuple[list[JsonDict], list[JsonDict], dict[str, str], int]:
+    """Validate each center page; return (summaries, rows, partial errors, eligible)."""
+    summaries: list[JsonDict] = []
+    candidates: list[JsonDict] = []
+    partial_errors: dict[str, str] = {}
+    eligible = 0
+    for center in cfg.centers:
+        center_payload = data_by_center.get(center)
+        if center_payload is None:
+            continue
+        try:
+            center_payload = ps_query_mod.validate_payload_contract(
+                center_payload,
+                center=center,
+                expected_query=expected_query,
+                expected_fields=internal_fields,
+                expected_cursor=cursor,
+            )
+        except ps_query_mod.QueryError as exc:
+            fan_errors[center] = str(exc)
+            continue
+        summary = center_payload.get("summary")
+        page = center_payload.get("page")
+        jobs = center_payload.get("jobs")
+        assert isinstance(summary, dict)
+        assert isinstance(page, dict)
+        assert isinstance(jobs, list)
+        typed_jobs = cast(list[JsonDict], jobs)
+        center_eligible = int(page["eligible"])
+        center_returned = int(page["returned"])
+        if not summary_only and center_returned != min(limit, center_eligible):
+            # A single head can safely continue its own byte-fitted page, but
+            # that prefix is not enough to form a globally ordered page.  A
+            # row omitted behind this center's last visible row may sort above
+            # another center's global cursor and then disappear forever.
+            # Isolate the center and require the caller to retry the same
+            # input cursor with a smaller projection.
+            fan_errors[center] = (
+                "head ps page reached its serialized byte budget; "
+                "retry with fewer --fields"
+            )
+            continue
+        summaries.append(cast(JsonDict, summary))
+        candidates.extend(typed_jobs)
+        eligible += center_eligible
+        head_errors = center_payload["errors"]
+        assert isinstance(head_errors, dict)
+        partial_errors.update(
+            {
+                f"{center}:{key}": value
+                for key, value in head_errors.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+        )
+    return summaries, candidates, partial_errors, eligible
+
+
 def _gather_laptop_ps_query(
     cfg: LaptopConfig,
     *,
@@ -6638,51 +6769,20 @@ def _gather_laptop_ps_query(
             if center not in fallback_centers
         )
     if fallback_centers and since is None:
-        fallback_cfg = LaptopConfig(
-            centers={center: cfg.centers[center] for center in fallback_centers},
-            default_center=(
-                cfg.default_center if cfg.default_center in fallback_centers else None
-            ),
+        _ps_query_legacy_fallback(
+            cfg,
+            fallback_centers,
+            data_by_center=data_by_center,
+            fan_errors=fan_errors,
+            status=status,
+            active_only=active_only,
+            issues_only=issues_only,
+            with_progress=with_progress,
+            internal_fields=internal_fields,
+            limit=limit,
+            cursor=cursor,
+            summary_only=summary_only,
         )
-        legacy_argv = ["ps"]
-        if status is not None:
-            legacy_argv.extend(["--status", status])
-        if active_only:
-            legacy_argv.append("--active")
-        if issues_only:
-            legacy_argv.append("--issues")
-        if with_progress:
-            legacy_argv.append("--with-progress")
-        fallback_data, fallback_errors = fan_json_by_center(fallback_cfg, legacy_argv)
-        for center in fallback_centers:
-            rows = _legacy_ps_query_rows(
-                fallback_data.get(center),
-                center=center,
-                status=status,
-                active_only=active_only,
-                issues_only=issues_only,
-            )
-            if rows is not None:
-                data_by_center[center] = ps_query_mod.build_payload(
-                    rows,
-                    center=center,
-                    status=status,
-                    active_only=active_only,
-                    issues_only=issues_only,
-                    since=None,
-                    selected_fields=internal_fields,
-                    limit=limit,
-                    cursor=cursor,
-                    summary_only=summary_only,
-                )
-                fan_errors.pop(center, None)
-                fan_errors.unreachable.discard(center)
-            elif center in fallback_errors:
-                fan_errors[center] = fallback_errors[center]
-                if center in fallback_errors.unreachable:
-                    fan_errors.unreachable.add(center)
-            else:
-                fan_errors[center] = "invalid legacy ps response from head"
     elif fallback_centers:
         for center in fallback_centers:
             fan_errors[center] = (
@@ -6690,58 +6790,16 @@ def _gather_laptop_ps_query(
                 "using --since"
             )
 
-    summaries: list[JsonDict] = []
-    candidates: list[JsonDict] = []
-    partial_errors: dict[str, str] = {}
-    eligible = 0
-    for center in cfg.centers:
-        center_payload = data_by_center.get(center)
-        if center_payload is None:
-            continue
-        try:
-            center_payload = ps_query_mod.validate_payload_contract(
-                center_payload,
-                center=center,
-                expected_query=expected_query,
-                expected_fields=internal_fields,
-                expected_cursor=cursor,
-            )
-        except ps_query_mod.QueryError as exc:
-            fan_errors[center] = str(exc)
-            continue
-        summary = center_payload.get("summary")
-        page = center_payload.get("page")
-        jobs = center_payload.get("jobs")
-        assert isinstance(summary, dict)
-        assert isinstance(page, dict)
-        assert isinstance(jobs, list)
-        typed_jobs = cast(list[JsonDict], jobs)
-        center_eligible = int(page["eligible"])
-        center_returned = int(page["returned"])
-        if not summary_only and center_returned != min(limit, center_eligible):
-            # A single head can safely continue its own byte-fitted page, but
-            # that prefix is not enough to form a globally ordered page.  A
-            # row omitted behind this center's last visible row may sort above
-            # another center's global cursor and then disappear forever.
-            # Isolate the center and require the caller to retry the same
-            # input cursor with a smaller projection.
-            fan_errors[center] = (
-                "head ps page reached its serialized byte budget; "
-                "retry with fewer --fields"
-            )
-            continue
-        summaries.append(cast(JsonDict, summary))
-        candidates.extend(typed_jobs)
-        eligible += center_eligible
-        head_errors = center_payload["errors"]
-        assert isinstance(head_errors, dict)
-        partial_errors.update(
-            {
-                f"{center}:{key}": value
-                for key, value in head_errors.items()
-                if isinstance(key, str) and isinstance(value, str)
-            }
-        )
+    summaries, candidates, partial_errors, eligible = _ps_query_collect_centers(
+        cfg,
+        data_by_center,
+        fan_errors=fan_errors,
+        expected_query=expected_query,
+        internal_fields=internal_fields,
+        cursor=cursor,
+        limit=limit,
+        summary_only=summary_only,
+    )
 
     try:
         merged_summary = ps_query_mod.merge_summaries(summaries)
