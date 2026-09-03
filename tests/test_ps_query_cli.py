@@ -4,6 +4,7 @@ import pytest
 from typer.testing import CliRunner
 
 from dt import cli, ps_query
+from dt.cli.commands import ps as ps_cmd
 from dt.config import HeadConfig, LaptopConfig, Node
 from dt.jobs import JobEntry
 from dt.remote import FanErrors
@@ -42,7 +43,7 @@ def test_ps_surfaces_damaged_registry_rows(tmp_path):
     cli.jobs_mod.save(cfg, _entry("good", created_at=1.0))
     (cfg.registry_dir() / "bad.json").write_text("{ not json", encoding="utf-8")
 
-    rows, errors = cli._gather_ps_rows(cfg, None)
+    rows, errors = ps_cmd._gather_ps_rows(cfg, None)
 
     # The readable job still lists; the unreadable one is no longer silent.
     assert [row["job_id"] for row in rows] == ["good"]

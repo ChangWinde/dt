@@ -3,7 +3,8 @@
 import json
 
 import dt.jobs as jobs_mod
-from dt import cli, maintenance
+from dt import maintenance
+from dt.cli.commands import ps as ps_cmd
 from dt.config import HeadConfig, Node, QueueCfg
 from dt.jobs import JobEntry, save
 
@@ -77,7 +78,7 @@ def test_ps_reports_unreadable_registry_rows(tmp_path, monkeypatch):
     save(cfg, _entry("healthy-job", status="finished", exit_code=0))
     damaged_path = _write_damaged_row(cfg)
 
-    rows, errors = cli._gather_ps_rows(cfg, status=None)
+    rows, errors = ps_cmd._gather_ps_rows(cfg, status=None)
 
     assert [row["job_id"] for row in rows] == ["healthy-job"]
     key = f"registry:{damaged_path.name}"
@@ -137,7 +138,7 @@ def test_ps_issues_filter_applies_before_limit(tmp_path):
             ),
         )
 
-    rows, _errors = cli._gather_ps_rows(cfg, status=None, issues_only=True, limit=2)
+    rows, _errors = ps_cmd._gather_ps_rows(cfg, status=None, issues_only=True, limit=2)
 
     job_ids = {row["job_id"] for row in rows}
     assert job_ids == {"failed-1", "failed-2"}

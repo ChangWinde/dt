@@ -13,12 +13,11 @@ from pathlib import Path
 
 from rich.console import Console
 
-from dt.cli import (
+from dt.cli import _resource_rows, _resource_summary_rows
+from dt.cli.commands.info import (
     _parse_phase_jsonl,
     _phase_summary_from_text,
     _phase_summary_rows,
-    _resource_rows,
-    _resource_summary_rows,
 )
 from dt.cli.commands.metrics import _metrics_table
 from dt.monitoring import parse_resource_jsonl as _parse_resource_jsonl

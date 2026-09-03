@@ -15,6 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 from dt import cli
+from dt.cli.commands import ps as ps_cmd
 from dt.cli.commands import clean as clean_cmd
 from dt.cli.commands import storage as storage_cmd
 from dt.agent import process_once
@@ -2272,7 +2273,7 @@ def test_ps_center_is_laptop_only_and_scopes_the_fan_out(tmp_path, monkeypatch):
         seen["centers"] = dict(cfg_arg.centers)
         return [], {}
 
-    monkeypatch.setattr(cli, "_gather_ps_rows", fake_gather)
+    monkeypatch.setattr(ps_cmd, "_gather_ps_rows", fake_gather)
     monkeypatch.setattr(cli, "_cfg", lambda: laptop)
 
     result = CliRunner().invoke(cli.app, ["ps", "-c", "b", "--json"])

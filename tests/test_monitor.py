@@ -12,6 +12,12 @@ import pytest
 from typer.testing import CliRunner
 
 from dt import cli, completion, diagnose
+from dt.cli.commands import watch as watch_cmd
+from dt.cli.commands import wait as wait_cmd
+from dt.cli.commands import ps as ps_cmd
+from dt.cli.commands import logs as logs_cmd
+from dt.cli.commands import info as info_cmd
+from dt.cli.commands import free as free_cmd
 from dt.completion import CompletionSignals
 from dt.config import HeadConfig, LaptopConfig, Node
 from dt.jobs import JobEntry
@@ -382,23 +388,23 @@ def test_info_actions_are_typed_and_never_suggest_double_runs():
             **kwargs,
         )
 
-    queued = cli._info_actions(entry("queued"))
+    queued = info_cmd._info_actions(entry("queued"))
     assert [action["kind"] for action in queued] == [
         "wait_for_terminal_state",
         "show_capacity",
     ]
     assert all(action["effect"] == "observe" for action in queued)
 
-    running = cli._info_actions(entry("running"))
+    running = info_cmd._info_actions(entry("running"))
     assert [action["kind"] for action in running] == ["follow_log", "watch_resources"]
 
-    success = cli._info_actions(entry("finished", exit_code=0))
+    success = info_cmd._info_actions(entry("finished", exit_code=0))
     assert [action["kind"] for action in success] == [
         "recover_outputs",
         "review_resources",
     ]
 
-    failure = cli._info_actions(entry("finished", exit_code=3))
+    failure = info_cmd._info_actions(entry("finished", exit_code=3))
     assert [action["kind"] for action in failure] == [
         "inspect_failure_log",
         "recover_evidence",
@@ -409,7 +415,7 @@ def test_info_actions_are_typed_and_never_suggest_double_runs():
 
     # A lost or uncertain launch may still be running remotely: the only safe
     # transition is a verified kill, never a resubmission that can double-run.
-    lost = cli._info_actions(entry("lost"))
+    lost = info_cmd._info_actions(entry("lost"))
     assert [action["kind"] for action in lost] == [
         "inspect_launch_evidence",
         "verified_kill",
@@ -417,7 +423,7 @@ def test_info_actions_are_typed_and_never_suggest_double_runs():
     assert lost[1]["effect"] == "destructive"
     assert lost[1]["requires_confirmation"] is True
 
-    uncertain = cli._info_actions(
+    uncertain = info_cmd._info_actions(
         entry(
             "failed",
             reason=cli.jobs_mod.UNCERTAIN_LAUNCH_PREFIX + "ssh transport dropped",
@@ -428,7 +434,7 @@ def test_info_actions_are_typed_and_never_suggest_double_runs():
         "verified_kill",
     ]
 
-    reject = cli._info_actions(
+    reject = info_cmd._info_actions(
         entry("finished", exit_code=3, result_state="scientific_reject")
     )
     assert [action["kind"] for action in reject] == [
@@ -436,7 +442,7 @@ def test_info_actions_are_typed_and_never_suggest_double_runs():
         "recover_evidence",
     ]
 
-    skipped = cli._info_actions(entry("skipped", after_success="pred-id"))
+    skipped = info_cmd._info_actions(entry("skipped", after_success="pred-id"))
     assert skipped == [
         {
             "kind": "inspect_predecessor",
@@ -539,7 +545,7 @@ def test_info_default_prioritizes_state_and_moves_internals_to_verbose(
     )
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_info_live", lambda *args, **kwargs: {})
+    monkeypatch.setattr(info_cmd, "_info_live", lambda *args, **kwargs: {})
 
     compact = CliRunner().invoke(cli.app, ["info", "abcd"])
     verbose = CliRunner().invoke(
@@ -603,7 +609,7 @@ def test_info_shows_a_reclaimed_code_copy_with_its_recovery_path(tmp_path, monke
     )
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_info_live", lambda *args, **kwargs: {})
+    monkeypatch.setattr(info_cmd, "_info_live", lambda *args, **kwargs: {})
 
     compact = CliRunner().invoke(cli.app, ["info", "abcd"], env={"COLUMNS": "120"})
     machine = CliRunner().invoke(cli.app, ["info", "abcd", "--json"])
@@ -816,7 +822,7 @@ def test_info_prestart_failure_includes_structured_env_log(tmp_path, monkeypatch
         "error": None,
     }
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_info_live", lambda entry_: {})
+    monkeypatch.setattr(info_cmd, "_info_live", lambda entry_: {})
     monkeypatch.setattr(
         cli,
         "_read_failed_start_log",
@@ -1216,7 +1222,7 @@ def test_info_collects_running_status_artifacts_and_resources_in_parallel(
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "refresh_status", refresh)
-    monkeypatch.setattr(cli, "_info_live", live)
+    monkeypatch.setattr(info_cmd, "_info_live", live)
     monkeypatch.setattr(cli, "_job_resources", resources)
     monkeypatch.setattr(cli.time, "time", lambda: 112.5)
 
@@ -1250,7 +1256,7 @@ def test_info_live_marks_nonzero_ssh_result_unreachable(monkeypatch):
         ),
     )
 
-    assert cli._info_live(entry) == {"unreachable": True}
+    assert info_cmd._info_live(entry) == {"unreachable": True}
 
 
 def test_info_live_missing_optional_telemetry_keeps_reachable_node(
@@ -1274,7 +1280,7 @@ def test_info_live_missing_optional_telemetry_keeps_reachable_node(
         exit_code=0,
     )
 
-    live = cli._info_live(entry)
+    live = info_cmd._info_live(entry)
 
     assert live.get("unreachable") is not True
     assert live["started_at"] == 100.0
@@ -1304,7 +1310,7 @@ def test_info_live_exposes_runtime_containment_and_linger(tmp_path):
         status="running",
     )
 
-    live = cli._info_live(entry)
+    live = info_cmd._info_live(entry)
 
     assert live["runtime_containment"] == "systemd_scope_verified"
     assert live["runtime_linger"] == "yes"
@@ -1329,7 +1335,7 @@ def test_info_live_preserves_subsecond_remote_timestamps(tmp_path):
         exit_code=0,
     )
 
-    live = cli._info_live(entry)
+    live = info_cmd._info_live(entry)
 
     assert live["started_at"] == 100.125
     assert live["finished_at"] == 102.875
@@ -1425,7 +1431,9 @@ def test_info_marks_persisted_node_clock_duration_as_cross_clock(tmp_path, monke
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "refresh_status", lambda _cfg, current: current)
-    monkeypatch.setattr(cli, "_info_live", lambda _entry, *_args: {"unreachable": True})
+    monkeypatch.setattr(
+        info_cmd, "_info_live", lambda _entry, *_args: {"unreachable": True}
+    )
     monkeypatch.setattr(cli, "_job_resources", lambda _cfg, _entry: None)
     monkeypatch.setattr(cli.time, "time", lambda: 180.0)
 
@@ -1516,7 +1524,7 @@ def test_ps_surfaces_unreachable_and_overdue_running_job(tmp_path, monkeypatch):
         ),
     )
 
-    rows, errors = cli._gather_ps_rows(cfg, status=None, include_progress=False)
+    rows, errors = ps_cmd._gather_ps_rows(cfg, status=None, include_progress=False)
 
     assert errors == {}
     assert len(rows) == 1
@@ -1584,8 +1592,8 @@ def test_active_ps_and_free_scheduler_context_do_not_decode_terminal_history(
         lambda _cfg, *, alive: {"heartbeat_stale": False},
     )
 
-    rows, errors = cli._gather_ps_rows(cfg, None, active_only=True)
-    context = cli._free_scheduler_context(cfg, resources=[])
+    rows, errors = ps_cmd._gather_ps_rows(cfg, None, active_only=True)
+    context = free_cmd._free_scheduler_context(cfg, resources=[])
 
     assert errors == {}
     assert [row["job_id"] for row in rows] == ["active-queued"]
@@ -1627,7 +1635,7 @@ def test_ps_does_not_probe_lost_jobs_after_the_rescue_window(tmp_path, monkeypat
         ),
     )
 
-    rows, errors = cli._gather_ps_rows(cfg, status=None)
+    rows, errors = ps_cmd._gather_ps_rows(cfg, status=None)
 
     assert errors == {}
     assert len(rows) == 1
@@ -1850,7 +1858,7 @@ def test_info_json_marks_unreachable_job_over_max_hours(tmp_path, monkeypatch):
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "refresh_status", lambda cfg_, entry_: entry_)
-    monkeypatch.setattr(cli, "_info_live", lambda entry_: {"unreachable": True})
+    monkeypatch.setattr(info_cmd, "_info_live", lambda entry_: {"unreachable": True})
     monkeypatch.setattr(
         cli, "_job_resources", lambda cfg_, entry_: {"error": "offline"}
     )
@@ -1909,7 +1917,7 @@ def test_watch_snapshot_combines_status_resources_and_log_tail(tmp_path, monkeyp
     )
     monkeypatch.setattr(cli.time, "time", lambda: 112.5)
 
-    current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert current is entry
     assert snapshot["status"] == "running"
@@ -1956,7 +1964,7 @@ def test_watch_queued_tail_reports_live_fifo_reason_and_preserves_last_probe(
     cli.jobs_mod.save(cfg, head)
     cli.jobs_mod.save(cfg, tail)
 
-    _current, snapshot = cli._watch_snapshot(cfg, tail, lines=20, compact=True)
+    _current, snapshot = watch_cmd._watch_snapshot(cfg, tail, lines=20, compact=True)
 
     assert snapshot["queue_position"] == 2
     assert snapshot["queue_depth"] == 2
@@ -1972,7 +1980,7 @@ def test_watch_queued_tail_reports_live_fifo_reason_and_preserves_last_probe(
     from rich.console import Console
 
     console = Console(width=120, record=True, color_system=None)
-    console.print(cli._watch_view(snapshot))
+    console.print(watch_cmd._watch_view(snapshot))
     rendered = " ".join(console.export_text().split())
     assert "queued #2/2" in rendered
     assert "waiting: FIFO behind queue-head (1 ahead)" in rendered
@@ -2024,22 +2032,22 @@ def test_watch_presents_lost_within_recovery_window_as_reconciling(
 
     reconciling = lost_entry("lost-fresh", None)
     assert cli.jobs_mod.lost_reconciling(reconciling) is True
-    _current, snapshot = cli._watch_snapshot(cfg, reconciling, lines=5)
+    _current, snapshot = watch_cmd._watch_snapshot(cfg, reconciling, lines=5)
     assert snapshot["lost_reconciling"] is True
 
     from rich.console import Console
 
     console = Console(width=120, record=True, color_system=None)
-    console.print(cli._watch_view(snapshot))
+    console.print(watch_cmd._watch_view(snapshot))
     rendered = " ".join(console.export_text().split())
     assert "lost? reconciling" in rendered
 
     settled = lost_entry("lost-settled", now - 30.0)
     assert cli.jobs_mod.lost_reconciling(settled) is False
-    _current, settled_snapshot = cli._watch_snapshot(cfg, settled, lines=5)
+    _current, settled_snapshot = watch_cmd._watch_snapshot(cfg, settled, lines=5)
     assert settled_snapshot["lost_reconciling"] is False
     console = Console(width=120, record=True, color_system=None)
-    console.print(cli._watch_view(settled_snapshot))
+    console.print(watch_cmd._watch_view(settled_snapshot))
     rendered = " ".join(console.export_text().split())
     assert "lost? reconciling" not in rendered
 
@@ -2093,7 +2101,7 @@ def test_watch_reports_selected_log_age_without_an_extra_remote_probe(
     monkeypatch.setattr(cli, "run_on", fake_run_on)
     monkeypatch.setattr(cli.time, "time", lambda: 225.25)
 
-    _current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    _current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert log_reads == 1
     assert snapshot["log_tail"] == "step 2/40\n"
@@ -2103,12 +2111,14 @@ def test_watch_reports_selected_log_age_without_an_extra_remote_probe(
     from rich.console import Console
 
     console = Console(width=100, record=True, color_system=None)
-    console.print(cli._watch_view(snapshot))
+    console.print(watch_cmd._watch_view(snapshot))
     single = " ".join(console.export_text().split())
     assert "log age 2m05s since last update" in single
 
     console = Console(width=100, record=True, color_system=None)
-    console.print(cli._watch_group_view(cli._watch_group_payload([snapshot])))
+    console.print(
+        watch_cmd._watch_group_view(watch_cmd._watch_group_payload([snapshot]))
+    )
     group = " ".join(console.export_text().split())
     assert "step 2/40 · 5% · log idle 2m05s" in group
 
@@ -2186,7 +2196,7 @@ def test_watch_reuses_log_probe_for_live_job_cpu_ram_and_io(tmp_path, monkeypatc
     monkeypatch.setattr(cli, "run_on", fake_run_on)
     monkeypatch.setattr(cli.time, "time", lambda: 225.0)
 
-    _current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    _current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert log_reads == 1
     assert snapshot["log_tail"] == "step 2/40\n"
@@ -2196,7 +2206,7 @@ def test_watch_reuses_log_probe_for_live_job_cpu_ram_and_io(tmp_path, monkeypatc
     from rich.console import Console
 
     console = Console(width=110, record=True, color_system=None)
-    console.print(cli._watch_view(snapshot))
+    console.print(watch_cmd._watch_view(snapshot))
     single = " ".join(console.export_text().split())
     assert "live phase dataset_loading" in single
     assert "live job CPU 98% · RAM 9.5 GiB" in single
@@ -2204,7 +2214,9 @@ def test_watch_reuses_log_probe_for_live_job_cpu_ram_and_io(tmp_path, monkeypatc
     assert "2 proc / 11 threads" in single
 
     console = Console(width=160, record=True, color_system=None)
-    console.print(cli._watch_group_view(cli._watch_group_payload([snapshot])))
+    console.print(
+        watch_cmd._watch_group_view(watch_cmd._watch_group_payload([snapshot]))
+    )
     group = " ".join(console.export_text().split())
     assert "step 2/40 · 5% · phase dataset_loading · job CPU 98%" in group
     assert "RAM 9.5" in group
@@ -2278,7 +2290,7 @@ def test_watch_rejects_malformed_job_resource_sample(tmp_path, monkeypatch):
         ),
     )
 
-    _current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    _current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert snapshot["log_tail"] == "still running\n"
     assert "job" not in snapshot["resources"]
@@ -2286,7 +2298,7 @@ def test_watch_rejects_malformed_job_resource_sample(tmp_path, monkeypatch):
     from rich.console import Console
 
     console = Console(width=100, record=True, color_system=None)
-    console.print(cli._watch_view(snapshot))
+    console.print(watch_cmd._watch_view(snapshot))
     assert "live gpu" in console.export_text()
     nonfinite = {
         **sample,
@@ -2363,7 +2375,7 @@ def test_watch_terminal_transition_drops_the_last_live_job_sample(
         ),
     )
 
-    _current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    _current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert snapshot["status"] == "finished"
     assert snapshot["resources"] is None
@@ -2450,7 +2462,7 @@ def test_watch_terminal_transition_includes_persisted_resource_summary(
         lambda *args, **kwargs: subprocess.CompletedProcess([], 0, f"{resource}\n", ""),
     )
 
-    current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert current.status == "finished"
     assert snapshot["resources"] is None
@@ -2468,7 +2480,9 @@ def test_watch_terminal_transition_includes_persisted_resource_summary(
             AssertionError("compact terminal transition must skip resource summary")
         ),
     )
-    compact_current, compact = cli._watch_snapshot(cfg, entry, lines=20, compact=True)
+    compact_current, compact = watch_cmd._watch_snapshot(
+        cfg, entry, lines=20, compact=True
+    )
     assert compact_current.status == "finished"
     assert compact["schema_version"] == "dt_watch_compact_v1"
     assert "resource_summary" not in compact
@@ -2477,7 +2491,7 @@ def test_watch_terminal_transition_includes_persisted_resource_summary(
     from rich.console import Console
 
     console = Console(width=100, record=True, color_system=None)
-    console.print(cli._watch_view(snapshot))
+    console.print(watch_cmd._watch_view(snapshot))
     rendered = console.export_text()
     assert "recent gpu" in rendered
     assert "99% window / 99% peak" in rendered
@@ -2523,7 +2537,7 @@ def test_watch_finished_without_telemetry_keeps_null_summary(tmp_path, monkeypat
         lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
     )
 
-    current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert current.status == "finished"
     assert snapshot["resource_summary"] is None
@@ -2577,7 +2591,7 @@ def test_watch_snapshot_collects_remote_reads_in_parallel(tmp_path, monkeypatch)
     monkeypatch.setattr(cli, "_read_job_log_tail", log_tail)
     monkeypatch.setattr(cli.time, "time", lambda: 112.5)
 
-    current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert current is entry
     assert snapshot["resources"]["gpus"][0]["util"] == 90
@@ -2635,7 +2649,7 @@ def test_watch_snapshot_surfaces_remote_log_probe_failure(tmp_path, monkeypatch)
     )
     monkeypatch.setattr(cli.time, "time", lambda: 110.0)
 
-    _current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    _current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert snapshot["resources"] == {"error": "No route to host"}
     assert snapshot["log_tail"] == "[log unavailable: No route to host]"
@@ -2648,7 +2662,7 @@ def test_watch_snapshot_surfaces_remote_log_probe_failure(tmp_path, monkeypatch)
     from rich.console import Console
 
     console = Console(width=100, record=True, color_system=None)
-    console.print(cli._watch_view(snapshot))
+    console.print(watch_cmd._watch_view(snapshot))
     rendered = console.export_text()
     assert "running? offline >max" in rendered
     assert "overdue by 6s" in rendered
@@ -2697,7 +2711,7 @@ def test_watch_snapshot_surfaces_active_nested_log(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(cli.time, "time", lambda: 112.5)
 
-    _current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    _current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert snapshot["log_source"] == "outputs/registry/train.progress.log"
     assert snapshot["log_tail"] == "step 420 loss=0.05\n"
@@ -2705,7 +2719,7 @@ def test_watch_snapshot_surfaces_active_nested_log(tmp_path, monkeypatch):
 
 
 def test_watch_labels_compatibility_log_as_combined_output():
-    view = cli._watch_view(
+    view = watch_cmd._watch_view(
         {
             "job_id": "failed",
             "name": "failed",
@@ -2760,7 +2774,7 @@ def test_watch_snapshot_reads_uncertain_launch_evidence(tmp_path, monkeypatch):
         ),
     )
 
-    _current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    _current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert snapshot["status"] == "failed"
     assert snapshot["log_tail"] == "wrapper may still be alive\n"
@@ -2806,7 +2820,7 @@ def test_watch_snapshot_reads_env_log_for_placed_prestart_failure(
 
     monkeypatch.setattr(cli, "run_on", fake_run_on)
 
-    _current, snapshot = cli._watch_snapshot(cfg, entry, lines=20)
+    _current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20)
 
     assert snapshot["status"] == "failed"
     assert snapshot["log_source"] == "logs/env.log"
@@ -3077,9 +3091,9 @@ def test_log_progress_parses_live_eta_and_latest_step():
 
 
 def test_fmt_ts_survives_out_of_range_timestamp():
-    assert cli._fmt_ts(None) == "-"
-    assert cli._fmt_ts(1e19) == "invalid"
-    assert cli._fmt_ts(1000.0) != "invalid"
+    assert info_cmd._fmt_ts(None) == "-"
+    assert info_cmd._fmt_ts(1e19) == "invalid"
+    assert info_cmd._fmt_ts(1000.0) != "invalid"
 
 
 def test_stable_remote_exit_normalizes_signal_codes():
@@ -3266,7 +3280,7 @@ def test_log_progress_parses_inline_throughput_from_live_step():
 
 def test_log_progress_formats_compact_terminal_summary():
     assert (
-        cli._format_log_progress(
+        watch_cmd._format_log_progress(
             {
                 "step": 5000,
                 "total_steps": 10000,
@@ -3315,12 +3329,14 @@ def test_watch_views_label_known_target_before_first_step():
     }
 
     console = Console(width=100, record=True, color_system=None)
-    console.print(cli._watch_view(snapshot))
+    console.print(watch_cmd._watch_view(snapshot))
     single = " ".join(console.export_text().split())
     assert "progress pre-step · target 15,000" in single
 
     console = Console(width=120, record=True, color_system=None)
-    console.print(cli._watch_group_view(cli._watch_group_payload([snapshot])))
+    console.print(
+        watch_cmd._watch_group_view(watch_cmd._watch_group_payload([snapshot]))
+    )
     group = " ".join(console.export_text().split())
     assert "pre-step · target 15,000 · phase campaign_run" in group
 
@@ -3575,7 +3591,7 @@ def test_failure_log_helpers_replace_nul_padding(tmp_path, monkeypatch):
     env_log = cli._read_failed_start_log(entry)
     emitted: list[str] = []
     written: list[str] = []
-    failure_log = cli._read_finished_failure_log(
+    failure_log = wait_cmd._read_finished_failure_log(
         replace(entry, status="finished", exit_code=1),
         20,
         emit=emitted.append,
@@ -4334,7 +4350,7 @@ def test_wait_multiple_waits_concurrently(tmp_path, monkeypatch):
         barrier.wait(timeout=1)
         return replace(entry, status="finished", exit_code=0)
 
-    monkeypatch.setattr(cli, "_wait_until_terminal", wait_until_terminal)
+    monkeypatch.setattr(wait_cmd, "_wait_until_terminal", wait_until_terminal)
 
     result = CliRunner().invoke(
         cli.app,
@@ -4387,7 +4403,7 @@ def test_wait_multiple_progress_uses_compact_indices_with_long_names(
         emit("[dim]queued; waiting for dispatch[/dim]")
         return replace(entry, status="finished", exit_code=0)
 
-    monkeypatch.setattr(cli, "_wait_until_terminal", wait_until_terminal)
+    monkeypatch.setattr(wait_cmd, "_wait_until_terminal", wait_until_terminal)
 
     result = CliRunner().invoke(
         cli.app,
@@ -4424,7 +4440,7 @@ def test_wait_single_json_ctrl_c_emits_machine_clean_resume(tmp_path, monkeypatc
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "find", lambda cfg_, ref: entry)
     monkeypatch.setattr(
-        cli,
+        wait_cmd,
         "_wait_until_terminal",
         lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt),
     )
@@ -4491,9 +4507,9 @@ def test_wait_multiple_ctrl_c_stops_only_local_workers(tmp_path, monkeypatch):
             raise KeyboardInterrupt
         second_started.set()
         assert stop_event.wait(timeout=1)
-        raise cli._WaitStopped
+        raise wait_cmd._WaitStopped
 
-    monkeypatch.setattr(cli, "_wait_until_terminal", wait_until_terminal)
+    monkeypatch.setattr(wait_cmd, "_wait_until_terminal", wait_until_terminal)
 
     result = CliRunner().invoke(
         cli.app,
@@ -4550,9 +4566,9 @@ def test_wait_multiple_json_ctrl_c_cancels_workers_and_emits_resume(
             raise KeyboardInterrupt
         second_started.set()
         assert stop_event.wait(timeout=1)
-        raise cli._WaitStopped
+        raise wait_cmd._WaitStopped
 
-    monkeypatch.setattr(cli, "_wait_until_terminal", wait_until_terminal)
+    monkeypatch.setattr(wait_cmd, "_wait_until_terminal", wait_until_terminal)
 
     result = CliRunner().invoke(
         cli.app,
@@ -5006,11 +5022,14 @@ def test_laptop_wait_json_ctrl_c_emits_machine_clean_resume(monkeypatch):
 
 def test_referenced_output_log_rejects_traversal():
     assert (
-        cli._referenced_output_log("failed; see outputs/registry/train.failure.log")
+        wait_cmd._referenced_output_log(
+            "failed; see outputs/registry/train.failure.log"
+        )
         == "outputs/registry/train.failure.log"
     )
     assert (
-        cli._referenced_output_log("failed; see outputs/../../etc/passwd.log") is None
+        wait_cmd._referenced_output_log("failed; see outputs/../../etc/passwd.log")
+        is None
     )
 
 
@@ -5109,7 +5128,7 @@ def test_watch_compact_snapshot_keeps_automation_fields_without_heavy_details(
         ),
     )
 
-    current, snapshot = cli._watch_snapshot(cfg, entry, lines=20, compact=True)
+    current, snapshot = watch_cmd._watch_snapshot(cfg, entry, lines=20, compact=True)
 
     assert current is entry
     assert snapshot["schema_version"] == "dt_watch_compact_v1"
@@ -5123,7 +5142,7 @@ def test_watch_compact_snapshot_keeps_automation_fields_without_heavy_details(
 
 
 def test_watch_group_payload_counts_terminal_issues():
-    payload = cli._watch_group_payload(
+    payload = watch_cmd._watch_group_payload(
         [
             {
                 "job_id": "ok",
@@ -5163,7 +5182,7 @@ def test_watch_group_payload_counts_terminal_issues():
 
 
 def test_watch_compact_group_payload_has_distinct_schema():
-    payload = cli._watch_group_payload(
+    payload = watch_cmd._watch_group_payload(
         [
             {
                 "schema_version": "dt_watch_compact_v1",
@@ -5251,7 +5270,7 @@ def test_watch_multiple_json_streams_group_frames_until_all_terminal(
     )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "find", lambda cfg_, ref: entries.get(ref))
-    monkeypatch.setattr(cli, "_watch_group_snapshot", lambda *args: next(frames))
+    monkeypatch.setattr(watch_cmd, "_watch_group_snapshot", lambda *args: next(frames))
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
     refs_file = tmp_path / "batch.jobs"
     refs_file.write_text("one\n# keep input order\ntwo\n")
@@ -5528,7 +5547,7 @@ def test_watch_json_ctrl_c_appends_one_resumable_interruption_frame(
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "find", lambda cfg_, ref: entry)
     monkeypatch.setattr(
-        cli,
+        watch_cmd,
         "_watch_snapshot",
         lambda cfg_, entry_, lines: (
             entry_,
@@ -5659,7 +5678,7 @@ def test_watch_uses_only_poll_driven_redraws(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref: entry)
     monkeypatch.setattr(
-        cli,
+        watch_cmd,
         "_watch_snapshot",
         lambda cfg_, entry_, lines: (
             entry_,
@@ -5674,7 +5693,7 @@ def test_watch_uses_only_poll_driven_redraws(tmp_path, monkeypatch):
             },
         ),
     )
-    monkeypatch.setattr(cli, "_watch_view", lambda snapshot: "frame")
+    monkeypatch.setattr(watch_cmd, "_watch_view", lambda snapshot: "frame")
     monkeypatch.setattr("rich.live.Live", FakeLive)
 
     result = CliRunner().invoke(cli.app, ["watch", "done", "--poll", "5"])
@@ -5725,7 +5744,7 @@ def test_watch_completion_wake_interrupts_long_refresh_interval(tmp_path, monkey
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "find", lambda cfg_, ref: running)
-    monkeypatch.setattr(cli, "_watch_snapshot", lambda *args: next(frames))
+    monkeypatch.setattr(watch_cmd, "_watch_snapshot", lambda *args: next(frames))
     monkeypatch.setattr(cli, "CompletionSignals", FakeSignals)
 
     result = CliRunner().invoke(
@@ -5788,7 +5807,7 @@ def test_wait_completion_wake_interrupts_long_poll(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(cli, "CompletionSignals", FakeSignals)
 
-    result = cli._wait_until_terminal(
+    result = wait_cmd._wait_until_terminal(
         cfg,
         running,
         30.0,
@@ -5835,7 +5854,7 @@ def test_watch_non_tty_final_frame_ends_with_newline(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref: entry)
     monkeypatch.setattr(
-        cli,
+        watch_cmd,
         "_watch_snapshot",
         lambda cfg_, entry_, lines: (
             entry_,
@@ -5850,7 +5869,7 @@ def test_watch_non_tty_final_frame_ends_with_newline(tmp_path, monkeypatch):
             },
         ),
     )
-    monkeypatch.setattr(cli, "_watch_view", lambda snapshot: "frame")
+    monkeypatch.setattr(watch_cmd, "_watch_view", lambda snapshot: "frame")
 
     assert cli.watch("done", 5.0, 20, False, False) is True
     assert stream.getvalue() == "frame\n"
@@ -5926,13 +5945,13 @@ def test_ps_watch_uses_poll_driven_redraws_and_stops_cleanly(tmp_path, monkeypat
         gather_calls.append(kwargs)
         return next(frames), {}
 
-    monkeypatch.setattr(cli, "_gather_ps_rows", fake_gather)
+    monkeypatch.setattr(ps_cmd, "_gather_ps_rows", fake_gather)
 
     def fake_view(*args, **kwargs):
         seen.setdefault("view_kwargs", []).append(kwargs)
         return args[0][0]["status"]
 
-    monkeypatch.setattr(cli, "_ps_view", fake_view)
+    monkeypatch.setattr(ps_cmd, "_ps_view", fake_view)
     monkeypatch.setattr(cli.time, "sleep", fake_sleep)
     monkeypatch.setattr("rich.live.Live", FakeLive)
 
@@ -5959,7 +5978,7 @@ def test_ps_watch_rejects_invalid_poll_before_gathering(tmp_path, monkeypatch, p
     )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli,
+        ps_cmd,
         "_gather_ps_rows",
         lambda *args: (_ for _ in ()).throw(AssertionError("must not gather")),
         raising=False,
@@ -6023,7 +6042,7 @@ def test_ps_failure_issue_view_is_actionable_without_live_enrichment(
     gather_calls = []
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli,
+        ps_cmd,
         "_gather_ps_rows",
         lambda cfg_, status, include_progress=False, **kwargs: (
             gather_calls.append((status, include_progress)) or rows,
@@ -6066,7 +6085,7 @@ def test_ps_watch_json_streams_complete_frames(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli,
+        ps_cmd,
         "_gather_ps_rows",
         lambda cfg_, status, include_progress=False: (next(frames), {}),
     )
@@ -6107,7 +6126,7 @@ def test_ps_watch_json_applies_limit_on_every_refresh(tmp_path, monkeypatch):
 
     def gather(cfg_, status, include_progress=False, limit=None):
         limits.append(limit)
-        return cli._limit_ps_rows(next(frames), limit), {}
+        return ps_cmd._limit_ps_rows(next(frames), limit), {}
 
     def fake_sleep(_seconds):
         nonlocal sleep_calls
@@ -6116,7 +6135,7 @@ def test_ps_watch_json_applies_limit_on_every_refresh(tmp_path, monkeypatch):
             raise KeyboardInterrupt
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_gather_ps_rows", gather)
+    monkeypatch.setattr(ps_cmd, "_gather_ps_rows", gather)
     monkeypatch.setattr(cli.time, "sleep", fake_sleep)
 
     result = CliRunner().invoke(
@@ -6172,7 +6191,7 @@ def test_ps_progress_enrichment_uses_active_nested_log(tmp_path, monkeypatch):
         ),
     )
 
-    rows, errors = cli._gather_ps_rows(cfg, status=None, include_progress=True)
+    rows, errors = ps_cmd._gather_ps_rows(cfg, status=None, include_progress=True)
 
     assert errors == {}
     assert rows[0]["log_source"] == "outputs/train.log"
@@ -6230,7 +6249,7 @@ def test_ps_progress_treats_not_yet_created_log_as_loading(tmp_path, monkeypatch
         ),
     )
 
-    rows, _errors = cli._gather_ps_rows(cfg, status=None, include_progress=True)
+    rows, _errors = ps_cmd._gather_ps_rows(cfg, status=None, include_progress=True)
 
     assert rows[0]["progress"] is None
     assert rows[0]["progress_error"] is None
@@ -6309,7 +6328,7 @@ def test_ps_live_resources_probe_each_node_once_and_filter_assigned_gpus(
 
     monkeypatch.setattr(cli, "probe_node", fake_probe_node)
 
-    rows, _errors = cli._gather_ps_rows(cfg, status=None, include_progress=True)
+    rows, _errors = ps_cmd._gather_ps_rows(cfg, status=None, include_progress=True)
 
     by_id = {row["job_id"]: row for row in rows}
     assert probe_calls == ["n1"]
@@ -6378,7 +6397,7 @@ def test_ps_progress_collects_status_resources_and_logs_in_one_parallel_wave(
     monkeypatch.setattr(cli, "probe_node", probe)
     monkeypatch.setattr(cli, "_read_job_log_tail", log_tail)
 
-    rows, _errors = cli._gather_ps_rows(cfg, status=None, include_progress=True)
+    rows, _errors = ps_cmd._gather_ps_rows(cfg, status=None, include_progress=True)
 
     assert rows[0]["resources"]["gpus"][0]["util"] == 90
     assert rows[0]["progress"] == {"step": 5}
@@ -6443,7 +6462,7 @@ def test_ps_progress_cpu_task_includes_node_host_resources(tmp_path, monkeypatch
 
     monkeypatch.setattr(cli, "probe_node", probe)
 
-    rows, _errors = cli._gather_ps_rows(cfg, status=None, include_progress=True)
+    rows, _errors = ps_cmd._gather_ps_rows(cfg, status=None, include_progress=True)
 
     assert probe_calls == ["n1"]
     assert rows[0]["resources"] == {
@@ -6470,7 +6489,7 @@ def test_laptop_ps_progress_is_collected_by_each_head(monkeypatch):
 
     monkeypatch.setattr(cli, "fan_json", fake_fan_json)
 
-    rows, errors = cli._gather_ps_rows(cfg, status="running", include_progress=True)
+    rows, errors = ps_cmd._gather_ps_rows(cfg, status="running", include_progress=True)
 
     assert errors == {}
     assert rows[0]["progress"] == {"step": 5}
@@ -6487,7 +6506,7 @@ def test_laptop_ps_active_filter_is_applied_by_each_head(monkeypatch):
 
     monkeypatch.setattr(cli, "fan_json", fake_fan_json)
 
-    rows, errors = cli._gather_ps_rows(
+    rows, errors = ps_cmd._gather_ps_rows(
         cfg,
         status=None,
         include_progress=True,
@@ -6511,7 +6530,7 @@ def test_laptop_ps_issue_filter_is_applied_before_each_head_window(monkeypatch):
             "a": {
                 "schema_version": cli.PS_WINDOW_SCHEMA,
                 "center": "a",
-                "query": cli._ps_window_contract_from_argv(["ps", "--issues"]),
+                "query": ps_cmd._ps_window_contract_from_argv(["ps", "--issues"]),
                 "total": 1,
                 "rows": [
                     {
@@ -6525,7 +6544,7 @@ def test_laptop_ps_issue_filter_is_applied_before_each_head_window(monkeypatch):
             "b": {
                 "schema_version": cli.PS_WINDOW_SCHEMA,
                 "center": "b",
-                "query": cli._ps_window_contract_from_argv(["ps", "--issues"]),
+                "query": ps_cmd._ps_window_contract_from_argv(["ps", "--issues"]),
                 "total": 0,
                 "rows": [],
             },
@@ -6533,7 +6552,7 @@ def test_laptop_ps_issue_filter_is_applied_before_each_head_window(monkeypatch):
 
     monkeypatch.setattr(cli, "fan_json_by_center", fan)
 
-    rows, errors = cli._gather_ps_rows(
+    rows, errors = ps_cmd._gather_ps_rows(
         cfg,
         status=None,
         issues_only=True,
@@ -6569,7 +6588,7 @@ def test_laptop_ps_issue_limit_is_forwarded_to_v2_head_window(monkeypatch):
         return [], {}
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_gather_ps_rows", fake_gather)
+    monkeypatch.setattr(ps_cmd, "_gather_ps_rows", fake_gather)
 
     result = CliRunner().invoke(cli.app, ["ps", "--issues", "--limit", "15"])
 
@@ -6621,17 +6640,17 @@ def test_laptop_ps_issue_window_falls_back_from_v1_semantics(monkeypatch):
 
     monkeypatch.setattr(cli, "fan_json_by_center", fan)
 
-    rows, errors = cli._gather_ps_rows(
+    rows, errors = ps_cmd._gather_ps_rows(
         cfg,
         status=None,
         issues_only=True,
         remote_window=True,
     )
-    rows = cli._ps_issue_rows(rows)
+    rows = ps_cmd._ps_issue_rows(rows)
 
     assert errors == {}
     assert [row["job_id"] for row in rows] == [old_failure["job_id"]]
-    assert cli._ps_rows_total(rows) == 1
+    assert ps_cmd._ps_rows_total(rows) == 1
     assert calls == [
         [
             "ps",
@@ -6687,7 +6706,7 @@ def test_legacy_active_fallback_computes_ref_against_full_history(monkeypatch):
 
     monkeypatch.setattr(cli, "fan_json_by_center", fan)
 
-    rows, errors = cli._gather_ps_rows(
+    rows, errors = ps_cmd._gather_ps_rows(
         cfg,
         status=None,
         active_only=True,
@@ -6709,7 +6728,7 @@ def test_multi_center_legacy_window_uses_full_unscoped_ref(monkeypatch):
         default_center="new",
     )
     old_job_id = "20260720-0000_old-job_dead"
-    query = cli._ps_window_contract_from_argv(["ps", "--active"])
+    query = ps_cmd._ps_window_contract_from_argv(["ps", "--active"])
 
     def fan(cfg_, argv):
         if set(cfg_.centers) == {"old"}:
@@ -6751,7 +6770,7 @@ def test_multi_center_legacy_window_uses_full_unscoped_ref(monkeypatch):
 
     monkeypatch.setattr(cli, "fan_json_by_center", fan)
 
-    rows, errors = cli._gather_ps_rows(
+    rows, errors = ps_cmd._gather_ps_rows(
         cfg,
         status=None,
         active_only=True,
@@ -6790,7 +6809,7 @@ def test_laptop_ps_issue_window_preserves_total_and_requested_limit(monkeypatch)
             "new": {
                 "schema_version": cli.PS_WINDOW_SCHEMA,
                 "center": "new",
-                "query": cli._ps_window_contract_from_argv(argv[:-1]),
+                "query": ps_cmd._ps_window_contract_from_argv(argv[:-1]),
                 "total": 100,
                 "rows": rows,
             }
@@ -6798,18 +6817,18 @@ def test_laptop_ps_issue_window_preserves_total_and_requested_limit(monkeypatch)
 
     monkeypatch.setattr(cli, "fan_json_by_center", fan)
 
-    observed, errors = cli._gather_ps_rows(
+    observed, errors = ps_cmd._gather_ps_rows(
         cfg,
         status=None,
         issues_only=True,
         remote_window=True,
         limit=50,
     )
-    observed = cli._ps_issue_rows(observed)
+    observed = ps_cmd._ps_issue_rows(observed)
 
     assert errors == {}
     assert len(observed) == 50
-    assert cli._ps_rows_total(observed) == 100
+    assert ps_cmd._ps_rows_total(observed) == 100
     assert seen == [
         [
             "ps",
@@ -6841,7 +6860,7 @@ def test_laptop_ps_limit_is_applied_by_each_head_and_globally(monkeypatch):
 
     monkeypatch.setattr(cli, "fan_json", fake_fan_json)
 
-    rows, errors = cli._gather_ps_rows(
+    rows, errors = ps_cmd._gather_ps_rows(
         cfg,
         status=None,
         include_progress=True,
@@ -6915,7 +6934,7 @@ def test_ps_window_json_keeps_active_and_reports_full_count(tmp_path, monkeypatc
     assert result.exit_code == 0, result.output
     payload = json.loads(result.stdout)
     assert payload["schema_version"] == cli.PS_WINDOW_SCHEMA
-    assert payload["query"] == cli._ps_window_contract(
+    assert payload["query"] == ps_cmd._ps_window_contract(
         status=None,
         active_only=False,
         issues_only=False,
@@ -7071,7 +7090,7 @@ def test_laptop_ps_window_preserves_remote_total(monkeypatch):
         "a": {
             "schema_version": cli.PS_WINDOW_SCHEMA,
             "center": "a",
-            "query": cli._ps_window_contract_from_argv(["ps"]),
+            "query": ps_cmd._ps_window_contract_from_argv(["ps"]),
             "total": 500,
             "rows": [
                 {
@@ -7086,7 +7105,7 @@ def test_laptop_ps_window_preserves_remote_total(monkeypatch):
         "b": {
             "schema_version": cli.PS_WINDOW_SCHEMA,
             "center": "b",
-            "query": cli._ps_window_contract_from_argv(["ps"]),
+            "query": ps_cmd._ps_window_contract_from_argv(["ps"]),
             "total": 63,
             "rows": [
                 {
@@ -7106,7 +7125,7 @@ def test_laptop_ps_window_preserves_remote_total(monkeypatch):
 
     monkeypatch.setattr(cli, "fan_json_by_center", fan)
 
-    rows, errors = cli._gather_ps_rows(
+    rows, errors = ps_cmd._gather_ps_rows(
         cfg,
         status=None,
         remote_window=True,
@@ -7116,7 +7135,7 @@ def test_laptop_ps_window_preserves_remote_total(monkeypatch):
     assert len(rows) == 510
     assert rows[0]["job_id"] == "a-running-0"
     assert rows[-1]["job_id"] == "b-finished-62"
-    assert cli._ps_rows_total(rows) == 563
+    assert ps_cmd._ps_rows_total(rows) == 563
     assert seen == [
         [
             "ps",
@@ -7154,7 +7173,7 @@ def test_laptop_ps_window_falls_back_to_old_head(monkeypatch):
 
     monkeypatch.setattr(cli, "fan_json_by_center", fan)
 
-    rows, errors = cli._gather_ps_rows(
+    rows, errors = ps_cmd._gather_ps_rows(
         cfg,
         status=None,
         remote_window=True,
@@ -7162,7 +7181,7 @@ def test_laptop_ps_window_falls_back_to_old_head(monkeypatch):
 
     assert errors == {}
     assert len(rows) == 10
-    assert cli._ps_rows_total(rows) == 40
+    assert ps_cmd._ps_rows_total(rows) == 40
     assert rows[0]["job_id"] == "job-30"
     assert calls == [
         [
@@ -7208,7 +7227,7 @@ def test_laptop_ps_limit_fallback_does_not_send_new_option_to_old_head(
 
     monkeypatch.setattr(cli, "fan_json_by_center", fan)
 
-    rows, errors = cli._gather_ps_rows(
+    rows, errors = ps_cmd._gather_ps_rows(
         cfg,
         status=None,
         remote_window=True,
@@ -7217,7 +7236,7 @@ def test_laptop_ps_limit_fallback_does_not_send_new_option_to_old_head(
 
     assert errors == {}
     assert [row["job_id"] for row in rows] == ["job-3", "job-4"]
-    assert cli._ps_rows_total(rows) == 5
+    assert ps_cmd._ps_rows_total(rows) == 5
     assert calls == [
         [
             "ps",
@@ -7256,14 +7275,14 @@ def test_per_center_ps_windows_preserve_exact_global_table_selection():
     local_windows = []
     for center in ("a", "b"):
         local_windows.extend(
-            cli._select_ps_rows(
+            ps_cmd._select_ps_rows(
                 [row for row in rows if row["center"] == center],
                 all_=False,
             )
         )
 
-    expected = cli._select_ps_rows(rows, all_=False)
-    observed = cli._select_ps_rows(local_windows, all_=False)
+    expected = ps_cmd._select_ps_rows(rows, all_=False)
+    observed = ps_cmd._select_ps_rows(local_windows, all_=False)
     assert [row["job_id"] for row in observed] == [row["job_id"] for row in expected]
 
 
@@ -7282,10 +7301,10 @@ def test_laptop_human_ps_uses_window_but_all_and_json_do_not(monkeypatch):
         remote_window=False,
     ):
         calls.append(remote_window)
-        return cli._PsRows([], total=0), {}
+        return ps_cmd._PsRows([], total=0), {}
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_gather_ps_rows", gather)
+    monkeypatch.setattr(ps_cmd, "_gather_ps_rows", gather)
 
     human = CliRunner().invoke(cli.app, ["ps"])
     all_jobs = CliRunner().invoke(cli.app, ["ps", "--all"])
@@ -8079,7 +8098,7 @@ def test_payload_integrity_prestart_skips_unrelated_environment_log(
     )
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_info_live", lambda entry_: {})
+    monkeypatch.setattr(info_cmd, "_info_live", lambda entry_: {})
     monkeypatch.setattr(
         cli,
         "_read_failed_start_log",
@@ -8432,7 +8451,7 @@ def test_logs_follow_waits_from_queue_then_follows_running_job(tmp_path, monkeyp
     monkeypatch.setattr(cli.time, "sleep", sleeps.append)
     followed = []
     monkeypatch.setattr(
-        cli,
+        logs_cmd,
         "_follow_job_log",
         lambda cfg_, entry_, lines: followed.append((entry_, lines)) or 7,
     )
@@ -8487,7 +8506,7 @@ def test_logs_follow_queue_edges_keep_actions_intact_with_long_job_id(
     monkeypatch.setattr(cli.jobs_mod, "find", lambda cfg_, ref: queued)
     monkeypatch.setattr(cli.jobs_mod, "load", lambda cfg_, job_id_: running)
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(cli, "_follow_job_log", lambda cfg_, entry_, lines: 0)
+    monkeypatch.setattr(logs_cmd, "_follow_job_log", lambda cfg_, entry_, lines: 0)
 
     result = CliRunner().invoke(cli.app, ["logs", job_id, "-f"])
 
@@ -8532,7 +8551,7 @@ def test_logs_follow_ctrl_c_while_queued_detaches_without_following(
         lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt),
     )
     monkeypatch.setattr(
-        cli,
+        logs_cmd,
         "_follow_job_log",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("Ctrl-C in queue must not start a tail")
@@ -8581,7 +8600,7 @@ def test_logs_follow_queue_failure_returns_stable_prestart_code(tmp_path, monkey
     monkeypatch.setattr(cli.jobs_mod, "load", lambda cfg_, job_id: failed)
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(
-        cli,
+        logs_cmd,
         "_follow_job_log",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("failed-before-start has no tail process")

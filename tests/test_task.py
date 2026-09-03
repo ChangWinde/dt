@@ -8,6 +8,8 @@ import typer
 from typer.testing import CliRunner
 
 from dt import cli, dispatch, remote
+from dt.cli.commands import wait as wait_cmd
+from dt.cli.commands import logs as logs_cmd
 from dt.config import ConfigError, HeadConfig, LaptopConfig, Node, Project
 from dt.dispatch import RunSpec
 from dt.jobs import JobEntry
@@ -1260,7 +1262,7 @@ def test_wait_enforces_the_reserved_exit_band():
         exit_code=66,
     )
 
-    payload, code = cli._wait_terminal_result(
+    payload, code = wait_cmd._wait_terminal_result(
         entry,
         error_lines=0,
         emit=lambda _line: None,
@@ -1269,7 +1271,7 @@ def test_wait_enforces_the_reserved_exit_band():
 
     assert code == 64
     assert payload["exit_code"] == 66
-    assert cli._log_terminal_exit_code(entry) == 64
+    assert logs_cmd._log_terminal_exit_code(entry) == 64
     # Codes outside both reserved bands pass through; >125 keeps clamping.
     assert cli._stable_wait_exit(0) == 0
     assert cli._stable_wait_exit(64) == 64
@@ -1297,10 +1299,10 @@ def test_finished_without_exit_code_is_infra_failure_not_success():
     # A finished record with no exit code is an infrastructure anomaly, never
     # a success, across the shared result classifier and both consumers.
     assert effective_result_state(entry) == "infra_failure"
-    assert cli._log_terminal_exit_code(entry) == 68
+    assert logs_cmd._log_terminal_exit_code(entry) == 68
 
     emitted: list[str] = []
-    payload, code = cli._wait_terminal_result(
+    payload, code = wait_cmd._wait_terminal_result(
         entry,
         error_lines=0,
         emit=emitted.append,

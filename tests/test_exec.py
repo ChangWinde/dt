@@ -5,6 +5,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from dt import cli, dispatch
+from dt.cli.commands import info as info_cmd
 from dt.config import HeadConfig, Node, Project
 from dt.jobs import JobEntry, effective_result_state
 from dt.layout import ROLE_LAYOUT
@@ -154,7 +155,7 @@ def test_info_path_contract_exposes_ownership_and_interpreter(tmp_path):
         cache_mode="shared",
     )
 
-    paths = cli._job_path_contract(cfg, source)
+    paths = info_cmd._job_path_contract(cfg, source)
 
     assert paths["schema_version"] == "dt_job_paths_v1"
     assert paths["snapshot_root"]["path"] == str(

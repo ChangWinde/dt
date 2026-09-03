@@ -2,7 +2,7 @@
 
 import pytest
 
-from dt import cli
+from dt.cli.commands import free as free_cmd
 from dt.config import ConfigError, HeadConfig, Node, parse
 from dt.dispatch import RunSpec, drained_probe_reasons, pick_candidates
 from dt.probe import Gpu, NodeStatus
@@ -161,11 +161,11 @@ def test_free_explanation_never_advertises_drained_capacity():
         }
     ]
 
-    explanation = cli._free_center_explanation("c", rows)
+    explanation = free_cmd._free_center_explanation("c", rows)
 
     assert explanation["capacity"]["gpus_free"] == 0
     assert explanation["capacity"]["free_by_node"] == {"n1": 0}
     assert explanation["capacity"]["physically_free_on_drained_nodes"] == 2
     assert explanation["state"] == "idle_capacity_drained"
     assert explanation["actions"] == []
-    assert cli._best_free_submit_node(rows) is None
+    assert free_cmd._best_free_submit_node(rows) is None

@@ -71,12 +71,19 @@ def test_command_module_reaches_patchable_infrastructure_through_root(module_nam
 @pytest.mark.parametrize("module_name", _command_modules())
 def test_command_module_commands_are_registered_on_the_root_app(module_name):
     module = importlib.import_module(module_name)
-    registered = {
-        command.name: command.callback for command in cli.app.registered_commands
-    }
-    short = module_name.rsplit(".", 1)[-1]
-    assert registered[short] is getattr(module, short)
-    assert getattr(cli, short) is getattr(module, short)
+    callbacks = {id(command.callback) for command in cli.app.registered_commands}
+    for group in cli.app.registered_groups:
+        callbacks |= {
+            id(command.callback) for command in group.typer_instance.registered_commands
+        }
+    registered = [
+        name
+        for name, value in vars(module).items()
+        if callable(value) and id(value) in callbacks and not name.startswith("_")
+    ]
+    assert registered, f"{module_name} registers no command on cli.app"
+    for name in registered:
+        assert getattr(cli, name) is getattr(module, name)
 
 
 @pytest.mark.parametrize("module_name", _command_modules())

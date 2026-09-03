@@ -11,6 +11,8 @@ import pytest
 from typer.testing import CliRunner
 
 from dt import cli, ps_query, remote
+from dt.cli.commands import wait as wait_cmd
+from dt.cli.commands import ps as ps_cmd
 from dt.config import HeadConfig, LaptopConfig, Node, QueueCfg
 from dt.probe import Gpu, NodeStatus
 
@@ -133,7 +135,7 @@ def test_compact_ps_preserves_bounded_head_partial_errors(monkeypatch):
         lambda *_args, **_kwargs: ({"c": payload}, remote.FanErrors()),
     )
 
-    actual, transport_errors = cli._gather_laptop_ps_query(
+    actual, transport_errors = ps_cmd._gather_laptop_ps_query(
         cfg,
         status=None,
         active_only=False,
@@ -402,7 +404,7 @@ def test_automatic_failure_log_reads_are_byte_bounded(monkeypatch):
 
     monkeypatch.setattr(cli, "run_on", run_on)
 
-    cli._read_finished_failure_log(
+    wait_cmd._read_finished_failure_log(
         entry,
         20,
         emit=lambda _message: None,
