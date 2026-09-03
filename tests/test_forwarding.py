@@ -42,19 +42,21 @@ def test_head_command_invoke_passes_a_fresh_mutable_argv():
 # -- laptop forwarding must mirror every submission-shaping option ----------------
 
 
-def _forwarded_flags(command_name: str) -> set[str]:
+def _forwarded_flags(command_name: str, *, source_name: str | None = None) -> set[str]:
     """Long/short flags the laptop branch of a command forwards to the head.
 
     Forwarding is written by hand (`_head_command(...).option("--x", ...)`),
     so a new typer option that is not mirrored here silently vanishes when the
-    command runs from a laptop. This reads the actual chain from the source.
+    command runs from a laptop. This reads the actual chain from the source of
+    ``source_name`` (the command itself unless its laptop route lives in a
+    helper).
     """
     import inspect
     import re
 
     from dt import cli
 
-    source = inspect.getsource(getattr(cli, command_name))
+    source = inspect.getsource(getattr(cli, source_name or command_name))
     chain = source[source.index("_head_command(") :]
     chain = chain[: chain.index(".passthrough(") if ".passthrough(" in chain else None]
     return set(
@@ -73,7 +75,7 @@ def test_run_forwards_every_submission_shaping_option():
     laptop_local = {"center", "follow", "poll", "lines"}
     # Options whose value travels by another channel than a flag.
     other_channel = {"environment"}  # names go inside the private stdin envelope
-    forwarded = _forwarded_flags("run")
+    forwarded = _forwarded_flags("run", source_name="_forward_run_to_head")
     missing = []
     for name, param in inspect.signature(cli.run).parameters.items():
         if not isinstance(param.default, typer.models.OptionInfo):

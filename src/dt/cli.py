@@ -2679,6 +2679,128 @@ def _resolve_laptop_run_center(
     return picked, None
 
 
+def _forward_run_to_head(
+    cfg: LaptopConfig,
+    *,
+    center: str | None,
+    picked_name: str,
+    cmd: list[str],
+    gpus: int,
+    project: str | None,
+    node: str | None,
+    require_path: str | None,
+    require_disk_gib: int | None,
+    max_hours: float | None,
+    min_vram_mib: int | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+    artifact_manifest: str | None,
+    artifacts: list[str],
+    artifact_targets: Mapping[str, str],
+    after_success: str | None,
+    after_complete: str | None,
+    after_result: str | None,
+    result_states: list[str],
+    request_id: str | None,
+    retry: int,
+    retry_on: str | None,
+    custom_env: Mapping[str, str] | None,
+    no_queue: bool,
+    plan: bool,
+    follow: bool,
+    poll: float,
+    lines: int,
+    json_: bool,
+) -> NoReturn:
+    """Laptop `dt run`: pick the center, mirror every option, forward the call.
+
+    The option chain below is the forwarding contract; the forwarding-drift
+    test reads it to prove every `dt run` option reaches the head.
+    """
+    env_envelope = (
+        custom_env_mod.encode_nul_pairs(custom_env).encode("utf-8")
+        if custom_env
+        else None
+    )
+    if center == "auto":
+        dependency_ref = after_success or after_complete or after_result
+        center, resolved_ref = _resolve_laptop_run_center(
+            cfg,
+            dependency_ref=dependency_ref,
+            request_id=request_id,
+            plan=plan,
+            require_path=require_path,
+            gpus=gpus,
+            require_disk_gib=require_disk_gib,
+            min_vram_mib=min_vram_mib,
+            node=node,
+            json_=json_,
+        )
+        if resolved_ref is not None:
+            if after_success is not None:
+                after_success = resolved_ref
+            elif after_complete is not None:
+                after_complete = resolved_ref
+            else:
+                after_result = resolved_ref
+    route = (
+        _head_command(cfg, center, "run")
+        .option("-g", gpus)
+        .option("-n", picked_name)
+        .option("-p", project or None)
+        .option("--node", node or None)
+        .option("--require-path", require_path or None)
+        .option("--require-disk-gib", require_disk_gib)
+        .option("--max-hours", max_hours)
+        .option("--min-vram-mib", min_vram_mib)
+        .option("--max-vram-mib", max_vram_mib)
+        .option("--max-job-memory-mib", max_job_memory_mib)
+        .option("--artifact-manifest", artifact_manifest or None)
+        .repeat("--artifact", artifacts)
+        .repeat(
+            "--artifact-target",
+            [f"{target}={source}" for target, source in artifact_targets.items()],
+        )
+        .option("--after-success", after_success or None)
+        .option("--after-complete", after_complete or None)
+        .option("--after-result", after_result or None)
+        .repeat("--when-result", result_states)
+        .option("--request-id", request_id or None)
+        .option("--retry", retry or None)
+        .option("--retry-on", retry_on or None)
+        .flag("--env-envelope-stdin", env_envelope is not None)
+        .flag("--no-queue", no_queue)
+        .flag("--plan", plan)
+        .flag("--json", json_)
+        .passthrough(cmd)
+    )
+    if plan:
+        if env_envelope is None:
+            rc = forward_call(route.head, route.argv())
+        else:
+            rc, _captured = forward_capture_stdout(
+                route.head,
+                route.argv(),
+                tty=False,
+                emit_stdout=True,
+                stdin_bytes=env_envelope,
+            )
+        raise typer.Exit(rc)
+    rc = _forward_submission_workflow(
+        route.head,
+        route.argv(),
+        action="run",
+        recovery_label=f"name {picked_name!r}",
+        follow=follow,
+        poll=poll,
+        lines=lines,
+        json_=json_,
+        request_id=request_id,
+        stdin_bytes=env_envelope,
+    )
+    raise typer.Exit(rc)
+
+
 def run(
     ctx: typer.Context,
     gpus: int = typer.Option(
@@ -2970,88 +3092,38 @@ def run(
 
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
-        env_envelope = (
-            custom_env_mod.encode_nul_pairs(custom_env).encode("utf-8")
-            if custom_env
-            else None
-        )
-        if center == "auto":
-            dependency_ref = after_success or after_complete or after_result
-            center, resolved_ref = _resolve_laptop_run_center(
-                cfg,
-                dependency_ref=dependency_ref,
-                request_id=request_id,
-                plan=plan,
-                require_path=require_path,
-                gpus=gpus,
-                require_disk_gib=require_disk_gib,
-                min_vram_mib=min_vram_mib,
-                node=node,
-                json_=json_,
-            )
-            if resolved_ref is not None:
-                if after_success is not None:
-                    after_success = resolved_ref
-                elif after_complete is not None:
-                    after_complete = resolved_ref
-                else:
-                    after_result = resolved_ref
-        route = (
-            _head_command(cfg, center, "run")
-            .option("-g", gpus)
-            .option("-n", picked_name)
-            .option("-p", project or None)
-            .option("--node", node or None)
-            .option("--require-path", require_path or None)
-            .option("--require-disk-gib", require_disk_gib)
-            .option("--max-hours", max_hours)
-            .option("--min-vram-mib", min_vram_mib)
-            .option("--max-vram-mib", max_vram_mib)
-            .option("--max-job-memory-mib", max_job_memory_mib)
-            .option("--artifact-manifest", artifact_manifest or None)
-            .repeat("--artifact", artifacts)
-            .repeat(
-                "--artifact-target",
-                [f"{target}={source}" for target, source in artifact_targets.items()],
-            )
-            .option("--after-success", after_success or None)
-            .option("--after-complete", after_complete or None)
-            .option("--after-result", after_result or None)
-            .repeat("--when-result", result_states)
-            .option("--request-id", request_id or None)
-            .option("--retry", retry or None)
-            .option("--retry-on", retry_on or None)
-            .flag("--env-envelope-stdin", env_envelope is not None)
-            .flag("--no-queue", no_queue)
-            .flag("--plan", plan)
-            .flag("--json", json_)
-            .passthrough(cmd)
-        )
-        if plan:
-            if env_envelope is None:
-                rc = forward_call(route.head, route.argv())
-            else:
-                rc, _captured = forward_capture_stdout(
-                    route.head,
-                    route.argv(),
-                    tty=False,
-                    emit_stdout=True,
-                    stdin_bytes=env_envelope,
-                )
-            raise typer.Exit(rc)
-        rc = _forward_submission_workflow(
-            route.head,
-            route.argv(),
-            action="run",
-            recovery_label=f"name {picked_name!r}",
+        _forward_run_to_head(
+            cfg,
+            center=center,
+            picked_name=picked_name,
+            cmd=cmd,
+            gpus=gpus,
+            project=project,
+            node=node,
+            require_path=require_path,
+            require_disk_gib=require_disk_gib,
+            max_hours=max_hours,
+            min_vram_mib=min_vram_mib,
+            max_vram_mib=max_vram_mib,
+            max_job_memory_mib=max_job_memory_mib,
+            artifact_manifest=artifact_manifest,
+            artifacts=artifacts,
+            artifact_targets=artifact_targets,
+            after_success=after_success,
+            after_complete=after_complete,
+            after_result=after_result,
+            result_states=result_states,
+            request_id=request_id,
+            retry=retry,
+            retry_on=retry_on,
+            custom_env=custom_env,
+            no_queue=no_queue,
+            plan=plan,
             follow=follow,
             poll=poll,
             lines=lines,
             json_=json_,
-            request_id=request_id,
-            stdin_bytes=env_envelope,
         )
-        raise typer.Exit(rc)
 
     request = SubmissionRequest(
         name=picked_name,
