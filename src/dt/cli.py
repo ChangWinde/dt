@@ -87,6 +87,16 @@ from .doctor import (
 )
 from .forwarding import HeadCommand
 from .lifecycle import runtime_identity, termination_probe, termination_verdict
+from .maintenance import (
+    DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
+    MAX_CLEAN_PLAN_PAGE_BYTES,
+    CleanAuthorization,
+    CleanPlan,
+    CleanPlanError,
+    clean_plan_page,
+    create_clean_plan,
+    load_clean_plan,
+)
 from .layout import (
     ROLE_LAYOUT,
     display_node_path,
@@ -15968,6 +15978,303 @@ def _owned_managed_results(
     return sorted(owned, key=lambda item: str(item.path))
 
 
+def _clean_plan_page_payload(
+    durable_plan: CleanPlan,
+    *,
+    page_offset: int,
+    page_limit: int,
+) -> JsonDict:
+    """One dt_clean_v1 page of a durable plan's authorization identities."""
+    page = clean_plan_page(durable_plan, offset=page_offset, limit=page_limit)
+    jobs: list[JsonDict] = []
+    managed: list[JsonDict] = []
+    for item in page.items:
+        rendered = {"index": item.index, "kind": item.kind, **item.identity}
+        if item.kind == "job":
+            job_dir = rendered.get("job_dir")
+            if isinstance(job_dir, str):
+                rendered["job_dir"] = redact_home_path(job_dir)
+            jobs.append(rendered)
+        else:
+            path = rendered.get("path")
+            if isinstance(path, str):
+                rendered["path"] = redact_home_path(path)
+            managed.append(rendered)
+    return {
+        "schema_version": "dt_clean_v1",
+        "plan_id": durable_plan.plan_id,
+        "expires_at": durable_plan.expires_at,
+        "eligible_jobs": len(durable_plan.jobs),
+        "managed_results_count": page.total - len(durable_plan.jobs),
+        "page": {
+            "offset": page.offset,
+            "limit": page.limit,
+            "returned": len(page.items),
+            "total": page.total,
+            "next_offset": page.next_offset,
+        },
+        "jobs": jobs,
+        "managed_results": managed,
+        "exit_code": 0,
+    }
+
+
+def _print_clean_plan_page(payload: JsonDict, *, kind: str) -> None:
+    """Emit a plan page as JSON, failing as ``kind`` if it exceeds the size cap."""
+    encoded = json.dumps(payload)
+    if len(encoded.encode("utf-8")) > MAX_CLEAN_PLAN_PAGE_BYTES:
+        _fail_submission(
+            kind=kind,
+            message="cleanup plan page exceeds its response size limit",
+            exit_code=1,
+            json_=True,
+        )
+    print(encoded)
+
+
+def _clean_inspect_plan(
+    cfg: HeadConfig,
+    plan_id: str,
+    *,
+    offset: int | None,
+    limit: int | None,
+    json_: bool,
+) -> None:
+    """`dt clean --inspect-plan`: page through a durable plan without acting."""
+    try:
+        durable_plan = load_clean_plan(cfg, plan_id)
+        payload = _clean_plan_page_payload(
+            durable_plan,
+            page_offset=0 if offset is None else offset,
+            page_limit=(DEFAULT_CLEAN_PLAN_PAGE_ITEMS if limit is None else limit),
+        )
+    except CleanPlanError as exc:
+        _fail_submission(
+            kind="clean_plan_invalid",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    payload["mode"] = "inspect"
+    if json_:
+        _print_clean_plan_page(payload, kind="clean_plan_invalid")
+        return
+    page_data = payload["page"]
+    assert isinstance(page_data, dict)
+    err.print(
+        f"plan {plan_id}: {page_data['total']} authorization identities · "
+        f"offset {page_data['offset']} · returned {page_data['returned']}"
+    )
+    preview_limit = 20
+    rendered_items = [*payload["jobs"], *payload["managed_results"]]
+    for item in rendered_items[:preview_limit]:
+        assert isinstance(item, dict)
+        identity = item.get("job_id", "-")
+        detail = item.get("path", item.get("job_dir", ""))
+        err.print(
+            f"[dim]{escape(str(item.get('kind')))} {escape(str(identity))} · "
+            f"{escape(diagnostic_excerpt(str(detail), limit=300))}[/dim]"
+        )
+    omitted = len(rendered_items) - preview_limit
+    if omitted > 0:
+        err.print(f"[dim]... {omitted} more identities in this page[/dim]")
+    if page_data["next_offset"] is not None:
+        err.print(
+            "[dim]next: dt clean --inspect-plan "
+            f"{escape(plan_id)} --offset {page_data['next_offset']}[/dim]"
+        )
+
+
+@dataclass(frozen=True)
+class _CleanScope:
+    """What one `dt clean` run may delete, and where the authority came from."""
+
+    before: str
+    cutoff: float
+    projects: set[str] | None
+    results: bool
+    victims: list[jobs_mod.JobEntry | CleanAuthorization]
+    managed_results: list[_ManagedResult]
+    # Live registry rows behind ``victims``; empty when replaying a durable plan.
+    preview_victims: list[jobs_mod.JobEntry]
+
+
+def _clean_scope_from_plan(
+    cfg: HeadConfig, plan_id: str, *, json_: bool
+) -> _CleanScope:
+    """Re-derive the deletion scope from a durable plan, re-verifying its paths."""
+    try:
+        durable_plan = load_clean_plan(cfg, plan_id)
+        scope = durable_plan.managed_identity
+        scope_before = scope.get("before")
+        scope_cutoff = scope.get("cutoff_ts")
+        scope_projects = scope.get("projects")
+        scope_results = scope.get("results")
+        raw_results = scope.get("managed_results")
+        if (
+            not isinstance(scope_before, str)
+            or isinstance(scope_cutoff, bool)
+            or not isinstance(scope_cutoff, (int, float))
+            or scope_projects is not None
+            and (
+                not isinstance(scope_projects, list)
+                or any(not isinstance(item, str) for item in scope_projects)
+            )
+            or not isinstance(scope_results, bool)
+            or not isinstance(raw_results, list)
+        ):
+            raise CleanPlanError("cleanup plan scope is invalid")
+        managed_results: list[_ManagedResult] = []
+        result_root = cfg.results_dir().resolve(strict=False)
+        for item in durable_plan.managed_results:
+            result_path = Path(item.path)
+            if (
+                not result_path.is_absolute()
+                or result_path == result_root
+                or result_path != result_path.resolve(strict=False)
+                or not result_path.is_relative_to(result_root)
+            ):
+                raise CleanPlanError("cleanup plan result path is unmanaged")
+            managed_results.append(
+                _ManagedResult(item.job_id, result_path, item.device, item.inode)
+            )
+    except CleanPlanError as exc:
+        _fail_submission(
+            kind="clean_plan_invalid",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    return _CleanScope(
+        before=scope_before,
+        cutoff=float(scope_cutoff),
+        projects=set(scope_projects) if scope_projects is not None else None,
+        results=scope_results,
+        victims=list(durable_plan.jobs),
+        managed_results=managed_results,
+        preview_victims=[],
+    )
+
+
+def _clean_scope_before(
+    cfg: HeadConfig,
+    before: str,
+    *,
+    projects: set[str] | None,
+    results: bool,
+    json_: bool,
+) -> _CleanScope:
+    """Select the live registry rows (and owned results) older than ``before``."""
+    from .dispatch import clean_job_victims
+
+    try:
+        cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
+    except ValueError:
+        _fail_submission(
+            kind="invalid_argument",
+            message=f"invalid --before {before!r}; expected a real YYYY-MM-DD date",
+            exit_code=1,
+            json_=json_,
+        )
+    preview_victims = clean_job_victims(cfg, cutoff, projects=projects)
+    return _CleanScope(
+        before=before,
+        cutoff=cutoff,
+        projects=projects,
+        results=results,
+        victims=list(preview_victims),
+        managed_results=(
+            _owned_managed_results(cfg, {entry.job_id for entry in preview_victims})
+            if results
+            else []
+        ),
+        preview_victims=preview_victims,
+    )
+
+
+def _clean_emit_plan(
+    cfg: HeadConfig,
+    scope: _CleanScope,
+    *,
+    envs: bool,
+    deployments: bool,
+    json_: bool,
+) -> None:
+    """`dt clean --plan`: persist the scope as a durable plan and preview it."""
+    projects = scope.projects
+    try:
+        durable_plan = create_clean_plan(
+            cfg,
+            scope.preview_victims,
+            managed_identity={
+                "before": scope.before,
+                "cutoff_ts": scope.cutoff,
+                "projects": sorted(projects) if projects is not None else None,
+                "results": scope.results,
+                "managed_results": [
+                    {
+                        "job_id": item.job_id,
+                        "path": str(item.path),
+                        "device": item.device,
+                        "inode": item.inode,
+                    }
+                    for item in scope.managed_results
+                ],
+            },
+        )
+    except CleanPlanError as exc:
+        _fail_submission(
+            kind="clean_plan_unavailable",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if json_:
+        payload = _clean_plan_page_payload(
+            durable_plan,
+            page_offset=0,
+            page_limit=DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
+        )
+        payload.update(
+            {
+                "mode": "plan",
+                "before": scope.before,
+                "projects": (sorted(projects) if projects is not None else None),
+                "envs": envs,
+                "deployments": deployments,
+                "results": scope.results,
+            }
+        )
+        _print_clean_plan_page(payload, kind="clean_plan_unavailable")
+        return
+    err.print(
+        f"plan {durable_plan.plan_id}: {len(scope.victims)} ended job dirs"
+        f" + {len(scope.managed_results)} identity-verified managed results"
+        + (" + stale shared venvs" if envs else "")
+        + (" + old release trees and installations" if deployments else "")
+        + (
+            f" · projects {escape(', '.join(sorted(projects)))}"
+            if projects is not None
+            else ""
+        )
+    )
+    preview_limit = 20
+    preview_page = clean_plan_page(durable_plan, offset=0, limit=preview_limit)
+    for item in preview_page.items:
+        identity = item.identity.get("job_id", "-")
+        detail = item.identity.get("path", item.identity.get("job_dir", ""))
+        err.print(
+            f"[dim]{escape(item.kind)} {escape(str(identity))} · "
+            f"{escape(diagnostic_excerpt(str(detail), limit=300))}[/dim]"
+        )
+    if preview_page.next_offset is not None:
+        err.print(
+            f"[dim]... {preview_page.total - len(preview_page.items)} more "
+            "identities · inspect with dt clean --inspect-plan "
+            f"{escape(durable_plan.plan_id)}[/dim]"
+        )
+
+
 def clean(
     before: Optional[str] = typer.Option(
         None, "--before", help="YYYY-MM-DD; delete finished jobs older than this"
@@ -16148,266 +16455,32 @@ def clean(
     if center is not None or all_centers:
         err.print("[red]--center and --all-centers are laptop-only options[/red]")
         raise typer.Exit(1)
-    from .dispatch import clean_job_victims, clean_jobs
-    from .maintenance import (
-        CleanAuthorization,
-        CleanPlan,
-        CleanPlanError,
-        DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
-        MAX_CLEAN_PLAN_PAGE_BYTES,
-        clean_plan_page,
-        create_clean_plan,
-        load_clean_plan,
-    )
-
-    def plan_page_payload(
-        durable_plan: CleanPlan,
-        *,
-        page_offset: int,
-        page_limit: int,
-    ) -> JsonDict:
-        page = clean_plan_page(
-            durable_plan,
-            offset=page_offset,
-            limit=page_limit,
-        )
-        jobs: list[JsonDict] = []
-        managed: list[JsonDict] = []
-        for item in page.items:
-            rendered = {"index": item.index, "kind": item.kind, **item.identity}
-            if item.kind == "job":
-                job_dir = rendered.get("job_dir")
-                if isinstance(job_dir, str):
-                    rendered["job_dir"] = redact_home_path(job_dir)
-                jobs.append(rendered)
-            else:
-                path = rendered.get("path")
-                if isinstance(path, str):
-                    rendered["path"] = redact_home_path(path)
-                managed.append(rendered)
-        return {
-            "schema_version": "dt_clean_v1",
-            "plan_id": durable_plan.plan_id,
-            "expires_at": durable_plan.expires_at,
-            "eligible_jobs": len(durable_plan.jobs),
-            "managed_results_count": page.total - len(durable_plan.jobs),
-            "page": {
-                "offset": page.offset,
-                "limit": page.limit,
-                "returned": len(page.items),
-                "total": page.total,
-                "next_offset": page.next_offset,
-            },
-            "jobs": jobs,
-            "managed_results": managed,
-            "exit_code": 0,
-        }
+    from .dispatch import clean_jobs
 
     if inspect_plan is not None:
-        try:
-            durable_plan = load_clean_plan(cfg, inspect_plan)
-            payload = plan_page_payload(
-                durable_plan,
-                page_offset=0 if offset is None else offset,
-                page_limit=(DEFAULT_CLEAN_PLAN_PAGE_ITEMS if limit is None else limit),
-            )
-        except CleanPlanError as exc:
-            _fail_submission(
-                kind="clean_plan_invalid",
-                message=str(exc),
-                exit_code=1,
-                json_=json_,
-            )
-        payload["mode"] = "inspect"
-        if json_:
-            encoded = json.dumps(payload)
-            if len(encoded.encode("utf-8")) > MAX_CLEAN_PLAN_PAGE_BYTES:
-                _fail_submission(
-                    kind="clean_plan_invalid",
-                    message="cleanup plan page exceeds its response size limit",
-                    exit_code=1,
-                    json_=True,
-                )
-            print(encoded)
-            return
-        page_data = payload["page"]
-        assert isinstance(page_data, dict)
-        err.print(
-            f"plan {inspect_plan}: {page_data['total']} authorization identities · "
-            f"offset {page_data['offset']} · returned {page_data['returned']}"
-        )
-        preview_limit = 20
-        rendered_items = [*payload["jobs"], *payload["managed_results"]]
-        for item in rendered_items[:preview_limit]:
-            assert isinstance(item, dict)
-            identity = item.get("job_id", "-")
-            detail = item.get("path", item.get("job_dir", ""))
-            err.print(
-                f"[dim]{escape(str(item.get('kind')))} {escape(str(identity))} · "
-                f"{escape(diagnostic_excerpt(str(detail), limit=300))}[/dim]"
-            )
-        omitted = len(rendered_items) - preview_limit
-        if omitted > 0:
-            err.print(f"[dim]... {omitted} more identities in this page[/dim]")
-        if page_data["next_offset"] is not None:
-            err.print(
-                "[dim]next: dt clean --inspect-plan "
-                f"{escape(inspect_plan)} --offset {page_data['next_offset']}[/dim]"
-            )
+        _clean_inspect_plan(cfg, inspect_plan, offset=offset, limit=limit, json_=json_)
         return
 
     projects = set(project) if project else None
-    preview_victims: list[jobs_mod.JobEntry] = []
     if apply_plan is not None:
-        try:
-            durable_plan = load_clean_plan(cfg, apply_plan)
-            scope = durable_plan.managed_identity
-            scope_before = scope.get("before")
-            scope_cutoff = scope.get("cutoff_ts")
-            scope_projects = scope.get("projects")
-            scope_results = scope.get("results")
-            raw_results = scope.get("managed_results")
-            if (
-                not isinstance(scope_before, str)
-                or isinstance(scope_cutoff, bool)
-                or not isinstance(scope_cutoff, (int, float))
-                or scope_projects is not None
-                and (
-                    not isinstance(scope_projects, list)
-                    or any(not isinstance(item, str) for item in scope_projects)
-                )
-                or not isinstance(scope_results, bool)
-                or not isinstance(raw_results, list)
-            ):
-                raise CleanPlanError("cleanup plan scope is invalid")
-            before = scope_before
-            cutoff = float(scope_cutoff)
-            projects = set(scope_projects) if scope_projects is not None else None
-            results = scope_results
-            victims: list[jobs_mod.JobEntry | CleanAuthorization] = list(
-                durable_plan.jobs
-            )
-            managed_results = []
-            result_root = cfg.results_dir().resolve(strict=False)
-            for item in durable_plan.managed_results:
-                result_path = Path(item.path)
-                if (
-                    not result_path.is_absolute()
-                    or result_path == result_root
-                    or result_path != result_path.resolve(strict=False)
-                    or not result_path.is_relative_to(result_root)
-                ):
-                    raise CleanPlanError("cleanup plan result path is unmanaged")
-                managed_results.append(
-                    _ManagedResult(item.job_id, result_path, item.device, item.inode)
-                )
-        except CleanPlanError as exc:
-            _fail_submission(
-                kind="clean_plan_invalid",
-                message=str(exc),
-                exit_code=1,
-                json_=json_,
-            )
+        scope = _clean_scope_from_plan(cfg, apply_plan, json_=json_)
+        before, cutoff, projects, results = (
+            scope.before,
+            scope.cutoff,
+            scope.projects,
+            scope.results,
+        )
     else:
         assert before is not None
-        try:
-            cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
-        except ValueError:
-            _fail_submission(
-                kind="invalid_argument",
-                message=f"invalid --before {before!r}; expected a real YYYY-MM-DD date",
-                exit_code=1,
-                json_=json_,
-            )
-        preview_victims = clean_job_victims(cfg, cutoff, projects=projects)
-        victims = list(preview_victims)
-        managed_results = (
-            _owned_managed_results(cfg, {entry.job_id for entry in victims})
-            if results
-            else []
+        scope = _clean_scope_before(
+            cfg, before, projects=projects, results=results, json_=json_
         )
+        cutoff = scope.cutoff
+    victims = scope.victims
+    managed_results = scope.managed_results
     n_victims = len(victims)
     if plan:
-        assert before is not None
-        try:
-            durable_plan = create_clean_plan(
-                cfg,
-                preview_victims,
-                managed_identity={
-                    "before": before,
-                    "cutoff_ts": cutoff,
-                    "projects": sorted(projects) if projects is not None else None,
-                    "results": results,
-                    "managed_results": [
-                        {
-                            "job_id": item.job_id,
-                            "path": str(item.path),
-                            "device": item.device,
-                            "inode": item.inode,
-                        }
-                        for item in managed_results
-                    ],
-                },
-            )
-        except CleanPlanError as exc:
-            _fail_submission(
-                kind="clean_plan_unavailable",
-                message=str(exc),
-                exit_code=1,
-                json_=json_,
-            )
-        if json_:
-            payload = plan_page_payload(
-                durable_plan,
-                page_offset=0,
-                page_limit=DEFAULT_CLEAN_PLAN_PAGE_ITEMS,
-            )
-            payload.update(
-                {
-                    "mode": "plan",
-                    "before": before,
-                    "projects": (sorted(projects) if projects is not None else None),
-                    "envs": envs,
-                    "deployments": deployments,
-                    "results": results,
-                }
-            )
-            encoded = json.dumps(payload)
-            if len(encoded.encode("utf-8")) > MAX_CLEAN_PLAN_PAGE_BYTES:
-                _fail_submission(
-                    kind="clean_plan_unavailable",
-                    message="cleanup plan page exceeds its response size limit",
-                    exit_code=1,
-                    json_=True,
-                )
-            print(encoded)
-            return
-        err.print(
-            f"plan {durable_plan.plan_id}: {n_victims} ended job dirs"
-            f" + {len(managed_results)} identity-verified managed results"
-            + (" + stale shared venvs" if envs else "")
-            + (" + old release trees and installations" if deployments else "")
-            + (
-                f" · projects {escape(', '.join(sorted(projects)))}"
-                if projects is not None
-                else ""
-            )
-        )
-        preview_limit = 20
-        preview_page = clean_plan_page(durable_plan, offset=0, limit=preview_limit)
-        for item in preview_page.items:
-            identity = item.identity.get("job_id", "-")
-            detail = item.identity.get("path", item.identity.get("job_dir", ""))
-            err.print(
-                f"[dim]{escape(item.kind)} {escape(str(identity))} · "
-                f"{escape(diagnostic_excerpt(str(detail), limit=300))}[/dim]"
-            )
-        if preview_page.next_offset is not None:
-            err.print(
-                f"[dim]... {preview_page.total - len(preview_page.items)} more "
-                "identities · inspect with dt clean --inspect-plan "
-                f"{escape(durable_plan.plan_id)}[/dim]"
-            )
+        _clean_emit_plan(cfg, scope, envs=envs, deployments=deployments, json_=json_)
         return
 
     removed_results = 0
