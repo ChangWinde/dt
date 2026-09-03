@@ -2043,6 +2043,67 @@ def _emit_failed_start(
     raise typer.Exit(exit_code)
 
 
+def _fail_from_submission_error(
+    exc: DispatchError | ConfigError,
+    *,
+    json_: bool,
+    unreachable_message: str = "no reachable node could take the job",
+    no_capacity_message: str = "no node could take the job",
+) -> NoReturn:
+    """Map one submission failure onto the CLI failure contract."""
+    if isinstance(exc, FailedBeforeStart):
+        _emit_failed_start(
+            exc.entry,
+            _maybe_read_failed_start_log(exc.entry),
+            json_=json_,
+            exit_code=EXIT_ENV,
+        )
+    if isinstance(exc, RequestConflict):
+        _fail_submission(
+            kind="idempotency_conflict",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if isinstance(exc, RequestOutcomeUnknown):
+        _fail_submission(
+            kind="submission_unknown",
+            message=str(exc),
+            reasons={"request_id": exc.request_id, "job_id": exc.job_id},
+            exit_code=EXIT_UNREACHABLE,
+            json_=json_,
+        )
+    if isinstance(exc, RequestRejected):
+        _fail_submission(
+            kind="submission_rejected",
+            message=str(exc),
+            exit_code=EXIT_ENV,
+            json_=json_,
+        )
+    if isinstance(exc, NoReachableNode):
+        _fail_submission(
+            kind="unreachable",
+            message=unreachable_message,
+            reasons=exc.reasons,
+            exit_code=EXIT_UNREACHABLE,
+            json_=json_,
+        )
+    if isinstance(exc, NoCapacity):
+        _fail_submission(
+            kind="no_capacity",
+            message=no_capacity_message,
+            reasons=exc.reasons,
+            exit_code=EXIT_NO_GPU,
+            json_=json_,
+        )
+    _fail_submission(
+        kind="environment",
+        message=str(exc),
+        exit_code=EXIT_ENV,
+        json_=json_,
+    )
+
+
 def _submit_entry(
     cfg: HeadConfig,
     spec: RunSpec,
@@ -2076,59 +2137,8 @@ def _submit_entry(
             exit_code=exc.exit_code,
             json_=json_,
         )
-    except FailedBeforeStart as e:
-        failure_log = _maybe_read_failed_start_log(e.entry)
-        _emit_failed_start(
-            e.entry,
-            failure_log,
-            json_=json_,
-            exit_code=EXIT_ENV,
-        )
-    except RequestConflict as e:
-        _fail_submission(
-            kind="idempotency_conflict",
-            message=str(e),
-            exit_code=1,
-            json_=json_,
-        )
-    except RequestOutcomeUnknown as e:
-        _fail_submission(
-            kind="submission_unknown",
-            message=str(e),
-            reasons={"request_id": e.request_id, "job_id": e.job_id},
-            exit_code=EXIT_UNREACHABLE,
-            json_=json_,
-        )
-    except RequestRejected as e:
-        _fail_submission(
-            kind="submission_rejected",
-            message=str(e),
-            exit_code=EXIT_ENV,
-            json_=json_,
-        )
-    except NoReachableNode as e:
-        _fail_submission(
-            kind="unreachable",
-            message="no reachable node could take the job",
-            reasons=e.reasons,
-            exit_code=EXIT_UNREACHABLE,
-            json_=json_,
-        )
-    except NoCapacity as e:
-        _fail_submission(
-            kind="no_capacity",
-            message="no node could take the job",
-            reasons=e.reasons,
-            exit_code=EXIT_NO_GPU,
-            json_=json_,
-        )
     except (DispatchError, ConfigError) as e:
-        _fail_submission(
-            kind="environment",
-            message=str(e),
-            exit_code=EXIT_ENV,
-            json_=json_,
-        )
+        _fail_from_submission_error(e, json_=json_)
 
     agent_started = None
     if entry.status == "queued":
@@ -13032,59 +13042,8 @@ def rerun(
 
     try:
         entry = submit(cfg, spec, Path.cwd(), log, no_queue=no_queue)
-    except FailedBeforeStart as e:
-        failure_log = _maybe_read_failed_start_log(e.entry)
-        _emit_failed_start(
-            e.entry,
-            failure_log,
-            json_=json_,
-            exit_code=EXIT_ENV,
-        )
-    except RequestConflict as e:
-        _fail_submission(
-            kind="idempotency_conflict",
-            message=str(e),
-            exit_code=1,
-            json_=json_,
-        )
-    except RequestOutcomeUnknown as e:
-        _fail_submission(
-            kind="submission_unknown",
-            message=str(e),
-            reasons={"request_id": e.request_id, "job_id": e.job_id},
-            exit_code=EXIT_UNREACHABLE,
-            json_=json_,
-        )
-    except RequestRejected as e:
-        _fail_submission(
-            kind="submission_rejected",
-            message=str(e),
-            exit_code=EXIT_ENV,
-            json_=json_,
-        )
-    except NoReachableNode as e:
-        _fail_submission(
-            kind="unreachable",
-            message="no reachable node could take the job",
-            reasons=e.reasons,
-            exit_code=EXIT_UNREACHABLE,
-            json_=json_,
-        )
-    except NoCapacity as e:
-        _fail_submission(
-            kind="no_capacity",
-            message="no node could take the job",
-            reasons=e.reasons,
-            exit_code=EXIT_NO_GPU,
-            json_=json_,
-        )
     except (DispatchError, ConfigError) as e:
-        _fail_submission(
-            kind="environment",
-            message=str(e),
-            exit_code=EXIT_ENV,
-            json_=json_,
-        )
+        _fail_from_submission_error(e, json_=json_)
 
     agent_started = None
     if entry.status == "queued":
@@ -13253,57 +13212,12 @@ def exec_job(
             log,
             no_queue=no_queue,
         )
-    except FailedBeforeStart as exc:
-        _emit_failed_start(
-            exc.entry,
-            _maybe_read_failed_start_log(exc.entry),
-            json_=json_,
-            exit_code=EXIT_ENV,
-        )
-    except RequestConflict as exc:
-        _fail_submission(
-            kind="idempotency_conflict",
-            message=str(exc),
-            exit_code=1,
-            json_=json_,
-        )
-    except RequestOutcomeUnknown as exc:
-        _fail_submission(
-            kind="submission_unknown",
-            message=str(exc),
-            reasons={"request_id": exc.request_id, "job_id": exc.job_id},
-            exit_code=EXIT_UNREACHABLE,
-            json_=json_,
-        )
-    except RequestRejected as exc:
-        _fail_submission(
-            kind="submission_rejected",
-            message=str(exc),
-            exit_code=EXIT_ENV,
-            json_=json_,
-        )
-    except NoReachableNode as exc:
-        _fail_submission(
-            kind="unreachable",
-            message="source node is unreachable",
-            reasons=exc.reasons,
-            exit_code=EXIT_UNREACHABLE,
-            json_=json_,
-        )
-    except NoCapacity as exc:
-        _fail_submission(
-            kind="no_capacity",
-            message="source node cannot take the diagnostic job",
-            reasons=exc.reasons,
-            exit_code=EXIT_NO_GPU,
-            json_=json_,
-        )
     except (DispatchError, ConfigError) as exc:
-        _fail_submission(
-            kind="environment",
-            message=str(exc),
-            exit_code=EXIT_ENV,
+        _fail_from_submission_error(
+            exc,
             json_=json_,
+            unreachable_message="source node is unreachable",
+            no_capacity_message="source node cannot take the diagnostic job",
         )
 
     agent_started = None
@@ -13729,59 +13643,8 @@ def fork(
 
     try:
         entry = dispatch_mod.submit_fork(cfg, source, spec, log, no_queue=no_queue)
-    except FailedBeforeStart as exc:
-        failure_log = _maybe_read_failed_start_log(exc.entry)
-        _emit_failed_start(
-            exc.entry,
-            failure_log,
-            json_=json_,
-            exit_code=EXIT_ENV,
-        )
-    except RequestConflict as exc:
-        _fail_submission(
-            kind="idempotency_conflict",
-            message=str(exc),
-            exit_code=1,
-            json_=json_,
-        )
-    except RequestOutcomeUnknown as exc:
-        _fail_submission(
-            kind="submission_unknown",
-            message=str(exc),
-            reasons={"request_id": exc.request_id, "job_id": exc.job_id},
-            exit_code=EXIT_UNREACHABLE,
-            json_=json_,
-        )
-    except RequestRejected as exc:
-        _fail_submission(
-            kind="submission_rejected",
-            message=str(exc),
-            exit_code=EXIT_ENV,
-            json_=json_,
-        )
-    except NoReachableNode as exc:
-        _fail_submission(
-            kind="unreachable",
-            message="no reachable node could take the job",
-            reasons=exc.reasons,
-            exit_code=EXIT_UNREACHABLE,
-            json_=json_,
-        )
-    except NoCapacity as exc:
-        _fail_submission(
-            kind="no_capacity",
-            message="no node could take the job",
-            reasons=exc.reasons,
-            exit_code=EXIT_NO_GPU,
-            json_=json_,
-        )
     except (DispatchError, ConfigError) as exc:
-        _fail_submission(
-            kind="environment",
-            message=str(exc),
-            exit_code=EXIT_ENV,
-            json_=json_,
-        )
+        _fail_from_submission_error(exc, json_=json_)
 
     agent_started = None
     if entry.status == "queued":
