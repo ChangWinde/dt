@@ -6050,57 +6050,19 @@ def _submit_prepared(
         lock_context.__exit__(None, None, None)
 
 
-def _submit_prepared_once(
-    cfg: HeadConfig,
+def _submission_meta(
     spec: RunSpec,
     *,
-    source_factory: Callable[[], StoredSnapshot],
+    job_id: str,
+    project_name: str,
+    runtime_sha256: str,
     git_sha: str | None,
     git_dirty: bool,
     git_diff: str | None,
-    submodule_commits: dict[str, str] | None = None,
-    log: Callable[[str], None],
-    no_queue: bool,
-    force_queue: bool = False,
-    force_queue_label: str = "batch",
-    allocated_job_id: str | None = None,
-    submitted_at: float | None = None,
-) -> JobEntry:
-    """Shared placement path after any durable request claim is established."""
-    _validate_run_spec(spec)
-    require_compatible_resident_agent(cfg)
-    effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
-    spec.require_disk_gib = effective_disk_floor or None
-    spec.name = sanitize_name(spec.name)
-    submitted_at = time.time() if submitted_at is None else submitted_at
-    job_id = allocated_job_id or new_job_id(spec.name)
-    session = f"dt_{job_id}"
-    # Persist the logical path; home expansion occurs only on the selected
-    # worker. Unpinned queued jobs use the default root until placement stores
-    # the selected node's effective root.
-    job_relpath = f"jobs/{job_id}"
-    submit_worker_roots = {node.name: cfg.worker_root_for(node) for node in cfg.nodes}
-    submit_worker_root = (
-        submit_worker_roots.get(spec.node, cfg.worker_root)
-        if spec.node
-        else cfg.worker_root
-    )
-    job_dir = (
-        node_path(submit_worker_root, "worker", "jobs", job_id)
-        if cfg.layout == ROLE_LAYOUT
-        else cfg.worker_job_dir(Node(name="-"), job_id)
-    )
-
-    def job_dir_for_node(node: Node) -> str:
-        return cfg.worker_job_dir(node, job_id)
-
-    project_name = spec.project or "?"
-    runtime_files = _runtime_payload_files()
-    runtime_sha256 = payload_sha256(runtime_files)
-    spec.payload_sha256 = runtime_sha256
-    if cfg.layout == ROLE_LAYOUT:
-        _stored_payload_dir(cfg, runtime_sha256, runtime_files)
-    meta = {
+    submodule_commits: dict[str, str] | None,
+) -> dict[str, object]:
+    """The job.json contract written next to the snapshot on the worker."""
+    return {
         "job_id": job_id,
         "name": spec.name,
         "project": project_name,
@@ -6145,6 +6107,139 @@ def _submit_prepared_once(
         ),
         "_diff": git_diff,
     }
+
+
+def _probe_for_submission(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    log: Callable[[str], None],
+) -> tuple[list[NodeStatus], dict[str, str]]:
+    """Probe the pinned node or the whole center; return statuses + reasons."""
+    if spec.node:
+        # pinned submit: probing the whole center is wasted latency when
+        # only one node can take the job anyway (burst submissions add up)
+        by_name = {n.name: n for n in cfg.nodes}
+        if spec.node not in by_name:
+            raise ConfigError(
+                f"unknown node {spec.node!r}; configured: {list(by_name)}"
+            )
+        log(f"probing {spec.node}")
+        pinned = by_name[spec.node]
+        statuses = [
+            (
+                probe_node(
+                    pinned,
+                    cfg.mem_threshold_mib,
+                    lease_root=cfg.lease_root_for(pinned),
+                )
+                if cfg.layout == ROLE_LAYOUT
+                else probe_node(pinned, cfg.mem_threshold_mib)
+            )
+        ]
+    else:
+        log(f"probing {cfg.center} nodes")
+        statuses = probe_center(cfg, use_cache=False)
+    probe_reasons = {
+        s.node: probe_rejection_reason(s, spec)
+        for s in statuses
+        if spec.node is None or s.node == spec.node  # pinned: others not tried
+    }
+    drained_probe_reasons(cfg, spec, probe_reasons)
+    return statuses, probe_reasons
+
+
+def _retract_no_queue_row(
+    cfg: HeadConfig,
+    pending: JobEntry,
+    probe_reasons: dict[str, str],
+) -> JobEntry:
+    """Undo a queued row that a --no-queue submission could not place.
+
+    Capacity changed between forecast and the serialized launch attempt.  No
+    launch is live (otherwise the dispatcher would have adopted it), so
+    restore the fail-fast contract without leaving an agent-visible queued
+    row behind.  Returns the row instead when another dispatcher already
+    owns it and removing it would hide a live task.
+    """
+    failure_reasons = dict(probe_reasons)
+    with job_lock(cfg, pending.job_id):
+        current = load(cfg, pending.job_id)
+        if (
+            current is not None
+            and current.status == "queued"
+            and current.dispatch_node is None
+            and current.dispatch_token is None
+        ):
+            if current.placement_failures:
+                failure_reasons = dict(current.placement_failures)
+            remove_staging(cfg, pending.job_id)
+            remove_record(cfg, pending.job_id)
+        elif current is not None:
+            # Either another dispatcher crossed the durable attempt boundary
+            # (removing the row would make a live task invisible) or the row
+            # already moved on; in both cases the caller gets the truth.
+            pending.__dict__.update(current.__dict__)
+            return pending
+    raise NoCapacity(failure_reasons)
+
+
+def _submit_prepared_once(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    *,
+    source_factory: Callable[[], StoredSnapshot],
+    git_sha: str | None,
+    git_dirty: bool,
+    git_diff: str | None,
+    submodule_commits: dict[str, str] | None = None,
+    log: Callable[[str], None],
+    no_queue: bool,
+    force_queue: bool = False,
+    force_queue_label: str = "batch",
+    allocated_job_id: str | None = None,
+    submitted_at: float | None = None,
+) -> JobEntry:
+    """Shared placement path after any durable request claim is established."""
+    _validate_run_spec(spec)
+    require_compatible_resident_agent(cfg)
+    effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    spec.require_disk_gib = effective_disk_floor or None
+    spec.name = sanitize_name(spec.name)
+    submitted_at = time.time() if submitted_at is None else submitted_at
+    job_id = allocated_job_id or new_job_id(spec.name)
+    session = f"dt_{job_id}"
+    # Persist the logical path; home expansion occurs only on the selected
+    # worker. Unpinned queued jobs use the default root until placement stores
+    # the selected node's effective root.
+    job_relpath = f"jobs/{job_id}"
+    submit_worker_roots = {node.name: cfg.worker_root_for(node) for node in cfg.nodes}
+    submit_worker_root = (
+        submit_worker_roots.get(spec.node, cfg.worker_root)
+        if spec.node
+        else cfg.worker_root
+    )
+    job_dir = (
+        node_path(submit_worker_root, "worker", "jobs", job_id)
+        if cfg.layout == ROLE_LAYOUT
+        else cfg.worker_job_dir(Node(name="-"), job_id)
+    )
+
+    project_name = spec.project or "?"
+    runtime_files = _runtime_payload_files()
+    runtime_sha256 = payload_sha256(runtime_files)
+    spec.payload_sha256 = runtime_sha256
+    if cfg.layout == ROLE_LAYOUT:
+        _stored_payload_dir(cfg, runtime_sha256, runtime_files)
+    meta = _submission_meta(
+        spec,
+        job_id=job_id,
+        project_name=project_name,
+        runtime_sha256=runtime_sha256,
+        git_sha=git_sha,
+        git_dirty=git_dirty,
+        git_diff=git_diff,
+        submodule_commits=submodule_commits,
+    )
     stored: StoredSnapshot | None = None
 
     def exact_source() -> StoredSnapshot:
@@ -6303,36 +6398,7 @@ def _submit_prepared_once(
             reason=f"waiting: max_my_jobs={cap} reached",
         )
 
-    if spec.node:
-        # pinned submit: probing the whole center is wasted latency when
-        # only one node can take the job anyway (burst submissions add up)
-        by_name = {n.name: n for n in cfg.nodes}
-        if spec.node not in by_name:
-            raise ConfigError(
-                f"unknown node {spec.node!r}; configured: {list(by_name)}"
-            )
-        log(f"probing {spec.node}")
-        pinned = by_name[spec.node]
-        statuses = [
-            (
-                probe_node(
-                    pinned,
-                    cfg.mem_threshold_mib,
-                    lease_root=cfg.lease_root_for(pinned),
-                )
-                if cfg.layout == ROLE_LAYOUT
-                else probe_node(pinned, cfg.mem_threshold_mib)
-            )
-        ]
-    else:
-        log(f"probing {cfg.center} nodes")
-        statuses = probe_center(cfg, use_cache=False)
-    probe_reasons = {
-        s.node: probe_rejection_reason(s, spec)
-        for s in statuses
-        if spec.node is None or s.node == spec.node  # pinned: others not tried
-    }
-    drained_probe_reasons(cfg, spec, probe_reasons)
+    statuses, probe_reasons = _probe_for_submission(cfg, spec, log)
     if statuses and all(status.unreachable for status in statuses):
         if no_queue:
             raise NoReachableNode(probe_reasons)
@@ -6378,39 +6444,7 @@ def _submit_prepared_once(
             )
         raise FailedBeforeStart(pending)
     if no_queue and pending.status == "queued":
-        # Capacity changed between forecast and the serialized launch attempt.
-        # No launch is live (otherwise the dispatcher would have adopted it),
-        # so restore the fail-fast contract without leaving an agent-visible
-        # queued row behind.
-        failure_reasons = dict(probe_reasons)
-        with job_lock(cfg, pending.job_id):
-            current = load(cfg, pending.job_id)
-            if (
-                current is not None
-                and current.status == "queued"
-                and current.dispatch_node is None
-                and current.dispatch_token is None
-            ):
-                if current.placement_failures:
-                    failure_reasons = dict(current.placement_failures)
-                remove_staging(cfg, pending.job_id)
-                remove_record(cfg, pending.job_id)
-            elif (
-                current is not None
-                and current.status == "queued"
-                and current.dispatch_node is not None
-                and current.dispatch_token is not None
-            ):
-                # Another dispatcher already crossed the durable attempt
-                # boundary.  Removing this row would make a live task
-                # invisible; preserve it even though the original caller
-                # requested fail-fast placement.
-                pending.__dict__.update(current.__dict__)
-                return pending
-            elif current is not None:
-                pending.__dict__.update(current.__dict__)
-                return pending
-        raise NoCapacity(failure_reasons)
+        return _retract_no_queue_row(cfg, pending, probe_reasons)
     if outcome in {"busy", "waiting", "blocked"}:
         return pending
     return pending
