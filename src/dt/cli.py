@@ -59,6 +59,7 @@ from .config import (
     HeadConfig,
     LaptopConfig,
     Node,
+    Site,
     config_path,
     head_bwlimit_kbps,
     load,
@@ -2678,6 +2679,128 @@ def _resolve_laptop_run_center(
     return picked, None
 
 
+def _forward_run_to_head(
+    cfg: LaptopConfig,
+    *,
+    center: str | None,
+    picked_name: str,
+    cmd: list[str],
+    gpus: int,
+    project: str | None,
+    node: str | None,
+    require_path: str | None,
+    require_disk_gib: int | None,
+    max_hours: float | None,
+    min_vram_mib: int | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+    artifact_manifest: str | None,
+    artifacts: list[str],
+    artifact_targets: Mapping[str, str],
+    after_success: str | None,
+    after_complete: str | None,
+    after_result: str | None,
+    result_states: list[str],
+    request_id: str | None,
+    retry: int,
+    retry_on: str | None,
+    custom_env: Mapping[str, str] | None,
+    no_queue: bool,
+    plan: bool,
+    follow: bool,
+    poll: float,
+    lines: int,
+    json_: bool,
+) -> NoReturn:
+    """Laptop `dt run`: pick the center, mirror every option, forward the call.
+
+    The option chain below is the forwarding contract; the forwarding-drift
+    test reads it to prove every `dt run` option reaches the head.
+    """
+    env_envelope = (
+        custom_env_mod.encode_nul_pairs(custom_env).encode("utf-8")
+        if custom_env
+        else None
+    )
+    if center == "auto":
+        dependency_ref = after_success or after_complete or after_result
+        center, resolved_ref = _resolve_laptop_run_center(
+            cfg,
+            dependency_ref=dependency_ref,
+            request_id=request_id,
+            plan=plan,
+            require_path=require_path,
+            gpus=gpus,
+            require_disk_gib=require_disk_gib,
+            min_vram_mib=min_vram_mib,
+            node=node,
+            json_=json_,
+        )
+        if resolved_ref is not None:
+            if after_success is not None:
+                after_success = resolved_ref
+            elif after_complete is not None:
+                after_complete = resolved_ref
+            else:
+                after_result = resolved_ref
+    route = (
+        _head_command(cfg, center, "run")
+        .option("-g", gpus)
+        .option("-n", picked_name)
+        .option("-p", project or None)
+        .option("--node", node or None)
+        .option("--require-path", require_path or None)
+        .option("--require-disk-gib", require_disk_gib)
+        .option("--max-hours", max_hours)
+        .option("--min-vram-mib", min_vram_mib)
+        .option("--max-vram-mib", max_vram_mib)
+        .option("--max-job-memory-mib", max_job_memory_mib)
+        .option("--artifact-manifest", artifact_manifest or None)
+        .repeat("--artifact", artifacts)
+        .repeat(
+            "--artifact-target",
+            [f"{target}={source}" for target, source in artifact_targets.items()],
+        )
+        .option("--after-success", after_success or None)
+        .option("--after-complete", after_complete or None)
+        .option("--after-result", after_result or None)
+        .repeat("--when-result", result_states)
+        .option("--request-id", request_id or None)
+        .option("--retry", retry or None)
+        .option("--retry-on", retry_on or None)
+        .flag("--env-envelope-stdin", env_envelope is not None)
+        .flag("--no-queue", no_queue)
+        .flag("--plan", plan)
+        .flag("--json", json_)
+        .passthrough(cmd)
+    )
+    if plan:
+        if env_envelope is None:
+            rc = forward_call(route.head, route.argv())
+        else:
+            rc, _captured = forward_capture_stdout(
+                route.head,
+                route.argv(),
+                tty=False,
+                emit_stdout=True,
+                stdin_bytes=env_envelope,
+            )
+        raise typer.Exit(rc)
+    rc = _forward_submission_workflow(
+        route.head,
+        route.argv(),
+        action="run",
+        recovery_label=f"name {picked_name!r}",
+        follow=follow,
+        poll=poll,
+        lines=lines,
+        json_=json_,
+        request_id=request_id,
+        stdin_bytes=env_envelope,
+    )
+    raise typer.Exit(rc)
+
+
 def run(
     ctx: typer.Context,
     gpus: int = typer.Option(
@@ -2969,88 +3092,38 @@ def run(
 
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
-        env_envelope = (
-            custom_env_mod.encode_nul_pairs(custom_env).encode("utf-8")
-            if custom_env
-            else None
-        )
-        if center == "auto":
-            dependency_ref = after_success or after_complete or after_result
-            center, resolved_ref = _resolve_laptop_run_center(
-                cfg,
-                dependency_ref=dependency_ref,
-                request_id=request_id,
-                plan=plan,
-                require_path=require_path,
-                gpus=gpus,
-                require_disk_gib=require_disk_gib,
-                min_vram_mib=min_vram_mib,
-                node=node,
-                json_=json_,
-            )
-            if resolved_ref is not None:
-                if after_success is not None:
-                    after_success = resolved_ref
-                elif after_complete is not None:
-                    after_complete = resolved_ref
-                else:
-                    after_result = resolved_ref
-        route = (
-            _head_command(cfg, center, "run")
-            .option("-g", gpus)
-            .option("-n", picked_name)
-            .option("-p", project or None)
-            .option("--node", node or None)
-            .option("--require-path", require_path or None)
-            .option("--require-disk-gib", require_disk_gib)
-            .option("--max-hours", max_hours)
-            .option("--min-vram-mib", min_vram_mib)
-            .option("--max-vram-mib", max_vram_mib)
-            .option("--max-job-memory-mib", max_job_memory_mib)
-            .option("--artifact-manifest", artifact_manifest or None)
-            .repeat("--artifact", artifacts)
-            .repeat(
-                "--artifact-target",
-                [f"{target}={source}" for target, source in artifact_targets.items()],
-            )
-            .option("--after-success", after_success or None)
-            .option("--after-complete", after_complete or None)
-            .option("--after-result", after_result or None)
-            .repeat("--when-result", result_states)
-            .option("--request-id", request_id or None)
-            .option("--retry", retry or None)
-            .option("--retry-on", retry_on or None)
-            .flag("--env-envelope-stdin", env_envelope is not None)
-            .flag("--no-queue", no_queue)
-            .flag("--plan", plan)
-            .flag("--json", json_)
-            .passthrough(cmd)
-        )
-        if plan:
-            if env_envelope is None:
-                rc = forward_call(route.head, route.argv())
-            else:
-                rc, _captured = forward_capture_stdout(
-                    route.head,
-                    route.argv(),
-                    tty=False,
-                    emit_stdout=True,
-                    stdin_bytes=env_envelope,
-                )
-            raise typer.Exit(rc)
-        rc = _forward_submission_workflow(
-            route.head,
-            route.argv(),
-            action="run",
-            recovery_label=f"name {picked_name!r}",
+        _forward_run_to_head(
+            cfg,
+            center=center,
+            picked_name=picked_name,
+            cmd=cmd,
+            gpus=gpus,
+            project=project,
+            node=node,
+            require_path=require_path,
+            require_disk_gib=require_disk_gib,
+            max_hours=max_hours,
+            min_vram_mib=min_vram_mib,
+            max_vram_mib=max_vram_mib,
+            max_job_memory_mib=max_job_memory_mib,
+            artifact_manifest=artifact_manifest,
+            artifacts=artifacts,
+            artifact_targets=artifact_targets,
+            after_success=after_success,
+            after_complete=after_complete,
+            after_result=after_result,
+            result_states=result_states,
+            request_id=request_id,
+            retry=retry,
+            retry_on=retry_on,
+            custom_env=custom_env,
+            no_queue=no_queue,
+            plan=plan,
             follow=follow,
             poll=poll,
             lines=lines,
             json_=json_,
-            request_id=request_id,
-            stdin_bytes=env_envelope,
         )
-        raise typer.Exit(rc)
 
     request = SubmissionRequest(
         name=picked_name,
@@ -4800,6 +4873,120 @@ def _inventory_finalize_group(
     )
 
 
+def _validate_inventory_options(
+    policy: _InventoryPolicy,
+    items: list[str],
+    *,
+    gpus: int,
+    stage_gpus: list[int] | None,
+    artifact: list[str] | None,
+    artifact_manifest: str | None,
+    max_hours: float | None,
+    min_vram_mib: int | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+    require_disk_gib: int | None,
+    request_id: str | None,
+    json_: bool,
+) -> tuple[list[int], list[str]]:
+    """Validate batch/chain options; returns (per-item GPU requests, artifacts)."""
+    if stage_gpus is not None:
+        if policy.dependency_policy is None:
+            _fail_submission(
+                kind="invalid_argument",
+                message="per-stage GPU requests are supported only by chain",
+                exit_code=1,
+                json_=json_,
+            )
+        if len(stage_gpus) != len(items):
+            _fail_submission(
+                kind="invalid_argument",
+                message=(
+                    f"--stage-gpus was provided {len(stage_gpus)} times for "
+                    f"{len(items)} stages"
+                ),
+                exit_code=1,
+                json_=json_,
+            )
+        if any(value < 0 for value in stage_gpus):
+            _fail_submission(
+                kind="invalid_argument",
+                message="--stage-gpus values must be non-negative",
+                exit_code=1,
+                json_=json_,
+            )
+    if gpus < 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--gpus must be non-negative",
+            exit_code=1,
+            json_=json_,
+        )
+    requested_gpus = stage_gpus or [gpus] * len(items)
+    artifacts = artifact or []
+    if artifacts and artifact_manifest:
+        _fail_submission(
+            kind="invalid_argument",
+            message="use either --artifact or --artifact-manifest, not both",
+            exit_code=1,
+            json_=json_,
+        )
+    if any(not path.strip() for path in artifacts):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--artifact paths must be non-empty",
+            exit_code=1,
+            json_=json_,
+        )
+    _validate_submission_resources(
+        gpus=max(requested_gpus),
+        max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
+        max_vram_mib=max_vram_mib,
+        max_job_memory_mib=max_job_memory_mib,
+        require_disk_gib=require_disk_gib,
+        artifact_manifest=artifact_manifest,
+        json_=json_,
+    )
+    _validate_submission_request_id(request_id, json_=json_)
+    return requested_gpus, artifacts
+
+
+def _inventory_publish_artifacts_now(
+    plan: _InventoryPlan,
+    outcome: _GroupOutcome,
+    artifact_action: Callable[[], None],
+    *,
+    json_: bool,
+) -> None:
+    """Without a request id there is no durable claim; publish artifacts eagerly."""
+    try:
+        artifact_action()
+    except _OperationFailure as exc:
+        outcome.fail_from(exc)
+    except KeyboardInterrupt:
+        outcome.fail(
+            f"{plan.policy.command}_artifact_sync_interrupted",
+            (
+                f"{plan.policy.command} artifact sync interrupted before job "
+                "submission; no jobs were registered. Rerun the same "
+                f"{plan.policy.command} to resume the partial transfer."
+            ),
+            130,
+        )
+    else:
+        if (
+            not json_
+            and outcome.artifact_sync is not None
+            and plan.artifact_manifest is not None
+        ):
+            _emit_task_artifact_sync_success(
+                plan.server,
+                plan.artifact_manifest,
+                outcome.artifact_sync,
+            )
+
+
 def _inventory_command(
     policy: _InventoryPolicy,
     server: str = typer.Argument(..., help="compute node, for example gpu-node-1"),
@@ -4875,65 +5062,21 @@ def _inventory_command(
         json_=json_,
         operation=policy.command,
     )
-    if stage_gpus is not None:
-        if policy.dependency_policy is None:
-            _fail_submission(
-                kind="invalid_argument",
-                message="per-stage GPU requests are supported only by chain",
-                exit_code=1,
-                json_=json_,
-            )
-        if len(stage_gpus) != len(items):
-            _fail_submission(
-                kind="invalid_argument",
-                message=(
-                    f"--stage-gpus was provided {len(stage_gpus)} times for "
-                    f"{len(items)} stages"
-                ),
-                exit_code=1,
-                json_=json_,
-            )
-        if any(value < 0 for value in stage_gpus):
-            _fail_submission(
-                kind="invalid_argument",
-                message="--stage-gpus values must be non-negative",
-                exit_code=1,
-                json_=json_,
-            )
-    if gpus < 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--gpus must be non-negative",
-            exit_code=1,
-            json_=json_,
-        )
-    requested_gpus = stage_gpus or [gpus] * len(items)
-    artifacts = artifact or []
-    if artifacts and artifact_manifest:
-        _fail_submission(
-            kind="invalid_argument",
-            message="use either --artifact or --artifact-manifest, not both",
-            exit_code=1,
-            json_=json_,
-        )
-    if any(not path.strip() for path in artifacts):
-        _fail_submission(
-            kind="invalid_argument",
-            message="--artifact paths must be non-empty",
-            exit_code=1,
-            json_=json_,
-        )
-    _validate_submission_resources(
-        gpus=max(requested_gpus),
+    requested_gpus, artifacts = _validate_inventory_options(
+        policy,
+        items,
+        gpus=gpus,
+        stage_gpus=stage_gpus,
+        artifact=artifact,
+        artifact_manifest=artifact_manifest,
         max_hours=max_hours,
         min_vram_mib=min_vram_mib,
         max_vram_mib=max_vram_mib,
         max_job_memory_mib=max_job_memory_mib,
         require_disk_gib=require_disk_gib,
-        artifact_manifest=artifact_manifest,
+        request_id=request_id,
         json_=json_,
     )
-    _validate_submission_request_id(request_id, json_=json_)
     default_prefix = (
         file.stem
         if file is not None and str(file) != "-" and file.stem
@@ -5026,31 +5169,7 @@ def _inventory_command(
     outcome.project = plan.project
 
     if request_id is None and artifact_action is not None and outcome.failure is None:
-        try:
-            artifact_action()
-        except _OperationFailure as exc:
-            outcome.fail_from(exc)
-        except KeyboardInterrupt:
-            outcome.fail(
-                f"{policy.command}_artifact_sync_interrupted",
-                (
-                    f"{policy.command} artifact sync interrupted before job "
-                    "submission; no jobs were registered. Rerun the same "
-                    f"{policy.command} to resume the partial transfer."
-                ),
-                130,
-            )
-        else:
-            if (
-                not json_
-                and outcome.artifact_sync is not None
-                and plan.artifact_manifest is not None
-            ):
-                _emit_task_artifact_sync_success(
-                    server,
-                    plan.artifact_manifest,
-                    outcome.artifact_sync,
-                )
+        _inventory_publish_artifacts_now(plan, outcome, artifact_action, json_=json_)
 
     if outcome.failure is None:
         _inventory_claim_group(
@@ -5450,6 +5569,138 @@ def _forward_laptop_matrix_run(
     )
 
 
+def _matrix_submit_units(
+    cfg: HeadConfig,
+    spec: matrix_mod.MatrixSpec,
+    outcome: _GroupOutcome,
+    *,
+    project: str | None,
+    artifact_manifest: str | None,
+    intent_sha256: str,
+    json_: bool,
+) -> None:
+    """Submit every unit not yet confirmed, in strict prefix order."""
+    request_id = spec.request_id
+    requested = len(spec.units)
+    for index in range(len(outcome.entries) + 1, requested + 1):
+        unit = spec.units[index - 1]
+
+        def log(message: str, *, item: int = index) -> None:
+            err.print(f"[dim]matrix {item}/{requested}: {escape(message)}[/dim]")
+
+        run_spec = RunSpec(
+            name=unit.name,
+            gpus=unit.gpus,
+            cmd=["bash", "-c", unit.command],
+            project=project,
+            node=spec.node,
+            max_hours=unit.max_hours,
+            artifact_manifest=artifact_manifest,
+            request_id=group_mod.item_request_id(request_id, index),
+        )
+        try:
+            entry = submit(cfg, run_spec, Path.cwd(), log)
+            _record_group_job(
+                cfg,
+                outcome,
+                request_id=request_id,
+                index=index,
+                entry=entry,
+            )
+        except KeyboardInterrupt:
+            confirmed = len(outcome.entries)
+            noun = "registration" if confirmed == 1 else "registrations"
+            outcome.fail(
+                "matrix_submission_interrupted",
+                (
+                    f"matrix submission interrupted after {confirmed} "
+                    f"confirmed {noun}; unit {index} outcome unknown. "
+                    "Confirmed jobs were not cancelled. Rerun "
+                    "`dt matrix run` with the same spec to reconcile "
+                    "this exact unit."
+                ),
+                130,
+                reasons={"request_id": request_id},
+                confirmed_submitted=confirmed,
+                uncertain_unit_index=index,
+            )
+            break
+        except (
+            FailedBeforeStart,
+            NoReachableNode,
+            NoCapacity,
+            DispatchError,
+            ConfigError,
+        ) as exc:
+            failure, failure_code, failed_entry = _batch_error(
+                exc, item_label="matrix unit"
+            )
+            outcome.failure = failure
+            outcome.failure_code = failure_code
+            if failed_entry is not None:
+                # An uncertain launch may still be running on the node,
+                # so it is not part of the durably confirmed prefix (see
+                # the batch path for the full rationale).
+                if (
+                    outcome.failure is not None
+                    and outcome.failure.get("kind") != "uncertain_launch"
+                ):
+                    try:
+                        _record_group_job(
+                            cfg,
+                            outcome,
+                            request_id=request_id,
+                            index=index,
+                            entry=failed_entry,
+                        )
+                    except (
+                        OSError,
+                        ValueError,
+                        intent_mod.RequestRecordError,
+                        group_mod.GroupRequestError,
+                    ) as persistence_exc:
+                        outcome.fail(
+                            "submission_unknown",
+                            (
+                                f"job {failed_entry.job_id} was registered "
+                                f"but request {request_id!r} progress "
+                                "could not be persisted"
+                            ),
+                            EXIT_UNREACHABLE,
+                            reasons={
+                                "request_id": request_id,
+                                "job_id": failed_entry.job_id,
+                                "detail": str(persistence_exc),
+                            },
+                        )
+                outcome.entries.append(failed_entry)
+                _group_ensure_agent(cfg, outcome, failed_entry)
+                if not json_:
+                    print(failed_entry.job_id, flush=True)
+            break
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            outcome.fail(
+                "submission_unknown",
+                (
+                    f"matrix unit {index} did not produce a complete "
+                    "durable group receipt; retry only with the same "
+                    "request id"
+                ),
+                EXIT_UNREACHABLE,
+                reasons={"request_id": request_id, "detail": str(exc)},
+            )
+            break
+        outcome.entries.append(entry)
+        _group_ensure_agent(cfg, outcome, entry)
+        if not json_:
+            print(entry.job_id, flush=True)
+
+
 def _matrix_run_head(
     cfg: HeadConfig,
     spec: matrix_mod.MatrixSpec,
@@ -5531,123 +5782,15 @@ def _matrix_run_head(
             )
 
     if outcome.failure is None and not outcome.group_terminal_replay:
-        for index in range(len(outcome.entries) + 1, requested + 1):
-            unit = spec.units[index - 1]
-
-            def log(message: str, *, item: int = index) -> None:
-                err.print(f"[dim]matrix {item}/{requested}: {escape(message)}[/dim]")
-
-            run_spec = RunSpec(
-                name=unit.name,
-                gpus=unit.gpus,
-                cmd=["bash", "-c", unit.command],
-                project=project,
-                node=spec.node,
-                max_hours=unit.max_hours,
-                artifact_manifest=artifact_manifest,
-                request_id=group_mod.item_request_id(request_id, index),
-            )
-            try:
-                entry = submit(cfg, run_spec, Path.cwd(), log)
-                _record_group_job(
-                    cfg,
-                    outcome,
-                    request_id=request_id,
-                    index=index,
-                    entry=entry,
-                )
-            except KeyboardInterrupt:
-                confirmed = len(outcome.entries)
-                noun = "registration" if confirmed == 1 else "registrations"
-                outcome.fail(
-                    "matrix_submission_interrupted",
-                    (
-                        f"matrix submission interrupted after {confirmed} "
-                        f"confirmed {noun}; unit {index} outcome unknown. "
-                        "Confirmed jobs were not cancelled. Rerun "
-                        "`dt matrix run` with the same spec to reconcile "
-                        "this exact unit."
-                    ),
-                    130,
-                    reasons={"request_id": request_id},
-                    confirmed_submitted=confirmed,
-                    uncertain_unit_index=index,
-                )
-                break
-            except (
-                FailedBeforeStart,
-                NoReachableNode,
-                NoCapacity,
-                DispatchError,
-                ConfigError,
-            ) as exc:
-                failure, failure_code, failed_entry = _batch_error(
-                    exc, item_label="matrix unit"
-                )
-                outcome.failure = failure
-                outcome.failure_code = failure_code
-                if failed_entry is not None:
-                    # An uncertain launch may still be running on the node,
-                    # so it is not part of the durably confirmed prefix (see
-                    # the batch path for the full rationale).
-                    if (
-                        outcome.failure is not None
-                        and outcome.failure.get("kind") != "uncertain_launch"
-                    ):
-                        try:
-                            _record_group_job(
-                                cfg,
-                                outcome,
-                                request_id=request_id,
-                                index=index,
-                                entry=failed_entry,
-                            )
-                        except (
-                            OSError,
-                            ValueError,
-                            intent_mod.RequestRecordError,
-                            group_mod.GroupRequestError,
-                        ) as persistence_exc:
-                            outcome.fail(
-                                "submission_unknown",
-                                (
-                                    f"job {failed_entry.job_id} was registered "
-                                    f"but request {request_id!r} progress "
-                                    "could not be persisted"
-                                ),
-                                EXIT_UNREACHABLE,
-                                reasons={
-                                    "request_id": request_id,
-                                    "job_id": failed_entry.job_id,
-                                    "detail": str(persistence_exc),
-                                },
-                            )
-                    outcome.entries.append(failed_entry)
-                    _group_ensure_agent(cfg, outcome, failed_entry)
-                    if not json_:
-                        print(failed_entry.job_id, flush=True)
-                break
-            except (
-                OSError,
-                ValueError,
-                intent_mod.RequestRecordError,
-                group_mod.GroupRequestError,
-            ) as exc:
-                outcome.fail(
-                    "submission_unknown",
-                    (
-                        f"matrix unit {index} did not produce a complete "
-                        "durable group receipt; retry only with the same "
-                        "request id"
-                    ),
-                    EXIT_UNREACHABLE,
-                    reasons={"request_id": request_id, "detail": str(exc)},
-                )
-                break
-            outcome.entries.append(entry)
-            _group_ensure_agent(cfg, outcome, entry)
-            if not json_:
-                print(entry.job_id, flush=True)
+        _matrix_submit_units(
+            cfg,
+            spec,
+            outcome,
+            project=project,
+            artifact_manifest=artifact_manifest,
+            intent_sha256=intent_sha256,
+            json_=json_,
+        )
 
     # Transient placement failures (every candidate busy or unreachable) keep
     # the group open on purpose: no unit outcome is ambiguous and nothing was
@@ -12488,6 +12631,63 @@ def _render_compare(data: JsonDict) -> None:
         _render_compare_metric(metric)
 
 
+def _compare_entries_across_heads(
+    refs: list[str],
+    locations: list[tuple[str, str]],
+    *,
+    json_: bool,
+) -> list[jobs_mod.JobEntry]:
+    """Fetch registry rows for refs that live on different heads."""
+    entries: list[jobs_mod.JobEntry] = []
+    for ref, (_center, head) in zip(refs, locations, strict=True):
+        proc = remote_dt(head, ["_find", ref], timeout=15)
+        if proc.returncode != 0:
+            _fail_submission(
+                kind="unreachable" if proc.returncode == 255 else "lookup_failed",
+                message=f"could not read job {ref!r} from {head}",
+                exit_code=(
+                    EXIT_UNREACHABLE if proc.returncode == 255 else EXIT_NOT_FOUND
+                ),
+                json_=json_,
+            )
+        try:
+            record = json.loads(proc.stdout)
+            if not isinstance(record, dict):
+                raise TypeError("registry response must be an object")
+            record.pop("custom_env_keys", None)
+            entries.append(jobs_mod.JobEntry(**record))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            _fail_submission(
+                kind="lookup_failed",
+                message=f"invalid registry response for job {ref!r}: {exc}",
+                exit_code=1,
+                json_=json_,
+            )
+    return entries
+
+
+def _compare_entries_on_head(
+    cfg: HeadConfig,
+    refs: list[str],
+    *,
+    json_: bool,
+) -> list[jobs_mod.JobEntry]:
+    """Resolve every ref against this head's registry in one snapshot."""
+    entries: list[jobs_mod.JobEntry] = []
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        for ref in refs:
+            entry = jobs_mod.find(cfg, ref)
+            if entry is None:
+                _fail_submission(
+                    kind="not_found",
+                    message=f"no job matching {ref!r}",
+                    exit_code=EXIT_NOT_FOUND,
+                    json_=json_,
+                )
+            entries.append(entry)
+    return entries
+
+
 def compare(
     refs: Optional[list[str]] = REFS_OPTIONAL_ARG,
     metric: Optional[str] = typer.Option(
@@ -12602,7 +12802,6 @@ def compare(
         )
 
     cfg = _cfg()
-    entries: list[jobs_mod.JobEntry]
     if isinstance(cfg, LaptopConfig):
         locations = [_locate(cfg, ref, json_=json_) for ref in refs]
         heads = {head for _center, head in locations}
@@ -12619,45 +12818,9 @@ def compare(
                 .flag("--json", json_)
             )
             raise typer.Exit(route.invoke(forward_call))
-
-        entries = []
-        for ref, (_center, head) in zip(refs, locations, strict=True):
-            proc = remote_dt(head, ["_find", ref], timeout=15)
-            if proc.returncode != 0:
-                _fail_submission(
-                    kind="unreachable" if proc.returncode == 255 else "lookup_failed",
-                    message=f"could not read job {ref!r} from {head}",
-                    exit_code=(
-                        EXIT_UNREACHABLE if proc.returncode == 255 else EXIT_NOT_FOUND
-                    ),
-                    json_=json_,
-                )
-            try:
-                record = json.loads(proc.stdout)
-                if not isinstance(record, dict):
-                    raise TypeError("registry response must be an object")
-                record.pop("custom_env_keys", None)
-                entries.append(jobs_mod.JobEntry(**record))
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                _fail_submission(
-                    kind="lookup_failed",
-                    message=f"invalid registry response for job {ref!r}: {exc}",
-                    exit_code=1,
-                    json_=json_,
-                )
+        entries = _compare_entries_across_heads(refs, locations, json_=json_)
     else:
-        entries = []
-        with jobs_mod.shared_resolution_snapshot(cfg):
-            for ref in refs:
-                entry = jobs_mod.find(cfg, ref)
-                if entry is None:
-                    _fail_submission(
-                        kind="not_found",
-                        message=f"no job matching {ref!r}",
-                        exit_code=EXIT_NOT_FOUND,
-                        json_=json_,
-                    )
-                entries.append(entry)
+        entries = _compare_entries_on_head(cfg, refs, json_=json_)
 
     if len({entry.job_id for entry in entries}) != len(entries):
         _fail_submission(
@@ -13502,6 +13665,233 @@ def _build_fork_spec(
     return item_spec
 
 
+def _validate_fork_options(
+    *,
+    request_id: str | None,
+    max_hours: float | None,
+    min_vram_mib: int | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+    artifact_manifest: str | None,
+    repeat: int,
+    inherit_cache: bool,
+    reuse_cache: str | None,
+    clone_cache: str | None,
+    no_queue: bool,
+    json_: bool,
+) -> None:
+    """Reject invalid or contradictory `dt fork` options before any I/O."""
+    _validate_submission_request_id(request_id, json_=json_)
+    if max_hours is not None and (not math.isfinite(max_hours) or max_hours <= 0):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--max-hours must be a finite positive number",
+            exit_code=1,
+            json_=json_,
+        )
+    if min_vram_mib is not None and min_vram_mib <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--min-vram-mib must be a positive integer",
+            exit_code=1,
+            json_=json_,
+        )
+    if max_vram_mib is not None and max_vram_mib <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--max-vram-mib must be a positive integer",
+            exit_code=1,
+            json_=json_,
+        )
+    if max_job_memory_mib is not None and max_job_memory_mib <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--max-job-memory-mib must be a positive integer",
+            exit_code=1,
+            json_=json_,
+        )
+    if (
+        artifact_manifest is not None
+        and re.fullmatch(
+            r"[0-9a-f]{64}",
+            artifact_manifest,
+        )
+        is None
+    ):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--artifact-manifest must be a lowercase SHA-256 digest",
+            exit_code=1,
+            json_=json_,
+        )
+    if isinstance(repeat, bool) or repeat < 1 or repeat > BATCH_MAX_TASKS:
+        _fail_submission(
+            kind="invalid_argument",
+            message=f"--repeat must be between 1 and {BATCH_MAX_TASKS:,}",
+            exit_code=1,
+            json_=json_,
+        )
+    selected_cache_modes = sum(
+        bool(value) for value in (inherit_cache, reuse_cache, clone_cache)
+    )
+    if selected_cache_modes > 1:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "use only one of --inherit-cache, --reuse-cache, or --clone-cache"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    if repeat > 1 and no_queue:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--no-queue cannot be used with --repeat greater than 1",
+            exit_code=1,
+            json_=json_,
+        )
+
+
+def _forward_fork_to_head(
+    cfg: LaptopConfig,
+    ref: str,
+    *,
+    name: str | None,
+    repeat: int,
+    reuse_cache: str | None,
+    clone_cache: str | None,
+    cache_env: str,
+    inherit_cache: bool,
+    artifact_manifest: str | None,
+    max_hours: float | None,
+    min_vram_mib: int | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+    request_id: str | None,
+    no_queue: bool,
+    command: list[str],
+    json_: bool,
+) -> NoReturn:
+    """Laptop `dt fork`: replay the invocation on the head that owns ``ref``."""
+    _, head = _locate(cfg, ref, json_=json_)
+    route = (
+        HeadCommand.start(head, "fork", ref)
+        .option("-n", name or None)
+        .option("--repeat", repeat if repeat > 1 else None)
+        .option("--reuse-cache", reuse_cache or None)
+        .option("--cache-env", cache_env if reuse_cache else None)
+        .option("--clone-cache", clone_cache or None)
+        .option("--cache-env", cache_env if clone_cache else None)
+        .flag("--inherit-cache", inherit_cache)
+        .option("--artifact-manifest", artifact_manifest)
+        .option("--max-hours", max_hours)
+        .option("--min-vram-mib", min_vram_mib)
+        .option("--max-vram-mib", max_vram_mib)
+        .option("--max-job-memory-mib", max_job_memory_mib)
+        .option("--request-id", request_id or None)
+        .flag("--no-queue", no_queue)
+        # Repeat forwarding always consumes the head's durable group
+        # receipt, even when the laptop renders it for a human. Without
+        # this, the head prints bare job ids after creating every member
+        # and the laptop reports a protocol failure that invites a
+        # duplicate retry.
+        .flag("--json", json_ or repeat > 1)
+    )
+    if command:
+        route = route.passthrough(command)
+    argv = route.argv()
+    if repeat > 1:
+        prefix = jobs_mod.sanitize_name((name or f"{ref}-fork").strip())
+        raise typer.Exit(
+            fork_repeat_mod.forward_laptop(
+                _fork_repeat_host(),
+                route.head,
+                argv,
+                ref=ref,
+                name_prefix=prefix,
+                json_=json_,
+                request_id=request_id,
+            )
+        )
+    rc, _job_id = _forward_laptop_submission(
+        route.head,
+        argv,
+        action="fork",
+        recovery_label=(f"name {name!r}" if name else f"a new fork of {ref!r}"),
+        json_=json_,
+        request_id=request_id,
+    )
+    raise typer.Exit(rc)
+
+
+def _report_fork(
+    cfg: HeadConfig,
+    entry: jobs_mod.JobEntry,
+    *,
+    old: jobs_mod.JobEntry,
+    source: jobs_mod.JobEntry,
+    source_display_ref: str,
+    agent_started: bool | None,
+    json_: bool,
+) -> None:
+    """Print the fork submission result (JSON payload or human summary)."""
+    exact = bool(old.snapshot_sha256 and entry.snapshot_sha256 == old.snapshot_sha256)
+    if json_:
+        print(
+            json.dumps(
+                _submission_payload(
+                    entry,
+                    forked_from=entry.forked_from or source.job_id,
+                    max_hours=entry.max_hours,
+                    exact_snapshot=exact,
+                    **(
+                        {"agent_started": agent_started}
+                        if agent_started is not None
+                        else {}
+                    ),
+                )
+            )
+        )
+        return
+
+    display_ref = _display_ref_for_entry(cfg, entry)
+    if getattr(entry, "_request_replayed", False):
+        err.print(
+            f"[cyan]replayed durable request[/cyan] "
+            f"{escape(entry.request_id or '')} · no new job created"
+        )
+    if entry.status == "queued":
+        agent_note = ""
+        if agent_started:
+            agent_note = " · agent started"
+        elif agent_started is False:
+            agent_note = " · [red]agent failed[/red]"
+        err.print(
+            f"[cyan]queued[/cyan] {escape(entry.name)} · "
+            f"fork of {escape(source_display_ref)}{agent_note}"
+        )
+        if entry.reason:
+            err.print(f"[yellow]reason: {escape(entry.reason)}[/yellow]")
+        if agent_started is False:
+            err.print("[red]next: dt agent run[/red]")
+    else:
+        gpu_text = ",".join(map(str, entry.gpus)) or "cpu"
+        err.print(
+            f"[green]started[/green] {escape(entry.name)} · "
+            f"[bold]{escape(entry.node)}[/bold] · GPU {gpu_text} · "
+            f"fork of {escape(source_display_ref)}"
+        )
+    exact_snapshot = (entry.snapshot_sha256 or "unknown")[:12]
+    err.print(f"[dim]exact snapshot {exact_snapshot}[/dim]")
+    next_command = (
+        f"dt watch {display_ref}"
+        if entry.status == "queued"
+        else f"dt logs {display_ref} -f · dt wait {display_ref}"
+    )
+    err.print(f"[dim]next: {escape(next_command)}[/dim]")
+    print(entry.job_id)
+
+
 def fork(
     ctx: typer.Context,
     ref: str = REF_ARG,
@@ -13587,130 +13977,44 @@ def fork(
     command = list(ctx.args)
     while command and command[0] == "--":
         command = command[1:]
-    _validate_submission_request_id(request_id, json_=json_)
-    if max_hours is not None and (not math.isfinite(max_hours) or max_hours <= 0):
-        _fail_submission(
-            kind="invalid_argument",
-            message="--max-hours must be a finite positive number",
-            exit_code=1,
-            json_=json_,
-        )
-    if min_vram_mib is not None and min_vram_mib <= 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--min-vram-mib must be a positive integer",
-            exit_code=1,
-            json_=json_,
-        )
-    if max_vram_mib is not None and max_vram_mib <= 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--max-vram-mib must be a positive integer",
-            exit_code=1,
-            json_=json_,
-        )
-    if max_job_memory_mib is not None and max_job_memory_mib <= 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--max-job-memory-mib must be a positive integer",
-            exit_code=1,
-            json_=json_,
-        )
-    if (
-        artifact_manifest is not None
-        and re.fullmatch(
-            r"[0-9a-f]{64}",
-            artifact_manifest,
-        )
-        is None
-    ):
-        _fail_submission(
-            kind="invalid_argument",
-            message="--artifact-manifest must be a lowercase SHA-256 digest",
-            exit_code=1,
-            json_=json_,
-        )
-    if isinstance(repeat, bool) or repeat < 1 or repeat > BATCH_MAX_TASKS:
-        _fail_submission(
-            kind="invalid_argument",
-            message=f"--repeat must be between 1 and {BATCH_MAX_TASKS:,}",
-            exit_code=1,
-            json_=json_,
-        )
-    selected_cache_modes = sum(
-        bool(value) for value in (inherit_cache, reuse_cache, clone_cache)
+    _validate_fork_options(
+        request_id=request_id,
+        max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
+        max_vram_mib=max_vram_mib,
+        max_job_memory_mib=max_job_memory_mib,
+        artifact_manifest=artifact_manifest,
+        repeat=repeat,
+        inherit_cache=inherit_cache,
+        reuse_cache=reuse_cache,
+        clone_cache=clone_cache,
+        no_queue=no_queue,
+        json_=json_,
     )
-    if selected_cache_modes > 1:
-        _fail_submission(
-            kind="invalid_argument",
-            message=(
-                "use only one of --inherit-cache, --reuse-cache, or --clone-cache"
-            ),
-            exit_code=1,
-            json_=json_,
-        )
-    if repeat > 1 and no_queue:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--no-queue cannot be used with --repeat greater than 1",
-            exit_code=1,
-            json_=json_,
-        )
 
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
-        _, head = _locate(cfg, ref, json_=json_)
-        route = (
-            HeadCommand.start(head, "fork", ref)
-            .option("-n", name or None)
-            .option("--repeat", repeat if repeat > 1 else None)
-            .option("--reuse-cache", reuse_cache or None)
-            .option("--cache-env", cache_env if reuse_cache else None)
-            .option("--clone-cache", clone_cache or None)
-            .option("--cache-env", cache_env if clone_cache else None)
-            .flag("--inherit-cache", inherit_cache)
-            .option("--artifact-manifest", artifact_manifest)
-            .option("--max-hours", max_hours)
-            .option("--min-vram-mib", min_vram_mib)
-            .option("--max-vram-mib", max_vram_mib)
-            .option("--max-job-memory-mib", max_job_memory_mib)
-            .option("--request-id", request_id or None)
-            .flag("--no-queue", no_queue)
-            # Repeat forwarding always consumes the head's durable group
-            # receipt, even when the laptop renders it for a human. Without
-            # this, the head prints bare job ids after creating every member
-            # and the laptop reports a protocol failure that invites a
-            # duplicate retry.
-            .flag("--json", json_ or repeat > 1)
-        )
-        if command:
-            route = route.passthrough(command)
-        argv = route.argv()
-        if repeat > 1:
-            prefix = jobs_mod.sanitize_name((name or f"{ref}-fork").strip())
-            raise typer.Exit(
-                fork_repeat_mod.forward_laptop(
-                    _fork_repeat_host(),
-                    route.head,
-                    argv,
-                    ref=ref,
-                    name_prefix=prefix,
-                    json_=json_,
-                    request_id=request_id,
-                )
-            )
-        rc, _job_id = _forward_laptop_submission(
-            route.head,
-            argv,
-            action="fork",
-            recovery_label=(f"name {name!r}" if name else f"a new fork of {ref!r}"),
-            json_=json_,
+        _forward_fork_to_head(
+            cfg,
+            ref,
+            name=name,
+            repeat=repeat,
+            reuse_cache=reuse_cache,
+            clone_cache=clone_cache,
+            cache_env=cache_env,
+            inherit_cache=inherit_cache,
+            artifact_manifest=artifact_manifest,
+            max_hours=max_hours,
+            min_vram_mib=min_vram_mib,
+            max_vram_mib=max_vram_mib,
+            max_job_memory_mib=max_job_memory_mib,
             request_id=request_id,
+            no_queue=no_queue,
+            command=command,
+            json_=json_,
         )
-        raise typer.Exit(rc)
 
     from . import dispatch as dispatch_mod
-    from rich.markup import escape
 
     old = _find_or_die(cfg, ref, json_=json_)
     old_display_ref = _display_ref_for_entry(cfg, old)
@@ -13827,62 +14131,15 @@ def fork(
         _fail_from_submission_error(exc, json_=json_)
 
     agent_started = _ensure_agent_for(cfg, entry)
-
-    exact = bool(old.snapshot_sha256 and entry.snapshot_sha256 == old.snapshot_sha256)
-    if json_:
-        print(
-            json.dumps(
-                _submission_payload(
-                    entry,
-                    forked_from=entry.forked_from or source.job_id,
-                    max_hours=entry.max_hours,
-                    exact_snapshot=exact,
-                    **(
-                        {"agent_started": agent_started}
-                        if agent_started is not None
-                        else {}
-                    ),
-                )
-            )
-        )
-        return
-
-    display_ref = _display_ref_for_entry(cfg, entry)
-    if getattr(entry, "_request_replayed", False):
-        err.print(
-            f"[cyan]replayed durable request[/cyan] "
-            f"{escape(entry.request_id or '')} · no new job created"
-        )
-    if entry.status == "queued":
-        agent_note = ""
-        if agent_started:
-            agent_note = " · agent started"
-        elif agent_started is False:
-            agent_note = " · [red]agent failed[/red]"
-        err.print(
-            f"[cyan]queued[/cyan] {escape(entry.name)} · "
-            f"fork of {escape(source_display_ref)}{agent_note}"
-        )
-        if entry.reason:
-            err.print(f"[yellow]reason: {escape(entry.reason)}[/yellow]")
-        if agent_started is False:
-            err.print("[red]next: dt agent run[/red]")
-    else:
-        gpu_text = ",".join(map(str, entry.gpus)) or "cpu"
-        err.print(
-            f"[green]started[/green] {escape(entry.name)} · "
-            f"[bold]{escape(entry.node)}[/bold] · GPU {gpu_text} · "
-            f"fork of {escape(source_display_ref)}"
-        )
-    exact_snapshot = (entry.snapshot_sha256 or "unknown")[:12]
-    err.print(f"[dim]exact snapshot {exact_snapshot}[/dim]")
-    next_command = (
-        f"dt watch {display_ref}"
-        if entry.status == "queued"
-        else f"dt logs {display_ref} -f · dt wait {display_ref}"
+    _report_fork(
+        cfg,
+        entry,
+        old=old,
+        source=source,
+        source_display_ref=source_display_ref,
+        agent_started=agent_started,
+        json_=json_,
     )
-    err.print(f"[dim]next: {escape(next_command)}[/dim]")
-    print(entry.job_id)
 
 
 # --------------------------------------------------------------------------
@@ -16526,6 +16783,215 @@ def _clean_emit_plan(
         )
 
 
+def _forward_clean_to_heads(
+    cfg: LaptopConfig,
+    *,
+    center: str | None,
+    all_centers: bool,
+    before: str | None,
+    project: list[str] | None,
+    envs: bool,
+    deployments: bool,
+    results: bool,
+    plan: bool,
+    apply_plan: str | None,
+    inspect_plan: str | None,
+    offset: int | None,
+    limit: int | None,
+    yes: bool,
+    json_: bool,
+) -> NoReturn:
+    """Laptop `dt clean`: replay the invocation on one or every center head."""
+    if all_centers and json_:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "clean --json reports one center; scope with --center "
+                "instead of --all-centers"
+            ),
+            exit_code=1,
+            json_=True,
+        )
+    rc = 0
+    argv_tail = (
+        [item for project_name in project or [] for item in ("--project", project_name)]
+        + (["--envs"] if envs else [])
+        + (["--deployments"] if deployments else [])
+        + (["--results"] if results else [])
+        + (["--plan"] if plan else [])
+        + (["--apply-plan", apply_plan] if apply_plan is not None else [])
+        + (["--inspect-plan", inspect_plan] if inspect_plan is not None else [])
+        + (["--offset", str(offset)] if offset is not None else [])
+        + (["--limit", str(limit)] if limit is not None else [])
+        + (["--json"] if json_ else [])
+        + (["-y"] if yes else [])
+    )
+    targets = (
+        list(cfg.centers.items())
+        if all_centers
+        else [
+            (
+                selected := _laptop_center(cfg, center),
+                cfg.centers[selected],
+            )
+        ]
+    )
+    for target_center, head in targets:
+        err.print(f"[dim]cleaning {escape(target_center)}[/dim]")
+        forwarded = ["clean"]
+        if before is not None:
+            forwarded += ["--before", before]
+        rc |= forward_call(head, [*forwarded, *argv_tail], tty=not (yes or json_))
+    raise typer.Exit(rc)
+
+
+def _clean_apply(
+    cfg: HeadConfig,
+    scope: _CleanScope,
+    *,
+    apply_plan: str | None,
+    envs: bool,
+    deployments: bool,
+    yes: bool,
+    json_: bool,
+) -> None:
+    """Confirm and execute the deletion scope; report and exit non-zero on failures."""
+    before = scope.before
+    cutoff = scope.cutoff
+    projects = scope.projects
+    results = scope.results
+    victims = scope.victims
+    managed_results = scope.managed_results
+    n_victims = len(victims)
+    from .dispatch import clean_jobs
+
+    removed_results = 0
+
+    def clean_apply_payload(
+        removed_jobs: int,
+        eligible: int,
+        failures: list[JsonDict],
+        removed_deployment_trees: int,
+        removed_envs: int,
+    ) -> JsonDict:
+        return {
+            "schema_version": "dt_clean_v1",
+            "mode": "apply",
+            "plan_id": apply_plan,
+            "before": before,
+            "projects": sorted(projects) if projects is not None else None,
+            "eligible_jobs": eligible,
+            "removed_jobs": removed_jobs,
+            "removed_envs": removed_envs if envs else None,
+            "removed_results": removed_results if results else None,
+            "removed_deployment_trees": (
+                removed_deployment_trees if deployments else None
+            ),
+            "failures": failures,
+            "exit_code": 1 if failures else 0,
+        }
+
+    if not n_victims and not envs and not deployments and not managed_results:
+        if json_:
+            print(json.dumps(clean_apply_payload(0, 0, [], 0, 0)))
+        else:
+            err.print("nothing to clean")
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            err.print("[red]non-interactive clean needs -y[/red]")
+            raise typer.Exit(1)
+        what = f"delete {n_victims} job dirs older than {before}"
+        if results:
+            what += f" + {len(managed_results)} verified managed results"
+        if envs:
+            what += " + stale shared venvs"
+        if deployments:
+            what += " + old release trees and installations"
+        typer.confirm(f"{what}?", abort=True)
+    managed_results_by_job: dict[str, list[_ManagedResult]] = {}
+    for managed_result in managed_results:
+        managed_results_by_job.setdefault(managed_result.job_id, []).append(
+            managed_result
+        )
+
+    def remove_managed_results(entry: jobs_mod.JobEntry) -> None:
+        nonlocal removed_results
+        for expected in managed_results_by_job.get(entry.job_id, []):
+            with jobs_mod.pull_destination_lock(cfg, expected.path):
+                observed = _managed_result_evidence(cfg.results_dir(), expected.path)
+                if (
+                    observed.job_id != expected.job_id
+                    or observed.device != expected.device
+                    or observed.inode != expected.inode
+                ):
+                    raise PrivateStateError(
+                        "managed result changed after ownership verification: "
+                        f"{expected.path}"
+                    )
+                shutil.rmtree(expected.path)
+                removed_results += 1
+
+    report = clean_jobs(
+        cfg,
+        cutoff,
+        envs=envs,
+        log=lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
+        projects=projects,
+        before_registry_remove=remove_managed_results if results else None,
+        authorized=victims,
+    )
+    removed_deployments = 0
+    deployment_failures = []
+    if deployments:
+        from .maintenance import clean_deployments
+
+        deployment_report = clean_deployments(
+            cfg,
+            cutoff,
+            lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
+            runner=run_on,
+        )
+        removed_deployments = deployment_report.removed
+        deployment_failures = deployment_report.failures
+    suffix = f" + {removed_results} managed results" if results else ""
+    if deployments:
+        suffix += f" + {removed_deployments} deployment trees"
+    err.print(f"cleaned {report.removed}/{report.eligible} jobs{suffix}")
+    all_failures = [*report.failures, *deployment_failures]
+    if json_:
+        print(
+            json.dumps(
+                clean_apply_payload(
+                    report.removed,
+                    report.eligible,
+                    [
+                        {
+                            "job_id": failure.job_id,
+                            "node": failure.node,
+                            "kind": failure.kind,
+                            "message": failure.message,
+                        }
+                        for failure in all_failures
+                    ],
+                    removed_deployments,
+                    report.removed_envs,
+                )
+            )
+        )
+    if all_failures:
+        err.print(
+            f"[red]{len(all_failures)} cleanup operation(s) incomplete; "
+            "rerun after fixing the reported cause[/red]"
+        )
+        for failure in all_failures:
+            err.print(
+                f"[red]{escape(failure.job_id)} · {escape(failure.kind)} · "
+                f"{escape(failure.message)}[/red]"
+            )
+        raise typer.Exit(1)
+
+
 def clean(
     before: Optional[str] = typer.Option(
         None, "--before", help="YYYY-MM-DD; delete finished jobs older than this"
@@ -16657,57 +17123,27 @@ def clean(
                 exit_code=1,
                 json_=json_,
             )
-        if all_centers and json_:
-            _fail_submission(
-                kind="invalid_argument",
-                message=(
-                    "clean --json reports one center; scope with --center "
-                    "instead of --all-centers"
-                ),
-                exit_code=1,
-                json_=True,
-            )
-        rc = 0
-        argv_tail = (
-            [
-                item
-                for project_name in project or []
-                for item in ("--project", project_name)
-            ]
-            + (["--envs"] if envs else [])
-            + (["--deployments"] if deployments else [])
-            + (["--results"] if results else [])
-            + (["--plan"] if plan else [])
-            + (["--apply-plan", apply_plan] if apply_plan is not None else [])
-            + (["--inspect-plan", inspect_plan] if inspect_plan is not None else [])
-            + (["--offset", str(offset)] if offset is not None else [])
-            + (["--limit", str(limit)] if limit is not None else [])
-            + (["--json"] if json_ else [])
-            + (["-y"] if yes else [])
+        _forward_clean_to_heads(
+            cfg,
+            center=center,
+            all_centers=all_centers,
+            before=before,
+            project=project,
+            envs=envs,
+            deployments=deployments,
+            results=results,
+            plan=plan,
+            apply_plan=apply_plan,
+            inspect_plan=inspect_plan,
+            offset=offset,
+            limit=limit,
+            yes=yes,
+            json_=json_,
         )
-        targets = (
-            list(cfg.centers.items())
-            if all_centers
-            else [
-                (
-                    selected := _laptop_center(cfg, center),
-                    cfg.centers[selected],
-                )
-            ]
-        )
-        for target_center, head in targets:
-            err.print(f"[dim]cleaning {escape(target_center)}[/dim]")
-            forwarded = ["clean"]
-            if before is not None:
-                forwarded += ["--before", before]
-            rc |= forward_call(head, [*forwarded, *argv_tail], tty=not (yes or json_))
-        raise typer.Exit(rc)
 
     if center is not None or all_centers:
         err.print("[red]--center and --all-centers are laptop-only options[/red]")
         raise typer.Exit(1)
-    from .dispatch import clean_jobs
-
     if inspect_plan is not None:
         _clean_inspect_plan(cfg, inspect_plan, offset=offset, limit=limit, json_=json_)
         return
@@ -16715,150 +17151,24 @@ def clean(
     projects = set(project) if project else None
     if apply_plan is not None:
         scope = _clean_scope_from_plan(cfg, apply_plan, json_=json_)
-        before, cutoff, projects, results = (
-            scope.before,
-            scope.cutoff,
-            scope.projects,
-            scope.results,
-        )
     else:
         assert before is not None
         scope = _clean_scope_before(
             cfg, before, projects=projects, results=results, json_=json_
         )
-        cutoff = scope.cutoff
-    victims = scope.victims
-    managed_results = scope.managed_results
-    n_victims = len(victims)
     if plan:
         _clean_emit_plan(cfg, scope, envs=envs, deployments=deployments, json_=json_)
         return
 
-    removed_results = 0
-
-    def clean_apply_payload(
-        removed_jobs: int,
-        eligible: int,
-        failures: list[JsonDict],
-        removed_deployment_trees: int,
-        removed_envs: int,
-    ) -> JsonDict:
-        return {
-            "schema_version": "dt_clean_v1",
-            "mode": "apply",
-            "plan_id": apply_plan,
-            "before": before,
-            "projects": sorted(projects) if projects is not None else None,
-            "eligible_jobs": eligible,
-            "removed_jobs": removed_jobs,
-            "removed_envs": removed_envs if envs else None,
-            "removed_results": removed_results if results else None,
-            "removed_deployment_trees": (
-                removed_deployment_trees if deployments else None
-            ),
-            "failures": failures,
-            "exit_code": 1 if failures else 0,
-        }
-
-    if not n_victims and not envs and not deployments and not managed_results:
-        if json_:
-            print(json.dumps(clean_apply_payload(0, 0, [], 0, 0)))
-        else:
-            err.print("nothing to clean")
-        return
-    if not yes:
-        if not sys.stdin.isatty():
-            err.print("[red]non-interactive clean needs -y[/red]")
-            raise typer.Exit(1)
-        what = f"delete {n_victims} job dirs older than {before}"
-        if results:
-            what += f" + {len(managed_results)} verified managed results"
-        if envs:
-            what += " + stale shared venvs"
-        if deployments:
-            what += " + old release trees and installations"
-        typer.confirm(f"{what}?", abort=True)
-    managed_results_by_job: dict[str, list[_ManagedResult]] = {}
-    for managed_result in managed_results:
-        managed_results_by_job.setdefault(managed_result.job_id, []).append(
-            managed_result
-        )
-
-    def remove_managed_results(entry: jobs_mod.JobEntry) -> None:
-        nonlocal removed_results
-        for expected in managed_results_by_job.get(entry.job_id, []):
-            with jobs_mod.pull_destination_lock(cfg, expected.path):
-                observed = _managed_result_evidence(cfg.results_dir(), expected.path)
-                if (
-                    observed.job_id != expected.job_id
-                    or observed.device != expected.device
-                    or observed.inode != expected.inode
-                ):
-                    raise PrivateStateError(
-                        "managed result changed after ownership verification: "
-                        f"{expected.path}"
-                    )
-                shutil.rmtree(expected.path)
-                removed_results += 1
-
-    report = clean_jobs(
+    _clean_apply(
         cfg,
-        cutoff,
+        scope,
+        apply_plan=apply_plan,
         envs=envs,
-        log=lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
-        projects=projects,
-        before_registry_remove=remove_managed_results if results else None,
-        authorized=victims,
+        deployments=deployments,
+        yes=yes,
+        json_=json_,
     )
-    removed_deployments = 0
-    deployment_failures = []
-    if deployments:
-        from .maintenance import clean_deployments
-
-        deployment_report = clean_deployments(
-            cfg,
-            cutoff,
-            lambda m: err.print(f"[dim]{escape(m)}[/dim]"),
-            runner=run_on,
-        )
-        removed_deployments = deployment_report.removed
-        deployment_failures = deployment_report.failures
-    suffix = f" + {removed_results} managed results" if results else ""
-    if deployments:
-        suffix += f" + {removed_deployments} deployment trees"
-    err.print(f"cleaned {report.removed}/{report.eligible} jobs{suffix}")
-    all_failures = [*report.failures, *deployment_failures]
-    if json_:
-        print(
-            json.dumps(
-                clean_apply_payload(
-                    report.removed,
-                    report.eligible,
-                    [
-                        {
-                            "job_id": failure.job_id,
-                            "node": failure.node,
-                            "kind": failure.kind,
-                            "message": failure.message,
-                        }
-                        for failure in all_failures
-                    ],
-                    removed_deployments,
-                    report.removed_envs,
-                )
-            )
-        )
-    if all_failures:
-        err.print(
-            f"[red]{len(all_failures)} cleanup operation(s) incomplete; "
-            "rerun after fixing the reported cause[/red]"
-        )
-        for failure in all_failures:
-            err.print(
-                f"[red]{escape(failure.job_id)} · {escape(failure.kind)} · "
-                f"{escape(failure.message)}[/red]"
-            )
-        raise typer.Exit(1)
 
 
 def _local_tree_disk_bytes(path: Path) -> int | None:
@@ -17927,6 +18237,59 @@ class _SyncRequest:
             )
 
 
+def _sync_transfer_summary(row: JsonDict, *, plan: bool) -> str:
+    """One-line transfer summary: bytes, deletions, files, manifest, duration."""
+    transferred_bytes = row.get("transferred_bytes")
+    gib = row.get("transferred_gib")
+    moved = (
+        _format_transfer_bytes(int(transferred_bytes))
+        if isinstance(transferred_bytes, int)
+        and not isinstance(transferred_bytes, bool)
+        else (
+            "no changed bytes"
+            if gib == 0
+            else (f"{float(gib):.2f} GiB" if gib is not None else "done")
+        )
+    )
+    deleted = row.get("deleted_files")
+    if isinstance(deleted, int) and not isinstance(deleted, bool) and deleted > 0:
+        moved += f" · would delete {deleted:,}" if plan else f" · {deleted:,} deleted"
+    transferred_files = row.get("transferred_files")
+    if (
+        isinstance(transferred_files, int)
+        and not isinstance(transferred_files, bool)
+        and transferred_files > 0
+    ):
+        noun = "file" if transferred_files == 1 else "files"
+        moved += f" · {transferred_files:,} {noun}"
+    manifest = row.get("artifact_manifest_sha256")
+    if isinstance(manifest, str):
+        moved += f" · manifest {manifest[:12]}"
+    duration = row.get("duration_s")
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+        moved += f" · {_fmt_short_duration(float(duration))}"
+    return moved
+
+
+def _print_sync_row(name: str, row: JsonDict, *, plan: bool) -> None:
+    """Human line for one successfully synced (or planned) node."""
+    moved = _sync_transfer_summary(row, plan=plan)
+    if plan:
+        if moved == "no changed bytes":
+            moved = "no changes"
+        elif not moved.startswith("no changed bytes"):
+            moved = f"would transfer {moved}"
+        err.print(
+            f"[cyan]plan[/cyan] {escape(name)}  {escape(moved)}  "
+            f"[dim]{escape(str(row['path']))}[/dim]"
+        )
+    else:
+        err.print(
+            f"[green]synced[/green] {escape(name)}  {escape(moved)}  "
+            f"[dim]{escape(str(row['path']))}[/dim]"
+        )
+
+
 def sync(
     nodes: list[str] = typer.Argument(
         ..., help="compute nodes that should receive project code or artifacts"
@@ -18172,51 +18535,7 @@ def sync(
         if failure_code is not None:
             err.print(f"[red]{escape(name)}: {escape(str(row['error']))}[/red]")
             continue
-        transferred_bytes = row.get("transferred_bytes")
-        gib = row.get("transferred_gib")
-        moved = (
-            _format_transfer_bytes(int(transferred_bytes))
-            if isinstance(transferred_bytes, int)
-            and not isinstance(transferred_bytes, bool)
-            else (
-                "no changed bytes"
-                if gib == 0
-                else (f"{float(gib):.2f} GiB" if gib is not None else "done")
-            )
-        )
-        deleted = row.get("deleted_files")
-        if isinstance(deleted, int) and not isinstance(deleted, bool) and deleted > 0:
-            moved += (
-                f" · would delete {deleted:,}" if plan else f" · {deleted:,} deleted"
-            )
-        transferred_files = row.get("transferred_files")
-        if (
-            isinstance(transferred_files, int)
-            and not isinstance(transferred_files, bool)
-            and transferred_files > 0
-        ):
-            noun = "file" if transferred_files == 1 else "files"
-            moved += f" · {transferred_files:,} {noun}"
-        manifest = row.get("artifact_manifest_sha256")
-        if isinstance(manifest, str):
-            moved += f" · manifest {manifest[:12]}"
-        duration = row.get("duration_s")
-        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
-            moved += f" · {_fmt_short_duration(float(duration))}"
-        if plan:
-            if moved == "no changed bytes":
-                moved = "no changes"
-            elif not moved.startswith("no changed bytes"):
-                moved = f"would transfer {moved}"
-            err.print(
-                f"[cyan]plan[/cyan] {escape(name)}  {escape(moved)}  "
-                f"[dim]{escape(str(row['path']))}[/dim]"
-            )
-        else:
-            err.print(
-                f"[green]synced[/green] {escape(name)}  {escape(moved)}  "
-                f"[dim]{escape(str(row['path']))}[/dim]"
-            )
+        _print_sync_row(name, row, plan=plan)
     if json_:
         print(json.dumps(rows))
     if failure_codes:
@@ -18761,6 +19080,148 @@ def _inspect_control_route(
     return row, warning
 
 
+def _topology_site_edges(
+    discovery: TopologyDiscovery,
+    configured_site: Site,
+    *,
+    source: str | None,
+    destination: str | None,
+    max_edges: int,
+    measure: bool,
+    json_: bool,
+) -> list[JsonDict]:
+    """Discover (and optionally measure) one site's edges as report rows."""
+    try:
+        discovered = discovery.discover_edges(
+            configured_site,
+            source=source,
+            destination=destination,
+            max_edges=max_edges,
+        )
+    except TopologyDiscoveryError as exc:
+        _fail_submission(
+            kind="topology_discovery_failed",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if measure:
+        registry = discovery.topology
+        for probe_edge in discovered:
+            if probe_edge.status != "direct":
+                continue
+            try:
+                discovery.measure_route(
+                    registry.node(probe_edge.source),
+                    registry.node(probe_edge.destination),
+                )
+            except TopologyDiscoveryError as exc:
+                err.print(
+                    f"[yellow]measure {escape(probe_edge.source)} → "
+                    f"{escape(probe_edge.destination)}: "
+                    f"{escape(str(exc))}[/yellow]"
+                )
+    edges = [asdict(discovered_edge) for discovered_edge in discovered]
+    for edge_row in edges:
+        if edge_row["status"] == "direct":
+            edge_row.update(
+                _topology_edge_sample(
+                    discovery,
+                    site_link_scope(configured_site),
+                    str(edge_row["source"]),
+                    str(edge_row["destination"]),
+                )
+            )
+    return edges
+
+
+def _topology_site_row(configured_site: Site, edges: list[JsonDict]) -> JsonDict:
+    return {
+        "site": configured_site.name,
+        "artifact_policy": configured_site.artifact_policy,
+        "gateway": configured_site.gateway,
+        "cache_node": configured_site.cache_node,
+        "route_circuit": {
+            "failures": configured_site.route_circuit_failures,
+            "cooldown_s": configured_site.route_circuit_cooldown_s,
+            "max_cooldown_s": configured_site.route_circuit_max_cooldown_s,
+        },
+        "nodes": list(configured_site.nodes),
+        "edges": edges,
+    }
+
+
+def _print_topology_report(
+    site_rows: list[JsonDict],
+    control_rows: list[JsonDict],
+) -> None:
+    """Human rendering of the site edges and head control routes."""
+
+    def throughput_suffix(row: JsonDict) -> str:
+        rate = row.get("throughput_mib_s")
+        if rate is None:
+            return ""
+        age = float(row.get("throughput_age_s") or 0.0)
+        if age < 90:
+            age_text = "now"
+        elif age < 5400:
+            age_text = f"{age / 60:.0f}m ago"
+        else:
+            age_text = f"{age / 3600:.1f}h ago"
+        origin = escape(str(row.get("throughput_origin") or "transfer"))
+        return f"  {float(rate):.1f} MiB/s [dim]({origin}, {age_text})[/dim]"
+
+    if not site_rows:
+        out.print("[dim]No sites configured; artifact routing is direct.[/dim]")
+    for site_row in site_rows:
+        out.print(
+            f"[bold]{escape(str(site_row['site']))}[/bold] · "
+            f"{escape(str(site_row['artifact_policy']))} · "
+            f"gateway {escape(str(site_row['gateway']))}"
+        )
+        edges = cast(list[JsonDict], site_row["edges"])
+        if not edges:
+            out.print("  [dim]single-node site[/dim]")
+            continue
+        for edge in edges:
+            source = escape(str(edge["source"]))
+            destination = escape(str(edge["destination"]))
+            if edge["status"] == "direct":
+                latency = float(edge["latency_ms"])
+                endpoint = escape(str(edge["endpoint"]))
+                origin = escape(str(edge["endpoint_origin"]))
+                out.print(
+                    f"  [green]direct[/green] {source} → {destination}  "
+                    f"{latency:.1f}ms  {endpoint}  [dim]{origin}[/dim]"
+                    f"{throughput_suffix(edge)}"
+                )
+            else:
+                kind = escape(str(edge["error_kind"] or "unavailable"))
+                out.print(
+                    f"  [yellow]unavailable[/yellow] {source} → "
+                    f"{destination}  [dim]{kind}[/dim]"
+                )
+    if control_rows:
+        out.print("[bold]control routes[/bold] · head → node (operator SSH)")
+        style_by_class = {
+            "local": "dim",
+            "direct": "green",
+            "opaque": "yellow",
+            "proxied": "magenta",
+            "relayed": "red",
+            "unreachable": "red",
+        }
+        for row in control_rows:
+            label = str(row.get("link_class") or "opaque")
+            style = style_by_class.get(label, "yellow")
+            out.print(
+                f"  [{style}]{escape(label)}[/{style}] head → "
+                f"{escape(str(row.get('node')))}"
+                f"{throughput_suffix(row)}  "
+                f"[dim]{escape(str(row.get('evidence') or ''))}[/dim]"
+            )
+
+
 def topology(
     site: Optional[str] = typer.Option(
         None,
@@ -18860,64 +19321,18 @@ def topology(
     direct_edges = 0
     unavailable_edges = 0
     for configured_site in selected:
-        try:
-            discovered = discovery.discover_edges(
-                configured_site,
-                source=source,
-                destination=destination,
-                max_edges=max_edges,
-            )
-        except TopologyDiscoveryError as exc:
-            _fail_submission(
-                kind="topology_discovery_failed",
-                message=str(exc),
-                exit_code=1,
-                json_=json_,
-            )
-        if measure:
-            registry = discovery.topology
-            for probe_edge in discovered:
-                if probe_edge.status != "direct":
-                    continue
-                try:
-                    discovery.measure_route(
-                        registry.node(probe_edge.source),
-                        registry.node(probe_edge.destination),
-                    )
-                except TopologyDiscoveryError as exc:
-                    err.print(
-                        f"[yellow]measure {escape(probe_edge.source)} → "
-                        f"{escape(probe_edge.destination)}: "
-                        f"{escape(str(exc))}[/yellow]"
-                    )
-        edges = [asdict(discovered_edge) for discovered_edge in discovered]
-        for edge_row in edges:
-            if edge_row["status"] == "direct":
-                edge_row.update(
-                    _topology_edge_sample(
-                        discovery,
-                        site_link_scope(configured_site),
-                        str(edge_row["source"]),
-                        str(edge_row["destination"]),
-                    )
-                )
+        edges = _topology_site_edges(
+            discovery,
+            configured_site,
+            source=source,
+            destination=destination,
+            max_edges=max_edges,
+            measure=measure,
+            json_=json_,
+        )
         direct_edges += sum(edge_row["status"] == "direct" for edge_row in edges)
         unavailable_edges += sum(edge_row["status"] != "direct" for edge_row in edges)
-        site_rows.append(
-            {
-                "site": configured_site.name,
-                "artifact_policy": configured_site.artifact_policy,
-                "gateway": configured_site.gateway,
-                "cache_node": configured_site.cache_node,
-                "route_circuit": {
-                    "failures": configured_site.route_circuit_failures,
-                    "cooldown_s": configured_site.route_circuit_cooldown_s,
-                    "max_cooldown_s": (configured_site.route_circuit_max_cooldown_s),
-                },
-                "nodes": list(configured_site.nodes),
-                "edges": edges,
-            }
-        )
+        site_rows.append(_topology_site_row(configured_site, edges))
     # Control routes: how the head itself reaches each node. This is where a
     # low-bandwidth frp/jump tunnel hides; classify it from evidence and show
     # any measured throughput so operators know what bulk data would ride.
@@ -18985,69 +19400,7 @@ def topology(
         print(json.dumps(payload))
         return
 
-    def throughput_suffix(row: JsonDict) -> str:
-        rate = row.get("throughput_mib_s")
-        if rate is None:
-            return ""
-        age = float(row.get("throughput_age_s") or 0.0)
-        if age < 90:
-            age_text = "now"
-        elif age < 5400:
-            age_text = f"{age / 60:.0f}m ago"
-        else:
-            age_text = f"{age / 3600:.1f}h ago"
-        origin = escape(str(row.get("throughput_origin") or "transfer"))
-        return f"  {float(rate):.1f} MiB/s [dim]({origin}, {age_text})[/dim]"
-
-    if not site_rows:
-        out.print("[dim]No sites configured; artifact routing is direct.[/dim]")
-    for site_row in site_rows:
-        out.print(
-            f"[bold]{escape(str(site_row['site']))}[/bold] · "
-            f"{escape(str(site_row['artifact_policy']))} · "
-            f"gateway {escape(str(site_row['gateway']))}"
-        )
-        edges = cast(list[JsonDict], site_row["edges"])
-        if not edges:
-            out.print("  [dim]single-node site[/dim]")
-            continue
-        for edge in edges:
-            source = escape(str(edge["source"]))
-            destination = escape(str(edge["destination"]))
-            if edge["status"] == "direct":
-                latency = float(edge["latency_ms"])
-                endpoint = escape(str(edge["endpoint"]))
-                origin = escape(str(edge["endpoint_origin"]))
-                out.print(
-                    f"  [green]direct[/green] {source} → {destination}  "
-                    f"{latency:.1f}ms  {endpoint}  [dim]{origin}[/dim]"
-                    f"{throughput_suffix(edge)}"
-                )
-            else:
-                kind = escape(str(edge["error_kind"] or "unavailable"))
-                out.print(
-                    f"  [yellow]unavailable[/yellow] {source} → "
-                    f"{destination}  [dim]{kind}[/dim]"
-                )
-    if control_rows:
-        out.print("[bold]control routes[/bold] · head → node (operator SSH)")
-        style_by_class = {
-            "local": "dim",
-            "direct": "green",
-            "opaque": "yellow",
-            "proxied": "magenta",
-            "relayed": "red",
-            "unreachable": "red",
-        }
-        for row in control_rows:
-            label = str(row.get("link_class") or "opaque")
-            style = style_by_class.get(label, "yellow")
-            out.print(
-                f"  [{style}]{escape(label)}[/{style}] head → "
-                f"{escape(str(row.get('node')))}"
-                f"{throughput_suffix(row)}  "
-                f"[dim]{escape(str(row.get('evidence') or ''))}[/dim]"
-            )
+    _print_topology_report(site_rows, control_rows)
 
 
 _DOCTOR_DEPENDENCIES = (
@@ -19527,6 +19880,101 @@ def _find(ref: str) -> None:
     print(json.dumps(jobs_mod.public_job_record(entry)))
 
 
+def _report_group_request(
+    cfg: HeadConfig,
+    group_record: group_mod.GroupRequestRecord,
+    *,
+    request_id: str,
+    inspection_in_progress: bool,
+    json_: bool,
+) -> None:
+    """`dt request` for a multi-job (batch/chain/matrix/repeat) request."""
+    try:
+        group_entries = group_mod.load_entries_or_fail(cfg, group_record)
+    except group_mod.GroupRequestError as exc:
+        _fail_submission(
+            kind="request_state_damaged",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    next_index = group_record.submitted + 1
+    unresolved: JsonDict | None = None
+    if next_index <= group_record.requested:
+        child_request_id = group_mod.item_request_id(request_id, next_index)
+        try:
+            child_record = intent_mod.load(cfg, child_request_id)
+        except intent_mod.RequestRecordError as exc:
+            _fail_submission(
+                kind="request_state_damaged",
+                message=str(exc),
+                exit_code=1,
+                json_=json_,
+            )
+        if child_record is not None:
+            child_entry = jobs_mod.load(cfg, child_record.job_id)
+            unresolved = {
+                "index": next_index,
+                "request_id": child_request_id,
+                "state": child_record.state,
+                "job_id": child_record.job_id,
+                "job_found": child_entry is not None,
+            }
+    group_payload: JsonDict = asdict(group_record)
+    group_payload["schema_version"] = group_payload.get("schema")
+    group_payload["job_ids"] = [entry.job_id for entry in group_entries]
+    group_payload["submitted"] = len(group_entries)
+    group_payload["jobs"] = [
+        {
+            "index": index,
+            "job_id": group_entry.job_id,
+            "status": group_entry.status,
+            "node": group_entry.node,
+            "reason": group_entry.reason,
+            "exit_code": group_entry.exit_code,
+        }
+        for index, group_entry in enumerate(group_entries, start=1)
+    ]
+    group_payload["next_index"] = (
+        next_index if next_index <= group_record.requested else None
+    )
+    group_payload["unresolved_child"] = unresolved
+    group_payload["inspection_in_progress"] = inspection_in_progress
+    group_payload["retry_with_same_request_id"] = (
+        group_record.state not in group_mod.GROUP_TERMINAL_STATES
+    )
+    if json_:
+        print(json.dumps(group_payload))
+        return
+    state_style = {
+        "confirmed": "green",
+        "prepared": "cyan",
+        "preparing": "yellow",
+        "rejected": "red",
+        "uncertain": "yellow",
+    }[group_record.state]
+    out.print(
+        f"[{state_style}]{group_record.state}[/{state_style}] "
+        f"{escape(group_record.request_id)} · {group_record.operation} · "
+        f"{len(group_entries)}/{group_record.requested} jobs"
+    )
+    if unresolved is not None:
+        err.print(
+            "[yellow]next child outcome is unresolved; retry the exact "
+            "original command with the same request id[/yellow]"
+        )
+    elif group_record.state == "rejected":
+        err.print(
+            "[red]this request was durably rejected; inspect the failure "
+            "and use a new request id[/red]"
+        )
+    elif group_record.state != "confirmed":
+        err.print(
+            "[yellow]retry the exact original command with the same "
+            "request id to resume from this prefix[/yellow]"
+        )
+
+
 def request_status(
     request_id: str = typer.Argument(..., help="durable submission request id"),
     center: Optional[str] = typer.Option(
@@ -19603,90 +20051,13 @@ def request_status(
             json_=json_,
         )
     if group_record is not None:
-        try:
-            group_entries = group_mod.load_entries_or_fail(cfg, group_record)
-        except group_mod.GroupRequestError as exc:
-            _fail_submission(
-                kind="request_state_damaged",
-                message=str(exc),
-                exit_code=1,
-                json_=json_,
-            )
-        next_index = group_record.submitted + 1
-        unresolved: JsonDict | None = None
-        if next_index <= group_record.requested:
-            child_request_id = group_mod.item_request_id(request_id, next_index)
-            try:
-                child_record = intent_mod.load(cfg, child_request_id)
-            except intent_mod.RequestRecordError as exc:
-                _fail_submission(
-                    kind="request_state_damaged",
-                    message=str(exc),
-                    exit_code=1,
-                    json_=json_,
-                )
-            if child_record is not None:
-                child_entry = jobs_mod.load(cfg, child_record.job_id)
-                unresolved = {
-                    "index": next_index,
-                    "request_id": child_request_id,
-                    "state": child_record.state,
-                    "job_id": child_record.job_id,
-                    "job_found": child_entry is not None,
-                }
-        group_payload: JsonDict = asdict(group_record)
-        group_payload["schema_version"] = group_payload.get("schema")
-        group_payload["job_ids"] = [entry.job_id for entry in group_entries]
-        group_payload["submitted"] = len(group_entries)
-        group_payload["jobs"] = [
-            {
-                "index": index,
-                "job_id": group_entry.job_id,
-                "status": group_entry.status,
-                "node": group_entry.node,
-                "reason": group_entry.reason,
-                "exit_code": group_entry.exit_code,
-            }
-            for index, group_entry in enumerate(group_entries, start=1)
-        ]
-        group_payload["next_index"] = (
-            next_index if next_index <= group_record.requested else None
+        _report_group_request(
+            cfg,
+            group_record,
+            request_id=request_id,
+            inspection_in_progress=inspection_in_progress,
+            json_=json_,
         )
-        group_payload["unresolved_child"] = unresolved
-        group_payload["inspection_in_progress"] = inspection_in_progress
-        group_payload["retry_with_same_request_id"] = (
-            group_record.state not in group_mod.GROUP_TERMINAL_STATES
-        )
-        if json_:
-            print(json.dumps(group_payload))
-            return
-        state_style = {
-            "confirmed": "green",
-            "prepared": "cyan",
-            "preparing": "yellow",
-            "rejected": "red",
-            "uncertain": "yellow",
-        }[group_record.state]
-        out.print(
-            f"[{state_style}]{group_record.state}[/{state_style}] "
-            f"{escape(group_record.request_id)} · {group_record.operation} · "
-            f"{len(group_entries)}/{group_record.requested} jobs"
-        )
-        if unresolved is not None:
-            err.print(
-                "[yellow]next child outcome is unresolved; retry the exact "
-                "original command with the same request id[/yellow]"
-            )
-        elif group_record.state == "rejected":
-            err.print(
-                "[red]this request was durably rejected; inspect the failure "
-                "and use a new request id[/red]"
-            )
-        elif group_record.state != "confirmed":
-            err.print(
-                "[yellow]retry the exact original command with the same "
-                "request id to resume from this prefix[/yellow]"
-            )
         return
     if record is None:
         if inspection_in_progress:
