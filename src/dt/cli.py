@@ -2417,6 +2417,96 @@ def _emit_submission(
     print(entry.job_id)  # bare id, last stdout line: agents rely on this
 
 
+def _resolve_laptop_run_center(
+    cfg: LaptopConfig,
+    *,
+    dependency_ref: str | None,
+    request_id: str | None,
+    plan: bool,
+    require_path: str | None,
+    gpus: int,
+    require_disk_gib: int | None,
+    min_vram_mib: int | None,
+    node: str | None,
+    json_: bool,
+) -> tuple[str, str | None]:
+    """Resolve ``-c auto`` for `dt run`.
+
+    A dependency pins the submission to the head that owns it (returned as
+    the resolved reference); otherwise every center is probed for capacity.
+    """
+    if dependency_ref is not None:
+        # A dependency is owned by exactly one head.  Route the dependent
+        # submission to that same authority before doing any capacity
+        # probing; choosing an unrelated freer center would make the
+        # head-local dependency impossible to resolve.
+        center, resolved_ref = _locate(cfg, dependency_ref, json_=json_)
+        err.print(
+            f"[dim]dependency belongs to center [bold]{escape(center)}[/bold][/dim]"
+        )
+        return center, resolved_ref
+    if request_id and not plan:
+        # Retry-safe submission stores its receipt on one chosen head.
+        # `-c auto` re-runs center selection on every attempt, so a retry
+        # can land on a different center and start a second job. Read-only
+        # plans create no receipt and therefore remain safe.
+        _fail_submission(
+            kind="invalid_request",
+            message=(
+                "-c auto cannot be combined with --request-id: a retry "
+                "may select a different center and duplicate the job; "
+                "pick an explicit center for idempotent submission"
+            ),
+            exit_code=2,
+            json_=json_,
+        )
+    if require_path:
+        err.print(
+            "[red]-c auto cannot honor --require-path: data lives in one "
+            "center, pick it explicitly[/red]"
+        )
+        raise typer.Exit(1)
+    from .remote import best_center
+
+    with err.status("probing all centers..."):
+        raw_rows, errors = fan_json(cfg, ["free", "--scheduler-context"])
+        rows = cast(list[JsonDict], raw_rows)
+    picked = best_center(
+        rows,
+        gpus,
+        require_disk_gib=require_disk_gib or 0,
+        min_vram_mib=min_vram_mib,
+        node=node,
+        require_scheduling_contract=True,
+    )
+    if picked is None:
+        if errors:
+            code = _fan_failure_exit_code(errors)
+            _fail_submission(
+                kind=(
+                    "unreachable"
+                    if code == EXIT_UNREACHABLE
+                    else "capacity_probe_failed"
+                ),
+                message=(
+                    "cannot select a center: every capacity probe failed"
+                    if set(errors) == set(cfg.centers)
+                    else "cannot select a center: some capacity probes failed"
+                ),
+                reasons=errors,
+                exit_code=code,
+                json_=json_,
+            )
+        _fail_submission(
+            kind="no_capacity",
+            message=f"no reachable center has {gpus} free card(s) on one node",
+            exit_code=EXIT_NO_GPU,
+            json_=json_,
+        )
+    err.print(f"[dim]auto-selected center [bold]{escape(picked)}[/bold][/dim]")
+    return picked, None
+
+
 def run(
     ctx: typer.Context,
     gpus: int = typer.Option(
@@ -2715,90 +2805,25 @@ def run(
         )
         if center == "auto":
             dependency_ref = after_success or after_complete or after_result
-            if dependency_ref is not None:
-                # A dependency is owned by exactly one head.  Route the
-                # dependent submission to that same authority before doing
-                # any capacity probing; choosing an unrelated freer center
-                # would make the head-local dependency impossible to resolve.
-                center, resolved_ref = _locate(cfg, dependency_ref, json_=json_)
+            center, resolved_ref = _resolve_laptop_run_center(
+                cfg,
+                dependency_ref=dependency_ref,
+                request_id=request_id,
+                plan=plan,
+                require_path=require_path,
+                gpus=gpus,
+                require_disk_gib=require_disk_gib,
+                min_vram_mib=min_vram_mib,
+                node=node,
+                json_=json_,
+            )
+            if resolved_ref is not None:
                 if after_success is not None:
                     after_success = resolved_ref
                 elif after_complete is not None:
                     after_complete = resolved_ref
                 else:
                     after_result = resolved_ref
-                err.print(
-                    f"[dim]dependency belongs to center "
-                    f"[bold]{escape(center)}[/bold][/dim]"
-                )
-            elif request_id and not plan:
-                # Retry-safe submission stores its receipt on one chosen head.
-                # `-c auto` re-runs center selection on every attempt, so a
-                # retry can land on a different center and start a second job.
-                # Read-only plans create no receipt and therefore remain safe.
-                _fail_submission(
-                    kind="invalid_request",
-                    message=(
-                        "-c auto cannot be combined with --request-id: a retry "
-                        "may select a different center and duplicate the job; "
-                        "pick an explicit center for idempotent submission"
-                    ),
-                    exit_code=2,
-                    json_=json_,
-                )
-            if dependency_ref is None and require_path:
-                err.print(
-                    "[red]-c auto cannot honor --require-path: data lives in one "
-                    "center, pick it explicitly[/red]"
-                )
-                raise typer.Exit(1)
-            if dependency_ref is None:
-                from .remote import best_center
-
-                with err.status("probing all centers..."):
-                    raw_rows, errors = fan_json(cfg, ["free", "--scheduler-context"])
-                    rows = cast(list[JsonDict], raw_rows)
-                picked = best_center(
-                    rows,
-                    gpus,
-                    require_disk_gib=require_disk_gib or 0,
-                    min_vram_mib=min_vram_mib,
-                    node=node,
-                    require_scheduling_contract=True,
-                )
-                if picked is None:
-                    if errors:
-                        code = _fan_failure_exit_code(errors)
-                        _fail_submission(
-                            kind=(
-                                "unreachable"
-                                if code == EXIT_UNREACHABLE
-                                else "capacity_probe_failed"
-                            ),
-                            message=(
-                                "cannot select a center: every capacity probe failed"
-                                if set(errors) == set(cfg.centers)
-                                else (
-                                    "cannot select a center: some capacity probes "
-                                    "failed"
-                                )
-                            ),
-                            reasons=errors,
-                            exit_code=code,
-                            json_=json_,
-                        )
-                    _fail_submission(
-                        kind="no_capacity",
-                        message=(
-                            f"no reachable center has {gpus} free card(s) on one node"
-                        ),
-                        exit_code=EXIT_NO_GPU,
-                        json_=json_,
-                    )
-                err.print(
-                    f"[dim]auto-selected center [bold]{escape(picked)}[/bold][/dim]"
-                )
-                center = picked
         route = (
             _head_command(cfg, center, "run")
             .option("-g", gpus)
