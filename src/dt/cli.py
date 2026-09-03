@@ -150,6 +150,20 @@ from .render import (
 )
 from . import pull_relay
 from . import sync_relay
+from .link_metrics import (
+    CONTROL_LINK_SCOPE,
+    MIN_SAMPLE_SECONDS,
+    LinkMetricsError,
+    site_link_scope,
+)
+from . import topology_discovery as topology_discovery_mod
+from .topology_discovery import (
+    BANDWIDTH_PROBE_ESCALATE_UNDER_S,
+    BANDWIDTH_PROBE_LARGE_BYTES,
+    BANDWIDTH_PROBE_SMALL_BYTES,
+    TopologyDiscovery,
+    TopologyDiscoveryError,
+)
 from . import evidence as evidence_mod
 from .sshio import (
     MAX_TRANSFER_RETRIES,
@@ -18447,6 +18461,94 @@ def seed(
 # --------------------------------------------------------------------------
 
 
+def _topology_edge_sample(
+    discovery: TopologyDiscovery,
+    scope: str,
+    edge_source: str,
+    edge_destination: str,
+) -> JsonDict:
+    """Recorded throughput for one link, or {} when nothing usable is known."""
+    try:
+        sample = discovery.link_metrics.sample(scope, edge_source, edge_destination)
+    except LinkMetricsError:
+        return {}
+    if sample is None:
+        return {}
+    return {
+        "throughput_mib_s": round(sample.smoothed_bps / (1 << 20), 2),
+        "throughput_origin": sample.origin,
+        "throughput_age_s": round(sample.age_s(), 1),
+    }
+
+
+def _inspect_control_route(
+    discovery: TopologyDiscovery,
+    node: Node,
+    *,
+    head_addresses: frozenset[str],
+    measure: bool,
+) -> tuple[JsonDict, str | None]:
+    """Classify how the head reaches ``node``; optionally probe its bandwidth.
+
+    Returns the report row and a measurement warning, if any.
+    """
+    client_address = None
+    server_address = None
+    if not node.local:
+        try:
+            advertisement = discovery.advertise(node)
+            client_address = advertisement.ssh_client_address
+            server_address = advertisement.ssh_server_address
+        except TopologyDiscoveryError as exc:
+            return (
+                {
+                    "node": node.name,
+                    "link_class": "unreachable",
+                    "evidence": str(exc),
+                },
+                None,
+            )
+    route_class = topology_discovery_mod.classify_control_route(
+        node,
+        client_address=client_address,
+        server_address=server_address,
+        ssh_options=topology_discovery_mod.resolved_ssh_options(node),
+        head_addresses=head_addresses,
+    )
+    row: JsonDict = {
+        "node": node.name,
+        "link_class": route_class.label,
+        "evidence": route_class.evidence,
+    }
+    warning: str | None = None
+    if measure and not node.local:
+        try:
+            moved, elapsed = topology_discovery_mod.measure_control_route(
+                node,
+                probe_bytes=BANDWIDTH_PROBE_SMALL_BYTES,
+            )
+            if elapsed < BANDWIDTH_PROBE_ESCALATE_UNDER_S:
+                moved, elapsed = topology_discovery_mod.measure_control_route(
+                    node,
+                    probe_bytes=BANDWIDTH_PROBE_LARGE_BYTES,
+                )
+            discovery.link_metrics.record(
+                CONTROL_LINK_SCOPE,
+                "head",
+                node.name,
+                transferred_bytes=moved,
+                elapsed_seconds=max(elapsed, MIN_SAMPLE_SECONDS),
+                origin="probe",
+            )
+        except (TopologyDiscoveryError, LinkMetricsError) as exc:
+            warning = str(exc)
+    if not node.local:
+        row.update(
+            _topology_edge_sample(discovery, CONTROL_LINK_SCOPE, "head", node.name)
+        )
+    return row, warning
+
+
 def topology(
     site: Optional[str] = typer.Option(
         None,
@@ -18520,35 +18622,9 @@ def topology(
             json_=json_,
         )
 
-    from .link_metrics import (
-        CONTROL_LINK_SCOPE,
-        LinkMetricsError,
-        site_link_scope,
-    )
     from .topology import TopologyRegistry
-    from .topology_discovery import (
-        TopologyDiscovery,
-        TopologyDiscoveryError,
-        classify_control_route,
-        local_interface_addresses,
-        measure_control_route,
-        resolved_ssh_options,
-    )
 
     discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
-
-    def edge_sample(scope: str, edge_source: str, edge_destination: str) -> JsonDict:
-        try:
-            sample = discovery.link_metrics.sample(scope, edge_source, edge_destination)
-        except LinkMetricsError:
-            return {}
-        if sample is None:
-            return {}
-        return {
-            "throughput_mib_s": round(sample.smoothed_bps / (1 << 20), 2),
-            "throughput_origin": sample.origin,
-            "throughput_age_s": round(sample.age_s(), 1),
-        }
 
     selected = [cfg.sites[site]] if site is not None else list(cfg.sites.values())
     if source is not None or destination is not None:
@@ -18606,7 +18682,8 @@ def topology(
         for edge_row in edges:
             if edge_row["status"] == "direct":
                 edge_row.update(
-                    edge_sample(
+                    _topology_edge_sample(
+                        discovery,
                         site_link_scope(configured_site),
                         str(edge_row["source"]),
                         str(edge_row["destination"]),
@@ -18646,7 +18723,7 @@ def topology(
         ]
     else:
         control_scope = [node.name for node in cfg.nodes]
-    head_addresses = local_interface_addresses()
+    head_addresses = topology_discovery_mod.local_interface_addresses()
     control_nodes: list[Node] = []
     seen_control: set[str] = set()
     for name in control_scope:
@@ -18659,66 +18736,9 @@ def topology(
         control_nodes.append(node)
 
     def inspect_control_route(node: Node) -> tuple[JsonDict, str | None]:
-        client_address = None
-        server_address = None
-        if not node.local:
-            try:
-                advertisement = discovery.advertise(node)
-                client_address = advertisement.ssh_client_address
-                server_address = advertisement.ssh_server_address
-            except TopologyDiscoveryError as exc:
-                return (
-                    {
-                        "node": node.name,
-                        "link_class": "unreachable",
-                        "evidence": str(exc),
-                    },
-                    None,
-                )
-        route_class = classify_control_route(
-            node,
-            client_address=client_address,
-            server_address=server_address,
-            ssh_options=resolved_ssh_options(node),
-            head_addresses=head_addresses,
+        return _inspect_control_route(
+            discovery, node, head_addresses=head_addresses, measure=measure
         )
-        row: JsonDict = {
-            "node": node.name,
-            "link_class": route_class.label,
-            "evidence": route_class.evidence,
-        }
-        warning: str | None = None
-        if measure and not node.local:
-            from .topology_discovery import (
-                BANDWIDTH_PROBE_ESCALATE_UNDER_S,
-                BANDWIDTH_PROBE_LARGE_BYTES,
-                BANDWIDTH_PROBE_SMALL_BYTES,
-            )
-            from .link_metrics import MIN_SAMPLE_SECONDS
-
-            try:
-                moved, elapsed = measure_control_route(
-                    node,
-                    probe_bytes=BANDWIDTH_PROBE_SMALL_BYTES,
-                )
-                if elapsed < BANDWIDTH_PROBE_ESCALATE_UNDER_S:
-                    moved, elapsed = measure_control_route(
-                        node,
-                        probe_bytes=BANDWIDTH_PROBE_LARGE_BYTES,
-                    )
-                discovery.link_metrics.record(
-                    CONTROL_LINK_SCOPE,
-                    "head",
-                    node.name,
-                    transferred_bytes=moved,
-                    elapsed_seconds=max(elapsed, MIN_SAMPLE_SECONDS),
-                    origin="probe",
-                )
-            except (TopologyDiscoveryError, LinkMetricsError) as exc:
-                warning = str(exc)
-        if not node.local:
-            row.update(edge_sample(CONTROL_LINK_SCOPE, "head", node.name))
-        return row, warning
 
     if len(control_nodes) <= 1:
         inspected_controls = [inspect_control_route(node) for node in control_nodes]
