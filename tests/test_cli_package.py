@@ -77,3 +77,18 @@ def test_command_module_commands_are_registered_on_the_root_app(module_name):
     short = module_name.rsplit(".", 1)[-1]
     assert registered[short] is getattr(module, short)
     assert getattr(cli, short) is getattr(module, short)
+
+
+@pytest.mark.parametrize("module_name", _command_modules())
+def test_command_module_text_never_leaks_the_root_binding(module_name):
+    """`_root.` is an implementation seam; it must never reach a user-facing string."""
+    module = importlib.import_module(module_name)
+    tree = ast.parse(Path(module.__file__).read_text())
+    leaked = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "_root." in node.value
+    ]
+    assert not leaked, leaked

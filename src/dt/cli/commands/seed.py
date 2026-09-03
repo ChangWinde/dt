@@ -32,7 +32,7 @@ from .. import (
 
 
 def _local_tree_apparent_bytes(path: Path) -> int:
-    """Return local source bytes as _root.rsync will see them, counting hard links.
+    """Return local source bytes as rsync will see them, counting hard links.
 
     GNU du is much faster than a Python walk for a warm multi-gigabyte uv
     cache. The fallback keeps seed usable on unusual head-node installations.
@@ -226,9 +226,7 @@ class _SeedRequest:
             else:
                 assert proc is not None
                 detail = (
-                    proc.stderr
-                    or proc.stdout
-                    or f"_root.rsync exited {proc.returncode}"
+                    proc.stderr or proc.stdout or f"rsync exited {proc.returncode}"
                 ).strip()
                 code = (
                     EXIT_UNREACHABLE
@@ -315,7 +313,7 @@ def seed(
 
     Copies the uv wheel cache and managed Python runtimes from this head.
     Optionally includes Hugging Face model caches. `dt doctor` identifies slow
-    nodes. Idempotent: _root.rsync moves only missing or changed files.
+    nodes. Idempotent: rsync moves only missing or changed files.
     """
     retries = _validated_retries(
         retries,
@@ -465,7 +463,7 @@ def seed(
             err.print(
                 "[dim]local source "
                 f"{_format_source_bytes(source_bytes)} per target; "
-                "_root.rsync transfers only missing/changed data[/dim]"
+                "rsync transfers only missing/changed data[/dim]"
             )
             with err.status(f"seeding caches -> {', '.join(names)}..."):
                 rows = run_all()
