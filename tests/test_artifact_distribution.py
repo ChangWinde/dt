@@ -1370,7 +1370,10 @@ def test_topology_cold_upload_unlocks_parallel_destination_fanout(
         return 100, 4
 
     def transfer(self, route, *args, **kwargs):
-        fanout_started.wait(timeout=1)
+        # Both destinations must reach this point concurrently; a serialized
+        # executor would never release the barrier, so the timeout only needs
+        # to outlast scheduling jitter on a loaded machine, not shape the test.
+        fanout_started.wait(timeout=30)
         return 20, 2
 
     monkeypatch.setattr(module.TopologyDiscovery, "replicas", replicas)
