@@ -17655,6 +17655,100 @@ def _format_source_bytes(value: int) -> str:
     return "0 B" if value == 0 else _format_transfer_bytes(value)
 
 
+@dataclass(frozen=True)
+class _SyncRequest:
+    """What one `dt sync` run ships to each node, and how."""
+
+    project_name: str
+    project_path: Path
+    artifacts: list[str]
+    plan: bool
+    retries: int
+    route: str
+    bwlimit: int | None
+
+    def sync_node(
+        self,
+        cfg: HeadConfig,
+        node: Node,
+        *,
+        cancel_event: Event,
+    ) -> tuple[JsonDict, int | None, list[str]]:
+        """Sync one node; returns (row, failure exit code, human messages)."""
+        # Resolved at call time so tests can stub dispatch.sync_* per case.
+        from .dispatch import sync_artifacts, sync_project
+
+        name = node.name
+        messages: list[str] = []
+        retry_events: list[JsonDict] = []
+        started = time.perf_counter()
+        try:
+            if self.artifacts:
+
+                def artifact_progress(message: str) -> None:
+                    err.print(f"[dim]{escape(name)}: {escape(message)}[/dim]")
+
+                row = sync_artifacts(
+                    cfg,
+                    self.project_name,
+                    self.project_path,
+                    node,
+                    self.artifacts,
+                    artifact_progress,
+                    plan=self.plan,
+                    retries=self.retries,
+                    route=self.route,
+                    bwlimit_kbps=self.bwlimit,
+                    on_retry=_rsync_retry_observer(name, "artifact-sync", retry_events),
+                    cancel_event=cancel_event,
+                )
+            else:
+                row = sync_project(
+                    cfg,
+                    self.project_name,
+                    self.project_path,
+                    node,
+                    messages.append,
+                    plan=self.plan,
+                    retries=self.retries,
+                    route=self.route,
+                    bwlimit_kbps=self.bwlimit,
+                    on_retry=_rsync_retry_observer(name, "sync", retry_events),
+                    cancel_event=cancel_event,
+                )
+            row["duration_s"] = max(0.0, time.perf_counter() - started)
+            if retry_events:
+                row["retry_events"] = retry_events
+            return row, None, messages
+        except (DispatchError, RemoteError) as e:
+            duration = max(0.0, time.perf_counter() - started)
+            code = (
+                EXIT_UNREACHABLE
+                if isinstance(e, RemoteError)
+                and (e.exit_code is None or e.exit_code in RSYNC_UNREACHABLE_EXIT_CODES)
+                else 1
+            )
+            message = str(e)
+            return (
+                {
+                    "node": name,
+                    "project": self.project_name,
+                    # Keep the historical free-text field for compatibility,
+                    # while exposing stable fields for machine consumers.
+                    "error": message,
+                    "error_kind": (
+                        "unreachable" if code == EXIT_UNREACHABLE else "sync_failed"
+                    ),
+                    "message": message,
+                    "exit_code": code,
+                    "duration_s": duration,
+                    **({"retry_events": retry_events} if retry_events else {}),
+                },
+                code,
+                messages,
+            )
+
+
 def sync(
     nodes: list[str] = typer.Argument(
         ..., help="compute nodes that should receive project code or artifacts"
@@ -17805,7 +17899,7 @@ def sync(
             )
         raise typer.Exit(rc)
 
-    from .dispatch import resolve_project, sync_artifacts, sync_project
+    from .dispatch import resolve_project
 
     def preflight_error(kind: str, message: str) -> NoReturn:
         if json_:
@@ -17837,104 +17931,18 @@ def sync(
     names = list(dict.fromkeys(nodes))
     cancel_event = Event()
 
-    def sync_one(
-        name: str,
-    ) -> tuple[JsonDict, int | None, list[str]]:
-        node = by_name[name]
-        messages: list[str] = []
-        retry_events: list[JsonDict] = []
-        started = time.perf_counter()
-        try:
-            if artifacts:
-                from rich.markup import escape
+    request = _SyncRequest(
+        project_name=project_name,
+        project_path=project_cfg.path,
+        artifacts=artifacts,
+        plan=plan,
+        retries=retries,
+        route=route,
+        bwlimit=bwlimit,
+    )
 
-                def artifact_progress(message: str) -> None:
-                    err.print(f"[dim]{escape(name)}: {escape(message)}[/dim]")
-
-                row = sync_artifacts(
-                    cfg,
-                    project_name,
-                    project_cfg.path,
-                    node,
-                    artifacts,
-                    artifact_progress,
-                    plan=plan,
-                    retries=retries,
-                    route=route,
-                    bwlimit_kbps=bwlimit,
-                    on_retry=_rsync_retry_observer(
-                        name,
-                        "artifact-sync",
-                        retry_events,
-                    ),
-                    cancel_event=cancel_event,
-                )
-            elif plan:
-                row = sync_project(
-                    cfg,
-                    project_name,
-                    project_cfg.path,
-                    node,
-                    messages.append,
-                    plan=True,
-                    retries=retries,
-                    route=route,
-                    bwlimit_kbps=bwlimit,
-                    on_retry=_rsync_retry_observer(
-                        name,
-                        "sync",
-                        retry_events,
-                    ),
-                    cancel_event=cancel_event,
-                )
-            else:
-                row = sync_project(
-                    cfg,
-                    project_name,
-                    project_cfg.path,
-                    node,
-                    messages.append,
-                    retries=retries,
-                    route=route,
-                    bwlimit_kbps=bwlimit,
-                    on_retry=_rsync_retry_observer(
-                        name,
-                        "sync",
-                        retry_events,
-                    ),
-                    cancel_event=cancel_event,
-                )
-            row["duration_s"] = max(0.0, time.perf_counter() - started)
-            if retry_events:
-                row["retry_events"] = retry_events
-            return row, None, messages
-        except (DispatchError, RemoteError) as e:
-            duration = max(0.0, time.perf_counter() - started)
-            code = (
-                EXIT_UNREACHABLE
-                if isinstance(e, RemoteError)
-                and (e.exit_code is None or e.exit_code in RSYNC_UNREACHABLE_EXIT_CODES)
-                else 1
-            )
-            message = str(e)
-            return (
-                {
-                    "node": name,
-                    "project": project_name,
-                    # Keep the historical free-text field for compatibility,
-                    # while exposing stable fields for machine consumers.
-                    "error": message,
-                    "error_kind": (
-                        "unreachable" if code == EXIT_UNREACHABLE else "sync_failed"
-                    ),
-                    "message": message,
-                    "exit_code": code,
-                    "duration_s": duration,
-                    **({"retry_events": retry_events} if retry_events else {}),
-                },
-                code,
-                messages,
-            )
+    def sync_one(name: str) -> tuple[JsonDict, int | None, list[str]]:
+        return request.sync_node(cfg, by_name[name], cancel_event=cancel_event)
 
     def run_all() -> list[tuple[JsonDict, int | None, list[str]]]:
         if len(names) == 1:
