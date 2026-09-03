@@ -59,6 +59,7 @@ from .config import (
     HeadConfig,
     LaptopConfig,
     Node,
+    Site,
     config_path,
     head_bwlimit_kbps,
     load,
@@ -18021,6 +18022,59 @@ class _SyncRequest:
             )
 
 
+def _sync_transfer_summary(row: JsonDict, *, plan: bool) -> str:
+    """One-line transfer summary: bytes, deletions, files, manifest, duration."""
+    transferred_bytes = row.get("transferred_bytes")
+    gib = row.get("transferred_gib")
+    moved = (
+        _format_transfer_bytes(int(transferred_bytes))
+        if isinstance(transferred_bytes, int)
+        and not isinstance(transferred_bytes, bool)
+        else (
+            "no changed bytes"
+            if gib == 0
+            else (f"{float(gib):.2f} GiB" if gib is not None else "done")
+        )
+    )
+    deleted = row.get("deleted_files")
+    if isinstance(deleted, int) and not isinstance(deleted, bool) and deleted > 0:
+        moved += f" · would delete {deleted:,}" if plan else f" · {deleted:,} deleted"
+    transferred_files = row.get("transferred_files")
+    if (
+        isinstance(transferred_files, int)
+        and not isinstance(transferred_files, bool)
+        and transferred_files > 0
+    ):
+        noun = "file" if transferred_files == 1 else "files"
+        moved += f" · {transferred_files:,} {noun}"
+    manifest = row.get("artifact_manifest_sha256")
+    if isinstance(manifest, str):
+        moved += f" · manifest {manifest[:12]}"
+    duration = row.get("duration_s")
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+        moved += f" · {_fmt_short_duration(float(duration))}"
+    return moved
+
+
+def _print_sync_row(name: str, row: JsonDict, *, plan: bool) -> None:
+    """Human line for one successfully synced (or planned) node."""
+    moved = _sync_transfer_summary(row, plan=plan)
+    if plan:
+        if moved == "no changed bytes":
+            moved = "no changes"
+        elif not moved.startswith("no changed bytes"):
+            moved = f"would transfer {moved}"
+        err.print(
+            f"[cyan]plan[/cyan] {escape(name)}  {escape(moved)}  "
+            f"[dim]{escape(str(row['path']))}[/dim]"
+        )
+    else:
+        err.print(
+            f"[green]synced[/green] {escape(name)}  {escape(moved)}  "
+            f"[dim]{escape(str(row['path']))}[/dim]"
+        )
+
+
 def sync(
     nodes: list[str] = typer.Argument(
         ..., help="compute nodes that should receive project code or artifacts"
@@ -18266,51 +18320,7 @@ def sync(
         if failure_code is not None:
             err.print(f"[red]{escape(name)}: {escape(str(row['error']))}[/red]")
             continue
-        transferred_bytes = row.get("transferred_bytes")
-        gib = row.get("transferred_gib")
-        moved = (
-            _format_transfer_bytes(int(transferred_bytes))
-            if isinstance(transferred_bytes, int)
-            and not isinstance(transferred_bytes, bool)
-            else (
-                "no changed bytes"
-                if gib == 0
-                else (f"{float(gib):.2f} GiB" if gib is not None else "done")
-            )
-        )
-        deleted = row.get("deleted_files")
-        if isinstance(deleted, int) and not isinstance(deleted, bool) and deleted > 0:
-            moved += (
-                f" · would delete {deleted:,}" if plan else f" · {deleted:,} deleted"
-            )
-        transferred_files = row.get("transferred_files")
-        if (
-            isinstance(transferred_files, int)
-            and not isinstance(transferred_files, bool)
-            and transferred_files > 0
-        ):
-            noun = "file" if transferred_files == 1 else "files"
-            moved += f" · {transferred_files:,} {noun}"
-        manifest = row.get("artifact_manifest_sha256")
-        if isinstance(manifest, str):
-            moved += f" · manifest {manifest[:12]}"
-        duration = row.get("duration_s")
-        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
-            moved += f" · {_fmt_short_duration(float(duration))}"
-        if plan:
-            if moved == "no changed bytes":
-                moved = "no changes"
-            elif not moved.startswith("no changed bytes"):
-                moved = f"would transfer {moved}"
-            err.print(
-                f"[cyan]plan[/cyan] {escape(name)}  {escape(moved)}  "
-                f"[dim]{escape(str(row['path']))}[/dim]"
-            )
-        else:
-            err.print(
-                f"[green]synced[/green] {escape(name)}  {escape(moved)}  "
-                f"[dim]{escape(str(row['path']))}[/dim]"
-            )
+        _print_sync_row(name, row, plan=plan)
     if json_:
         print(json.dumps(rows))
     if failure_codes:
@@ -18855,6 +18865,148 @@ def _inspect_control_route(
     return row, warning
 
 
+def _topology_site_edges(
+    discovery: TopologyDiscovery,
+    configured_site: Site,
+    *,
+    source: str | None,
+    destination: str | None,
+    max_edges: int,
+    measure: bool,
+    json_: bool,
+) -> list[JsonDict]:
+    """Discover (and optionally measure) one site's edges as report rows."""
+    try:
+        discovered = discovery.discover_edges(
+            configured_site,
+            source=source,
+            destination=destination,
+            max_edges=max_edges,
+        )
+    except TopologyDiscoveryError as exc:
+        _fail_submission(
+            kind="topology_discovery_failed",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if measure:
+        registry = discovery.topology
+        for probe_edge in discovered:
+            if probe_edge.status != "direct":
+                continue
+            try:
+                discovery.measure_route(
+                    registry.node(probe_edge.source),
+                    registry.node(probe_edge.destination),
+                )
+            except TopologyDiscoveryError as exc:
+                err.print(
+                    f"[yellow]measure {escape(probe_edge.source)} → "
+                    f"{escape(probe_edge.destination)}: "
+                    f"{escape(str(exc))}[/yellow]"
+                )
+    edges = [asdict(discovered_edge) for discovered_edge in discovered]
+    for edge_row in edges:
+        if edge_row["status"] == "direct":
+            edge_row.update(
+                _topology_edge_sample(
+                    discovery,
+                    site_link_scope(configured_site),
+                    str(edge_row["source"]),
+                    str(edge_row["destination"]),
+                )
+            )
+    return edges
+
+
+def _topology_site_row(configured_site: Site, edges: list[JsonDict]) -> JsonDict:
+    return {
+        "site": configured_site.name,
+        "artifact_policy": configured_site.artifact_policy,
+        "gateway": configured_site.gateway,
+        "cache_node": configured_site.cache_node,
+        "route_circuit": {
+            "failures": configured_site.route_circuit_failures,
+            "cooldown_s": configured_site.route_circuit_cooldown_s,
+            "max_cooldown_s": configured_site.route_circuit_max_cooldown_s,
+        },
+        "nodes": list(configured_site.nodes),
+        "edges": edges,
+    }
+
+
+def _print_topology_report(
+    site_rows: list[JsonDict],
+    control_rows: list[JsonDict],
+) -> None:
+    """Human rendering of the site edges and head control routes."""
+
+    def throughput_suffix(row: JsonDict) -> str:
+        rate = row.get("throughput_mib_s")
+        if rate is None:
+            return ""
+        age = float(row.get("throughput_age_s") or 0.0)
+        if age < 90:
+            age_text = "now"
+        elif age < 5400:
+            age_text = f"{age / 60:.0f}m ago"
+        else:
+            age_text = f"{age / 3600:.1f}h ago"
+        origin = escape(str(row.get("throughput_origin") or "transfer"))
+        return f"  {float(rate):.1f} MiB/s [dim]({origin}, {age_text})[/dim]"
+
+    if not site_rows:
+        out.print("[dim]No sites configured; artifact routing is direct.[/dim]")
+    for site_row in site_rows:
+        out.print(
+            f"[bold]{escape(str(site_row['site']))}[/bold] · "
+            f"{escape(str(site_row['artifact_policy']))} · "
+            f"gateway {escape(str(site_row['gateway']))}"
+        )
+        edges = cast(list[JsonDict], site_row["edges"])
+        if not edges:
+            out.print("  [dim]single-node site[/dim]")
+            continue
+        for edge in edges:
+            source = escape(str(edge["source"]))
+            destination = escape(str(edge["destination"]))
+            if edge["status"] == "direct":
+                latency = float(edge["latency_ms"])
+                endpoint = escape(str(edge["endpoint"]))
+                origin = escape(str(edge["endpoint_origin"]))
+                out.print(
+                    f"  [green]direct[/green] {source} → {destination}  "
+                    f"{latency:.1f}ms  {endpoint}  [dim]{origin}[/dim]"
+                    f"{throughput_suffix(edge)}"
+                )
+            else:
+                kind = escape(str(edge["error_kind"] or "unavailable"))
+                out.print(
+                    f"  [yellow]unavailable[/yellow] {source} → "
+                    f"{destination}  [dim]{kind}[/dim]"
+                )
+    if control_rows:
+        out.print("[bold]control routes[/bold] · head → node (operator SSH)")
+        style_by_class = {
+            "local": "dim",
+            "direct": "green",
+            "opaque": "yellow",
+            "proxied": "magenta",
+            "relayed": "red",
+            "unreachable": "red",
+        }
+        for row in control_rows:
+            label = str(row.get("link_class") or "opaque")
+            style = style_by_class.get(label, "yellow")
+            out.print(
+                f"  [{style}]{escape(label)}[/{style}] head → "
+                f"{escape(str(row.get('node')))}"
+                f"{throughput_suffix(row)}  "
+                f"[dim]{escape(str(row.get('evidence') or ''))}[/dim]"
+            )
+
+
 def topology(
     site: Optional[str] = typer.Option(
         None,
@@ -18954,64 +19106,18 @@ def topology(
     direct_edges = 0
     unavailable_edges = 0
     for configured_site in selected:
-        try:
-            discovered = discovery.discover_edges(
-                configured_site,
-                source=source,
-                destination=destination,
-                max_edges=max_edges,
-            )
-        except TopologyDiscoveryError as exc:
-            _fail_submission(
-                kind="topology_discovery_failed",
-                message=str(exc),
-                exit_code=1,
-                json_=json_,
-            )
-        if measure:
-            registry = discovery.topology
-            for probe_edge in discovered:
-                if probe_edge.status != "direct":
-                    continue
-                try:
-                    discovery.measure_route(
-                        registry.node(probe_edge.source),
-                        registry.node(probe_edge.destination),
-                    )
-                except TopologyDiscoveryError as exc:
-                    err.print(
-                        f"[yellow]measure {escape(probe_edge.source)} → "
-                        f"{escape(probe_edge.destination)}: "
-                        f"{escape(str(exc))}[/yellow]"
-                    )
-        edges = [asdict(discovered_edge) for discovered_edge in discovered]
-        for edge_row in edges:
-            if edge_row["status"] == "direct":
-                edge_row.update(
-                    _topology_edge_sample(
-                        discovery,
-                        site_link_scope(configured_site),
-                        str(edge_row["source"]),
-                        str(edge_row["destination"]),
-                    )
-                )
+        edges = _topology_site_edges(
+            discovery,
+            configured_site,
+            source=source,
+            destination=destination,
+            max_edges=max_edges,
+            measure=measure,
+            json_=json_,
+        )
         direct_edges += sum(edge_row["status"] == "direct" for edge_row in edges)
         unavailable_edges += sum(edge_row["status"] != "direct" for edge_row in edges)
-        site_rows.append(
-            {
-                "site": configured_site.name,
-                "artifact_policy": configured_site.artifact_policy,
-                "gateway": configured_site.gateway,
-                "cache_node": configured_site.cache_node,
-                "route_circuit": {
-                    "failures": configured_site.route_circuit_failures,
-                    "cooldown_s": configured_site.route_circuit_cooldown_s,
-                    "max_cooldown_s": (configured_site.route_circuit_max_cooldown_s),
-                },
-                "nodes": list(configured_site.nodes),
-                "edges": edges,
-            }
-        )
+        site_rows.append(_topology_site_row(configured_site, edges))
     # Control routes: how the head itself reaches each node. This is where a
     # low-bandwidth frp/jump tunnel hides; classify it from evidence and show
     # any measured throughput so operators know what bulk data would ride.
@@ -19079,69 +19185,7 @@ def topology(
         print(json.dumps(payload))
         return
 
-    def throughput_suffix(row: JsonDict) -> str:
-        rate = row.get("throughput_mib_s")
-        if rate is None:
-            return ""
-        age = float(row.get("throughput_age_s") or 0.0)
-        if age < 90:
-            age_text = "now"
-        elif age < 5400:
-            age_text = f"{age / 60:.0f}m ago"
-        else:
-            age_text = f"{age / 3600:.1f}h ago"
-        origin = escape(str(row.get("throughput_origin") or "transfer"))
-        return f"  {float(rate):.1f} MiB/s [dim]({origin}, {age_text})[/dim]"
-
-    if not site_rows:
-        out.print("[dim]No sites configured; artifact routing is direct.[/dim]")
-    for site_row in site_rows:
-        out.print(
-            f"[bold]{escape(str(site_row['site']))}[/bold] · "
-            f"{escape(str(site_row['artifact_policy']))} · "
-            f"gateway {escape(str(site_row['gateway']))}"
-        )
-        edges = cast(list[JsonDict], site_row["edges"])
-        if not edges:
-            out.print("  [dim]single-node site[/dim]")
-            continue
-        for edge in edges:
-            source = escape(str(edge["source"]))
-            destination = escape(str(edge["destination"]))
-            if edge["status"] == "direct":
-                latency = float(edge["latency_ms"])
-                endpoint = escape(str(edge["endpoint"]))
-                origin = escape(str(edge["endpoint_origin"]))
-                out.print(
-                    f"  [green]direct[/green] {source} → {destination}  "
-                    f"{latency:.1f}ms  {endpoint}  [dim]{origin}[/dim]"
-                    f"{throughput_suffix(edge)}"
-                )
-            else:
-                kind = escape(str(edge["error_kind"] or "unavailable"))
-                out.print(
-                    f"  [yellow]unavailable[/yellow] {source} → "
-                    f"{destination}  [dim]{kind}[/dim]"
-                )
-    if control_rows:
-        out.print("[bold]control routes[/bold] · head → node (operator SSH)")
-        style_by_class = {
-            "local": "dim",
-            "direct": "green",
-            "opaque": "yellow",
-            "proxied": "magenta",
-            "relayed": "red",
-            "unreachable": "red",
-        }
-        for row in control_rows:
-            label = str(row.get("link_class") or "opaque")
-            style = style_by_class.get(label, "yellow")
-            out.print(
-                f"  [{style}]{escape(label)}[/{style}] head → "
-                f"{escape(str(row.get('node')))}"
-                f"{throughput_suffix(row)}  "
-                f"[dim]{escape(str(row.get('evidence') or ''))}[/dim]"
-            )
+    _print_topology_report(site_rows, control_rows)
 
 
 _DOCTOR_DEPENDENCIES = (
@@ -19621,6 +19665,101 @@ def _find(ref: str) -> None:
     print(json.dumps(jobs_mod.public_job_record(entry)))
 
 
+def _report_group_request(
+    cfg: HeadConfig,
+    group_record: group_mod.GroupRequestRecord,
+    *,
+    request_id: str,
+    inspection_in_progress: bool,
+    json_: bool,
+) -> None:
+    """`dt request` for a multi-job (batch/chain/matrix/repeat) request."""
+    try:
+        group_entries = group_mod.load_entries_or_fail(cfg, group_record)
+    except group_mod.GroupRequestError as exc:
+        _fail_submission(
+            kind="request_state_damaged",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    next_index = group_record.submitted + 1
+    unresolved: JsonDict | None = None
+    if next_index <= group_record.requested:
+        child_request_id = group_mod.item_request_id(request_id, next_index)
+        try:
+            child_record = intent_mod.load(cfg, child_request_id)
+        except intent_mod.RequestRecordError as exc:
+            _fail_submission(
+                kind="request_state_damaged",
+                message=str(exc),
+                exit_code=1,
+                json_=json_,
+            )
+        if child_record is not None:
+            child_entry = jobs_mod.load(cfg, child_record.job_id)
+            unresolved = {
+                "index": next_index,
+                "request_id": child_request_id,
+                "state": child_record.state,
+                "job_id": child_record.job_id,
+                "job_found": child_entry is not None,
+            }
+    group_payload: JsonDict = asdict(group_record)
+    group_payload["schema_version"] = group_payload.get("schema")
+    group_payload["job_ids"] = [entry.job_id for entry in group_entries]
+    group_payload["submitted"] = len(group_entries)
+    group_payload["jobs"] = [
+        {
+            "index": index,
+            "job_id": group_entry.job_id,
+            "status": group_entry.status,
+            "node": group_entry.node,
+            "reason": group_entry.reason,
+            "exit_code": group_entry.exit_code,
+        }
+        for index, group_entry in enumerate(group_entries, start=1)
+    ]
+    group_payload["next_index"] = (
+        next_index if next_index <= group_record.requested else None
+    )
+    group_payload["unresolved_child"] = unresolved
+    group_payload["inspection_in_progress"] = inspection_in_progress
+    group_payload["retry_with_same_request_id"] = (
+        group_record.state not in group_mod.GROUP_TERMINAL_STATES
+    )
+    if json_:
+        print(json.dumps(group_payload))
+        return
+    state_style = {
+        "confirmed": "green",
+        "prepared": "cyan",
+        "preparing": "yellow",
+        "rejected": "red",
+        "uncertain": "yellow",
+    }[group_record.state]
+    out.print(
+        f"[{state_style}]{group_record.state}[/{state_style}] "
+        f"{escape(group_record.request_id)} · {group_record.operation} · "
+        f"{len(group_entries)}/{group_record.requested} jobs"
+    )
+    if unresolved is not None:
+        err.print(
+            "[yellow]next child outcome is unresolved; retry the exact "
+            "original command with the same request id[/yellow]"
+        )
+    elif group_record.state == "rejected":
+        err.print(
+            "[red]this request was durably rejected; inspect the failure "
+            "and use a new request id[/red]"
+        )
+    elif group_record.state != "confirmed":
+        err.print(
+            "[yellow]retry the exact original command with the same "
+            "request id to resume from this prefix[/yellow]"
+        )
+
+
 def request_status(
     request_id: str = typer.Argument(..., help="durable submission request id"),
     center: Optional[str] = typer.Option(
@@ -19697,90 +19836,13 @@ def request_status(
             json_=json_,
         )
     if group_record is not None:
-        try:
-            group_entries = group_mod.load_entries_or_fail(cfg, group_record)
-        except group_mod.GroupRequestError as exc:
-            _fail_submission(
-                kind="request_state_damaged",
-                message=str(exc),
-                exit_code=1,
-                json_=json_,
-            )
-        next_index = group_record.submitted + 1
-        unresolved: JsonDict | None = None
-        if next_index <= group_record.requested:
-            child_request_id = group_mod.item_request_id(request_id, next_index)
-            try:
-                child_record = intent_mod.load(cfg, child_request_id)
-            except intent_mod.RequestRecordError as exc:
-                _fail_submission(
-                    kind="request_state_damaged",
-                    message=str(exc),
-                    exit_code=1,
-                    json_=json_,
-                )
-            if child_record is not None:
-                child_entry = jobs_mod.load(cfg, child_record.job_id)
-                unresolved = {
-                    "index": next_index,
-                    "request_id": child_request_id,
-                    "state": child_record.state,
-                    "job_id": child_record.job_id,
-                    "job_found": child_entry is not None,
-                }
-        group_payload: JsonDict = asdict(group_record)
-        group_payload["schema_version"] = group_payload.get("schema")
-        group_payload["job_ids"] = [entry.job_id for entry in group_entries]
-        group_payload["submitted"] = len(group_entries)
-        group_payload["jobs"] = [
-            {
-                "index": index,
-                "job_id": group_entry.job_id,
-                "status": group_entry.status,
-                "node": group_entry.node,
-                "reason": group_entry.reason,
-                "exit_code": group_entry.exit_code,
-            }
-            for index, group_entry in enumerate(group_entries, start=1)
-        ]
-        group_payload["next_index"] = (
-            next_index if next_index <= group_record.requested else None
+        _report_group_request(
+            cfg,
+            group_record,
+            request_id=request_id,
+            inspection_in_progress=inspection_in_progress,
+            json_=json_,
         )
-        group_payload["unresolved_child"] = unresolved
-        group_payload["inspection_in_progress"] = inspection_in_progress
-        group_payload["retry_with_same_request_id"] = (
-            group_record.state not in group_mod.GROUP_TERMINAL_STATES
-        )
-        if json_:
-            print(json.dumps(group_payload))
-            return
-        state_style = {
-            "confirmed": "green",
-            "prepared": "cyan",
-            "preparing": "yellow",
-            "rejected": "red",
-            "uncertain": "yellow",
-        }[group_record.state]
-        out.print(
-            f"[{state_style}]{group_record.state}[/{state_style}] "
-            f"{escape(group_record.request_id)} · {group_record.operation} · "
-            f"{len(group_entries)}/{group_record.requested} jobs"
-        )
-        if unresolved is not None:
-            err.print(
-                "[yellow]next child outcome is unresolved; retry the exact "
-                "original command with the same request id[/yellow]"
-            )
-        elif group_record.state == "rejected":
-            err.print(
-                "[red]this request was durably rejected; inspect the failure "
-                "and use a new request id[/red]"
-            )
-        elif group_record.state != "confirmed":
-            err.print(
-                "[yellow]retry the exact original command with the same "
-                "request id to resume from this prefix[/yellow]"
-            )
         return
     if record is None:
         if inspection_in_progress:
