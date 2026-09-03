@@ -615,38 +615,8 @@ def compact_job_refs(
     )
 
 
-def _decode_entry(
-    raw: object,
-    *,
-    layout: str | None = None,
-    registry_updated_at: float | None = None,
-    expected_job_id: str | None = None,
-    include_private: bool = True,
-) -> JobEntry:
-    if not isinstance(raw, dict):
-        raise TypeError("job registry entry must be a JSON object")
-    raw_job_id = raw.get("job_id")
-    if not _valid_job_id(raw_job_id):
-        raise ValueError("job registry identity is unsafe")
-    if expected_job_id is not None and raw_job_id != expected_job_id:
-        raise ValueError("job registry identity does not match its filename")
-    payload = {key: value for key, value in raw.items() if key in _JOB_ENTRY_FIELDS}
-    try:
-        normalized_custom_env = custom_env_mod.validate(payload.get("custom_env", {}))
-    except custom_env_mod.CustomEnvironmentError as exc:
-        raise ValueError(str(exc)) from exc
-    payload["custom_env"] = normalized_custom_env if include_private else {}
-    entry = JobEntry(**payload)
-    _bound_entry_diagnostics(entry)
-    entry.custom_env_keys = sorted(normalized_custom_env)
-    entry.custom_env_loaded = include_private
-    # Early launchers persisted an empty string when no uv environment existed.
-    # Normalize that historical sentinel before validating the current optional
-    # identity contract.
-    if entry.env_hash == "":
-        entry.env_hash = None
-    if entry.cache_source_env_hash == "":
-        entry.cache_source_env_hash = None
+def _validate_entry_lifecycle(entry: JobEntry) -> None:
+    """Required text, status, booleans, GPUs, pgid, exit code, result, timestamps."""
     required_strings = (
         entry.job_id,
         entry.name,
@@ -722,6 +692,10 @@ def _decode_entry(
         for value in (entry.created_at, *timestamps)
     ):
         raise ValueError("job registry has invalid lifecycle timestamps")
+
+
+def _validate_entry_collections(entry: JobEntry) -> None:
+    """Placement failures, worker roots, submodule commits, artifact targets, extras."""
     if not isinstance(entry.placement_failures, dict) or any(
         not isinstance(node, str) or not isinstance(reason, str)
         for node, reason in entry.placement_failures.items()
@@ -760,6 +734,10 @@ def _decode_entry(
         or any(not is_config_id(extra) for extra in entry.extras)
     ):
         raise ValueError("job registry has invalid project extras")
+
+
+def _validate_entry_provenance(entry: JobEntry) -> None:
+    """Optional text fields, retry policy, legacy cleanup, dispatch claim identity."""
     optional_text = (
         entry.git_sha,
         entry.snapshot_sha256,
@@ -839,6 +817,10 @@ def _decode_entry(
         # row unreadable.
         entry.dispatch_owner = None
         entry.dispatch_claimed_at = None
+
+
+def _validate_entry_limits(entry: JobEntry) -> None:
+    """Digest and environment identities, optional measurements and resource limits."""
     digest_fields = (
         entry.snapshot_sha256,
         entry.payload_sha256,
@@ -909,6 +891,10 @@ def _decode_entry(
         or entry.require_disk_gib < 0
     ):
         raise ValueError("job registry has an invalid disk requirement")
+
+
+def _validate_entry_contracts(entry: JobEntry) -> None:
+    """Launch phases, setup inputs, result states, modes, layout, roots, isolation."""
     if not isinstance(entry.launch_phases_s, dict) or any(
         not isinstance(key, str)
         or isinstance(value, bool)
@@ -958,6 +944,45 @@ def _decode_entry(
             raise ValueError("job registry has an invalid relative job path")
     if entry.gpu_isolation != "advisory":
         raise ValueError("job registry requests unsupported physical GPU isolation")
+
+
+def _decode_entry(
+    raw: object,
+    *,
+    layout: str | None = None,
+    registry_updated_at: float | None = None,
+    expected_job_id: str | None = None,
+    include_private: bool = True,
+) -> JobEntry:
+    if not isinstance(raw, dict):
+        raise TypeError("job registry entry must be a JSON object")
+    raw_job_id = raw.get("job_id")
+    if not _valid_job_id(raw_job_id):
+        raise ValueError("job registry identity is unsafe")
+    if expected_job_id is not None and raw_job_id != expected_job_id:
+        raise ValueError("job registry identity does not match its filename")
+    payload = {key: value for key, value in raw.items() if key in _JOB_ENTRY_FIELDS}
+    try:
+        normalized_custom_env = custom_env_mod.validate(payload.get("custom_env", {}))
+    except custom_env_mod.CustomEnvironmentError as exc:
+        raise ValueError(str(exc)) from exc
+    payload["custom_env"] = normalized_custom_env if include_private else {}
+    entry = JobEntry(**payload)
+    _bound_entry_diagnostics(entry)
+    entry.custom_env_keys = sorted(normalized_custom_env)
+    entry.custom_env_loaded = include_private
+    # Early launchers persisted an empty string when no uv environment existed.
+    # Normalize that historical sentinel before validating the current optional
+    # identity contract.
+    if entry.env_hash == "":
+        entry.env_hash = None
+    if entry.cache_source_env_hash == "":
+        entry.cache_source_env_hash = None
+    _validate_entry_lifecycle(entry)
+    _validate_entry_collections(entry)
+    _validate_entry_provenance(entry)
+    _validate_entry_limits(entry)
+    _validate_entry_contracts(entry)
     if entry.storage_layout is None:
         # An absent storage_layout is a legacy-era sentinel: every role-v1
         # record is stamped explicitly by save(). Inferring the layout from
