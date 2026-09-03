@@ -2431,6 +2431,99 @@ def _emit_submission(
     print(entry.job_id)  # bare id, last stdout line: agents rely on this
 
 
+def _emit_run_plan(
+    cfg: HeadConfig,
+    request: SubmissionRequest,
+    *,
+    artifacts: list[str],
+    artifact_manifest: str | None,
+    custom_env: Mapping[str, str] | None,
+    no_queue: bool,
+    json_: bool,
+) -> None:
+    """Resolve dependencies and print a `dt run --plan` preview; write nothing."""
+    node = request.node
+    after_success_id = None
+    if request.after_success:
+        after_success_id, node = _resolve_submission_dependency(
+            cfg,
+            request.after_success,
+            requested_node=node,
+            json_=json_,
+        )
+    after_complete_id = None
+    if request.after_complete:
+        after_complete_id = _resolve_completion_dependency(
+            cfg,
+            request.after_complete,
+            json_=json_,
+        )
+    after_result_id = None
+    if request.after_result:
+        after_result_id = _resolve_completion_dependency(
+            cfg,
+            request.after_result,
+            json_=json_,
+        )
+    resolved = request.resolved(
+        node=node,
+        project=request.project,
+        artifact_manifest=request.artifact_manifest,
+        after_success=after_success_id,
+        after_complete=after_complete_id,
+        after_result=after_result_id,
+    )
+    try:
+        payload = preview_submission(
+            cfg,
+            resolved.to_run_spec(),
+            Path.cwd(),
+            no_queue=no_queue,
+        )
+    except (DispatchError, ConfigError) as exc:
+        _fail_submission(
+            kind="plan_failed",
+            message=str(exc),
+            exit_code=EXIT_ENV,
+            json_=json_,
+        )
+    payload["artifacts"] = {
+        "requested": list(artifacts),
+        "sync_required": bool(artifacts),
+        "manifest": artifact_manifest,
+    }
+    if custom_env:
+        environment_row = cast(JsonDict, payload.setdefault("environment", {}))
+        environment_row["variables"] = sorted(custom_env)
+    if json_:
+        print(json.dumps(payload))
+        return
+    placement = cast(JsonDict, payload["placement"])
+    outcome = str(placement.get("outcome") or "unknown")
+    selected = placement.get("selected_node")
+    gpus_preview = placement.get("selected_gpus") or []
+    target = (
+        f"{selected} · GPU {','.join(map(str, gpus_preview)) or 'cpu'}"
+        if selected
+        else str(placement.get("reason") or "placement unresolved")
+    )
+    out.print(f"[bold]plan[/bold] {escape(outcome)} · {escape(target)}")
+    snapshot_row = cast(JsonDict, payload["snapshot"])
+    out.print(
+        f"snapshot {_format_transfer_bytes(snapshot_row['source_bytes'])} · "
+        "no state written"
+    )
+    environment_row = cast(JsonDict, payload["environment"])
+    out.print(
+        f"environment {escape(str(environment_row.get('status')))}"
+        + (
+            f" · {escape(str(environment_row.get('identity')))}"
+            if environment_row.get("identity")
+            else ""
+        )
+    )
+
+
 def _resolve_laptop_run_center(
     cfg: LaptopConfig,
     *,
@@ -2919,89 +3012,15 @@ def run(
         custom_env=tuple(custom_env.items()),
     )
     if plan:
-        node = request.node
-        after_success_id = None
-        if request.after_success:
-            after_success_id, node = _resolve_submission_dependency(
-                cfg,
-                request.after_success,
-                requested_node=node,
-                json_=json_,
-            )
-        after_complete_id = None
-        if request.after_complete:
-            after_complete_id = _resolve_completion_dependency(
-                cfg,
-                request.after_complete,
-                json_=json_,
-            )
-        after_result_id = None
-        if request.after_result:
-            after_result_id = _resolve_completion_dependency(
-                cfg,
-                request.after_result,
-                json_=json_,
-            )
-        resolved = request.resolved(
-            node=node,
-            project=request.project,
-            artifact_manifest=request.artifact_manifest,
-            after_success=after_success_id,
-            after_complete=after_complete_id,
-            after_result=after_result_id,
+        _emit_run_plan(
+            cfg,
+            request,
+            artifacts=artifacts,
+            artifact_manifest=artifact_manifest,
+            custom_env=custom_env,
+            no_queue=no_queue,
+            json_=json_,
         )
-        try:
-            payload = preview_submission(
-                cfg,
-                resolved.to_run_spec(),
-                Path.cwd(),
-                no_queue=no_queue,
-            )
-        except (DispatchError, ConfigError) as exc:
-            _fail_submission(
-                kind="plan_failed",
-                message=str(exc),
-                exit_code=EXIT_ENV,
-                json_=json_,
-            )
-        payload["artifacts"] = {
-            "requested": list(artifacts),
-            "sync_required": bool(artifacts),
-            "manifest": artifact_manifest,
-        }
-        if custom_env:
-            environment_row = cast(
-                JsonDict,
-                payload.setdefault("environment", {}),
-            )
-            environment_row["variables"] = sorted(custom_env)
-        if json_:
-            print(json.dumps(payload))
-        else:
-            placement = cast(JsonDict, payload["placement"])
-            outcome = str(placement.get("outcome") or "unknown")
-            selected = placement.get("selected_node")
-            gpus_preview = placement.get("selected_gpus") or []
-            target = (
-                f"{selected} · GPU {','.join(map(str, gpus_preview)) or 'cpu'}"
-                if selected
-                else str(placement.get("reason") or "placement unresolved")
-            )
-            out.print(f"[bold]plan[/bold] {escape(outcome)} · {escape(target)}")
-            snapshot_row = cast(JsonDict, payload["snapshot"])
-            out.print(
-                f"snapshot {_format_transfer_bytes(snapshot_row['source_bytes'])} · "
-                "no state written"
-            )
-            environment_row = cast(JsonDict, payload["environment"])
-            out.print(
-                f"environment {escape(str(environment_row.get('status')))}"
-                + (
-                    f" · {escape(str(environment_row.get('identity')))}"
-                    if environment_row.get("identity")
-                    else ""
-                )
-            )
         return
     entry, agent_started, artifact_sync = _submit_request(
         cfg,
@@ -5551,13 +5570,12 @@ def _matrix_run_head(
 
     def ensure_agent(entry: jobs_mod.JobEntry) -> None:
         nonlocal agent_checked, agent_started
-        if entry.status != "queued" or agent_checked:
+        if agent_checked:
             return
-        from . import agent as agent_mod
-
-        agent_checked = True
-        if agent_mod.alive_pid(cfg) is None:
-            agent_started = agent_mod.start_detached(cfg)
+        started = _ensure_agent_for(cfg, entry)
+        if entry.status == "queued":
+            agent_checked = True
+            agent_started = started
 
     resumed = len(entries)
     for existing_index, existing_entry in enumerate(entries, start=1):
