@@ -247,7 +247,9 @@ def test_collect_qualifies_every_remote_failure_and_bounds_transport(
 
     def log_reader(_entry, lines):
         observed["log_lines"] = lines
-        return subprocess.CompletedProcess(["ssh"], 255, "", "secret"), "", "", ""
+        return diagnose.LogTail(
+            subprocess.CompletedProcess(["ssh"], 255, "", "secret"), "", "", ""
+        )
 
     def runner(
         _name,
@@ -336,7 +338,7 @@ def test_collect_refreshes_lifecycle_without_inventing_state_on_failure(
     payload = diagnose.collect(
         cfg,
         entry,
-        log_reader=lambda *_args: (
+        log_reader=lambda *_args: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             "",
             "logs/stdout.log",
@@ -390,7 +392,7 @@ def test_cli_head_uses_same_payload_for_json_and_human_and_bounds_log_timeout(
 
     def fake_read_log(item, lines, *, timeout):
         observed.append((item.job_id, lines, timeout))
-        return subprocess.CompletedProcess([], 0, "", ""), "", "", ""
+        return diagnose.LogTail(subprocess.CompletedProcess([], 0, "", ""), "", "", "")
 
     monkeypatch.setattr(cli, "_read_job_log_tail", fake_read_log)
 

@@ -13,6 +13,7 @@ from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
 
+from .jsonvalue import as_int, as_number
 from .jobs import CANCEL_UNVERIFIED_PREFIX
 
 out = Console()
@@ -134,21 +135,12 @@ def _reserved_zero_util_label(gpus: list[JsonRow]) -> str | None:
 
 
 def _disk_low_headroom(system: JsonRow) -> tuple[bool, float | None]:
-    free = system.get("disk_free_gib")
-    total = system.get("disk_total_gib")
-    if (
-        not isinstance(free, (int, float))
-        or isinstance(free, bool)
-        or not isinstance(total, (int, float))
-        or isinstance(total, bool)
-        or total <= 0
-    ):
+    free = as_number(system.get("disk_free_gib"))
+    total = as_number(system.get("disk_total_gib"))
+    if free is None or total is None or total <= 0:
         return False, None
-    fraction = max(0.0, float(free)) / float(total)
-    return (
-        float(free) < DISK_LOW_FREE_GIB or fraction < DISK_LOW_FREE_FRACTION,
-        fraction,
-    )
+    fraction = max(0.0, free) / total
+    return free < DISK_LOW_FREE_GIB or fraction < DISK_LOW_FREE_FRACTION, fraction
 
 
 def _compact_remote_error(value: object) -> str:
@@ -402,24 +394,12 @@ def _live_resource_text(row: JsonRow, gpus: str) -> str:
         system = resources.get("system")
         if not isinstance(system, dict):
             return "cpu:…"
-        load = system.get("cpu_load1")
-        used = system.get("mem_used_mib")
-        io = system.get("io_pressure")
-        load_text = (
-            f"{float(load):.1f}"
-            if isinstance(load, (int, float)) and not isinstance(load, bool)
-            else "-"
-        )
-        ram_text = (
-            f"{_gib(float(used))}G"
-            if isinstance(used, (int, float)) and not isinstance(used, bool)
-            else "-"
-        )
-        io_text = (
-            f"{float(io):.1f}%"
-            if isinstance(io, (int, float)) and not isinstance(io, bool)
-            else "-"
-        )
+        load = as_number(system.get("cpu_load1"))
+        used = as_number(system.get("mem_used_mib"))
+        io = as_number(system.get("io_pressure"))
+        load_text = f"{load:.1f}" if load is not None else "-"
+        ram_text = f"{_gib(used)}G" if used is not None else "-"
+        io_text = f"{io:.1f}%" if io is not None else "-"
         return f"C{load_text}/R{ram_text}/I{io_text}"
     live_gpus = [gpu for gpu in (resources.get("gpus") or []) if isinstance(gpu, dict)]
     if not live_gpus:
@@ -455,24 +435,24 @@ def _progress_parts(row: JsonRow, *, wide: bool) -> list[str]:
     if not isinstance(progress, dict):
         return parts
     status = row.get("status", "?")
-    step = progress.get("step")
-    total = progress.get("total_steps")
-    if isinstance(step, int):
+    step = as_int(progress.get("step"))
+    total = as_int(progress.get("total_steps"))
+    if step is not None:
         step_text = f"{step:,}"
-        if isinstance(total, int):
+        if total is not None:
             step_text += f"/{total:,}"
         parts.append(f"step {step_text}" if wide else step_text)
-    elif status == "running" and isinstance(total, int) and not isinstance(total, bool):
+    elif status == "running" and total is not None:
         parts.append(f"pre-step · target {total:,}" if wide else f"pre-step /{total:,}")
-    percent = progress.get("percent")
-    if isinstance(percent, (int, float)) and not isinstance(percent, bool):
-        parts.append(f"{float(percent):g}%" if wide else f"{float(percent):.0f}%")
+    percent = as_number(progress.get("percent"))
+    if percent is not None:
+        parts.append(f"{percent:g}%" if wide else f"{percent:.0f}%")
     eta = progress.get("eta")
     if isinstance(eta, str) and eta:
         parts.append(f"ETA {escape(eta)}")
-    samples = progress.get("samples_per_sec")
-    if isinstance(samples, (int, float)) and not isinstance(samples, bool):
-        parts.append(f"{float(samples):g}/s")
+    samples = as_number(progress.get("samples_per_sec"))
+    if samples is not None:
+        parts.append(f"{samples:g}/s")
     return parts
 
 

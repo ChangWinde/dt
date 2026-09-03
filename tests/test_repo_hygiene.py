@@ -74,7 +74,8 @@ def test_ci_fails_on_thread_exceptions_and_requires_relay_e2e_dependencies():
 
     assert "error::pytest.PytestUnhandledThreadExceptionWarning" in workflow
     assert 'DT_REQUIRE_RELAY_E2E: "1"' in workflow
-    assert "openssh-server rsync zsh" in workflow.replace("\\\n", " ")
+    assert "openssh-server rsync shellcheck zsh" in workflow.replace("\\\n", " ")
+    assert "shellcheck --shell=sh src/dt/shell/*.sh" in workflow
     assert "--cov=dt" in workflow
     assert "--cov-branch" in workflow
     assert 'UV_PYTHON" == "3.11' in workflow

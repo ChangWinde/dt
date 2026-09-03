@@ -1,3 +1,5 @@
+import pytest
+
 from dt.forwarding import HeadCommand
 
 
@@ -39,7 +41,7 @@ def test_head_command_invoke_passes_a_fresh_mutable_argv():
     assert command.argv() == ["info", "job", "--json"]
 
 
-# -- laptop forwarding must mirror every submission-shaping option ----------------
+# -- laptop forwarding must mirror every head-side option ---------------------------
 
 
 def _forwarded_flags(command_name: str, *, source_name: str | None = None) -> set[str]:
@@ -57,34 +59,74 @@ def _forwarded_flags(command_name: str, *, source_name: str | None = None) -> se
     from dt import cli
 
     source = inspect.getsource(getattr(cli, source_name or command_name))
-    chain = source[source.index("_head_command(") :]
+    starts = [
+        index
+        for index in (source.find("_head_command("), source.find("HeadCommand.start("))
+        if index >= 0
+    ]
+    assert starts, f"{source_name or command_name} has no laptop forwarding chain"
+    chain = source[min(starts) :]
     chain = chain[: chain.index(".passthrough(") if ".passthrough(" in chain else None]
     return set(
         re.findall(r'\.(?:option|repeat|flag)\(\s*"(-{1,2}[a-z][a-z0-9-]*)"', chain)
     )
 
 
-def test_run_forwards_every_submission_shaping_option():
+# Every command with a laptop route: (command, helper holding the chain,
+# options the laptop consumes itself, options that travel by another channel).
+_FORWARDED_COMMANDS = [
+    (
+        "run",
+        "_forward_run_to_head",
+        {"center", "follow", "poll", "lines"},
+        {"environment"},
+    ),
+    ("task", None, {"center", "follow", "poll", "lines"}, set()),
+    # --file/-F is read on the laptop; its lines travel as positional items.
+    ("batch", "_inventory_command", {"center"}, {"file"}),
+    ("chain", "_inventory_command", {"center"}, {"file"}),
+    ("logs", None, set(), set()),
+    ("info", None, set(), set()),
+    ("diagnose", None, set(), set()),
+    ("compare", None, set(), {"file"}),
+    ("watch", None, set(), {"file"}),
+    ("metrics", None, set(), set()),
+    ("rerun", None, set(), set()),
+    ("exec_job", None, set(), set()),
+    ("fork", "_forward_fork_to_head", set(), set()),
+    ("storage", None, {"center"}, set()),
+]
+
+
+@pytest.mark.parametrize(
+    ("command_name", "source_name", "laptop_local", "other_channel"),
+    _FORWARDED_COMMANDS,
+    ids=[case[0] for case in _FORWARDED_COMMANDS],
+)
+def test_laptop_route_forwards_every_head_option(
+    command_name, source_name, laptop_local, other_channel
+):
     import inspect
 
     import typer
 
     from dt import cli
 
-    # Options consumed on the laptop itself, never meant for the head.
-    laptop_local = {"center", "follow", "poll", "lines"}
-    # Options whose value travels by another channel than a flag.
-    other_channel = {"environment"}  # names go inside the private stdin envelope
-    forwarded = _forwarded_flags("run", source_name="_forward_run_to_head")
+    forwarded = _forwarded_flags(command_name, source_name=source_name)
     missing = []
-    for name, param in inspect.signature(cli.run).parameters.items():
+    for name, param in inspect.signature(getattr(cli, command_name)).parameters.items():
         if not isinstance(param.default, typer.models.OptionInfo):
             continue
         if name in laptop_local or name in other_channel:
             continue
-        decls = set(param.default.param_decls or ())
+        # A "--x/--no-x" declaration is one option with two spellings.
+        decls = {
+            spelling
+            for decl in (param.default.param_decls or ())
+            for spelling in decl.split("/")
+        }
         if not decls & forwarded:
             missing.append(f"{name} {sorted(decls)}")
     assert not missing, (
-        f"declared on `dt run` but never forwarded to the head: {missing}"
+        f"declared on `dt {command_name}` but never forwarded to the head: {missing}"
     )
