@@ -11075,6 +11075,129 @@ def _print_info_table(
     out.print(table)
 
 
+_INFO_LAUNCH_PHASE_LABELS = (
+    ("payload_attestation", "payload"),
+    ("preflight", "preflight"),
+    ("artifact_verification", "artifact verify"),
+    ("environment", "env"),
+    ("launch_lock_wait", "lock"),
+    ("gpu_probe", "GPU probe"),
+    ("session_start", "session"),
+    ("remote_total", "remote total"),
+)
+
+
+def _info_launch_rows(entry: jobs_mod.JobEntry) -> list[tuple[str, Any]]:
+    """Stage timings and environment-preparation facts recorded at launch."""
+    rows: list[tuple[str, Any]] = []
+    snapshot_duration = getattr(entry, "snapshot_duration_s", None)
+    launch_duration = getattr(entry, "launch_duration_s", None)
+    if snapshot_duration is not None:
+        rows.append(("snapshot stage", _fmt_short_duration(snapshot_duration)))
+    if launch_duration is not None:
+        rows.append(("prepare stage", _fmt_short_duration(launch_duration)))
+    if entry.launch_phases_s:
+        phase_text = " · ".join(
+            f"{label} {_fmt_short_duration(entry.launch_phases_s[key])}"
+            for key, label in _INFO_LAUNCH_PHASE_LABELS
+            if key in entry.launch_phases_s
+        )
+        rows.append(("prepare phases", phase_text))
+    env_preexisting = getattr(entry, "env_preexisting", None)
+    if env_preexisting is not None:
+        rows.append(("env state", "existing" if env_preexisting else "new"))
+    setup_ran = getattr(entry, "setup_ran", None)
+    if entry.setup and setup_ran is not None:
+        rows.append(("setup hook", "ran" if setup_ran else "cached"))
+    if entry.setup_inputs is not None:
+        rows.append(
+            (
+                "setup inputs",
+                ", ".join(escape(item) for item in entry.setup_inputs) or "(none)",
+            )
+        )
+    if entry.extras:
+        rows.append(("extras", ", ".join(escape(item) for item in entry.extras)))
+    return rows
+
+
+def _info_provenance_rows(
+    entry: jobs_mod.JobEntry,
+    display_refs: Mapping[str, str],
+) -> list[tuple[str, Any]]:
+    """Lineage rows (rerun, dependencies, fork, retry) in display order."""
+    rows: list[tuple[str, Any]] = []
+    if entry.rerun_of:
+        rows.append(("rerun of", display_refs.get(entry.rerun_of, entry.rerun_of)))
+        if entry.rerun_snapshot_changed is True:
+            rows.append(
+                (
+                    "rerun code",
+                    "[yellow]changed[/yellow] "
+                    f"{(entry.rerun_source_snapshot_sha256 or 'unknown')[:12]} → "
+                    f"{(entry.snapshot_sha256 or 'unknown')[:12]}",
+                )
+            )
+        elif entry.rerun_snapshot_changed is False:
+            rows.append(
+                ("rerun code", f"unchanged {(entry.snapshot_sha256 or 'unknown')[:12]}")
+            )
+        else:
+            rows.append(("rerun code", "unknown (source snapshot unavailable)"))
+    if entry.after_result:
+        rows.append(
+            (
+                "after result",
+                f"{display_refs.get(entry.after_result, entry.after_result)} in "
+                f"[{', '.join(entry.after_result_states)}]",
+            )
+        )
+    if entry.after_complete:
+        rows.append(
+            (
+                "after complete",
+                display_refs.get(entry.after_complete, entry.after_complete),
+            )
+        )
+    if entry.after_success:
+        rows.append(
+            (
+                "after success",
+                display_refs.get(entry.after_success, entry.after_success),
+            )
+        )
+    if entry.forked_from:
+        rows.append(
+            ("forked from", display_refs.get(entry.forked_from, entry.forked_from))
+        )
+    if entry.retried_by:
+        rows.append(
+            ("retried by", display_refs.get(entry.retried_by, entry.retried_by))
+        )
+    if entry.retry_of:
+        rows.append(
+            (
+                "retry",
+                f"attempt {entry.retry_count}/{entry.retry_limit} of "
+                f"{display_refs.get(entry.retry_of, entry.retry_of)}",
+            )
+        )
+    return rows
+
+
+def _info_failure_log_rows(failure_log: JsonDict) -> list[tuple[str, Any]]:
+    """The pre-start failure log tail, or why it could not be read."""
+    from rich.text import Text
+
+    failure_tail = str(failure_log.get("tail") or "").rstrip()
+    failure_error = failure_log.get("error")
+    if failure_tail:
+        return [("failure log", Text(failure_tail, style="red"))]
+    if failure_error:
+        return [("failure log", Text(f"unavailable: {failure_error}", style="yellow"))]
+    return []
+
+
 def _render_info_table(
     entry: jobs_mod.JobEntry,
     data: JsonDict,
@@ -11221,139 +11344,10 @@ def _render_info_table(
             for node, reason in entry.placement_failures.items()
         )
         rows.insert(3, ("placement failures", placement_text))
-    snapshot_duration = getattr(entry, "snapshot_duration_s", None)
-    launch_duration = getattr(entry, "launch_duration_s", None)
-    if snapshot_duration is not None:
-        rows.append(("snapshot stage", _fmt_short_duration(snapshot_duration)))
-    if launch_duration is not None:
-        rows.append(("prepare stage", _fmt_short_duration(launch_duration)))
-    if entry.launch_phases_s:
-        phase_labels = (
-            ("payload_attestation", "payload"),
-            ("preflight", "preflight"),
-            ("artifact_verification", "artifact verify"),
-            ("environment", "env"),
-            ("launch_lock_wait", "lock"),
-            ("gpu_probe", "GPU probe"),
-            ("session_start", "session"),
-            ("remote_total", "remote total"),
-        )
-        phase_text = " · ".join(
-            f"{label} {_fmt_short_duration(entry.launch_phases_s[key])}"
-            for key, label in phase_labels
-            if key in entry.launch_phases_s
-        )
-        rows.append(("prepare phases", phase_text))
-    env_preexisting = getattr(entry, "env_preexisting", None)
-    if env_preexisting is not None:
-        rows.append(("env state", "existing" if env_preexisting else "new"))
-    setup_ran = getattr(entry, "setup_ran", None)
-    if entry.setup and setup_ran is not None:
-        rows.append(("setup hook", "ran" if setup_ran else "cached"))
-    if entry.setup_inputs is not None:
-        rows.append(
-            (
-                "setup inputs",
-                ", ".join(escape(item) for item in entry.setup_inputs) or "(none)",
-            )
-        )
-    if entry.extras:
-        rows.append(("extras", ", ".join(escape(item) for item in entry.extras)))
+    rows.extend(_info_launch_rows(entry))
     if failure_log is not None:
-        from rich.text import Text
-
-        failure_tail = str(failure_log.get("tail") or "").rstrip()
-        failure_error = failure_log.get("error")
-        if failure_tail:
-            rows.append(("failure log", Text(failure_tail, style="red")))
-        elif failure_error:
-            rows.append(
-                (
-                    "failure log",
-                    Text(
-                        f"unavailable: {failure_error}",
-                        style="yellow",
-                    ),
-                )
-            )
-    if entry.retry_of:
-        rows.insert(
-            7,
-            (
-                "retry",
-                f"attempt {entry.retry_count}/{entry.retry_limit} of "
-                f"{display_refs.get(entry.retry_of, entry.retry_of)}",
-            ),
-        )
-    if entry.retried_by:
-        rows.insert(
-            7,
-            (
-                "retried by",
-                display_refs.get(entry.retried_by, entry.retried_by),
-            ),
-        )
-    if entry.forked_from:
-        rows.insert(
-            7,
-            (
-                "forked from",
-                display_refs.get(entry.forked_from, entry.forked_from),
-            ),
-        )
-    if entry.after_success:
-        rows.insert(
-            7,
-            (
-                "after success",
-                display_refs.get(entry.after_success, entry.after_success),
-            ),
-        )
-    if entry.after_complete:
-        rows.insert(
-            7,
-            (
-                "after complete",
-                display_refs.get(entry.after_complete, entry.after_complete),
-            ),
-        )
-    if entry.after_result:
-        rows.insert(
-            7,
-            (
-                "after result",
-                f"{display_refs.get(entry.after_result, entry.after_result)} in "
-                f"[{', '.join(entry.after_result_states)}]",
-            ),
-        )
-    if entry.rerun_of:
-        rows.insert(
-            7,
-            (
-                "rerun of",
-                display_refs.get(entry.rerun_of, entry.rerun_of),
-            ),
-        )
-        if entry.rerun_snapshot_changed is True:
-            rows.insert(
-                8,
-                (
-                    "rerun code",
-                    "[yellow]changed[/yellow] "
-                    f"{(entry.rerun_source_snapshot_sha256 or 'unknown')[:12]} → "
-                    f"{(entry.snapshot_sha256 or 'unknown')[:12]}",
-                ),
-            )
-        elif entry.rerun_snapshot_changed is False:
-            rows.insert(
-                8,
-                (
-                    "rerun code",
-                    f"unchanged {(entry.snapshot_sha256 or 'unknown')[:12]}",
-                ),
-            )
-        else:
-            rows.insert(8, ("rerun code", "unknown (source snapshot unavailable)"))
+        rows.extend(_info_failure_log_rows(failure_log))
+    rows[7:7] = _info_provenance_rows(entry, display_refs)
     if entry.cache_source_job:
         cache_mode = entry.cache_mode or "shared"
         rows.append(
