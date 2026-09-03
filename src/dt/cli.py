@@ -15489,6 +15489,135 @@ def pull(
     )
 
 
+def _kill_locked(
+    cfg: HeadConfig,
+    entry: jobs_mod.JobEntry,
+    *,
+    sig: str,
+    sweep: bool,
+    finish: Callable[[str, str, jobs_mod.JobEntry | None, str], str],
+) -> str:
+    """Signal the job under its lock and record the verified verdict."""
+    # A concurrent wait/info may have observed completion after our
+    # preflight but before this destructive transition acquired the lock.
+    current = jobs_mod.load(cfg, entry.job_id)
+    if current is not None:
+        entry = current
+    uncertain_launch = _is_uncertain_launch(entry)
+    # A22-6: --sweep gives already-terminal jobs their only orphan
+    # cleanup entry.  The probe still signals and takes a census, but the
+    # terminal record itself is never rewritten, and the EXITED shortcut
+    # is disabled so a recorded completion cannot shield the leftovers.
+    terminal_sweep = (
+        sweep and not uncertain_launch and entry.status not in ("running", "lost")
+    )
+    if (
+        entry.status not in ("running", "lost")
+        and not uncertain_launch
+        and not terminal_sweep
+    ):
+        message = f"{entry.job_id} is already {entry.status}"
+        err.print(message)
+        return finish("ok", "already_terminal", entry, message)
+
+    # Signal both the normal process group and framework children that
+    # escaped it with setpgrp, then require a positive death verdict.  An
+    # uncertain launch has no known PGID, so also leave the launch sentinel
+    # and close its tmux session while the procfs cwd scan finds survivors.
+    if uncertain_launch:
+        target = f"uncertain launch {entry.job_id}"
+    elif terminal_sweep:
+        target = f"leftover processes of {entry.job_id}"
+    else:
+        target = f"group {entry.pgid}"
+
+    def unverified(detail: str) -> str:
+        message = f"could not verify death of {target} on {entry.node}: {detail}"
+        err.print(f"[red]{escape(message)}[/red]")
+        return finish("unverified", "unverified", entry, message)
+
+    try:
+        probe = termination_probe(
+            entry.job_dir,
+            entry.pgid,
+            sig,
+            boot_id=entry.boot_id,
+            job_id=entry.job_id,
+            session=entry.session if uncertain_launch else None,
+            cancel_sentinel=uncertain_launch,
+            layout=entry.storage_layout,
+            ignore_exit_marker=terminal_sweep,
+        )
+    except ValueError as exc:
+        return unverified(str(exc))
+    try:
+        proc = run_on(entry.node, entry.node_local, probe, timeout=20)
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as e:
+        return unverified(str(e))
+    verdict, detail = termination_verdict(
+        proc.returncode,
+        proc.stdout,
+        proc.stderr,
+    )
+    if verdict == "UNVERIFIED":
+        return unverified(str(detail))
+    if verdict == "ALIVE":
+        if terminal_sweep:
+            retained = entry.status
+            force_hint = "dt kill " + entry.job_id + " -y --force --sweep"
+        else:
+            retained = "failed" if uncertain_launch else "running"
+            force_hint = "dt kill " + entry.job_id + " -y --force"
+        message = f"{target} on {entry.node} survived {sig}"
+        err.print(
+            f"[red]{escape(message)}[/red] "
+            f"(job stays '{escape(retained)}'; try: "
+            f"{escape(force_hint)})"
+        )
+        return finish("alive", "survived", entry, message)
+    if verdict == "EXITED":
+        # The exit marker predates our signal: completion won the race
+        # (the interactive confirmation window alone can hide seconds).
+        # Rewriting a finished job into killed/cancelled would erase its
+        # real result and mis-skip every dependent gated on it.  Prefer
+        # the full remote completion record; fall back to the probe's
+        # sanitized exit code when that read is unavailable (also the
+        # only completion path for an uncertain launch, whose failed
+        # status the refresh probe deliberately leaves alone).
+        entry = jobs_mod._refresh_status_locked(cfg, entry)
+        if entry.status != "finished":
+            entry.status = "finished"
+            entry.exit_code = int(detail) if detail is not None else None
+            entry.finished_at = entry.finished_at or time.time()
+            entry.result_state = None
+            entry.reason = "completed before kill; recorded from exit marker"
+            jobs_mod.save(cfg, entry)
+        message = f"{entry.job_id} completed before {sig} was sent"
+        err.print(f"[yellow]{escape(message)}; result preserved[/yellow]")
+        return finish("ok", "completed", entry, message)
+    if terminal_sweep:
+        # Confirmed DEAD: the sweep found or produced a quiet capsule.
+        # The terminal record already tells the truth; leave it alone.
+        message = f"sent {sig} to {target} on {entry.node}; no owned survivors"
+        err.print(f"[yellow]{escape(message)}[/yellow]")
+        return finish("ok", "swept", entry, message)
+    previous_reason = entry.reason
+    entry.status = "killed"
+    entry.result_state = "cancelled"
+    entry.finished_at = time.time()
+    if uncertain_launch:
+        entry.reason = (
+            f"uncertain launch cleanup confirmed dead by user ({sig}); "
+            f"previous: {previous_reason}"
+        )
+    else:
+        entry.reason = f"killed by user ({sig})"
+    jobs_mod.save(cfg, entry)
+    message = f"sent {sig} to {target} on {entry.node}; confirmed dead"
+    err.print(f"[yellow]{escape(message)}[/yellow]")
+    return finish("ok", "killed", entry, message)
+
+
 def _kill_one(
     cfg: HeadConfig,
     ref: str,
@@ -15576,134 +15705,175 @@ def _kill_one(
         typer.confirm(f"kill {target}?", abort=True)
     sig = "KILL" if force else "TERM"
     with jobs_mod.job_lock(cfg, entry.job_id):
-        # A concurrent wait/info may have observed completion after our
-        # preflight but before this destructive transition acquired the lock.
-        current = jobs_mod.load(cfg, entry.job_id)
-        if current is not None:
-            entry = current
-        uncertain_launch = _is_uncertain_launch(entry)
-        # A22-6: --sweep gives already-terminal jobs their only orphan
-        # cleanup entry.  The probe still signals and takes a census, but the
-        # terminal record itself is never rewritten, and the EXITED shortcut
-        # is disabled so a recorded completion cannot shield the leftovers.
-        terminal_sweep = (
-            sweep and not uncertain_launch and entry.status not in ("running", "lost")
-        )
-        if (
-            entry.status not in ("running", "lost")
-            and not uncertain_launch
-            and not terminal_sweep
-        ):
-            message = f"{entry.job_id} is already {entry.status}"
-            err.print(message)
-            return finish("ok", "already_terminal", entry, message)
+        return _kill_locked(cfg, entry, sig=sig, sweep=sweep, finish=finish)
 
-        # Signal both the normal process group and framework children that
-        # escaped it with setpgrp, then require a positive death verdict.  An
-        # uncertain launch has no known PGID, so also leave the launch sentinel
-        # and close its tmux session while the procfs cwd scan finds survivors.
-        if uncertain_launch:
-            target = f"uncertain launch {entry.job_id}"
-        elif terminal_sweep:
-            target = f"leftover processes of {entry.job_id}"
-        else:
-            target = f"group {entry.pgid}"
-        try:
-            probe = termination_probe(
-                entry.job_dir,
-                entry.pgid,
-                sig,
-                boot_id=entry.boot_id,
-                job_id=entry.job_id,
-                session=entry.session if uncertain_launch else None,
-                cancel_sentinel=uncertain_launch,
-                layout=entry.storage_layout,
-                ignore_exit_marker=terminal_sweep,
-            )
-        except ValueError as exc:
-            message = f"could not verify death of {target} on {entry.node}: {exc}"
-            err.print(f"[red]{escape(message)}[/red]")
-            return finish("unverified", "unverified", entry, message)
-        try:
-            proc = run_on(entry.node, entry.node_local, probe, timeout=20)
-        except (RemoteError, subprocess.TimeoutExpired, OSError) as e:
-            message = f"could not verify death of {target} on {entry.node}: {e}"
-            err.print(f"[red]{escape(message)}[/red]")
-            return finish(
-                "unverified",
-                "unverified",
-                entry,
-                message,
-            )
-        verdict, detail = termination_verdict(
-            proc.returncode,
-            proc.stdout,
-            proc.stderr,
+
+def _exit_for_kill_outcomes(outcomes: list[str]) -> NoReturn:
+    """Exit with the aggregate verdict of one `dt kill` invocation."""
+    if all(outcome == "ok" for outcome in outcomes):
+        raise typer.Exit(0)
+    # single-ref keeps the old exit semantics agents rely on
+    if len(outcomes) == 1 and outcomes[0] == "notfound":
+        raise typer.Exit(EXIT_NOT_FOUND)
+    if all(outcome == "unreachable" for outcome in outcomes):
+        raise typer.Exit(EXIT_UNREACHABLE)
+    raise typer.Exit(1)
+
+
+def _kill_via_laptop_json(
+    cfg: LaptopConfig,
+    refs: list[str],
+    *,
+    force: bool,
+    sweep: bool,
+) -> NoReturn:
+    """Laptop `dt kill --json`: route each ref to its center, merge one array."""
+    rows: list[JsonDict] = []
+    outcomes: list[str] = []
+    argv_tail = (
+        ["-y"]
+        + (["--force"] if force else [])
+        + (["--sweep"] if sweep else [])
+        + ["--json"]
+    )
+    for ref in refs:
+        lookup_errors: dict[str, str] = {}
+        unreachable: set[str] = set()
+        hit = find_center(
+            cfg,
+            ref,
+            errors=lookup_errors,
+            unreachable=unreachable,
         )
-        if verdict == "UNVERIFIED":
-            message = f"could not verify death of {target} on {entry.node}: {detail}"
-            err.print(f"[red]{escape(message)}[/red]")
-            return finish(
-                "unverified",
-                "unverified",
-                entry,
-                message,
+        if hit is None:
+            if lookup_errors:
+                only_transport_failures = set(lookup_errors) == unreachable
+                code = EXIT_UNREACHABLE if only_transport_failures else 1
+                detail = "; ".join(
+                    f"{center}: {message}" for center, message in lookup_errors.items()
+                )
+                rows.append(
+                    {
+                        "ref": ref,
+                        "job_id": None,
+                        "outcome": "unverified",
+                        "status": None,
+                        "reason": None,
+                        "message": (
+                            f"cannot determine which center owns job {ref!r}: {detail}"
+                        ),
+                        "exit_code": code,
+                    }
+                )
+                outcomes.append("unreachable" if code == EXIT_UNREACHABLE else "failed")
+                continue
+            rows.append(
+                {
+                    "ref": ref,
+                    "job_id": None,
+                    "outcome": "not_found",
+                    "status": None,
+                    "reason": None,
+                    "message": (f"no center's registry knows job {ref!r}"),
+                    "exit_code": EXIT_NOT_FOUND,
+                }
             )
-        if verdict == "ALIVE":
-            if terminal_sweep:
-                retained = entry.status
-                force_hint = "dt kill " + entry.job_id + " -y --force --sweep"
+            outcomes.append("notfound")
+            continue
+        _, head, _entry = hit
+        try:
+            proc = remote_dt(
+                head,
+                ["kill", ref, *argv_tail],
+                timeout=60,
+            )
+            payload = json.loads(proc.stdout or "[]")
+            if not isinstance(payload, list) or len(payload) != 1:
+                raise ValueError("head returned invalid kill JSON")
+            row = payload[0]
+            if not isinstance(row, dict):
+                raise ValueError("head returned invalid kill result")
+            row_exit = row.get("exit_code")
+            if not isinstance(row_exit, int) or isinstance(row_exit, bool):
+                raise ValueError("head returned invalid kill exit code")
+            rows.append(row)
+            outcomes.append(
+                "ok"
+                if row_exit == 0
+                else ("notfound" if row_exit == EXIT_NOT_FOUND else "failed")
+            )
+        except (RemoteError, TypeError, ValueError, json.JSONDecodeError) as e:
+            rows.append(
+                {
+                    "ref": ref,
+                    "job_id": _entry.get("job_id"),
+                    "outcome": "unverified",
+                    "status": _entry.get("status"),
+                    "reason": _entry.get("reason"),
+                    "message": str(e),
+                    "exit_code": 1,
+                }
+            )
+            outcomes.append("failed")
+    print(json.dumps(rows))
+    _exit_for_kill_outcomes(outcomes)
+
+
+def _kill_via_laptop_human(
+    cfg: LaptopConfig,
+    refs: list[str],
+    *,
+    yes: bool,
+    force: bool,
+    sweep: bool,
+) -> NoReturn:
+    """Laptop `dt kill`: forward each ref interactively to its center."""
+    argv_tail = (
+        (["-y"] if yes else [])
+        + (["--force"] if force else [])
+        + (["--sweep"] if sweep else [])
+    )
+    human_outcomes: list[str] = []
+    for ref in refs:
+        human_lookup_errors: dict[str, str] = {}
+        human_unreachable: set[str] = set()
+        hit = find_center(
+            cfg,
+            ref,
+            errors=human_lookup_errors,
+            unreachable=human_unreachable,
+        )
+        if hit is None:
+            if human_lookup_errors:
+                detail = "; ".join(
+                    f"{name}: {message}"
+                    for name, message in human_lookup_errors.items()
+                )
+                err.print(
+                    "[red]cannot determine which center owns job "
+                    f"{escape(ref)!s}: {escape(detail)}[/red]"
+                )
+                human_outcomes.append(
+                    "unreachable"
+                    if set(human_lookup_errors) == human_unreachable
+                    else "failed"
+                )
             else:
-                retained = "failed" if uncertain_launch else "running"
-                force_hint = "dt kill " + entry.job_id + " -y --force"
-            message = f"{target} on {entry.node} survived {sig}"
-            err.print(
-                f"[red]{escape(message)}[/red] "
-                f"(job stays '{escape(retained)}'; try: "
-                f"{escape(force_hint)})"
-            )
-            return finish("alive", "survived", entry, message)
-        if verdict == "EXITED":
-            # The exit marker predates our signal: completion won the race
-            # (the interactive confirmation window alone can hide seconds).
-            # Rewriting a finished job into killed/cancelled would erase its
-            # real result and mis-skip every dependent gated on it.  Prefer
-            # the full remote completion record; fall back to the probe's
-            # sanitized exit code when that read is unavailable (also the
-            # only completion path for an uncertain launch, whose failed
-            # status the refresh probe deliberately leaves alone).
-            entry = jobs_mod._refresh_status_locked(cfg, entry)
-            if entry.status != "finished":
-                entry.status = "finished"
-                entry.exit_code = int(detail) if detail is not None else None
-                entry.finished_at = entry.finished_at or time.time()
-                entry.result_state = None
-                entry.reason = "completed before kill; recorded from exit marker"
-                jobs_mod.save(cfg, entry)
-            message = f"{entry.job_id} completed before {sig} was sent"
-            err.print(f"[yellow]{escape(message)}; result preserved[/yellow]")
-            return finish("ok", "completed", entry, message)
-        if terminal_sweep:
-            # Confirmed DEAD: the sweep found or produced a quiet capsule.
-            # The terminal record already tells the truth; leave it alone.
-            message = f"sent {sig} to {target} on {entry.node}; no owned survivors"
-            err.print(f"[yellow]{escape(message)}[/yellow]")
-            return finish("ok", "swept", entry, message)
-        previous_reason = entry.reason
-        entry.status = "killed"
-        entry.result_state = "cancelled"
-        entry.finished_at = time.time()
-        if uncertain_launch:
-            entry.reason = (
-                f"uncertain launch cleanup confirmed dead by user ({sig}); "
-                f"previous: {previous_reason}"
-            )
-        else:
-            entry.reason = f"killed by user ({sig})"
-        jobs_mod.save(cfg, entry)
-        message = f"sent {sig} to {target} on {entry.node}; confirmed dead"
-        err.print(f"[yellow]{escape(message)}[/yellow]")
-        return finish("ok", "killed", entry, message)
+                err.print(f"[red]no center's registry knows job {escape(ref)!s}[/red]")
+                human_outcomes.append("notfound")
+            continue
+        _center, head, _entry = hit
+        code = forward_call(head, ["kill", ref, *argv_tail], tty=not yes)
+        human_outcomes.append(
+            "ok"
+            if code == 0
+            else "notfound"
+            if code == EXIT_NOT_FOUND
+            else "unreachable"
+            if code == EXIT_UNREACHABLE
+            else "failed"
+        )
+    _exit_for_kill_outcomes(human_outcomes)
 
 
 def kill(
@@ -15744,163 +15914,12 @@ def kill(
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         if json_:
-            rows: list[JsonDict] = []
-            outcomes: list[str] = []
-            argv_tail = (
-                ["-y"]
-                + (["--force"] if force else [])
-                + (["--sweep"] if sweep else [])
-                + ["--json"]
-            )
-            for ref in refs:
-                lookup_errors: dict[str, str] = {}
-                unreachable: set[str] = set()
-                hit = find_center(
-                    cfg,
-                    ref,
-                    errors=lookup_errors,
-                    unreachable=unreachable,
-                )
-                if hit is None:
-                    if lookup_errors:
-                        only_transport_failures = set(lookup_errors) == unreachable
-                        code = EXIT_UNREACHABLE if only_transport_failures else 1
-                        detail = "; ".join(
-                            f"{center}: {message}"
-                            for center, message in lookup_errors.items()
-                        )
-                        rows.append(
-                            {
-                                "ref": ref,
-                                "job_id": None,
-                                "outcome": "unverified",
-                                "status": None,
-                                "reason": None,
-                                "message": (
-                                    "cannot determine which center owns job "
-                                    f"{ref!r}: {detail}"
-                                ),
-                                "exit_code": code,
-                            }
-                        )
-                        outcomes.append(
-                            "unreachable" if code == EXIT_UNREACHABLE else "failed"
-                        )
-                        continue
-                    rows.append(
-                        {
-                            "ref": ref,
-                            "job_id": None,
-                            "outcome": "not_found",
-                            "status": None,
-                            "reason": None,
-                            "message": (f"no center's registry knows job {ref!r}"),
-                            "exit_code": EXIT_NOT_FOUND,
-                        }
-                    )
-                    outcomes.append("notfound")
-                    continue
-                _, head, _entry = hit
-                try:
-                    proc = remote_dt(
-                        head,
-                        ["kill", ref, *argv_tail],
-                        timeout=60,
-                    )
-                    payload = json.loads(proc.stdout or "[]")
-                    if not isinstance(payload, list) or len(payload) != 1:
-                        raise ValueError("head returned invalid kill JSON")
-                    row = payload[0]
-                    if not isinstance(row, dict):
-                        raise ValueError("head returned invalid kill result")
-                    row_exit = row.get("exit_code")
-                    if not isinstance(row_exit, int) or isinstance(row_exit, bool):
-                        raise ValueError("head returned invalid kill exit code")
-                    rows.append(row)
-                    outcomes.append(
-                        "ok"
-                        if row_exit == 0
-                        else ("notfound" if row_exit == EXIT_NOT_FOUND else "failed")
-                    )
-                except (RemoteError, TypeError, ValueError, json.JSONDecodeError) as e:
-                    rows.append(
-                        {
-                            "ref": ref,
-                            "job_id": _entry.get("job_id"),
-                            "outcome": "unverified",
-                            "status": _entry.get("status"),
-                            "reason": _entry.get("reason"),
-                            "message": str(e),
-                            "exit_code": 1,
-                        }
-                    )
-                    outcomes.append("failed")
-            print(json.dumps(rows))
-            if all(outcome == "ok" for outcome in outcomes):
-                return
-            if len(outcomes) == 1 and outcomes[0] == "notfound":
-                raise typer.Exit(EXIT_NOT_FOUND)
-            if all(outcome == "unreachable" for outcome in outcomes):
-                raise typer.Exit(EXIT_UNREACHABLE)
-            raise typer.Exit(1)
-        argv_tail = (
-            (["-y"] if yes else [])
-            + (["--force"] if force else [])
-            + (["--sweep"] if sweep else [])
-        )
-        human_outcomes: list[str] = []
-        for ref in refs:
-            human_lookup_errors: dict[str, str] = {}
-            human_unreachable: set[str] = set()
-            hit = find_center(
-                cfg,
-                ref,
-                errors=human_lookup_errors,
-                unreachable=human_unreachable,
-            )
-            if hit is None:
-                if human_lookup_errors:
-                    detail = "; ".join(
-                        f"{name}: {message}"
-                        for name, message in human_lookup_errors.items()
-                    )
-                    err.print(
-                        "[red]cannot determine which center owns job "
-                        f"{escape(ref)!s}: {escape(detail)}[/red]"
-                    )
-                    human_outcomes.append(
-                        "unreachable"
-                        if set(human_lookup_errors) == human_unreachable
-                        else "failed"
-                    )
-                else:
-                    err.print(
-                        f"[red]no center's registry knows job {escape(ref)!s}[/red]"
-                    )
-                    human_outcomes.append("notfound")
-                continue
-            _center, head, _entry = hit
-            code = forward_call(head, ["kill", ref, *argv_tail], tty=not yes)
-            human_outcomes.append(
-                "ok"
-                if code == 0
-                else "notfound"
-                if code == EXIT_NOT_FOUND
-                else "unreachable"
-                if code == EXIT_UNREACHABLE
-                else "failed"
-            )
-        if all(outcome == "ok" for outcome in human_outcomes):
-            return
-        if len(human_outcomes) == 1 and human_outcomes[0] == "notfound":
-            raise typer.Exit(EXIT_NOT_FOUND)
-        if all(outcome == "unreachable" for outcome in human_outcomes):
-            raise typer.Exit(EXIT_UNREACHABLE)
-        raise typer.Exit(1)
+            _kill_via_laptop_json(cfg, refs, force=force, sweep=sweep)
+        _kill_via_laptop_human(cfg, refs, yes=yes, force=force, sweep=sweep)
 
     cfg = _need_head(cfg)
-    rows = [{} for _ref in refs] if json_ else []
-    outcomes = []
+    rows: list[JsonDict] = [{} for _ref in refs] if json_ else []
+    outcomes: list[str] = []
     for index, ref in enumerate(refs):
         try:
             outcome = _kill_one(
@@ -15930,12 +15949,7 @@ def kill(
         outcomes.append(outcome)
     if json_:
         print(json.dumps(rows))
-    if all(o == "ok" for o in outcomes):
-        return
-    # single-ref keeps the old exit semantics agents rely on
-    if len(outcomes) == 1 and outcomes[0] == "notfound":
-        raise typer.Exit(EXIT_NOT_FOUND)
-    raise typer.Exit(1)
+    _exit_for_kill_outcomes(outcomes)
 
 
 @dataclass(frozen=True)
