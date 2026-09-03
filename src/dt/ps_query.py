@@ -13,6 +13,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Any, TypeAlias, cast
 
+from .jsonvalue import as_number
 from .jobs import (
     JOB_STATUSES,
     MAX_JOB_COLLECTION_ITEMS,
@@ -313,18 +314,8 @@ def selection_digest(
 
 
 def _finite_number(value: object) -> bool:
-    """True only for a finite real number.
-
-    Rejects bool and, critically, an int so large that ``float(value)`` raises
-    ``OverflowError`` (a caller-supplied cursor or a malformed head row can carry
-    ``10**400``; the overflow must become an invalid-argument, not a 500).
-    """
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return False
-    try:
-        return math.isfinite(float(value))
-    except OverflowError:
-        return False
+    """True only for a finite real number (bool and 10**400 both fail)."""
+    return as_number(value) is not None
 
 
 def _bounded_text(value: object) -> bool:

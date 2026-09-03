@@ -98,6 +98,7 @@ from .maintenance import (
     create_clean_plan,
     load_clean_plan,
 )
+from .jsonvalue import as_int, as_number
 from .layout import (
     ROLE_LAYOUT,
     display_node_path,
@@ -894,39 +895,17 @@ def _best_free_submit_node(rows: list[JsonDict]) -> object:
         free_gpus = sum(bool(gpu.get("free")) for gpu in row.get("gpus") or [])
         system = row.get("system")
         system = system if isinstance(system, dict) else {}
-        disk_free = system.get("disk_free_gib")
-        disk_total = system.get("disk_total_gib")
-        free_known = (
-            isinstance(disk_free, int | float)
-            and not isinstance(disk_free, bool)
-            and math.isfinite(float(disk_free))
-        )
-        total_known = (
-            isinstance(disk_total, int | float)
-            and not isinstance(disk_total, bool)
-            and math.isfinite(float(disk_total))
-            and float(disk_total) > 0
-        )
-        if free_known and total_known:
-            assert isinstance(disk_free, int | float)
-            assert isinstance(disk_total, int | float)
+        disk_free = as_number(system.get("disk_free_gib"))
+        disk_total = as_number(system.get("disk_total_gib"))
+        if disk_free is not None and disk_total is not None and disk_total > 0:
             low_disk = (
-                float(disk_free) < DISK_LOW_FREE_GIB
-                or float(disk_free) / float(disk_total) < DISK_LOW_FREE_FRACTION
+                disk_free < DISK_LOW_FREE_GIB
+                or disk_free / disk_total < DISK_LOW_FREE_FRACTION
             )
             disk_health = 0 if low_disk else 2
         else:
             disk_health = 1
-        return (
-            free_gpus,
-            disk_health,
-            (
-                float(disk_free)
-                if isinstance(disk_free, int | float)
-                and not isinstance(disk_free, bool)
-                else -1.0
-            ),
-        )
+        return (free_gpus, disk_health, disk_free if disk_free is not None else -1.0)
 
     eligible = [row for row in rows if not row.get("drained")]
     if not eligible:
@@ -940,11 +919,9 @@ def _free_gpu_meets_minimum(gpu: object, minimum_mib: int | None) -> bool:
         return False
     if minimum_mib is None:
         return True
-    raw_total = gpu.get("mem_total_mib", gpu.get("mem_total"))
+    raw_total = as_number(gpu.get("mem_total_mib", gpu.get("mem_total")))
     return (
-        isinstance(raw_total, (int, float))
-        and not isinstance(raw_total, bool)
-        and math.isfinite(float(raw_total))
+        raw_total is not None
         and raw_total > 0
         and int(raw_total) == raw_total
         and raw_total >= minimum_mib
@@ -1532,14 +1509,9 @@ def _free_scheduler_table(
             [row for row in rows if row.get("center") == center]
         )
         total = cap.total
-        minimum = context.get("queue_head_min_vram_mib")
-        minimum = (
-            minimum
-            if isinstance(minimum, int)
-            and not isinstance(minimum, bool)
-            and minimum > 0
-            else None
-        )
+        minimum = as_int(context.get("queue_head_min_vram_mib"))
+        if minimum is not None and minimum <= 0:
+            minimum = None
         free_count = cap.free_count
         running = context.get("running")
         queued = context.get("queued")
@@ -3345,12 +3317,8 @@ def _emit_task_artifact_sync_success(
 ) -> None:
     from rich.markup import escape
 
-    moved = row.get("transferred_bytes")
-    moved_text = (
-        _format_transfer_bytes(moved)
-        if isinstance(moved, int) and not isinstance(moved, bool)
-        else "done"
-    )
+    moved = as_int(row.get("transferred_bytes"))
+    moved_text = _format_transfer_bytes(moved) if moved is not None else "done"
     err.print(
         f"[green]synced inputs[/green] {escape(server)}  {moved_text} · "
         f"manifest {manifest[:12]}"
@@ -6319,7 +6287,7 @@ def _gather_laptop_ps_window(
             errors[center] = "invalid ps window object from head"
             continue
         window_rows = payload.get("rows")
-        window_total = payload.get("total")
+        window_total = as_int(payload.get("total"))
         if (
             payload.get("schema_version") != PS_WINDOW_SCHEMA
             or payload.get("center") != center
@@ -6327,8 +6295,7 @@ def _gather_laptop_ps_window(
             or not isinstance(window_rows, list)
             or not all(isinstance(row, dict) for row in window_rows)
             or not all(row.get("center") == center for row in window_rows)
-            or not isinstance(window_total, int)
-            or isinstance(window_total, bool)
+            or window_total is None
             or window_total < len(window_rows)
             or not _ps_window_size_is_exact(
                 window_rows,
@@ -6358,15 +6325,11 @@ def _max_hours_overdue(
     duration_s: object,
 ) -> float | None:
     """Return registry-observed seconds beyond the requested runtime guard."""
-    if (
-        not isinstance(max_hours, (int, float))
-        or isinstance(max_hours, bool)
-        or max_hours <= 0
-        or not isinstance(duration_s, (int, float))
-        or isinstance(duration_s, bool)
-    ):
+    limit = as_number(max_hours)
+    elapsed = as_number(duration_s)
+    if limit is None or limit <= 0 or elapsed is None:
         return None
-    overdue = float(duration_s) - float(max_hours) * 3600
+    overdue = elapsed - limit * 3600
     return overdue if overdue > 0 else None
 
 
@@ -6672,11 +6635,7 @@ def _ps_issue_rows(rows: list[JsonDict]) -> list[JsonDict]:
             if exit_code is None:
                 # A finished record without an exit code is an infra failure.
                 return True
-            return (
-                isinstance(exit_code, int)
-                and not isinstance(exit_code, bool)
-                and exit_code != 0
-            )
+            return as_int(exit_code) not in (None, 0)
         if status == "queued" and isinstance(reason, str):
             return reason.startswith("blocked:") or "unreachable:" in reason
         if status == "running":
@@ -7993,22 +7952,14 @@ def _safe_job_resource_sample(value: object) -> JsonDict | None:
 
     safe_job: dict[str, int | float | None] = {}
     for key in ("processes", "threads"):
-        candidate = job.get(key)
-        if (
-            not isinstance(candidate, int)
-            or isinstance(candidate, bool)
-            or candidate < 0
-        ):
+        count = as_int(job.get(key))
+        if count is None or count < 0:
             return None
-        safe_job[key] = candidate
+        safe_job[key] = count
 
     def safe_metric(candidate: object) -> bool:
-        if not isinstance(candidate, (int, float)) or isinstance(candidate, bool):
-            return False
-        try:
-            return math.isfinite(float(candidate)) and 0 <= float(candidate) <= 10**15
-        except OverflowError:
-            return False
+        number = as_number(candidate)
+        return number is not None and 0 <= number <= 10**15
 
     for key in ("rss_mib", "cpu_pct", "read_mib_s", "write_mib_s"):
         candidate = job.get(key)
@@ -8284,30 +8235,30 @@ def _format_eta_duration(seconds: int) -> str:
 
 def _format_log_progress(progress: JsonDict) -> str:
     parts: list[str] = []
-    step = progress.get("step")
-    total = progress.get("total_steps")
-    if isinstance(step, int):
+    step = as_int(progress.get("step"))
+    total = as_int(progress.get("total_steps"))
+    if step is not None:
         step_text = f"{step:,}"
-        if isinstance(total, int):
+        if total is not None:
             step_text += f"/{total:,}"
         parts.append(f"step {step_text}")
-    elif isinstance(total, int) and not isinstance(total, bool):
+    elif total is not None:
         # A declared target without an observed step is a useful, bounded
         # state: the job is pre-step. Do not call it compilation or healthy
         # utilization because neither is proven by the log.
         parts.append(f"pre-step · target {total:,}")
-    percent = progress.get("percent")
-    if isinstance(percent, (int, float)) and not isinstance(percent, bool):
-        parts.append(f"{float(percent):g}%")
+    percent = as_number(progress.get("percent"))
+    if percent is not None:
+        parts.append(f"{percent:g}%")
     eta = progress.get("eta")
     if isinstance(eta, str) and eta:
         parts.append(f"ETA {eta}")
-    step_time = progress.get("step_time_s")
-    if isinstance(step_time, (int, float)) and not isinstance(step_time, bool):
-        parts.append(f"{float(step_time):g} s/step")
-    samples = progress.get("samples_per_sec")
-    if isinstance(samples, (int, float)) and not isinstance(samples, bool):
-        parts.append(f"{float(samples):g} samples/s")
+    step_time = as_number(progress.get("step_time_s"))
+    if step_time is not None:
+        parts.append(f"{step_time:g} s/step")
+    samples = as_number(progress.get("samples_per_sec"))
+    if samples is not None:
+        parts.append(f"{samples:g} samples/s")
     return " · ".join(parts)
 
 
@@ -9141,14 +9092,7 @@ def _probable_host_oom_hint(
         return None
 
     def number(row: JsonDict, key: str) -> float | None:
-        value = row.get(key)
-        if (
-            not isinstance(value, (int, float))
-            or isinstance(value, bool)
-            or not math.isfinite(float(value))
-        ):
-            return None
-        return float(value)
+        return as_number(row.get(key))
 
     total_mib = number(host, "mem_total_mib")
     used_mib = number(host, "mem_used_peak_mib")
@@ -9373,12 +9317,7 @@ def _render_wait_group(payload: JsonDict) -> None:
     for raw in jobs:
         assert isinstance(raw, dict)
         status = str(raw["status"])
-        raw_code = raw.get("exit_code")
-        code = (
-            int(raw_code)
-            if isinstance(raw_code, int) and not isinstance(raw_code, bool)
-            else None
-        )
+        code = as_int(raw.get("exit_code"))
         if code == 0:
             result = "[green]✓ ok[/green]"
         elif status == "finished" and code is None:
@@ -9715,9 +9654,9 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _fmt_memory_mib(value: object, *, compact: bool = False) -> str:
-    if not isinstance(value, int | float) or isinstance(value, bool):
+    mib = as_number(value)
+    if mib is None:
         return "-"
-    mib = float(value)
     if mib < 1024:
         return f"{mib:.1f}{'M' if compact else ' MiB'}"
     return f"{mib / 1024:.1f}{'G' if compact else ' GiB'}"
@@ -9958,14 +9897,8 @@ def _watch_snapshot(
             if proc.returncode != 0 and LOG_SOURCE_MARK not in (proc.stdout or ""):
                 detail = (proc.stderr or proc.stdout or "log probe failed").strip()
                 raise RuntimeError(detail)
-            candidate = getattr(proc, "_dt_log_updated_at", None)
-            if (
-                isinstance(candidate, (int, float))
-                and not isinstance(candidate, bool)
-                and math.isfinite(float(candidate))
-                and float(candidate) > 0
-            ):
-                log_updated_at = float(candidate)
+            log_updated_at = as_number(getattr(proc, "_dt_log_updated_at", None))
+            if log_updated_at is not None and log_updated_at > 0:
                 log_age_s = max(0.0, time.time() - log_updated_at)
             resource_sample = getattr(proc, "_dt_resource_sample", None)
             if entry.status == "running" and isinstance(resource_sample, dict):
@@ -10203,15 +10136,10 @@ def _watch_view(snapshot: JsonDict) -> Any:
         summary = _format_log_progress(progress)
         if summary:
             t.add_row("progress", summary)
-    log_age = snapshot.get("log_age_s")
-    if (
-        status == "running"
-        and isinstance(log_age, (int, float))
-        and not isinstance(log_age, bool)
-        and math.isfinite(float(log_age))
-    ):
-        age_text = f"{_fmt_duration(float(log_age))} since last update"
-        if float(log_age) >= 60:
+    log_age = as_number(snapshot.get("log_age_s"))
+    if status == "running" and log_age is not None:
+        age_text = f"{_fmt_duration(log_age)} since last update"
+        if log_age >= 60:
             age_text = f"[yellow]{age_text}[/yellow]"
         t.add_row("log age", age_text)
     raw_log = str(snapshot.get("log_tail") or "")
@@ -10301,12 +10229,8 @@ def _watch_group_view(payload: JsonDict) -> Any:
                     total = float(gpu.get("mem_total", 0)) / 1024
                     where += f"\n{gpu.get('util', 0)}% · {used:.1f}/{total:.1f} GiB"
 
-        duration = snapshot.get("duration_s")
-        elapsed = (
-            _fmt_duration(float(duration))
-            if isinstance(duration, int | float) and not isinstance(duration, bool)
-            else "-"
-        )
+        duration = as_number(snapshot.get("duration_s"))
+        elapsed = _fmt_duration(duration) if duration is not None else "-"
         detail = ""
         reason = snapshot.get("reason")
         if reason:
@@ -10336,20 +10260,14 @@ def _watch_group_view(payload: JsonDict) -> Any:
             else:
                 memory = job.get("rss_mib")
                 label = "RAM"
-            if isinstance(memory, (int, float)) and not isinstance(memory, bool):
+            if as_number(memory) is not None:
                 job_parts.append(f"{label} {_fmt_memory_mib(memory)}")
             if job_parts:
                 job_detail = " · ".join(job_parts)
                 detail = f"{detail} · {job_detail}" if detail else job_detail
-        log_age = snapshot.get("log_age_s")
-        if (
-            status == "running"
-            and isinstance(log_age, (int, float))
-            and not isinstance(log_age, bool)
-            and math.isfinite(float(log_age))
-            and float(log_age) >= 60
-        ):
-            idle = f"log idle {_fmt_duration(float(log_age))}"
+        log_age = as_number(snapshot.get("log_age_s"))
+        if status == "running" and log_age is not None and log_age >= 60:
+            idle = f"log idle {_fmt_duration(log_age)}"
             detail = f"{detail} · [yellow]{idle}[/yellow]" if detail else idle
         exit_code = snapshot.get("exit_code")
         if status == "finished":
@@ -10395,21 +10313,14 @@ def _gpu_sampling_note(summary: JsonDict) -> str | None:
     """Explain a zero sampled peak without claiming that the GPU was idle."""
     zero_peak = []
     for index, gpu in (summary.get("gpus") or {}).items():
-        peak = gpu.get("util_peak_pct")
-        if (
-            isinstance(peak, (int, float))
-            and not isinstance(peak, bool)
-            and float(peak) == 0
-        ):
+        if as_number(gpu.get("util_peak_pct")) == 0:
             zero_peak.append(str(index))
     if not zero_peak:
         return None
 
-    interval = summary.get("sample_interval_s")
+    interval = as_number(summary.get("sample_interval_s"))
     cadence = (
-        f"~{float(interval):.1f}s intervals"
-        if isinstance(interval, (int, float)) and not isinstance(interval, bool)
-        else "periodic intervals"
+        f"~{interval:.1f}s intervals" if interval is not None else "periodic intervals"
     )
     gpu_label = ", ".join(f"GPU {index}" for index in zero_peak)
     return (
@@ -10449,12 +10360,8 @@ def _phase_spans_for_human(
         for span in summary.get("phases") or []
         if isinstance(span, dict) and _safe_phase_name(span.get("phase"))
     ]
-    already_omitted = summary.get("phase_spans_omitted")
-    if (
-        not isinstance(already_omitted, int)
-        or isinstance(already_omitted, bool)
-        or already_omitted < 0
-    ):
+    already_omitted = as_int(summary.get("phase_spans_omitted")) or 0
+    if already_omitted < 0:
         already_omitted = 0
     if len(spans) <= max_spans and not already_omitted:
         return spans, 0
@@ -10674,9 +10581,8 @@ def _metrics_table(entry: jobs_mod.JobEntry, summary: JsonDict) -> Any:
     t.add_column("peak", justify="right")
 
     def fmt(value: object, suffix: str = "", scale: float = 1.0) -> str:
-        if not isinstance(value, int | float) or isinstance(value, bool):
-            return "-"
-        return "-" if value is None else f"{float(value) / scale:.1f}{suffix}"
+        number = as_number(value)
+        return "-" if number is None else f"{number / scale:.1f}{suffix}"
 
     gpu_error_samples = int(summary.get("gpu_error_samples") or 0)
     if gpu_error_samples:
@@ -10828,20 +10734,18 @@ def _parse_phase_jsonl(text: str) -> tuple[list[JsonDict], int]:
         except json.JSONDecodeError:
             invalid += 1
             continue
-        timestamp = row.get("timestamp") if isinstance(row, dict) else None
+        timestamp = as_number(row.get("timestamp")) if isinstance(row, dict) else None
         phase = row.get("phase") if isinstance(row, dict) else None
         if (
             not isinstance(row, dict)
             or row.get("schema_version") != "dt_phase_v1"
             or not _safe_phase_name(phase)
-            or not isinstance(timestamp, (int, float))
-            or isinstance(timestamp, bool)
-            or not math.isfinite(float(timestamp))
-            or float(timestamp) <= 0
+            or timestamp is None
+            or timestamp <= 0
         ):
             invalid += 1
             continue
-        markers.append({"phase": phase, "timestamp": float(timestamp)})
+        markers.append({"phase": phase, "timestamp": timestamp})
     return markers, invalid
 
 
@@ -10907,12 +10811,8 @@ def _phase_summary_rows(
         if marker is None:
             parts.append(f"… {omitted} phases …")
             continue
-        duration = marker.get("duration_s")
-        suffix = (
-            _fmt_short_duration(float(duration))
-            if isinstance(duration, (int, float)) and not isinstance(duration, bool)
-            else "current"
-        )
+        duration = as_number(marker.get("duration_s"))
+        suffix = _fmt_short_duration(duration) if duration is not None else "current"
         parts.append(f"{marker['phase']} {suffix}")
     return [("phase timeline", " → ".join(parts))] if parts else []
 
@@ -12190,17 +12090,9 @@ def _read_compare_metric(
 ) -> JsonDict:
     if output_glob == COMPARE_JOB_METRIC_SOURCE:
         if field == "duration_s":
-            started_at = entry.started_at
-            finished_at = entry.finished_at
-            if (
-                not isinstance(started_at, (int, float))
-                or isinstance(started_at, bool)
-                or not math.isfinite(float(started_at))
-                or not isinstance(finished_at, (int, float))
-                or isinstance(finished_at, bool)
-                or not math.isfinite(float(finished_at))
-                or finished_at < started_at
-            ):
+            started_at = as_number(entry.started_at)
+            finished_at = as_number(entry.finished_at)
+            if started_at is None or finished_at is None or finished_at < started_at:
                 return {
                     "status": "error",
                     "error": "metric_read_failed",
@@ -12375,10 +12267,8 @@ def _compare_metric_payload(
 
 
 def _compare_numeric_field(row: JsonDict, field: str) -> float:
-    value = row[field]
-    assert not isinstance(value, bool) and isinstance(value, (int, float))
-    number = float(value)
-    assert math.isfinite(number)
+    number = as_number(row[field])
+    assert number is not None  # rows come from _compare_payload, already validated
     return number
 
 
@@ -12394,14 +12284,7 @@ def _compare_metric_gate(
     baseline, candidate = groups
     assert isinstance(baseline, dict)
     assert isinstance(candidate, dict)
-    raw_improvement = candidate.get("improvement_vs_baseline_pct")
-    observed_improvement = (
-        float(raw_improvement)
-        if isinstance(raw_improvement, (int, float))
-        and not isinstance(raw_improvement, bool)
-        and math.isfinite(float(raw_improvement))
-        else None
-    )
+    observed_improvement = as_number(candidate.get("improvement_vs_baseline_pct"))
     failures: list[str] = []
     if min_improvement is not None:
         if observed_improvement is None:
@@ -12431,20 +12314,16 @@ def _compare_metric_gate(
     if max_spread is not None:
         for group in groups:
             assert isinstance(group, dict)
-            spread = group.get("spread_pct")
-            if (
-                not isinstance(spread, (int, float))
-                or isinstance(spread, bool)
-                or not math.isfinite(float(spread))
-            ):
+            spread = as_number(group.get("spread_pct"))
+            if spread is None:
                 failures.append(
                     f"{group['label']} spread unavailable (need at least two runs)"
                 )
             else:
-                spread_values.append(float(spread))
-                if float(spread) > max_spread:
+                spread_values.append(spread)
+                if spread > max_spread:
                     failures.append(
-                        f"{group['label']} spread {float(spread):.3f}% > "
+                        f"{group['label']} spread {spread:.3f}% > "
                         f"allowed {max_spread:.3f}%"
                     )
 
@@ -14224,9 +14103,9 @@ def _validated_retries(
     operation: str,
     json_: bool,
 ) -> int:
-    retries = (
-        value if isinstance(value, int) and not isinstance(value, bool) else default
-    )
+    retries = as_int(value)
+    if retries is None:
+        retries = default
     if retries < 0:
         _fail_submission(
             kind="invalid_argument",
@@ -16274,8 +16153,8 @@ def _kill_via_laptop_json(
             row = payload[0]
             if not isinstance(row, dict):
                 raise ValueError("head returned invalid kill result")
-            row_exit = row.get("exit_code")
-            if not isinstance(row_exit, int) or isinstance(row_exit, bool):
+            row_exit = as_int(row.get("exit_code"))
+            if row_exit is None:
                 raise ValueError("head returned invalid kill exit code")
             rows.append(row)
             outcomes.append(
@@ -17514,8 +17393,8 @@ def storage(
     if json_:
         print(json.dumps(payload))
         return
-    total_bytes = payload["total_bytes"]
-    if not isinstance(total_bytes, int) or isinstance(total_bytes, bool):
+    total_bytes = as_int(payload["total_bytes"])
+    if total_bytes is None:
         raise ValueError("invalid storage inventory total")
     head_rows = payload["head"]
     if not isinstance(head_rows, list):
@@ -18268,35 +18147,30 @@ class _SyncRequest:
 
 def _sync_transfer_summary(row: JsonDict, *, plan: bool) -> str:
     """One-line transfer summary: bytes, deletions, files, manifest, duration."""
-    transferred_bytes = row.get("transferred_bytes")
+    transferred_bytes = as_int(row.get("transferred_bytes"))
     gib = row.get("transferred_gib")
     moved = (
-        _format_transfer_bytes(int(transferred_bytes))
-        if isinstance(transferred_bytes, int)
-        and not isinstance(transferred_bytes, bool)
+        _format_transfer_bytes(transferred_bytes)
+        if transferred_bytes is not None
         else (
             "no changed bytes"
             if gib == 0
             else (f"{float(gib):.2f} GiB" if gib is not None else "done")
         )
     )
-    deleted = row.get("deleted_files")
-    if isinstance(deleted, int) and not isinstance(deleted, bool) and deleted > 0:
+    deleted = as_int(row.get("deleted_files"))
+    if deleted is not None and deleted > 0:
         moved += f" · would delete {deleted:,}" if plan else f" · {deleted:,} deleted"
-    transferred_files = row.get("transferred_files")
-    if (
-        isinstance(transferred_files, int)
-        and not isinstance(transferred_files, bool)
-        and transferred_files > 0
-    ):
+    transferred_files = as_int(row.get("transferred_files"))
+    if transferred_files is not None and transferred_files > 0:
         noun = "file" if transferred_files == 1 else "files"
         moved += f" · {transferred_files:,} {noun}"
     manifest = row.get("artifact_manifest_sha256")
     if isinstance(manifest, str):
         moved += f" · manifest {manifest[:12]}"
-    duration = row.get("duration_s")
-    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
-        moved += f" · {_fmt_short_duration(float(duration))}"
+    duration = as_number(row.get("duration_s"))
+    if duration is not None:
+        moved += f" · {_fmt_short_duration(duration)}"
     return moved
 
 

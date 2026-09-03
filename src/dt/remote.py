@@ -16,6 +16,7 @@ from typing import Any, BinaryIO, TypeAlias, cast
 
 from .config import LaptopConfig
 from .operation_log import current_operation_id, record_handoff
+from .jsonvalue import as_number
 from .redaction import redact_remote_detail
 from .terminal import sanitize_terminal_text
 from .sshio import (
@@ -175,12 +176,8 @@ def _strict_remote_json(text: str) -> object:
 
 
 def _finite_observation_number(value: object) -> bool:
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return False
-    try:
-        return math.isfinite(float(value)) and abs(float(value)) <= 10**15
-    except OverflowError:
-        return False
+    number = as_number(value)
+    return number is not None and abs(number) <= 10**15
 
 
 def _valid_free_row(row: object) -> bool:
