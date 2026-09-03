@@ -1909,6 +1909,80 @@ def validate_artifact_targets(targets: Mapping[str, str]) -> dict[str, str]:
     return validated
 
 
+def _validate_cache_reuse_contract(
+    spec: RunSpec,
+    cache_values: tuple[str | None, ...],
+) -> None:
+    """Validate and normalize a complete cache-reuse contract in place."""
+    if not all(isinstance(value, str) and value for value in cache_values):
+        raise ConfigError("cache reuse contract is incomplete")
+    if (
+        not isinstance(spec.forked_from, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", spec.forked_from) is None
+    ):
+        raise ConfigError("cache reuse requires safe fork provenance")
+    if re.fullmatch(r"[A-Za-z0-9_-]+", spec.cache_source_job or "") is None:
+        raise ConfigError("cache source job identity is unsafe")
+    source_value = spec.cache_source_job_dir or ""
+    if source_value.startswith(("~/", "/")):
+        try:
+            normalized_source_dir = normalize_node_root(source_value)
+        except ValueError as exc:
+            raise ConfigError("cache source job directory is unsafe") from exc
+    else:
+        source_dir = PurePosixPath(source_value)
+        if (
+            source_dir.is_absolute()
+            or ".." in source_dir.parts
+            or not source_dir.parts
+            or re.fullmatch(r"[A-Za-z0-9._/-]+", source_dir.as_posix()) is None
+        ):
+            raise ConfigError("cache source job directory is unsafe")
+        normalized_source_dir = source_dir.as_posix()
+    relative = PurePosixPath(spec.cache_source_path or "")
+    if (
+        relative.is_absolute()
+        or len(relative.parts) < 2
+        or relative.parts[0] != "outputs"
+        or ".." in relative.parts
+        or re.fullmatch(r"[A-Za-z0-9._/-]+", relative.as_posix()) is None
+    ):
+        raise ConfigError(
+            "reuse-cache must be a directory below the source job's outputs/"
+        )
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", spec.cache_env or "") is None:
+        raise ConfigError("cache-env must be a valid environment variable name")
+    reserved_cache_envs = {
+        "HOME",
+        "PATH",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "UV_PROJECT_ENVIRONMENT",
+        "CUDA_VISIBLE_DEVICES",
+    }
+    if spec.cache_env in reserved_cache_envs or (
+        str(spec.cache_env).startswith("DT_")
+        and spec.cache_env != "DT_REUSED_CACHE_DIR"
+    ):
+        raise ConfigError(f"cache-env {spec.cache_env!r} is reserved")
+    if re.fullmatch(r"[0-9a-f]{12}", spec.cache_source_env_hash or "") is None:
+        raise ConfigError("cache source environment identity is invalid")
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{64}",
+            spec.cache_source_snapshot_sha256 or "",
+        )
+        is None
+    ):
+        raise ConfigError("cache source snapshot identity is invalid")
+    if spec.cache_mode is None:
+        spec.cache_mode = "shared"
+    elif spec.cache_mode not in {"shared", "clone"}:
+        raise ConfigError("cache mode must be shared or clone")
+    spec.cache_source_job_dir = normalized_source_dir
+    spec.cache_source_path = relative.as_posix()
+
+
 def _validate_run_spec(spec: RunSpec) -> None:
     """Enforce submission invariants before probing, snapshotting, or launching."""
     if not spec.cmd or not any(part.strip() for part in spec.cmd):
@@ -2088,73 +2162,7 @@ def _validate_run_spec(spec: RunSpec) -> None:
         spec.cache_source_snapshot_sha256,
     )
     if any(value is not None for value in cache_values):
-        if not all(isinstance(value, str) and value for value in cache_values):
-            raise ConfigError("cache reuse contract is incomplete")
-        if (
-            not isinstance(spec.forked_from, str)
-            or re.fullmatch(r"[A-Za-z0-9_-]+", spec.forked_from) is None
-        ):
-            raise ConfigError("cache reuse requires safe fork provenance")
-        if re.fullmatch(r"[A-Za-z0-9_-]+", spec.cache_source_job or "") is None:
-            raise ConfigError("cache source job identity is unsafe")
-        source_value = spec.cache_source_job_dir or ""
-        if source_value.startswith(("~/", "/")):
-            try:
-                normalized_source_dir = normalize_node_root(source_value)
-            except ValueError as exc:
-                raise ConfigError("cache source job directory is unsafe") from exc
-        else:
-            source_dir = PurePosixPath(source_value)
-            if (
-                source_dir.is_absolute()
-                or ".." in source_dir.parts
-                or not source_dir.parts
-                or re.fullmatch(r"[A-Za-z0-9._/-]+", source_dir.as_posix()) is None
-            ):
-                raise ConfigError("cache source job directory is unsafe")
-            normalized_source_dir = source_dir.as_posix()
-        relative = PurePosixPath(spec.cache_source_path or "")
-        if (
-            relative.is_absolute()
-            or len(relative.parts) < 2
-            or relative.parts[0] != "outputs"
-            or ".." in relative.parts
-            or re.fullmatch(r"[A-Za-z0-9._/-]+", relative.as_posix()) is None
-        ):
-            raise ConfigError(
-                "reuse-cache must be a directory below the source job's outputs/"
-            )
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", spec.cache_env or "") is None:
-            raise ConfigError("cache-env must be a valid environment variable name")
-        reserved_cache_envs = {
-            "HOME",
-            "PATH",
-            "PYTHONPATH",
-            "VIRTUAL_ENV",
-            "UV_PROJECT_ENVIRONMENT",
-            "CUDA_VISIBLE_DEVICES",
-        }
-        if spec.cache_env in reserved_cache_envs or (
-            str(spec.cache_env).startswith("DT_")
-            and spec.cache_env != "DT_REUSED_CACHE_DIR"
-        ):
-            raise ConfigError(f"cache-env {spec.cache_env!r} is reserved")
-        if re.fullmatch(r"[0-9a-f]{12}", spec.cache_source_env_hash or "") is None:
-            raise ConfigError("cache source environment identity is invalid")
-        if (
-            re.fullmatch(
-                r"[0-9a-f]{64}",
-                spec.cache_source_snapshot_sha256 or "",
-            )
-            is None
-        ):
-            raise ConfigError("cache source snapshot identity is invalid")
-        if spec.cache_mode is None:
-            spec.cache_mode = "shared"
-        elif spec.cache_mode not in {"shared", "clone"}:
-            raise ConfigError("cache mode must be shared or clone")
-        spec.cache_source_job_dir = normalized_source_dir
-        spec.cache_source_path = relative.as_posix()
+        _validate_cache_reuse_contract(spec, cache_values)
     elif spec.cache_mode is not None:
         raise ConfigError("cache mode requires a complete cache source contract")
 
@@ -3771,6 +3779,44 @@ def _preview_environment(
     }
 
 
+def _preview_dependency_outcome(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    outcome_reason: str | None,
+) -> tuple[str | None, str | None]:
+    """Forecast what an --after-* dependency would do to this submission."""
+    if spec.after_success:
+        predecessor = load(cfg, spec.after_success)
+        if predecessor is not None and _dependency_settled(predecessor):
+            if not _job_succeeded(predecessor):
+                result = effective_result_state(predecessor) or predecessor.status
+                return "skip", (
+                    f"dependency {spec.after_success} completed as {result}; "
+                    "required success"
+                )
+            return None, outcome_reason
+        return "queue", f"waiting: dependency {spec.after_success}"
+    if spec.after_complete:
+        predecessor = load(cfg, spec.after_complete)
+        if predecessor is None or not _dependency_settled(predecessor):
+            return "queue", f"waiting: completion dependency {spec.after_complete}"
+        return None, outcome_reason
+    if spec.after_result:
+        predecessor = load(cfg, spec.after_result)
+        expected = ",".join(spec.after_result_states)
+        if predecessor is None or not _dependency_settled(predecessor):
+            return "queue", (
+                f"waiting: result dependency {spec.after_result} in [{expected}]"
+            )
+        result = effective_result_state(predecessor) or predecessor.status
+        if result not in spec.after_result_states:
+            return "skip", (
+                f"dependency {spec.after_result} completed as {result}; "
+                f"expected one of {expected}"
+            )
+    return None, outcome_reason
+
+
 def preview_submission(
     cfg: HeadConfig,
     spec: RunSpec,
@@ -3866,41 +3912,8 @@ def preview_submission(
             outcome = "reject" if no_queue else "queue"
         outcome_reason = forecast.reason
 
-    if outcome is None and spec.after_success:
-        predecessor = load(cfg, spec.after_success)
-        if predecessor is not None and _dependency_settled(predecessor):
-            if not _job_succeeded(predecessor):
-                result = effective_result_state(predecessor) or predecessor.status
-                outcome = "skip"
-                outcome_reason = (
-                    f"dependency {spec.after_success} completed as {result}; "
-                    "required success"
-                )
-        else:
-            outcome = "queue"
-            outcome_reason = f"waiting: dependency {spec.after_success}"
-    elif outcome is None and spec.after_complete:
-        predecessor = load(cfg, spec.after_complete)
-        if predecessor is None or not _dependency_settled(predecessor):
-            outcome = "queue"
-            outcome_reason = f"waiting: completion dependency {spec.after_complete}"
-    elif outcome is None and spec.after_result:
-        predecessor = load(cfg, spec.after_result)
-        if predecessor is None or not _dependency_settled(predecessor):
-            expected = ",".join(spec.after_result_states)
-            outcome = "queue"
-            outcome_reason = (
-                f"waiting: result dependency {spec.after_result} in [{expected}]"
-            )
-        else:
-            result = effective_result_state(predecessor) or predecessor.status
-            if result not in spec.after_result_states:
-                expected = ",".join(spec.after_result_states)
-                outcome = "skip"
-                outcome_reason = (
-                    f"dependency {spec.after_result} completed as {result}; "
-                    f"expected one of {expected}"
-                )
+    if outcome is None:
+        outcome, outcome_reason = _preview_dependency_outcome(cfg, spec, outcome_reason)
 
     if outcome is None:
         if spec.node:
@@ -3910,16 +3923,7 @@ def preview_submission(
                 raise ConfigError(
                     f"unknown node {spec.node!r}; configured: {list(by_name)}"
                 )
-            status = (
-                probe_node(
-                    pinned,
-                    cfg.mem_threshold_mib,
-                    lease_root=cfg.lease_root_for(pinned),
-                )
-                if cfg.layout == ROLE_LAYOUT
-                else probe_node(pinned, cfg.mem_threshold_mib)
-            )
-            statuses = [status]
+            statuses = [_probe_pinned_node(cfg, pinned)]
         else:
             statuses = probe_center(cfg, use_cache=False)
         reasons = {
@@ -5643,6 +5647,216 @@ def _submit_fork_locked(
     )
 
 
+def _resolve_prior_request(
+    cfg: HeadConfig,
+    request_id: str,
+    record: intent_mod.RequestRecord,
+) -> tuple[intent_mod.RequestRecord, JobEntry | None]:
+    """Decide what a prior durable receipt for ``request_id`` means.
+
+    Returns ``(record, replayed)``: when ``replayed`` is a JobEntry the request
+    already completed and that job is the answer; otherwise ``record`` is
+    authorized for replay and the caller may proceed to claim it.
+    """
+    try:
+        record, existing = reconcile_submission_request(cfg, record)
+    except (
+        OSError,
+        RegistryError,
+        intent_mod.RequestRecordError,
+        ValueError,
+    ) as exc:
+        raise RequestOutcomeUnknown(
+            request_id,
+            record.job_id,
+            f"request {request_id!r} has a job record but its "
+            "durable receipt could not be reconciled; inspect "
+            f"`dt request {request_id} --json` before retrying",
+        ) from exc
+    if record.state == "confirmed" and existing is not None:
+        if record.error_kind == "failed_before_start":
+            raise FailedBeforeStart(existing)
+        setattr(existing, "_request_replayed", True)
+        return record, existing
+    if record.state == "confirmed" and existing is None:
+        raise RequestRejected(
+            f"request {request_id!r} was already confirmed as job "
+            f"{record.job_id}, but its job history was cleaned; "
+            "refusing a duplicate submission"
+        )
+    if record.state == "rejected":
+        disposition = intent_mod.resolve_disposition(
+            record,
+            registry_job_present=existing is not None,
+        )
+        if disposition.retry_safe:
+            # The rejection provably never crossed the launch boundary
+            # (placement refusal, unreachable transport, or an interrupted
+            # bulk transfer). Reopen the same identity via the normal replay
+            # path instead of replaying a terminal receipt forever.
+            record = intent_mod.authorize_replay(record, disposition)
+        else:
+            detail = record.error_message or "submission was rejected"
+            raise RequestRejected(
+                f"request {request_id!r} was already rejected: {detail}"
+            )
+    if record.state != "replay_authorized":
+        raise RequestOutcomeUnknown(
+            request_id,
+            record.job_id,
+            f"request {request_id!r} may have been submitted as "
+            f"{record.job_id}; inspect `dt request {request_id} --json` "
+            "before retrying",
+        )
+    if existing is not None:
+        raise RequestOutcomeUnknown(
+            request_id,
+            record.job_id,
+            f"request {request_id!r} was authorized for replay but job "
+            f"{record.job_id} appeared; inspect it before retrying",
+        )
+    return record, None
+
+
+def _claim_request_identity(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    request_id: str,
+    intent_sha256: str,
+    record: intent_mod.RequestRecord | None,
+) -> tuple[str, intent_mod.RequestRecord]:
+    """Persist the preparing claim: a fresh identity or a reclaimed replay."""
+    if record is None:
+        job_id = new_job_id(spec.name)
+        record = intent_mod.create(request_id, intent_sha256, job_id)
+        try:
+            intent_mod.save(cfg, record)
+        except intent_mod.RequestDurabilityUnknown as exc:
+            raise RequestOutcomeUnknown(
+                request_id,
+                job_id,
+                f"request {request_id!r} was not launched because its durable "
+                "claim durability is unknown; inspect "
+                f"`dt request {request_id} --json` before retrying",
+            ) from exc
+        except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+            # The launch boundary has not been crossed. Report a known safe
+            # rejection instead of leaking an OSError/traceback or inviting a
+            # retry whose durable identity was never proven.
+            raise RequestRejected(
+                f"request {request_id!r} was not launched because its durable "
+                f"claim could not be persisted: {exc}"
+            ) from exc
+        return job_id, record
+    job_id = record.job_id
+    try:
+        record = intent_mod.reclaim_replay(record)
+        intent_mod.save(cfg, record)
+    except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+        # A failed atomic replace may leave either the durable authorization
+        # or the reclaimed preparing state visible. Both are launch-free, but
+        # only a fresh query can prove which.
+        raise RequestOutcomeUnknown(
+            request_id,
+            job_id,
+            f"request {request_id!r} replay claim durability is unknown; "
+            f"inspect `dt request {request_id} --json` before retrying",
+        ) from exc
+    return job_id, record
+
+
+def _record_submission_failure(
+    cfg: HeadConfig,
+    *,
+    request_id: str,
+    job_id: str,
+    record: intent_mod.RequestRecord,
+    exc: BaseException,
+    claimed_action_in_progress: bool,
+) -> None:
+    """Persist the durable verdict for a submission that raised ``exc``.
+
+    Raises RequestOutcomeUnknown if the verdict itself could not be saved.
+    """
+    try:
+        existing = load(cfg, job_id)
+    except (RegistryError, ValueError):
+        existing = None
+    if claimed_action_in_progress:
+        # The compute launch boundary has not been crossed. A callback that
+        # marked its failure retry-safe (an interrupted transfer into
+        # convergent remote state) may reopen this identity; any other
+        # callback may have partially changed its remote destination, so
+        # reject durably and never run it again.
+        state = "rejected"
+        error_kind = (
+            "claimed_action_interrupted"
+            if getattr(exc, "retry_safe", False)
+            else "claimed_action_failed"
+        )
+    elif isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        state = "uncertain"
+        error_kind = "interrupted"
+    elif existing is not None and (existing.reason or "").startswith(
+        UNCERTAIN_LAUNCH_PREFIX
+    ):
+        state = "uncertain"
+        error_kind = "launch_outcome_unknown"
+    elif isinstance(exc, FailedBeforeStart) and existing is not None:
+        state = "confirmed"
+        error_kind = "failed_before_start"
+    elif isinstance(exc, (ConfigError, DispatchError, NoCapacity, NoReachableNode)):
+        state = "rejected"
+        error_kind = type(exc).__name__
+    else:
+        # Unexpected local I/O or serialization errors can happen after the
+        # remote launcher accepted the job but before its registry row became
+        # visible.  Fail closed so retrying this request id can never launch
+        # a second long-running task.
+        state = "uncertain"
+        error_kind = type(exc).__name__
+    try:
+        latest_record = intent_mod.load(cfg, request_id) or record
+        intent_mod.save(
+            cfg,
+            intent_mod.transition(
+                latest_record,
+                state,
+                error_kind=error_kind,
+                error_message=str(exc),
+            ),
+        )
+    except (OSError, intent_mod.RequestRecordError, ValueError) as persistence_exc:
+        raise RequestOutcomeUnknown(
+            request_id,
+            job_id,
+            f"request {request_id!r} did not return a durable final "
+            f"receipt; inspect `dt request {request_id} --json` "
+            "before retrying",
+        ) from persistence_exc
+
+
+def _confirm_request(
+    cfg: HeadConfig,
+    *,
+    request_id: str,
+    job_id: str,
+    record: intent_mod.RequestRecord,
+) -> None:
+    """Persist the confirmed receipt for a job that was registered."""
+    try:
+        latest_record = intent_mod.load(cfg, request_id) or record
+        intent_mod.save(cfg, intent_mod.transition(latest_record, "confirmed"))
+    except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+        raise RequestOutcomeUnknown(
+            request_id,
+            job_id,
+            f"request {request_id!r} created job {job_id}, but its durable "
+            "confirmation could not be persisted; inspect "
+            f"`dt request {request_id} --json` before retrying",
+        ) from exc
+
+
 def _submit_prepared(
     cfg: HeadConfig,
     spec: RunSpec,
@@ -5793,108 +6007,16 @@ def _submit_prepared(
                 f"request {request_id!r} already belongs to a different intent"
             )
         if record is not None:
-            try:
-                record, existing = reconcile_submission_request(cfg, record)
-            except (
-                OSError,
-                RegistryError,
-                intent_mod.RequestRecordError,
-                ValueError,
-            ) as exc:
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    record.job_id,
-                    f"request {request_id!r} has a job record but its "
-                    "durable receipt could not be reconciled; inspect "
-                    f"`dt request {request_id} --json` before retrying",
-                ) from exc
-            if record.state == "confirmed" and existing is not None:
-                if record.error_kind == "failed_before_start":
-                    raise FailedBeforeStart(existing)
-                setattr(existing, "_request_replayed", True)
-                return existing
-            if record.state == "confirmed" and existing is None:
-                raise RequestRejected(
-                    f"request {request_id!r} was already confirmed as job "
-                    f"{record.job_id}, but its job history was cleaned; "
-                    "refusing a duplicate submission"
-                )
-            if record.state == "rejected":
-                disposition = intent_mod.resolve_disposition(
-                    record,
-                    registry_job_present=existing is not None,
-                )
-                if disposition.retry_safe:
-                    # The rejection provably never crossed the launch boundary
-                    # (placement refusal, unreachable transport, or an
-                    # interrupted bulk transfer). Reopen the same identity via
-                    # the normal replay path instead of replaying a terminal
-                    # receipt forever.
-                    record = intent_mod.authorize_replay(record, disposition)
-                else:
-                    detail = record.error_message or "submission was rejected"
-                    raise RequestRejected(
-                        f"request {request_id!r} was already rejected: {detail}"
-                    )
-            if record.state != "replay_authorized":
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    record.job_id,
-                    f"request {request_id!r} may have been submitted as "
-                    f"{record.job_id}; inspect `dt request {request_id} --json` "
-                    "before retrying",
-                )
-            if existing is not None:
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    record.job_id,
-                    f"request {request_id!r} was authorized for replay but job "
-                    f"{record.job_id} appeared; inspect it before retrying",
-                )
+            record, replayed = _resolve_prior_request(cfg, request_id, record)
+            if replayed is not None:
+                return replayed
 
         # Close the small race in which an incompatible supervisor starts
         # after the first check but before a new or replayed durable claim.
         require_compatible_resident_agent(cfg)
-        if record is None:
-            job_id = new_job_id(spec.name)
-            record = intent_mod.create(request_id, intent_sha256, job_id)
-            try:
-                intent_mod.save(cfg, record)
-            except intent_mod.RequestDurabilityUnknown as exc:
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    job_id,
-                    f"request {request_id!r} was not launched because its durable "
-                    "claim durability is unknown; inspect "
-                    f"`dt request {request_id} --json` before retrying",
-                ) from exc
-            except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
-                # The launch boundary has not been crossed. Report a known safe
-                # rejection instead of leaking an OSError/traceback or inviting a
-                # retry whose durable identity was never proven.
-                raise RequestRejected(
-                    f"request {request_id!r} was not launched because its durable "
-                    f"claim could not be persisted: {exc}"
-                ) from exc
-        else:
-            job_id = record.job_id
-            try:
-                record = intent_mod.reclaim_replay(record)
-                intent_mod.save(cfg, record)
-            except (
-                OSError,
-                intent_mod.RequestRecordError,
-                ValueError,
-            ) as exc:
-                # A failed atomic replace may leave either the durable
-                # authorization or the reclaimed preparing state visible.
-                # Both are launch-free, but only a fresh query can prove which.
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    job_id,
-                    f"request {request_id!r} replay claim durability is unknown; "
-                    f"inspect `dt request {request_id} --json` before retrying",
-                ) from exc
+        job_id, record = _claim_request_identity(
+            cfg, spec, request_id, intent_sha256, record
+        )
         claimed_action_in_progress = claimed_action is not None
         try:
             if claimed_action is not None:
@@ -5916,138 +6038,35 @@ def _submit_prepared(
                 submitted_at=record.created_at,
             )
         except BaseException as exc:
-            try:
-                existing = load(cfg, job_id)
-            except (RegistryError, ValueError):
-                existing = None
-            if claimed_action_in_progress:
-                # The compute launch boundary has not been crossed. A callback
-                # that marked its failure retry-safe (an interrupted transfer
-                # into convergent remote state) may reopen this identity; any
-                # other callback may have partially changed its remote
-                # destination, so reject durably and never run it again.
-                state = "rejected"
-                error_kind = (
-                    "claimed_action_interrupted"
-                    if getattr(exc, "retry_safe", False)
-                    else "claimed_action_failed"
-                )
-            elif isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                state = "uncertain"
-                error_kind = "interrupted"
-            elif existing is not None and (existing.reason or "").startswith(
-                UNCERTAIN_LAUNCH_PREFIX
-            ):
-                state = "uncertain"
-                error_kind = "launch_outcome_unknown"
-            elif isinstance(exc, FailedBeforeStart) and existing is not None:
-                state = "confirmed"
-                error_kind = "failed_before_start"
-            elif isinstance(
-                exc,
-                (ConfigError, DispatchError, NoCapacity, NoReachableNode),
-            ):
-                state = "rejected"
-                error_kind = type(exc).__name__
-            else:
-                # Unexpected local I/O or serialization errors can happen
-                # after the remote launcher accepted the job but before its
-                # registry row became visible.  Fail closed so retrying this
-                # request id can never launch a second long-running task.
-                state = "uncertain"
-                error_kind = type(exc).__name__
-            try:
-                latest_record = intent_mod.load(cfg, request_id) or record
-                intent_mod.save(
-                    cfg,
-                    intent_mod.transition(
-                        latest_record,
-                        state,
-                        error_kind=error_kind,
-                        error_message=str(exc),
-                    ),
-                )
-            except (
-                OSError,
-                intent_mod.RequestRecordError,
-                ValueError,
-            ) as persistence_exc:
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    job_id,
-                    f"request {request_id!r} did not return a durable final "
-                    f"receipt; inspect `dt request {request_id} --json` "
-                    "before retrying",
-                ) from persistence_exc
+            _record_submission_failure(
+                cfg,
+                request_id=request_id,
+                job_id=job_id,
+                record=record,
+                exc=exc,
+                claimed_action_in_progress=claimed_action_in_progress,
+            )
             raise
-        try:
-            latest_record = intent_mod.load(cfg, request_id) or record
-            intent_mod.save(cfg, intent_mod.transition(latest_record, "confirmed"))
-        except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
-            raise RequestOutcomeUnknown(
-                request_id,
-                job_id,
-                f"request {request_id!r} created job {job_id}, but its durable "
-                "confirmation could not be persisted; inspect "
-                f"`dt request {request_id} --json` before retrying",
-            ) from exc
+        _confirm_request(cfg, request_id=request_id, job_id=job_id, record=record)
         return entry
     finally:
         _HELD_REQUEST_ID.reset(request_owner_token)
         lock_context.__exit__(None, None, None)
 
 
-def _submit_prepared_once(
-    cfg: HeadConfig,
+def _submission_meta(
     spec: RunSpec,
     *,
-    source_factory: Callable[[], StoredSnapshot],
+    job_id: str,
+    project_name: str,
+    runtime_sha256: str,
     git_sha: str | None,
     git_dirty: bool,
     git_diff: str | None,
-    submodule_commits: dict[str, str] | None = None,
-    log: Callable[[str], None],
-    no_queue: bool,
-    force_queue: bool = False,
-    force_queue_label: str = "batch",
-    allocated_job_id: str | None = None,
-    submitted_at: float | None = None,
-) -> JobEntry:
-    """Shared placement path after any durable request claim is established."""
-    _validate_run_spec(spec)
-    require_compatible_resident_agent(cfg)
-    effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
-    spec.require_disk_gib = effective_disk_floor or None
-    spec.name = sanitize_name(spec.name)
-    submitted_at = time.time() if submitted_at is None else submitted_at
-    job_id = allocated_job_id or new_job_id(spec.name)
-    session = f"dt_{job_id}"
-    # Persist the logical path; home expansion occurs only on the selected
-    # worker. Unpinned queued jobs use the default root until placement stores
-    # the selected node's effective root.
-    job_relpath = f"jobs/{job_id}"
-    submit_worker_roots = {node.name: cfg.worker_root_for(node) for node in cfg.nodes}
-    submit_worker_root = (
-        submit_worker_roots.get(spec.node, cfg.worker_root)
-        if spec.node
-        else cfg.worker_root
-    )
-    job_dir = (
-        node_path(submit_worker_root, "worker", "jobs", job_id)
-        if cfg.layout == ROLE_LAYOUT
-        else cfg.worker_job_dir(Node(name="-"), job_id)
-    )
-
-    def job_dir_for_node(node: Node) -> str:
-        return cfg.worker_job_dir(node, job_id)
-
-    project_name = spec.project or "?"
-    runtime_files = _runtime_payload_files()
-    runtime_sha256 = payload_sha256(runtime_files)
-    spec.payload_sha256 = runtime_sha256
-    if cfg.layout == ROLE_LAYOUT:
-        _stored_payload_dir(cfg, runtime_sha256, runtime_files)
-    meta = {
+    submodule_commits: dict[str, str] | None,
+) -> dict[str, object]:
+    """The job.json contract written next to the snapshot on the worker."""
+    return {
         "job_id": job_id,
         "name": spec.name,
         "project": project_name,
@@ -6092,6 +6111,140 @@ def _submit_prepared_once(
         ),
         "_diff": git_diff,
     }
+
+
+def _probe_pinned_node(cfg: HeadConfig, pinned: Node) -> NodeStatus:
+    """Probe one pinned node, honouring the role layout's lease root."""
+    if cfg.layout == ROLE_LAYOUT:
+        return probe_node(
+            pinned,
+            cfg.mem_threshold_mib,
+            lease_root=cfg.lease_root_for(pinned),
+        )
+    return probe_node(pinned, cfg.mem_threshold_mib)
+
+
+def _probe_for_submission(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    log: Callable[[str], None],
+) -> tuple[list[NodeStatus], dict[str, str]]:
+    """Probe the pinned node or the whole center; return statuses + reasons."""
+    if spec.node:
+        # pinned submit: probing the whole center is wasted latency when
+        # only one node can take the job anyway (burst submissions add up)
+        by_name = {n.name: n for n in cfg.nodes}
+        if spec.node not in by_name:
+            raise ConfigError(
+                f"unknown node {spec.node!r}; configured: {list(by_name)}"
+            )
+        log(f"probing {spec.node}")
+        pinned = by_name[spec.node]
+        statuses = [_probe_pinned_node(cfg, pinned)]
+    else:
+        log(f"probing {cfg.center} nodes")
+        statuses = probe_center(cfg, use_cache=False)
+    probe_reasons = {
+        s.node: probe_rejection_reason(s, spec)
+        for s in statuses
+        if spec.node is None or s.node == spec.node  # pinned: others not tried
+    }
+    drained_probe_reasons(cfg, spec, probe_reasons)
+    return statuses, probe_reasons
+
+
+def _retract_no_queue_row(
+    cfg: HeadConfig,
+    pending: JobEntry,
+    probe_reasons: dict[str, str],
+) -> JobEntry:
+    """Undo a queued row that a --no-queue submission could not place.
+
+    Capacity changed between forecast and the serialized launch attempt.  No
+    launch is live (otherwise the dispatcher would have adopted it), so
+    restore the fail-fast contract without leaving an agent-visible queued
+    row behind.  Returns the row instead when another dispatcher already
+    owns it and removing it would hide a live task.
+    """
+    failure_reasons = dict(probe_reasons)
+    with job_lock(cfg, pending.job_id):
+        current = load(cfg, pending.job_id)
+        if (
+            current is not None
+            and current.status == "queued"
+            and current.dispatch_node is None
+            and current.dispatch_token is None
+        ):
+            if current.placement_failures:
+                failure_reasons = dict(current.placement_failures)
+            remove_staging(cfg, pending.job_id)
+            remove_record(cfg, pending.job_id)
+        elif current is not None:
+            # Either another dispatcher crossed the durable attempt boundary
+            # (removing the row would make a live task invisible) or the row
+            # already moved on; in both cases the caller gets the truth.
+            pending.__dict__.update(current.__dict__)
+            return pending
+    raise NoCapacity(failure_reasons)
+
+
+def _submit_prepared_once(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    *,
+    source_factory: Callable[[], StoredSnapshot],
+    git_sha: str | None,
+    git_dirty: bool,
+    git_diff: str | None,
+    submodule_commits: dict[str, str] | None = None,
+    log: Callable[[str], None],
+    no_queue: bool,
+    force_queue: bool = False,
+    force_queue_label: str = "batch",
+    allocated_job_id: str | None = None,
+    submitted_at: float | None = None,
+) -> JobEntry:
+    """Shared placement path after any durable request claim is established."""
+    _validate_run_spec(spec)
+    require_compatible_resident_agent(cfg)
+    effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
+    spec.require_disk_gib = effective_disk_floor or None
+    spec.name = sanitize_name(spec.name)
+    submitted_at = time.time() if submitted_at is None else submitted_at
+    job_id = allocated_job_id or new_job_id(spec.name)
+    session = f"dt_{job_id}"
+    # Persist the logical path; home expansion occurs only on the selected
+    # worker. Unpinned queued jobs use the default root until placement stores
+    # the selected node's effective root.
+    job_relpath = f"jobs/{job_id}"
+    submit_worker_roots = {node.name: cfg.worker_root_for(node) for node in cfg.nodes}
+    submit_worker_root = (
+        submit_worker_roots.get(spec.node, cfg.worker_root)
+        if spec.node
+        else cfg.worker_root
+    )
+    job_dir = (
+        node_path(submit_worker_root, "worker", "jobs", job_id)
+        if cfg.layout == ROLE_LAYOUT
+        else cfg.worker_job_dir(Node(name="-"), job_id)
+    )
+
+    project_name = spec.project or "?"
+    runtime_files = _runtime_payload_files()
+    runtime_sha256 = payload_sha256(runtime_files)
+    spec.payload_sha256 = runtime_sha256
+    if cfg.layout == ROLE_LAYOUT:
+        _stored_payload_dir(cfg, runtime_sha256, runtime_files)
+    meta = _submission_meta(
+        spec,
+        job_id=job_id,
+        project_name=project_name,
+        runtime_sha256=runtime_sha256,
+        git_sha=git_sha,
+        git_dirty=git_dirty,
+        git_diff=git_diff,
+        submodule_commits=submodule_commits,
+    )
     stored: StoredSnapshot | None = None
 
     def exact_source() -> StoredSnapshot:
@@ -6250,36 +6403,7 @@ def _submit_prepared_once(
             reason=f"waiting: max_my_jobs={cap} reached",
         )
 
-    if spec.node:
-        # pinned submit: probing the whole center is wasted latency when
-        # only one node can take the job anyway (burst submissions add up)
-        by_name = {n.name: n for n in cfg.nodes}
-        if spec.node not in by_name:
-            raise ConfigError(
-                f"unknown node {spec.node!r}; configured: {list(by_name)}"
-            )
-        log(f"probing {spec.node}")
-        pinned = by_name[spec.node]
-        statuses = [
-            (
-                probe_node(
-                    pinned,
-                    cfg.mem_threshold_mib,
-                    lease_root=cfg.lease_root_for(pinned),
-                )
-                if cfg.layout == ROLE_LAYOUT
-                else probe_node(pinned, cfg.mem_threshold_mib)
-            )
-        ]
-    else:
-        log(f"probing {cfg.center} nodes")
-        statuses = probe_center(cfg, use_cache=False)
-    probe_reasons = {
-        s.node: probe_rejection_reason(s, spec)
-        for s in statuses
-        if spec.node is None or s.node == spec.node  # pinned: others not tried
-    }
-    drained_probe_reasons(cfg, spec, probe_reasons)
+    statuses, probe_reasons = _probe_for_submission(cfg, spec, log)
     if statuses and all(status.unreachable for status in statuses):
         if no_queue:
             raise NoReachableNode(probe_reasons)
@@ -6325,39 +6449,7 @@ def _submit_prepared_once(
             )
         raise FailedBeforeStart(pending)
     if no_queue and pending.status == "queued":
-        # Capacity changed between forecast and the serialized launch attempt.
-        # No launch is live (otherwise the dispatcher would have adopted it),
-        # so restore the fail-fast contract without leaving an agent-visible
-        # queued row behind.
-        failure_reasons = dict(probe_reasons)
-        with job_lock(cfg, pending.job_id):
-            current = load(cfg, pending.job_id)
-            if (
-                current is not None
-                and current.status == "queued"
-                and current.dispatch_node is None
-                and current.dispatch_token is None
-            ):
-                if current.placement_failures:
-                    failure_reasons = dict(current.placement_failures)
-                remove_staging(cfg, pending.job_id)
-                remove_record(cfg, pending.job_id)
-            elif (
-                current is not None
-                and current.status == "queued"
-                and current.dispatch_node is not None
-                and current.dispatch_token is not None
-            ):
-                # Another dispatcher already crossed the durable attempt
-                # boundary.  Removing this row would make a live task
-                # invisible; preserve it even though the original caller
-                # requested fail-fast placement.
-                pending.__dict__.update(current.__dict__)
-                return pending
-            elif current is not None:
-                pending.__dict__.update(current.__dict__)
-                return pending
-        raise NoCapacity(failure_reasons)
+        return _retract_no_queue_row(cfg, pending, probe_reasons)
     if outcome in {"busy", "waiting", "blocked"}:
         return pending
     return pending
@@ -7271,100 +7363,9 @@ def _sync_queued_job_to_node(
     return observed
 
 
-def _dispatch_queued_active(
-    cfg: HeadConfig,
-    entry: JobEntry,
-    log: Callable[[str], None],
-) -> tuple[str, str | None]:
-    """Dispatch one queued entry with atomic, cancellation-aware transitions."""
-
-    def commit(*, persist: bool = True) -> tuple[str, str | None] | None:
-        current = _commit_queued_transition(cfg, entry, persist=persist)
-        if current is None:
-            return None
-        entry.__dict__.update(current.__dict__)
-        return _existing_dispatch_outcome(current)
-
-    staging = stage_dir(cfg, entry.job_id)
-    staged_code = (
-        _snapshot_path(cfg, entry.snapshot_sha256 or "")
-        if entry.storage_layout == ROLE_LAYOUT
-        else staging / "code"
-    )
-    if staged_code.is_symlink() or not staged_code.is_dir():
-        detail = (
-            "staging snapshot is an unsafe symlink"
-            if staged_code.is_symlink()
-            else (
-                "archived queue snapshot missing"
-                if entry.storage_layout == ROLE_LAYOUT
-                else "staging snapshot missing"
-            )
-        )
-        entry.status, entry.reason = "failed", detail
-        interrupted = commit()
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
-    try:
-        _repair_queued_snapshot(cfg, entry, staging, log)
-    except DispatchError as exc:
-        entry.status, entry.reason = "failed", str(exc)
-        interrupted = commit()
-        remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
-    try:
-        staged_payload_dir = (
-            _stored_payload_dir(cfg, entry.payload_sha256 or "")
-            if entry.storage_layout == ROLE_LAYOUT and entry.payload_sha256
-            else staging
-        )
-    except DispatchError as exc:
-        entry.status, entry.reason = "failed", str(exc)
-        interrupted = commit()
-        remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
-    staged_payload_complete = all(
-        (staged_payload_dir / name).is_file() for name in RUNTIME_PAYLOAD_NAMES
-    )
-    if entry.payload_sha256 or staged_payload_complete:
-        try:
-            observed_payload = payload_sha256(
-                _payload_files_from_dir(staged_payload_dir)
-            )
-        except OSError as exc:
-            entry.status = "failed"
-            entry.reason = f"staged dt payload cannot be read: {exc}"
-            interrupted = commit()
-            remove_staging(cfg, entry.job_id)
-            if interrupted is not None:
-                return interrupted
-            return "failed", entry.reason
-        if (
-            entry.payload_sha256 is not None
-            and observed_payload != entry.payload_sha256
-        ):
-            entry.status = "failed"
-            entry.reason = (
-                "staged dt payload changed after submission: "
-                f"expected {entry.payload_sha256}, observed {observed_payload}"
-            )
-            interrupted = commit()
-            remove_staging(cfg, entry.job_id)
-            if interrupted is not None:
-                return interrupted
-            return "failed", entry.reason
-        if entry.payload_sha256 is None:
-            entry.payload_sha256 = observed_payload
-            interrupted = commit()
-            if interrupted is not None:
-                return interrupted
-
-    spec = RunSpec(
+def _queued_run_spec(entry: JobEntry) -> RunSpec:
+    """Rebuild the exact submission contract a queued registry row carries."""
+    return RunSpec(
         name=entry.name,
         cmd=shlex.split(entry.cmd),
         node=entry.pin_node,
@@ -7396,27 +7397,182 @@ def _dispatch_queued_active(
         cache_mode=entry.cache_mode,
         payload_sha256=entry.payload_sha256,
     )
+
+
+def _recover_claimed_dispatch(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    *,
+    job_dir_for_node: Callable[[Node], str],
+    log: Callable[[str], None],
+) -> tuple[str, str | None] | None:
+    """Resolve a queued row that still carries a dispatch claim.
+
+    Returns the outcome to report when the row must not be re-placed yet (a
+    live owner, an unverifiable remote attempt, or a recovered launch), or
+    None once the stale claim has been cleared and placement may proceed.
+    """
+
+    def blocked(detail: str) -> tuple[str, str | None]:
+        entry.reason = f"blocked: {detail}"
+        current = _commit_queued_transition(cfg, entry)
+        if current is not None:
+            entry.__dict__.update(current.__dict__)
+            return _existing_dispatch_outcome(current)
+        return "blocked", detail
+
+    hold_reason = _dispatch_claim_hold_reason(entry)
+    if hold_reason is not None:
+        # The claim owner is alive on this head and the claim is fresh.
+        # Probing now could observe a no-evidence window (mkdir/rsync/ssh
+        # setup) and cancel a perfectly valid in-flight launch. Leave the
+        # row untouched; the owner will finish or its death unblocks us.
+        return "waiting", hold_reason
+    configured = next(
+        (node for node in cfg.nodes if node.name == entry.dispatch_node),
+        None,
+    )
+    if configured is None:
+        return blocked(
+            f"previous dispatch node {entry.dispatch_node!r} is no longer "
+            "configured; recovery cannot prove the remote attempt absent"
+        )
+    attempted_node = _queued_node(cfg, entry, configured)
+    adopted, recovery_error = _adopt_interrupted_queued_launch(
+        cfg,
+        entry,
+        attempted_node,
+        job_dir_for_node(attempted_node),
+    )
+    if adopted is not None:
+        log(
+            f"recovered {adopted.status} launch on {attempted_node.name} "
+            "before resynchronizing"
+        )
+        return _finish_queued_placement(cfg, entry, adopted)
+    if recovery_error is not None:
+        return blocked(
+            f"dispatch recovery unverified on {attempted_node.name}: {recovery_error}"
+        )
+    # The cancellation sentinel closed any in-progress launch race and a
+    # complete survivor census proved the old attempt absent. Only now may a
+    # retry overwrite support files or the immutable code projection.
+    recovered_attempt = (entry.dispatch_node, entry.dispatch_token)
+    entry.dispatch_node = None
+    entry.dispatch_token = None
+    entry.dispatch_owner = None
+    entry.dispatch_claimed_at = None
+    entry.reason = None
+    current = _commit_queued_transition(
+        cfg,
+        entry,
+        expected_attempt=recovered_attempt,
+    )
+    if current is not None:
+        entry.__dict__.update(current.__dict__)
+        return _existing_dispatch_outcome(current)
+    return None
+
+
+def _dispatch_queued_active(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    log: Callable[[str], None],
+) -> tuple[str, str | None]:
+    """Dispatch one queued entry with atomic, cancellation-aware transitions."""
+
+    def commit(*, persist: bool = True) -> tuple[str, str | None] | None:
+        current = _commit_queued_transition(cfg, entry, persist=persist)
+        if current is None:
+            return None
+        entry.__dict__.update(current.__dict__)
+        return _existing_dispatch_outcome(current)
+
+    def fail(detail: str, *, cleanup: bool = True) -> tuple[str, str | None]:
+        entry.status, entry.reason = "failed", detail
+        interrupted = commit()
+        if cleanup:
+            remove_staging(cfg, entry.job_id)
+        if interrupted is not None:
+            return interrupted
+        return "failed", entry.reason
+
+    def hold(reason: str, outcome: tuple[str, str | None]) -> tuple[str, str | None]:
+        changed = entry.reason != reason
+        if changed:
+            entry.reason = reason
+        interrupted = commit(persist=changed)
+        if interrupted is not None:
+            return interrupted
+        return outcome
+
+    staging = stage_dir(cfg, entry.job_id)
+    staged_code = (
+        _snapshot_path(cfg, entry.snapshot_sha256 or "")
+        if entry.storage_layout == ROLE_LAYOUT
+        else staging / "code"
+    )
+    if staged_code.is_symlink() or not staged_code.is_dir():
+        detail = (
+            "staging snapshot is an unsafe symlink"
+            if staged_code.is_symlink()
+            else (
+                "archived queue snapshot missing"
+                if entry.storage_layout == ROLE_LAYOUT
+                else "staging snapshot missing"
+            )
+        )
+        return fail(detail, cleanup=False)
+    try:
+        _repair_queued_snapshot(cfg, entry, staging, log)
+    except DispatchError as exc:
+        return fail(str(exc))
+    try:
+        staged_payload_dir = (
+            _stored_payload_dir(cfg, entry.payload_sha256 or "")
+            if entry.storage_layout == ROLE_LAYOUT and entry.payload_sha256
+            else staging
+        )
+    except DispatchError as exc:
+        return fail(str(exc))
+    staged_payload_complete = all(
+        (staged_payload_dir / name).is_file() for name in RUNTIME_PAYLOAD_NAMES
+    )
+    if entry.payload_sha256 or staged_payload_complete:
+        try:
+            observed_payload = payload_sha256(
+                _payload_files_from_dir(staged_payload_dir)
+            )
+        except OSError as exc:
+            return fail(f"staged dt payload cannot be read: {exc}")
+        if (
+            entry.payload_sha256 is not None
+            and observed_payload != entry.payload_sha256
+        ):
+            return fail(
+                (
+                    "staged dt payload changed after submission: "
+                    f"expected {entry.payload_sha256}, observed {observed_payload}"
+                )
+            )
+        if entry.payload_sha256 is None:
+            entry.payload_sha256 = observed_payload
+            interrupted = commit()
+            if interrupted is not None:
+                return interrupted
+
+    spec = _queued_run_spec(entry)
     effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)
     spec.require_disk_gib = effective_disk_floor or None
     try:
         _validate_run_spec(spec)
     except ConfigError as exc:
-        entry.status, entry.reason = "failed", str(exc)
-        interrupted = commit()
-        remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
+        return fail(str(exc))
     if entry.storage_layout == ROLE_LAYOUT:
         try:
             _ensure_role_queue_bundle(cfg, entry, spec, staging, staged_code, log)
         except DispatchError as exc:
-            entry.status, entry.reason = "failed", str(exc)
-            interrupted = commit()
-            remove_staging(cfg, entry.job_id)
-            if interrupted is not None:
-                return interrupted
-            return "failed", entry.reason
+            return fail(str(exc))
 
     def job_dir_for_node(node: Node) -> str:
         if entry.storage_layout == ROLE_LAYOUT:
@@ -7424,87 +7580,17 @@ def _dispatch_queued_active(
         return entry.job_dir
 
     if entry.dispatch_node is not None:
-        hold_reason = _dispatch_claim_hold_reason(entry)
-        if hold_reason is not None:
-            # The claim owner is alive on this head and the claim is fresh.
-            # Probing now could observe a no-evidence window (mkdir/rsync/ssh
-            # setup) and cancel a perfectly valid in-flight launch. Leave the
-            # row untouched; the owner will finish or its death unblocks us.
-            return "waiting", hold_reason
-        configured = next(
-            (node for node in cfg.nodes if node.name == entry.dispatch_node),
-            None,
+        recovered = _recover_claimed_dispatch(
+            cfg, entry, job_dir_for_node=job_dir_for_node, log=log
         )
-        if configured is None:
-            detail = (
-                f"previous dispatch node {entry.dispatch_node!r} is no longer "
-                "configured; recovery cannot prove the remote attempt absent"
-            )
-            entry.reason = f"blocked: {detail}"
-            interrupted = commit()
-            if interrupted is not None:
-                return interrupted
-            return "blocked", detail
-        attempted_node = _queued_node(cfg, entry, configured)
-        attempted_job_dir = job_dir_for_node(attempted_node)
-        adopted, recovery_error = _adopt_interrupted_queued_launch(
-            cfg,
-            entry,
-            attempted_node,
-            attempted_job_dir,
-        )
-        if adopted is not None:
-            log(
-                f"recovered {adopted.status} launch on {attempted_node.name} "
-                "before resynchronizing"
-            )
-            return _finish_queued_placement(cfg, entry, adopted)
-        if recovery_error is not None:
-            detail = f"dispatch recovery unverified on {attempted_node.name}: {recovery_error}"
-            entry.reason = f"blocked: {detail}"
-            interrupted = commit()
-            if interrupted is not None:
-                return interrupted
-            return "blocked", detail
-        # The cancellation sentinel closed any in-progress launch race and a
-        # complete survivor census proved the old attempt absent. Only now may
-        # a retry overwrite support files or the immutable code projection.
-        recovered_attempt = (entry.dispatch_node, entry.dispatch_token)
-        entry.dispatch_node = None
-        entry.dispatch_token = None
-        entry.dispatch_owner = None
-        entry.dispatch_claimed_at = None
-        entry.reason = None
-        current = _commit_queued_transition(
-            cfg,
-            entry,
-            expected_attempt=recovered_attempt,
-        )
-        if current is not None:
-            entry.__dict__.update(current.__dict__)
-            return _existing_dispatch_outcome(current)
+        if recovered is not None:
+            return recovered
     if spec.node:
         by_name = {node.name: node for node in cfg.nodes}
         pinned = by_name.get(spec.node)
         if pinned is None:
-            entry.status = "failed"
-            entry.reason = f"unknown node {spec.node!r}; configured: {list(by_name)}"
-            interrupted = commit()
-            remove_staging(cfg, entry.job_id)
-            if interrupted is not None:
-                return interrupted
-            return "failed", entry.reason
-        statuses = [
-            (
-                probe_node(
-                    pinned,
-                    cfg.mem_threshold_mib,
-                    lease_root=cfg.lease_root_for(pinned),
-                )
-                if cfg.layout == ROLE_LAYOUT
-                else probe_node(pinned, cfg.mem_threshold_mib)
-            )
-        ]
+            return fail(f"unknown node {spec.node!r}; configured: {list(by_name)}")
+        statuses = [_probe_pinned_node(cfg, pinned)]
     else:
         statuses = probe_center(cfg, use_cache=False)
     probe_reasons = {
@@ -7514,26 +7600,15 @@ def _dispatch_queued_active(
     try:
         candidates = pick_candidates(statuses, cfg.nodes, spec, _reserve_for(cfg, spec))
     except ConfigError as e:
-        entry.status, entry.reason = "failed", str(e)
-        interrupted = commit()
-        remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
+        return fail(str(e))
     if statuses and all(status.unreachable for status in statuses):
-        waiting_reason = waiting_unreachable_reason(probe_reasons)
-        changed = entry.reason != waiting_reason
-        if changed:
-            entry.reason = waiting_reason
-        interrupted = commit(persist=changed)
-        if interrupted is not None:
-            return interrupted
-        if spec.node is not None:
-            detail = "; ".join(
-                f"{node}: {reason}" for node, reason in probe_reasons.items()
-            )
-            return "blocked", detail
-        return "busy", None
+        detail = "; ".join(
+            f"{node}: {reason}" for node, reason in probe_reasons.items()
+        )
+        return hold(
+            waiting_unreachable_reason(probe_reasons),
+            ("blocked", detail) if spec.node is not None else ("busy", None),
+        )
     if pin_is_busy(statuses, spec):
         candidates = []
     if not candidates:
@@ -7541,22 +7616,8 @@ def _dispatch_queued_active(
             detail = "; ".join(
                 f"{node}: {reason}" for node, reason in probe_reasons.items()
             )
-            blocked_reason = f"blocked: {detail}"
-            changed = entry.reason != blocked_reason
-            if changed:
-                entry.reason = blocked_reason
-            interrupted = commit(persist=changed)
-            if interrupted is not None:
-                return interrupted
-            return "blocked", detail
-        waiting_reason = waiting_capacity_reason(probe_reasons)
-        changed = entry.reason != waiting_reason
-        if changed:
-            entry.reason = waiting_reason
-        interrupted = commit(persist=changed)
-        if interrupted is not None:
-            return interrupted
-        return "busy", None
+            return hold(f"blocked: {detail}", ("blocked", detail))
+        return hold(waiting_capacity_reason(probe_reasons), ("busy", None))
 
     candidates = [_queued_node(cfg, entry, node) for node in candidates]
 
@@ -7593,12 +7654,7 @@ def _dispatch_queued_active(
             submodule_commits=entry.submodule_commits,
         )
     except DispatchError as e:
-        entry.status, entry.reason = "failed", str(e)
-        interrupted = commit()
-        remove_staging(cfg, entry.job_id)
-        if interrupted is not None:
-            return interrupted
-        return "failed", entry.reason
+        return fail(str(e))
 
     if placed:
         return _finish_queued_placement(cfg, entry, placed)
@@ -7647,11 +7703,11 @@ def _dispatch_queued_active(
             entry.__dict__.update(current.__dict__)
             return _existing_dispatch_outcome(current)
         return "failed", entry.reason
-    if failure_kinds == {"unreachable"}:
-        waiting_reason = waiting_unreachable_reason(reasons)
-        changed = entry.reason != waiting_reason or placement_failures_changed
+
+    def settle(reason: str, outcome: tuple[str, str | None]) -> tuple[str, str | None]:
+        changed = entry.reason != reason or placement_failures_changed
         if changed:
-            entry.reason = waiting_reason
+            entry.reason = reason
         current = _commit_queued_transition(
             cfg,
             entry,
@@ -7661,41 +7717,19 @@ def _dispatch_queued_active(
         if current is not None:
             entry.__dict__.update(current.__dict__)
             return _existing_dispatch_outcome(current)
-        return "busy", None
+        return outcome
+
+    if failure_kinds == {"unreachable"}:
+        return settle(waiting_unreachable_reason(reasons), ("busy", None))
     if blocked_not_busy(reasons):
         detail = "; ".join(f"{n}: {r}" for n, r in reasons.items())
-        blocked_reason = f"blocked: {detail}"
-        changed = entry.reason != blocked_reason or placement_failures_changed
-        if changed:
-            entry.reason = blocked_reason
-        current = _commit_queued_transition(
-            cfg,
-            entry,
-            persist=changed,
-            expected_attempt=owned_attempt,
-        )
-        if current is not None:
-            entry.__dict__.update(current.__dict__)
-            return _existing_dispatch_outcome(current)
-        return "blocked", detail
-    waiting_reason = (
+        return settle(f"blocked: {detail}", ("blocked", detail))
+    return settle(
         waiting_placement_failure_reason(reasons)
         if reasons
-        else waiting_capacity_reason(probe_reasons)
+        else waiting_capacity_reason(probe_reasons),
+        ("busy", None),
     )
-    changed = entry.reason != waiting_reason or placement_failures_changed
-    if changed:
-        entry.reason = waiting_reason
-    current = _commit_queued_transition(
-        cfg,
-        entry,
-        persist=changed,
-        expected_attempt=owned_attempt,
-    )
-    if current is not None:
-        entry.__dict__.update(current.__dict__)
-        return _existing_dispatch_outcome(current)
-    return "busy", None
 
 
 # --------------------------------------------------------------------------
