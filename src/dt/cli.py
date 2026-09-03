@@ -2432,18 +2432,18 @@ def _emit_submission(
     else:
         gpu_str = ",".join(map(str, entry.gpus)) or "cpu"
         details = []
-        snapshot_duration = getattr(entry, "snapshot_duration_s", None)
+        snapshot_duration = entry.snapshot_duration_s
         if isinstance(snapshot_duration, (int, float)) and not isinstance(
             snapshot_duration, bool
         ):
             details.append(f"snapshot {_fmt_short_duration(snapshot_duration)}")
-        launch_duration = getattr(entry, "launch_duration_s", None)
+        launch_duration = entry.launch_duration_s
         if isinstance(launch_duration, (int, float)) and not isinstance(
             launch_duration, bool
         ):
             details.append(f"prepare {_fmt_short_duration(launch_duration)}")
         if entry.env_hash:
-            env_state = getattr(entry, "env_preexisting", None)
+            env_state = entry.env_preexisting
             state = (
                 " existing"
                 if env_state is True
@@ -2452,7 +2452,7 @@ def _emit_submission(
                 else ""
             )
             details.append(f"env {entry.env_hash}{state}")
-        setup_ran = getattr(entry, "setup_ran", None)
+        setup_ran = entry.setup_ran
         if entry.setup and setup_ran is not None:
             details.append("setup ran" if setup_ran else "setup cached")
         err.print(
@@ -6336,13 +6336,14 @@ def _max_hours_overdue(
 def _collect_ps_progress(entry: jobs_mod.JobEntry) -> JsonDict:
     """Parse the job's log tail for progress; never raise, report the error."""
     try:
-        proc, _path, source, tail = _read_job_log_tail(entry, 80)
+        read = _read_job_log_tail(entry, 80)
+        proc = read.proc
         if proc.returncode != 0 and LOG_SOURCE_MARK not in (proc.stdout or ""):
             detail = (proc.stderr or proc.stdout or "log probe failed").strip()
             raise RuntimeError(detail)
         return {
-            "progress": _parse_log_progress(tail),
-            "log_source": source,
+            "progress": _parse_log_progress(read.tail),
+            "log_source": read.source,
             "progress_error": None,
         }
     except Exception as exc:
@@ -8264,7 +8265,7 @@ def _format_log_progress(progress: JsonDict) -> str:
 
 def _read_job_log_tail(
     entry: jobs_mod.JobEntry, lines: int, *, timeout: float = 10
-) -> tuple[subprocess.CompletedProcess[str], str, str, str]:
+) -> diagnose_mod.LogTail:
     proc = run_on(
         entry.node,
         entry.node_local,
@@ -8275,9 +8276,14 @@ def _read_job_log_tail(
     path, display, tail, updated_at, resource_sample = _parse_job_log_tail_response(
         entry, proc.stdout or ""
     )
-    setattr(proc, "_dt_log_updated_at", updated_at)
-    setattr(proc, "_dt_resource_sample", resource_sample)
-    return proc, path, display, tail
+    return diagnose_mod.LogTail(
+        proc=proc,
+        path=path,
+        source=display,
+        tail=tail,
+        updated_at=updated_at,
+        resource_sample=resource_sample,
+    )
 
 
 def _is_uncertain_launch(entry: jobs_mod.JobEntry) -> bool:
@@ -8454,7 +8460,8 @@ def _follow_job_log(
             except KeyboardInterrupt:
                 return None
         try:
-            proc, log_path, display, tail = _read_job_log_tail(entry, lines, timeout=30)
+            read = _read_job_log_tail(entry, lines, timeout=30)
+            proc, log_path, display, tail = read.proc, read.path, read.source, read.tail
         except KeyboardInterrupt:
             return None
         except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
@@ -8678,7 +8685,8 @@ def logs(
             return
         raise typer.Exit(rc)
     try:
-        proc, log_path, display, tail = _read_job_log_tail(entry, lines, timeout=30)
+        read = _read_job_log_tail(entry, lines, timeout=30)
+        proc, log_path, display, tail = read.proc, read.path, read.source, read.tail
     except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
         if json_:
             _fail_submission(
@@ -9893,15 +9901,16 @@ def _watch_snapshot(
     progress = None
     if log_future is not None:
         try:
-            proc, _path, log_source, log_tail = log_future.result()
+            read = log_future.result()
+            proc, log_source, log_tail = read.proc, read.source, read.tail
             if proc.returncode != 0 and LOG_SOURCE_MARK not in (proc.stdout or ""):
                 detail = (proc.stderr or proc.stdout or "log probe failed").strip()
                 raise RuntimeError(detail)
-            log_updated_at = as_number(getattr(proc, "_dt_log_updated_at", None))
+            log_updated_at = read.updated_at
             if log_updated_at is not None and log_updated_at > 0:
                 log_age_s = max(0.0, time.time() - log_updated_at)
-            resource_sample = getattr(proc, "_dt_resource_sample", None)
-            if entry.status == "running" and isinstance(resource_sample, dict):
+            resource_sample = read.resource_sample
+            if entry.status == "running" and resource_sample is not None:
                 resources = dict(resources or {})
                 if isinstance(resource_sample.get("job"), dict):
                     resources["job"] = resource_sample["job"]
@@ -11133,8 +11142,8 @@ _INFO_LAUNCH_PHASE_LABELS = (
 def _info_launch_rows(entry: jobs_mod.JobEntry) -> list[tuple[str, Any]]:
     """Stage timings and environment-preparation facts recorded at launch."""
     rows: list[tuple[str, Any]] = []
-    snapshot_duration = getattr(entry, "snapshot_duration_s", None)
-    launch_duration = getattr(entry, "launch_duration_s", None)
+    snapshot_duration = entry.snapshot_duration_s
+    launch_duration = entry.launch_duration_s
     if snapshot_duration is not None:
         rows.append(("snapshot stage", _fmt_short_duration(snapshot_duration)))
     if launch_duration is not None:
@@ -11146,10 +11155,10 @@ def _info_launch_rows(entry: jobs_mod.JobEntry) -> list[tuple[str, Any]]:
             if key in entry.launch_phases_s
         )
         rows.append(("prepare phases", phase_text))
-    env_preexisting = getattr(entry, "env_preexisting", None)
+    env_preexisting = entry.env_preexisting
     if env_preexisting is not None:
         rows.append(("env state", "existing" if env_preexisting else "new"))
-    setup_ran = getattr(entry, "setup_ran", None)
+    setup_ran = entry.setup_ran
     if entry.setup and setup_ran is not None:
         rows.append(("setup hook", "ran" if setup_ran else "cached"))
     if entry.setup_inputs is not None:
@@ -11832,10 +11841,7 @@ def diagnose(
         job_id=entry.job_id,
     )
 
-    def read_log(
-        item: jobs_mod.JobEntry,
-        lines: int,
-    ) -> tuple[subprocess.CompletedProcess[str], str, str, str]:
+    def read_log(item: jobs_mod.JobEntry, lines: int) -> diagnose_mod.LogTail:
         return _read_job_log_tail(
             item,
             lines,

@@ -605,10 +605,19 @@ def read_transfer_events(
     }
 
 
-LogReader = Callable[
-    ["JobEntry", int],
-    tuple[subprocess.CompletedProcess[str], str, str, str],
-]
+@dataclass(frozen=True)
+class LogTail:
+    """One bounded read of a job's selected log plus its side metadata."""
+
+    proc: subprocess.CompletedProcess[str]
+    path: str
+    source: str
+    tail: str
+    updated_at: float | None = None
+    resource_sample: dict[str, Any] | None = None
+
+
+LogReader = Callable[["JobEntry", int], LogTail]
 NodeProbe = Callable[..., "NodeStatus"]
 StatusRefresher = Callable[..., "JobEntry"]
 
@@ -831,26 +840,26 @@ def _node_evidence(status: "NodeStatus") -> EvidenceSection:
 
 def _log_evidence(entry: "JobEntry", log_reader: LogReader) -> EvidenceSection:
     try:
-        proc, _path, display, tail = log_reader(entry, LOG_TAIL_LINES)
+        read = log_reader(entry, LOG_TAIL_LINES)
     except (OSError, RuntimeError, RemoteError, subprocess.SubprocessError):
         return omitted_section("log_read_failed")
+    proc = read.proc
     if proc.returncode != 0:
         return omitted_section(
             "node_unreachable" if proc.returncode == 255 else "log_read_failed",
             data={"returncode": proc.returncode},
         )
-    bounded, truncated = bounded_tail(tail)
-    updated_at = getattr(proc, "_dt_log_updated_at", None)
+    bounded, truncated = bounded_tail(read.tail)
     return section(
         {
-            "source": display,
+            "source": read.source,
             "tail": bounded,
             "line_limit": LOG_TAIL_LINES,
             "byte_limit": LOG_TAIL_MAX_BYTES,
         },
         complete=not truncated,
         omission_reason="byte_limit" if truncated else None,
-        source_updated_at=updated_at,
+        source_updated_at=read.updated_at,
     )
 
 

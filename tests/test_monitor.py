@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from dt import cli, completion
+from dt import cli, completion, diagnose
 from dt.completion import CompletionSignals
 from dt.config import HeadConfig, LaptopConfig, Node
 from dt.jobs import JobEntry
@@ -2437,7 +2437,7 @@ def test_watch_terminal_transition_includes_persisted_resource_summary(
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines: (
+        lambda entry_, lines: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -2510,7 +2510,7 @@ def test_watch_finished_without_telemetry_keeps_null_summary(tmp_path, monkeypat
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines: (
+        lambda entry_, lines: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -2565,7 +2565,7 @@ def test_watch_snapshot_collects_remote_reads_in_parallel(tmp_path, monkeypatch)
 
     def log_tail(entry_, lines):
         rendezvous.wait()
-        return (
+        return diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -2626,7 +2626,7 @@ def test_watch_snapshot_surfaces_remote_log_probe_failure(tmp_path, monkeypatch)
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines: (
+        lambda entry_, lines: diagnose.LogTail(
             subprocess.CompletedProcess([], 255, "", "No route to host"),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -2837,12 +2837,12 @@ def test_smart_log_tail_selects_newer_nested_log_on_disk(tmp_path):
         status="running",
     )
 
-    proc, selected, display, tail = cli._read_job_log_tail(entry, 20)
+    read = cli._read_job_log_tail(entry, 20)
 
-    assert proc.returncode == 0
-    assert selected == str(nested)
-    assert display == "outputs/registry/train.progress.log"
-    assert tail == "step 420 loss=0.05\n"
+    assert read.proc.returncode == 0
+    assert read.path == str(nested)
+    assert read.source == "outputs/registry/train.progress.log"
+    assert read.tail == "step 420 loss=0.05\n"
 
 
 def test_smart_log_tail_keeps_home_relative_display_separate_from_read_path(tmp_path):
@@ -2929,12 +2929,12 @@ def test_smart_log_tail_reads_across_retained_stdout_generations(
         storage_layout=storage_layout,
     )
 
-    proc, selected, display, tail = cli._read_job_log_tail(entry, 4)
+    read = cli._read_job_log_tail(entry, 4)
 
-    assert proc.returncode == 0, proc.stderr
-    assert selected == str(stdout)
-    assert display == "logs/stdout.log"
-    assert tail == "line-2\nline-3\nline-4\nline-5\n"
+    assert read.proc.returncode == 0, read.proc.stderr
+    assert read.path == str(stdout)
+    assert read.source == "logs/stdout.log"
+    assert read.tail == "line-2\nline-3\nline-4\nline-5\n"
 
 
 def test_logs_human_and_json_replace_nul_padding_at_shared_tail_boundary(
@@ -3020,7 +3020,7 @@ def test_logs_compacts_long_active_source_without_changing_log_text(
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda *args, **kwargs: (
+        lambda *args, **kwargs: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry.job_dir}/{display}",
             display,
@@ -5094,7 +5094,7 @@ def test_watch_compact_snapshot_keeps_automation_fields_without_heavy_details(
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda *_args: (
+        lambda *_args: diagnose.LogTail(
             proc,
             tmp_path / "stdout.log",
             "logs/stdout.log",
@@ -6164,7 +6164,7 @@ def test_ps_progress_enrichment_uses_active_nested_log(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines: (
+        lambda entry_, lines: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             "dt/jobs/live/outputs/train.log",
             "outputs/train.log",
@@ -6217,7 +6217,7 @@ def test_ps_progress_treats_not_yet_created_log_as_loading(tmp_path, monkeypatch
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines: (
+        lambda entry_, lines: diagnose.LogTail(
             subprocess.CompletedProcess(
                 [],
                 1,
@@ -6274,7 +6274,7 @@ def test_ps_live_resources_probe_each_node_once_and_filter_assigned_gpus(
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines: (
+        lambda entry_, lines: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -6367,7 +6367,7 @@ def test_ps_progress_collects_status_resources_and_logs_in_one_parallel_wave(
 
     def log_tail(entry_, lines):
         rendezvous.wait()
-        return (
+        return diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -6417,7 +6417,7 @@ def test_ps_progress_cpu_task_includes_node_host_resources(tmp_path, monkeypatch
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines: (
+        lambda entry_, lines: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -8304,7 +8304,7 @@ def test_logs_follow_reconnects_after_compute_link_loss(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines, timeout=10: (
+        lambda entry_, lines, timeout=10: diagnose.LogTail(
             next(reads),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -8369,7 +8369,7 @@ def test_logs_follow_finished_job_returns_tail_and_job_exit_without_tail_process
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines, timeout=10: (
+        lambda entry_, lines, timeout=10: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -8624,7 +8624,7 @@ def test_logs_follow_running_job_uses_wrapper_pid_and_returns_job_exit(
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines, timeout=10: (
+        lambda entry_, lines, timeout=10: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -8685,7 +8685,7 @@ def test_logs_follow_initial_probe_timeout_retries_after_two_seconds(
     reads = iter(
         [
             cli.RemoteError("n1", "timed out"),
-            (
+            diagnose.LogTail(
                 subprocess.CompletedProcess([], 0, "", ""),
                 f"{entry.job_dir}/logs/stdout.log",
                 "logs/stdout.log",
@@ -8744,7 +8744,7 @@ def test_logs_follow_ctrl_c_stops_without_cancelling_job(tmp_path, monkeypatch):
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines, timeout=10: (
+        lambda entry_, lines, timeout=10: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -8793,7 +8793,7 @@ def test_logs_follow_tail_sigint_exit_stops_without_cancelling_job(
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines, timeout=10: (
+        lambda entry_, lines, timeout=10: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
@@ -8844,7 +8844,7 @@ def test_logs_follow_local_tail_sigint_stops_without_exec_or_cancelling_job(
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
-        lambda entry_, lines, timeout=10: (
+        lambda entry_, lines, timeout=10: diagnose.LogTail(
             subprocess.CompletedProcess([], 0, "", ""),
             f"{entry_.job_dir}/logs/stdout.log",
             "logs/stdout.log",
