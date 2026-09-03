@@ -5327,8 +5327,10 @@ def _matrix_run_head(
     requested = len(spec.units)
     project = spec.project
     artifact_manifest: str | None = None
+    artifact_sync: JsonDict | None = None
     artifact_action: Callable[[], None] | None = None
-    outcome = _GroupOutcome(project=project)
+    failure: JsonDict | None = None
+    failure_code = 0
     if spec.artifacts:
         artifact_node = spec.node
         if artifact_node is None:
@@ -5343,41 +5345,158 @@ def _matrix_run_head(
                 list(spec.artifacts),
             )
         except (ConfigError, DispatchError) as exc:
-            outcome.fail_from(exc, item_label="matrix unit")
-        else:
-            artifact_action = _artifact_publisher(
-                cfg,
-                outcome,
-                server=artifact_node,
-                project=project,
-                artifacts=list(spec.artifacts),
-                manifest=artifact_manifest,
+            failure, failure_code, _entry = _batch_error(
+                exc,
+                item_label="matrix unit",
             )
+        else:
+
+            def publish_artifacts() -> None:
+                nonlocal artifact_sync
+                synced_project, synced_manifest, row = _sync_task_artifacts_raw(
+                    cfg,
+                    server=artifact_node,
+                    project=project,
+                    artifacts=list(spec.artifacts),
+                    expected_manifest_sha256=artifact_manifest,
+                )
+                if synced_project != project or synced_manifest != artifact_manifest:
+                    raise _OperationFailure(
+                        "artifact_sync_failed",
+                        "artifact sync returned an identity different from "
+                        "the claimed group intent",
+                        1,
+                    )
+                artifact_sync = row
+
+            artifact_action = publish_artifacts
 
     intent_sha256 = matrix_mod.intent_sha256(
         spec,
         center=cfg.center,
         artifact_manifest=artifact_manifest,
     )
-    if outcome.failure is None:
-        _claim_group_request(
-            cfg,
-            outcome,
-            request_id=request_id,
-            intent_sha256=intent_sha256,
-            operation=matrix_mod.MATRIX_OPERATION,
-            requested=requested,
-            artifact_action=artifact_action,
-            artifact_manifest=artifact_manifest,
-            artifact_node=spec.node,
-            item_label="matrix unit",
-            json_=json_,
-        )
-    entries = outcome.entries
+    entries: list[jobs_mod.JobEntry] = []
+    group_record: group_mod.GroupRequestRecord | None = None
+    group_terminal_replay = False
+    if failure is None:
+        try:
+            group_record = group_mod.locked_claim(
+                cfg,
+                request_id,
+                intent_sha256,
+                operation=matrix_mod.MATRIX_OPERATION,
+                requested=requested,
+                claimed_action=artifact_action,
+            )
+            if (
+                artifact_sync is not None
+                and artifact_manifest is not None
+                and spec.node is not None
+                and not json_
+            ):
+                _emit_task_artifact_sync_success(
+                    spec.node,
+                    artifact_manifest,
+                    artifact_sync,
+                )
+            entries = group_mod.load_entries_or_fail(cfg, group_record)
+            if group_record.state == "confirmed":
+                group_terminal_replay = True
+                failure = _group_failure(group_record)
+                failure_code = group_record.exit_code or 0
+        except _OperationFailure as exc:
+            failure, failure_code, _failed = _batch_error(
+                exc,
+                item_label="matrix unit",
+            )
+        except KeyboardInterrupt:
+            failure = {
+                "kind": "matrix_artifact_sync_interrupted",
+                "message": (
+                    "matrix artifact sync interrupted before job submission; "
+                    "no jobs were registered. The request was durably "
+                    "rejected; inspect the partial transfer and use a new "
+                    "request id to try again."
+                ),
+                "reasons": {"request_id": request_id},
+                "exit_code": 130,
+            }
+            failure_code = 130
+        except group_mod.GroupRequestConflict as exc:
+            failure = {
+                "kind": "idempotency_conflict",
+                "message": str(exc),
+                "reasons": {"request_id": request_id},
+                "exit_code": 1,
+            }
+            failure_code = 1
+        except group_mod.GroupRequestRejected as exc:
+            group_record = exc.record
+            if group_record is not None:
+                failure = _group_failure(group_record)
+                failure_code = int(failure["exit_code"]) if failure is not None else 1
+            else:
+                failure = {
+                    "kind": "submission_rejected",
+                    "message": str(exc),
+                    "reasons": {"request_id": request_id},
+                    "exit_code": EXIT_ENV,
+                }
+                failure_code = EXIT_ENV
+        except group_mod.GroupRequestOutcomeUnknown as exc:
+            group_record = exc.record
+            failure = {
+                "kind": "submission_unknown",
+                "message": str(exc),
+                "reasons": {"request_id": request_id},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+        except intent_mod.RequestLockError as exc:
+            failure = {
+                "kind": "submission_rejected",
+                "message": (
+                    f"request {request_id!r} was not advanced because its "
+                    f"durable lock could not be acquired: {exc}"
+                ),
+                "reasons": {"request_id": request_id},
+                "exit_code": EXIT_ENV,
+            }
+            failure_code = EXIT_ENV
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} has unreadable durable group "
+                    "state; refusing to submit any additional jobs"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
+
+    agent_started: bool | None = None
+    agent_checked = False
+
+    def ensure_agent(entry: jobs_mod.JobEntry) -> None:
+        nonlocal agent_checked, agent_started
+        if entry.status != "queued" or agent_checked:
+            return
+        from . import agent as agent_mod
+
+        agent_checked = True
+        if agent_mod.alive_pid(cfg) is None:
+            agent_started = agent_mod.start_detached(cfg)
 
     resumed = len(entries)
     for existing_index, existing_entry in enumerate(entries, start=1):
-        _group_ensure_agent(cfg, outcome, existing_entry)
+        ensure_agent(existing_entry)
         if not json_:
             print(existing_entry.job_id, flush=True)
             err.print(
@@ -5385,7 +5504,7 @@ def _matrix_run_head(
                 f"{escape(existing_entry.job_id)}[/dim]"
             )
 
-    if outcome.failure is None and not outcome.group_terminal_replay:
+    if failure is None and not group_terminal_replay:
         for index in range(len(entries) + 1, requested + 1):
             unit = spec.units[index - 1]
 
@@ -5404,26 +5523,31 @@ def _matrix_run_head(
             )
             try:
                 entry = submit(cfg, run_spec, Path.cwd(), log)
-                _record_group_job(
-                    cfg, outcome, request_id=request_id, index=index, entry=entry
+                group_record = group_mod.locked_record_job(
+                    cfg,
+                    request_id,
+                    intent_sha256=intent_sha256,
+                    index=index,
+                    job_id=entry.job_id,
                 )
             except KeyboardInterrupt:
                 confirmed = len(entries)
                 noun = "registration" if confirmed == 1 else "registrations"
-                outcome.fail(
-                    "matrix_submission_interrupted",
-                    (
+                failure = {
+                    "kind": "matrix_submission_interrupted",
+                    "message": (
                         f"matrix submission interrupted after {confirmed} "
                         f"confirmed {noun}; unit {index} outcome unknown. "
                         "Confirmed jobs were not cancelled. Rerun "
                         "`dt matrix run` with the same spec to reconcile "
                         "this exact unit."
                     ),
-                    130,
-                    reasons={"request_id": request_id},
-                    confirmed_submitted=confirmed,
-                    uncertain_unit_index=index,
-                )
+                    "reasons": {"request_id": request_id},
+                    "exit_code": 130,
+                    "confirmed_submitted": confirmed,
+                    "uncertain_unit_index": index,
+                }
+                failure_code = 130
                 break
             except (
                 FailedBeforeStart,
@@ -5432,7 +5556,7 @@ def _matrix_run_head(
                 DispatchError,
                 ConfigError,
             ) as exc:
-                outcome.failure, outcome.failure_code, failed_entry = _batch_error(
+                failure, failure_code, failed_entry = _batch_error(
                     exc,
                     item_label="matrix unit",
                 )
@@ -5440,14 +5564,14 @@ def _matrix_run_head(
                     # An uncertain launch may still be running on the node,
                     # so it is not part of the durably confirmed prefix (see
                     # the batch path for the full rationale).
-                    if outcome.failure.get("kind") != "uncertain_launch":
+                    if failure.get("kind") != "uncertain_launch":
                         try:
-                            _record_group_job(
+                            group_record = group_mod.locked_record_job(
                                 cfg,
-                                outcome,
-                                request_id=request_id,
+                                request_id,
+                                intent_sha256=intent_sha256,
                                 index=index,
-                                entry=failed_entry,
+                                job_id=failed_entry.job_id,
                             )
                         except (
                             OSError,
@@ -5455,22 +5579,23 @@ def _matrix_run_head(
                             intent_mod.RequestRecordError,
                             group_mod.GroupRequestError,
                         ) as persistence_exc:
-                            outcome.fail(
-                                "submission_unknown",
-                                (
+                            failure = {
+                                "kind": "submission_unknown",
+                                "message": (
                                     f"job {failed_entry.job_id} was registered "
                                     f"but request {request_id!r} progress "
                                     "could not be persisted"
                                 ),
-                                EXIT_UNREACHABLE,
-                                reasons={
+                                "reasons": {
                                     "request_id": request_id,
                                     "job_id": failed_entry.job_id,
                                     "detail": str(persistence_exc),
                                 },
-                            )
+                                "exit_code": EXIT_UNREACHABLE,
+                            }
+                            failure_code = EXIT_UNREACHABLE
                     entries.append(failed_entry)
-                    _group_ensure_agent(cfg, outcome, failed_entry)
+                    ensure_agent(failed_entry)
                     if not json_:
                         print(failed_entry.job_id, flush=True)
                 break
@@ -5480,55 +5605,92 @@ def _matrix_run_head(
                 intent_mod.RequestRecordError,
                 group_mod.GroupRequestError,
             ) as exc:
-                outcome.fail(
-                    "submission_unknown",
-                    (
+                failure = {
+                    "kind": "submission_unknown",
+                    "message": (
                         f"matrix unit {index} did not produce a complete "
                         "durable group receipt; retry only with the same "
                         "request id"
                     ),
-                    EXIT_UNREACHABLE,
-                    reasons={"request_id": request_id, "detail": str(exc)},
-                )
+                    "reasons": {"request_id": request_id, "detail": str(exc)},
+                    "exit_code": EXIT_UNREACHABLE,
+                }
+                failure_code = EXIT_UNREACHABLE
                 break
             entries.append(entry)
-            _group_ensure_agent(cfg, outcome, entry)
+            ensure_agent(entry)
             if not json_:
                 print(entry.job_id, flush=True)
 
     # Transient placement failures (every candidate busy or unreachable) keep
-    # the group open on purpose so the same request id resumes from the
-    # confirmed prefix once capacity or connectivity returns; this is the
-    # per-unit recovery contract research sweeps rely on.
-    transient = bool(
-        outcome.failure
-        and outcome.failure.get("kind") in {"no_capacity", "unreachable"}
-    )
-    _finalize_group_request(
-        cfg,
-        outcome,
-        request_id=request_id,
-        interrupted_kind="matrix_submission_interrupted",
-        transient=transient,
-    )
+    # the group open on purpose: no unit outcome is ambiguous and nothing was
+    # partially launched, so the same request id must resume from the
+    # confirmed prefix once capacity or connectivity returns instead of
+    # replaying a terminal rejection. This is the per-unit recovery contract
+    # research sweeps rely on.
+    transient = bool(failure and failure.get("kind") in {"no_capacity", "unreachable"})
+    if (
+        group_record is not None
+        and not group_terminal_replay
+        and not transient
+        and group_record.state != "rejected"
+    ):
+        uncertain = bool(
+            failure
+            and failure.get("kind")
+            in {
+                "matrix_submission_interrupted",
+                "submission_unknown",
+                "idempotency_conflict",
+                "uncertain_launch",
+            }
+        )
+        try:
+            group_record = group_mod.locked_transition(
+                cfg,
+                request_id,
+                intent_sha256=intent_sha256,
+                state="uncertain" if uncertain else "confirmed",
+                exit_code=None if uncertain else failure_code,
+                error_kind=(str(failure["kind"]) if failure is not None else None),
+                error_message=(
+                    str(failure.get("message")) if failure is not None else None
+                ),
+            )
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} did not produce a durable final "
+                    "group receipt; retry only with the same request id"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            failure_code = EXIT_UNREACHABLE
 
     receipt = matrix_mod.run_receipt(
         spec,
         entries=entries,
         resumed=resumed,
-        error=outcome.failure,
-        exit_code=outcome.failure_code,
-        idempotent_replay=outcome.group_terminal_replay,
+        error=failure,
+        exit_code=failure_code,
+        idempotent_replay=group_terminal_replay,
         artifact_manifest=artifact_manifest,
-        artifact_sync=outcome.artifact_sync,
-        agent_started=outcome.agent_started,
+        artifact_sync=artifact_sync,
+        agent_started=agent_started,
     )
     if json_:
         print(json.dumps(receipt))
     else:
         _emit_matrix_human(receipt, emit_job_ids=False)
-    if outcome.failure_code:
-        raise typer.Exit(outcome.failure_code)
+    if failure_code:
+        raise typer.Exit(failure_code)
 
 
 @_typed_cli_decorator(matrix_app.command("plan"))
@@ -6764,6 +6926,501 @@ def _ps_view(
     )
 
 
+@dataclass(frozen=True)
+class _PsView:
+    """Validated `dt ps` options plus the derived view state every mode reads."""
+
+    status: str | None
+    active: bool
+    all_: bool
+    recent: bool
+    issues: bool
+    limit: int | None
+    wide: bool
+    with_progress: bool
+    json_: bool
+    poll: float
+    window: bool
+    window_schema: str | None
+    query_mode: bool
+    summary: bool
+    cursor: str | None
+    query_limit: int
+    selected_fields: tuple[str, ...]
+    parsed_since: float | None
+    default_active_view: bool
+    active_only: bool
+    recent_view: bool
+    legacy_issue_window: bool
+    view_title: str
+    empty_text: str
+
+
+def _ps_view_from_options(
+    *,
+    status: str | None,
+    active: bool,
+    all_: bool,
+    recent: bool,
+    issues: bool,
+    limit: int | None,
+    wide: bool,
+    with_progress: bool,
+    json_: bool,
+    poll: float,
+    window: bool,
+    window_schema: str | None,
+    compact: bool,
+    fields_: str | None,
+    summary: bool,
+    since: str | None,
+    cursor: str | None,
+    watch_: bool,
+) -> _PsView:
+    """Validate the option combination and derive the view state."""
+    query_mode = (
+        compact
+        or fields_ is not None
+        or summary
+        or since is not None
+        or (cursor is not None)
+    )
+    if query_mode:
+        # Agent-query flags exist only to shape the bounded JSON envelope, so
+        # they imply --json instead of rejecting the invocation.
+        json_ = True
+    if active and status is not None:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--active cannot be combined with --status",
+            exit_code=1,
+            json_=json_,
+        )
+    if recent and (active or all_ or status is not None or issues or limit is not None):
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "--recent cannot be combined with --active, --all, --status, "
+                "--issues, or --limit"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    if not math.isfinite(poll) or poll <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--poll must be positive",
+            exit_code=1,
+            json_=json_,
+        )
+    if status is not None and status not in jobs_mod.JOB_STATUSES:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"unknown --status {status!r}; expected one of "
+                + ", ".join(sorted(jobs_mod.JOB_STATUSES))
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    if limit is not None and limit <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--limit must be positive",
+            exit_code=1,
+            json_=json_,
+        )
+    if query_mode and (watch_ or recent or window):
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "bounded ps queries cannot be combined with --watch, --recent, "
+                "or internal --window"
+            ),
+            exit_code=1,
+            json_=True,
+        )
+    if summary and (
+        fields_ is not None or cursor is not None or limit is not None or with_progress
+    ):
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "--summary cannot be combined with --fields, --cursor, --limit, "
+                "or --with-progress"
+            ),
+            exit_code=1,
+            json_=True,
+        )
+    query_limit = limit or ps_query_mod.DEFAULT_LIMIT
+    try:
+        selected_fields = ps_query_mod.parse_fields(fields_)
+        parsed_since = ps_query_mod.parse_since(since)
+        if query_mode:
+            digest = ps_query_mod.selection_digest(
+                status=status,
+                active_only=active,
+                issues_only=issues,
+                since=parsed_since,
+            )
+            ps_query_mod.paginate(
+                [],
+                limit=query_limit,
+                cursor=cursor,
+                digest=digest,
+                order=ps_query_mod.ORDER_FIELD,
+            )
+    except ps_query_mod.QueryError as exc:
+        _fail_submission(
+            kind="invalid_argument",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if window_schema is not None and (not window or window_schema != PS_WINDOW_SCHEMA):
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"--window-schema requires --window and must be {PS_WINDOW_SCHEMA!r}"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    default_active_view = (
+        not json_
+        and status is None
+        and not active
+        and not recent
+        and not all_
+        and not issues
+        and limit is None
+    )
+    if issues:
+        view_title = "All issues" if all_ else "Recent issues"
+        empty_text = "no jobs need attention"
+    elif all_:
+        view_title = "All jobs"
+        empty_text = "no jobs"
+    elif recent:
+        view_title = "Active + recent"
+        empty_text = "no jobs"
+    elif status is not None:
+        view_title = f"{status.title()} jobs"
+        empty_text = f"no {status} jobs"
+    elif limit is not None:
+        view_title = "Newest jobs"
+        empty_text = "no jobs"
+    else:
+        view_title = "Active jobs"
+        empty_text = "no active jobs"
+    return _PsView(
+        status=status,
+        active=active,
+        all_=all_,
+        recent=recent,
+        issues=issues,
+        limit=limit,
+        wide=wide,
+        with_progress=with_progress,
+        json_=json_,
+        poll=poll,
+        window=window,
+        window_schema=window_schema,
+        query_mode=query_mode,
+        summary=summary,
+        cursor=cursor,
+        query_limit=query_limit,
+        selected_fields=selected_fields,
+        parsed_since=parsed_since,
+        default_active_view=default_active_view,
+        active_only=active or default_active_view,
+        recent_view=recent or issues or status is not None,
+        legacy_issue_window=bool(window and window_schema is None and issues),
+        view_title=view_title,
+        empty_text=empty_text,
+    )
+
+
+def _ps_gather(
+    cfg: HeadConfig | LaptopConfig,
+    view: _PsView,
+    *,
+    include_progress: bool,
+) -> tuple[list[JsonDict], dict[str, str]]:
+    """Collect the rows this view needs, filtering issues before any limit."""
+    remote_window = isinstance(cfg, LaptopConfig) and (
+        view.window or (not view.json_ and (not view.all_ or view.limit is not None))
+    )
+    window_kwargs: JsonDict = {"remote_window": True} if remote_window else {}
+    if view.limit is not None and not view.legacy_issue_window and not view.query_mode:
+        # The v2 head applies issue filtering before this limit. Legacy v1
+        # windows remain excluded above because they cannot prove that
+        # ordering and would otherwise hide older failures.
+        window_kwargs["limit"] = view.limit
+    if view.issues and not view.legacy_issue_window:
+        # The legacy v1 window contract ships the full superset and lets the
+        # old laptop client filter; every other path filters on the head
+        # before the newest-N window (audit A4).
+        window_kwargs["issues_only"] = True
+    if view.active_only:
+        rows, errors = _gather_ps_rows(
+            cfg,
+            view.status,
+            include_progress=include_progress,
+            active_only=True,
+            **window_kwargs,
+        )
+    else:
+        rows, errors = _gather_ps_rows(
+            cfg,
+            view.status,
+            include_progress=include_progress,
+            **window_kwargs,
+        )
+    if view.issues and not view.legacy_issue_window:
+        # Filter the whole set to issue rows first; apply the human --limit
+        # only outside query mode. In query mode every issue row is handed to
+        # build_payload so the envelope's eligible/next_cursor count the full
+        # issue set instead of a pre-truncated slice.
+        rows = _ps_issue_rows(rows)
+        if not view.query_mode:
+            rows = _limit_ps_rows(rows, view.limit)
+    return rows, errors
+
+
+def _ps_query_mode(cfg: HeadConfig | LaptopConfig, view: _PsView) -> None:
+    """Emit the bounded dt_ps_query_v1 envelope."""
+    if isinstance(cfg, LaptopConfig):
+        payload, query_errors = _gather_laptop_ps_query(
+            cfg,
+            status=view.status,
+            active_only=view.active,
+            issues_only=view.issues,
+            with_progress=view.with_progress,
+            since=view.parsed_since,
+            selected_fields=view.selected_fields,
+            limit=view.query_limit,
+            cursor=view.cursor,
+            summary_only=view.summary,
+        )
+        if query_errors and set(query_errors) == set(cfg.centers):
+            code = _fan_failure_exit_code(query_errors)
+            _fail_submission(
+                kind=(
+                    "unreachable" if code == EXIT_UNREACHABLE else "center_query_failed"
+                ),
+                message="cannot query jobs: every center query failed",
+                reasons=query_errors,
+                exit_code=code,
+                json_=True,
+            )
+    else:
+        query_rows, query_errors = _ps_gather(
+            cfg, view, include_progress=view.with_progress
+        )
+        try:
+            payload = ps_query_mod.build_payload(
+                query_rows,
+                center=cfg.center,
+                status=view.status,
+                active_only=view.active,
+                issues_only=view.issues,
+                since=view.parsed_since,
+                selected_fields=view.selected_fields,
+                limit=view.query_limit,
+                cursor=view.cursor,
+                summary_only=view.summary,
+                errors=query_errors,
+            )
+        except ps_query_mod.QueryError as exc:
+            _fail_submission(
+                kind="query_too_large",
+                message=str(exc),
+                exit_code=1,
+                json_=True,
+            )
+    print(json.dumps(payload))
+
+
+def _ps_watch_mode(cfg: HeadConfig | LaptopConfig, view: _PsView) -> None:
+    """Refresh the listing until interrupted (JSONL or a live table)."""
+
+    def live_view(rows: list[JsonDict], errors: dict[str, str]) -> Any:
+        return _ps_view(
+            rows,
+            errors,
+            all_=view.all_,
+            recent=view.recent_view,
+            limit=view.limit,
+            wide=view.wide,
+            poll=view.poll,
+            show_queue_runway=view.status is None and not view.issues,
+            laptop=isinstance(cfg, LaptopConfig),
+            title=view.view_title,
+            empty_text=view.empty_text,
+        )
+
+    try:
+        if view.json_:
+            while True:
+                refresh_started = time.monotonic()
+                rows, errors = _ps_gather(cfg, view, include_progress=True)
+                for center, message in errors.items():
+                    err.print(
+                        f"[yellow]{escape(center)} unreachable: "
+                        f"{escape(message)}[/yellow]"
+                    )
+                print(json.dumps(rows), flush=True)
+                _sleep_for_poll_interval(refresh_started, view.poll)
+        else:
+            from rich.live import Live
+
+            refresh_started = time.monotonic()
+            rows, errors = _ps_gather(cfg, view, include_progress=True)
+            with Live(live_view(rows, errors), console=out, auto_refresh=False) as live:
+                while True:
+                    _sleep_for_poll_interval(refresh_started, view.poll)
+                    refresh_started = time.monotonic()
+                    rows, errors = _ps_gather(cfg, view, include_progress=True)
+                    live.update(live_view(rows, errors), refresh=True)
+    except KeyboardInterrupt:
+        return
+
+
+def _ps_json_mode(
+    cfg: HeadConfig | LaptopConfig,
+    view: _PsView,
+    rows: list[JsonDict],
+) -> None:
+    """Emit the full-array JSON contract (or the internal window envelope)."""
+    if view.window:
+        schema_version = view.window_schema or PS_LEGACY_WINDOW_SCHEMA
+        if schema_version == PS_LEGACY_WINDOW_SCHEMA:
+            if view.legacy_issue_window or view.limit is not None:
+                window_rows = sorted(rows, key=lambda row: row.get("created_at", 0))
+            else:
+                window_rows = _select_v1_compatible_ps_rows(rows)
+        else:
+            window_rows = _visible_ps_rows(rows, all_=False, limit=view.limit)
+        print(
+            json.dumps(
+                {
+                    "schema_version": schema_version,
+                    "center": cfg.center if isinstance(cfg, HeadConfig) else "all",
+                    **(
+                        {
+                            "query": _ps_window_contract(
+                                status=view.status,
+                                active_only=view.active_only,
+                                issues_only=view.issues,
+                                limit=view.limit,
+                                with_progress=view.with_progress,
+                            )
+                        }
+                        if schema_version == PS_WINDOW_SCHEMA
+                        else {}
+                    ),
+                    "total": _ps_rows_total(rows),
+                    "rows": window_rows,
+                }
+            )
+        )
+        return
+    if view.recent:
+        rows = _visible_ps_rows(rows, all_=False, limit=None, recent=True)
+    print(json.dumps(rows))  # stable default contract: json is never truncated
+
+
+def _ps_human_mode(
+    view: _PsView,
+    rows: list[JsonDict],
+    errors: dict[str, str],
+    *,
+    all_centers_failed: bool,
+) -> None:
+    """Render the human table for the visible slice of ``rows``."""
+    # Rewrite diagnostics only for the visible slice; the replacement table
+    # still comes from the full row set so hidden predecessors stay routable.
+    visible = _humanize_ps_references(
+        _visible_ps_rows(
+            rows,
+            all_=view.all_,
+            limit=view.limit,
+            recent=view.recent_view,
+        ),
+        reference_rows=rows,
+    )
+    total = _ps_rows_total(rows)
+    if view.limit is not None and len(visible) != total:
+        hint = f"--limit {view.limit}: newest matching jobs"
+        err.print(f"[dim]showing {len(visible)} of {total} jobs ({hint})[/dim]")
+    status = view.status
+    if view.issues:
+        issue_count = f"{len(visible)}/{total}" if len(visible) != total else str(total)
+        caption = f"{issue_count} need attention" + (
+            "" if view.all_ else " · all issues: dt ps --issues -a"
+        )
+    elif view.default_active_view:
+        caption = "history: dt ps --recent · details: dt info REF"
+    elif view.recent:
+        caption = (
+            f"{len(visible)} shown of {total} · {PS_RECENT_LIMIT} recent max · "
+            "all history: dt ps -a"
+        )
+    elif view.all_:
+        caption = f"{len(visible)} jobs · narrow with: dt ps -s STATUS"
+    elif status is not None:
+        status_count = (
+            f"{len(visible)}/{total}" if len(visible) != total else str(total)
+        )
+        caption = (
+            f"{status_count} {status} · all: dt ps -s {status} -a · newest: --limit N"
+        )
+    elif view.limit is not None:
+        caption = f"{len(visible)} newest jobs"
+    else:
+        caption = None
+    if not visible:
+        if view.default_active_view:
+            if errors:
+                out.print(
+                    "[yellow]No active jobs reported by reachable centers.[/yellow]"
+                )
+            else:
+                out.print("[bold green]No active jobs.[/bold green]")
+            out.print(
+                "[dim]submit: dt run -n NAME -f -- COMMAND · "
+                "history: dt ps --recent[/dim]"
+            )
+        elif view.issues:
+            out.print("[bold green]No jobs need attention.[/bold green]")
+            if not view.all_:
+                out.print("[dim]complete issue history: dt ps --issues -a[/dim]")
+        elif status is not None:
+            out.print(f"[dim]No {escape(status)} jobs.[/dim]")
+        else:
+            out.print("[dim]No jobs.[/dim]")
+        if all_centers_failed:
+            raise typer.Exit(_fan_failure_exit_code(errors))
+        return
+    out.print(
+        ps_table(
+            visible,
+            wide=view.wide,
+            caption=caption,
+            show_progress=view.with_progress,
+            show_issue=(
+                not view.with_progress
+                and (view.issues or status in ("failed", "lost", "skipped"))
+            ),
+            title=view.view_title,
+            empty_text=view.empty_text,
+        )
+    )
+    if all_centers_failed:
+        raise typer.Exit(_fan_failure_exit_code(errors))
+
+
 def ps(
     status: Optional[str] = typer.Option(
         None,
@@ -6884,114 +7541,26 @@ def ps(
     ),
 ) -> None:
     """Show active jobs; opt into recent or complete history."""
-    query_mode = (
-        compact
-        or fields_ is not None
-        or summary
-        or since is not None
-        or (cursor is not None)
+    view = _ps_view_from_options(
+        status=status,
+        active=active,
+        all_=all_,
+        recent=recent,
+        issues=issues,
+        limit=limit,
+        wide=wide,
+        with_progress=with_progress,
+        json_=json_,
+        poll=poll,
+        window=window,
+        window_schema=window_schema,
+        compact=compact,
+        fields_=fields_,
+        summary=summary,
+        since=since,
+        cursor=cursor,
+        watch_=watch_,
     )
-    if query_mode:
-        # Agent-query flags exist only to shape the bounded JSON envelope, so
-        # they imply --json instead of rejecting the invocation.
-        json_ = True
-    if active and status is not None:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--active cannot be combined with --status",
-            exit_code=1,
-            json_=json_,
-        )
-    if recent and (active or all_ or status is not None or issues or limit is not None):
-        _fail_submission(
-            kind="invalid_argument",
-            message=(
-                "--recent cannot be combined with --active, --all, --status, "
-                "--issues, or --limit"
-            ),
-            exit_code=1,
-            json_=json_,
-        )
-    if not math.isfinite(poll) or poll <= 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--poll must be positive",
-            exit_code=1,
-            json_=json_,
-        )
-    if status is not None and status not in jobs_mod.JOB_STATUSES:
-        _fail_submission(
-            kind="invalid_argument",
-            message=(
-                f"unknown --status {status!r}; expected one of "
-                + ", ".join(sorted(jobs_mod.JOB_STATUSES))
-            ),
-            exit_code=1,
-            json_=json_,
-        )
-    if limit is not None and limit <= 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--limit must be positive",
-            exit_code=1,
-            json_=json_,
-        )
-    if query_mode and (watch_ or recent or window):
-        _fail_submission(
-            kind="invalid_argument",
-            message=(
-                "bounded ps queries cannot be combined with --watch, --recent, "
-                "or internal --window"
-            ),
-            exit_code=1,
-            json_=True,
-        )
-    if summary and (
-        fields_ is not None or cursor is not None or limit is not None or with_progress
-    ):
-        _fail_submission(
-            kind="invalid_argument",
-            message=(
-                "--summary cannot be combined with --fields, --cursor, --limit, "
-                "or --with-progress"
-            ),
-            exit_code=1,
-            json_=True,
-        )
-    query_limit = limit or ps_query_mod.DEFAULT_LIMIT
-    try:
-        selected_fields = ps_query_mod.parse_fields(fields_)
-        parsed_since = ps_query_mod.parse_since(since)
-        if query_mode:
-            digest = ps_query_mod.selection_digest(
-                status=status,
-                active_only=active,
-                issues_only=issues,
-                since=parsed_since,
-            )
-            ps_query_mod.paginate(
-                [],
-                limit=query_limit,
-                cursor=cursor,
-                digest=digest,
-                order=ps_query_mod.ORDER_FIELD,
-            )
-    except ps_query_mod.QueryError as exc:
-        _fail_submission(
-            kind="invalid_argument",
-            message=str(exc),
-            exit_code=1,
-            json_=json_,
-        )
-    if window_schema is not None and (not window or window_schema != PS_WINDOW_SCHEMA):
-        _fail_submission(
-            kind="invalid_argument",
-            message=(
-                f"--window-schema requires --window and must be {PS_WINDOW_SCHEMA!r}"
-            ),
-            exit_code=1,
-            json_=json_,
-        )
     cfg = _cfg()
     if center is not None:
         if not isinstance(cfg, LaptopConfig):
@@ -6999,7 +7568,7 @@ def ps(
                 kind="invalid_argument",
                 message="--center is a laptop-only option",
                 exit_code=1,
-                json_=json_,
+                json_=view.json_,
             )
         if center not in cfg.centers:
             _fail_submission(
@@ -7008,7 +7577,7 @@ def ps(
                     f"unknown center {center!r}; configured: {sorted(cfg.centers)}"
                 ),
                 exit_code=1,
-                json_=json_,
+                json_=view.json_,
             )
         selected_center = _laptop_center(cfg, center)
         # Scope the fan-out instead of filtering afterwards: unreachable
@@ -7018,197 +7587,25 @@ def ps(
             centers={selected_center: cfg.centers[selected_center]},
             default_center=selected_center,
         )
-    default_active_view = (
-        not json_
-        and status is None
-        and not active
-        and not recent
-        and not all_
-        and not issues
-        and limit is None
-    )
-    active_only = active or default_active_view
-    recent_view = recent or issues or status is not None
-    legacy_issue_window = window and window_schema is None and issues
-    if issues:
-        view_title = "All issues" if all_ else "Recent issues"
-        empty_text = "no jobs need attention"
-    elif all_:
-        view_title = "All jobs"
-        empty_text = "no jobs"
-    elif recent:
-        view_title = "Active + recent"
-        empty_text = "no jobs"
-    elif status is not None:
-        view_title = f"{status.title()} jobs"
-        empty_text = f"no {status} jobs"
-    elif limit is not None:
-        view_title = "Newest jobs"
-        empty_text = "no jobs"
-    else:
-        view_title = "Active jobs"
-        empty_text = "no active jobs"
-    remote_window = isinstance(cfg, LaptopConfig) and (
-        window or (not json_ and (not all_ or limit is not None))
-    )
 
-    def gather(include_progress: bool) -> tuple[list[JsonDict], dict[str, str]]:
-        window_kwargs: JsonDict = {"remote_window": True} if remote_window else {}
-        if limit is not None and not legacy_issue_window and not query_mode:
-            # The v2 head applies issue filtering before this limit. Legacy v1
-            # windows remain excluded above because they cannot prove that
-            # ordering and would otherwise hide older failures.
-            window_kwargs["limit"] = limit
-        if issues and not legacy_issue_window:
-            # The legacy v1 window contract ships the full superset and lets
-            # the old laptop client filter; every other path filters on the
-            # head before the newest-N window (audit A4).
-            window_kwargs["issues_only"] = True
-        if active_only:
-            rows, errors = _gather_ps_rows(
-                cfg,
-                status,
-                include_progress=include_progress,
-                active_only=True,
-                **window_kwargs,
-            )
-        else:
-            rows, errors = _gather_ps_rows(
-                cfg,
-                status,
-                include_progress=include_progress,
-                **window_kwargs,
-            )
-        if issues and not legacy_issue_window:
-            # Filter the whole set to issue rows first; apply the human --limit
-            # only outside query mode. In query mode every issue row is handed
-            # to build_payload so the envelope's eligible/next_cursor count the
-            # full issue set instead of a pre-truncated slice.
-            rows = _ps_issue_rows(rows)
-            if not query_mode:
-                rows = _limit_ps_rows(rows, limit)
-        return rows, errors
-
-    if query_mode:
-        if isinstance(cfg, LaptopConfig):
-            payload, query_errors = _gather_laptop_ps_query(
-                cfg,
-                status=status,
-                active_only=active,
-                issues_only=issues,
-                with_progress=with_progress,
-                since=parsed_since,
-                selected_fields=selected_fields,
-                limit=query_limit,
-                cursor=cursor,
-                summary_only=summary,
-            )
-            if query_errors and set(query_errors) == set(cfg.centers):
-                code = _fan_failure_exit_code(query_errors)
-                _fail_submission(
-                    kind=(
-                        "unreachable"
-                        if code == EXIT_UNREACHABLE
-                        else "center_query_failed"
-                    ),
-                    message="cannot query jobs: every center query failed",
-                    reasons=query_errors,
-                    exit_code=code,
-                    json_=True,
-                )
-        else:
-            query_rows, query_errors = gather(include_progress=with_progress)
-            try:
-                payload = ps_query_mod.build_payload(
-                    query_rows,
-                    center=cfg.center,
-                    status=status,
-                    active_only=active,
-                    issues_only=issues,
-                    since=parsed_since,
-                    selected_fields=selected_fields,
-                    limit=query_limit,
-                    cursor=cursor,
-                    summary_only=summary,
-                    errors=query_errors,
-                )
-            except ps_query_mod.QueryError as exc:
-                _fail_submission(
-                    kind="query_too_large",
-                    message=str(exc),
-                    exit_code=1,
-                    json_=True,
-                )
-        print(json.dumps(payload))
+    if view.query_mode:
+        _ps_query_mode(cfg, view)
+        return
+    if watch_:
+        _ps_watch_mode(cfg, view)
         return
 
-    if watch_:
-        try:
-            if json_:
-                while True:
-                    refresh_started = time.monotonic()
-                    rows, errors = gather(include_progress=True)
-                    for center, message in errors.items():
-                        err.print(
-                            f"[yellow]{escape(center)} unreachable: "
-                            f"{escape(message)}[/yellow]"
-                        )
-                    print(json.dumps(rows), flush=True)
-                    _sleep_for_poll_interval(refresh_started, poll)
-            else:
-                from rich.live import Live
-
-                refresh_started = time.monotonic()
-                rows, errors = gather(include_progress=True)
-                with Live(
-                    _ps_view(
-                        rows,
-                        errors,
-                        all_=all_,
-                        recent=recent_view,
-                        limit=limit,
-                        wide=wide,
-                        poll=poll,
-                        show_queue_runway=status is None and not issues,
-                        laptop=isinstance(cfg, LaptopConfig),
-                        title=view_title,
-                        empty_text=empty_text,
-                    ),
-                    console=out,
-                    auto_refresh=False,
-                ) as live:
-                    while True:
-                        _sleep_for_poll_interval(refresh_started, poll)
-                        refresh_started = time.monotonic()
-                        rows, errors = gather(include_progress=True)
-                        live.update(
-                            _ps_view(
-                                rows,
-                                errors,
-                                all_=all_,
-                                recent=recent_view,
-                                limit=limit,
-                                wide=wide,
-                                poll=poll,
-                                show_queue_runway=status is None and not issues,
-                                laptop=isinstance(cfg, LaptopConfig),
-                                title=view_title,
-                                empty_text=empty_text,
-                            ),
-                            refresh=True,
-                        )
-        except KeyboardInterrupt:
-            return
-
-    rows, errors = gather(include_progress=with_progress)
-    for center, message in errors.items():
-        err.print(f"[yellow]{escape(center)} unreachable: {escape(message)}[/yellow]")
+    rows, errors = _ps_gather(cfg, view, include_progress=view.with_progress)
+    for center_name, message in errors.items():
+        err.print(
+            f"[yellow]{escape(center_name)} unreachable: {escape(message)}[/yellow]"
+        )
     all_centers_failed = (
         isinstance(cfg, LaptopConfig)
         and bool(errors)
         and set(errors) == set(cfg.centers)
     )
-    if all_centers_failed and json_:
+    if all_centers_failed and view.json_:
         code = _fan_failure_exit_code(errors)
         _fail_submission(
             kind=("unreachable" if code == EXIT_UNREACHABLE else "center_query_failed"),
@@ -7217,140 +7614,10 @@ def ps(
             exit_code=code,
             json_=True,
         )
-    if json_:
-        if window:
-            schema_version = window_schema or PS_LEGACY_WINDOW_SCHEMA
-            if schema_version == PS_LEGACY_WINDOW_SCHEMA:
-                if legacy_issue_window:
-                    window_rows = sorted(
-                        rows,
-                        key=lambda row: row.get("created_at", 0),
-                    )
-                elif limit is not None:
-                    window_rows = sorted(
-                        rows,
-                        key=lambda row: row.get("created_at", 0),
-                    )
-                else:
-                    window_rows = _select_v1_compatible_ps_rows(rows)
-            else:
-                window_rows = _visible_ps_rows(
-                    rows,
-                    all_=False,
-                    limit=limit,
-                )
-            print(
-                json.dumps(
-                    {
-                        "schema_version": schema_version,
-                        "center": cfg.center if isinstance(cfg, HeadConfig) else "all",
-                        **(
-                            {
-                                "query": _ps_window_contract(
-                                    status=status,
-                                    active_only=active_only,
-                                    issues_only=issues,
-                                    limit=limit,
-                                    with_progress=with_progress,
-                                )
-                            }
-                            if schema_version == PS_WINDOW_SCHEMA
-                            else {}
-                        ),
-                        "total": _ps_rows_total(rows),
-                        "rows": window_rows,
-                    }
-                )
-            )
-            return
-        if recent:
-            rows = _visible_ps_rows(
-                rows,
-                all_=False,
-                limit=None,
-                recent=True,
-            )
-        print(json.dumps(rows))  # stable default contract: json is never truncated
+    if view.json_:
+        _ps_json_mode(cfg, view, rows)
         return
-    # Rewrite diagnostics only for the visible slice; the replacement table
-    # still comes from the full row set so hidden predecessors stay routable.
-    visible = _humanize_ps_references(
-        _visible_ps_rows(
-            rows,
-            all_=all_,
-            limit=limit,
-            recent=recent_view,
-        ),
-        reference_rows=rows,
-    )
-    total = _ps_rows_total(rows)
-    if limit is not None and len(visible) != total:
-        hint = f"--limit {limit}: newest matching jobs"
-        err.print(f"[dim]showing {len(visible)} of {total} jobs ({hint})[/dim]")
-    if issues:
-        issue_count = f"{len(visible)}/{total}" if len(visible) != total else str(total)
-        caption = f"{issue_count} need attention" + (
-            "" if all_ else " · all issues: dt ps --issues -a"
-        )
-    elif default_active_view:
-        caption = "history: dt ps --recent · details: dt info REF"
-    elif recent:
-        caption = (
-            f"{len(visible)} shown of {total} · {PS_RECENT_LIMIT} recent max · "
-            "all history: dt ps -a"
-        )
-    elif all_:
-        caption = f"{len(visible)} jobs · narrow with: dt ps -s STATUS"
-    elif status is not None:
-        status_count = (
-            f"{len(visible)}/{total}" if len(visible) != total else str(total)
-        )
-        caption = (
-            f"{status_count} {status} · all: dt ps -s {status} -a · newest: --limit N"
-        )
-    elif limit is not None:
-        caption = f"{len(visible)} newest jobs"
-    else:
-        caption = None
-    if not visible:
-        if default_active_view:
-            if errors:
-                out.print(
-                    "[yellow]No active jobs reported by reachable centers.[/yellow]"
-                )
-            else:
-                out.print("[bold green]No active jobs.[/bold green]")
-            out.print(
-                "[dim]submit: dt run -n NAME -f -- COMMAND · "
-                "history: dt ps --recent[/dim]"
-            )
-        elif issues:
-            out.print("[bold green]No jobs need attention.[/bold green]")
-            if not all_:
-                out.print("[dim]complete issue history: dt ps --issues -a[/dim]")
-        elif status is not None:
-            out.print(f"[dim]No {escape(status)} jobs.[/dim]")
-        else:
-            out.print("[dim]No jobs.[/dim]")
-        if all_centers_failed:
-            raise typer.Exit(_fan_failure_exit_code(errors))
-        return
-    out.print(
-        ps_table(
-            visible,
-            wide=wide,
-            caption=caption,
-            show_progress=with_progress,
-            show_issue=(
-                not with_progress
-                and (issues or status in ("failed", "lost", "skipped"))
-            ),
-            title=view_title,
-            empty_text=empty_text,
-        )
-    )
-    if all_centers_failed:
-        raise typer.Exit(_fan_failure_exit_code(errors))
+    _ps_human_mode(view, rows, errors, all_centers_failed=all_centers_failed)
 
 
 # --------------------------------------------------------------------------
