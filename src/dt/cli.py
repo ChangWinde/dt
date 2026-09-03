@@ -973,6 +973,259 @@ def _free_submit_action(
     }
 
 
+@dataclass(frozen=True)
+class _CenterCapacity:
+    """GPU capacity summary of one center's reachable `dt free` rows."""
+
+    reachable: list[JsonDict]
+    total: int
+    physical_free_by_node: dict[str, int]
+    free_by_node: dict[str, int]
+    drained_nodes: list[str]
+    lease_owners: list[str]
+    gpu_inventory_errors: dict[str, str]
+
+    @property
+    def free_count(self) -> int:
+        return sum(self.free_by_node.values())
+
+    @property
+    def drained_free_count(self) -> int:
+        return sum(
+            self.physical_free_by_node.get(node, 0) for node in self.drained_nodes
+        )
+
+    def fitting_free_by_node(self, minimum: int | None) -> dict[str, int]:
+        """Free GPUs per node that also satisfy the queue head's VRAM floor."""
+        return {
+            str(row.get("node")): (
+                0
+                if row.get("drained")
+                else sum(
+                    _free_gpu_meets_minimum(gpu, minimum)
+                    for gpu in row.get("gpus") or []
+                )
+            )
+            for row in self.reachable
+        }
+
+    @classmethod
+    def from_rows(cls, rows: list[JsonDict]) -> "_CenterCapacity":
+        reachable = [row for row in rows if not row.get("error")]
+        physical_free_by_node = {
+            str(row.get("node")): sum(
+                bool(gpu.get("free")) for gpu in row.get("gpus") or []
+            )
+            for row in reachable
+        }
+        return cls(
+            reachable=reachable,
+            total=sum(len(row.get("gpus") or []) for row in reachable),
+            physical_free_by_node=physical_free_by_node,
+            free_by_node={
+                str(row.get("node")): (
+                    0
+                    if row.get("drained")
+                    else physical_free_by_node[str(row.get("node"))]
+                )
+                for row in reachable
+            },
+            drained_nodes=[
+                str(row.get("node")) for row in reachable if row.get("drained")
+            ],
+            lease_owners=list(
+                dict.fromkeys(
+                    str(gpu.get("lease_owner") or "unknown")
+                    for row in reachable
+                    for gpu in row.get("gpus") or []
+                    if gpu.get("leased")
+                )
+            ),
+            gpu_inventory_errors={
+                str(row.get("node")): str(row["gpu_inventory_error"])
+                for row in reachable
+                if row.get("gpu_inventory_error")
+            },
+        )
+
+
+def _free_center_verdict(
+    center: str,
+    cap: _CenterCapacity,
+    context: JsonDict,
+    *,
+    running: int,
+    queued: int,
+    pin_center: bool,
+) -> tuple[str, str, list[JsonDict]]:
+    """Classify one center's scheduler state; returns (state, message, actions)."""
+    reachable = cap.reachable
+    total = cap.total
+    free_count = cap.free_count
+    drained_free_count = cap.drained_free_count
+    lease_owners = cap.lease_owners
+    gpu_inventory_errors = cap.gpu_inventory_errors
+    actions: list[JsonDict] = []
+    if running == 0 and queued == 0:
+        if lease_owners:
+            state = "idle_with_dt_leases"
+            message = (
+                f"registry idle but {len(lease_owners)} dt GPU "
+                f"{'lease remains' if len(lease_owners) == 1 else 'leases remain'}"
+            )
+            actions.extend(
+                {
+                    "kind": "inspect_lease",
+                    "job_id": owner,
+                    "argv": ["dt", "info", owner],
+                }
+                for owner in lease_owners
+            )
+        elif gpu_inventory_errors:
+            details = ", ".join(
+                f"{node}: {message.removeprefix('GPU inventory incomplete: ')}"
+                for node, message in gpu_inventory_errors.items()
+            )
+            state = "gpu_inventory_incomplete"
+            message = f"GPU inventory incomplete: {details}"
+            if free_count:
+                best_node = str(_best_free_submit_node(reachable))
+                actions.append(
+                    _free_submit_action(
+                        "submit",
+                        best_node,
+                        center=center if pin_center else None,
+                    )
+                )
+        elif free_count:
+            best_node = str(_best_free_submit_node(reachable))
+            state = "idle_no_dt_work"
+            message = "GPU capacity is free and no dt work is queued"
+            actions.append(
+                _free_submit_action(
+                    "submit",
+                    best_node,
+                    center=center if pin_center else None,
+                )
+            )
+        elif drained_free_count:
+            state = "idle_capacity_drained"
+            message = (
+                f"{drained_free_count} physically free GPU "
+                f"{'is' if drained_free_count == 1 else 'are'} excluded by node drain"
+            )
+        elif total:
+            state = "idle_external_gpu_occupancy"
+            message = "no dt work is queued; GPUs are occupied outside dt"
+        else:
+            state = "no_gpu_inventory"
+            message = "no reachable GPU inventory"
+    elif queued and context.get("agent_alive") is False:
+        state = "queue_agent_stopped"
+        message = "queued work is stalled because the queue agent is stopped"
+        actions.append(
+            {
+                "kind": "start_agent",
+                "argv": [
+                    "dt",
+                    "agent",
+                    "start",
+                    *(["-c", center] if pin_center else []),
+                ],
+            }
+        )
+    elif queued and context.get("agent_heartbeat_stale") is True:
+        state = "queue_agent_stale"
+        message = "queued work is stalled because the agent heartbeat is stale"
+        actions.append(
+            {
+                "kind": "inspect_agent",
+                "argv": [
+                    "dt",
+                    "agent",
+                    "status",
+                    "--verbose",
+                    *(["-c", center] if pin_center else []),
+                ],
+            }
+        )
+    elif queued:
+        reason = context.get("queue_head_reason")
+        state = (
+            "queue_head_blocked"
+            if isinstance(reason, str) and reason.startswith("blocked:")
+            else "queued_waiting"
+        )
+        message = (
+            str(reason)
+            if isinstance(reason, str) and reason
+            else "queued work is waiting for dispatch"
+        )
+        head = context.get("queue_head_job_id")
+        if isinstance(head, str) and head:
+            actions.append(
+                {
+                    "kind": "inspect_queue_head",
+                    "job_id": head,
+                    "argv": ["dt", "info", head],
+                }
+            )
+    else:
+        running_nodes = context.get("running_nodes")
+        successor_node = (
+            running_nodes[0]
+            if isinstance(running_nodes, list)
+            and len(running_nodes) == 1
+            and isinstance(running_nodes[0], str)
+            else None
+        )
+        if free_count:
+            best_node = str(_best_free_submit_node(reachable))
+            state = "queue_runway_empty_with_free_capacity"
+            message = (
+                "running work has no queued successor and additional GPU "
+                "capacity is free now"
+            )
+            actions.append(
+                _free_submit_action(
+                    "submit_now",
+                    best_node,
+                    center=center if pin_center else None,
+                )
+            )
+            if successor_node is not None and successor_node != best_node:
+                actions.append(
+                    _free_submit_action(
+                        "queue_successor",
+                        successor_node,
+                        center=center if pin_center else None,
+                    )
+                )
+        else:
+            state = "queue_runway_empty"
+            message = (
+                f"queue ends after {running} running "
+                f"{'job' if running == 1 else 'jobs'}"
+            )
+            if successor_node is not None:
+                actions.append(
+                    _free_submit_action(
+                        "queue_successor",
+                        successor_node,
+                        center=center if pin_center else None,
+                    )
+                )
+            else:
+                actions.append(
+                    {
+                        "kind": "select_successor_node",
+                        "argv": None,
+                        "reason": "running jobs span zero or multiple known nodes",
+                    }
+                )
+    return state, message, actions
+
+
 def _free_center_explanation(
     center: str,
     rows: list[JsonDict],
@@ -980,39 +1233,16 @@ def _free_center_explanation(
     pin_center: bool = False,
 ) -> JsonDict:
     """Build a stable machine explanation for one center's capacity state."""
-    reachable = [row for row in rows if not row.get("error")]
+    cap = _CenterCapacity.from_rows(rows)
+    reachable = cap.reachable
     unavailable = [row for row in rows if row.get("error")]
-    total = sum(len(row.get("gpus") or []) for row in reachable)
-    physical_free_by_node = {
-        str(row.get("node")): sum(
-            bool(gpu.get("free")) for gpu in row.get("gpus") or []
-        )
-        for row in reachable
-    }
-    free_by_node = {
-        str(row.get("node")): (
-            0 if row.get("drained") else physical_free_by_node[str(row.get("node"))]
-        )
-        for row in reachable
-    }
-    free_count = sum(free_by_node.values())
-    drained_nodes = [str(row.get("node")) for row in reachable if row.get("drained")]
-    drained_free_count = sum(
-        physical_free_by_node.get(node, 0) for node in drained_nodes
-    )
-    gpu_inventory_errors = {
-        str(row.get("node")): str(row["gpu_inventory_error"])
-        for row in reachable
-        if row.get("gpu_inventory_error")
-    }
-    lease_owners = list(
-        dict.fromkeys(
-            str(gpu.get("lease_owner") or "unknown")
-            for row in reachable
-            for gpu in row.get("gpus") or []
-            if gpu.get("leased")
-        )
-    )
+    total = cap.total
+    free_by_node = cap.free_by_node
+    free_count = cap.free_count
+    drained_nodes = cap.drained_nodes
+    drained_free_count = cap.drained_free_count
+    gpu_inventory_errors = cap.gpu_inventory_errors
+    lease_owners = cap.lease_owners
     context = next(
         (row["_scheduler"] for row in rows if isinstance(row.get("_scheduler"), dict)),
         None,
@@ -1046,166 +1276,11 @@ def _free_center_explanation(
         result["message"] = str(context.get("error") or "scheduler state unavailable")
         return result
 
-    actions: list[JsonDict] = []
-    if running == 0 and queued == 0:
-        if lease_owners:
-            result["state"] = "idle_with_dt_leases"
-            result["message"] = (
-                f"registry idle but {len(lease_owners)} dt GPU "
-                f"{'lease remains' if len(lease_owners) == 1 else 'leases remain'}"
-            )
-            actions.extend(
-                {
-                    "kind": "inspect_lease",
-                    "job_id": owner,
-                    "argv": ["dt", "info", owner],
-                }
-                for owner in lease_owners
-            )
-        elif gpu_inventory_errors:
-            details = ", ".join(
-                f"{node}: {message.removeprefix('GPU inventory incomplete: ')}"
-                for node, message in gpu_inventory_errors.items()
-            )
-            result["state"] = "gpu_inventory_incomplete"
-            result["message"] = f"GPU inventory incomplete: {details}"
-            if free_count:
-                best_node = str(_best_free_submit_node(reachable))
-                actions.append(
-                    _free_submit_action(
-                        "submit",
-                        best_node,
-                        center=center if pin_center else None,
-                    )
-                )
-        elif free_count:
-            best_node = str(_best_free_submit_node(reachable))
-            result["state"] = "idle_no_dt_work"
-            result["message"] = "GPU capacity is free and no dt work is queued"
-            actions.append(
-                _free_submit_action(
-                    "submit",
-                    best_node,
-                    center=center if pin_center else None,
-                )
-            )
-        elif drained_free_count:
-            result["state"] = "idle_capacity_drained"
-            result["message"] = (
-                f"{drained_free_count} physically free GPU "
-                f"{'is' if drained_free_count == 1 else 'are'} excluded by node drain"
-            )
-        elif total:
-            result["state"] = "idle_external_gpu_occupancy"
-            result["message"] = "no dt work is queued; GPUs are occupied outside dt"
-        else:
-            result["state"] = "no_gpu_inventory"
-            result["message"] = "no reachable GPU inventory"
-    elif queued and context.get("agent_alive") is False:
-        result["state"] = "queue_agent_stopped"
-        result["message"] = "queued work is stalled because the queue agent is stopped"
-        actions.append(
-            {
-                "kind": "start_agent",
-                "argv": [
-                    "dt",
-                    "agent",
-                    "start",
-                    *(["-c", center] if pin_center else []),
-                ],
-            }
-        )
-    elif queued and context.get("agent_heartbeat_stale") is True:
-        result["state"] = "queue_agent_stale"
-        result["message"] = (
-            "queued work is stalled because the agent heartbeat is stale"
-        )
-        actions.append(
-            {
-                "kind": "inspect_agent",
-                "argv": [
-                    "dt",
-                    "agent",
-                    "status",
-                    "--verbose",
-                    *(["-c", center] if pin_center else []),
-                ],
-            }
-        )
-    elif queued:
-        reason = context.get("queue_head_reason")
-        result["state"] = (
-            "queue_head_blocked"
-            if isinstance(reason, str) and reason.startswith("blocked:")
-            else "queued_waiting"
-        )
-        result["message"] = (
-            str(reason)
-            if isinstance(reason, str) and reason
-            else "queued work is waiting for dispatch"
-        )
-        head = context.get("queue_head_job_id")
-        if isinstance(head, str) and head:
-            actions.append(
-                {
-                    "kind": "inspect_queue_head",
-                    "job_id": head,
-                    "argv": ["dt", "info", head],
-                }
-            )
-    else:
-        running_nodes = context.get("running_nodes")
-        successor_node = (
-            running_nodes[0]
-            if isinstance(running_nodes, list)
-            and len(running_nodes) == 1
-            and isinstance(running_nodes[0], str)
-            else None
-        )
-        if free_count:
-            best_node = str(_best_free_submit_node(reachable))
-            result["state"] = "queue_runway_empty_with_free_capacity"
-            result["message"] = (
-                "running work has no queued successor and additional GPU "
-                "capacity is free now"
-            )
-            actions.append(
-                _free_submit_action(
-                    "submit_now",
-                    best_node,
-                    center=center if pin_center else None,
-                )
-            )
-            if successor_node is not None and successor_node != best_node:
-                actions.append(
-                    _free_submit_action(
-                        "queue_successor",
-                        successor_node,
-                        center=center if pin_center else None,
-                    )
-                )
-        else:
-            result["state"] = "queue_runway_empty"
-            result["message"] = (
-                f"queue ends after {running} running "
-                f"{'job' if running == 1 else 'jobs'}"
-            )
-            if successor_node is not None:
-                actions.append(
-                    _free_submit_action(
-                        "queue_successor",
-                        successor_node,
-                        center=center if pin_center else None,
-                    )
-                )
-            else:
-                actions.append(
-                    {
-                        "kind": "select_successor_node",
-                        "argv": None,
-                        "reason": "running jobs span zero or multiple known nodes",
-                    }
-                )
+    state, message, actions = _free_center_verdict(
+        center, cap, context, running=running, queued=queued, pin_center=pin_center
+    )
+    result["state"] = state
+    result["message"] = message
     result["actions"] = actions
     return result
 
@@ -1267,6 +1342,165 @@ def _free_explain_payload(
     }
 
 
+def _free_action_text(
+    cap: _CenterCapacity,
+    context: JsonDict,
+    *,
+    running: int,
+    queued: int,
+    minimum: int | None,
+    explain: bool,
+    center_suffix: str,
+) -> str:
+    """The human next-action phrase for one center's scheduler state."""
+    reachable = cap.reachable
+    total = cap.total
+    free_by_node = cap.free_by_node
+    fitting_free_by_node = cap.fitting_free_by_node(minimum)
+    fitting_free_count = sum(fitting_free_by_node.values())
+    free_count = cap.free_count
+    drained_free_count = cap.drained_free_count
+    lease_owners = cap.lease_owners
+    gpu_inventory_errors = cap.gpu_inventory_errors
+    reason = context.get("queue_head_reason")
+    action = ""
+    if running == 0 and queued == 0:
+        if lease_owners:
+            owner = escape(lease_owners[0])
+            noun = "lease remains" if len(lease_owners) == 1 else "leases remain"
+            action = (
+                "[yellow]registry idle, but "
+                f"{len(lease_owners)} dt GPU {noun}[/yellow]"
+                f" · inspect: dt info {owner}"
+            )
+        elif free_count:
+            best_node = _best_free_submit_node(reachable)
+            action = (
+                "[green]idle: no dt work queued[/green]"
+                f" · submit: dt task {escape(str(best_node))} "
+                f"'COMMAND' -n NAME{center_suffix}"
+            )
+        elif drained_free_count:
+            action = (
+                f"[yellow]{drained_free_count} physically free GPU "
+                f"{'is' if drained_free_count == 1 else 'are'} drained[/yellow]"
+            )
+        elif total:
+            action = "idle: no dt work queued; GPUs are occupied outside dt"
+        elif gpu_inventory_errors:
+            nodes = ", ".join(gpu_inventory_errors)
+            action = f"[yellow]GPU inventory incomplete on {escape(nodes)}[/yellow]"
+        else:
+            action = "no reachable GPU inventory"
+    elif queued and context.get("agent_alive") is False:
+        action = (
+            "[red]stalled: queue agent is stopped[/red]"
+            f" · run: dt agent start{center_suffix}"
+        )
+    elif queued and context.get("agent_heartbeat_stale") is True:
+        action = (
+            "[red]stalled: queue agent heartbeat is stale[/red]"
+            f" · inspect: dt agent status -v{center_suffix}"
+        )
+    elif queued:
+        pin_node = context.get("queue_head_pin_node")
+        requested = context.get("queue_head_gpus_requested")
+        wanted = requested if isinstance(requested, int) and requested >= 0 else 1
+        gpu_word = "GPU" if wanted == 1 else "GPUs"
+        if isinstance(reason, str) and reason.startswith("blocked:"):
+            action = "[yellow]next is blocked by a job constraint[/yellow]"
+        elif isinstance(reason, str) and "max_my_jobs=" in reason:
+            action = "[yellow]next waits for dt concurrency quota[/yellow]"
+        elif isinstance(pin_node, str) and pin_node:
+            pin_free = fitting_free_by_node.get(pin_node)
+            if pin_free is None:
+                action = (
+                    f"[yellow]next waits for {escape(pin_node)}; "
+                    "node unavailable[/yellow]"
+                )
+            elif wanted == 0 or pin_free >= wanted:
+                action = f"[yellow]next is dispatching on {escape(pin_node)}[/yellow]"
+            else:
+                elsewhere = max(0, sum(fitting_free_by_node.values()) - pin_free)
+                action = (
+                    f"[yellow]next needs {wanted} {gpu_word} on "
+                    f"{escape(pin_node)}[/yellow]"
+                )
+                if elsewhere and explain:
+                    verb = "is" if elsewhere == 1 else "are"
+                    action += f" · {elsewhere} free elsewhere {verb} not eligible"
+        elif wanted == 0:
+            action = "[yellow]next CPU task is dispatching[/yellow]"
+        else:
+            reserve = context.get("reserve_free_per_node")
+            reserve_count = reserve if isinstance(reserve, int) and reserve > 0 else 0
+            effective = {
+                node: (
+                    fitting_free_by_node.get(node, 0)
+                    if count - wanted >= reserve_count
+                    else 0
+                )
+                for node, count in free_by_node.items()
+            }
+            best = max(effective.values(), default=0)
+            raw_best = max(fitting_free_by_node.values(), default=0)
+            if best >= wanted:
+                action = "[yellow]next is dispatching[/yellow]"
+            elif raw_best >= wanted and reserve_count:
+                action = (
+                    f"[yellow]next needs {wanted} {gpu_word}; "
+                    "capacity held in reserve[/yellow]"
+                )
+                if explain:
+                    action += f" · reserve_free_per_node={reserve_count}"
+            elif fitting_free_count:
+                free_label = (
+                    f"{fitting_free_count} fitting free"
+                    if minimum is not None
+                    else f"{fitting_free_count} free"
+                )
+                action = (
+                    f"[yellow]next needs {wanted} {gpu_word} together; "
+                    f"{free_label} "
+                    f"{'GPU is' if fitting_free_count == 1 else 'GPUs are'} "
+                    "split across nodes[/yellow]"
+                )
+            else:
+                action = f"next needs {wanted} {gpu_word} capacity"
+        if minimum is not None:
+            action += f" · ≥{minimum:,} MiB/GPU"
+    else:
+        running_nodes = context.get("running_nodes")
+        successor_node = "NODE"
+        if (
+            isinstance(running_nodes, list)
+            and len(running_nodes) == 1
+            and isinstance(running_nodes[0], str)
+        ):
+            successor_node = running_nodes[0]
+        if free_count:
+            best_node = _best_free_submit_node(reachable)
+            action = (
+                "[yellow]queue empty; additional GPU capacity is available "
+                "now[/yellow]"
+                f" · submit: dt task {escape(str(best_node))} "
+                f"'COMMAND' -n NAME{center_suffix}"
+            )
+            if successor_node != str(best_node):
+                action += (
+                    f" · keep busy: dt task {escape(successor_node)} "
+                    f"'COMMAND' -n NAME{center_suffix}"
+                )
+        else:
+            noun = "job" if running == 1 else "jobs"
+            action = (
+                f"[yellow]queue ends after {running} running {noun}[/yellow]"
+                f" · queue next: dt task {escape(successor_node)} "
+                f"'COMMAND' -n NAME{center_suffix}"
+            )
+    return action
+
+
 def _free_scheduler_table(
     rows: list[JsonDict],
     *,
@@ -1292,21 +1526,10 @@ def _free_scheduler_table(
     one_center = len(contexts) == 1
     for center, context in contexts.items():
         center_suffix = f" {escape(shlex.join(['-c', center]))}" if pin_centers else ""
-        center_rows = [row for row in rows if row.get("center") == center]
-        reachable = [row for row in center_rows if not row.get("error")]
-        total = sum(len(row.get("gpus") or []) for row in reachable)
-        physical_free_by_node = {
-            str(row.get("node")): sum(
-                bool(gpu.get("free")) for gpu in row.get("gpus") or []
-            )
-            for row in reachable
-        }
-        free_by_node = {
-            str(row.get("node")): (
-                0 if row.get("drained") else physical_free_by_node[str(row.get("node"))]
-            )
-            for row in reachable
-        }
+        cap = _CenterCapacity.from_rows(
+            [row for row in rows if row.get("center") == center]
+        )
+        total = cap.total
         minimum = context.get("queue_head_min_vram_mib")
         minimum = (
             minimum
@@ -1315,37 +1538,7 @@ def _free_scheduler_table(
             and minimum > 0
             else None
         )
-        fitting_free_by_node = {
-            str(row.get("node")): (
-                0
-                if row.get("drained")
-                else sum(
-                    _free_gpu_meets_minimum(gpu, minimum)
-                    for gpu in row.get("gpus") or []
-                )
-            )
-            for row in reachable
-        }
-        fitting_free_count = sum(fitting_free_by_node.values())
-        free_count = sum(free_by_node.values())
-        drained_free_count = sum(
-            physical_free_by_node[str(row.get("node"))]
-            for row in reachable
-            if row.get("drained")
-        )
-        lease_owners = list(
-            dict.fromkeys(
-                str(gpu.get("lease_owner") or "unknown")
-                for row in reachable
-                for gpu in row.get("gpus") or []
-                if gpu.get("leased")
-            )
-        )
-        gpu_inventory_errors = {
-            str(row.get("node")): str(row["gpu_inventory_error"])
-            for row in reachable
-            if row.get("gpu_inventory_error")
-        }
+        free_count = cap.free_count
         running = context.get("running")
         queued = context.get("queued")
         label = escape("dt" if one_center else center)
@@ -1355,146 +1548,16 @@ def _free_scheduler_table(
             continue
 
         counts = f"{free_count}/{total} GPU free · {running} running · {queued} queued"
-        action = ""
         reason = context.get("queue_head_reason")
-        if running == 0 and queued == 0:
-            if lease_owners:
-                owner = escape(lease_owners[0])
-                noun = "lease remains" if len(lease_owners) == 1 else "leases remain"
-                action = (
-                    "[yellow]registry idle, but "
-                    f"{len(lease_owners)} dt GPU {noun}[/yellow]"
-                    f" · inspect: dt info {owner}"
-                )
-            elif free_count:
-                best_node = _best_free_submit_node(reachable)
-                action = (
-                    "[green]idle: no dt work queued[/green]"
-                    f" · submit: dt task {escape(str(best_node))} "
-                    f"'COMMAND' -n NAME{center_suffix}"
-                )
-            elif drained_free_count:
-                action = (
-                    f"[yellow]{drained_free_count} physically free GPU "
-                    f"{'is' if drained_free_count == 1 else 'are'} drained[/yellow]"
-                )
-            elif total:
-                action = "idle: no dt work queued; GPUs are occupied outside dt"
-            elif gpu_inventory_errors:
-                nodes = ", ".join(gpu_inventory_errors)
-                action = f"[yellow]GPU inventory incomplete on {escape(nodes)}[/yellow]"
-            else:
-                action = "no reachable GPU inventory"
-        elif queued and context.get("agent_alive") is False:
-            action = (
-                "[red]stalled: queue agent is stopped[/red]"
-                f" · run: dt agent start{center_suffix}"
-            )
-        elif queued and context.get("agent_heartbeat_stale") is True:
-            action = (
-                "[red]stalled: queue agent heartbeat is stale[/red]"
-                f" · inspect: dt agent status -v{center_suffix}"
-            )
-        elif queued:
-            pin_node = context.get("queue_head_pin_node")
-            requested = context.get("queue_head_gpus_requested")
-            wanted = requested if isinstance(requested, int) and requested >= 0 else 1
-            gpu_word = "GPU" if wanted == 1 else "GPUs"
-            if isinstance(reason, str) and reason.startswith("blocked:"):
-                action = "[yellow]next is blocked by a job constraint[/yellow]"
-            elif isinstance(reason, str) and "max_my_jobs=" in reason:
-                action = "[yellow]next waits for dt concurrency quota[/yellow]"
-            elif isinstance(pin_node, str) and pin_node:
-                pin_free = fitting_free_by_node.get(pin_node)
-                if pin_free is None:
-                    action = (
-                        f"[yellow]next waits for {escape(pin_node)}; "
-                        "node unavailable[/yellow]"
-                    )
-                elif wanted == 0 or pin_free >= wanted:
-                    action = (
-                        f"[yellow]next is dispatching on {escape(pin_node)}[/yellow]"
-                    )
-                else:
-                    elsewhere = max(0, sum(fitting_free_by_node.values()) - pin_free)
-                    action = (
-                        f"[yellow]next needs {wanted} {gpu_word} on "
-                        f"{escape(pin_node)}[/yellow]"
-                    )
-                    if elsewhere and explain:
-                        verb = "is" if elsewhere == 1 else "are"
-                        action += f" · {elsewhere} free elsewhere {verb} not eligible"
-            elif wanted == 0:
-                action = "[yellow]next CPU task is dispatching[/yellow]"
-            else:
-                reserve = context.get("reserve_free_per_node")
-                reserve_count = (
-                    reserve if isinstance(reserve, int) and reserve > 0 else 0
-                )
-                effective = {
-                    node: (
-                        fitting_free_by_node.get(node, 0)
-                        if count - wanted >= reserve_count
-                        else 0
-                    )
-                    for node, count in free_by_node.items()
-                }
-                best = max(effective.values(), default=0)
-                raw_best = max(fitting_free_by_node.values(), default=0)
-                if best >= wanted:
-                    action = "[yellow]next is dispatching[/yellow]"
-                elif raw_best >= wanted and reserve_count:
-                    action = (
-                        f"[yellow]next needs {wanted} {gpu_word}; "
-                        "capacity held in reserve[/yellow]"
-                    )
-                    if explain:
-                        action += f" · reserve_free_per_node={reserve_count}"
-                elif fitting_free_count:
-                    free_label = (
-                        f"{fitting_free_count} fitting free"
-                        if minimum is not None
-                        else f"{fitting_free_count} free"
-                    )
-                    action = (
-                        f"[yellow]next needs {wanted} {gpu_word} together; "
-                        f"{free_label} "
-                        f"{'GPU is' if fitting_free_count == 1 else 'GPUs are'} "
-                        "split across nodes[/yellow]"
-                    )
-                else:
-                    action = f"next needs {wanted} {gpu_word} capacity"
-            if minimum is not None:
-                action += f" · ≥{minimum:,} MiB/GPU"
-        else:
-            running_nodes = context.get("running_nodes")
-            successor_node = "NODE"
-            if (
-                isinstance(running_nodes, list)
-                and len(running_nodes) == 1
-                and isinstance(running_nodes[0], str)
-            ):
-                successor_node = running_nodes[0]
-            if free_count:
-                best_node = _best_free_submit_node(reachable)
-                action = (
-                    "[yellow]queue empty; additional GPU capacity is available "
-                    "now[/yellow]"
-                    f" · submit: dt task {escape(str(best_node))} "
-                    f"'COMMAND' -n NAME{center_suffix}"
-                )
-                if successor_node != str(best_node):
-                    action += (
-                        f" · keep busy: dt task {escape(successor_node)} "
-                        f"'COMMAND' -n NAME{center_suffix}"
-                    )
-            else:
-                noun = "job" if running == 1 else "jobs"
-                action = (
-                    f"[yellow]queue ends after {running} running {noun}[/yellow]"
-                    f" · queue next: dt task {escape(successor_node)} "
-                    f"'COMMAND' -n NAME{center_suffix}"
-                )
+        action = _free_action_text(
+            cap,
+            context,
+            running=running,
+            queued=queued,
+            minimum=minimum,
+            explain=explain,
+            center_suffix=center_suffix,
+        )
 
         table.add_row(label, f"{counts} · {action}")
         head = context.get("queue_head_job_id")
