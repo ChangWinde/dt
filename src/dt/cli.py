@@ -4801,6 +4801,120 @@ def _inventory_finalize_group(
     )
 
 
+def _validate_inventory_options(
+    policy: _InventoryPolicy,
+    items: list[str],
+    *,
+    gpus: int,
+    stage_gpus: list[int] | None,
+    artifact: list[str] | None,
+    artifact_manifest: str | None,
+    max_hours: float | None,
+    min_vram_mib: int | None,
+    max_vram_mib: int | None,
+    max_job_memory_mib: int | None,
+    require_disk_gib: int | None,
+    request_id: str | None,
+    json_: bool,
+) -> tuple[list[int], list[str]]:
+    """Validate batch/chain options; returns (per-item GPU requests, artifacts)."""
+    if stage_gpus is not None:
+        if policy.dependency_policy is None:
+            _fail_submission(
+                kind="invalid_argument",
+                message="per-stage GPU requests are supported only by chain",
+                exit_code=1,
+                json_=json_,
+            )
+        if len(stage_gpus) != len(items):
+            _fail_submission(
+                kind="invalid_argument",
+                message=(
+                    f"--stage-gpus was provided {len(stage_gpus)} times for "
+                    f"{len(items)} stages"
+                ),
+                exit_code=1,
+                json_=json_,
+            )
+        if any(value < 0 for value in stage_gpus):
+            _fail_submission(
+                kind="invalid_argument",
+                message="--stage-gpus values must be non-negative",
+                exit_code=1,
+                json_=json_,
+            )
+    if gpus < 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--gpus must be non-negative",
+            exit_code=1,
+            json_=json_,
+        )
+    requested_gpus = stage_gpus or [gpus] * len(items)
+    artifacts = artifact or []
+    if artifacts and artifact_manifest:
+        _fail_submission(
+            kind="invalid_argument",
+            message="use either --artifact or --artifact-manifest, not both",
+            exit_code=1,
+            json_=json_,
+        )
+    if any(not path.strip() for path in artifacts):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--artifact paths must be non-empty",
+            exit_code=1,
+            json_=json_,
+        )
+    _validate_submission_resources(
+        gpus=max(requested_gpus),
+        max_hours=max_hours,
+        min_vram_mib=min_vram_mib,
+        max_vram_mib=max_vram_mib,
+        max_job_memory_mib=max_job_memory_mib,
+        require_disk_gib=require_disk_gib,
+        artifact_manifest=artifact_manifest,
+        json_=json_,
+    )
+    _validate_submission_request_id(request_id, json_=json_)
+    return requested_gpus, artifacts
+
+
+def _inventory_publish_artifacts_now(
+    plan: _InventoryPlan,
+    outcome: _GroupOutcome,
+    artifact_action: Callable[[], None],
+    *,
+    json_: bool,
+) -> None:
+    """Without a request id there is no durable claim; publish artifacts eagerly."""
+    try:
+        artifact_action()
+    except _OperationFailure as exc:
+        outcome.fail_from(exc)
+    except KeyboardInterrupt:
+        outcome.fail(
+            f"{plan.policy.command}_artifact_sync_interrupted",
+            (
+                f"{plan.policy.command} artifact sync interrupted before job "
+                "submission; no jobs were registered. Rerun the same "
+                f"{plan.policy.command} to resume the partial transfer."
+            ),
+            130,
+        )
+    else:
+        if (
+            not json_
+            and outcome.artifact_sync is not None
+            and plan.artifact_manifest is not None
+        ):
+            _emit_task_artifact_sync_success(
+                plan.server,
+                plan.artifact_manifest,
+                outcome.artifact_sync,
+            )
+
+
 def _inventory_command(
     policy: _InventoryPolicy,
     server: str = typer.Argument(..., help="compute node, for example gpu-node-1"),
@@ -4876,65 +4990,21 @@ def _inventory_command(
         json_=json_,
         operation=policy.command,
     )
-    if stage_gpus is not None:
-        if policy.dependency_policy is None:
-            _fail_submission(
-                kind="invalid_argument",
-                message="per-stage GPU requests are supported only by chain",
-                exit_code=1,
-                json_=json_,
-            )
-        if len(stage_gpus) != len(items):
-            _fail_submission(
-                kind="invalid_argument",
-                message=(
-                    f"--stage-gpus was provided {len(stage_gpus)} times for "
-                    f"{len(items)} stages"
-                ),
-                exit_code=1,
-                json_=json_,
-            )
-        if any(value < 0 for value in stage_gpus):
-            _fail_submission(
-                kind="invalid_argument",
-                message="--stage-gpus values must be non-negative",
-                exit_code=1,
-                json_=json_,
-            )
-    if gpus < 0:
-        _fail_submission(
-            kind="invalid_argument",
-            message="--gpus must be non-negative",
-            exit_code=1,
-            json_=json_,
-        )
-    requested_gpus = stage_gpus or [gpus] * len(items)
-    artifacts = artifact or []
-    if artifacts and artifact_manifest:
-        _fail_submission(
-            kind="invalid_argument",
-            message="use either --artifact or --artifact-manifest, not both",
-            exit_code=1,
-            json_=json_,
-        )
-    if any(not path.strip() for path in artifacts):
-        _fail_submission(
-            kind="invalid_argument",
-            message="--artifact paths must be non-empty",
-            exit_code=1,
-            json_=json_,
-        )
-    _validate_submission_resources(
-        gpus=max(requested_gpus),
+    requested_gpus, artifacts = _validate_inventory_options(
+        policy,
+        items,
+        gpus=gpus,
+        stage_gpus=stage_gpus,
+        artifact=artifact,
+        artifact_manifest=artifact_manifest,
         max_hours=max_hours,
         min_vram_mib=min_vram_mib,
         max_vram_mib=max_vram_mib,
         max_job_memory_mib=max_job_memory_mib,
         require_disk_gib=require_disk_gib,
-        artifact_manifest=artifact_manifest,
+        request_id=request_id,
         json_=json_,
     )
-    _validate_submission_request_id(request_id, json_=json_)
     default_prefix = (
         file.stem
         if file is not None and str(file) != "-" and file.stem
@@ -5027,31 +5097,7 @@ def _inventory_command(
     outcome.project = plan.project
 
     if request_id is None and artifact_action is not None and outcome.failure is None:
-        try:
-            artifact_action()
-        except _OperationFailure as exc:
-            outcome.fail_from(exc)
-        except KeyboardInterrupt:
-            outcome.fail(
-                f"{policy.command}_artifact_sync_interrupted",
-                (
-                    f"{policy.command} artifact sync interrupted before job "
-                    "submission; no jobs were registered. Rerun the same "
-                    f"{policy.command} to resume the partial transfer."
-                ),
-                130,
-            )
-        else:
-            if (
-                not json_
-                and outcome.artifact_sync is not None
-                and plan.artifact_manifest is not None
-            ):
-                _emit_task_artifact_sync_success(
-                    server,
-                    plan.artifact_manifest,
-                    outcome.artifact_sync,
-                )
+        _inventory_publish_artifacts_now(plan, outcome, artifact_action, json_=json_)
 
     if outcome.failure is None:
         _inventory_claim_group(
@@ -5451,6 +5497,138 @@ def _forward_laptop_matrix_run(
     )
 
 
+def _matrix_submit_units(
+    cfg: HeadConfig,
+    spec: matrix_mod.MatrixSpec,
+    outcome: _GroupOutcome,
+    *,
+    project: str | None,
+    artifact_manifest: str | None,
+    intent_sha256: str,
+    json_: bool,
+) -> None:
+    """Submit every unit not yet confirmed, in strict prefix order."""
+    request_id = spec.request_id
+    requested = len(spec.units)
+    for index in range(len(outcome.entries) + 1, requested + 1):
+        unit = spec.units[index - 1]
+
+        def log(message: str, *, item: int = index) -> None:
+            err.print(f"[dim]matrix {item}/{requested}: {escape(message)}[/dim]")
+
+        run_spec = RunSpec(
+            name=unit.name,
+            gpus=unit.gpus,
+            cmd=["bash", "-c", unit.command],
+            project=project,
+            node=spec.node,
+            max_hours=unit.max_hours,
+            artifact_manifest=artifact_manifest,
+            request_id=group_mod.item_request_id(request_id, index),
+        )
+        try:
+            entry = submit(cfg, run_spec, Path.cwd(), log)
+            _record_group_job(
+                cfg,
+                outcome,
+                request_id=request_id,
+                index=index,
+                entry=entry,
+            )
+        except KeyboardInterrupt:
+            confirmed = len(outcome.entries)
+            noun = "registration" if confirmed == 1 else "registrations"
+            outcome.fail(
+                "matrix_submission_interrupted",
+                (
+                    f"matrix submission interrupted after {confirmed} "
+                    f"confirmed {noun}; unit {index} outcome unknown. "
+                    "Confirmed jobs were not cancelled. Rerun "
+                    "`dt matrix run` with the same spec to reconcile "
+                    "this exact unit."
+                ),
+                130,
+                reasons={"request_id": request_id},
+                confirmed_submitted=confirmed,
+                uncertain_unit_index=index,
+            )
+            break
+        except (
+            FailedBeforeStart,
+            NoReachableNode,
+            NoCapacity,
+            DispatchError,
+            ConfigError,
+        ) as exc:
+            failure, failure_code, failed_entry = _batch_error(
+                exc, item_label="matrix unit"
+            )
+            outcome.failure = failure
+            outcome.failure_code = failure_code
+            if failed_entry is not None:
+                # An uncertain launch may still be running on the node,
+                # so it is not part of the durably confirmed prefix (see
+                # the batch path for the full rationale).
+                if (
+                    outcome.failure is not None
+                    and outcome.failure.get("kind") != "uncertain_launch"
+                ):
+                    try:
+                        _record_group_job(
+                            cfg,
+                            outcome,
+                            request_id=request_id,
+                            index=index,
+                            entry=failed_entry,
+                        )
+                    except (
+                        OSError,
+                        ValueError,
+                        intent_mod.RequestRecordError,
+                        group_mod.GroupRequestError,
+                    ) as persistence_exc:
+                        outcome.fail(
+                            "submission_unknown",
+                            (
+                                f"job {failed_entry.job_id} was registered "
+                                f"but request {request_id!r} progress "
+                                "could not be persisted"
+                            ),
+                            EXIT_UNREACHABLE,
+                            reasons={
+                                "request_id": request_id,
+                                "job_id": failed_entry.job_id,
+                                "detail": str(persistence_exc),
+                            },
+                        )
+                outcome.entries.append(failed_entry)
+                _group_ensure_agent(cfg, outcome, failed_entry)
+                if not json_:
+                    print(failed_entry.job_id, flush=True)
+            break
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            outcome.fail(
+                "submission_unknown",
+                (
+                    f"matrix unit {index} did not produce a complete "
+                    "durable group receipt; retry only with the same "
+                    "request id"
+                ),
+                EXIT_UNREACHABLE,
+                reasons={"request_id": request_id, "detail": str(exc)},
+            )
+            break
+        outcome.entries.append(entry)
+        _group_ensure_agent(cfg, outcome, entry)
+        if not json_:
+            print(entry.job_id, flush=True)
+
+
 def _matrix_run_head(
     cfg: HeadConfig,
     spec: matrix_mod.MatrixSpec,
@@ -5532,123 +5710,15 @@ def _matrix_run_head(
             )
 
     if outcome.failure is None and not outcome.group_terminal_replay:
-        for index in range(len(outcome.entries) + 1, requested + 1):
-            unit = spec.units[index - 1]
-
-            def log(message: str, *, item: int = index) -> None:
-                err.print(f"[dim]matrix {item}/{requested}: {escape(message)}[/dim]")
-
-            run_spec = RunSpec(
-                name=unit.name,
-                gpus=unit.gpus,
-                cmd=["bash", "-c", unit.command],
-                project=project,
-                node=spec.node,
-                max_hours=unit.max_hours,
-                artifact_manifest=artifact_manifest,
-                request_id=group_mod.item_request_id(request_id, index),
-            )
-            try:
-                entry = submit(cfg, run_spec, Path.cwd(), log)
-                _record_group_job(
-                    cfg,
-                    outcome,
-                    request_id=request_id,
-                    index=index,
-                    entry=entry,
-                )
-            except KeyboardInterrupt:
-                confirmed = len(outcome.entries)
-                noun = "registration" if confirmed == 1 else "registrations"
-                outcome.fail(
-                    "matrix_submission_interrupted",
-                    (
-                        f"matrix submission interrupted after {confirmed} "
-                        f"confirmed {noun}; unit {index} outcome unknown. "
-                        "Confirmed jobs were not cancelled. Rerun "
-                        "`dt matrix run` with the same spec to reconcile "
-                        "this exact unit."
-                    ),
-                    130,
-                    reasons={"request_id": request_id},
-                    confirmed_submitted=confirmed,
-                    uncertain_unit_index=index,
-                )
-                break
-            except (
-                FailedBeforeStart,
-                NoReachableNode,
-                NoCapacity,
-                DispatchError,
-                ConfigError,
-            ) as exc:
-                failure, failure_code, failed_entry = _batch_error(
-                    exc, item_label="matrix unit"
-                )
-                outcome.failure = failure
-                outcome.failure_code = failure_code
-                if failed_entry is not None:
-                    # An uncertain launch may still be running on the node,
-                    # so it is not part of the durably confirmed prefix (see
-                    # the batch path for the full rationale).
-                    if (
-                        outcome.failure is not None
-                        and outcome.failure.get("kind") != "uncertain_launch"
-                    ):
-                        try:
-                            _record_group_job(
-                                cfg,
-                                outcome,
-                                request_id=request_id,
-                                index=index,
-                                entry=failed_entry,
-                            )
-                        except (
-                            OSError,
-                            ValueError,
-                            intent_mod.RequestRecordError,
-                            group_mod.GroupRequestError,
-                        ) as persistence_exc:
-                            outcome.fail(
-                                "submission_unknown",
-                                (
-                                    f"job {failed_entry.job_id} was registered "
-                                    f"but request {request_id!r} progress "
-                                    "could not be persisted"
-                                ),
-                                EXIT_UNREACHABLE,
-                                reasons={
-                                    "request_id": request_id,
-                                    "job_id": failed_entry.job_id,
-                                    "detail": str(persistence_exc),
-                                },
-                            )
-                    outcome.entries.append(failed_entry)
-                    _group_ensure_agent(cfg, outcome, failed_entry)
-                    if not json_:
-                        print(failed_entry.job_id, flush=True)
-                break
-            except (
-                OSError,
-                ValueError,
-                intent_mod.RequestRecordError,
-                group_mod.GroupRequestError,
-            ) as exc:
-                outcome.fail(
-                    "submission_unknown",
-                    (
-                        f"matrix unit {index} did not produce a complete "
-                        "durable group receipt; retry only with the same "
-                        "request id"
-                    ),
-                    EXIT_UNREACHABLE,
-                    reasons={"request_id": request_id, "detail": str(exc)},
-                )
-                break
-            outcome.entries.append(entry)
-            _group_ensure_agent(cfg, outcome, entry)
-            if not json_:
-                print(entry.job_id, flush=True)
+        _matrix_submit_units(
+            cfg,
+            spec,
+            outcome,
+            project=project,
+            artifact_manifest=artifact_manifest,
+            intent_sha256=intent_sha256,
+            json_=json_,
+        )
 
     # Transient placement failures (every candidate busy or unreachable) keep
     # the group open on purpose: no unit outcome is ambiguous and nothing was
@@ -12489,6 +12559,63 @@ def _render_compare(data: JsonDict) -> None:
         _render_compare_metric(metric)
 
 
+def _compare_entries_across_heads(
+    refs: list[str],
+    locations: list[tuple[str, str]],
+    *,
+    json_: bool,
+) -> list[jobs_mod.JobEntry]:
+    """Fetch registry rows for refs that live on different heads."""
+    entries: list[jobs_mod.JobEntry] = []
+    for ref, (_center, head) in zip(refs, locations, strict=True):
+        proc = remote_dt(head, ["_find", ref], timeout=15)
+        if proc.returncode != 0:
+            _fail_submission(
+                kind="unreachable" if proc.returncode == 255 else "lookup_failed",
+                message=f"could not read job {ref!r} from {head}",
+                exit_code=(
+                    EXIT_UNREACHABLE if proc.returncode == 255 else EXIT_NOT_FOUND
+                ),
+                json_=json_,
+            )
+        try:
+            record = json.loads(proc.stdout)
+            if not isinstance(record, dict):
+                raise TypeError("registry response must be an object")
+            record.pop("custom_env_keys", None)
+            entries.append(jobs_mod.JobEntry(**record))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            _fail_submission(
+                kind="lookup_failed",
+                message=f"invalid registry response for job {ref!r}: {exc}",
+                exit_code=1,
+                json_=json_,
+            )
+    return entries
+
+
+def _compare_entries_on_head(
+    cfg: HeadConfig,
+    refs: list[str],
+    *,
+    json_: bool,
+) -> list[jobs_mod.JobEntry]:
+    """Resolve every ref against this head's registry in one snapshot."""
+    entries: list[jobs_mod.JobEntry] = []
+    with jobs_mod.shared_resolution_snapshot(cfg):
+        for ref in refs:
+            entry = jobs_mod.find(cfg, ref)
+            if entry is None:
+                _fail_submission(
+                    kind="not_found",
+                    message=f"no job matching {ref!r}",
+                    exit_code=EXIT_NOT_FOUND,
+                    json_=json_,
+                )
+            entries.append(entry)
+    return entries
+
+
 def compare(
     refs: Optional[list[str]] = REFS_OPTIONAL_ARG,
     metric: Optional[str] = typer.Option(
@@ -12603,7 +12730,6 @@ def compare(
         )
 
     cfg = _cfg()
-    entries: list[jobs_mod.JobEntry]
     if isinstance(cfg, LaptopConfig):
         locations = [_locate(cfg, ref, json_=json_) for ref in refs]
         heads = {head for _center, head in locations}
@@ -12620,45 +12746,9 @@ def compare(
                 .flag("--json", json_)
             )
             raise typer.Exit(route.invoke(forward_call))
-
-        entries = []
-        for ref, (_center, head) in zip(refs, locations, strict=True):
-            proc = remote_dt(head, ["_find", ref], timeout=15)
-            if proc.returncode != 0:
-                _fail_submission(
-                    kind="unreachable" if proc.returncode == 255 else "lookup_failed",
-                    message=f"could not read job {ref!r} from {head}",
-                    exit_code=(
-                        EXIT_UNREACHABLE if proc.returncode == 255 else EXIT_NOT_FOUND
-                    ),
-                    json_=json_,
-                )
-            try:
-                record = json.loads(proc.stdout)
-                if not isinstance(record, dict):
-                    raise TypeError("registry response must be an object")
-                record.pop("custom_env_keys", None)
-                entries.append(jobs_mod.JobEntry(**record))
-            except (TypeError, ValueError, json.JSONDecodeError) as exc:
-                _fail_submission(
-                    kind="lookup_failed",
-                    message=f"invalid registry response for job {ref!r}: {exc}",
-                    exit_code=1,
-                    json_=json_,
-                )
+        entries = _compare_entries_across_heads(refs, locations, json_=json_)
     else:
-        entries = []
-        with jobs_mod.shared_resolution_snapshot(cfg):
-            for ref in refs:
-                entry = jobs_mod.find(cfg, ref)
-                if entry is None:
-                    _fail_submission(
-                        kind="not_found",
-                        message=f"no job matching {ref!r}",
-                        exit_code=EXIT_NOT_FOUND,
-                        json_=json_,
-                    )
-                entries.append(entry)
+        entries = _compare_entries_on_head(cfg, refs, json_=json_)
 
     if len({entry.job_id for entry in entries}) != len(entries):
         _fail_submission(
