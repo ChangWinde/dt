@@ -6227,6 +6227,75 @@ def _max_hours_overdue(
     return overdue if overdue > 0 else None
 
 
+def _collect_ps_progress(entry: jobs_mod.JobEntry) -> JsonDict:
+    """Parse the job's log tail for progress; never raise, report the error."""
+    try:
+        proc, _path, source, tail = _read_job_log_tail(entry, 80)
+        if proc.returncode != 0 and LOG_SOURCE_MARK not in (proc.stdout or ""):
+            detail = (proc.stderr or proc.stdout or "log probe failed").strip()
+            raise RuntimeError(detail)
+        return {
+            "progress": _parse_log_progress(tail),
+            "log_source": source,
+            "progress_error": None,
+        }
+    except Exception as exc:
+        detail = " ".join(str(exc).split())
+        if len(detail) > 120:
+            detail = detail[:117] + "..."
+        return {
+            "progress": None,
+            "log_source": None,
+            "progress_error": detail or type(exc).__name__,
+        }
+
+
+def _attach_ps_live_columns(
+    rows: list[JsonDict],
+    entries: list[jobs_mod.JobEntry],
+    *,
+    progress_by_id: dict[str, JsonDict],
+    node_statuses: dict[str, NodeStatus],
+    configured_nodes: dict[str, Node],
+) -> None:
+    """Fill progress and live resource columns for running rows (--with-progress)."""
+    by_id = {row["job_id"]: row for row in rows}
+    for entry in entries:
+        if entry.status != "running":
+            continue
+        row = by_id[entry.job_id]
+        row.update(
+            progress_by_id.get(
+                entry.job_id,
+                {"progress": None, "log_source": None, "progress_error": None},
+            )
+        )
+        if entry.node not in configured_nodes:
+            row["resources"] = {"error": f"node {entry.node!r} is no longer configured"}
+            continue
+        node_status = node_statuses[entry.node]
+        if node_status.error:
+            row["resources"] = {"error": node_status.error}
+            continue
+        assigned = set(entry.gpus)
+        live_gpus = [asdict(gpu) for gpu in node_status.gpus if gpu.index in assigned]
+        missing = sorted(assigned - {gpu["index"] for gpu in live_gpus})
+        if missing:
+            row["resources"] = {
+                "error": f"assigned GPU(s) {missing} missing from node probe"
+            }
+            continue
+        row["resources"] = {
+            "gpus": live_gpus,
+            "system": (asdict(node_status.system) if node_status.system else None),
+        }
+    for row in rows:
+        row.setdefault("progress", None)
+        row.setdefault("log_source", None)
+        row.setdefault("progress_error", None)
+        row.setdefault("resources", None)
+
+
 def _gather_ps_rows(
     cfg: HeadConfig | LaptopConfig,
     status: str | None,
@@ -6297,27 +6366,6 @@ def _gather_ps_rows(
         )
         return entry.job_id, refreshed, observation
 
-    def collect_progress(entry: jobs_mod.JobEntry) -> JsonDict:
-        try:
-            proc, _path, source, tail = _read_job_log_tail(entry, 80)
-            if proc.returncode != 0 and LOG_SOURCE_MARK not in (proc.stdout or ""):
-                detail = (proc.stderr or proc.stdout or "log probe failed").strip()
-                raise RuntimeError(detail)
-            return {
-                "progress": _parse_log_progress(tail),
-                "log_source": source,
-                "progress_error": None,
-            }
-        except Exception as exc:
-            detail = " ".join(str(exc).split())
-            if len(detail) > 120:
-                detail = detail[:117] + "..."
-            return {
-                "progress": None,
-                "log_source": None,
-                "progress_error": detail or type(exc).__name__,
-            }
-
     if stale:
         node_names = (
             sorted({entry.node for entry in stale if entry.node in configured_nodes})
@@ -6338,7 +6386,10 @@ def _gather_ps_rows(
                 for node_name in node_names
             }
             progress_futures = (
-                {entry.job_id: pool.submit(collect_progress, entry) for entry in stale}
+                {
+                    entry.job_id: pool.submit(_collect_ps_progress, entry)
+                    for entry in stale
+                }
                 if include_progress
                 else {}
             )
@@ -6395,49 +6446,13 @@ def _gather_ps_rows(
         row["max_hours_overdue_s"] = overdue
         rows.append(row)
     if include_progress:
-        by_id = {row["job_id"]: row for row in rows}
-        running = [entry for entry in entries if entry.status == "running"]
-
-        for entry in running:
-            row = by_id[entry.job_id]
-            row.update(
-                progress_by_id.get(
-                    entry.job_id,
-                    {
-                        "progress": None,
-                        "log_source": None,
-                        "progress_error": None,
-                    },
-                )
-            )
-            if entry.node not in configured_nodes:
-                row["resources"] = {
-                    "error": f"node {entry.node!r} is no longer configured"
-                }
-                continue
-            node_status = node_statuses[entry.node]
-            if node_status.error:
-                row["resources"] = {"error": node_status.error}
-                continue
-            assigned = set(entry.gpus)
-            live_gpus = [
-                asdict(gpu) for gpu in node_status.gpus if gpu.index in assigned
-            ]
-            missing = sorted(assigned - {gpu["index"] for gpu in live_gpus})
-            if missing:
-                row["resources"] = {
-                    "error": f"assigned GPU(s) {missing} missing from node probe"
-                }
-                continue
-            row["resources"] = {
-                "gpus": live_gpus,
-                "system": (asdict(node_status.system) if node_status.system else None),
-            }
-        for row in rows:
-            row.setdefault("progress", None)
-            row.setdefault("log_source", None)
-            row.setdefault("progress_error", None)
-            row.setdefault("resources", None)
+        _attach_ps_live_columns(
+            rows,
+            entries,
+            progress_by_id=progress_by_id,
+            node_statuses=node_statuses,
+            configured_nodes=configured_nodes,
+        )
     if issues_only:
         # Filter before the newest-N window: otherwise the oldest failing
         # jobs silently vanish from --issues and the bounded-query envelope
