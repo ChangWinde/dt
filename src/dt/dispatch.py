@@ -1909,6 +1909,80 @@ def validate_artifact_targets(targets: Mapping[str, str]) -> dict[str, str]:
     return validated
 
 
+def _validate_cache_reuse_contract(
+    spec: RunSpec,
+    cache_values: tuple[str | None, ...],
+) -> None:
+    """Validate and normalize a complete cache-reuse contract in place."""
+    if not all(isinstance(value, str) and value for value in cache_values):
+        raise ConfigError("cache reuse contract is incomplete")
+    if (
+        not isinstance(spec.forked_from, str)
+        or re.fullmatch(r"[A-Za-z0-9_-]+", spec.forked_from) is None
+    ):
+        raise ConfigError("cache reuse requires safe fork provenance")
+    if re.fullmatch(r"[A-Za-z0-9_-]+", spec.cache_source_job or "") is None:
+        raise ConfigError("cache source job identity is unsafe")
+    source_value = spec.cache_source_job_dir or ""
+    if source_value.startswith(("~/", "/")):
+        try:
+            normalized_source_dir = normalize_node_root(source_value)
+        except ValueError as exc:
+            raise ConfigError("cache source job directory is unsafe") from exc
+    else:
+        source_dir = PurePosixPath(source_value)
+        if (
+            source_dir.is_absolute()
+            or ".." in source_dir.parts
+            or not source_dir.parts
+            or re.fullmatch(r"[A-Za-z0-9._/-]+", source_dir.as_posix()) is None
+        ):
+            raise ConfigError("cache source job directory is unsafe")
+        normalized_source_dir = source_dir.as_posix()
+    relative = PurePosixPath(spec.cache_source_path or "")
+    if (
+        relative.is_absolute()
+        or len(relative.parts) < 2
+        or relative.parts[0] != "outputs"
+        or ".." in relative.parts
+        or re.fullmatch(r"[A-Za-z0-9._/-]+", relative.as_posix()) is None
+    ):
+        raise ConfigError(
+            "reuse-cache must be a directory below the source job's outputs/"
+        )
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", spec.cache_env or "") is None:
+        raise ConfigError("cache-env must be a valid environment variable name")
+    reserved_cache_envs = {
+        "HOME",
+        "PATH",
+        "PYTHONPATH",
+        "VIRTUAL_ENV",
+        "UV_PROJECT_ENVIRONMENT",
+        "CUDA_VISIBLE_DEVICES",
+    }
+    if spec.cache_env in reserved_cache_envs or (
+        str(spec.cache_env).startswith("DT_")
+        and spec.cache_env != "DT_REUSED_CACHE_DIR"
+    ):
+        raise ConfigError(f"cache-env {spec.cache_env!r} is reserved")
+    if re.fullmatch(r"[0-9a-f]{12}", spec.cache_source_env_hash or "") is None:
+        raise ConfigError("cache source environment identity is invalid")
+    if (
+        re.fullmatch(
+            r"[0-9a-f]{64}",
+            spec.cache_source_snapshot_sha256 or "",
+        )
+        is None
+    ):
+        raise ConfigError("cache source snapshot identity is invalid")
+    if spec.cache_mode is None:
+        spec.cache_mode = "shared"
+    elif spec.cache_mode not in {"shared", "clone"}:
+        raise ConfigError("cache mode must be shared or clone")
+    spec.cache_source_job_dir = normalized_source_dir
+    spec.cache_source_path = relative.as_posix()
+
+
 def _validate_run_spec(spec: RunSpec) -> None:
     """Enforce submission invariants before probing, snapshotting, or launching."""
     if not spec.cmd or not any(part.strip() for part in spec.cmd):
@@ -2088,73 +2162,7 @@ def _validate_run_spec(spec: RunSpec) -> None:
         spec.cache_source_snapshot_sha256,
     )
     if any(value is not None for value in cache_values):
-        if not all(isinstance(value, str) and value for value in cache_values):
-            raise ConfigError("cache reuse contract is incomplete")
-        if (
-            not isinstance(spec.forked_from, str)
-            or re.fullmatch(r"[A-Za-z0-9_-]+", spec.forked_from) is None
-        ):
-            raise ConfigError("cache reuse requires safe fork provenance")
-        if re.fullmatch(r"[A-Za-z0-9_-]+", spec.cache_source_job or "") is None:
-            raise ConfigError("cache source job identity is unsafe")
-        source_value = spec.cache_source_job_dir or ""
-        if source_value.startswith(("~/", "/")):
-            try:
-                normalized_source_dir = normalize_node_root(source_value)
-            except ValueError as exc:
-                raise ConfigError("cache source job directory is unsafe") from exc
-        else:
-            source_dir = PurePosixPath(source_value)
-            if (
-                source_dir.is_absolute()
-                or ".." in source_dir.parts
-                or not source_dir.parts
-                or re.fullmatch(r"[A-Za-z0-9._/-]+", source_dir.as_posix()) is None
-            ):
-                raise ConfigError("cache source job directory is unsafe")
-            normalized_source_dir = source_dir.as_posix()
-        relative = PurePosixPath(spec.cache_source_path or "")
-        if (
-            relative.is_absolute()
-            or len(relative.parts) < 2
-            or relative.parts[0] != "outputs"
-            or ".." in relative.parts
-            or re.fullmatch(r"[A-Za-z0-9._/-]+", relative.as_posix()) is None
-        ):
-            raise ConfigError(
-                "reuse-cache must be a directory below the source job's outputs/"
-            )
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", spec.cache_env or "") is None:
-            raise ConfigError("cache-env must be a valid environment variable name")
-        reserved_cache_envs = {
-            "HOME",
-            "PATH",
-            "PYTHONPATH",
-            "VIRTUAL_ENV",
-            "UV_PROJECT_ENVIRONMENT",
-            "CUDA_VISIBLE_DEVICES",
-        }
-        if spec.cache_env in reserved_cache_envs or (
-            str(spec.cache_env).startswith("DT_")
-            and spec.cache_env != "DT_REUSED_CACHE_DIR"
-        ):
-            raise ConfigError(f"cache-env {spec.cache_env!r} is reserved")
-        if re.fullmatch(r"[0-9a-f]{12}", spec.cache_source_env_hash or "") is None:
-            raise ConfigError("cache source environment identity is invalid")
-        if (
-            re.fullmatch(
-                r"[0-9a-f]{64}",
-                spec.cache_source_snapshot_sha256 or "",
-            )
-            is None
-        ):
-            raise ConfigError("cache source snapshot identity is invalid")
-        if spec.cache_mode is None:
-            spec.cache_mode = "shared"
-        elif spec.cache_mode not in {"shared", "clone"}:
-            raise ConfigError("cache mode must be shared or clone")
-        spec.cache_source_job_dir = normalized_source_dir
-        spec.cache_source_path = relative.as_posix()
+        _validate_cache_reuse_contract(spec, cache_values)
     elif spec.cache_mode is not None:
         raise ConfigError("cache mode requires a complete cache source contract")
 
@@ -3771,6 +3779,44 @@ def _preview_environment(
     }
 
 
+def _preview_dependency_outcome(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    outcome_reason: str | None,
+) -> tuple[str | None, str | None]:
+    """Forecast what an --after-* dependency would do to this submission."""
+    if spec.after_success:
+        predecessor = load(cfg, spec.after_success)
+        if predecessor is not None and _dependency_settled(predecessor):
+            if not _job_succeeded(predecessor):
+                result = effective_result_state(predecessor) or predecessor.status
+                return "skip", (
+                    f"dependency {spec.after_success} completed as {result}; "
+                    "required success"
+                )
+            return None, outcome_reason
+        return "queue", f"waiting: dependency {spec.after_success}"
+    if spec.after_complete:
+        predecessor = load(cfg, spec.after_complete)
+        if predecessor is None or not _dependency_settled(predecessor):
+            return "queue", f"waiting: completion dependency {spec.after_complete}"
+        return None, outcome_reason
+    if spec.after_result:
+        predecessor = load(cfg, spec.after_result)
+        expected = ",".join(spec.after_result_states)
+        if predecessor is None or not _dependency_settled(predecessor):
+            return "queue", (
+                f"waiting: result dependency {spec.after_result} in [{expected}]"
+            )
+        result = effective_result_state(predecessor) or predecessor.status
+        if result not in spec.after_result_states:
+            return "skip", (
+                f"dependency {spec.after_result} completed as {result}; "
+                f"expected one of {expected}"
+            )
+    return None, outcome_reason
+
+
 def preview_submission(
     cfg: HeadConfig,
     spec: RunSpec,
@@ -3866,41 +3912,8 @@ def preview_submission(
             outcome = "reject" if no_queue else "queue"
         outcome_reason = forecast.reason
 
-    if outcome is None and spec.after_success:
-        predecessor = load(cfg, spec.after_success)
-        if predecessor is not None and _dependency_settled(predecessor):
-            if not _job_succeeded(predecessor):
-                result = effective_result_state(predecessor) or predecessor.status
-                outcome = "skip"
-                outcome_reason = (
-                    f"dependency {spec.after_success} completed as {result}; "
-                    "required success"
-                )
-        else:
-            outcome = "queue"
-            outcome_reason = f"waiting: dependency {spec.after_success}"
-    elif outcome is None and spec.after_complete:
-        predecessor = load(cfg, spec.after_complete)
-        if predecessor is None or not _dependency_settled(predecessor):
-            outcome = "queue"
-            outcome_reason = f"waiting: completion dependency {spec.after_complete}"
-    elif outcome is None and spec.after_result:
-        predecessor = load(cfg, spec.after_result)
-        if predecessor is None or not _dependency_settled(predecessor):
-            expected = ",".join(spec.after_result_states)
-            outcome = "queue"
-            outcome_reason = (
-                f"waiting: result dependency {spec.after_result} in [{expected}]"
-            )
-        else:
-            result = effective_result_state(predecessor) or predecessor.status
-            if result not in spec.after_result_states:
-                expected = ",".join(spec.after_result_states)
-                outcome = "skip"
-                outcome_reason = (
-                    f"dependency {spec.after_result} completed as {result}; "
-                    f"expected one of {expected}"
-                )
+    if outcome is None:
+        outcome, outcome_reason = _preview_dependency_outcome(cfg, spec, outcome_reason)
 
     if outcome is None:
         if spec.node:
@@ -3910,16 +3923,7 @@ def preview_submission(
                 raise ConfigError(
                     f"unknown node {spec.node!r}; configured: {list(by_name)}"
                 )
-            status = (
-                probe_node(
-                    pinned,
-                    cfg.mem_threshold_mib,
-                    lease_root=cfg.lease_root_for(pinned),
-                )
-                if cfg.layout == ROLE_LAYOUT
-                else probe_node(pinned, cfg.mem_threshold_mib)
-            )
-            statuses = [status]
+            statuses = [_probe_pinned_node(cfg, pinned)]
         else:
             statuses = probe_center(cfg, use_cache=False)
         reasons = {
