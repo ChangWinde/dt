@@ -11000,6 +11000,99 @@ def _info_actions(entry: jobs_mod.JobEntry) -> list[JsonDict]:
     return []
 
 
+def _info_resource_guard_text(resource_guard: Mapping[str, object]) -> str:
+    """Human text for one resource-guard trip recorded on the job."""
+    phase = resource_guard.get("phase")
+    phase_text = f" during {phase}" if _safe_phase_name(phase) else ""
+    if resource_guard.get("kind") == "max_vram_mib_observation_failure":
+        return (
+            "VRAM telemetry unavailable for "
+            f"{resource_guard.get('consecutive_failures')} samples: "
+            f"{escape(str(resource_guard.get('reason') or 'unknown'))}"
+            f"{phase_text}"
+        )
+    if resource_guard.get("kind") == "max_job_memory_mib":
+        return (
+            f"job {resource_guard.get('observed_metric')} used "
+            f"{resource_guard.get('observed_mib')} MiB > "
+            f"{resource_guard.get('limit_mib')} MiB{phase_text}"
+        )
+    return (
+        f"GPU {resource_guard.get('gpu_index')} used "
+        f"{resource_guard.get('observed_mib')} MiB > "
+        f"{resource_guard.get('limit_mib')} MiB{phase_text}"
+    )
+
+
+_INFO_COMPACT_LABELS = frozenset(
+    {
+        "name",
+        "ref",
+        "status",
+        "queue",
+        "queue head",
+        "previous",
+        "placement failures",
+        "where",
+        "gpus",
+        "cmd",
+        "project",
+        "submitted (head)",
+        "duration",
+        "exit code",
+        "outputs",
+        "code copy",
+        "forked from",
+        "after success",
+        "rerun of",
+        "rerun code",
+        "retry",
+        "retried by",
+        "failure log",
+        "guard trip",
+        "phase timeline",
+        "live gpu",
+        "live host",
+        "next",
+    }
+)
+
+
+def _print_info_table(
+    rows: list[tuple[str, Any]],
+    *,
+    verbose: bool,
+) -> None:
+    """Filter and print the human ``dt info`` two-column table."""
+    from rich.table import Table as RTable
+
+    rendered_rows = (
+        rows
+        if verbose
+        else [
+            row
+            for row in rows
+            if (
+                row[0] in _INFO_COMPACT_LABELS
+                or row[0].startswith(("started (", "finished ("))
+            )
+            and not (
+                row[1] == "-"
+                and (
+                    row[0] in {"exit code", "outputs", "code copy"}
+                    or row[0].startswith("finished (")
+                )
+            )
+        ]
+    )
+    table = RTable(show_header=False, box=None, pad_edge=False)
+    table.add_column(style="bold dim", justify="right")
+    table.add_column(overflow="fold", ratio=1)
+    for key, value in rendered_rows:
+        table.add_row(key, value)
+    out.print(table)
+
+
 def _render_info_table(
     entry: jobs_mod.JobEntry,
     data: JsonDict,
@@ -11021,12 +11114,8 @@ def _render_info_table(
     resource_summary = data["resource_summary"]
     phase_summary = data["phase_summary"]
     failure_log = data.get("failure_log")
-    from rich.table import Table as RTable
     from rich.markup import escape
 
-    t = RTable(show_header=False, box=None, pad_edge=False)
-    t.add_column(style="bold dim", justify="right")
-    t.add_column(overflow="fold", ratio=1)
     style = {
         "running": "bold green",
         "finished": "cyan",
@@ -11310,28 +11399,7 @@ def _render_info_table(
         rows.append(("max job memory", f"{entry.max_job_memory_mib:,} MiB"))
     resource_guard = data.get("resource_guard")
     if isinstance(resource_guard, dict):
-        phase = resource_guard.get("phase")
-        phase_text = f" during {phase}" if _safe_phase_name(phase) else ""
-        if resource_guard.get("kind") == "max_vram_mib_observation_failure":
-            guard_text = (
-                "VRAM telemetry unavailable for "
-                f"{resource_guard.get('consecutive_failures')} samples: "
-                f"{escape(str(resource_guard.get('reason') or 'unknown'))}"
-                f"{phase_text}"
-            )
-        elif resource_guard.get("kind") == "max_job_memory_mib":
-            guard_text = (
-                f"job {resource_guard.get('observed_metric')} used "
-                f"{resource_guard.get('observed_mib')} MiB > "
-                f"{resource_guard.get('limit_mib')} MiB{phase_text}"
-            )
-        else:
-            guard_text = (
-                f"GPU {resource_guard.get('gpu_index')} used "
-                f"{resource_guard.get('observed_mib')} MiB > "
-                f"{resource_guard.get('limit_mib')} MiB{phase_text}"
-            )
-        rows.append(("guard trip", guard_text))
+        rows.append(("guard trip", _info_resource_guard_text(resource_guard)))
     if entry.require_path:
         rows.append(("require", escape(entry.require_path)))
     if entry.require_disk_gib is not None:
@@ -11350,58 +11418,7 @@ def _render_info_table(
         else f"dt logs {display_ref} · dt pull {display_ref} --lite"
     )
     rows.append(("next", next_action))
-    compact_labels = {
-        "name",
-        "ref",
-        "status",
-        "queue",
-        "queue head",
-        "previous",
-        "placement failures",
-        "where",
-        "gpus",
-        "cmd",
-        "project",
-        "submitted (head)",
-        "duration",
-        "exit code",
-        "outputs",
-        "code copy",
-        "forked from",
-        "after success",
-        "rerun of",
-        "rerun code",
-        "retry",
-        "retried by",
-        "failure log",
-        "guard trip",
-        "phase timeline",
-        "live gpu",
-        "live host",
-        "next",
-    }
-    rendered_rows = (
-        rows
-        if verbose
-        else [
-            row
-            for row in rows
-            if (
-                row[0] in compact_labels
-                or row[0].startswith(("started (", "finished ("))
-            )
-            and not (
-                row[1] == "-"
-                and (
-                    row[0] in {"exit code", "outputs", "code copy"}
-                    or row[0].startswith("finished (")
-                )
-            )
-        ]
-    )
-    for k, v in rendered_rows:
-        t.add_row(k, v)
-    out.print(t)
+    _print_info_table(rows, verbose=verbose)
 
 
 def info(
