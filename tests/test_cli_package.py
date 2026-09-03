@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 import pytest
+import typer
 
 from dt import cli
 from dt.cli import commands
@@ -71,19 +72,30 @@ def test_command_module_reaches_patchable_infrastructure_through_root(module_nam
 @pytest.mark.parametrize("module_name", _command_modules())
 def test_command_module_commands_are_registered_on_the_root_app(module_name):
     module = importlib.import_module(module_name)
-    callbacks = {id(command.callback) for command in cli.app.registered_commands}
-    for group in cli.app.registered_groups:
-        callbacks |= {
-            id(command.callback) for command in group.typer_instance.registered_commands
-        }
-    registered = [
-        name
-        for name, value in vars(module).items()
-        if callable(value) and id(value) in callbacks and not name.startswith("_")
-    ]
-    assert registered, f"{module_name} registers no command on cli.app"
-    for name in registered:
-        assert getattr(cli, name) is getattr(module, name)
+    top_level = {id(command.callback) for command in cli.app.registered_commands}
+    mounted_groups = {id(group.typer_instance) for group in cli.app.registered_groups}
+    grouped = {
+        id(command.callback)
+        for group in cli.app.registered_groups
+        for command in group.typer_instance.registered_commands
+    }
+    registered = 0
+    for name, value in vars(module).items():
+        if name.startswith("_") or not callable(value):
+            continue
+        if id(value) in top_level:
+            # the root re-exports every top-level command it registers
+            assert getattr(cli, name) is value
+            registered += 1
+        elif id(value) in grouped:
+            registered += 1
+    if registered == 0:
+        # a sub-command group: the module owns the Typer instance the root mounts
+        apps = [
+            value for value in vars(module).values() if isinstance(value, typer.Typer)
+        ]
+        assert apps and all(id(app) in mounted_groups for app in apps), module_name
+        assert any(app.registered_commands for app in apps)
 
 
 @pytest.mark.parametrize("module_name", _command_modules())

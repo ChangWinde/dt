@@ -630,7 +630,7 @@ def test_disk_headroom_warning_covers_percentage_and_absolute_floor():
 def test_agent_status_card_stays_readable_at_80_columns():
     from rich.console import Console
 
-    from dt.cli import _agent_status_table
+    from dt.cli.commands.agent import _agent_status_table
 
     status = {
         "alive": True,
@@ -678,7 +678,7 @@ def test_agent_status_card_stays_readable_at_80_columns():
 def test_stopped_agent_status_shows_the_recovery_command():
     from rich.console import Console
 
-    from dt.cli import _agent_status_table
+    from dt.cli.commands.agent import _agent_status_table
 
     status = {
         "alive": False,
@@ -710,7 +710,7 @@ def test_stopped_agent_status_shows_the_recovery_command():
 def test_verbose_agent_status_keeps_complete_queue_id_at_60_columns():
     from rich.console import Console
 
-    from dt.cli import _agent_status_table
+    from dt.cli.commands.agent import _agent_status_table
 
     job_id = "20260731-1311_uo114-libero_object_dp-v1_2d0f4c7f75c473c4"
     status = {
