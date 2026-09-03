@@ -130,6 +130,7 @@ from .snapshot_store import (
 )
 from . import submission_intent as intent_mod
 from . import sync_relay
+from .pull_relay import RelayRoute
 from .sshio import (
     BULK_TRANSFER_TIMEOUT_S,
     RSYNC_UNREACHABLE_EXIT_CODES,
@@ -1119,6 +1120,211 @@ def _sync_project_locked(
     return result
 
 
+@dataclass
+class _ArtifactItemOutcome:
+    """One artifact transfer's report row and its effect on running totals."""
+
+    row: dict[str, object]
+    transferred_bytes: int | None
+    deleted_files: int
+    transferred_files: int | None
+    relaying: bool
+    relay_error: str | None
+    relayed: bool
+
+
+def _sync_one_artifact(
+    cfg: HeadConfig,
+    node: Node,
+    *,
+    project_name: str,
+    root_rel: str,
+    index: int,
+    total: int,
+    relative: str,
+    source: Path,
+    is_dir: bool,
+    source_bytes: int,
+    mode: int,
+    source_sha256: str,
+    plan: bool,
+    retries: int,
+    effective_bwlimit: int | None,
+    on_retry: Callable[[RsyncRetryEvent], None] | None,
+    cancel_event: Event | None,
+    relay_route: RelayRoute | None,
+    relaying: bool,
+    relay_error: str | None,
+    log: Callable[[str], None],
+) -> _ArtifactItemOutcome:
+    """Prepare, transfer, and report one explicit artifact."""
+    relayed = False
+    log(
+        f"artifact {index}/{total} "
+        f"{'planning' if plan else 'syncing'} {relative} "
+        f"({source_bytes} bytes)"
+    )
+    artifact_started = time.perf_counter()
+    target_rel = f"{root_rel}/{relative}"
+    parent_rel = str(Path(target_rel).parent)
+    check = _artifact_remote_check(
+        root_rel,
+        relative,
+        is_dir=is_dir,
+        prepare=not plan,
+    )
+    checked = run_on(node.name, node.local, check, timeout=15)
+    parent_present: bool | None = None
+    if plan and checked.returncode in (0, 1):
+        parent_present = checked.returncode == 0
+    elif checked.returncode != 0:
+        detail = (
+            checked.stderr.strip()
+            or checked.stdout.strip()
+            or f"remote preparation exited {checked.returncode}"
+        )
+        if checked.returncode == 255:
+            raise RemoteError(
+                node.name,
+                f"artifact sync preparation failed: {detail}",
+                checked.returncode,
+            )
+        raise DispatchError(
+            f"artifact sync to {node.name} failed preparing {relative!r}: {detail}"
+        )
+
+    if plan and not parent_present:
+        preview_rel = (
+            f".dt-artifact-plan-{sanitize_name(project_name)}-{uuid.uuid4().hex}"
+        )
+        destination = rsync_destination(
+            node.name,
+            node.local,
+            preview_rel,
+            directory=True,
+        )
+    else:
+        destination_rel = target_rel if is_dir else parent_rel
+        destination = rsync_destination(
+            node.name,
+            node.local,
+            destination_rel,
+            directory=True,
+        )
+    source_arg = f"{source}/" if is_dir else str(source)
+    proc = None
+    if relaying and relay_route is not None and relay_route.gateway is not None:
+        # Leg A stages into the mirror's copy of this artifact's
+        # own path, so leg B replays with the same file/directory
+        # semantics the direct push would use.
+        staged_rel = sync_relay.artifact_mirror_relative(project_name)
+        staged_parent = f"{staged_rel}/{relative}"
+        if not is_dir:
+            staged_parent = str(PurePosixPath(staged_parent).parent)
+        try:
+            leg_a = rsync(
+                source_arg,
+                rsync_destination(
+                    relay_route.gateway.name,
+                    relay_route.gateway.local,
+                    staged_parent,
+                    directory=True,
+                ),
+                delete=is_dir,
+                timeout=BULK_TRANSFER_TIMEOUT_S,
+                retries=retries,
+                bwlimit_kbps=effective_bwlimit,
+                on_retry=on_retry,
+                stats=True,
+                checksum=True,
+                cancel_event=cancel_event,
+            )
+            if leg_a.returncode != 0:
+                raise sync_relay.RelayError(
+                    "head -> gateway staging failed: "
+                    + diagnostic_excerpt(
+                        leg_a.stderr,
+                        None,
+                        fallback=f"rsync exited {leg_a.returncode}",
+                    )
+                )
+            proc = sync_relay.push_artifact(
+                cfg,
+                relay_route,
+                project_name,
+                relative,
+                target_rel if is_dir else parent_rel,
+                is_dir=is_dir,
+                cancel_event=cancel_event,
+            )
+            relayed = True
+        except sync_relay.RelayError as exc:
+            relay_error = str(exc)
+            relaying = False
+            proc = None
+            log(
+                f"gateway relay failed for {relative!r}: {relay_error}; "
+                "falling back to the direct route"
+            )
+    if proc is None:
+        proc = rsync(
+            source_arg,
+            destination,
+            delete=is_dir,
+            timeout=BULK_TRANSFER_TIMEOUT_S,
+            retries=retries,
+            bwlimit_kbps=effective_bwlimit,
+            on_retry=on_retry,
+            stats=True,
+            checksum=True,
+            dry_run=plan,
+            cancel_event=cancel_event,
+        )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
+        if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
+            raise RemoteError(
+                node.name,
+                f"artifact sync failed for {relative!r}: {detail}",
+                proc.returncode,
+            )
+        raise DispatchError(
+            f"artifact sync to {node.name} failed for {relative!r}: {detail}"
+        )
+
+    moved = transferred_bytes(proc.stdout)
+    deleted = 0 if plan and parent_present is False else deleted_files(proc.stdout)
+    files = transferred_files(proc.stdout)
+    row: dict[str, object] = {
+        "source": relative,
+        "path": display_node_path(target_rel),
+        "kind": "directory" if is_dir else "file",
+        "mode": mode,
+        "source_bytes": source_bytes,
+        "source_sha256": source_sha256,
+        "transferred_bytes": moved,
+        "deleted_files": deleted or 0,
+    }
+    if files is not None:
+        row["transferred_files"] = files
+    if plan:
+        row["destination_parent_present"] = parent_present
+    log(
+        f"artifact {index}/{total} "
+        f"{'planned' if plan else 'synced'} {relative} in "
+        f"{max(0.0, time.perf_counter() - artifact_started):.3f}s"
+    )
+    return _ArtifactItemOutcome(
+        row=row,
+        transferred_bytes=moved,
+        deleted_files=deleted or 0,
+        transferred_files=files,
+        relaying=relaying,
+        relay_error=relay_error,
+        relayed=relayed,
+    )
+
+
 def sync_artifacts(
     cfg: HeadConfig,
     project_name: str,
@@ -1233,175 +1439,43 @@ def sync_artifacts(
             mode,
             source_sha256,
         ) in enumerate(sources, start=1):
-            log(
-                f"artifact {index}/{len(sources)} "
-                f"{'planning' if plan else 'syncing'} {relative} "
-                f"({source_bytes} bytes)"
-            )
-            artifact_started = time.perf_counter()
-            target_rel = f"{root_rel}/{relative}"
-            parent_rel = str(Path(target_rel).parent)
-            check = _artifact_remote_check(
-                root_rel,
-                relative,
+            outcome = _sync_one_artifact(
+                cfg,
+                node,
+                project_name=project_name,
+                root_rel=root_rel,
+                index=index,
+                total=len(sources),
+                relative=relative,
+                source=source,
                 is_dir=is_dir,
-                prepare=not plan,
+                source_bytes=source_bytes,
+                mode=mode,
+                source_sha256=source_sha256,
+                plan=plan,
+                retries=retries,
+                effective_bwlimit=effective_bwlimit,
+                on_retry=on_retry,
+                cancel_event=cancel_event,
+                relay_route=relay_route,
+                relaying=relaying,
+                relay_error=relay_error,
+                log=log,
             )
-            checked = run_on(node.name, node.local, check, timeout=15)
-            parent_present: bool | None = None
-            if plan and checked.returncode in (0, 1):
-                parent_present = checked.returncode == 0
-            elif checked.returncode != 0:
-                detail = (
-                    checked.stderr.strip()
-                    or checked.stdout.strip()
-                    or f"remote preparation exited {checked.returncode}"
-                )
-                if checked.returncode == 255:
-                    raise RemoteError(
-                        node.name,
-                        f"artifact sync preparation failed: {detail}",
-                        checked.returncode,
-                    )
-                raise DispatchError(
-                    f"artifact sync to {node.name} failed preparing "
-                    f"{relative!r}: {detail}"
-                )
-
-            if plan and not parent_present:
-                preview_rel = (
-                    f".dt-artifact-plan-{sanitize_name(project_name)}-"
-                    f"{uuid.uuid4().hex}"
-                )
-                destination = rsync_destination(
-                    node.name,
-                    node.local,
-                    preview_rel,
-                    directory=True,
-                )
-            else:
-                destination_rel = target_rel if is_dir else parent_rel
-                destination = rsync_destination(
-                    node.name,
-                    node.local,
-                    destination_rel,
-                    directory=True,
-                )
-            source_arg = f"{source}/" if is_dir else str(source)
-            proc = None
-            if relaying and relay_route is not None and relay_route.gateway is not None:
-                # Leg A stages into the mirror's copy of this artifact's
-                # own path, so leg B replays with the same file/directory
-                # semantics the direct push would use.
-                staged_rel = sync_relay.artifact_mirror_relative(project_name)
-                staged_parent = f"{staged_rel}/{relative}"
-                if not is_dir:
-                    staged_parent = str(PurePosixPath(staged_parent).parent)
-                try:
-                    leg_a = rsync(
-                        source_arg,
-                        rsync_destination(
-                            relay_route.gateway.name,
-                            relay_route.gateway.local,
-                            staged_parent,
-                            directory=True,
-                        ),
-                        delete=is_dir,
-                        timeout=BULK_TRANSFER_TIMEOUT_S,
-                        retries=retries,
-                        bwlimit_kbps=effective_bwlimit,
-                        on_retry=on_retry,
-                        stats=True,
-                        checksum=True,
-                        cancel_event=cancel_event,
-                    )
-                    if leg_a.returncode != 0:
-                        raise sync_relay.RelayError(
-                            "head -> gateway staging failed: "
-                            + diagnostic_excerpt(
-                                leg_a.stderr,
-                                None,
-                                fallback=f"rsync exited {leg_a.returncode}",
-                            )
-                        )
-                    proc = sync_relay.push_artifact(
-                        cfg,
-                        relay_route,
-                        project_name,
-                        relative,
-                        target_rel if is_dir else parent_rel,
-                        is_dir=is_dir,
-                        cancel_event=cancel_event,
-                    )
-                    relayed_any = True
-                except sync_relay.RelayError as exc:
-                    relay_error = str(exc)
-                    relaying = False
-                    proc = None
-                    log(
-                        f"gateway relay failed for {relative!r}: {relay_error}; "
-                        "falling back to the direct route"
-                    )
-            if proc is None:
-                proc = rsync(
-                    source_arg,
-                    destination,
-                    delete=is_dir,
-                    timeout=BULK_TRANSFER_TIMEOUT_S,
-                    retries=retries,
-                    bwlimit_kbps=effective_bwlimit,
-                    on_retry=on_retry,
-                    stats=True,
-                    checksum=True,
-                    dry_run=plan,
-                    cancel_event=cancel_event,
-                )
-            if proc.returncode != 0:
-                detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
-                if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
-                    raise RemoteError(
-                        node.name,
-                        f"artifact sync failed for {relative!r}: {detail}",
-                        proc.returncode,
-                    )
-                raise DispatchError(
-                    f"artifact sync to {node.name} failed for {relative!r}: {detail}"
-                )
-
-            moved = transferred_bytes(proc.stdout)
-            deleted = (
-                0 if plan and parent_present is False else deleted_files(proc.stdout)
-            )
-            files = transferred_files(proc.stdout)
-            total_deleted += deleted or 0
-            if moved is None:
+            rows.append(outcome.row)
+            total_deleted += outcome.deleted_files
+            if outcome.transferred_bytes is None:
                 total_bytes_known = False
             else:
-                total_bytes += moved
-            if files is None:
+                total_bytes += outcome.transferred_bytes
+            if outcome.transferred_files is None:
                 total_files_known = False
             else:
-                total_files += files
-            row: dict[str, object] = {
-                "source": relative,
-                "path": display_node_path(target_rel),
-                "kind": "directory" if is_dir else "file",
-                "mode": mode,
-                "source_bytes": source_bytes,
-                "source_sha256": source_sha256,
-                "transferred_bytes": moved,
-                "deleted_files": deleted or 0,
-            }
-            if files is not None:
-                row["transferred_files"] = files
-            if plan:
-                row["destination_parent_present"] = parent_present
-            rows.append(row)
-            log(
-                f"artifact {index}/{len(sources)} "
-                f"{'planned' if plan else 'synced'} {relative} in "
-                f"{max(0.0, time.perf_counter() - artifact_started):.3f}s"
-            )
+                total_files += outcome.transferred_files
+            relaying = outcome.relaying
+            relay_error = outcome.relay_error
+            if outcome.relayed:
+                relayed_any = True
 
         try:
             stable_sources = _artifact_sources(project_dir, artifacts)
