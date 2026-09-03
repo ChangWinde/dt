@@ -14466,6 +14466,179 @@ def _recover_runtime_evidence(
     return evidence_provenance
 
 
+def _pull_argv(
+    refs: list[str],
+    *,
+    to: str | None,
+    collection: str | None,
+    lite: bool,
+    excludes: list[str],
+    force: bool,
+    retries: int,
+    route: str,
+    bwlimit: int | None,
+    json_: bool,
+) -> list[str]:
+    """The `dt pull` argv that reproduces this invocation (forward or resume)."""
+    argv = ["pull", *refs]
+    if to:
+        argv += ["--to", to]
+    if collection:
+        argv += ["--collection", collection]
+    if lite:
+        argv.append("--lite")
+    for pattern in excludes:
+        argv += ["--exclude", pattern]
+    if force:
+        argv.append("--force")
+    if retries != 2:
+        argv += ["--retries", str(retries)]
+    if route != "auto":
+        argv += ["--route", route]
+    if bwlimit is not None:
+        argv += ["--bwlimit", str(bwlimit)]
+    if json_:
+        argv.append("--json")
+    return argv
+
+
+def _forward_pull_to_head(
+    cfg: LaptopConfig,
+    ref: str,
+    *,
+    to: str | None,
+    collection: str | None,
+    lite: bool,
+    excludes: list[str],
+    force: bool,
+    retries: int,
+    route: str,
+    bwlimit: int | None,
+    json_: bool,
+) -> NoReturn:
+    """Laptop `dt pull`: replay the invocation on the head that owns ``ref``."""
+    _, head = _locate(cfg, ref, json_=json_)
+    argv = _pull_argv(
+        [ref],
+        to=to,
+        collection=collection,
+        lite=lite,
+        # The head expands --lite itself; forwarding those patterns would
+        # only duplicate argv.
+        excludes=[p for p in excludes if not (lite and p in LITE_PULL_EXCLUDES)],
+        force=force,
+        retries=retries,
+        route=route,
+        bwlimit=bwlimit,
+        json_=json_,
+    )
+    if not json_:
+        err.print("[dim]results land on the head node (projects live there)[/dim]")
+    rc = _forward_retryable_with_reconnect(head, argv, ref, operation="pull")
+    if rc is None:
+        _pull_interrupted(
+            message=(
+                "pull stopped locally; head-side and partial result data "
+                "were not deleted"
+            ),
+            resume=["dt", *argv],
+            json_=json_,
+        )
+    raise typer.Exit(rc)
+
+
+def _pullable_entry(cfg: HeadConfig, ref: str) -> jobs_mod.JobEntry:
+    """Resolve ``ref`` to a job whose outputs can exist; else raise the phase error."""
+    entry = jobs_mod.find(cfg, ref)
+    if entry is None:
+        raise _PullPhaseError("not_found", f"no job matching {ref!r}", EXIT_NOT_FOUND)
+    if entry.status == "queued":
+        raise _PullPhaseError(
+            "not_ready",
+            f"{entry.job_id} is still queued; no outputs yet",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+        )
+    if (
+        entry.status == "failed"
+        and not _is_uncertain_launch(entry)
+        and entry.node == "-"
+    ):
+        raise _PullPhaseError(
+            "failed_before_start",
+            f"{entry.job_id} failed before starting: {entry.reason}",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+        )
+    if entry.node == "-":
+        raise _PullPhaseError(
+            "not_started",
+            f"{entry.job_id} never started (status {entry.status}); no outputs exist",
+            1,
+            job_id=entry.job_id,
+            node=entry.node,
+        )
+    return entry
+
+
+def _pull_success_payload(
+    entry: jobs_mod.JobEntry,
+    *,
+    dst: Path,
+    outputs_present: bool,
+    lite: bool,
+    excludes: list[str],
+    pull_route: pull_relay.RelayRoute,
+    relay_error: str | None,
+    remote_outputs_bytes: int | None,
+    evidence_provenance: str | None,
+    retry_events: list[JsonDict],
+    records: list[str],
+) -> JsonDict:
+    """The dt_pull_v1 success envelope."""
+    return {
+        "schema_version": "dt_pull_v1",
+        "job_id": entry.job_id,
+        # `outcome` is the canonical operation-result key (matching kill);
+        # `status` stays one release for compatibility, then only `outcome`
+        # and the lifecycle-`job_status` remain.
+        "outcome": "pulled",
+        "status": "pulled",
+        "job_status": entry.status,
+        "node": entry.node,
+        "destination": str(dst),
+        # Explicit landing contract: pull merges the remote outputs/ contents
+        # directly into the job-level root, so automation must not append
+        # another outputs/ segment. `outputs_root` is therefore the same
+        # directory as `destination_root` when application outputs were
+        # recovered, and null for records-only recoveries.
+        "destination_root": str(dst),
+        "outputs_root": str(dst) if outputs_present else None,
+        "files": _pull_top_level_entries(dst),
+        "lite": lite,
+        "excludes": excludes,
+        "route": pull_route.route,
+        "route_gateway": (
+            pull_route.gateway.name if pull_route.gateway is not None else None
+        ),
+        "route_reason": pull_route.reason,
+        **({"relay_error": relay_error} if relay_error is not None else {}),
+        **(
+            {"remote_outputs_bytes": remote_outputs_bytes}
+            if remote_outputs_bytes is not None
+            else {}
+        ),
+        "application_outputs_recovered": outputs_present,
+        "records_scope": "dt_control_allowlist",
+        "evidence_provenance": evidence_provenance,
+        **({"outputs_present": False} if not outputs_present else {}),
+        **({"retry_events": retry_events} if retry_events else {}),
+        "records": records,
+    }
+
+
 def _pull_unlocked(
     ref: str = REF_ARG,
     to: Optional[str] = typer.Option(
@@ -14544,44 +14717,19 @@ def _pull_unlocked(
     if lite:
         excludes = list(dict.fromkeys([*LITE_PULL_EXCLUDES, *excludes]))
     if isinstance(cfg, LaptopConfig):
-        _, head = _locate(cfg, ref, json_=json_)
-        argv = ["pull", ref] + (["--to", to] if to else [])
-        if _collection:
-            argv += ["--collection", _collection]
-        if lite:
-            argv.append("--lite")
-        for pattern in excludes:
-            if lite and pattern in LITE_PULL_EXCLUDES:
-                continue  # the head expands --lite; avoid duplicate argv
-            argv += ["--exclude", pattern]
-        if force:
-            argv.append("--force")
-        if retries != 2:
-            argv += ["--retries", str(retries)]
-        if route != "auto":
-            argv += ["--route", route]
-        if bwlimit is not None:
-            argv += ["--bwlimit", str(bwlimit)]
-        if json_:
-            argv.append("--json")
-        else:
-            err.print("[dim]results land on the head node (projects live there)[/dim]")
-        rc = _forward_retryable_with_reconnect(
-            head,
-            argv,
+        _forward_pull_to_head(
+            cfg,
             ref,
-            operation="pull",
+            to=to,
+            collection=_collection,
+            lite=lite,
+            excludes=excludes,
+            force=force,
+            retries=retries,
+            route=route,
+            bwlimit=bwlimit,
+            json_=json_,
         )
-        if rc is None:
-            _pull_interrupted(
-                message=(
-                    "pull stopped locally; head-side and partial result data "
-                    "were not deleted"
-                ),
-                resume=["dt", *argv],
-                json_=json_,
-            )
-        raise typer.Exit(rc)
     output_excludes = list(dict.fromkeys([*PULL_RESERVED_EXCLUDES, *excludes]))
     entry: jobs_mod.JobEntry | None = None
     remote_outputs_bytes: int | None = None
@@ -14616,41 +14764,10 @@ def _pull_unlocked(
         raise typer.Exit(exit_code)
 
     if json_:
-        entry = jobs_mod.find(cfg, ref)
-        if entry is None:
-            fail(
-                "not_found",
-                f"no job matching {ref!r}",
-                EXIT_NOT_FOUND,
-            )
-        if entry.status == "queued":
-            fail(
-                "not_ready",
-                f"{entry.job_id} is still queued; no outputs yet",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
-        if (
-            entry.status == "failed"
-            and not _is_uncertain_launch(entry)
-            and entry.node == "-"
-        ):
-            fail(
-                "failed_before_start",
-                f"{entry.job_id} failed before starting: {entry.reason}",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
-        if entry.node == "-":
-            fail(
-                "not_started",
-                f"{entry.job_id} never started (status {entry.status}); no outputs exist",
-                1,
-                job_id=entry.job_id,
-                node=entry.node,
-            )
+        try:
+            entry = _pullable_entry(cfg, ref)
+        except _PullPhaseError as phase:
+            fail(phase.kind, phase.message, phase.exit_code, **phase.fields)
     else:
         entry = _find_or_die(cfg, ref)
         if not (
@@ -14847,45 +14964,19 @@ def _pull_unlocked(
         )
 
     records = confirmed_records(logs_recovered=True)
-    payload = {
-        "schema_version": "dt_pull_v1",
-        "job_id": entry.job_id,
-        # `outcome` is the canonical operation-result key (matching kill);
-        # `status` stays one release for compatibility, then only `outcome`
-        # and the lifecycle-`job_status` remain.
-        "outcome": "pulled",
-        "status": "pulled",
-        "job_status": entry.status,
-        "node": entry.node,
-        "destination": str(dst),
-        # Explicit landing contract: pull merges the remote outputs/ contents
-        # directly into the job-level root, so automation must not append
-        # another outputs/ segment. `outputs_root` is therefore the same
-        # directory as `destination_root` when application outputs were
-        # recovered, and null for records-only recoveries.
-        "destination_root": str(dst),
-        "outputs_root": str(dst) if outputs_present else None,
-        "files": _pull_top_level_entries(dst),
-        "lite": lite,
-        "excludes": excludes,
-        "route": pull_route.route,
-        "route_gateway": (
-            pull_route.gateway.name if pull_route.gateway is not None else None
-        ),
-        "route_reason": pull_route.reason,
-        **({"relay_error": relay_error} if relay_error is not None else {}),
-        **(
-            {"remote_outputs_bytes": remote_outputs_bytes}
-            if remote_outputs_bytes is not None
-            else {}
-        ),
-        "application_outputs_recovered": outputs_present,
-        "records_scope": "dt_control_allowlist",
-        "evidence_provenance": evidence_provenance,
-        **({"outputs_present": False} if not outputs_present else {}),
-        **({"retry_events": retry_events} if retry_events else {}),
-        "records": records,
-    }
+    payload = _pull_success_payload(
+        entry,
+        dst=dst,
+        outputs_present=outputs_present,
+        lite=lite,
+        excludes=excludes,
+        pull_route=pull_route,
+        relay_error=relay_error,
+        remote_outputs_bytes=remote_outputs_bytes,
+        evidence_provenance=evidence_provenance,
+        retry_events=retry_events,
+        records=records,
+    )
     if _result is not None:
         _result.update(payload)
         _result["exit_code"] = 0
@@ -15037,6 +15128,133 @@ def _pull_group_one(
     return result
 
 
+def _pull_group(
+    cfg: HeadConfig,
+    refs: list[str],
+    entries: list[jobs_mod.JobEntry | None],
+    *,
+    to: str | None,
+    collection: str | None,
+    exclude: list[str] | None,
+    lite: bool,
+    force: bool,
+    retries: int,
+    route: str,
+    bwlimit: int | None,
+    json_: bool,
+    resume_argv: Callable[[list[str]], list[str]],
+) -> NoReturn:
+    """Recover several jobs under one root, up to four at a time."""
+    try:
+        root = (
+            Path(to).expanduser()
+            if to
+            else (
+                _ensure_collection_root(cfg, collection)
+                if collection
+                else (
+                    cfg.results_dir() / "jobs"
+                    if cfg.layout == ROLE_LAYOUT
+                    else cfg.results_dir()
+                )
+            )
+        ).absolute()
+    except ValueError as exc:
+        _fail_submission(
+            kind="destination_unusable",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+    if root.exists() and not root.is_dir():
+        _fail_submission(
+            kind="destination_conflict",
+            message=f"{root} exists and is not a directory",
+            exit_code=1,
+            json_=json_,
+        )
+    cancel_event = Event()
+    ordered_results: list[JsonDict | None] = [None] * len(entries)
+    work_items: list[tuple[int, str, jobs_mod.JobEntry, Path]] = []
+    for index, (ref, entry) in enumerate(zip(refs, entries, strict=True)):
+        if entry is None:
+            ordered_results[index] = {
+                "ref": ref,
+                "job_id": None,
+                "name": None,
+                "node": None,
+                "status": "error",
+                "error": "not_found",
+                "message": f"no job matching {ref!r}",
+                "exit_code": EXIT_NOT_FOUND,
+            }
+            continue
+        work_items.append((index, ref, entry, root / entry.job_id))
+
+    pool = (
+        ThreadPoolExecutor(max_workers=min(4, len(work_items))) if work_items else None
+    )
+    futures = (
+        {
+            pool.submit(
+                _pull_group_one,
+                cfg,
+                ref,
+                entry,
+                destination,
+                exclude,
+                lite,
+                force,
+                retries,
+                route,
+                bwlimit,
+                cancel_event,
+            ): index
+            for index, ref, entry, destination in work_items
+        }
+        if pool is not None
+        else {}
+    )
+    try:
+        if json_:
+            for future in as_completed(futures):
+                ordered_results[futures[future]] = future.result()
+        elif futures:
+            count = (
+                f"{len(work_items)} jobs"
+                if len(work_items) == len(entries)
+                else f"{len(work_items)}/{len(entries)} resolved jobs"
+            )
+            with err.status(f"recovering {count} into {root} (up to 4 in parallel)..."):
+                for future in as_completed(futures):
+                    ordered_results[futures[future]] = future.result()
+    except KeyboardInterrupt:
+        cancel_event.set()
+        for future in futures:
+            future.cancel()
+        _pull_interrupted(
+            message=(
+                "pull stopped locally; completed and partial job directories were kept"
+            ),
+            resume=["dt", *resume_argv(refs)],
+            json_=json_,
+        )
+    finally:
+        cancel_event.set()
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    results = [result for result in ordered_results if result is not None]
+    group_payload = _pull_group_payload(root, results)
+    if json_:
+        print(json.dumps(group_payload))
+    else:
+        _render_pull_group(group_payload)
+    summary = group_payload["summary"]
+    assert isinstance(summary, dict)
+    raise typer.Exit(int(summary["aggregate_exit_code"]))
+
+
 def pull(
     refs: Optional[list[str]] = REFS_OPTIONAL_ARG,
     to: Optional[str] = typer.Option(
@@ -15149,21 +15367,39 @@ def pull(
             json_=json_,
         )
     cfg = _cfg()
+
+    def resume_argv(selected_refs: list[str]) -> list[str]:
+        return _pull_argv(
+            selected_refs,
+            to=to,
+            collection=collection,
+            lite=lite,
+            excludes=exclude or [],
+            force=force,
+            retries=retries,
+            route=route,
+            bwlimit=bwlimit,
+            json_=json_,
+        )
+
+    def pull_single(ref: str) -> None:
+        _pull_unlocked(
+            ref,
+            to,
+            exclude,
+            lite,
+            force,
+            json_,
+            retries,
+            route=route,
+            bwlimit=bwlimit,
+            _cfg_override=cfg,
+            _collection=collection,
+        )
+
     if isinstance(cfg, LaptopConfig):
         if len(refs) == 1:
-            _pull_unlocked(
-                refs[0],
-                to,
-                exclude,
-                lite,
-                force,
-                json_,
-                retries,
-                route=route,
-                bwlimit=bwlimit,
-                _cfg_override=cfg,
-                _collection=collection,
-            )
+            pull_single(refs[0])
             return
         locations = {ref: _locate(cfg, ref, json_=json_) for ref in refs}
         centers = {center for center, _head in locations.values()}
@@ -15179,26 +15415,8 @@ def pull(
                 json_=json_,
             )
         head = next(iter(locations.values()))[1]
-        argv = ["pull", *refs]
-        if to:
-            argv += ["--to", to]
-        if collection:
-            argv += ["--collection", collection]
-        if lite:
-            argv.append("--lite")
-        for pattern in exclude or []:
-            argv += ["--exclude", pattern]
-        if force:
-            argv.append("--force")
-        if retries != 2:
-            argv += ["--retries", str(retries)]
-        if route != "auto":
-            argv += ["--route", route]
-        if bwlimit is not None:
-            argv += ["--bwlimit", str(bwlimit)]
-        if json_:
-            argv.append("--json")
-        else:
+        argv = resume_argv(refs)
+        if not json_:
             err.print("[dim]results land on the head node (projects live there)[/dim]")
         rc = _forward_retryable_with_reconnect(
             head,
@@ -15220,19 +15438,7 @@ def pull(
     with jobs_mod.shared_resolution_snapshot(cfg):
         entries = [jobs_mod.find(cfg, ref) for ref in refs]
     if len(entries) == 1 and entries[0] is None:
-        _pull_unlocked(
-            refs[0],
-            to,
-            exclude,
-            lite,
-            force,
-            json_,
-            retries,
-            route=route,
-            bwlimit=bwlimit,
-            _cfg_override=cfg,
-            _collection=collection,
-        )
+        pull_single(refs[0])
         return
     resolved_entries = [entry for entry in entries if entry is not None]
     if len({entry.job_id for entry in resolved_entries}) != len(resolved_entries):
@@ -15257,173 +15463,159 @@ def pull(
         try:
             with jobs_mod.job_lock(cfg, entry.job_id):
                 with jobs_mod.pull_destination_lock(cfg, destination):
-                    _pull_unlocked(
-                        entry.job_id,
-                        to,
-                        exclude,
-                        lite,
-                        force,
-                        json_,
-                        retries,
-                        route=route,
-                        bwlimit=bwlimit,
-                        _cfg_override=cfg,
-                        _collection=collection,
-                    )
+                    pull_single(entry.job_id)
         except KeyboardInterrupt:
-            resume = ["dt", "pull", refs[0]]
-            if to:
-                resume += ["--to", to]
-            if collection:
-                resume += ["--collection", collection]
-            if lite:
-                resume.append("--lite")
-            for pattern in exclude or []:
-                resume += ["--exclude", pattern]
-            if force:
-                resume.append("--force")
-            if retries != 2:
-                resume += ["--retries", str(retries)]
-            if route != "auto":
-                resume += ["--route", route]
-            if bwlimit is not None:
-                resume += ["--bwlimit", str(bwlimit)]
-            if json_:
-                resume.append("--json")
             _pull_interrupted(
                 message=("pull stopped locally; partial result data were not deleted"),
-                resume=resume,
+                resume=["dt", *resume_argv([refs[0]])],
                 json_=json_,
             )
         return
 
-    try:
-        root = (
-            Path(to).expanduser()
-            if to
-            else (
-                _ensure_collection_root(cfg, collection)
-                if collection
-                else (
-                    cfg.results_dir() / "jobs"
-                    if cfg.layout == ROLE_LAYOUT
-                    else cfg.results_dir()
-                )
-            )
-        ).absolute()
-    except ValueError as exc:
-        _fail_submission(
-            kind="destination_unusable",
-            message=str(exc),
-            exit_code=1,
-            json_=json_,
-        )
-    if root.exists() and not root.is_dir():
-        _fail_submission(
-            kind="destination_conflict",
-            message=f"{root} exists and is not a directory",
-            exit_code=1,
-            json_=json_,
-        )
-    cancel_event = Event()
-    ordered_results: list[JsonDict | None] = [None] * len(entries)
-    work_items: list[tuple[int, str, jobs_mod.JobEntry, Path]] = []
-    for index, (ref, entry) in enumerate(zip(refs, entries, strict=True)):
-        if entry is None:
-            ordered_results[index] = {
-                "ref": ref,
-                "job_id": None,
-                "name": None,
-                "node": None,
-                "status": "error",
-                "error": "not_found",
-                "message": f"no job matching {ref!r}",
-                "exit_code": EXIT_NOT_FOUND,
-            }
-            continue
-        work_items.append((index, ref, entry, root / entry.job_id))
-
-    pool = (
-        ThreadPoolExecutor(max_workers=min(4, len(work_items))) if work_items else None
+    _pull_group(
+        cfg,
+        refs,
+        entries,
+        to=to,
+        collection=collection,
+        exclude=exclude,
+        lite=lite,
+        force=force,
+        retries=retries,
+        route=route,
+        bwlimit=bwlimit,
+        json_=json_,
+        resume_argv=resume_argv,
     )
-    futures = (
-        {
-            pool.submit(
-                _pull_group_one,
-                cfg,
-                ref,
-                entry,
-                destination,
-                exclude,
-                lite,
-                force,
-                retries,
-                route,
-                bwlimit,
-                cancel_event,
-            ): index
-            for index, ref, entry, destination in work_items
-        }
-        if pool is not None
-        else {}
-    )
-    try:
-        if json_:
-            for future in as_completed(futures):
-                ordered_results[futures[future]] = future.result()
-        elif futures:
-            count = (
-                f"{len(work_items)} jobs"
-                if len(work_items) == len(entries)
-                else f"{len(work_items)}/{len(entries)} resolved jobs"
-            )
-            with err.status(f"recovering {count} into {root} (up to 4 in parallel)..."):
-                for future in as_completed(futures):
-                    ordered_results[futures[future]] = future.result()
-    except KeyboardInterrupt:
-        cancel_event.set()
-        for future in futures:
-            future.cancel()
-        resume = ["dt", "pull", *refs]
-        if to:
-            resume += ["--to", to]
-        if collection:
-            resume += ["--collection", collection]
-        if lite:
-            resume.append("--lite")
-        for pattern in exclude or []:
-            resume += ["--exclude", pattern]
-        if force:
-            resume.append("--force")
-        if retries != 2:
-            resume += ["--retries", str(retries)]
-        if route != "auto":
-            resume += ["--route", route]
-        if bwlimit is not None:
-            resume += ["--bwlimit", str(bwlimit)]
-        if json_:
-            resume.append("--json")
-        _pull_interrupted(
-            message=(
-                "pull stopped locally; completed and partial job directories were kept"
-            ),
-            resume=resume,
-            json_=json_,
-        )
-    finally:
-        cancel_event.set()
-        if pool is not None:
-            pool.shutdown(wait=True, cancel_futures=True)
 
-    results = [result for result in ordered_results if result is not None]
-    group_payload = _pull_group_payload(root, results)
-    if json_:
-        print(json.dumps(group_payload))
+
+def _kill_locked(
+    cfg: HeadConfig,
+    entry: jobs_mod.JobEntry,
+    *,
+    sig: str,
+    sweep: bool,
+    finish: Callable[[str, str, jobs_mod.JobEntry | None, str], str],
+) -> str:
+    """Signal the job under its lock and record the verified verdict."""
+    # A concurrent wait/info may have observed completion after our
+    # preflight but before this destructive transition acquired the lock.
+    current = jobs_mod.load(cfg, entry.job_id)
+    if current is not None:
+        entry = current
+    uncertain_launch = _is_uncertain_launch(entry)
+    # A22-6: --sweep gives already-terminal jobs their only orphan
+    # cleanup entry.  The probe still signals and takes a census, but the
+    # terminal record itself is never rewritten, and the EXITED shortcut
+    # is disabled so a recorded completion cannot shield the leftovers.
+    terminal_sweep = (
+        sweep and not uncertain_launch and entry.status not in ("running", "lost")
+    )
+    if (
+        entry.status not in ("running", "lost")
+        and not uncertain_launch
+        and not terminal_sweep
+    ):
+        message = f"{entry.job_id} is already {entry.status}"
+        err.print(message)
+        return finish("ok", "already_terminal", entry, message)
+
+    # Signal both the normal process group and framework children that
+    # escaped it with setpgrp, then require a positive death verdict.  An
+    # uncertain launch has no known PGID, so also leave the launch sentinel
+    # and close its tmux session while the procfs cwd scan finds survivors.
+    if uncertain_launch:
+        target = f"uncertain launch {entry.job_id}"
+    elif terminal_sweep:
+        target = f"leftover processes of {entry.job_id}"
     else:
-        _render_pull_group(group_payload)
-    summary = group_payload["summary"]
-    assert isinstance(summary, dict)
-    raise typer.Exit(int(summary["aggregate_exit_code"]))
+        target = f"group {entry.pgid}"
+
+    def unverified(detail: str) -> str:
+        message = f"could not verify death of {target} on {entry.node}: {detail}"
+        err.print(f"[red]{escape(message)}[/red]")
+        return finish("unverified", "unverified", entry, message)
+
+    try:
+        probe = termination_probe(
+            entry.job_dir,
+            entry.pgid,
+            sig,
+            boot_id=entry.boot_id,
+            job_id=entry.job_id,
+            session=entry.session if uncertain_launch else None,
+            cancel_sentinel=uncertain_launch,
+            layout=entry.storage_layout,
+            ignore_exit_marker=terminal_sweep,
+        )
+    except ValueError as exc:
+        return unverified(str(exc))
+    try:
+        proc = run_on(entry.node, entry.node_local, probe, timeout=20)
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as e:
+        return unverified(str(e))
+    verdict, detail = termination_verdict(
+        proc.returncode,
+        proc.stdout,
+        proc.stderr,
+    )
+    if verdict == "UNVERIFIED":
+        return unverified(str(detail))
+    if verdict == "ALIVE":
+        if terminal_sweep:
+            retained = entry.status
+            force_hint = "dt kill " + entry.job_id + " -y --force --sweep"
+        else:
+            retained = "failed" if uncertain_launch else "running"
+            force_hint = "dt kill " + entry.job_id + " -y --force"
+        message = f"{target} on {entry.node} survived {sig}"
+        err.print(
+            f"[red]{escape(message)}[/red] "
+            f"(job stays '{escape(retained)}'; try: "
+            f"{escape(force_hint)})"
+        )
+        return finish("alive", "survived", entry, message)
+    if verdict == "EXITED":
+        # The exit marker predates our signal: completion won the race
+        # (the interactive confirmation window alone can hide seconds).
+        # Rewriting a finished job into killed/cancelled would erase its
+        # real result and mis-skip every dependent gated on it.  Prefer
+        # the full remote completion record; fall back to the probe's
+        # sanitized exit code when that read is unavailable (also the
+        # only completion path for an uncertain launch, whose failed
+        # status the refresh probe deliberately leaves alone).
+        entry = jobs_mod._refresh_status_locked(cfg, entry)
+        if entry.status != "finished":
+            entry.status = "finished"
+            entry.exit_code = int(detail) if detail is not None else None
+            entry.finished_at = entry.finished_at or time.time()
+            entry.result_state = None
+            entry.reason = "completed before kill; recorded from exit marker"
+            jobs_mod.save(cfg, entry)
+        message = f"{entry.job_id} completed before {sig} was sent"
+        err.print(f"[yellow]{escape(message)}; result preserved[/yellow]")
+        return finish("ok", "completed", entry, message)
+    if terminal_sweep:
+        # Confirmed DEAD: the sweep found or produced a quiet capsule.
+        # The terminal record already tells the truth; leave it alone.
+        message = f"sent {sig} to {target} on {entry.node}; no owned survivors"
+        err.print(f"[yellow]{escape(message)}[/yellow]")
+        return finish("ok", "swept", entry, message)
+    previous_reason = entry.reason
+    entry.status = "killed"
+    entry.result_state = "cancelled"
+    entry.finished_at = time.time()
+    if uncertain_launch:
+        entry.reason = (
+            f"uncertain launch cleanup confirmed dead by user ({sig}); "
+            f"previous: {previous_reason}"
+        )
+    else:
+        entry.reason = f"killed by user ({sig})"
+    jobs_mod.save(cfg, entry)
+    message = f"sent {sig} to {target} on {entry.node}; confirmed dead"
+    err.print(f"[yellow]{escape(message)}[/yellow]")
+    return finish("ok", "killed", entry, message)
 
 
 def _kill_one(
@@ -15513,134 +15705,175 @@ def _kill_one(
         typer.confirm(f"kill {target}?", abort=True)
     sig = "KILL" if force else "TERM"
     with jobs_mod.job_lock(cfg, entry.job_id):
-        # A concurrent wait/info may have observed completion after our
-        # preflight but before this destructive transition acquired the lock.
-        current = jobs_mod.load(cfg, entry.job_id)
-        if current is not None:
-            entry = current
-        uncertain_launch = _is_uncertain_launch(entry)
-        # A22-6: --sweep gives already-terminal jobs their only orphan
-        # cleanup entry.  The probe still signals and takes a census, but the
-        # terminal record itself is never rewritten, and the EXITED shortcut
-        # is disabled so a recorded completion cannot shield the leftovers.
-        terminal_sweep = (
-            sweep and not uncertain_launch and entry.status not in ("running", "lost")
-        )
-        if (
-            entry.status not in ("running", "lost")
-            and not uncertain_launch
-            and not terminal_sweep
-        ):
-            message = f"{entry.job_id} is already {entry.status}"
-            err.print(message)
-            return finish("ok", "already_terminal", entry, message)
+        return _kill_locked(cfg, entry, sig=sig, sweep=sweep, finish=finish)
 
-        # Signal both the normal process group and framework children that
-        # escaped it with setpgrp, then require a positive death verdict.  An
-        # uncertain launch has no known PGID, so also leave the launch sentinel
-        # and close its tmux session while the procfs cwd scan finds survivors.
-        if uncertain_launch:
-            target = f"uncertain launch {entry.job_id}"
-        elif terminal_sweep:
-            target = f"leftover processes of {entry.job_id}"
-        else:
-            target = f"group {entry.pgid}"
-        try:
-            probe = termination_probe(
-                entry.job_dir,
-                entry.pgid,
-                sig,
-                boot_id=entry.boot_id,
-                job_id=entry.job_id,
-                session=entry.session if uncertain_launch else None,
-                cancel_sentinel=uncertain_launch,
-                layout=entry.storage_layout,
-                ignore_exit_marker=terminal_sweep,
-            )
-        except ValueError as exc:
-            message = f"could not verify death of {target} on {entry.node}: {exc}"
-            err.print(f"[red]{escape(message)}[/red]")
-            return finish("unverified", "unverified", entry, message)
-        try:
-            proc = run_on(entry.node, entry.node_local, probe, timeout=20)
-        except (RemoteError, subprocess.TimeoutExpired, OSError) as e:
-            message = f"could not verify death of {target} on {entry.node}: {e}"
-            err.print(f"[red]{escape(message)}[/red]")
-            return finish(
-                "unverified",
-                "unverified",
-                entry,
-                message,
-            )
-        verdict, detail = termination_verdict(
-            proc.returncode,
-            proc.stdout,
-            proc.stderr,
+
+def _exit_for_kill_outcomes(outcomes: list[str]) -> NoReturn:
+    """Exit with the aggregate verdict of one `dt kill` invocation."""
+    if all(outcome == "ok" for outcome in outcomes):
+        raise typer.Exit(0)
+    # single-ref keeps the old exit semantics agents rely on
+    if len(outcomes) == 1 and outcomes[0] == "notfound":
+        raise typer.Exit(EXIT_NOT_FOUND)
+    if all(outcome == "unreachable" for outcome in outcomes):
+        raise typer.Exit(EXIT_UNREACHABLE)
+    raise typer.Exit(1)
+
+
+def _kill_via_laptop_json(
+    cfg: LaptopConfig,
+    refs: list[str],
+    *,
+    force: bool,
+    sweep: bool,
+) -> NoReturn:
+    """Laptop `dt kill --json`: route each ref to its center, merge one array."""
+    rows: list[JsonDict] = []
+    outcomes: list[str] = []
+    argv_tail = (
+        ["-y"]
+        + (["--force"] if force else [])
+        + (["--sweep"] if sweep else [])
+        + ["--json"]
+    )
+    for ref in refs:
+        lookup_errors: dict[str, str] = {}
+        unreachable: set[str] = set()
+        hit = find_center(
+            cfg,
+            ref,
+            errors=lookup_errors,
+            unreachable=unreachable,
         )
-        if verdict == "UNVERIFIED":
-            message = f"could not verify death of {target} on {entry.node}: {detail}"
-            err.print(f"[red]{escape(message)}[/red]")
-            return finish(
-                "unverified",
-                "unverified",
-                entry,
-                message,
+        if hit is None:
+            if lookup_errors:
+                only_transport_failures = set(lookup_errors) == unreachable
+                code = EXIT_UNREACHABLE if only_transport_failures else 1
+                detail = "; ".join(
+                    f"{center}: {message}" for center, message in lookup_errors.items()
+                )
+                rows.append(
+                    {
+                        "ref": ref,
+                        "job_id": None,
+                        "outcome": "unverified",
+                        "status": None,
+                        "reason": None,
+                        "message": (
+                            f"cannot determine which center owns job {ref!r}: {detail}"
+                        ),
+                        "exit_code": code,
+                    }
+                )
+                outcomes.append("unreachable" if code == EXIT_UNREACHABLE else "failed")
+                continue
+            rows.append(
+                {
+                    "ref": ref,
+                    "job_id": None,
+                    "outcome": "not_found",
+                    "status": None,
+                    "reason": None,
+                    "message": (f"no center's registry knows job {ref!r}"),
+                    "exit_code": EXIT_NOT_FOUND,
+                }
             )
-        if verdict == "ALIVE":
-            if terminal_sweep:
-                retained = entry.status
-                force_hint = "dt kill " + entry.job_id + " -y --force --sweep"
+            outcomes.append("notfound")
+            continue
+        _, head, _entry = hit
+        try:
+            proc = remote_dt(
+                head,
+                ["kill", ref, *argv_tail],
+                timeout=60,
+            )
+            payload = json.loads(proc.stdout or "[]")
+            if not isinstance(payload, list) or len(payload) != 1:
+                raise ValueError("head returned invalid kill JSON")
+            row = payload[0]
+            if not isinstance(row, dict):
+                raise ValueError("head returned invalid kill result")
+            row_exit = row.get("exit_code")
+            if not isinstance(row_exit, int) or isinstance(row_exit, bool):
+                raise ValueError("head returned invalid kill exit code")
+            rows.append(row)
+            outcomes.append(
+                "ok"
+                if row_exit == 0
+                else ("notfound" if row_exit == EXIT_NOT_FOUND else "failed")
+            )
+        except (RemoteError, TypeError, ValueError, json.JSONDecodeError) as e:
+            rows.append(
+                {
+                    "ref": ref,
+                    "job_id": _entry.get("job_id"),
+                    "outcome": "unverified",
+                    "status": _entry.get("status"),
+                    "reason": _entry.get("reason"),
+                    "message": str(e),
+                    "exit_code": 1,
+                }
+            )
+            outcomes.append("failed")
+    print(json.dumps(rows))
+    _exit_for_kill_outcomes(outcomes)
+
+
+def _kill_via_laptop_human(
+    cfg: LaptopConfig,
+    refs: list[str],
+    *,
+    yes: bool,
+    force: bool,
+    sweep: bool,
+) -> NoReturn:
+    """Laptop `dt kill`: forward each ref interactively to its center."""
+    argv_tail = (
+        (["-y"] if yes else [])
+        + (["--force"] if force else [])
+        + (["--sweep"] if sweep else [])
+    )
+    human_outcomes: list[str] = []
+    for ref in refs:
+        human_lookup_errors: dict[str, str] = {}
+        human_unreachable: set[str] = set()
+        hit = find_center(
+            cfg,
+            ref,
+            errors=human_lookup_errors,
+            unreachable=human_unreachable,
+        )
+        if hit is None:
+            if human_lookup_errors:
+                detail = "; ".join(
+                    f"{name}: {message}"
+                    for name, message in human_lookup_errors.items()
+                )
+                err.print(
+                    "[red]cannot determine which center owns job "
+                    f"{escape(ref)!s}: {escape(detail)}[/red]"
+                )
+                human_outcomes.append(
+                    "unreachable"
+                    if set(human_lookup_errors) == human_unreachable
+                    else "failed"
+                )
             else:
-                retained = "failed" if uncertain_launch else "running"
-                force_hint = "dt kill " + entry.job_id + " -y --force"
-            message = f"{target} on {entry.node} survived {sig}"
-            err.print(
-                f"[red]{escape(message)}[/red] "
-                f"(job stays '{escape(retained)}'; try: "
-                f"{escape(force_hint)})"
-            )
-            return finish("alive", "survived", entry, message)
-        if verdict == "EXITED":
-            # The exit marker predates our signal: completion won the race
-            # (the interactive confirmation window alone can hide seconds).
-            # Rewriting a finished job into killed/cancelled would erase its
-            # real result and mis-skip every dependent gated on it.  Prefer
-            # the full remote completion record; fall back to the probe's
-            # sanitized exit code when that read is unavailable (also the
-            # only completion path for an uncertain launch, whose failed
-            # status the refresh probe deliberately leaves alone).
-            entry = jobs_mod._refresh_status_locked(cfg, entry)
-            if entry.status != "finished":
-                entry.status = "finished"
-                entry.exit_code = int(detail) if detail is not None else None
-                entry.finished_at = entry.finished_at or time.time()
-                entry.result_state = None
-                entry.reason = "completed before kill; recorded from exit marker"
-                jobs_mod.save(cfg, entry)
-            message = f"{entry.job_id} completed before {sig} was sent"
-            err.print(f"[yellow]{escape(message)}; result preserved[/yellow]")
-            return finish("ok", "completed", entry, message)
-        if terminal_sweep:
-            # Confirmed DEAD: the sweep found or produced a quiet capsule.
-            # The terminal record already tells the truth; leave it alone.
-            message = f"sent {sig} to {target} on {entry.node}; no owned survivors"
-            err.print(f"[yellow]{escape(message)}[/yellow]")
-            return finish("ok", "swept", entry, message)
-        previous_reason = entry.reason
-        entry.status = "killed"
-        entry.result_state = "cancelled"
-        entry.finished_at = time.time()
-        if uncertain_launch:
-            entry.reason = (
-                f"uncertain launch cleanup confirmed dead by user ({sig}); "
-                f"previous: {previous_reason}"
-            )
-        else:
-            entry.reason = f"killed by user ({sig})"
-        jobs_mod.save(cfg, entry)
-        message = f"sent {sig} to {target} on {entry.node}; confirmed dead"
-        err.print(f"[yellow]{escape(message)}[/yellow]")
-        return finish("ok", "killed", entry, message)
+                err.print(f"[red]no center's registry knows job {escape(ref)!s}[/red]")
+                human_outcomes.append("notfound")
+            continue
+        _center, head, _entry = hit
+        code = forward_call(head, ["kill", ref, *argv_tail], tty=not yes)
+        human_outcomes.append(
+            "ok"
+            if code == 0
+            else "notfound"
+            if code == EXIT_NOT_FOUND
+            else "unreachable"
+            if code == EXIT_UNREACHABLE
+            else "failed"
+        )
+    _exit_for_kill_outcomes(human_outcomes)
 
 
 def kill(
@@ -15681,163 +15914,12 @@ def kill(
     cfg = _cfg()
     if isinstance(cfg, LaptopConfig):
         if json_:
-            rows: list[JsonDict] = []
-            outcomes: list[str] = []
-            argv_tail = (
-                ["-y"]
-                + (["--force"] if force else [])
-                + (["--sweep"] if sweep else [])
-                + ["--json"]
-            )
-            for ref in refs:
-                lookup_errors: dict[str, str] = {}
-                unreachable: set[str] = set()
-                hit = find_center(
-                    cfg,
-                    ref,
-                    errors=lookup_errors,
-                    unreachable=unreachable,
-                )
-                if hit is None:
-                    if lookup_errors:
-                        only_transport_failures = set(lookup_errors) == unreachable
-                        code = EXIT_UNREACHABLE if only_transport_failures else 1
-                        detail = "; ".join(
-                            f"{center}: {message}"
-                            for center, message in lookup_errors.items()
-                        )
-                        rows.append(
-                            {
-                                "ref": ref,
-                                "job_id": None,
-                                "outcome": "unverified",
-                                "status": None,
-                                "reason": None,
-                                "message": (
-                                    "cannot determine which center owns job "
-                                    f"{ref!r}: {detail}"
-                                ),
-                                "exit_code": code,
-                            }
-                        )
-                        outcomes.append(
-                            "unreachable" if code == EXIT_UNREACHABLE else "failed"
-                        )
-                        continue
-                    rows.append(
-                        {
-                            "ref": ref,
-                            "job_id": None,
-                            "outcome": "not_found",
-                            "status": None,
-                            "reason": None,
-                            "message": (f"no center's registry knows job {ref!r}"),
-                            "exit_code": EXIT_NOT_FOUND,
-                        }
-                    )
-                    outcomes.append("notfound")
-                    continue
-                _, head, _entry = hit
-                try:
-                    proc = remote_dt(
-                        head,
-                        ["kill", ref, *argv_tail],
-                        timeout=60,
-                    )
-                    payload = json.loads(proc.stdout or "[]")
-                    if not isinstance(payload, list) or len(payload) != 1:
-                        raise ValueError("head returned invalid kill JSON")
-                    row = payload[0]
-                    if not isinstance(row, dict):
-                        raise ValueError("head returned invalid kill result")
-                    row_exit = row.get("exit_code")
-                    if not isinstance(row_exit, int) or isinstance(row_exit, bool):
-                        raise ValueError("head returned invalid kill exit code")
-                    rows.append(row)
-                    outcomes.append(
-                        "ok"
-                        if row_exit == 0
-                        else ("notfound" if row_exit == EXIT_NOT_FOUND else "failed")
-                    )
-                except (RemoteError, TypeError, ValueError, json.JSONDecodeError) as e:
-                    rows.append(
-                        {
-                            "ref": ref,
-                            "job_id": _entry.get("job_id"),
-                            "outcome": "unverified",
-                            "status": _entry.get("status"),
-                            "reason": _entry.get("reason"),
-                            "message": str(e),
-                            "exit_code": 1,
-                        }
-                    )
-                    outcomes.append("failed")
-            print(json.dumps(rows))
-            if all(outcome == "ok" for outcome in outcomes):
-                return
-            if len(outcomes) == 1 and outcomes[0] == "notfound":
-                raise typer.Exit(EXIT_NOT_FOUND)
-            if all(outcome == "unreachable" for outcome in outcomes):
-                raise typer.Exit(EXIT_UNREACHABLE)
-            raise typer.Exit(1)
-        argv_tail = (
-            (["-y"] if yes else [])
-            + (["--force"] if force else [])
-            + (["--sweep"] if sweep else [])
-        )
-        human_outcomes: list[str] = []
-        for ref in refs:
-            human_lookup_errors: dict[str, str] = {}
-            human_unreachable: set[str] = set()
-            hit = find_center(
-                cfg,
-                ref,
-                errors=human_lookup_errors,
-                unreachable=human_unreachable,
-            )
-            if hit is None:
-                if human_lookup_errors:
-                    detail = "; ".join(
-                        f"{name}: {message}"
-                        for name, message in human_lookup_errors.items()
-                    )
-                    err.print(
-                        "[red]cannot determine which center owns job "
-                        f"{escape(ref)!s}: {escape(detail)}[/red]"
-                    )
-                    human_outcomes.append(
-                        "unreachable"
-                        if set(human_lookup_errors) == human_unreachable
-                        else "failed"
-                    )
-                else:
-                    err.print(
-                        f"[red]no center's registry knows job {escape(ref)!s}[/red]"
-                    )
-                    human_outcomes.append("notfound")
-                continue
-            _center, head, _entry = hit
-            code = forward_call(head, ["kill", ref, *argv_tail], tty=not yes)
-            human_outcomes.append(
-                "ok"
-                if code == 0
-                else "notfound"
-                if code == EXIT_NOT_FOUND
-                else "unreachable"
-                if code == EXIT_UNREACHABLE
-                else "failed"
-            )
-        if all(outcome == "ok" for outcome in human_outcomes):
-            return
-        if len(human_outcomes) == 1 and human_outcomes[0] == "notfound":
-            raise typer.Exit(EXIT_NOT_FOUND)
-        if all(outcome == "unreachable" for outcome in human_outcomes):
-            raise typer.Exit(EXIT_UNREACHABLE)
-        raise typer.Exit(1)
+            _kill_via_laptop_json(cfg, refs, force=force, sweep=sweep)
+        _kill_via_laptop_human(cfg, refs, yes=yes, force=force, sweep=sweep)
 
     cfg = _need_head(cfg)
-    rows = [{} for _ref in refs] if json_ else []
-    outcomes = []
+    rows: list[JsonDict] = [{} for _ref in refs] if json_ else []
+    outcomes: list[str] = []
     for index, ref in enumerate(refs):
         try:
             outcome = _kill_one(
@@ -15867,12 +15949,7 @@ def kill(
         outcomes.append(outcome)
     if json_:
         print(json.dumps(rows))
-    if all(o == "ok" for o in outcomes):
-        return
-    # single-ref keeps the old exit semantics agents rely on
-    if len(outcomes) == 1 and outcomes[0] == "notfound":
-        raise typer.Exit(EXIT_NOT_FOUND)
-    raise typer.Exit(1)
+    _exit_for_kill_outcomes(outcomes)
 
 
 @dataclass(frozen=True)
