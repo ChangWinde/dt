@@ -420,6 +420,260 @@ def _finalize_fork_repeat(
         )
 
 
+@dataclass
+class _RepeatProgress:
+    """Mutable progress of one fork-repeat group across its phases."""
+
+    entries: list[jobs_mod.JobEntry]
+    failure: JsonDict | None = None
+    failure_code: int = 0
+    group_record: group_mod.GroupRequestRecord | None = None
+    group_terminal_replay: bool = False
+    agent_started: bool | None = None
+    agent_checked: bool = False
+
+    def ensure_agent(self, cfg: HeadConfig, entry: jobs_mod.JobEntry) -> None:
+        if self.agent_checked:
+            return
+        from . import agent as agent_mod
+
+        started = agent_mod.ensure_for_queued_job(cfg, entry)
+        if entry.status == "queued":
+            self.agent_checked = True
+            self.agent_started = started
+
+
+def _verify_terminal_replay(
+    host: Host,
+    cfg: HeadConfig,
+    progress: _RepeatProgress,
+    *,
+    source: jobs_mod.JobEntry,
+    build_spec: Callable[[str | None], RunSpec],
+    log: Callable[[str], None],
+    prefix: str,
+    repeat: int,
+    request_id: str | None,
+    json_: bool,
+) -> None:
+    """Prove a confirmed group's first member still resolves to the same job."""
+    from . import dispatch as dispatch_mod
+
+    if request_id is None:
+        host.fail_submission(
+            kind="submission_unknown",
+            message="terminal fork receipt has no durable request identity",
+            exit_code=EXIT_UNREACHABLE,
+            json_=json_,
+        )
+    try:
+        replay_spec = build_spec(_member_name(prefix, 1, repeat))
+        replay_spec.request_id = group_mod.item_request_id(request_id, 1)
+        verified_entry = dispatch_mod.submit_fork(
+            cfg,
+            source,
+            replay_spec,
+            log,
+            force_queue=False,
+            force_queue_label="fork repeat",
+        )
+        if verified_entry.job_id != progress.entries[0].job_id:
+            raise group_mod.GroupRequestError(
+                "terminal group replay resolved to a different first job"
+            )
+    except FailedBeforeStart as exc:
+        if exc.entry.job_id != progress.entries[0].job_id:
+            progress.failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} terminal receipt resolved "
+                    "to a different failed first job"
+                ),
+                "reasons": {"request_id": request_id},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            progress.failure_code = EXIT_UNREACHABLE
+            progress.group_terminal_replay = False
+    except (
+        NoReachableNode,
+        NoCapacity,
+        DispatchError,
+        ConfigError,
+    ) as exc:
+        progress.failure, progress.failure_code, _failed_entry = host.batch_error(
+            exc,
+            item_label="fork repeat replay",
+        )
+        progress.group_terminal_replay = False
+    except (
+        OSError,
+        ValueError,
+        intent_mod.RequestRecordError,
+        group_mod.GroupRequestError,
+    ) as exc:
+        progress.failure = {
+            "kind": "submission_unknown",
+            "message": (
+                f"request {request_id!r} terminal receipt could not be "
+                "verified without risking a duplicate"
+            ),
+            "reasons": {"request_id": request_id, "detail": str(exc)},
+            "exit_code": EXIT_UNREACHABLE,
+        }
+        progress.failure_code = EXIT_UNREACHABLE
+        progress.group_terminal_replay = False
+
+
+def _submit_repeat_items(
+    host: Host,
+    cfg: HeadConfig,
+    progress: _RepeatProgress,
+    *,
+    source: jobs_mod.JobEntry,
+    spec: RunSpec,
+    build_spec: Callable[[str | None], RunSpec],
+    prefix: str,
+    repeat: int,
+    request_id: str | None,
+    group_intent_sha256: str | None,
+    json_: bool,
+) -> None:
+    """Submit every member not yet confirmed, in strict prefix order."""
+    from . import dispatch as dispatch_mod
+
+    for index in range(len(progress.entries) + 1, repeat + 1):
+        if progress.failure is not None or progress.group_terminal_replay:
+            break
+        item_spec = (
+            spec if index == 1 else build_spec(_member_name(prefix, index, repeat))
+        )
+        item_spec.request_id = (
+            group_mod.item_request_id(request_id, index)
+            if request_id is not None
+            else None
+        )
+
+        def item_log(message: str, *, item: int = index) -> None:
+            host.err.print(
+                f"[dim]fork repeat {item}/{repeat}: {host.escape(message)}[/dim]"
+            )
+
+        try:
+            entry = dispatch_mod.submit_fork(
+                cfg,
+                source,
+                item_spec,
+                item_log,
+                force_queue=index > 1,
+                force_queue_label="fork repeat",
+            )
+            if request_id is not None and group_intent_sha256 is not None:
+                progress.group_record = group_mod.locked_record_job(
+                    cfg,
+                    request_id,
+                    intent_sha256=group_intent_sha256,
+                    index=index,
+                    job_id=entry.job_id,
+                )
+        except KeyboardInterrupt:
+            confirmed = len(progress.entries)
+            noun = "registration" if confirmed == 1 else "registrations"
+            progress.failure = {
+                "kind": "fork_repeat_submission_interrupted",
+                "message": (
+                    "fork repeat submission interrupted after "
+                    f"{confirmed} confirmed {noun}; item {index} outcome "
+                    "unknown. Confirmed jobs were not cancelled. "
+                    + (
+                        f"Retry the same command with --request-id "
+                        f"{request_id!r} to reconcile this exact item."
+                        if request_id is not None
+                        else "Do not resubmit blindly; inspect `dt ps -w` "
+                        f"for prefix {prefix!r}."
+                    )
+                ),
+                "reasons": {},
+                "exit_code": 130,
+                "confirmed_submitted": confirmed,
+                "uncertain_repeat_index": index,
+            }
+            progress.failure_code = 130
+            break
+        except (
+            FailedBeforeStart,
+            NoReachableNode,
+            NoCapacity,
+            DispatchError,
+            ConfigError,
+        ) as exc:
+            progress.failure, progress.failure_code, failed_entry = host.batch_error(
+                exc,
+                item_label="fork repeat item",
+            )
+            if failed_entry is not None:
+                if (
+                    progress.failure.get("kind") != "uncertain_launch"
+                    and request_id is not None
+                    and group_intent_sha256 is not None
+                ):
+                    try:
+                        progress.group_record = group_mod.locked_record_job(
+                            cfg,
+                            request_id,
+                            intent_sha256=group_intent_sha256,
+                            index=index,
+                            job_id=failed_entry.job_id,
+                        )
+                    except (
+                        OSError,
+                        ValueError,
+                        intent_mod.RequestRecordError,
+                        group_mod.GroupRequestError,
+                    ) as persistence_exc:
+                        progress.failure = {
+                            "kind": "submission_unknown",
+                            "message": (
+                                f"job {failed_entry.job_id} was registered "
+                                f"but request {request_id!r} progress could "
+                                "not be persisted"
+                            ),
+                            "reasons": {
+                                "request_id": request_id,
+                                "job_id": failed_entry.job_id,
+                                "detail": str(persistence_exc),
+                            },
+                            "exit_code": EXIT_UNREACHABLE,
+                        }
+                        progress.failure_code = EXIT_UNREACHABLE
+                progress.entries.append(failed_entry)
+                progress.ensure_agent(cfg, failed_entry)
+                if not json_:
+                    print(failed_entry.job_id, flush=True)
+            break
+        except (
+            OSError,
+            ValueError,
+            intent_mod.RequestRecordError,
+            group_mod.GroupRequestError,
+        ) as exc:
+            progress.failure = {
+                "kind": "submission_unknown",
+                "message": (
+                    f"fork repeat item {index} did not produce a complete "
+                    "durable group receipt; retry only with the same "
+                    "request id"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            }
+            progress.failure_code = EXIT_UNREACHABLE
+            break
+        progress.entries.append(entry)
+        progress.ensure_agent(cfg, entry)
+        if not json_:
+            print(entry.job_id, flush=True)
+
+
 def run(
     host: Host,
     *,
@@ -446,8 +700,6 @@ def run(
     json_: bool,
 ) -> None:
     """Submit or reconcile a durable same-node fork group."""
-    from . import dispatch as dispatch_mod
-
     entries: list[jobs_mod.JobEntry] = []
     failure: JsonDict | None = None
     failure_code = 0
@@ -493,235 +745,63 @@ def run(
             group_intent_sha256=group_intent_sha256,
             repeat=repeat,
         )
-    agent_started: bool | None = None
-    agent_checked = False
-
-    def ensure_agent(repeat_entry: jobs_mod.JobEntry) -> None:
-        nonlocal agent_checked, agent_started
-        if agent_checked:
-            return
-        from . import agent as agent_mod
-
-        started = agent_mod.ensure_for_queued_job(cfg, repeat_entry)
-        if repeat_entry.status == "queued":
-            agent_checked = True
-            agent_started = started
-
-    for existing_entry in entries:
-        ensure_agent(existing_entry)
+    progress = _RepeatProgress(
+        entries=entries,
+        failure=failure,
+        failure_code=failure_code,
+        group_record=group_record,
+        group_terminal_replay=group_terminal_replay,
+    )
+    for existing_entry in progress.entries:
+        progress.ensure_agent(cfg, existing_entry)
         if not json_:
             print(existing_entry.job_id, flush=True)
 
-    if group_terminal_replay and entries:
-        if request_id is None:
-            host.fail_submission(
-                kind="submission_unknown",
-                message="terminal fork receipt has no durable request identity",
-                exit_code=EXIT_UNREACHABLE,
-                json_=json_,
-            )
-        try:
-            replay_spec = build_spec(_member_name(prefix, 1, repeat))
-            replay_spec.request_id = group_mod.item_request_id(request_id, 1)
-            verified_entry = dispatch_mod.submit_fork(
-                cfg,
-                source,
-                replay_spec,
-                log,
-                force_queue=False,
-                force_queue_label="fork repeat",
-            )
-            if verified_entry.job_id != entries[0].job_id:
-                raise group_mod.GroupRequestError(
-                    "terminal group replay resolved to a different first job"
-                )
-        except FailedBeforeStart as exc:
-            if exc.entry.job_id != entries[0].job_id:
-                failure = {
-                    "kind": "submission_unknown",
-                    "message": (
-                        f"request {request_id!r} terminal receipt resolved "
-                        "to a different failed first job"
-                    ),
-                    "reasons": {"request_id": request_id},
-                    "exit_code": EXIT_UNREACHABLE,
-                }
-                failure_code = EXIT_UNREACHABLE
-                group_terminal_replay = False
-        except (
-            NoReachableNode,
-            NoCapacity,
-            DispatchError,
-            ConfigError,
-        ) as exc:
-            failure, failure_code, _failed_entry = host.batch_error(
-                exc,
-                item_label="fork repeat replay",
-            )
-            group_terminal_replay = False
-        except (
-            OSError,
-            ValueError,
-            intent_mod.RequestRecordError,
-            group_mod.GroupRequestError,
-        ) as exc:
-            failure = {
-                "kind": "submission_unknown",
-                "message": (
-                    f"request {request_id!r} terminal receipt could not be "
-                    "verified without risking a duplicate"
-                ),
-                "reasons": {"request_id": request_id, "detail": str(exc)},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
-            group_terminal_replay = False
-
-    for index in range(len(entries) + 1, repeat + 1):
-        if failure is not None or group_terminal_replay:
-            break
-        item_spec = (
-            spec if index == 1 else build_spec(_member_name(prefix, index, repeat))
-        )
-        item_spec.request_id = (
-            group_mod.item_request_id(request_id, index)
-            if request_id is not None
-            else None
+    if progress.group_terminal_replay and progress.entries:
+        _verify_terminal_replay(
+            host,
+            cfg,
+            progress,
+            source=source,
+            build_spec=build_spec,
+            log=log,
+            prefix=prefix,
+            repeat=repeat,
+            request_id=request_id,
+            json_=json_,
         )
 
-        def item_log(message: str, *, item: int = index) -> None:
-            host.err.print(
-                f"[dim]fork repeat {item}/{repeat}: {host.escape(message)}[/dim]"
-            )
-
-        try:
-            entry = dispatch_mod.submit_fork(
-                cfg,
-                source,
-                item_spec,
-                item_log,
-                force_queue=index > 1,
-                force_queue_label="fork repeat",
-            )
-            if request_id is not None and group_intent_sha256 is not None:
-                group_record = group_mod.locked_record_job(
-                    cfg,
-                    request_id,
-                    intent_sha256=group_intent_sha256,
-                    index=index,
-                    job_id=entry.job_id,
-                )
-        except KeyboardInterrupt:
-            confirmed = len(entries)
-            noun = "registration" if confirmed == 1 else "registrations"
-            failure = {
-                "kind": "fork_repeat_submission_interrupted",
-                "message": (
-                    "fork repeat submission interrupted after "
-                    f"{confirmed} confirmed {noun}; item {index} outcome "
-                    "unknown. Confirmed jobs were not cancelled. "
-                    + (
-                        f"Retry the same command with --request-id "
-                        f"{request_id!r} to reconcile this exact item."
-                        if request_id is not None
-                        else "Do not resubmit blindly; inspect `dt ps -w` "
-                        f"for prefix {prefix!r}."
-                    )
-                ),
-                "reasons": {},
-                "exit_code": 130,
-                "confirmed_submitted": confirmed,
-                "uncertain_repeat_index": index,
-            }
-            failure_code = 130
-            break
-        except (
-            FailedBeforeStart,
-            NoReachableNode,
-            NoCapacity,
-            DispatchError,
-            ConfigError,
-        ) as exc:
-            failure, failure_code, failed_entry = host.batch_error(
-                exc,
-                item_label="fork repeat item",
-            )
-            if failed_entry is not None:
-                if (
-                    failure.get("kind") != "uncertain_launch"
-                    and request_id is not None
-                    and group_intent_sha256 is not None
-                ):
-                    try:
-                        group_record = group_mod.locked_record_job(
-                            cfg,
-                            request_id,
-                            intent_sha256=group_intent_sha256,
-                            index=index,
-                            job_id=failed_entry.job_id,
-                        )
-                    except (
-                        OSError,
-                        ValueError,
-                        intent_mod.RequestRecordError,
-                        group_mod.GroupRequestError,
-                    ) as persistence_exc:
-                        failure = {
-                            "kind": "submission_unknown",
-                            "message": (
-                                f"job {failed_entry.job_id} was registered "
-                                f"but request {request_id!r} progress could "
-                                "not be persisted"
-                            ),
-                            "reasons": {
-                                "request_id": request_id,
-                                "job_id": failed_entry.job_id,
-                                "detail": str(persistence_exc),
-                            },
-                            "exit_code": EXIT_UNREACHABLE,
-                        }
-                        failure_code = EXIT_UNREACHABLE
-                entries.append(failed_entry)
-                ensure_agent(failed_entry)
-                if not json_:
-                    print(failed_entry.job_id, flush=True)
-            break
-        except (
-            OSError,
-            ValueError,
-            intent_mod.RequestRecordError,
-            group_mod.GroupRequestError,
-        ) as exc:
-            failure = {
-                "kind": "submission_unknown",
-                "message": (
-                    f"fork repeat item {index} did not produce a complete "
-                    "durable group receipt; retry only with the same "
-                    "request id"
-                ),
-                "reasons": {"request_id": request_id, "detail": str(exc)},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
-            break
-        entries.append(entry)
-        ensure_agent(entry)
-        if not json_:
-            print(entry.job_id, flush=True)
+    _submit_repeat_items(
+        host,
+        cfg,
+        progress,
+        source=source,
+        spec=spec,
+        build_spec=build_spec,
+        prefix=prefix,
+        repeat=repeat,
+        request_id=request_id,
+        group_intent_sha256=group_intent_sha256,
+        json_=json_,
+    )
 
     if (
         request_id is not None
-        and group_record is not None
+        and progress.group_record is not None
         and group_intent_sha256 is not None
     ):
-        group_record, failure, failure_code = _finalize_fork_repeat(
+        (
+            progress.group_record,
+            progress.failure,
+            progress.failure_code,
+        ) = _finalize_fork_repeat(
             cfg,
             request_id=request_id,
-            group_record=group_record,
+            group_record=progress.group_record,
             group_intent_sha256=group_intent_sha256,
-            group_terminal_replay=group_terminal_replay,
-            failure=failure,
-            failure_code=failure_code,
+            group_terminal_replay=progress.group_terminal_replay,
+            failure=progress.failure,
+            failure_code=progress.failure_code,
         )
 
     cache_mode = (
@@ -741,20 +821,19 @@ def run(
         source=source,
         name_prefix=prefix,
         requested=repeat,
-        entries=entries,
-        display_refs=host.display_refs_for_entries(cfg, entries),
+        entries=progress.entries,
+        display_refs=host.display_refs_for_entries(cfg, progress.entries),
         cache_mode=cache_mode,
         cold_cache_env=cold_cache_env,
-        agent_started=agent_started,
-        error=failure,
-        exit_code=failure_code,
+        agent_started=progress.agent_started,
+        error=progress.failure,
+        exit_code=progress.failure_code,
         request_id=request_id,
-        idempotent_replay=group_terminal_replay,
+        idempotent_replay=progress.group_terminal_replay,
     )
     if json_:
         print(json.dumps(receipt))
     else:
         emit_human(host, receipt, emit_job_ids=False)
-    if failure_code:
-        raise typer.Exit(failure_code)
-    return
+    if progress.failure_code:
+        raise typer.Exit(progress.failure_code)
