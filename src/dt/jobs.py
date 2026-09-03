@@ -615,38 +615,8 @@ def compact_job_refs(
     )
 
 
-def _decode_entry(
-    raw: object,
-    *,
-    layout: str | None = None,
-    registry_updated_at: float | None = None,
-    expected_job_id: str | None = None,
-    include_private: bool = True,
-) -> JobEntry:
-    if not isinstance(raw, dict):
-        raise TypeError("job registry entry must be a JSON object")
-    raw_job_id = raw.get("job_id")
-    if not _valid_job_id(raw_job_id):
-        raise ValueError("job registry identity is unsafe")
-    if expected_job_id is not None and raw_job_id != expected_job_id:
-        raise ValueError("job registry identity does not match its filename")
-    payload = {key: value for key, value in raw.items() if key in _JOB_ENTRY_FIELDS}
-    try:
-        normalized_custom_env = custom_env_mod.validate(payload.get("custom_env", {}))
-    except custom_env_mod.CustomEnvironmentError as exc:
-        raise ValueError(str(exc)) from exc
-    payload["custom_env"] = normalized_custom_env if include_private else {}
-    entry = JobEntry(**payload)
-    _bound_entry_diagnostics(entry)
-    entry.custom_env_keys = sorted(normalized_custom_env)
-    entry.custom_env_loaded = include_private
-    # Early launchers persisted an empty string when no uv environment existed.
-    # Normalize that historical sentinel before validating the current optional
-    # identity contract.
-    if entry.env_hash == "":
-        entry.env_hash = None
-    if entry.cache_source_env_hash == "":
-        entry.cache_source_env_hash = None
+def _validate_entry_lifecycle(entry: JobEntry) -> None:
+    """Required text, status, booleans, GPUs, pgid, exit code, result, timestamps."""
     required_strings = (
         entry.job_id,
         entry.name,
@@ -722,6 +692,10 @@ def _decode_entry(
         for value in (entry.created_at, *timestamps)
     ):
         raise ValueError("job registry has invalid lifecycle timestamps")
+
+
+def _validate_entry_collections(entry: JobEntry) -> None:
+    """Placement failures, worker roots, submodule commits, artifact targets, extras."""
     if not isinstance(entry.placement_failures, dict) or any(
         not isinstance(node, str) or not isinstance(reason, str)
         for node, reason in entry.placement_failures.items()
@@ -760,6 +734,10 @@ def _decode_entry(
         or any(not is_config_id(extra) for extra in entry.extras)
     ):
         raise ValueError("job registry has invalid project extras")
+
+
+def _validate_entry_provenance(entry: JobEntry) -> None:
+    """Optional text fields, retry policy, legacy cleanup, dispatch claim identity."""
     optional_text = (
         entry.git_sha,
         entry.snapshot_sha256,
@@ -839,6 +817,10 @@ def _decode_entry(
         # row unreadable.
         entry.dispatch_owner = None
         entry.dispatch_claimed_at = None
+
+
+def _validate_entry_limits(entry: JobEntry) -> None:
+    """Digest and environment identities, optional measurements and resource limits."""
     digest_fields = (
         entry.snapshot_sha256,
         entry.payload_sha256,
@@ -909,6 +891,10 @@ def _decode_entry(
         or entry.require_disk_gib < 0
     ):
         raise ValueError("job registry has an invalid disk requirement")
+
+
+def _validate_entry_contracts(entry: JobEntry) -> None:
+    """Launch phases, setup inputs, result states, modes, layout, roots, isolation."""
     if not isinstance(entry.launch_phases_s, dict) or any(
         not isinstance(key, str)
         or isinstance(value, bool)
@@ -958,6 +944,45 @@ def _decode_entry(
             raise ValueError("job registry has an invalid relative job path")
     if entry.gpu_isolation != "advisory":
         raise ValueError("job registry requests unsupported physical GPU isolation")
+
+
+def _decode_entry(
+    raw: object,
+    *,
+    layout: str | None = None,
+    registry_updated_at: float | None = None,
+    expected_job_id: str | None = None,
+    include_private: bool = True,
+) -> JobEntry:
+    if not isinstance(raw, dict):
+        raise TypeError("job registry entry must be a JSON object")
+    raw_job_id = raw.get("job_id")
+    if not _valid_job_id(raw_job_id):
+        raise ValueError("job registry identity is unsafe")
+    if expected_job_id is not None and raw_job_id != expected_job_id:
+        raise ValueError("job registry identity does not match its filename")
+    payload = {key: value for key, value in raw.items() if key in _JOB_ENTRY_FIELDS}
+    try:
+        normalized_custom_env = custom_env_mod.validate(payload.get("custom_env", {}))
+    except custom_env_mod.CustomEnvironmentError as exc:
+        raise ValueError(str(exc)) from exc
+    payload["custom_env"] = normalized_custom_env if include_private else {}
+    entry = JobEntry(**payload)
+    _bound_entry_diagnostics(entry)
+    entry.custom_env_keys = sorted(normalized_custom_env)
+    entry.custom_env_loaded = include_private
+    # Early launchers persisted an empty string when no uv environment existed.
+    # Normalize that historical sentinel before validating the current optional
+    # identity contract.
+    if entry.env_hash == "":
+        entry.env_hash = None
+    if entry.cache_source_env_hash == "":
+        entry.cache_source_env_hash = None
+    _validate_entry_lifecycle(entry)
+    _validate_entry_collections(entry)
+    _validate_entry_provenance(entry)
+    _validate_entry_limits(entry)
+    _validate_entry_contracts(entry)
     if entry.storage_layout is None:
         # An absent storage_layout is a legacy-era sentinel: every role-v1
         # record is stamped explicitly by save(). Inferring the layout from
@@ -3023,39 +3048,8 @@ def refresh_status(
         )
 
 
-def _refresh_status_locked(
-    cfg: HeadConfig,
-    entry: JobEntry,
-    timeout: float = 8,
-    *,
-    observation: dict[str, object] | None = None,
-) -> JobEntry:
-    """One remote round-trip: read exit_code/completion time, else liveness.
-
-    Liveness checks the *positive* wrapper pid (== pgid, it stays alive while
-    the job runs): `kill -0 -- -pgid` parses differently across login shells.
-    `lost` is re-evaluated too, so a late-arriving exit_code can rescue it.
-    ``observation`` receives transient probe health without persisting a network
-    failure as durable job state.
-    """
-    if observation is not None:
-        observation.clear()
-        observation.update(
-            node_unreachable=False,
-            status_probe_error=None,
-        )
-    if entry.status not in ("running", "lost"):
-        return entry
-    try:
-        validate_job_capsule(entry.job_dir, job_id=entry.job_id)
-    except ValueError as exc:
-        if observation is not None:
-            observation.update(
-                node_unreachable=False,
-                status_probe_error=str(exc),
-            )
-        return entry
-    state_dir = job_state_dir(entry.job_dir, entry.storage_layout)
+def _status_probe_script(entry: JobEntry, state_dir: str) -> str:
+    """The bash probe that reports completion or liveness for one job."""
     state = node_path_expression(state_dir)
     wrapper_pid = int(entry.pgid) if entry.pgid is not None else 0
     # Every field below comes from a job-writable file. dt_probe_field
@@ -3094,82 +3088,213 @@ def _refresh_status_locked(
     # procfs tail used by process_identity_shell. Pin the parser to bash just
     # like destructive lifecycle callers do.
     probe = f"env LC_ALL=C bash -c {shlex.quote(probe)}"
+    return probe
+
+
+def _positive_timestamp(value: str) -> float | None:
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(timestamp):
+        # inf/nan from a job-writable state file must never reach the
+        # registry: json round-trips reject it and every later consumer of
+        # this row would crash.
+        return None
+    return timestamp if timestamp > 0 else None
+
+
+@dataclass(frozen=True)
+class _StatusProbe:
+    """Parsed status-probe response anchored on the trusted marker."""
+
+    token: str
+    boot_id: str | None
+    started_at: float | None
+    finished_at: float | None
+    result: str
+
+
+def _run_status_probe(
+    entry: JobEntry,
+    probe: str,
+    *,
+    timeout: float,
+    observation: dict[str, object] | None,
+) -> _StatusProbe | None:
+    """Run the probe; None means no trusted evidence (keep the last state)."""
     try:
         proc = run_on(entry.node, entry.node_local, probe, timeout=timeout)
-        if proc.returncode != 0:
-            if observation is not None:
-                detail = (
-                    proc.stderr
-                    or proc.stdout
-                    or f"status probe exited {proc.returncode}"
-                )
-                observation.update(
-                    node_unreachable=True,
-                    status_probe_error=" ".join(detail.split()),
-                )
-            return entry  # ssh/shell failure is not evidence that the job died
-        tokens = (proc.stdout or "").strip().splitlines()
-        if STATUS_MARK in tokens:
-            # Anchor on the FIRST marker: it is emitted right after the trusted
-            # /proc boot_id line, before any worker-written state file. A job
-            # that writes a fake marker into its own state file cannot move the
-            # anchor (and head -n 1 above already caps each file to one token).
-            marker_index = tokens.index(STATUS_MARK)
-            current_boot_id = tokens[marker_index - 1] if marker_index else None
-            token = (
-                tokens[marker_index + 1] if len(tokens) > marker_index + 1 else "LOST"
-            )
-            started_token = (
-                tokens[marker_index + 2]
-                if len(tokens) > marker_index + 2
-                else "UNKNOWN"
-            )
-            finished_token = (
-                tokens[marker_index + 3]
-                if len(tokens) > marker_index + 3
-                else "UNKNOWN"
-            )
-            result_token = (
-                tokens[marker_index + 4]
-                if len(tokens) > marker_index + 4
-                else "UNKNOWN"
-            )
-        else:
-            # This command always emits STATUS_MARK before reading any
-            # job-writable field. Missing framing therefore means the remote
-            # shell did not execute the trusted probe we sent. Legacy two-line
-            # output is ambiguous with workload-controlled stdout and must not
-            # drive a lifecycle transition.
-            if observation is not None:
-                observation.update(
-                    status_probe_error=(
-                        "status probe response is missing trusted protocol marker; "
-                        "registry retained"
-                    )
-                )
-            return entry
     except Exception as exc:
         if observation is not None:
             observation.update(
                 node_unreachable=True,
                 status_probe_error=" ".join(str(exc).split()) or type(exc).__name__,
             )
-        return entry  # unreachable node: keep last known state
+        return None  # unreachable node: keep last known state
+    if proc.returncode != 0:
+        if observation is not None:
+            detail = (
+                proc.stderr or proc.stdout or f"status probe exited {proc.returncode}"
+            )
+            observation.update(
+                node_unreachable=True,
+                status_probe_error=" ".join(detail.split()),
+            )
+        return None  # ssh/shell failure is not evidence that the job died
+    tokens = (proc.stdout or "").strip().splitlines()
+    if STATUS_MARK not in tokens:
+        # This command always emits STATUS_MARK before reading any
+        # job-writable field. Missing framing therefore means the remote shell
+        # did not execute the trusted probe we sent. Legacy two-line output is
+        # ambiguous with workload-controlled stdout and must not drive a
+        # lifecycle transition.
+        if observation is not None:
+            observation.update(
+                status_probe_error=(
+                    "status probe response is missing trusted protocol marker; "
+                    "registry retained"
+                )
+            )
+        return None
+    # Anchor on the FIRST marker: it is emitted right after the trusted /proc
+    # boot_id line, before any worker-written state file. A job that writes a
+    # fake marker into its own state file cannot move the anchor (and head -n 1
+    # above already caps each file to one token).
+    marker_index = tokens.index(STATUS_MARK)
 
-    def positive_timestamp(value: str) -> float | None:
-        try:
-            timestamp = float(value)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(timestamp):
-            # inf/nan from a job-writable state file must never reach the
-            # registry: json round-trips reject it and every later consumer
-            # of this row would crash.
-            return None
-        return timestamp if timestamp > 0 else None
+    def field_after(offset: int, default: str) -> str:
+        index = marker_index + offset
+        return tokens[index] if len(tokens) > index else default
 
-    remote_started_at = positive_timestamp(started_token)
-    remote_finished_at = positive_timestamp(finished_token)
+    return _StatusProbe(
+        token=field_after(1, "LOST"),
+        boot_id=tokens[marker_index - 1] if marker_index else None,
+        started_at=_positive_timestamp(field_after(2, "UNKNOWN")),
+        finished_at=_positive_timestamp(field_after(3, "UNKNOWN")),
+        result=field_after(4, "UNKNOWN"),
+    )
+
+
+def _mark_running_from_probe(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    remote_started_at: float | None,
+) -> None:
+    """Record live evidence; a rescued lost row sheds its terminal meaning."""
+    changed = False
+    if remote_started_at is not None and entry.started_at != remote_started_at:
+        entry.started_at = remote_started_at
+        changed = True
+    if entry.status != "running":
+        entry.status = "running"
+        entry.reason = None
+        entry.finished_at = None
+        changed = True
+    elif entry.reason is not None and not entry.reason.startswith(
+        CANCEL_UNVERIFIED_PREFIX
+    ):
+        entry.reason = None
+        changed = True
+    # Status, exit code and typed result are one state transition, never
+    # independently sticky fields.
+    if entry.exit_code is not None:
+        entry.exit_code = None
+        changed = True
+    if entry.result_state is not None:
+        entry.result_state = None
+        changed = True
+    if entry.finished_at is not None:
+        entry.finished_at = None
+        changed = True
+    if changed:
+        save(cfg, entry)
+
+
+def _mark_lost_from_probe(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    token: str,
+    state_dir: str,
+) -> None:
+    """Record a LOST/STALE verdict, or repair an older lost row's metadata."""
+    lost_reason = (
+        (
+            f"wrapper pid {entry.pgid} is alive but its process identity "
+            "does not match this job; refusing to adopt a reused process"
+        )
+        if token == "STALE"
+        else (
+            f"wrapper pid {entry.pgid} is not running and "
+            f"{state_dir}/exit_code is missing"
+        )
+    )
+    if entry.status == "lost":
+        # Registries written before lost diagnostics were persisted can
+        # already carry the terminal state with an empty reason. A fresh,
+        # reachable LOST probe is sufficient evidence to repair that metadata
+        # without changing the original terminal timestamp.
+        changed = False
+        if not entry.reason:
+            entry.reason = lost_reason
+            entry.finished_at = entry.finished_at or time.time()
+            changed = True
+        if entry.result_state != "infra_failure":
+            entry.result_state = "infra_failure"
+            changed = True
+        if changed:
+            save(cfg, entry)
+        return
+    entry.status = "lost"
+    entry.terminal_finalized_at = None
+    entry.reason = lost_reason
+    entry.finished_at = time.time()
+    entry.result_state = "infra_failure"
+    save(cfg, entry)
+
+
+def _refresh_status_locked(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    timeout: float = 8,
+    *,
+    observation: dict[str, object] | None = None,
+) -> JobEntry:
+    """One remote round-trip: read exit_code/completion time, else liveness.
+
+    Liveness checks the *positive* wrapper pid (== pgid, it stays alive while
+    the job runs): `kill -0 -- -pgid` parses differently across login shells.
+    `lost` is re-evaluated too, so a late-arriving exit_code can rescue it.
+    ``observation`` receives transient probe health without persisting a network
+    failure as durable job state.
+    """
+    if observation is not None:
+        observation.clear()
+        observation.update(
+            node_unreachable=False,
+            status_probe_error=None,
+        )
+    if entry.status not in ("running", "lost"):
+        return entry
+    try:
+        validate_job_capsule(entry.job_dir, job_id=entry.job_id)
+    except ValueError as exc:
+        if observation is not None:
+            observation.update(
+                node_unreachable=False,
+                status_probe_error=str(exc),
+            )
+        return entry
+    state_dir = job_state_dir(entry.job_dir, entry.storage_layout)
+    probe = _status_probe_script(entry, state_dir)
+    tokens = _run_status_probe(entry, probe, timeout=timeout, observation=observation)
+    if tokens is None:
+        return entry
+    token = tokens.token
+    current_boot_id = tokens.boot_id
+    result_token = tokens.result
+    remote_started_at = tokens.started_at
+    remote_finished_at = tokens.finished_at
     if entry.status == "lost" and entry.terminal_finalized_at is not None:
         # A dependent may already have made an irreversible decision from this
         # result. Even trusted late worker evidence cannot reopen that history.
@@ -3239,34 +3364,7 @@ def _refresh_status_locked(
                     )
                 )
             return entry
-        changed = False
-        if remote_started_at is not None and entry.started_at != remote_started_at:
-            entry.started_at = remote_started_at
-            changed = True
-        if entry.status != "running":
-            entry.status = "running"
-            entry.reason = None
-            entry.finished_at = None
-            changed = True
-        elif entry.reason is not None and not entry.reason.startswith(
-            CANCEL_UNVERIFIED_PREFIX
-        ):
-            entry.reason = None
-            changed = True
-        # A rescued ``lost`` row must not carry its old terminal meaning into
-        # the running state.  Status, exit code and typed result are one state
-        # transition, never independently sticky fields.
-        if entry.exit_code is not None:
-            entry.exit_code = None
-            changed = True
-        if entry.result_state is not None:
-            entry.result_state = None
-            changed = True
-        if entry.finished_at is not None:
-            entry.finished_at = None
-            changed = True
-        if changed:
-            save(cfg, entry)
+        _mark_running_from_probe(cfg, entry, remote_started_at)
         return entry
     if token == "UNVERIFIED":
         # A live PID whose boot/start identity cannot be proven may be either
@@ -3281,37 +3379,7 @@ def _refresh_status_locked(
             )
         return entry
     if token in {"LOST", "STALE"}:
-        lost_reason = (
-            (
-                f"wrapper pid {entry.pgid} is alive but its process identity "
-                "does not match this job; refusing to adopt a reused process"
-            )
-            if token == "STALE"
-            else (
-                f"wrapper pid {entry.pgid} is not running and "
-                f"{state_dir}/exit_code is missing"
-            )
-        )
-        if entry.status == "lost":
-            # Registries written before lost diagnostics were persisted can
-            # already carry the terminal state with an empty reason. A fresh,
-            # reachable LOST probe is sufficient evidence to repair that
-            # metadata without changing the original terminal timestamp.
-            changed = False
-            if not entry.reason:
-                entry.reason = lost_reason
-                entry.finished_at = entry.finished_at or time.time()
-                changed = True
-            if entry.result_state != "infra_failure":
-                entry.result_state = "infra_failure"
-                changed = True
-            if changed:
-                save(cfg, entry)
-            return entry
-        entry.status = "lost"
-        entry.terminal_finalized_at = None
-        entry.reason = lost_reason
-        entry.finished_at = time.time()
-        entry.result_state = "infra_failure"
+        _mark_lost_from_probe(cfg, entry, token, state_dir)
+        return entry
     save(cfg, entry)
     return entry

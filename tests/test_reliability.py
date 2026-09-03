@@ -546,7 +546,7 @@ def test_status_probe_bounds_job_writable_fields():
     """Probe fields from job-writable files are flattened to one line."""
     import inspect
 
-    source = inspect.getsource(jobs._refresh_status_locked)
+    source = inspect.getsource(jobs._status_probe_script)
 
     assert "dt_probe_field" in source
     assert "cat {state}/exit_code" not in source

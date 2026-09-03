@@ -990,6 +990,185 @@ def _remove_unreferenced_snapshots(
         save_state(cfg, state)
 
 
+def _delete_remote_job_dir(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    managed_dir: str,
+    *,
+    runner: Runner,
+    log: Log,
+) -> CleanFailure | None:
+    """Remove the job directory on its node after a full liveness census."""
+
+    def refuse(kind: str, message: str) -> CleanFailure:
+        log(f"{entry.job_id}: {message}; registry retained")
+        return CleanFailure(
+            job_id=entry.job_id, node=entry.node, kind=kind, message=message
+        )
+
+    # compact's preflight gates, mirrored: a stale row pointing at an
+    # unconfigured node or the wrong locality would rm -rf a nonexistent
+    # per-job slot on the wrong executor, return 0, and delete the only
+    # record still naming the real workdir.
+    node = next((item for item in cfg.nodes if item.name == entry.node), None)
+    if node is None:
+        return refuse(
+            "node_not_configured",
+            f"node {entry.node!r} is not in the configuration",
+        )
+    if node.local != entry.node_local:
+        return refuse(
+            "node_identity_mismatch",
+            f"registry row says node_local={entry.node_local} but "
+            f"the configured node is {'local' if node.local else 'remote'}",
+        )
+    # Every victim gets the full identity census, not a bare kill -0 on the
+    # recorded leader for lost rows only: a dead leader with live in-capsule
+    # orphans, a false-terminal row from an earlier bad postmortem, or an
+    # unprovable probe must all refuse deletion instead of pulling the
+    # directory out from under running processes and unregistering them.
+    identity_file = node_path_expression(
+        job_state_dir(managed_dir, entry.storage_layout) + "/process_start_ticks"
+    )
+    pgid = int(entry.pgid) if isinstance(entry.pgid, int) and entry.pgid > 0 else 0
+    live_guard = (
+        liveness_shell()
+        + "dt_jl_state=$(dt_job_live_state "
+        + f"{node_path_expression(managed_dir)} {pgid} "
+        + f"{shlex.quote(entry.boot_id or '')} {identity_file}); "
+        + '[ "$dt_jl_state" = DEAD ] || '
+        + '{ echo "DT_CLEAN_LIVE $dt_jl_state" >&2; exit 75; }; '
+    )
+    # The census inside live_guard depends on POSIX word splitting; a bare
+    # command would run under the node's login shell, and zsh's no-split
+    # default turns a live census into a false DEAD. Pin bash exactly like
+    # the kill probe does.
+    delete_script = f"{live_guard}rm -rf -- {node_path_expression(managed_dir)}"
+    try:
+        proc = runner(
+            entry.node,
+            entry.node_local,
+            f"bash -c {shlex.quote(delete_script)}",
+            60,
+            False,
+        )
+    except Exception as exc:
+        return refuse(
+            "remote_delete_failed", f"remote delete on {entry.node} failed: {exc}"
+        )
+    if proc.returncode == 0:
+        return None
+    detail = diagnostic_excerpt(proc.stderr, proc.stdout)
+    if proc.returncode == 75 and "DT_CLEAN_LIVE" in detail:
+        unproven = "UNPROVEN" in detail
+        return refuse(
+            "liveness_unproven" if unproven else "state_changed",
+            (
+                "job liveness could not be proven; cleanup refused"
+                if unproven
+                else "job processes are still running; cleanup refused"
+            ),
+        )
+    message = f"remote delete on {entry.node} exited {proc.returncode}"
+    if detail:
+        message += f": {detail}"
+    return refuse("remote_delete_failed", message)
+
+
+def _clean_one_job(
+    cfg: HeadConfig,
+    authorization: CleanAuthorization,
+    *,
+    cutoff_ts: float,
+    projects: set[str] | None,
+    runner: Runner,
+    before_registry_remove: BeforeRegistryRemove | None,
+    log: Log,
+) -> tuple[JobEntry | None, CleanFailure | None]:
+    """Revalidate one authorized victim under its lock and delete it.
+
+    Returns ``(removed_entry, failure)``; exactly one is non-None.
+    """
+    try:
+        entry = load(cfg, authorization.job_id)
+    except (RegistryError, ValueError) as exc:
+        # A row that turned unreadable after the cleanup plan must not abort
+        # the whole sweep; report it and keep going.
+        message = f"registry row became unreadable: {exc}"
+        log(f"{authorization.job_id}: {message}; registry retained")
+        return None, CleanFailure(
+            job_id=authorization.job_id,
+            node=authorization.node,
+            kind="registry_row_unreadable",
+            message=message,
+        )
+    authorized_identity = (
+        authorization.job_id,
+        authorization.node,
+        authorization.node_local,
+        authorization.job_dir,
+        authorization.storage_layout,
+        authorization.updated_at,
+    )
+    current_identity = (
+        (
+            entry.job_id,
+            entry.node,
+            entry.node_local,
+            entry.job_dir,
+            entry.storage_layout,
+            entry.updated_at,
+        )
+        if entry is not None
+        else None
+    )
+    if (
+        entry is None
+        or current_identity != authorized_identity
+        or not _still_cleanable(cfg, entry, cutoff_ts, projects)
+    ):
+        message = "job state or active references changed after cleanup plan"
+        log(f"{authorization.job_id}: {message}; registry retained")
+        return None, CleanFailure(
+            job_id=authorization.job_id,
+            node=authorization.node,
+            kind="state_changed",
+            message=message,
+        )
+    managed_dir = _managed_job_dir(cfg, entry)
+    if managed_dir is None:
+        message = f"refusing unmanaged job_dir {entry.job_dir!r}"
+        log(f"{entry.job_id}: {message}")
+        return None, CleanFailure(
+            job_id=entry.job_id,
+            node=entry.node,
+            kind="unsafe_job_dir",
+            message=message,
+        )
+    if entry.node != "-":
+        failure = _delete_remote_job_dir(
+            cfg, entry, managed_dir, runner=runner, log=log
+        )
+        if failure is not None:
+            return None, failure
+    try:
+        if before_registry_remove is not None:
+            before_registry_remove(entry)
+        for queue in {cfg.queue_dir(), cfg.legacy_queue_dir()}:
+            shutil.rmtree(queue / entry.job_id, ignore_errors=True)
+        remove_record(cfg, entry.job_id)
+    except Exception as exc:
+        message = f"local cleanup failed: {exc}"
+        log(f"{entry.job_id}: {message}; registry retained")
+        return None, CleanFailure(
+            job_id=entry.job_id,
+            node=entry.node,
+            kind="local_cleanup_failed",
+            message=message,
+        )
+    return entry, None
+
+
 def clean_jobs(
     cfg: HeadConfig,
     cutoff_ts: float,
@@ -1017,216 +1196,19 @@ def clean_jobs(
     for selected in victims:
         authorization = _clean_authorization(selected)
         with job_lock(cfg, authorization.job_id):
-            try:
-                entry = load(cfg, authorization.job_id)
-            except (RegistryError, ValueError) as exc:
-                # A row that turned unreadable after the cleanup plan must
-                # not abort the whole sweep; report it and keep going.
-                message = f"registry row became unreadable: {exc}"
-                log(f"{authorization.job_id}: {message}; registry retained")
-                failures.append(
-                    CleanFailure(
-                        job_id=authorization.job_id,
-                        node=authorization.node,
-                        kind="registry_row_unreadable",
-                        message=message,
-                    )
-                )
-                continue
-            authorized_identity = (
-                authorization.job_id,
-                authorization.node,
-                authorization.node_local,
-                authorization.job_dir,
-                authorization.storage_layout,
-                authorization.updated_at,
+            removed, failure = _clean_one_job(
+                cfg,
+                authorization,
+                cutoff_ts=cutoff_ts,
+                projects=projects,
+                runner=runner,
+                before_registry_remove=before_registry_remove,
+                log=log,
             )
-            current_identity = (
-                (
-                    entry.job_id,
-                    entry.node,
-                    entry.node_local,
-                    entry.job_dir,
-                    entry.storage_layout,
-                    entry.updated_at,
-                )
-                if entry is not None
-                else None
-            )
-            if (
-                entry is None
-                or current_identity != authorized_identity
-                or not _still_cleanable(
-                    cfg,
-                    entry,
-                    cutoff_ts,
-                    projects,
-                )
-            ):
-                message = "job state or active references changed after cleanup plan"
-                log(f"{authorization.job_id}: {message}; registry retained")
-                failures.append(
-                    CleanFailure(
-                        job_id=authorization.job_id,
-                        node=authorization.node,
-                        kind="state_changed",
-                        message=message,
-                    )
-                )
-                continue
-            managed_dir = _managed_job_dir(cfg, entry)
-            if managed_dir is None:
-                message = f"refusing unmanaged job_dir {entry.job_dir!r}"
-                log(f"{entry.job_id}: {message}")
-                failures.append(
-                    CleanFailure(
-                        job_id=entry.job_id,
-                        node=entry.node,
-                        kind="unsafe_job_dir",
-                        message=message,
-                    )
-                )
-                continue
-            if entry.node != "-":
-                # compact's preflight gates, mirrored: a stale row pointing at
-                # an unconfigured node or the wrong locality would rm -rf a
-                # nonexistent per-job slot on the wrong executor, return 0,
-                # and delete the only record still naming the real workdir.
-                node = next(
-                    (item for item in cfg.nodes if item.name == entry.node),
-                    None,
-                )
-                if node is None:
-                    message = f"node {entry.node!r} is not in the configuration"
-                    log(f"{entry.job_id}: {message}; registry retained")
-                    failures.append(
-                        CleanFailure(
-                            job_id=entry.job_id,
-                            node=entry.node,
-                            kind="node_not_configured",
-                            message=message,
-                        )
-                    )
-                    continue
-                if node.local != entry.node_local:
-                    message = (
-                        f"registry row says node_local={entry.node_local} but "
-                        f"the configured node is "
-                        f"{'local' if node.local else 'remote'}"
-                    )
-                    log(f"{entry.job_id}: {message}; registry retained")
-                    failures.append(
-                        CleanFailure(
-                            job_id=entry.job_id,
-                            node=entry.node,
-                            kind="node_identity_mismatch",
-                            message=message,
-                        )
-                    )
-                    continue
-                # Every victim gets the full identity census, not a bare
-                # kill -0 on the recorded leader for lost rows only: a dead
-                # leader with live in-capsule orphans, a false-terminal row
-                # from an earlier bad postmortem, or an unprovable probe must
-                # all refuse deletion instead of pulling the directory out
-                # from under running processes and unregistering them.
-                identity_file = node_path_expression(
-                    job_state_dir(managed_dir, entry.storage_layout)
-                    + "/process_start_ticks"
-                )
-                pgid = (
-                    int(entry.pgid)
-                    if isinstance(entry.pgid, int) and entry.pgid > 0
-                    else 0
-                )
-                live_guard = (
-                    liveness_shell()
-                    + "dt_jl_state=$(dt_job_live_state "
-                    + f"{node_path_expression(managed_dir)} {pgid} "
-                    + f"{shlex.quote(entry.boot_id or '')} {identity_file}); "
-                    + '[ "$dt_jl_state" = DEAD ] || '
-                    + '{ echo "DT_CLEAN_LIVE $dt_jl_state" >&2; exit 75; }; '
-                )
-                # The census inside live_guard depends on POSIX word
-                # splitting; a bare command would run under the node's login
-                # shell, and zsh's no-split default turns a live census into
-                # a false DEAD. Pin bash exactly like the kill probe does.
-                delete_script = (
-                    f"{live_guard}rm -rf -- {node_path_expression(managed_dir)}"
-                )
-                try:
-                    proc = runner(
-                        entry.node,
-                        entry.node_local,
-                        f"bash -c {shlex.quote(delete_script)}",
-                        60,
-                        False,
-                    )
-                except Exception as exc:
-                    message = f"remote delete on {entry.node} failed: {exc}"
-                    log(f"{entry.job_id}: {message}; registry retained")
-                    failures.append(
-                        CleanFailure(
-                            job_id=entry.job_id,
-                            node=entry.node,
-                            kind="remote_delete_failed",
-                            message=message,
-                        )
-                    )
-                    continue
-                if proc.returncode != 0:
-                    detail = diagnostic_excerpt(proc.stderr, proc.stdout)
-                    if proc.returncode == 75 and "DT_CLEAN_LIVE" in detail:
-                        unproven = "UNPROVEN" in detail
-                        message = (
-                            "job liveness could not be proven; cleanup refused"
-                            if unproven
-                            else "job processes are still running; cleanup refused"
-                        )
-                        log(f"{entry.job_id}: {message}; registry retained")
-                        failures.append(
-                            CleanFailure(
-                                job_id=entry.job_id,
-                                node=entry.node,
-                                kind=(
-                                    "liveness_unproven" if unproven else "state_changed"
-                                ),
-                                message=message,
-                            )
-                        )
-                        continue
-                    message = f"remote delete on {entry.node} exited {proc.returncode}"
-                    if detail:
-                        message += f": {detail}"
-                    log(f"{entry.job_id}: {message}; registry retained")
-                    failures.append(
-                        CleanFailure(
-                            job_id=entry.job_id,
-                            node=entry.node,
-                            kind="remote_delete_failed",
-                            message=message,
-                        )
-                    )
-                    continue
-            try:
-                if before_registry_remove is not None:
-                    before_registry_remove(entry)
-                for queue in {cfg.queue_dir(), cfg.legacy_queue_dir()}:
-                    shutil.rmtree(queue / entry.job_id, ignore_errors=True)
-                remove_record(cfg, entry.job_id)
-            except Exception as exc:
-                message = f"local cleanup failed: {exc}"
-                log(f"{entry.job_id}: {message}; registry retained")
-                failures.append(
-                    CleanFailure(
-                        job_id=entry.job_id,
-                        node=entry.node,
-                        kind="local_cleanup_failed",
-                        message=message,
-                    )
-                )
-                continue
-            removed_entries.append(entry)
+        if failure is not None:
+            failures.append(failure)
+        if removed is not None:
+            removed_entries.append(removed)
 
     try:
         _remove_unreferenced_snapshots(cfg, removed_entries, cutoff_ts, log)
