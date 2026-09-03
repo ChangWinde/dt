@@ -6985,6 +6985,63 @@ def _queued_node(cfg: HeadConfig, entry: JobEntry, node: Node) -> Node:
     )
 
 
+def _finish_queued_placement(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    placed: JobEntry,
+) -> tuple[str, str | None]:
+    """Publish a placed queued job, honouring a dequeue that raced the launch.
+
+    ``entry`` is updated in place to the registry's final row.
+    """
+    placed.git_sha, placed.git_dirty = entry.git_sha, entry.git_dirty
+    placed.submodule_commits = (
+        dict(entry.submodule_commits) if entry.submodule_commits is not None else None
+    )
+    current = _commit_queued_transition(
+        cfg,
+        placed,
+        expected_attempt=(entry.dispatch_node, entry.dispatch_token),
+    )
+    if current is not None and current.status == "killed":
+        if placed.status == "finished":
+            restored = _restore_finished_after_raced_dequeue(cfg, placed)
+            entry.__dict__.update(restored.__dict__)
+            remove_staging(cfg, entry.job_id)
+            return _existing_dispatch_outcome(restored)
+        # User dequeued mid-dispatch. Keep the fast CLI response, but only
+        # retain killed after a positive remote death verdict.
+        cancel_error = _cancel_placed_launch(placed)
+        if cancel_error is not None:
+            restored = _restore_running_after_cancel_failure(
+                cfg,
+                placed,
+                cancel_error,
+            )
+            entry.__dict__.update(restored.__dict__)
+            remove_staging(cfg, entry.job_id)
+            if restored.status == "running":
+                return "cancel-failed", f"{placed.node}: {cancel_error}"
+            return _existing_dispatch_outcome(restored)
+        recorded = _record_cancelled_inflight_launch(
+            cfg,
+            current,
+            placed,
+        )
+        entry.__dict__.update(recorded.__dict__)
+        remove_staging(cfg, entry.job_id)
+        if recorded.status == "killed":
+            return "killed", placed.node
+        return _existing_dispatch_outcome(recorded)
+    if current is not None:
+        entry.__dict__.update(current.__dict__)
+        remove_staging(cfg, entry.job_id)
+        return _existing_dispatch_outcome(current)
+    entry.__dict__.update(placed.__dict__)
+    remove_staging(cfg, entry.job_id)
+    return _existing_dispatch_outcome(placed)
+
+
 def _sync_queued_job_to_node(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -7307,56 +7364,6 @@ def _dispatch_queued_active(
             return cfg.worker_job_dir(node, entry.job_id)
         return entry.job_dir
 
-    def finish_placement(placed: JobEntry) -> tuple[str, str | None]:
-        placed.git_sha, placed.git_dirty = entry.git_sha, entry.git_dirty
-        placed.submodule_commits = (
-            dict(entry.submodule_commits)
-            if entry.submodule_commits is not None
-            else None
-        )
-        current = _commit_queued_transition(
-            cfg,
-            placed,
-            expected_attempt=(entry.dispatch_node, entry.dispatch_token),
-        )
-        if current is not None and current.status == "killed":
-            if placed.status == "finished":
-                restored = _restore_finished_after_raced_dequeue(cfg, placed)
-                entry.__dict__.update(restored.__dict__)
-                remove_staging(cfg, entry.job_id)
-                return _existing_dispatch_outcome(restored)
-            # User dequeued mid-dispatch. Keep the fast CLI response, but only
-            # retain killed after a positive remote death verdict.
-            cancel_error = _cancel_placed_launch(placed)
-            if cancel_error is not None:
-                restored = _restore_running_after_cancel_failure(
-                    cfg,
-                    placed,
-                    cancel_error,
-                )
-                entry.__dict__.update(restored.__dict__)
-                remove_staging(cfg, entry.job_id)
-                if restored.status == "running":
-                    return "cancel-failed", f"{placed.node}: {cancel_error}"
-                return _existing_dispatch_outcome(restored)
-            recorded = _record_cancelled_inflight_launch(
-                cfg,
-                current,
-                placed,
-            )
-            entry.__dict__.update(recorded.__dict__)
-            remove_staging(cfg, entry.job_id)
-            if recorded.status == "killed":
-                return "killed", placed.node
-            return _existing_dispatch_outcome(recorded)
-        if current is not None:
-            entry.__dict__.update(current.__dict__)
-            remove_staging(cfg, entry.job_id)
-            return _existing_dispatch_outcome(current)
-        entry.__dict__.update(placed.__dict__)
-        remove_staging(cfg, entry.job_id)
-        return _existing_dispatch_outcome(placed)
-
     if entry.dispatch_node is not None:
         hold_reason = _dispatch_claim_hold_reason(entry)
         if hold_reason is not None:
@@ -7392,7 +7399,7 @@ def _dispatch_queued_active(
                 f"recovered {adopted.status} launch on {attempted_node.name} "
                 "before resynchronizing"
             )
-            return finish_placement(adopted)
+            return _finish_queued_placement(cfg, entry, adopted)
         if recovery_error is not None:
             detail = f"dispatch recovery unverified on {attempted_node.name}: {recovery_error}"
             entry.reason = f"blocked: {detail}"
@@ -7535,7 +7542,7 @@ def _dispatch_queued_active(
         return "failed", entry.reason
 
     if placed:
-        return finish_placement(placed)
+        return _finish_queued_placement(cfg, entry, placed)
     if "interrupted" in failure_kinds:
         if entry.status == "queued":
             if entry.dispatch_node is not None:
