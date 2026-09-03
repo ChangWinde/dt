@@ -275,6 +275,151 @@ def forward_laptop(
     )
 
 
+def _claim_fork_repeat(
+    host: Host,
+    cfg: HeadConfig,
+    *,
+    request_id: str,
+    group_intent_sha256: str,
+    repeat: int,
+) -> tuple[
+    list[jobs_mod.JobEntry],
+    group_mod.GroupRequestRecord | None,
+    bool,
+    JsonDict | None,
+    int,
+]:
+    """Claim or resume the durable fork-repeat group.
+
+    Returns ``(entries, group_record, terminal_replay, failure, failure_code)``.
+    """
+    try:
+        group_record = group_mod.locked_claim(
+            cfg,
+            request_id,
+            group_intent_sha256,
+            operation="fork_repeat",
+            requested=repeat,
+        )
+        entries = group_mod.load_entries_or_fail(cfg, group_record)
+        if group_record.state == "confirmed":
+            return (
+                entries,
+                group_record,
+                True,
+                host.group_failure(group_record),
+                group_record.exit_code or 0,
+            )
+        return entries, group_record, False, None, 0
+    except group_mod.GroupRequestConflict as exc:
+        return (
+            [],
+            None,
+            False,
+            {
+                "kind": "idempotency_conflict",
+                "message": str(exc),
+                "reasons": {"request_id": request_id},
+                "exit_code": 1,
+            },
+            1,
+        )
+    except intent_mod.RequestLockError as exc:
+        return (
+            [],
+            None,
+            False,
+            {
+                "kind": "submission_rejected",
+                "message": (
+                    f"request {request_id!r} was not advanced because its "
+                    f"durable lock could not be acquired: {exc}"
+                ),
+                "reasons": {"request_id": request_id},
+                "exit_code": EXIT_ENV,
+            },
+            EXIT_ENV,
+        )
+    except (
+        OSError,
+        ValueError,
+        intent_mod.RequestRecordError,
+        group_mod.GroupRequestError,
+    ) as exc:
+        return (
+            [],
+            None,
+            False,
+            {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} has unreadable durable group "
+                    "state; refusing to submit any additional jobs"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            },
+            EXIT_UNREACHABLE,
+        )
+
+
+def _finalize_fork_repeat(
+    cfg: HeadConfig,
+    *,
+    request_id: str,
+    group_record: group_mod.GroupRequestRecord,
+    group_intent_sha256: str,
+    group_terminal_replay: bool,
+    failure: JsonDict | None,
+    failure_code: int,
+) -> tuple[group_mod.GroupRequestRecord, JsonDict | None, int]:
+    """Write the durable final receipt; return updated record and failure."""
+    if group_terminal_replay:
+        return group_record, failure, failure_code
+    uncertain = bool(
+        failure
+        and failure.get("kind")
+        in {
+            "fork_repeat_submission_interrupted",
+            "submission_unknown",
+            "idempotency_conflict",
+            "uncertain_launch",
+        }
+    )
+    try:
+        group_record = group_mod.locked_transition(
+            cfg,
+            request_id,
+            intent_sha256=group_intent_sha256,
+            state="uncertain" if uncertain else "confirmed",
+            exit_code=None if uncertain else failure_code,
+            error_kind=(str(failure["kind"]) if failure is not None else None),
+            error_message=(
+                str(failure.get("message")) if failure is not None else None
+            ),
+        )
+        return group_record, failure, failure_code
+    except (
+        OSError,
+        ValueError,
+        intent_mod.RequestRecordError,
+        group_mod.GroupRequestError,
+    ) as exc:
+        return (
+            group_record,
+            {
+                "kind": "submission_unknown",
+                "message": (
+                    f"request {request_id!r} did not produce a durable final "
+                    "group receipt; retry only with the same request id"
+                ),
+                "reasons": {"request_id": request_id, "detail": str(exc)},
+                "exit_code": EXIT_UNREACHABLE,
+            },
+            EXIT_UNREACHABLE,
+        )
+
+
 def run(
     host: Host,
     *,
@@ -335,66 +480,32 @@ def run(
                 "max_job_memory_mib": max_job_memory_mib,
             }
         )
-        try:
-            group_record = group_mod.locked_claim(
-                cfg,
-                request_id,
-                group_intent_sha256,
-                operation="fork_repeat",
-                requested=repeat,
-            )
-            entries = group_mod.load_entries_or_fail(cfg, group_record)
-            if group_record.state == "confirmed":
-                group_terminal_replay = True
-                failure = host.group_failure(group_record)
-                failure_code = group_record.exit_code or 0
-        except group_mod.GroupRequestConflict as exc:
-            failure = {
-                "kind": "idempotency_conflict",
-                "message": str(exc),
-                "reasons": {"request_id": request_id},
-                "exit_code": 1,
-            }
-            failure_code = 1
-        except intent_mod.RequestLockError as exc:
-            failure = {
-                "kind": "submission_rejected",
-                "message": (
-                    f"request {request_id!r} was not advanced because its "
-                    f"durable lock could not be acquired: {exc}"
-                ),
-                "reasons": {"request_id": request_id},
-                "exit_code": EXIT_ENV,
-            }
-            failure_code = EXIT_ENV
-        except (
-            OSError,
-            ValueError,
-            intent_mod.RequestRecordError,
-            group_mod.GroupRequestError,
-        ) as exc:
-            failure = {
-                "kind": "submission_unknown",
-                "message": (
-                    f"request {request_id!r} has unreadable durable group "
-                    "state; refusing to submit any additional jobs"
-                ),
-                "reasons": {"request_id": request_id, "detail": str(exc)},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
+        (
+            entries,
+            group_record,
+            group_terminal_replay,
+            failure,
+            failure_code,
+        ) = _claim_fork_repeat(
+            host,
+            cfg,
+            request_id=request_id,
+            group_intent_sha256=group_intent_sha256,
+            repeat=repeat,
+        )
     agent_started: bool | None = None
     agent_checked = False
 
     def ensure_agent(repeat_entry: jobs_mod.JobEntry) -> None:
         nonlocal agent_checked, agent_started
-        if repeat_entry.status != "queued" or agent_checked:
+        if agent_checked:
             return
         from . import agent as agent_mod
 
-        agent_checked = True
-        if agent_mod.alive_pid(cfg) is None:
-            agent_started = agent_mod.start_detached(cfg)
+        started = agent_mod.ensure_for_queued_job(cfg, repeat_entry)
+        if repeat_entry.status == "queued":
+            agent_checked = True
+            agent_started = started
 
     for existing_entry in entries:
         ensure_agent(existing_entry)
@@ -602,46 +713,16 @@ def run(
         request_id is not None
         and group_record is not None
         and group_intent_sha256 is not None
-        and not group_terminal_replay
     ):
-        uncertain = bool(
-            failure
-            and failure.get("kind")
-            in {
-                "fork_repeat_submission_interrupted",
-                "submission_unknown",
-                "idempotency_conflict",
-                "uncertain_launch",
-            }
+        group_record, failure, failure_code = _finalize_fork_repeat(
+            cfg,
+            request_id=request_id,
+            group_record=group_record,
+            group_intent_sha256=group_intent_sha256,
+            group_terminal_replay=group_terminal_replay,
+            failure=failure,
+            failure_code=failure_code,
         )
-        try:
-            group_record = group_mod.locked_transition(
-                cfg,
-                request_id,
-                intent_sha256=group_intent_sha256,
-                state="uncertain" if uncertain else "confirmed",
-                exit_code=None if uncertain else failure_code,
-                error_kind=(str(failure["kind"]) if failure is not None else None),
-                error_message=(
-                    str(failure.get("message")) if failure is not None else None
-                ),
-            )
-        except (
-            OSError,
-            ValueError,
-            intent_mod.RequestRecordError,
-            group_mod.GroupRequestError,
-        ) as exc:
-            failure = {
-                "kind": "submission_unknown",
-                "message": (
-                    f"request {request_id!r} did not produce a durable final "
-                    "group receipt; retry only with the same request id"
-                ),
-                "reasons": {"request_id": request_id, "detail": str(exc)},
-                "exit_code": EXIT_UNREACHABLE,
-            }
-            failure_code = EXIT_UNREACHABLE
 
     cache_mode = (
         "inherited"

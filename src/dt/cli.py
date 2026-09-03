@@ -4220,13 +4220,9 @@ def _ensure_agent_for(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> bool | None:
 
     Returns None when no start was needed, else start_detached's verdict.
     """
-    if entry.status != "queued":
-        return None
     from . import agent as agent_mod
 
-    if agent_mod.alive_pid(cfg) is not None:
-        return None
-    return agent_mod.start_detached(cfg)
+    return agent_mod.ensure_for_queued_job(cfg, entry)
 
 
 def _group_ensure_agent(
