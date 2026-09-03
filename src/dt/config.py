@@ -1021,6 +1021,272 @@ def _parse_job_logs(data: dict[str, Any]) -> JobLogsCfg:
     return JobLogsCfg(max_file_mib=max_file_mib, keep_files=keep_files)
 
 
+@dataclass(frozen=True)
+class _HeadPaths:
+    root: Path
+    worker_root: str
+    envs: str
+    envs_explicit: bool
+    results_root: Path | None
+
+
+def _parse_paths(data: dict[str, Any]) -> _HeadPaths:
+    """Validate and normalize the head `paths` block."""
+    paths = _optional_mapping(data, "paths")
+    _reject_unknown(
+        paths,
+        {"root", "worker_root", "envs", "results"},
+        "paths",
+    )
+    raw_head_root = _nonempty_string(
+        paths.get("root", "~/dt"),
+        "paths.root",
+    )
+    try:
+        head_root_text = normalize_node_root(raw_head_root)
+    except ValueError as exc:
+        raise ConfigError(f"`paths.root` {exc}") from None
+    root = Path(head_root_text).expanduser()
+    raw_worker_root = _nonempty_string(
+        paths.get("worker_root", "~/dt"),
+        "paths.worker_root",
+    )
+    try:
+        worker_root = normalize_node_root(raw_worker_root)
+    except ValueError as exc:
+        raise ConfigError(f"`paths.worker_root` {exc}") from None
+    envs_explicit = "envs" in paths
+    raw_envs = _nonempty_string(
+        paths.get(
+            "envs",
+            node_path(worker_root, "worker", "envs"),
+        ),
+        "paths.envs",
+    )
+    try:
+        envs = normalize_node_root(raw_envs)
+    except ValueError as exc:
+        raise ConfigError(f"`paths.envs` {exc}") from None
+    results_value = paths.get("results")
+    if results_value is not None:
+        raw_results = _nonempty_string(results_value, "paths.results")
+        try:
+            results_path = normalize_node_root(raw_results)
+        except ValueError as exc:
+            raise ConfigError(f"`paths.results` {exc}") from None
+        results_root = Path(results_path).expanduser()
+    else:
+        results_root = None
+    return _HeadPaths(
+        root=root,
+        worker_root=worker_root,
+        envs=envs,
+        envs_explicit=envs_explicit,
+        results_root=results_root,
+    )
+
+
+def _parse_projects(data: dict[str, Any]) -> dict[str, Project]:
+    """Validate the head `projects` block."""
+    raw_projects = _optional_mapping(data, "projects")
+    _require_item_limit(len(raw_projects), "projects", MAX_PROJECTS)
+    projects: dict[str, Project] = {}
+    for raw_name, p in raw_projects.items():
+        name = _config_id(raw_name, "projects name")
+        if name in projects:
+            raise ConfigError(
+                f"projects has duplicate name {name!r} after normalization"
+            )
+        if isinstance(p, dict):
+            _reject_unknown(
+                p,
+                {"path", "setup", "setup_inputs", "extras"},
+                f"project {name!r}",
+            )
+            if "path" not in p:
+                raise ConfigError(f"project {name!r} needs a `path`")
+            project_path = _project_root(p["path"], f"projects.{name}.path")
+            raw_setup = p.get("setup")
+            setup = (
+                _nonempty_string(raw_setup, f"projects.{name}.setup")
+                if raw_setup is not None
+                else None
+            )
+            setup_inputs = _parse_setup_inputs(name, p.get("setup_inputs"))
+            if setup_inputs is not None and setup is None:
+                raise ConfigError(
+                    f"project {name!r} has `setup_inputs` but no `setup` hook"
+                )
+            raw_extras = p.get("extras")
+            if raw_extras is None:
+                extras: list[str] = []
+            elif not isinstance(raw_extras, list):
+                raise ConfigError(f"project {name!r} `extras` must be a list")
+            else:
+                _require_item_limit(
+                    len(raw_extras),
+                    f"projects.{name}.extras",
+                    MAX_PROJECT_EXTRAS,
+                )
+                extras = []
+                for extra in raw_extras:
+                    normalized_extra = _config_id(
+                        extra,
+                        f"projects.{name}.extras[]",
+                    )
+                    if normalized_extra not in extras:
+                        extras.append(normalized_extra)
+            projects[name] = Project(
+                path=project_path,
+                setup=setup,
+                setup_inputs=setup_inputs,
+                extras=extras,
+            )
+        else:
+            project_path = _project_root(p, f"projects.{name}")
+            projects[name] = Project(path=project_path)
+    return projects
+
+
+def _parse_queue(data: dict[str, Any]) -> QueueCfg:
+    """Validate the head `queue` block."""
+    qraw = _optional_mapping(data, "queue")
+    _reject_unknown(
+        qraw,
+        {
+            "poll_s",
+            "active_poll_s",
+            "max_my_jobs",
+            "reserve_free_per_node",
+            "auto_clean_days",
+            "auto_compact_hours",
+        },
+        "queue",
+    )
+    max_jobs = qraw.get("max_my_jobs")
+    auto_clean = qraw.get("auto_clean_days")
+    auto_compact_raw = qraw.get("auto_compact_hours", DEFAULT_AUTO_COMPACT_HOURS)
+    poll_s = _integer(qraw.get("poll_s", 60), "queue.poll_s")
+    active_poll_s = _finite_number(
+        qraw.get("active_poll_s", 2.0), "queue.active_poll_s"
+    )
+    if not 0 < poll_s <= MAX_QUEUE_POLL_S:
+        raise ConfigError(
+            f"queue `poll_s` must be between 1 and {MAX_QUEUE_POLL_S} seconds"
+        )
+    if not 0 < active_poll_s <= MAX_QUEUE_ACTIVE_POLL_S:
+        raise ConfigError(
+            "queue `active_poll_s` must be a finite positive number no greater "
+            f"than {MAX_QUEUE_ACTIVE_POLL_S:g} seconds"
+        )
+    parsed_max_jobs = (
+        _integer(max_jobs, "queue.max_my_jobs") if max_jobs is not None else None
+    )
+    if parsed_max_jobs is not None and parsed_max_jobs <= 0:
+        raise ConfigError("queue `max_my_jobs` must be a positive integer")
+    reserve_free = _integer(
+        qraw.get("reserve_free_per_node", 0),
+        "queue.reserve_free_per_node",
+    )
+    if reserve_free < 0:
+        raise ConfigError("queue `reserve_free_per_node` must be non-negative")
+    parsed_auto_clean = (
+        _finite_number(auto_clean, "queue.auto_clean_days")
+        if auto_clean is not None
+        else None
+    )
+    if parsed_auto_clean is not None and parsed_auto_clean <= 0:
+        raise ConfigError("queue `auto_clean_days` must be a finite positive number")
+    # ``false`` is the explicit opt-out; a number is the terminal age after
+    # which node-side code copies are reclaimed.
+    parsed_auto_compact: float | None
+    if auto_compact_raw is False:
+        parsed_auto_compact = None
+    elif auto_compact_raw is True:
+        raise ConfigError(
+            "queue `auto_compact_hours` takes the terminal age in hours "
+            f"(default {DEFAULT_AUTO_COMPACT_HOURS:g}) or `false`, not `true`"
+        )
+    else:
+        parsed_auto_compact = _finite_number(
+            auto_compact_raw, "queue.auto_compact_hours"
+        )
+        if not 0 < parsed_auto_compact <= MAX_AUTO_COMPACT_HOURS:
+            raise ConfigError(
+                "queue `auto_compact_hours` must be `false` or a finite "
+                f"positive number no greater than {MAX_AUTO_COMPACT_HOURS:g}"
+            )
+    queue = QueueCfg(
+        poll_s=poll_s,
+        active_poll_s=active_poll_s,
+        max_my_jobs=parsed_max_jobs,
+        reserve_free_per_node=reserve_free,
+        auto_clean_days=parsed_auto_clean,
+        auto_compact_hours=parsed_auto_compact,
+    )
+    return queue
+
+
+@dataclass(frozen=True)
+class _HeadLimits:
+    mem_threshold_mib: int
+    disk_min_gib: int
+    snapshot_warn_gib: float
+    snapshot_excludes: list[str]
+    webhook: str | None
+    proxy: str | None
+
+
+def _parse_head_limits(data: dict[str, Any]) -> _HeadLimits:
+    """Validate the scalar head thresholds, excludes, webhook, and proxy."""
+    mem_threshold_mib = _integer(
+        data.get("mem_threshold_mib", 500), "mem_threshold_mib"
+    )
+    disk_min_gib = _integer(data.get("disk_min_gib", 10), "disk_min_gib")
+    snapshot_warn_gib = _finite_number(
+        data.get("snapshot_warn_gib", 2.0), "snapshot_warn_gib"
+    )
+    if mem_threshold_mib <= 0:
+        raise ConfigError(
+            "`mem_threshold_mib` must be positive; 0 marks every GPU busy "
+            "and stalls the whole center"
+        )
+    if disk_min_gib < 0:
+        raise ConfigError("`disk_min_gib` must be non-negative")
+    if snapshot_warn_gib < 0:
+        raise ConfigError("`snapshot_warn_gib` must be non-negative")
+    raw_excludes = data.get("snapshot_excludes")
+    if raw_excludes is None:
+        excludes: list[str] = []
+    elif not isinstance(raw_excludes, list):
+        raise ConfigError("`snapshot_excludes` must be a list of strings")
+    else:
+        _require_item_limit(
+            len(raw_excludes),
+            "snapshot_excludes",
+            MAX_SNAPSHOT_EXCLUDES,
+        )
+        excludes = [_snapshot_exclude(item) for item in raw_excludes]
+    raw_webhook = data.get("webhook")
+    webhook = _webhook_url(raw_webhook) if raw_webhook is not None else None
+    raw_proxy = data.get("proxy")
+    if raw_proxy is None:
+        proxy = None
+    else:
+        # The value is exported verbatim as HTTP_PROXY/HTTPS_PROXY for
+        # every job and environment build, so it must be a real HTTP(S)
+        # proxy URL, mirroring the webhook validation.
+        proxy = _http_url(raw_proxy, "proxy", noun="proxy URL")
+    return _HeadLimits(
+        mem_threshold_mib=mem_threshold_mib,
+        disk_min_gib=disk_min_gib,
+        snapshot_warn_gib=snapshot_warn_gib,
+        snapshot_excludes=excludes,
+        webhook=webhook,
+        proxy=proxy,
+    )
+
+
 def parse(data: object) -> HeadConfig | LaptopConfig:
     if not isinstance(data, dict) or not data:
         raise ConfigError("config file is empty or not a mapping")
@@ -1088,184 +1354,9 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             "head config",
         )
         center = _config_id(data["center"], "center")
-        paths = _optional_mapping(data, "paths")
-        _reject_unknown(
-            paths,
-            {"root", "worker_root", "envs", "results"},
-            "paths",
-        )
-        raw_head_root = _nonempty_string(
-            paths.get("root", "~/dt"),
-            "paths.root",
-        )
-        try:
-            head_root_text = normalize_node_root(raw_head_root)
-        except ValueError as exc:
-            raise ConfigError(f"`paths.root` {exc}") from None
-        root = Path(head_root_text).expanduser()
-        raw_worker_root = _nonempty_string(
-            paths.get("worker_root", "~/dt"),
-            "paths.worker_root",
-        )
-        try:
-            worker_root = normalize_node_root(raw_worker_root)
-        except ValueError as exc:
-            raise ConfigError(f"`paths.worker_root` {exc}") from None
-        envs_explicit = "envs" in paths
-        raw_envs = _nonempty_string(
-            paths.get(
-                "envs",
-                node_path(worker_root, "worker", "envs"),
-            ),
-            "paths.envs",
-        )
-        try:
-            envs = normalize_node_root(raw_envs)
-        except ValueError as exc:
-            raise ConfigError(f"`paths.envs` {exc}") from None
-        results_value = paths.get("results")
-        if results_value is not None:
-            raw_results = _nonempty_string(results_value, "paths.results")
-            try:
-                results_path = normalize_node_root(raw_results)
-            except ValueError as exc:
-                raise ConfigError(f"`paths.results` {exc}") from None
-            results_root = Path(results_path).expanduser()
-        else:
-            results_root = None
-        raw_projects = _optional_mapping(data, "projects")
-        _require_item_limit(len(raw_projects), "projects", MAX_PROJECTS)
-        projects: dict[str, Project] = {}
-        for raw_name, p in raw_projects.items():
-            name = _config_id(raw_name, "projects name")
-            if name in projects:
-                raise ConfigError(
-                    f"projects has duplicate name {name!r} after normalization"
-                )
-            if isinstance(p, dict):
-                _reject_unknown(
-                    p,
-                    {"path", "setup", "setup_inputs", "extras"},
-                    f"project {name!r}",
-                )
-                if "path" not in p:
-                    raise ConfigError(f"project {name!r} needs a `path`")
-                project_path = _project_root(p["path"], f"projects.{name}.path")
-                raw_setup = p.get("setup")
-                setup = (
-                    _nonempty_string(raw_setup, f"projects.{name}.setup")
-                    if raw_setup is not None
-                    else None
-                )
-                setup_inputs = _parse_setup_inputs(name, p.get("setup_inputs"))
-                if setup_inputs is not None and setup is None:
-                    raise ConfigError(
-                        f"project {name!r} has `setup_inputs` but no `setup` hook"
-                    )
-                raw_extras = p.get("extras")
-                if raw_extras is None:
-                    extras: list[str] = []
-                elif not isinstance(raw_extras, list):
-                    raise ConfigError(f"project {name!r} `extras` must be a list")
-                else:
-                    _require_item_limit(
-                        len(raw_extras),
-                        f"projects.{name}.extras",
-                        MAX_PROJECT_EXTRAS,
-                    )
-                    extras = []
-                    for extra in raw_extras:
-                        normalized_extra = _config_id(
-                            extra,
-                            f"projects.{name}.extras[]",
-                        )
-                        if normalized_extra not in extras:
-                            extras.append(normalized_extra)
-                projects[name] = Project(
-                    path=project_path,
-                    setup=setup,
-                    setup_inputs=setup_inputs,
-                    extras=extras,
-                )
-            else:
-                project_path = _project_root(p, f"projects.{name}")
-                projects[name] = Project(path=project_path)
-        qraw = _optional_mapping(data, "queue")
-        _reject_unknown(
-            qraw,
-            {
-                "poll_s",
-                "active_poll_s",
-                "max_my_jobs",
-                "reserve_free_per_node",
-                "auto_clean_days",
-                "auto_compact_hours",
-            },
-            "queue",
-        )
-        max_jobs = qraw.get("max_my_jobs")
-        auto_clean = qraw.get("auto_clean_days")
-        auto_compact_raw = qraw.get("auto_compact_hours", DEFAULT_AUTO_COMPACT_HOURS)
-        poll_s = _integer(qraw.get("poll_s", 60), "queue.poll_s")
-        active_poll_s = _finite_number(
-            qraw.get("active_poll_s", 2.0), "queue.active_poll_s"
-        )
-        if not 0 < poll_s <= MAX_QUEUE_POLL_S:
-            raise ConfigError(
-                f"queue `poll_s` must be between 1 and {MAX_QUEUE_POLL_S} seconds"
-            )
-        if not 0 < active_poll_s <= MAX_QUEUE_ACTIVE_POLL_S:
-            raise ConfigError(
-                "queue `active_poll_s` must be a finite positive number no greater "
-                f"than {MAX_QUEUE_ACTIVE_POLL_S:g} seconds"
-            )
-        parsed_max_jobs = (
-            _integer(max_jobs, "queue.max_my_jobs") if max_jobs is not None else None
-        )
-        if parsed_max_jobs is not None and parsed_max_jobs <= 0:
-            raise ConfigError("queue `max_my_jobs` must be a positive integer")
-        reserve_free = _integer(
-            qraw.get("reserve_free_per_node", 0),
-            "queue.reserve_free_per_node",
-        )
-        if reserve_free < 0:
-            raise ConfigError("queue `reserve_free_per_node` must be non-negative")
-        parsed_auto_clean = (
-            _finite_number(auto_clean, "queue.auto_clean_days")
-            if auto_clean is not None
-            else None
-        )
-        if parsed_auto_clean is not None and parsed_auto_clean <= 0:
-            raise ConfigError(
-                "queue `auto_clean_days` must be a finite positive number"
-            )
-        # ``false`` is the explicit opt-out; a number is the terminal age after
-        # which node-side code copies are reclaimed.
-        parsed_auto_compact: float | None
-        if auto_compact_raw is False:
-            parsed_auto_compact = None
-        elif auto_compact_raw is True:
-            raise ConfigError(
-                "queue `auto_compact_hours` takes the terminal age in hours "
-                f"(default {DEFAULT_AUTO_COMPACT_HOURS:g}) or `false`, not `true`"
-            )
-        else:
-            parsed_auto_compact = _finite_number(
-                auto_compact_raw, "queue.auto_compact_hours"
-            )
-            if not 0 < parsed_auto_compact <= MAX_AUTO_COMPACT_HOURS:
-                raise ConfigError(
-                    "queue `auto_compact_hours` must be `false` or a finite "
-                    f"positive number no greater than {MAX_AUTO_COMPACT_HOURS:g}"
-                )
-        queue = QueueCfg(
-            poll_s=poll_s,
-            active_poll_s=active_poll_s,
-            max_my_jobs=parsed_max_jobs,
-            reserve_free_per_node=reserve_free,
-            auto_clean_days=parsed_auto_clean,
-            auto_compact_hours=parsed_auto_compact,
-        )
+        head_paths = _parse_paths(data)
+        projects = _parse_projects(data)
+        queue = _parse_queue(data)
         default_project = data.get("default_project")
         if default_project is not None:
             default_project = _nonempty_string(default_project, "default_project")
@@ -1273,44 +1364,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 raise ConfigError(
                     f"`default_project` {default_project!r} is not in configured projects"
                 )
-        mem_threshold_mib = _integer(
-            data.get("mem_threshold_mib", 500), "mem_threshold_mib"
-        )
-        disk_min_gib = _integer(data.get("disk_min_gib", 10), "disk_min_gib")
-        snapshot_warn_gib = _finite_number(
-            data.get("snapshot_warn_gib", 2.0), "snapshot_warn_gib"
-        )
-        if mem_threshold_mib <= 0:
-            raise ConfigError(
-                "`mem_threshold_mib` must be positive; 0 marks every GPU busy "
-                "and stalls the whole center"
-            )
-        if disk_min_gib < 0:
-            raise ConfigError("`disk_min_gib` must be non-negative")
-        if snapshot_warn_gib < 0:
-            raise ConfigError("`snapshot_warn_gib` must be non-negative")
-        raw_excludes = data.get("snapshot_excludes")
-        if raw_excludes is None:
-            excludes: list[str] = []
-        elif not isinstance(raw_excludes, list):
-            raise ConfigError("`snapshot_excludes` must be a list of strings")
-        else:
-            _require_item_limit(
-                len(raw_excludes),
-                "snapshot_excludes",
-                MAX_SNAPSHOT_EXCLUDES,
-            )
-            excludes = [_snapshot_exclude(item) for item in raw_excludes]
-        raw_webhook = data.get("webhook")
-        webhook = _webhook_url(raw_webhook) if raw_webhook is not None else None
-        raw_proxy = data.get("proxy")
-        if raw_proxy is None:
-            proxy = None
-        else:
-            # The value is exported verbatim as HTTP_PROXY/HTTPS_PROXY for
-            # every job and environment build, so it must be a real HTTP(S)
-            # proxy URL, mirroring the webhook validation.
-            proxy = _http_url(raw_proxy, "proxy", noun="proxy URL")
+        limits = _parse_head_limits(data)
         nodes = _parse_nodes(data.get("nodes") or [])
         raw_sites = _mapping(data["sites"], "sites") if "sites" in data else None
         sites = _parse_sites(raw_sites, nodes)
@@ -1319,21 +1373,21 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             nodes=nodes,
             projects=projects,
             default_project=default_project,
-            root=root,
-            envs=envs,
-            worker_root=worker_root,
-            envs_explicit=envs_explicit,
-            results_root=results_root,
-            mem_threshold_mib=mem_threshold_mib,
-            disk_min_gib=disk_min_gib,
+            root=head_paths.root,
+            envs=head_paths.envs,
+            worker_root=head_paths.worker_root,
+            envs_explicit=head_paths.envs_explicit,
+            results_root=head_paths.results_root,
+            mem_threshold_mib=limits.mem_threshold_mib,
+            disk_min_gib=limits.disk_min_gib,
             queue=queue,
             operations=_parse_operations(data),
             job_logs=_parse_job_logs(data),
             sites=sites,
-            webhook=webhook,
-            snapshot_excludes=excludes,
-            snapshot_warn_gib=snapshot_warn_gib,
-            proxy=proxy,
+            webhook=limits.webhook,
+            snapshot_excludes=limits.snapshot_excludes,
+            snapshot_warn_gib=limits.snapshot_warn_gib,
+            proxy=limits.proxy,
             layout=ROLE_LAYOUT,
         )
 
