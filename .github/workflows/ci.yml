@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update --quiet
           sudo apt-get install --yes --no-install-recommends \
-            openssh-server rsync zsh
+            openssh-server rsync shellcheck zsh
 
       - name: Sync locked development environment
         env:
@@ -93,9 +93,10 @@ jobs:
             scripts/benchmark_control_plane.py \
             scripts/benchmark_remote_plane.py scripts/docs.py \
             scripts/release_contract.py scripts/repo_hygiene.py
-          bash -n src/dt/payload/*.sh bootstrap.sh scripts/deploy.sh \
-            install.sh scripts/package-check.sh scripts/release-check.sh \
-            scripts/security-check.sh
+          bash -n src/dt/payload/*.sh src/dt/shell/*.sh bootstrap.sh \
+            scripts/deploy.sh install.sh scripts/package-check.sh \
+            scripts/release-check.sh scripts/security-check.sh
+          shellcheck --shell=sh src/dt/shell/*.sh
           git diff --check
 
       - name: Build and install package artifacts
