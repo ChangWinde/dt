@@ -5643,6 +5643,216 @@ def _submit_fork_locked(
     )
 
 
+def _resolve_prior_request(
+    cfg: HeadConfig,
+    request_id: str,
+    record: intent_mod.RequestRecord,
+) -> tuple[intent_mod.RequestRecord, JobEntry | None]:
+    """Decide what a prior durable receipt for ``request_id`` means.
+
+    Returns ``(record, replayed)``: when ``replayed`` is a JobEntry the request
+    already completed and that job is the answer; otherwise ``record`` is
+    authorized for replay and the caller may proceed to claim it.
+    """
+    try:
+        record, existing = reconcile_submission_request(cfg, record)
+    except (
+        OSError,
+        RegistryError,
+        intent_mod.RequestRecordError,
+        ValueError,
+    ) as exc:
+        raise RequestOutcomeUnknown(
+            request_id,
+            record.job_id,
+            f"request {request_id!r} has a job record but its "
+            "durable receipt could not be reconciled; inspect "
+            f"`dt request {request_id} --json` before retrying",
+        ) from exc
+    if record.state == "confirmed" and existing is not None:
+        if record.error_kind == "failed_before_start":
+            raise FailedBeforeStart(existing)
+        setattr(existing, "_request_replayed", True)
+        return record, existing
+    if record.state == "confirmed" and existing is None:
+        raise RequestRejected(
+            f"request {request_id!r} was already confirmed as job "
+            f"{record.job_id}, but its job history was cleaned; "
+            "refusing a duplicate submission"
+        )
+    if record.state == "rejected":
+        disposition = intent_mod.resolve_disposition(
+            record,
+            registry_job_present=existing is not None,
+        )
+        if disposition.retry_safe:
+            # The rejection provably never crossed the launch boundary
+            # (placement refusal, unreachable transport, or an interrupted
+            # bulk transfer). Reopen the same identity via the normal replay
+            # path instead of replaying a terminal receipt forever.
+            record = intent_mod.authorize_replay(record, disposition)
+        else:
+            detail = record.error_message or "submission was rejected"
+            raise RequestRejected(
+                f"request {request_id!r} was already rejected: {detail}"
+            )
+    if record.state != "replay_authorized":
+        raise RequestOutcomeUnknown(
+            request_id,
+            record.job_id,
+            f"request {request_id!r} may have been submitted as "
+            f"{record.job_id}; inspect `dt request {request_id} --json` "
+            "before retrying",
+        )
+    if existing is not None:
+        raise RequestOutcomeUnknown(
+            request_id,
+            record.job_id,
+            f"request {request_id!r} was authorized for replay but job "
+            f"{record.job_id} appeared; inspect it before retrying",
+        )
+    return record, None
+
+
+def _claim_request_identity(
+    cfg: HeadConfig,
+    spec: RunSpec,
+    request_id: str,
+    intent_sha256: str,
+    record: intent_mod.RequestRecord | None,
+) -> tuple[str, intent_mod.RequestRecord]:
+    """Persist the preparing claim: a fresh identity or a reclaimed replay."""
+    if record is None:
+        job_id = new_job_id(spec.name)
+        record = intent_mod.create(request_id, intent_sha256, job_id)
+        try:
+            intent_mod.save(cfg, record)
+        except intent_mod.RequestDurabilityUnknown as exc:
+            raise RequestOutcomeUnknown(
+                request_id,
+                job_id,
+                f"request {request_id!r} was not launched because its durable "
+                "claim durability is unknown; inspect "
+                f"`dt request {request_id} --json` before retrying",
+            ) from exc
+        except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+            # The launch boundary has not been crossed. Report a known safe
+            # rejection instead of leaking an OSError/traceback or inviting a
+            # retry whose durable identity was never proven.
+            raise RequestRejected(
+                f"request {request_id!r} was not launched because its durable "
+                f"claim could not be persisted: {exc}"
+            ) from exc
+        return job_id, record
+    job_id = record.job_id
+    try:
+        record = intent_mod.reclaim_replay(record)
+        intent_mod.save(cfg, record)
+    except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+        # A failed atomic replace may leave either the durable authorization
+        # or the reclaimed preparing state visible. Both are launch-free, but
+        # only a fresh query can prove which.
+        raise RequestOutcomeUnknown(
+            request_id,
+            job_id,
+            f"request {request_id!r} replay claim durability is unknown; "
+            f"inspect `dt request {request_id} --json` before retrying",
+        ) from exc
+    return job_id, record
+
+
+def _record_submission_failure(
+    cfg: HeadConfig,
+    *,
+    request_id: str,
+    job_id: str,
+    record: intent_mod.RequestRecord,
+    exc: BaseException,
+    claimed_action_in_progress: bool,
+) -> None:
+    """Persist the durable verdict for a submission that raised ``exc``.
+
+    Raises RequestOutcomeUnknown if the verdict itself could not be saved.
+    """
+    try:
+        existing = load(cfg, job_id)
+    except (RegistryError, ValueError):
+        existing = None
+    if claimed_action_in_progress:
+        # The compute launch boundary has not been crossed. A callback that
+        # marked its failure retry-safe (an interrupted transfer into
+        # convergent remote state) may reopen this identity; any other
+        # callback may have partially changed its remote destination, so
+        # reject durably and never run it again.
+        state = "rejected"
+        error_kind = (
+            "claimed_action_interrupted"
+            if getattr(exc, "retry_safe", False)
+            else "claimed_action_failed"
+        )
+    elif isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        state = "uncertain"
+        error_kind = "interrupted"
+    elif existing is not None and (existing.reason or "").startswith(
+        UNCERTAIN_LAUNCH_PREFIX
+    ):
+        state = "uncertain"
+        error_kind = "launch_outcome_unknown"
+    elif isinstance(exc, FailedBeforeStart) and existing is not None:
+        state = "confirmed"
+        error_kind = "failed_before_start"
+    elif isinstance(exc, (ConfigError, DispatchError, NoCapacity, NoReachableNode)):
+        state = "rejected"
+        error_kind = type(exc).__name__
+    else:
+        # Unexpected local I/O or serialization errors can happen after the
+        # remote launcher accepted the job but before its registry row became
+        # visible.  Fail closed so retrying this request id can never launch
+        # a second long-running task.
+        state = "uncertain"
+        error_kind = type(exc).__name__
+    try:
+        latest_record = intent_mod.load(cfg, request_id) or record
+        intent_mod.save(
+            cfg,
+            intent_mod.transition(
+                latest_record,
+                state,
+                error_kind=error_kind,
+                error_message=str(exc),
+            ),
+        )
+    except (OSError, intent_mod.RequestRecordError, ValueError) as persistence_exc:
+        raise RequestOutcomeUnknown(
+            request_id,
+            job_id,
+            f"request {request_id!r} did not return a durable final "
+            f"receipt; inspect `dt request {request_id} --json` "
+            "before retrying",
+        ) from persistence_exc
+
+
+def _confirm_request(
+    cfg: HeadConfig,
+    *,
+    request_id: str,
+    job_id: str,
+    record: intent_mod.RequestRecord,
+) -> None:
+    """Persist the confirmed receipt for a job that was registered."""
+    try:
+        latest_record = intent_mod.load(cfg, request_id) or record
+        intent_mod.save(cfg, intent_mod.transition(latest_record, "confirmed"))
+    except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
+        raise RequestOutcomeUnknown(
+            request_id,
+            job_id,
+            f"request {request_id!r} created job {job_id}, but its durable "
+            "confirmation could not be persisted; inspect "
+            f"`dt request {request_id} --json` before retrying",
+        ) from exc
+
+
 def _submit_prepared(
     cfg: HeadConfig,
     spec: RunSpec,
@@ -5793,108 +6003,16 @@ def _submit_prepared(
                 f"request {request_id!r} already belongs to a different intent"
             )
         if record is not None:
-            try:
-                record, existing = reconcile_submission_request(cfg, record)
-            except (
-                OSError,
-                RegistryError,
-                intent_mod.RequestRecordError,
-                ValueError,
-            ) as exc:
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    record.job_id,
-                    f"request {request_id!r} has a job record but its "
-                    "durable receipt could not be reconciled; inspect "
-                    f"`dt request {request_id} --json` before retrying",
-                ) from exc
-            if record.state == "confirmed" and existing is not None:
-                if record.error_kind == "failed_before_start":
-                    raise FailedBeforeStart(existing)
-                setattr(existing, "_request_replayed", True)
-                return existing
-            if record.state == "confirmed" and existing is None:
-                raise RequestRejected(
-                    f"request {request_id!r} was already confirmed as job "
-                    f"{record.job_id}, but its job history was cleaned; "
-                    "refusing a duplicate submission"
-                )
-            if record.state == "rejected":
-                disposition = intent_mod.resolve_disposition(
-                    record,
-                    registry_job_present=existing is not None,
-                )
-                if disposition.retry_safe:
-                    # The rejection provably never crossed the launch boundary
-                    # (placement refusal, unreachable transport, or an
-                    # interrupted bulk transfer). Reopen the same identity via
-                    # the normal replay path instead of replaying a terminal
-                    # receipt forever.
-                    record = intent_mod.authorize_replay(record, disposition)
-                else:
-                    detail = record.error_message or "submission was rejected"
-                    raise RequestRejected(
-                        f"request {request_id!r} was already rejected: {detail}"
-                    )
-            if record.state != "replay_authorized":
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    record.job_id,
-                    f"request {request_id!r} may have been submitted as "
-                    f"{record.job_id}; inspect `dt request {request_id} --json` "
-                    "before retrying",
-                )
-            if existing is not None:
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    record.job_id,
-                    f"request {request_id!r} was authorized for replay but job "
-                    f"{record.job_id} appeared; inspect it before retrying",
-                )
+            record, replayed = _resolve_prior_request(cfg, request_id, record)
+            if replayed is not None:
+                return replayed
 
         # Close the small race in which an incompatible supervisor starts
         # after the first check but before a new or replayed durable claim.
         require_compatible_resident_agent(cfg)
-        if record is None:
-            job_id = new_job_id(spec.name)
-            record = intent_mod.create(request_id, intent_sha256, job_id)
-            try:
-                intent_mod.save(cfg, record)
-            except intent_mod.RequestDurabilityUnknown as exc:
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    job_id,
-                    f"request {request_id!r} was not launched because its durable "
-                    "claim durability is unknown; inspect "
-                    f"`dt request {request_id} --json` before retrying",
-                ) from exc
-            except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
-                # The launch boundary has not been crossed. Report a known safe
-                # rejection instead of leaking an OSError/traceback or inviting a
-                # retry whose durable identity was never proven.
-                raise RequestRejected(
-                    f"request {request_id!r} was not launched because its durable "
-                    f"claim could not be persisted: {exc}"
-                ) from exc
-        else:
-            job_id = record.job_id
-            try:
-                record = intent_mod.reclaim_replay(record)
-                intent_mod.save(cfg, record)
-            except (
-                OSError,
-                intent_mod.RequestRecordError,
-                ValueError,
-            ) as exc:
-                # A failed atomic replace may leave either the durable
-                # authorization or the reclaimed preparing state visible.
-                # Both are launch-free, but only a fresh query can prove which.
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    job_id,
-                    f"request {request_id!r} replay claim durability is unknown; "
-                    f"inspect `dt request {request_id} --json` before retrying",
-                ) from exc
+        job_id, record = _claim_request_identity(
+            cfg, spec, request_id, intent_sha256, record
+        )
         claimed_action_in_progress = claimed_action is not None
         try:
             if claimed_action is not None:
@@ -5916,81 +6034,16 @@ def _submit_prepared(
                 submitted_at=record.created_at,
             )
         except BaseException as exc:
-            try:
-                existing = load(cfg, job_id)
-            except (RegistryError, ValueError):
-                existing = None
-            if claimed_action_in_progress:
-                # The compute launch boundary has not been crossed. A callback
-                # that marked its failure retry-safe (an interrupted transfer
-                # into convergent remote state) may reopen this identity; any
-                # other callback may have partially changed its remote
-                # destination, so reject durably and never run it again.
-                state = "rejected"
-                error_kind = (
-                    "claimed_action_interrupted"
-                    if getattr(exc, "retry_safe", False)
-                    else "claimed_action_failed"
-                )
-            elif isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                state = "uncertain"
-                error_kind = "interrupted"
-            elif existing is not None and (existing.reason or "").startswith(
-                UNCERTAIN_LAUNCH_PREFIX
-            ):
-                state = "uncertain"
-                error_kind = "launch_outcome_unknown"
-            elif isinstance(exc, FailedBeforeStart) and existing is not None:
-                state = "confirmed"
-                error_kind = "failed_before_start"
-            elif isinstance(
-                exc,
-                (ConfigError, DispatchError, NoCapacity, NoReachableNode),
-            ):
-                state = "rejected"
-                error_kind = type(exc).__name__
-            else:
-                # Unexpected local I/O or serialization errors can happen
-                # after the remote launcher accepted the job but before its
-                # registry row became visible.  Fail closed so retrying this
-                # request id can never launch a second long-running task.
-                state = "uncertain"
-                error_kind = type(exc).__name__
-            try:
-                latest_record = intent_mod.load(cfg, request_id) or record
-                intent_mod.save(
-                    cfg,
-                    intent_mod.transition(
-                        latest_record,
-                        state,
-                        error_kind=error_kind,
-                        error_message=str(exc),
-                    ),
-                )
-            except (
-                OSError,
-                intent_mod.RequestRecordError,
-                ValueError,
-            ) as persistence_exc:
-                raise RequestOutcomeUnknown(
-                    request_id,
-                    job_id,
-                    f"request {request_id!r} did not return a durable final "
-                    f"receipt; inspect `dt request {request_id} --json` "
-                    "before retrying",
-                ) from persistence_exc
+            _record_submission_failure(
+                cfg,
+                request_id=request_id,
+                job_id=job_id,
+                record=record,
+                exc=exc,
+                claimed_action_in_progress=claimed_action_in_progress,
+            )
             raise
-        try:
-            latest_record = intent_mod.load(cfg, request_id) or record
-            intent_mod.save(cfg, intent_mod.transition(latest_record, "confirmed"))
-        except (OSError, intent_mod.RequestRecordError, ValueError) as exc:
-            raise RequestOutcomeUnknown(
-                request_id,
-                job_id,
-                f"request {request_id!r} created job {job_id}, but its durable "
-                "confirmation could not be persisted; inspect "
-                f"`dt request {request_id} --json` before retrying",
-            ) from exc
+        _confirm_request(cfg, request_id=request_id, job_id=job_id, record=record)
         return entry
     finally:
         _HELD_REQUEST_ID.reset(request_owner_token)
