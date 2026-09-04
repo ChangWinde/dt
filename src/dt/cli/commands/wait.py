@@ -18,6 +18,7 @@ import typer
 
 from ... import cli as _root
 from ... import jobs as jobs_mod
+from ...forwarding import HeadCommand
 from ...config import HeadConfig, LaptopConfig
 from ...jsonvalue import as_int, as_number
 from ...layout import job_payload_dir, node_path_expression
@@ -783,25 +784,20 @@ def wait(
                 json_=json_,
             )
         head = next(iter(locations.values()))[1]
-        argv = [
-            "wait",
-            *refs,
-            "--poll",
-            str(poll),
-            "--error-lines",
-            str(error_lines),
-        ]
-        if timeout is not None:
-            argv += ["--timeout", f"{timeout:g}"]
-        if json_:
-            argv.append("--json")
-        if primary_log_shown:
-            argv.append("--primary-log-shown")
-        if not completion_wake:
-            argv.append("--no-completion-wake")
+        # The forwarding-drift test reads this chain: every head option of
+        # `dt wait` must appear here or be consumed on the laptop.
+        route = (
+            HeadCommand.start(head, "wait", *refs)
+            .option("--poll", poll)
+            .option("--error-lines", error_lines)
+            .option("--timeout", f"{timeout:g}" if timeout is not None else None)
+            .flag("--json", json_)
+            .flag("--primary-log-shown", primary_log_shown)
+            .flag("--no-completion-wake", not completion_wake)
+        )
         rc = _root._forward_monitor_with_reconnect(
             head,
-            argv,
+            route.argv(),
             refs[0],
             tty=False,
         )
