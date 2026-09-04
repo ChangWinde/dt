@@ -33,21 +33,21 @@ from pathlib import Path
 from pathlib import PurePosixPath
 from typing import Protocol
 
-from .config import (
+from ..config import (
     MAX_PROJECT_EXTRAS,
     MAX_SETUP_INPUTS,
     HeadConfig,
     is_config_id,
 )
-from .layout import (
+from ..layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
     job_state_dir,
     node_path_expression,
     normalize_node_root,
 )
-from .lifecycle import liveness_shell, validate_job_capsule
-from .private_state import (
+from ..lifecycle import liveness_shell, validate_job_capsule
+from ..private_state import (
     PrivateStateError,
     atomic_write,
     bounded_directory_reader,
@@ -57,8 +57,8 @@ from .private_state import (
     open_private_regular,
     read_bounded,
 )
-from .sshio import diagnostic_excerpt, run_on
-from . import custom_env as custom_env_mod
+from ..sshio import diagnostic_excerpt, run_on
+from .. import custom_env as custom_env_mod
 
 NAME_RE = re.compile(r"[^A-Za-z0-9_-]+")
 MAX_SAFE_NAME_LENGTH = 64
