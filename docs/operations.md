@@ -466,6 +466,12 @@ Run one bounded CPU-only canary, then one authorized bounded GPU canary before
 broad use. Preserve the job IDs and `dt info --json` outputs with the upgrade
 record.
 
+Best-effort work that dt swallows on purpose (link-metrics bookkeeping,
+optional resource telemetry, tab-completion configuration) is still reported:
+the agent log shows `suppressed <kind>: <ExceptionType>: <redacted detail>`
+once per kind and exception type per process, and any command prints the same
+line to stderr for every occurrence when `DT_DEBUG_SUPPRESSED=1` is set.
+
 The head row's `registry` check reports how much job history is retained.
 Active scheduling, status, `free`, and the default active `ps` view use the
 derived active index instead of scanning terminal history. Past a few thousand

@@ -80,6 +80,13 @@ Behavior changes need the cheapest focused regression plus the relevant broader
 suite. Queueing, cancellation, retry, cleanup, transfer, path, or identity
 changes require a denied or failure-path regression.
 
+A broad `except Exception` that deliberately continues (efficiency memory,
+optional telemetry, tab completion) must still make the failure observable:
+call `operation_log.note_suppressed(kind, exc)` before swallowing it. The note
+reaches the agent log once per kind and exception type, and stderr when
+`DT_DEBUG_SUPPRESSED=1` is set; it never raises. Handlers that already surface
+the failure (a row field, a log line, an observation) need nothing extra.
+
 ## Required checks
 
 Run:

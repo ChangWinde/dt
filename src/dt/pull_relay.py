@@ -31,6 +31,7 @@ from .sshio import (
     run_on,
 )
 from . import topology_discovery as topology_discovery_mod
+from .operation_log import note_suppressed
 
 RELAY_MIN_BYTES = 64 << 20
 STAGING_GC_DAYS = 7
@@ -420,8 +421,9 @@ def _record_stage_sample(
             transferred_bytes=moved,
             elapsed_seconds=elapsed,
         )
-    except Exception:
+    except Exception as exc:
         # Efficiency-only memory must never fail the pull that fed it.
+        note_suppressed("link_metrics", exc)
         return
 
 
@@ -445,5 +447,6 @@ def record_pull_leg(
             transferred_bytes=moved,
             elapsed_seconds=elapsed,
         )
-    except Exception:
+    except Exception as exc:
+        note_suppressed("link_metrics", exc)
         return

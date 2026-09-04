@@ -385,7 +385,8 @@ def _complete_ref(incomplete: str) -> list[str]:
     the laptop must not ssh on every <TAB>)."""
     try:
         cfg = load()
-    except Exception:
+    except Exception as exc:
+        operation_log_mod.note_suppressed("completion_config", exc)
         return []
     if not isinstance(cfg, HeadConfig):
         return []
@@ -2573,7 +2574,8 @@ def _job_resource_summary(
             timeout=10,
             require_file=False,
         )
-    except Exception:
+    except Exception as exc:
+        operation_log_mod.note_suppressed("resource_telemetry", exc)
         return None
     if result.returncode != 0:
         return None

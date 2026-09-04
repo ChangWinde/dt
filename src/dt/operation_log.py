@@ -13,6 +13,7 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 import time
 import uuid
@@ -20,12 +21,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from . import __version__
 from ._provenance import SOURCE_COMMIT
 from .config import ConfigError, HeadConfig, LaptopConfig, OperationsCfg, load
 from .layout import ROLE_LAYOUT
+from .redaction import redact_home_path
 
 SCHEMA_VERSION = "dt_operation_event_v1"
 QUERY_SCHEMA_VERSION = "dt_operation_events_v1"
@@ -283,6 +285,52 @@ def _problem_fingerprint(exc: BaseException) -> str:
 def _safe_exception_type(exc: BaseException) -> str:
     name = type(exc).__name__[:80]
     return name if _EXCEPTION_TYPE_RE.fullmatch(name) else "Exception"
+
+
+_SUPPRESSED_SINK: Callable[[str], None] | None = None
+_SUPPRESSED_SEEN: set[tuple[str, str]] = set()
+_SUPPRESSED_LOCK = Lock()
+SUPPRESSED_DEBUG_ENV = "DT_DEBUG_SUPPRESSED"
+
+
+def set_suppressed_sink(sink: Callable[[str], None] | None) -> None:
+    """Route suppressed-failure notes to ``sink`` (the agent installs its log)."""
+    global _SUPPRESSED_SINK
+    with _SUPPRESSED_LOCK:
+        _SUPPRESSED_SINK = sink
+        _SUPPRESSED_SEEN.clear()
+
+
+def note_suppressed(kind: str, exc: BaseException) -> None:
+    """Record a best-effort failure the caller is about to swallow.
+
+    The convention for ``except Exception`` blocks that deliberately continue
+    (efficiency memory, tab completion, optional telemetry): the failure must
+    still be observable. One line per (kind, exception type) per process goes
+    to the installed sink, and to stderr when ``DT_DEBUG_SUPPRESSED`` is set.
+    The message is redacted and bounded like every other dt log line, and this
+    function never raises.
+    """
+    safe_kind = kind if _SAFE_KIND_RE.fullmatch(kind) else "unclassified"
+    exception_type = _safe_exception_type(exc)
+    with _SUPPRESSED_LOCK:
+        sink = _SUPPRESSED_SINK
+        first = (safe_kind, exception_type) not in _SUPPRESSED_SEEN
+        _SUPPRESSED_SEEN.add((safe_kind, exception_type))
+    if not first and not os.environ.get(SUPPRESSED_DEBUG_ENV):
+        return
+    detail = redact_home_path(" ".join(str(exc).split()))[:240]
+    line = f"suppressed {safe_kind}: {exception_type}"
+    if detail:
+        line += f": {detail}"
+    line += f" [{_problem_fingerprint(exc)}]"
+    try:
+        if os.environ.get(SUPPRESSED_DEBUG_ENV):
+            print(f"dt: {line}", file=sys.stderr, flush=True)
+        if sink is not None and first:
+            sink(line)
+    except Exception:
+        pass  # observability must never turn a swallowed failure into a new one
 
 
 def _ensure_private_directory(directory: Path) -> None:

@@ -35,6 +35,7 @@ from .sshio import (
     rsync_failure_retryable,
     run_on,
 )
+from .operation_log import note_suppressed
 
 PUSH_TIMEOUT_S = 4 * 3600
 PUSH_ATTEMPTS = 3
@@ -461,6 +462,7 @@ def _record_push_sample(
             transferred_bytes=moved,
             elapsed_seconds=elapsed,
         )
-    except Exception:
+    except Exception as exc:
         # Efficiency-only memory must never fail the sync that fed it.
+        note_suppressed("link_metrics", exc)
         return
