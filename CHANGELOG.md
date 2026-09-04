@@ -28,6 +28,9 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   Linger=yes") instead of requiring `dt info` per job. `dt doctor`'s linger
   remediation is now a copy-pasteable `loginctl enable-linger "$(id -un)"`,
   and a missing `--artifact` path names the project root it was resolved under.
+- The agent retries blocked queue entries immediately when a running job
+  ends, instead of leaving a freshly idle node unused until each entry's
+  placement backoff (up to five minutes) expires.
 
 ### Added
 

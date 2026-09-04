@@ -79,6 +79,15 @@ policy, log path, and the complete queue-head ID.
 
 ## Capacity and placement
 
+A queued job whose placement is blocked by something job-specific (a missing
+dataset path, an unfit or full node) is retried on a capped exponential
+backoff — 5 s doubling to at most 300 s — so a permanently blocked entry does
+not re-probe the fleet every tick. The moment any running job ends, the agent
+drops every pending backoff and retries the blocked entries on the next tick,
+so a node that just freed up is never left idle behind a five-minute wait.
+`dt ps` shows the blocked reason in its issue column.
+
+
 ```bash
 dt free --who
 dt free --explain

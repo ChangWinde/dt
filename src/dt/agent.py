@@ -1004,7 +1004,20 @@ def _process_once_with_snapshot(
     loop can make watcher/sleep decisions without another historical scan.
     """
     damage: list[RegistryDamage] = []
-    entries = _reconcile_jobs(cfg, log, active_entries(cfg, damage=damage))
+    active = active_entries(cfg, damage=damage)
+    running_before = {entry.job_id for entry in active if entry.status == "running"}
+    entries = _reconcile_jobs(cfg, log, active)
+    running_after = {entry.job_id for entry in entries if entry.status == "running"}
+    if blocked_backoff and running_before - running_after:
+        # A job just left a node, so the capacity picture every blocked entry
+        # was diagnosed against has changed. Retry them now instead of letting
+        # a node sit idle until their backoff deadlines (up to five minutes)
+        # expire one by one.
+        log(
+            f"capacity changed: retrying {len(blocked_backoff)} blocked job(s) "
+            "without waiting for their backoff"
+        )
+        blocked_backoff.clear()
     for item in damage:
         log(
             f"registry entry {item.path} is unreadable ({item.detail}); "
