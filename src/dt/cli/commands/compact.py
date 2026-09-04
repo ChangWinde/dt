@@ -42,8 +42,22 @@ def compact(
     json_: bool = typer.Option(
         False, "--json", help="emit one dt_compact_v1 object on stdout"
     ),
+    prune_modified: bool = typer.Option(
+        False,
+        "--prune-modified",
+        help=(
+            "also delete code copies holding files the job wrote after it "
+            "started (outputs that belong in $DT_OUTPUT_DIR); kept by default"
+        ),
+    ),
 ) -> None:
-    """Remove recoverable code copies from old terminal job workdirs."""
+    """Remove recoverable code copies from old terminal job workdirs.
+
+    A code copy that gained files after the job started is reported as
+    code_modified and kept: those files are results the job wrote into its
+    disposable snapshot copy, which dt pull does not fetch. Copy them out of
+    <job_dir>/code on the node, or pass --prune-modified to accept the loss.
+    """
     if json_ and not plan and not yes:
         _fail_submission(
             kind="confirmation_required",
@@ -59,6 +73,7 @@ def compact(
             + (["--plan"] if plan else [])
             + (["-y"] if yes else [])
             + (["--json"] if json_ else [])
+            + (["--prune-modified"] if prune_modified else [])
         )
         raise typer.Exit(
             _root.forward_call(
@@ -96,6 +111,7 @@ def compact(
         cutoff,
         before=before,
         apply=not plan,
+        prune_modified=prune_modified,
     )
     payload = report.payload
     if json_:
@@ -131,6 +147,14 @@ def compact(
             f"failed {payload['failed_jobs']} · "
             f"{_format_transfer_bytes(planned_code_bytes)}"
         )
+        modified = payload["code_modified_jobs"]
+        if isinstance(modified, int) and modified:
+            err.print(
+                f"[yellow]kept {modified} job(s) whose code copy holds files written "
+                "after start (results in the disposable snapshot copy, which dt pull "
+                "does not fetch); copy them out of <job_dir>/code on the node first, "
+                "or rerun with --prune-modified to delete them anyway[/yellow]"
+            )
         skipped = payload["skipped"]
         if isinstance(skipped, dict) and skipped:
             err.print(

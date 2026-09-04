@@ -19,7 +19,7 @@ from ... import evidence as evidence_mod
 from ... import jobs as jobs_mod
 from ...config import HeadConfig, LaptopConfig
 from ...forwarding import HeadCommand
-from ...jsonvalue import as_number
+from ...jsonvalue import as_int, as_number
 from ...layout import (
     ROLE_LAYOUT,
     display_node_path,
@@ -36,6 +36,7 @@ from ...monitoring import (
 from ...path_contract import job_path_contract as _job_path_contract
 from .. import (
     INFO_COMMAND_PREVIEW_CHARS,
+    _format_transfer_bytes,
     INFO_MARK,
     INFO_PHASE_TAIL,
     INFO_RESOURCE_TAIL,
@@ -204,6 +205,15 @@ def _info_live(
             f"if test -f {evidence}/resource-guard.json; then {guard_reader}; "
             f"else cat {job}/outputs/dt/resource-guard.json 2>/dev/null || true; fi"
         )
+    # Files in the immutable code copy newer than the start marker were
+    # written by the job (results that belong under $DT_OUTPUT_DIR); count
+    # them so info can warn before compaction discards them.
+    code_modified_reader = (
+        f"if test -f {state}/started_at && test -d {job}/code; then "
+        f"timeout 20s find {job}/code -xdev -type f -newer {state}/started_at "
+        "-printf '%s\\n' 2>/dev/null | awk '{n++; b+=$1} END {printf \"%d %d\", n+0, b+0}'; "
+        "fi"
+    )
     probe = (
         f"cat {state}/started_at 2>/dev/null; echo {marker}; "
         f"cat {state}/finished_at 2>/dev/null; echo {marker}; "
@@ -211,7 +221,8 @@ def _info_live(
         f"test -f {control}/code_dirty.patch && echo yes; echo {marker}; "
         f"{resource_reader}; "
         f"echo {marker}; {phase_reader}; echo {marker}; {guard_reader}; "
-        f"echo {marker}; {containment_reader}; echo {marker}; {linger_reader}"
+        f"echo {marker}; {containment_reader}; echo {marker}; {linger_reader}; "
+        f"echo {marker}; {code_modified_reader}"
     )
     try:
         proc = _root.run_on(
@@ -235,7 +246,12 @@ def _info_live(
             guard_text,
             runtime_containment,
             runtime_linger,
-        ) = _parse_marked(proc.stdout or "", 9, marker=marker)
+            code_modified_text,
+        ) = _parse_marked(proc.stdout or "", 10, marker=marker)
+        code_modified_files = code_modified_bytes = 0
+        parts = code_modified_text.split()
+        if len(parts) == 2 and all(part.isdigit() for part in parts):
+            code_modified_files, code_modified_bytes = int(parts[0]), int(parts[1])
         resource_guard = None
         try:
             candidate = json.loads(guard_text)
@@ -263,6 +279,8 @@ def _info_live(
             "resource_guard": resource_guard,
             "runtime_containment": runtime_containment.strip() or None,
             "runtime_linger": runtime_linger.strip() or None,
+            "code_modified_files": code_modified_files,
+            "code_modified_bytes": code_modified_bytes,
         }
     except Exception:
         return {"unreachable": True}
@@ -410,6 +428,7 @@ _INFO_COMPACT_LABELS = frozenset(
         "queue head",
         "previous",
         "placement failures",
+        "results in code/",
         "where",
         "gpus",
         "cmd",
@@ -672,6 +691,20 @@ def _render_info_table(
         ("duration", _fmt_duration(duration) if duration is not None else "-"),
         ("exit code", "-" if entry.exit_code is None else str(entry.exit_code)),
         ("outputs", data["outputs_size"] or "-"),
+        *(
+            [
+                (
+                    "results in code/",
+                    f"[yellow]{files} file(s), {_format_transfer_bytes(bytes_)} "
+                    "written after start into the disposable code copy; dt pull does "
+                    "not fetch code/ and compaction keeps such trees until you move or "
+                    "delete them - write results to $DT_OUTPUT_DIR[/yellow]",
+                )
+            ]
+            if (files := as_int(data.get("code_modified_files")) or 0) > 0
+            and (bytes_ := as_int(data.get("code_modified_bytes")) or 0) >= 0
+            else []
+        ),
         (
             "code copy",
             (
@@ -738,6 +771,12 @@ def _render_info_table(
             f"{escape(node)}: {escape(reason)}"
             for node, reason in entry.placement_failures.items()
         )
+        if entry.updated_at is not None:
+            # These reasons are the last attempt's diagnosis, not a live probe;
+            # say how old they are so a fixed node is not judged by them.
+            placement_text += (
+                f"\n[dim]as of {_fmt_ts(entry.updated_at)} (last attempt)[/dim]"
+            )
         rows.insert(3, ("placement failures", placement_text))
     rows.extend(_info_launch_rows(entry))
     if failure_log is not None:
@@ -993,6 +1032,8 @@ def _info_payload(
         "job_dir": entry.job_dir,
         "paths": _job_path_contract(cfg, entry),
         "outputs_size": live.get("outputs_size"),
+        "code_modified_files": as_int(live.get("code_modified_files")) or 0,
+        "code_modified_bytes": as_int(live.get("code_modified_bytes")) or 0,
         "env_hash": entry.env_hash,
         "env_mode": entry.env_mode or "sync",
         "env_source_job": entry.env_source_job,

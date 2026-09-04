@@ -280,8 +280,9 @@ def _render_doctor_actions(payload: JsonDict) -> None:
             )
         elif action_type == "enable_linger":
             err.print(
-                f"[dim]{prefix} ask an administrator to run "
-                f"loginctl enable-linger USER for {node}[/dim]"
+                f'[dim]{prefix} on {node} run: loginctl enable-linger "$(id -un)" '
+                "(allowed for your own account on most systems; otherwise ask an "
+                "administrator)[/dim]"
             )
 
 

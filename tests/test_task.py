@@ -704,6 +704,12 @@ def test_task_human_submission_shows_snapshot_and_environment_preparation(
         lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, None),
     )
 
+    # this test checks the 80-column terminal contract; a piped console is
+    # otherwise unbounded so scripts get whole lines
+    monkeypatch.setattr(cli.err, "width", 80)
+    # this test checks the 80-column terminal contract; a piped console is
+    # otherwise unbounded so scripts get whole lines
+    monkeypatch.setattr(cli.err, "width", 80)
     result = CliRunner().invoke(
         cli.app,
         ["task", "n1", "python train.py", "-p", "p"],

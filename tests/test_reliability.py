@@ -559,7 +559,9 @@ def test_status_probe_bounds_job_writable_fields():
         pgid=4242,
     )
     state_dir = "~/dt/worker/jobs/probe-fields/state"
-    state = jobs.node_path_expression(state_dir)
+    from dt.layout import node_path_expression
+
+    state = node_path_expression(state_dir)
 
     script = jobs._status_probe_script(entry, state_dir)
 
@@ -1039,6 +1041,80 @@ def test_launch_drop_fails_over_to_next_node(tmp_path, monkeypatch):
     assert cancelled == ["n1"]  # orphan cleanup ran for the dropped node
 
 
+def test_identity_conflict_retires_a_stale_marker_and_retries(tmp_path, monkeypatch):
+    """Field report: a marker left by a refused launcher blocked the job forever."""
+    cfg = _cfg(tmp_path)
+    attempted: list[str] = []
+    retired: list[tuple[str, str]] = []
+
+    def retire(node, job_dir, session, *, layout):
+        retired.append((node.name, job_dir))
+        return None  # six hours old, no runtime state behind it
+
+    monkeypatch.setattr(dispatch, "_retire_stale_launch_identity", retire)
+    monkeypatch.setattr(
+        dispatch, "_cancel_orphan", lambda *args, **kwargs: AssertionError("no cancel")
+    )
+
+    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
+        attempted.append(node.name)
+        if node.name == "n1":
+            return 18, "a different launch identity owns this job directory"
+        return 10, "busy"
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+    entry, reasons, fatal, failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda m: None,
+    )
+
+    assert entry is None and not fatal
+    assert retired == [("n1", "dt/jobs/jid")]
+    assert attempted == ["n1", "n2"]  # retired, then the loop moved on
+    assert "stale launch identity retired" in reasons["n1"]
+    assert "identity-conflict" not in failure_kinds and "retryable" in failure_kinds
+
+
+def test_retryable_refusal_binds_the_cancellation_of_its_own_marker(
+    tmp_path, monkeypatch
+):
+    """node-unfit after publishing must not leave a marker that poisons retries."""
+    cfg = _cfg(tmp_path)
+    cancelled: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        dispatch,
+        "_cancel_orphan",
+        lambda node, job_dir, session, **kwargs: cancelled.append(
+            (node.name, kwargs.get("dispatch_token"))
+        ),
+    )
+    monkeypatch.setattr(
+        dispatch, "launch", lambda *args, **kwargs: (15, "GPU runtime requires Linger")
+    )
+    spec = _spec()
+    spec.dispatch_token = "1" * 32
+    entry, reasons, fatal, failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        spec,
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda m: None,
+    )
+
+    assert entry is None and not fatal
+    assert cancelled == [("n1", "1" * 32), ("n2", "1" * 32)]
+    assert "retryable" in failure_kinds
+
+
 def test_identity_conflict_stops_failover_without_cancel_or_failure(
     tmp_path, monkeypatch
 ):
@@ -1050,6 +1126,10 @@ def test_identity_conflict_stops_failover_without_cancel_or_failure(
         dispatch,
         "_cancel_orphan",
         lambda node, job_dir, session, **kwargs: cancelled.append(node.name),
+    )
+    # the marker is minutes old: a launcher may be starting behind it
+    monkeypatch.setattr(
+        dispatch, "_retire_stale_launch_identity", lambda *args, **kwargs: "fresh:120"
     )
 
     def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
@@ -6259,6 +6339,8 @@ def test_dead_leader_signals_in_group_orphan_that_left_the_capsule(tmp_path):
             assert time.monotonic() < deadline, "in-group orphan survived the probe"
             time.sleep(0.05)
     finally:
+        if leader.stdout is not None:
+            leader.stdout.close()
         subprocess.run(
             ["kill", "-9", str(orphan_pid)], capture_output=True, check=False
         )
@@ -6306,6 +6388,8 @@ def test_termination_probe_signals_orphans_after_leader_death(tmp_path):
             assert time.monotonic() < deadline, "orphan survived the probe"
             time.sleep(0.05)
     finally:
+        if leader.stdout is not None:
+            leader.stdout.close()
         subprocess.run(
             ["kill", "-9", str(orphan_pid)],
             capture_output=True,
@@ -6445,6 +6529,8 @@ def test_zombie_leader_group_signal_reaches_wandering_orphan(tmp_path):
             assert time.monotonic() < deadline, "wandering orphan survived"
             time.sleep(0.05)
     finally:
+        if leader.stdout is not None:
+            leader.stdout.close()
         subprocess.run(
             ["kill", "-9", str(orphan_pid)], capture_output=True, check=False
         )
@@ -7038,6 +7124,8 @@ def test_termination_probe_signals_matching_process_group(tmp_path):
         ) == ("DEAD", None)
         assert owner.wait(timeout=30) == 143
     finally:
+        if owner.stdout is not None:
+            owner.stdout.close()
         if owner.poll() is None:
             owner.terminate()
             owner.wait(timeout=2)

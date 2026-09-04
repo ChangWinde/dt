@@ -79,8 +79,6 @@ def test_modules_import_only_public_names_from_other_modules(module, path):
             if alias.name.startswith("_") and not alias.name.startswith("__"):
                 offenders.append(f"{'.' * node.level}{node.module or ''}.{alias.name}")
     # concern modules of a package may share the package's private helpers
-    in_package = (
-        path.parent.name in {"dispatch", "commands"} and path.name != "__init__.py"
-    )
+    in_package = path.parent != SRC and path.name != "__init__.py"
     offenders = [o for o in offenders if not (in_package and o.startswith("."))]
     assert not offenders, f"{module} imports private names: {offenders}"

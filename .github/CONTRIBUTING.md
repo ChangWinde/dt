@@ -94,6 +94,7 @@ Run:
 ```bash
 uv run --no-sync pytest -q -p no:cacheprovider \
   -W error::pytest.PytestUnhandledThreadExceptionWarning \
+  -W error::ResourceWarning -W error::DeprecationWarning \
   --cov=dt --cov-branch --cov-report=term-missing:skip-covered
 uv run --no-sync python scripts/docs.py
 uv run --no-sync ruff check .

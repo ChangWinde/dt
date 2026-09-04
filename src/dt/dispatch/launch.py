@@ -28,7 +28,13 @@ from ..layout import (
     job_state_dir,
     node_path_expression,
 )
-from ..lifecycle import LAUNCH_RECOVERY_MARK, termination_probe, termination_verdict
+from ..lifecycle import (
+    LAUNCH_RECOVERY_MARK,
+    launch_recovery_probe,
+    termination_probe,
+    termination_verdict,
+)
+from ..submission_intent import REMOTE_LAUNCH_MARKER_NAME
 from ..sshio import RemoteError, diagnostic_excerpt
 from . import (
     DispatchError,
@@ -275,6 +281,76 @@ def _cancel_orphan(
         # result.  Failing over would run the same work twice.
         return "launch already ran to completion on the node"
     return detail or "orphan cancellation could not be verified"
+
+
+# A launch identity marker with no runtime state behind it for this long can
+# only be the leftover of an attempt that died before creating a session: a
+# live launcher publishes the marker seconds before it creates runtime state,
+# and no environment setup runs for six hours without producing any.
+STALE_LAUNCH_IDENTITY_S = 6 * 3600
+
+
+def _retire_stale_launch_identity(
+    node: Node,
+    node_job_dir: str,
+    session: str,
+    *,
+    layout: str | None,
+) -> str | None:
+    """Delete a foreign launch identity that provably belongs to no launch.
+
+    Returns None when the marker was retired (the next attempt may publish
+    its own identity), otherwise the reason it was kept. The capsule must show
+    no runtime state (NONE from the recovery census) and the marker must be
+    older than STALE_LAUNCH_IDENTITY_S; both are re-checked on the node right
+    before the unlink so a launcher that just published is never disturbed.
+    """
+    try:
+        proc = _root.run_on(
+            node.name,
+            node.local,
+            launch_recovery_probe(node_job_dir, session, layout=layout),
+            timeout=20,
+        )
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        return f"recovery probe failed: {' '.join(str(exc).split())[:200]}"
+    if proc.returncode != 0:
+        return f"recovery probe exited {proc.returncode}"
+    try:
+        recovered = _parse_launch_recovery(proc.stdout)
+    except DispatchError as exc:
+        return str(exc)
+    if recovered.state != "NONE":
+        return f"capsule has runtime state ({recovered.state})"
+    marker = node_path_expression(
+        f"{job_state_dir(node_job_dir, layout)}/{REMOTE_LAUNCH_MARKER_NAME}"
+    )
+    script = (
+        f"DT_M={marker}; DT_MIN_AGE={STALE_LAUNCH_IDENTITY_S}; "
+        'if [ ! -f "$DT_M" ] || [ -L "$DT_M" ]; then echo KEEP absent; exit 0; fi; '
+        'DT_META=$(stat -c "%u:%a:%s:%h" -- "$DT_M" 2>/dev/null) || { echo KEEP unreadable; exit 0; }; '
+        '[ "$DT_META" = "$(id -u):600:65:1" ] || { echo KEEP unsafe; exit 0; }; '
+        'DT_MTIME=$(stat -c %Y -- "$DT_M" 2>/dev/null) || { echo KEEP unreadable; exit 0; }; '
+        "DT_AGE=$(( $(date +%s) - DT_MTIME )); "
+        '[ "$DT_AGE" -ge "$DT_MIN_AGE" ] || { echo "KEEP fresh:$DT_AGE"; exit 0; }; '
+        'rm -f -- "$DT_M" && echo "RETIRED $DT_AGE" || echo KEEP unlink_failed'
+    )
+    try:
+        proc = _root.run_on(
+            node.name,
+            node.local,
+            f"env LC_ALL=C bash -c {shlex.quote(script)}",
+            timeout=20,
+        )
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        return f"marker probe failed: {' '.join(str(exc).split())[:200]}"
+    verdict = (proc.stdout or "").strip().splitlines()
+    last = verdict[-1] if verdict else ""
+    if last.startswith("RETIRED "):
+        return None
+    return (
+        last.removeprefix("KEEP ").strip() or f"marker probe exited {proc.returncode}"
+    )
 
 
 @dataclass(frozen=True)
@@ -810,13 +886,28 @@ def _try_nodes(
             # Our launcher exited without touching the foreign marker or
             # starting a session, so there is nothing of ours to cancel; the
             # concurrent attempt it met may still be starting on this node.
-            # Stop the candidate loop instead of failing over: the job stays
-            # queued and the next dispatch probe adopts or supersedes the
-            # marker once its runtime state is provable.
+            # A marker with no runtime state behind it for hours is the
+            # leftover of an attempt that died before launching (a launcher
+            # that refused node-unfit after publishing, for example); retire
+            # it so the job does not stay blocked forever, otherwise stop the
+            # candidate loop and let the next tick probe the foreign identity.
+            kept = _root._retire_stale_launch_identity(
+                node, node_job_dir, session, layout=cfg.layout
+            )
+            if kept is None:
+                reasons[node.name] = (
+                    f"{reason}: stale launch identity retired; retrying"
+                )
+                failure_kinds.add("retryable")
+                log(
+                    f"{node.name} retired a stale launch identity with no "
+                    "runtime state behind it; the next attempt may proceed"
+                )
+                continue
             failure_kinds.add("identity-conflict")
             log(
-                f"{node.name} {reason}; stopping failover until dispatch "
-                "recovery probes the foreign launch identity"
+                f"{node.name} {reason} ({kept}); stopping failover until "
+                "dispatch recovery probes the foreign launch identity"
             )
             return None, reasons, False, failure_kinds
         if code in FATAL:
@@ -839,6 +930,19 @@ def _try_nodes(
                 )
                 return None, reasons, True, failure_kinds
             reasons[node.name] = f"{reasons[node.name]}; cancelled on node"
+        elif spec.dispatch_token is not None:
+            # The launcher publishes its identity before the preflight that
+            # refused, so the marker for this token is still on the node. Bind
+            # its cancellation now: the sentinel names the token, and the next
+            # launcher of this job supersedes the marker instead of refusing
+            # with identity-conflict until the end of time.
+            retire_error = cancel_launch_orphan(node, node_job_dir)
+            if retire_error is not None:
+                log(
+                    f"{node.name} could not retire this attempt's launch "
+                    f"identity ({retire_error}); a later retry may need "
+                    "recovery"
+                )
         failure_kinds.add("retryable")
         log(f"{node.name} {reason}, trying next node")
     return None, reasons, False, failure_kinds

@@ -6,6 +6,46 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- dt no longer consumes the stdin of the script that invoked it: every child
+  process gets `/dev/null` unless dt spools an explicit payload, and a
+  non-interactive laptop-to-head forward no longer attaches stdin. `ssh head
+  'bash -s' < submit.sh` used to lose the rest of the script to the first
+  `dt run`'s ssh session, submitting a fraction of the jobs and exiting 0.
+- `dt kill` dequeues a queued job that still carries a dispatch attempt (it
+  was placed once and bounced): the attempt is cancelled on its node the way
+  failover recovery does, then the row turns killed. It used to fail with
+  "only queued jobs may retain a dispatch attempt identity".
+- `dt compact` keeps a code copy that holds files written after the job
+  started (`code_modified` in the report, counted in `code_modified_jobs`)
+  instead of deleting results a job wrote into its snapshot copy;
+  `--prune-modified` accepts the loss explicitly and leaves the list of deleted
+  files (size and path) beside the receipt as `code-pruned.modified.tsv`. The
+  automatic sweep never prunes such trees. `dt info` warns when a job wrote
+  files into its code copy (`code_modified_files` / `code_modified_bytes` in
+  `--json`) and dates its placement-failure reasons ("as of ... (last attempt)").
+- `dt ps` shows why a queued job is blocked or offline in its default view
+  (the issue column appears whenever such a row is visible), compacted to the
+  node and the specific reason ("psibot-yw: GPU runtime requires loginctl
+  Linger=yes") instead of requiring `dt info` per job. `dt doctor`'s linger
+  remediation is now a copy-pasteable `loginctl enable-linger "$(id -un)"`,
+  and a missing `--artifact` path names the project root it was resolved under.
+- A launch that was refused after publishing its identity marker (node unfit
+  at the launcher's preflight, for example) no longer poisons the job: the
+  dispatcher binds the refused attempt's cancellation on the node, so the next
+  launcher supersedes the marker instead of exiting `identity-conflict`; and an
+  identity marker that has sat for six hours with no runtime state behind it
+  is retired on the spot, so a job blocked by a stale marker from an older
+  build recovers instead of staying queued forever.
+- Human output written to a pipe is no longer wrapped or ellipsized to an
+  assumed 80 columns: `dt ps | awk '{print $1}'` now yields complete job ids
+  and names. A real terminal keeps its measured width and the compaction
+  policy of ADR 0008; an explicit `COLUMNS` still wins.
+- The agent retries blocked queue entries immediately when a running job
+  ends, instead of leaving a freshly idle node unused until each entry's
+  placement backoff (up to five minutes) expires.
+
 ### Added
 
 - `dt agent start/stop/install --json` return one `dt_agent_control_v1` receipt
@@ -70,7 +110,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   package `src/dt/cli/` (a 3.3k-line composition root plus one module per
   command family under `cli/commands/`) and `src/dt/dispatch.py` the package
   `src/dt/dispatch/` (a 1.7k-line root plus `submission`, `queued`, `launch`,
-  `staging`, `snapshots`, `artifacts`, `preview`); the lifecycle and doctor shell
+  `staging`, `snapshots`, `artifacts`, `preview`) and `src/dt/jobs.py` the package
+  `src/dt/jobs/` (root plus `status` probes and `active_index`); the lifecycle and doctor shell
   libraries and the node probe's GPU, compute-app, and host-capacity queries
   ship as `src/dt/shell/*.sh` resources checked by shellcheck in CI; JSON numbers are narrowed through `dt.jsonvalue`; the ps contract
   validator returns a typed page; modules import only public names from each

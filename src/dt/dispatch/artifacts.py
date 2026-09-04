@@ -194,7 +194,12 @@ def _artifact_sources(
             source = cursor.resolve(strict=True)
             normalized = source.relative_to(root)
         except FileNotFoundError as e:
-            raise DispatchError(f"artifact path does not exist: {raw!r}") from e
+            # Relative artifacts resolve under the configured project root, not
+            # the shell's cwd; say which root was used so a mismatch is obvious.
+            raise DispatchError(
+                f"artifact path does not exist: {raw!r} (resolved under project "
+                f"root {str(root)!r})"
+            ) from e
         except ValueError as e:
             raise DispatchError(
                 f"artifact path resolves outside the project: {raw!r}"

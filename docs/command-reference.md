@@ -371,7 +371,9 @@ codes above 125 clamp to 125), and `--json` always carries the untruncated
 ## Destructive commands
 
 `kill`, `clean`, and mutating `compact` require explicit confirmation for
-non-interactive use. Cleanup and compaction provide `--plan`. `dt clean`
+non-interactive use. Cleanup and compaction provide `--plan`. Compaction keeps a
+code copy that holds files written after the job started (`code_modified`);
+`--prune-modified` is the explicit escalation that deletes those too. `dt clean`
 persists an exact job/result plan for 24 hours; apply it with
 `dt clean --apply-plan PLAN_ID -y`. JSON previews return one bounded page, not
 the full authorization. Follow `page.next_offset` with `dt clean

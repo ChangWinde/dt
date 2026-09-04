@@ -79,6 +79,15 @@ policy, log path, and the complete queue-head ID.
 
 ## Capacity and placement
 
+A queued job whose placement is blocked by something job-specific (a missing
+dataset path, an unfit or full node) is retried on a capped exponential
+backoff — 5 s doubling to at most 300 s — so a permanently blocked entry does
+not re-probe the fleet every tick. The moment any running job ends, the agent
+drops every pending backoff and retries the blocked entries on the next tick,
+so a node that just freed up is never left idle behind a five-minute wait.
+`dt ps` shows the blocked reason in its issue column.
+
+
 ```bash
 dt free --who
 dt free --explain
@@ -408,6 +417,17 @@ dt compact --before 2026-07-01 -y
 
 It retains job metadata, outputs, logs, checkpoints, payloads, and registry
 entries. Identity or recovery mismatch rejects the candidate.
+
+The code copy is an immutable snapshot, so any regular file newer than the
+job's start marker was written by the job itself — results that belong under
+`$DT_OUTPUT_DIR`. Compaction reports such trees as `code_modified` (with the
+file count and bytes) and keeps them. `dt pull` fetches `outputs/`, not
+`code/`, so copy such files out of `<job_dir>/code` on the node yourself (the
+path is in `dt info REF --json` under `paths`), or accept the loss with
+`dt compact --before DATE -y --prune-modified`, which also leaves the list of
+deleted files (size and path) next to the receipt as
+`code-pruned.modified.tsv`. The automatic sweep never prunes a modified tree;
+it logs how many it kept.
 
 The resident agent runs the same procedure automatically every six hours for
 jobs that have been terminal for longer than `queue.auto_compact_hours`

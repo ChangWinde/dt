@@ -1004,7 +1004,20 @@ def _process_once_with_snapshot(
     loop can make watcher/sleep decisions without another historical scan.
     """
     damage: list[RegistryDamage] = []
-    entries = _reconcile_jobs(cfg, log, active_entries(cfg, damage=damage))
+    active = active_entries(cfg, damage=damage)
+    running_before = {entry.job_id for entry in active if entry.status == "running"}
+    entries = _reconcile_jobs(cfg, log, active)
+    running_after = {entry.job_id for entry in entries if entry.status == "running"}
+    if blocked_backoff and running_before - running_after:
+        # A job just left a node, so the capacity picture every blocked entry
+        # was diagnosed against has changed. Retry them now instead of letting
+        # a node sit idle until their backoff deadlines (up to five minutes)
+        # expire one by one.
+        log(
+            f"capacity changed: retrying {len(blocked_backoff)} blocked job(s) "
+            "without waiting for their backoff"
+        )
+        blocked_backoff.clear()
     for item in damage:
         log(
             f"registry entry {item.path} is unreadable ({item.detail}); "
@@ -1303,6 +1316,14 @@ def _maybe_autocompact(cfg: HeadConfig, log: Callable[[str], None]) -> None:
     errors = payload.get("preflight_errors")
     if isinstance(failed, int) and failed:
         log(f"auto-compact: {failed} job(s) could not be compacted safely")
+    modified = payload.get("code_modified_jobs")
+    if isinstance(modified, int) and modified:
+        # The automatic sweep never accepts the loss on the operator's behalf.
+        log(
+            f"auto-compact: kept {modified} job(s) whose code copy holds files "
+            "written after start; copy them out of <job_dir>/code on the node "
+            "(dt pull does not fetch code/) or run dt compact --prune-modified"
+        )
     if isinstance(errors, list) and errors:
         log(f"auto-compact: refused, recovery archive problem: {errors[0]}")
 

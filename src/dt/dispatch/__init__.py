@@ -1613,6 +1613,8 @@ from .preview import (  # noqa: E402
     preview_submission as preview_submission,
 )
 from .launch import (  # noqa: E402
+    STALE_LAUNCH_IDENTITY_S as STALE_LAUNCH_IDENTITY_S,
+    _retire_stale_launch_identity as _retire_stale_launch_identity,
     _RecoveredLaunch as _RecoveredLaunch,
     _adopt_interrupted_queued_launch as _adopt_interrupted_queued_launch,
     _cancel_orphan as _cancel_orphan,
@@ -1654,6 +1656,7 @@ from .submission import (  # noqa: E402
     submit_fork as submit_fork,
 )
 from .queued import (  # noqa: E402
+    cancel_queued_attempt as cancel_queued_attempt,
     _QueuedStage as _QueuedStage,
     _StageInterrupted as _StageInterrupted,
     _StageUnusable as _StageUnusable,

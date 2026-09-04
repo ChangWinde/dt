@@ -1812,6 +1812,58 @@ def test_blocked_backoff_clears_once_the_job_dispatches(tmp_path, monkeypatch):
     assert backoff == {}
 
 
+def test_blocked_backoff_resets_when_a_running_job_frees_capacity(
+    tmp_path, monkeypatch
+):
+    """A node that just freed up must not sit idle behind five-minute backoffs."""
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("stuck", "queued", created_at=1.0))
+    save(
+        cfg,
+        _entry("busy", "running", created_at=0.5, node="n1", node_local=True, pgid=77),
+    )
+    dispatched: list[str] = []
+    monkeypatch.setattr(
+        agent,
+        "dispatch_queued",
+        lambda cfg_, entry_, log_: (
+            dispatched.append(entry_.job_id)
+            or ("blocked", "n1: node-unfit: no free GPU")
+        ),
+    )
+    finished = {"flag": False}
+
+    def reconcile(cfg_, log_, entries=None):
+        rows = list(entries or [])
+        if finished["flag"]:
+            for row in rows:
+                if row.job_id == "busy":
+                    row.status = "finished"
+                    row.exit_code = 0
+        return rows
+
+    monkeypatch.setattr(agent, "_reconcile_jobs", reconcile)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(agent.time, "monotonic", lambda: clock["now"])
+    backoff: dict[str, tuple[int, float]] = {}
+    logs: list[str] = []
+
+    agent._process_once_with_snapshot(cfg, logs.append, blocked_backoff=backoff)
+    assert dispatched == ["stuck"] and "stuck" in backoff
+
+    clock["now"] = 1001.0  # well inside the backoff window
+    agent._process_once_with_snapshot(cfg, logs.append, blocked_backoff=backoff)
+    assert dispatched == ["stuck"]  # still waiting
+
+    finished["flag"] = True  # the running job ends this tick
+    clock["now"] = 1002.0
+    agent._process_once_with_snapshot(cfg, logs.append, blocked_backoff=backoff)
+    assert dispatched == ["stuck", "stuck"]  # retried immediately
+    assert any("capacity changed" in message for message in logs)
+
+
 def test_blocked_backoff_never_overflows_after_days_of_retries(monkeypatch):
     """float ** raises OverflowError at 2.0**1024 where * returns inf; an
     unguarded bump would poison the stored deadline and crash every poll
