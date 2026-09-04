@@ -27,57 +27,16 @@ from typing import Iterator, TypeAlias
 
 from .config import HeadConfig, Node
 from .layout import ROLE_LAYOUT, node_path_expression
+from . import shell
 from .private_state import PrivateStateError, decode_strict_json, read_bounded_regular
 from .sshio import CONTROL_CAPTURE_BYTES, RemoteError, run_on
 
 GPU_ERROR = "---DT-GPU-ERROR---"
 APP_ERROR = "---DT-APP-ERROR---"
-GPU_Q = (
-    "dt_gpu_raw=$(nvidia-smi "
-    "--query-gpu=index,uuid,memory.used,memory.total,utilization.gpu,temperature.gpu "
-    "--format=csv,noheader,nounits 2>&1); dt_gpu_rc=$?; "
-    'if [ "$dt_gpu_rc" -ne 0 ]; then '
-    f"echo {GPU_ERROR}; printf '%s\\n' \"$dt_gpu_raw\"; "
-    "else printf '%s\\n' \"$dt_gpu_raw\" "
-    "| while IFS=, read -r idx uuid used total util temp; do "
-    'idx=$(printf %s "$idx" | tr -d " "); '
-    'lease="${DT_GPU_LEASE_ROOT:-$HOME/dt/gpu-leases}/gpu-$idx.lock"; '
-    "leased=0; lease_owner=; "
-    # A lease file whose lock cannot be checked must read busy, not free:
-    # flock vanishing (PATH regression, rebuilt container) while a wrapper
-    # holds the lease would otherwise double-allocate a busy GPU. Stale-file
-    # false-busy is visible and fixable (doctor reports DT_FLOCK=missing).
-    'if [ -e "$lease" ] && { ! command -v flock >/dev/null 2>&1 '
-    '|| ! flock -n -s "$lease" -c true; }; then '
-    'leased=1; lease_owner=$(head -n 1 "$lease" 2>/dev/null); fi; '
-    'echo "$idx,$uuid,$used,$total,$util,$temp,$leased,$lease_owner"; done; fi'
-)
-# Compute apps + owning user. Resolve all unique numeric PIDs in one ps call;
-# process-heavy nodes otherwise pay one remote fork per nvidia-smi row.
-APP_Q = (
-    "dt_app_raw=$(nvidia-smi --query-compute-apps=gpu_uuid,pid "
-    "--format=csv,noheader 2>&1); dt_app_rc=$?; "
-    'if [ "$dt_app_rc" -ne 0 ]; then '
-    f"echo {APP_ERROR}; printf '%s\\n' \"$dt_app_raw\"; "
-    "else dt_app_pids=$(printf '%s\\n' \"$dt_app_raw\" "
-    '| awk -F, \'{ p=$2; gsub(/[[:space:]]/, "", p); '
-    "if (p ~ /^[0-9]+$/ && !seen[p]++) { "
-    'if (out != "") out=out ","; out=out p } } END { print out }\'); '
-    "dt_app_users=; "
-    'if [ -n "$dt_app_pids" ]; then '
-    'dt_app_users=$(ps -o pid=,user= -p "$dt_app_pids" 2>/dev/null); fi; '
-    "{ printf '%s\\n' \"$dt_app_users\"; echo ---DT-APP-ROWS---; "
-    "printf '%s\\n' \"$dt_app_raw\"; } | awk '"
-    '$0 == "---DT-APP-ROWS---" { rows=1; next } '
-    "!rows { users[$1]=$2; next } "
-    '{ split($0, f, ","); '
-    'gsub(/[[:space:]]/, "", f[1]); '
-    'gsub(/[[:space:]]/, "", f[2]); '
-    'if (f[1] == "") next; '
-    'if (f[2] != "") { key=f[1] SUBSEP f[2]; if (seen[key]++) next } '
-    'u=(f[2] in users && users[f[2]] != "") ? users[f[2]] : "?"; '
-    'print f[1] "," f[2] "," u }\'; fi'
-)
+# GPU rows, compute apps, and host capacity are POSIX sh resources; the probe
+# below runs the three as parallel subshells under the node's login shell.
+GPU_Q = shell.load("probe_gpu.sh").rstrip("\n")
+APP_Q = shell.load("probe_apps.sh").rstrip("\n")
 SEP = "---DT---"
 SYS_SEP = "---DT-SYS---"
 PROBE_CACHE_MAX_BYTES = 8 * 1024 * 1024
@@ -86,28 +45,7 @@ INTERACTIVE_PROBE_BUDGET_S = 0.65
 # Interactive status is a read path: once its shared budget expires, a long
 # TERM grace is strictly worse than returning stale fail-closed capacity.
 INTERACTIVE_PROBE_CANCEL_GRACE_S = 0.05
-SYSTEM_Q = r"""
-cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 0)
-load1=$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)
-mem=$(awk '
-  /^MemTotal:/ {total=$2}
-  /^MemAvailable:/ {avail=$2}
-  END {printf "%d %d", total, avail}
-' /proc/meminfo 2>/dev/null)
-mem_total=${mem%% *}; mem_avail=${mem##* }
-disk=$(df -Pk "$HOME" 2>/dev/null | awk 'NR==2 {print $2, $4}')
-disk_total=${disk%% *}; disk_avail=${disk##* }
-io=$(awk '
-  /^some / {
-    for (i=1; i<=NF; i++) if ($i ~ /^avg10=/) {
-      split($i, v, "="); print v[2]; exit
-    }
-  }
-' /proc/pressure/io 2>/dev/null)
-printf '%s,%s,%s,%s,%s,%s,%s\n' \
-  "${cores:-0}" "${load1:-0}" "${mem_total:-0}" "${mem_avail:-0}" \
-  "${disk_total:-0}" "${disk_avail:-0}" "${io:--1}"
-"""
+SYSTEM_Q = shell.load("probe_system.sh")
 PROBE_CMD = (
     'umask 077; if [ "${0:-}" = dt-bounded-probe ] && [ -n "${1:-}" ]; then '
     "dt_probe_tmp=$1; else "
