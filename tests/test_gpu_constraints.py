@@ -7,6 +7,8 @@ import pytest
 from typer.testing import CliRunner
 
 from dt import cli, dispatch, jobs, ps_query, remote, scheduler
+from dt.cli.commands import run as run_cmd
+from dt.cli.commands import free as free_cmd
 from dt.config import HeadConfig, Node, Project, QueueCfg
 from dt.dispatch import RunSpec
 from dt.probe import Gpu, NodeStatus
@@ -229,7 +231,7 @@ def test_free_explain_preserves_minimum_memory_and_unknown_inventory_reason(
         "agent_heartbeat_stale": False,
         "model": model,
     }
-    payload = cli._free_explain_payload(
+    payload = free_cmd._free_explain_payload(
         [
             {
                 "center": "test",
@@ -353,7 +355,7 @@ def test_task_json_persists_and_reports_minimum_gpu_memory(
         return entry, None
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_submit_entry", fake_submit)
+    monkeypatch.setattr(run_cmd, "_submit_entry", fake_submit)
     result = CliRunner().invoke(
         cli.app,
         [

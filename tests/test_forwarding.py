@@ -58,7 +58,13 @@ def _forwarded_flags(command_name: str, *, source_name: str | None = None) -> se
 
     from dt import cli
 
-    source = inspect.getsource(getattr(cli, source_name or command_name))
+    import importlib
+
+    command = getattr(cli, command_name)
+    owner = cli
+    if source_name is not None and not hasattr(cli, source_name):
+        owner = importlib.import_module(command.__module__)
+    source = inspect.getsource(getattr(owner, source_name or command_name))
     starts = [
         index
         for index in (source.find("_head_command("), source.find("HeadCommand.start("))

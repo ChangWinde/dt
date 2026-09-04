@@ -8,6 +8,9 @@ import typer
 from typer.testing import CliRunner
 
 from dt import cli, dispatch, remote
+from dt.cli.commands import run as run_cmd
+from dt.cli.commands import wait as wait_cmd
+from dt.cli.commands import logs as logs_cmd
 from dt.config import ConfigError, HeadConfig, LaptopConfig, Node, Project
 from dt.dispatch import RunSpec
 from dt.jobs import JobEntry
@@ -166,7 +169,7 @@ def test_submission_json_and_human_report_failed_agent_autostart(tmp_path, monke
     entry.pgid = None
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli,
+        run_cmd,
         "_submit_entry",
         lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, False),
     )
@@ -695,7 +698,7 @@ def test_task_human_submission_shows_snapshot_and_environment_preparation(
     entry.setup_ran = False
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli,
+        run_cmd,
         "_submit_entry",
         lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, None),
     )
@@ -741,7 +744,7 @@ def test_task_surfaces_queued_block_reason_in_human_and_json_output(
     entry.reason = "blocked: n1: path-missing: /data/libero"
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli,
+        run_cmd,
         "_submit_entry",
         lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, None),
     )
@@ -770,7 +773,7 @@ def test_submission_receipt_treats_registry_labels_as_text(tmp_path, monkeypatch
     entry.project = "[link=file:///tmp/fake]project[/link]"
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli,
+        run_cmd,
         "_submit_entry",
         lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, None),
     )
@@ -796,7 +799,7 @@ def test_task_follow_enters_watch_and_preserves_job_exit_code(tmp_path, monkeypa
         lambda cfg_, spec, cwd, log, no_queue=False: _entry(spec),
     )
     monkeypatch.setattr(
-        cli,
+        run_cmd,
         "watch",
         lambda ref, poll, lines, json_, completion_wake: (
             watched.append((ref, poll, lines, json_, completion_wake)) or True
@@ -823,7 +826,7 @@ def test_task_follow_enters_watch_and_preserves_job_exit_code(tmp_path, monkeypa
         )
         raise typer.Exit(7)
 
-    monkeypatch.setattr(cli, "wait", fake_wait)
+    monkeypatch.setattr(run_cmd, "wait", fake_wait)
 
     result = CliRunner().invoke(
         cli.app,
@@ -863,7 +866,7 @@ def test_run_follow_uses_the_same_terminal_contract_as_task(tmp_path, monkeypatc
         lambda cfg_, spec, cwd, log, no_queue=False: _entry(spec),
     )
     monkeypatch.setattr(
-        cli,
+        run_cmd,
         "watch",
         lambda ref, poll, lines, json_, completion_wake: (
             watched.append((ref, poll, lines, json_, completion_wake)) or True
@@ -890,7 +893,7 @@ def test_run_follow_uses_the_same_terminal_contract_as_task(tmp_path, monkeypatc
         )
         raise typer.Exit(7)
 
-    monkeypatch.setattr(cli, "wait", fake_wait)
+    monkeypatch.setattr(run_cmd, "wait", fake_wait)
 
     result = CliRunner().invoke(
         cli.app,
@@ -947,7 +950,7 @@ def test_run_can_sync_explicit_artifacts_to_a_pinned_node(tmp_path, monkeypatch)
         seen["spec"] = spec
         return _entry(spec), None
 
-    monkeypatch.setattr(cli, "_submit_entry", fake_submit)
+    monkeypatch.setattr(run_cmd, "_submit_entry", fake_submit)
 
     result = CliRunner().invoke(
         cli.app,
@@ -1041,8 +1044,8 @@ def test_task_follow_json_streams_submission_watch_and_terminal_result(
         print(json.dumps({"job_id": ref, "status": "finished", "exit_code": 7}))
         raise typer.Exit(7)
 
-    monkeypatch.setattr(cli, "watch", fake_watch)
-    monkeypatch.setattr(cli, "wait", fake_wait)
+    monkeypatch.setattr(run_cmd, "watch", fake_watch)
+    monkeypatch.setattr(run_cmd, "wait", fake_wait)
 
     result = CliRunner().invoke(
         cli.app,
@@ -1074,7 +1077,7 @@ def test_task_follow_does_not_repeat_primary_failure_but_keeps_referenced_log(
     primary = "runner failed; see outputs/registry/train.failure.log"
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli,
+        run_cmd,
         "_submit_entry",
         lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, None),
     )
@@ -1084,7 +1087,7 @@ def test_task_follow_does_not_repeat_primary_failure_but_keeps_referenced_log(
         cli.err.print(primary)
         return True
 
-    monkeypatch.setattr(cli, "watch", watched)
+    monkeypatch.setattr(run_cmd, "watch", watched)
     responses = iter(
         [
             subprocess.CompletedProcess([], 0, f"{primary}\n", ""),
@@ -1116,12 +1119,12 @@ def test_task_follow_ctrl_c_explains_detach_and_recovery_commands(
         lambda cfg_, spec, cwd, log, no_queue=False: _entry(spec),
     )
     monkeypatch.setattr(
-        cli,
+        run_cmd,
         "watch",
         lambda ref, poll, lines, json_, completion_wake: False,
     )
     monkeypatch.setattr(
-        cli,
+        run_cmd,
         "wait",
         lambda *args: waited.append(args),
     )
@@ -1260,7 +1263,7 @@ def test_wait_enforces_the_reserved_exit_band():
         exit_code=66,
     )
 
-    payload, code = cli._wait_terminal_result(
+    payload, code = wait_cmd._wait_terminal_result(
         entry,
         error_lines=0,
         emit=lambda _line: None,
@@ -1269,7 +1272,7 @@ def test_wait_enforces_the_reserved_exit_band():
 
     assert code == 64
     assert payload["exit_code"] == 66
-    assert cli._log_terminal_exit_code(entry) == 64
+    assert logs_cmd._log_terminal_exit_code(entry) == 64
     # Codes outside both reserved bands pass through; >125 keeps clamping.
     assert cli._stable_wait_exit(0) == 0
     assert cli._stable_wait_exit(64) == 64
@@ -1297,10 +1300,10 @@ def test_finished_without_exit_code_is_infra_failure_not_success():
     # A finished record with no exit code is an infrastructure anomaly, never
     # a success, across the shared result classifier and both consumers.
     assert effective_result_state(entry) == "infra_failure"
-    assert cli._log_terminal_exit_code(entry) == 68
+    assert logs_cmd._log_terminal_exit_code(entry) == 68
 
     emitted: list[str] = []
-    payload, code = cli._wait_terminal_result(
+    payload, code = wait_cmd._wait_terminal_result(
         entry,
         error_lines=0,
         emit=emitted.append,

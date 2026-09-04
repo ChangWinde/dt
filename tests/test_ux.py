@@ -3,6 +3,8 @@ info parsing helpers."""
 
 import pytest
 
+from dt.cli.commands import ps as ps_cmd
+
 from rich.text import Text
 
 from dt.config import Project
@@ -628,7 +630,7 @@ def test_disk_headroom_warning_covers_percentage_and_absolute_floor():
 def test_agent_status_card_stays_readable_at_80_columns():
     from rich.console import Console
 
-    from dt.cli import _agent_status_table
+    from dt.cli.commands.agent import _agent_status_table
 
     status = {
         "alive": True,
@@ -676,7 +678,7 @@ def test_agent_status_card_stays_readable_at_80_columns():
 def test_stopped_agent_status_shows_the_recovery_command():
     from rich.console import Console
 
-    from dt.cli import _agent_status_table
+    from dt.cli.commands.agent import _agent_status_table
 
     status = {
         "alive": False,
@@ -708,7 +710,7 @@ def test_stopped_agent_status_shows_the_recovery_command():
 def test_verbose_agent_status_keeps_complete_queue_id_at_60_columns():
     from rich.console import Console
 
-    from dt.cli import _agent_status_table
+    from dt.cli.commands.agent import _agent_status_table
 
     job_id = "20260731-1311_uo114-libero_object_dp-v1_2d0f4c7f75c473c4"
     status = {
@@ -912,7 +914,8 @@ def test_free_human_explains_idle_gpu_and_keeps_public_json_unchanged(
 
 
 def test_free_explain_reports_stopped_agent_and_blocked_queue():
-    from dt.cli import _free_explain_payload
+
+    from dt.cli.commands.free import _free_explain_payload
 
     row = _node("c", "n1", 1, total=1)
     row["_scheduler"] = {
@@ -952,7 +955,8 @@ def test_free_explain_reports_stopped_agent_and_blocked_queue():
 
 
 def test_free_explain_distinguishes_incomplete_inventory_from_no_gpu_node():
-    from dt.cli import _free_explain_payload
+
+    from dt.cli.commands.free import _free_explain_payload
 
     row = {
         "center": "c",
@@ -990,7 +994,8 @@ def test_free_explain_distinguishes_incomplete_inventory_from_no_gpu_node():
 
 
 def test_free_explain_reports_queue_runway_and_free_capacity():
-    from dt.cli import _free_explain_payload
+
+    from dt.cli.commands.free import _free_explain_payload
 
     rows = [
         _node("c", "busy", 0, total=1),
@@ -1030,7 +1035,8 @@ def test_free_explain_reports_queue_runway_and_free_capacity():
 
 
 def test_free_explain_marks_old_head_scheduler_unknown():
-    from dt.cli import _free_explain_payload
+
+    from dt.cli.commands.free import _free_explain_payload
 
     row = _node("old", "n1", 1, total=1)
 
@@ -1046,7 +1052,7 @@ def test_free_explain_marks_old_head_scheduler_unknown():
 def test_free_human_idle_suggestion_avoids_known_low_disk_node():
     from rich.console import Console
 
-    from dt.cli import _free_view
+    from dt.cli.commands.free import _free_view
 
     rows = [
         _node("c", "low-disk", 1, total=1),
@@ -1135,7 +1141,7 @@ def test_free_human_warns_when_active_queue_has_no_successor(tmp_path, monkeypat
 def test_free_human_warns_when_queue_empty_with_unused_capacity():
     from rich.console import Console
 
-    from dt.cli import _free_view
+    from dt.cli.commands.free import _free_view
 
     rows = [
         _node("c", "busy", 0, total=1),
@@ -1167,7 +1173,7 @@ def test_free_human_warns_when_queue_empty_with_unused_capacity():
 def test_free_human_queue_runway_old_head_context_uses_safe_node_placeholder():
     from rich.console import Console
 
-    from dt.cli import _free_view
+    from dt.cli.commands.free import _free_view
 
     row = _node("c", "busy", 0, total=1)
     row["_scheduler"] = {
@@ -1190,7 +1196,7 @@ def test_free_human_queue_runway_old_head_context_uses_safe_node_placeholder():
 def test_ps_watch_view_warns_when_running_center_has_no_successor():
     from rich.console import Console
 
-    from dt.cli import _ps_view
+    from dt.cli.commands.ps import _ps_view
 
     rows = [
         {
@@ -1231,7 +1237,7 @@ def test_ps_watch_view_warns_when_running_center_has_no_successor():
 def test_ps_watch_view_treats_center_errors_as_literal_text():
     from rich.console import Console
 
-    from dt.cli import _ps_view
+    from dt.cli.commands.ps import _ps_view
 
     console = Console(width=100, record=True, color_system=None)
     console.print(
@@ -1250,7 +1256,7 @@ def test_ps_watch_view_treats_center_errors_as_literal_text():
 def test_ps_watch_view_laptop_runway_command_pins_the_center():
     from rich.console import Console
 
-    from dt.cli import _ps_view
+    from dt.cli.commands.ps import _ps_view
 
     rows = [
         {
@@ -1288,7 +1294,7 @@ def test_ps_watch_view_laptop_runway_command_pins_the_center():
 def test_ps_watch_view_status_filtered_mode_does_not_infer_queue_runway():
     from rich.console import Console
 
-    from dt.cli import _ps_view
+    from dt.cli.commands.ps import _ps_view
 
     rows = [
         {
@@ -1327,7 +1333,7 @@ def test_ps_watch_view_status_filtered_mode_does_not_infer_queue_runway():
 def test_ps_watch_view_suppresses_runway_warning_when_successor_is_queued():
     from rich.console import Console
 
-    from dt.cli import _ps_view
+    from dt.cli.commands.ps import _ps_view
 
     rows = [
         {
@@ -1381,7 +1387,7 @@ def test_ps_watch_view_suppresses_runway_warning_when_successor_is_queued():
 def test_ps_watch_view_multi_center_runway_avoids_guessing_one_command():
     from rich.console import Console
 
-    from dt.cli import _ps_view
+    from dt.cli.commands.ps import _ps_view
 
     rows = [
         {
@@ -1587,7 +1593,7 @@ def test_laptop_free_explain_pins_actions_to_their_centers(monkeypatch):
 def test_free_scheduler_explains_untracked_dt_lease():
     from rich.console import Console
 
-    from dt.cli import _free_view
+    from dt.cli.commands.free import _free_view
 
     row = _node("c", "n1", 0, total=1)
     row["gpus"][0].update(
@@ -1620,7 +1626,7 @@ def test_free_scheduler_explains_untracked_dt_lease():
 def test_free_scheduler_default_hides_verbose_queue_head_diagnosis():
     from rich.console import Console
 
-    from dt.cli import _free_view
+    from dt.cli.commands.free import _free_view
 
     rows = [
         _node("c", "psibot-hm", 0, total=1),
@@ -1668,7 +1674,7 @@ def test_free_scheduler_default_hides_verbose_queue_head_diagnosis():
 def test_free_scheduler_explains_pinned_queue_cannot_use_free_gpu_elsewhere():
     from rich.console import Console
 
-    from dt.cli import _free_view
+    from dt.cli.commands.free import _free_view
 
     rows = [
         _node("c", "n1", 1, total=1),
@@ -1703,7 +1709,7 @@ def test_free_scheduler_explains_pinned_queue_cannot_use_free_gpu_elsewhere():
 def test_free_scheduler_prioritizes_job_specific_block_over_free_capacity():
     from rich.console import Console
 
-    from dt.cli import _free_view
+    from dt.cli.commands.free import _free_view
 
     row = _node("c", "n1", 1, total=1)
     row["_scheduler"] = {
@@ -1957,7 +1963,7 @@ def test_ps_watch_subtracts_collection_time_from_poll(tmp_path, monkeypatch):
     sleeps = []
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.time, "monotonic", lambda: next(monotonic))
-    monkeypatch.setattr(cli, "_gather_ps_rows", lambda *args, **kwargs: ([], {}))
+    monkeypatch.setattr(ps_cmd, "_gather_ps_rows", lambda *args, **kwargs: ([], {}))
 
     def stop_after_first_frame(seconds):
         sleeps.append(seconds)
@@ -2890,7 +2896,7 @@ def test_ps_issues_empty_state_does_not_render_an_empty_table(tmp_path, monkeypa
     )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli,
+        ps_cmd,
         "_gather_ps_rows",
         lambda *args, **kwargs: ([], {}),
     )
@@ -2905,10 +2911,9 @@ def test_ps_issues_empty_state_does_not_render_an_empty_table(tmp_path, monkeypa
 
 
 def test_ps_human_issues_compact_dependency_ids_without_mutating_machine_rows():
-    from dt import cli
 
     predecessor_id = "20260730-0047_long-predecessor-name_1234567890abcdef"
-    rows = cli._PsRows(
+    rows = ps_cmd._PsRows(
         [
             {
                 "job_id": predecessor_id,
@@ -2925,7 +2930,7 @@ def test_ps_human_issues_compact_dependency_ids_without_mutating_machine_rows():
         applied_filters={"issues"},
     )
 
-    human_rows = cli._humanize_ps_references(rows)
+    human_rows = ps_cmd._humanize_ps_references(rows)
 
     assert predecessor_id in rows[1]["reason"]
     assert human_rows[1]["reason"] == "dependency cdef failed"
@@ -3272,7 +3277,8 @@ def test_ps_table_marks_queued_reason_and_uses_pinned_target():
 
 
 def test_ps_selection_defaults_to_active_and_recent_is_bounded():
-    from dt.cli import _select_ps_rows
+
+    from dt.cli.commands.ps import _select_ps_rows
 
     rows = [
         {
@@ -4479,7 +4485,8 @@ def test_laptop_clean_can_target_one_nondefault_center(monkeypatch):
 
 
 def test_parse_marked_segments():
-    from dt.cli import INFO_MARK, _parse_marked
+    from dt.cli import INFO_MARK
+    from dt.cli.commands.info import _parse_marked
 
     text = f"1752900000\n{INFO_MARK}\n\n{INFO_MARK}\n1.5G\n{INFO_MARK}\nyes\n"
     started, finished, outputs, patch = _parse_marked(text, 4)

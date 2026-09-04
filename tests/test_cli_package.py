@@ -1,0 +1,113 @@
+"""The dt.cli package contract: command modules bind to the root's infrastructure.
+
+Tests stub shared infrastructure through ``dt.cli`` (``monkeypatch.setattr(cli,
+"run_on", ...)``).  A command module that imported ``run_on`` directly would
+bypass those stubs silently, so every such name must be reached as
+``_root.<name>`` at call time.  The root declares that surface by importing the
+names with a redundant alias (``from ..sshio import run_on as run_on``).
+"""
+
+from __future__ import annotations
+
+import ast
+import importlib
+import pkgutil
+import re
+from pathlib import Path
+
+import pytest
+import typer
+
+from dt import cli
+from dt.cli import commands
+
+ROOT = Path(cli.__file__)
+
+
+_STUB_PATTERN = re.compile(r'monkeypatch\.setattr\(\s*cli\s*,\s*"([A-Za-z_]\w*)"')
+
+
+def _patchable_surface() -> set[str]:
+    """Names the test suite stubs through ``dt.cli`` plus the root's declared re-exports."""
+    tree = ast.parse(ROOT.read_text())
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom):
+            names.update(
+                alias.name for alias in node.names if alias.asname == alias.name
+            )
+    for test_file in Path(__file__).parent.glob("*.py"):
+        names.update(_STUB_PATTERN.findall(test_file.read_text()))
+    return names
+
+
+def _command_modules() -> list[str]:
+    return [
+        f"{commands.__name__}.{info.name}"
+        for info in pkgutil.iter_modules(commands.__path__)
+    ]
+
+
+def test_root_declares_a_non_empty_patchable_surface():
+    surface = _patchable_surface()
+    assert {"run_on", "forward_call", "submit", "rsync"} <= surface
+
+
+@pytest.mark.parametrize("module_name", _command_modules())
+def test_command_module_reaches_patchable_infrastructure_through_root(module_name):
+    module = importlib.import_module(module_name)
+    tree = ast.parse(Path(module.__file__).read_text())
+    surface = _patchable_surface()
+    direct = sorted(
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+        if (alias.asname or alias.name) in surface
+    )
+    assert not direct, f"{module_name} must use _root.<name> for: {direct}"
+    assert module._root is cli
+
+
+@pytest.mark.parametrize("module_name", _command_modules())
+def test_command_module_commands_are_registered_on_the_root_app(module_name):
+    module = importlib.import_module(module_name)
+    top_level = {id(command.callback) for command in cli.app.registered_commands}
+    mounted_groups = {id(group.typer_instance) for group in cli.app.registered_groups}
+    grouped = {
+        id(command.callback)
+        for group in cli.app.registered_groups
+        for command in group.typer_instance.registered_commands
+    }
+    registered = 0
+    for name, value in vars(module).items():
+        if name.startswith("_") or not callable(value):
+            continue
+        if id(value) in top_level:
+            # the root re-exports every top-level command it registers
+            assert getattr(cli, name) is value
+            registered += 1
+        elif id(value) in grouped:
+            registered += 1
+    if registered == 0:
+        # a sub-command group: the module owns the Typer instance the root mounts
+        apps = [
+            value for value in vars(module).values() if isinstance(value, typer.Typer)
+        ]
+        assert apps and all(id(app) in mounted_groups for app in apps), module_name
+        assert any(app.registered_commands for app in apps)
+
+
+@pytest.mark.parametrize("module_name", _command_modules())
+def test_command_module_text_never_leaks_the_root_binding(module_name):
+    """`_root.` is an implementation seam; it must never reach a user-facing string."""
+    module = importlib.import_module(module_name)
+    tree = ast.parse(Path(module.__file__).read_text())
+    leaked = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and "_root." in node.value
+    ]
+    assert not leaked, leaked

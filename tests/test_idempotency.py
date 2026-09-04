@@ -13,6 +13,7 @@ import typer
 from typer.testing import CliRunner
 
 from dt import cli, dispatch
+from dt.cli.commands import run as run_cmd
 from dt.config import HeadConfig, LaptopConfig, Node, Project
 from dt.dispatch import (
     RequestConflict,
@@ -243,7 +244,7 @@ def test_cli_artifact_publish_is_inside_single_request_claim(tmp_path, monkeypat
 
     monkeypatch.setattr(dispatch, "_submit_prepared_once", fake_submit_once)
     monkeypatch.setattr(cli, "_sync_task_artifacts_raw", fake_sync)
-    request = cli.SubmissionRequest(
+    request = run_cmd.SubmissionRequest(
         name="train",
         gpus=1,
         command=("true",),
@@ -252,14 +253,14 @@ def test_cli_artifact_publish_is_inside_single_request_claim(tmp_path, monkeypat
         request_id="agent-cli-artifact:1",
     )
 
-    first = cli._submit_request(
+    first = run_cmd._submit_request(
         cfg,
         request,
         artifacts=[artifact.name],
         no_queue=False,
         json_=True,
     )
-    replay = cli._submit_request(
+    replay = run_cmd._submit_request(
         cfg,
         request,
         artifacts=[artifact.name],
@@ -268,7 +269,7 @@ def test_cli_artifact_publish_is_inside_single_request_claim(tmp_path, monkeypat
     )
     artifact.write_bytes(b"version two")
     with pytest.raises(typer.Exit):
-        cli._submit_request(
+        run_cmd._submit_request(
             cfg,
             request,
             artifacts=[artifact.name],

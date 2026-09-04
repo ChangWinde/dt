@@ -15,6 +15,9 @@ import pytest
 from typer.testing import CliRunner
 
 from dt import cli
+from dt.cli.commands import ps as ps_cmd
+from dt.cli.commands import clean as clean_cmd
+from dt.cli.commands import storage as storage_cmd
 from dt.agent import process_once
 from dt.config import HeadConfig, Node, QueueCfg, parse
 from dt.dispatch import blocked_not_busy, clean_jobs, spec_from_entry
@@ -1914,7 +1917,7 @@ def test_managed_result_invalid_identity_never_authorizes_deletion(tmp_path, rec
     (result / "dt" / "job.json").write_text(record)
     (result / "keep.txt").write_text("user data\n")
 
-    assert cli._owned_managed_results(cfg, {"old-done"}) == []
+    assert clean_cmd._owned_managed_results(cfg, {"old-done"}) == []
     assert result.is_dir()
     assert (result / "keep.txt").read_text() == "user data\n"
 
@@ -2270,7 +2273,7 @@ def test_ps_center_is_laptop_only_and_scopes_the_fan_out(tmp_path, monkeypatch):
         seen["centers"] = dict(cfg_arg.centers)
         return [], {}
 
-    monkeypatch.setattr(cli, "_gather_ps_rows", fake_gather)
+    monkeypatch.setattr(ps_cmd, "_gather_ps_rows", fake_gather)
     monkeypatch.setattr(cli, "_cfg", lambda: laptop)
 
     result = CliRunner().invoke(cli.app, ["ps", "-c", "b", "--json"])
@@ -2317,7 +2320,7 @@ def test_clean_results_failure_retains_retryable_registry_record(tmp_path, monke
     (owned / "dt" / "job.json").write_text(json.dumps({"job_id": old.job_id}))
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(
-        cli.shutil,
+        clean_cmd.shutil,
         "rmtree",
         lambda path: (_ for _ in ()).throw(OSError("read-only result")),
     )
@@ -2342,7 +2345,7 @@ def test_clean_results_refuses_path_replaced_after_ownership_scan(
     owned = cfg.results_dir() / old.job_id
     (owned / "dt").mkdir(parents=True)
     (owned / "dt" / "job.json").write_text(json.dumps({"job_id": old.job_id}))
-    original_scan = cli._owned_managed_results
+    original_scan = clean_cmd._owned_managed_results
 
     def replace_after_scan(cfg_, job_ids):
         scanned = original_scan(cfg_, job_ids)
@@ -2355,7 +2358,7 @@ def test_clean_results_refuses_path_replaced_after_ownership_scan(
         return scanned
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "_owned_managed_results", replace_after_scan)
+    monkeypatch.setattr(clean_cmd, "_owned_managed_results", replace_after_scan)
 
     cleaned = CliRunner().invoke(
         cli.app,
@@ -2396,7 +2399,7 @@ def test_clean_results_holds_pull_destination_lock_while_deleting(
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "pull_destination_lock", destination_lock)
-    monkeypatch.setattr(cli.shutil, "rmtree", checked_rmtree)
+    monkeypatch.setattr(clean_cmd.shutil, "rmtree", checked_rmtree)
 
     cleaned = CliRunner().invoke(
         cli.app,
@@ -2576,7 +2579,9 @@ def test_storage_defaults_to_scope_summary_and_keeps_details_explicit(
         "total_bytes": 1000,
     }
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli, "storage_inventory", lambda *args, **kwargs: payload)
+    monkeypatch.setattr(
+        storage_cmd, "storage_inventory", lambda *args, **kwargs: payload
+    )
 
     summary = CliRunner().invoke(cli.app, ["storage"])
     details = CliRunner().invoke(cli.app, ["storage", "--details"])
@@ -2608,7 +2613,7 @@ def test_storage_defaults_to_scope_summary_and_keeps_details_explicit(
 def test_storage_details_keep_complete_paths_at_60_columns():
     from rich.console import Console
 
-    from dt.cli import _storage_table
+    from dt.cli.commands.storage import _storage_table
 
     path = (
         "/srv/dt/results/a-very-long-research-project/"

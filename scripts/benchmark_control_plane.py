@@ -36,7 +36,9 @@ SOURCE = ROOT / "src"
 if str(SOURCE) not in sys.path:
     sys.path.insert(0, str(SOURCE))
 
-from dt import agent, cli, jobs, probe, sshio  # noqa: E402
+from dt import agent, jobs, probe, sshio  # noqa: E402
+from dt.cli.commands import free as free_cmd  # noqa: E402
+from dt.cli.commands import ps as ps_cmd  # noqa: E402
 from dt.config import HeadConfig, Node, QueueCfg  # noqa: E402
 from dt.jobs import JobEntry  # noqa: E402
 from dt.layout import ROLE_LAYOUT  # noqa: E402
@@ -626,7 +628,7 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
     elif metric == "active_ps":
 
         def action() -> None:
-            rows, errors = cli._gather_ps_rows(  # noqa: SLF001
+            rows, errors = ps_cmd._gather_ps_rows(  # noqa: SLF001
                 cfg,
                 None,
                 active_only=True,
@@ -639,7 +641,7 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
     elif metric == "free_scheduler_context":
 
         def action() -> None:
-            context = cli._free_scheduler_context(cfg, resources)  # noqa: SLF001
+            context = free_cmd._free_scheduler_context(cfg, resources)  # noqa: SLF001
             if context.get("queued") != args.active_jobs or context.get("error"):
                 raise RuntimeError("free scheduler context was incomplete")
 
@@ -675,7 +677,7 @@ def _worker(args: argparse.Namespace) -> dict[str, object]:
                     soft_deadline_s=args.probe_budget_s,
                 )
                 rows = probe.status_as_dict(slow_cfg.center, statuses)
-                rows = cli._with_free_scheduler_context(slow_cfg, rows)  # noqa: SLF001
+                rows = free_cmd._with_free_scheduler_context(slow_cfg, rows)  # noqa: SLF001
                 slow = next(status for status in statuses if status.node == "node-slow")
                 if len(rows) != args.nodes or not slow.stale or slow.free_gpus:
                     raise RuntimeError(

@@ -6,6 +6,7 @@ from typer.testing import CliRunner
 
 from dt import agent as agent_mod
 from dt import cli, doctor
+from dt.cli.commands import doctor as doctor_cmd
 from dt.config import HeadConfig, Node, Project, Site
 
 
@@ -72,7 +73,7 @@ def test_doctor_contract_reports_default_project_and_indirect_bulk_route():
         }
     ]
 
-    payload = cli._doctor_contract(rows, exit_code=0)  # noqa: SLF001
+    payload = doctor_cmd._doctor_contract(rows, exit_code=0)  # noqa: SLF001
 
     kinds = {issue["kind"] for issue in payload["issues"]}
     assert kinds == {"default_project_unavailable", "bulk_route_indirect"}

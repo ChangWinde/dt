@@ -90,7 +90,7 @@ Additional rules:
 - Destructive `--plan` output may remain intentionally detailed because target
   review is a safety requirement, not noise.
 - `src/dt/render.py` owns shared Rich behavior and reusable fleet/job renderers.
-  `src/dt/cli.py` remains the composition root and may keep a private
+  `src/dt/cli/` remains the composition root and may keep a private
   command-specific card when it directly composes that command's payload. It
   must not duplicate reusable width, status, reference, or path policy. No
   generic renderer registry is introduced while Rich is the sole human-output

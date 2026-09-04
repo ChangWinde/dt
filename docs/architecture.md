@@ -305,20 +305,27 @@ retains the complete documented payload.
 Shared Rich behavior and reusable fleet/job tables live in `render.py`. The CLI
 composition root supplies already validated domain data and chooses default,
 detail, or machine presentation. A command-specific card may remain private to
-`cli.py` when it only composes that command's payload; reusable rendering policy
-does not move back into the composition root. Display compaction never alters
+its command module when it only composes that command's payload; reusable
+rendering policy does not move back into the composition root. Display compaction never alters
 executable paths or arguments. Empty results use concise state messages rather
 than empty tables. The full rationale and width contract are recorded in
 [ADR 0008](adr/0008-operator-first-cli-presentation.md).
 
 ## Source modules
 
-`src/dt/cli.py` is the Typer composition root. It preserves command names,
-stdout/stderr separation, JSON schemas, and stable exit codes. Cohesive domain
-policy moves out incrementally through tested, module-qualified call-site
-migrations rather than by a wholesale command rewrite;
-[ADR 0035](adr/0035-incremental-bounded-context-extraction.md) defines the
-boundary and acceptance criteria.
+`src/dt/cli/` is the Typer package. `cli/__init__.py` is the composition root:
+it owns the `app`, shared infrastructure (configuration loading, job lookup,
+laptop-to-head forwarding, retry policy, submission failure reporting,
+telemetry tables), and the exit-code contract. Each command family lives in
+`cli/commands/<name>.py` and registers itself with the root, which imports the
+command modules last. Command modules reach infrastructure that tests stub
+through `dt.cli` as `_root.<name>` at call time and import everything else from
+its owning module; `tests/test_cli_package.py` enforces that contract. The
+package preserves command names, stdout/stderr separation, JSON schemas, and
+stable exit codes. Cohesive domain policy moves out incrementally through
+tested, module-qualified call-site migrations rather than by a wholesale
+command rewrite; [ADR 0035](adr/0035-incremental-bounded-context-extraction.md)
+defines the boundary and acceptance criteria.
 
 | Area | Modules |
 |---|---|
@@ -328,7 +335,7 @@ boundary and acceptance criteria.
 | Observation | `monitoring.py`, `ps_query.py`, `doctor.py`, `render.py` |
 | Data recovery and retention | `transfers.py`, `pull_evidence.py`, `storage.py`, `migration.py`, `compact.py`, `maintenance.py` |
 | Identity | `snapshot_hash.py`, `snapshot_store.py`, `payload_hash.py` |
-| Node runtime | `payload/` |
+| Node runtime | `payload/`, `shell/` |
 
 Domain modules expose typed or pure boundaries where practical. Subprocess,
 SSH, filesystem, registry, and terminal rendering remain explicit seams so

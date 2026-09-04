@@ -13,16 +13,15 @@ from pathlib import Path
 
 from rich.console import Console
 
-from dt.cli import (
-    _metrics_table,
+from dt.cli import _resource_rows, _resource_summary_rows
+from dt.cli.commands.info import (
     _parse_phase_jsonl,
     _phase_summary_from_text,
     _phase_summary_rows,
-    _parse_resource_jsonl,
-    _resource_rows,
-    _resource_summary_rows,
-    _summarize_resources,
 )
+from dt.cli.commands.metrics import _metrics_table
+from dt.monitoring import parse_resource_jsonl as _parse_resource_jsonl
+from dt.monitoring import summarize_resources as _summarize_resources
 from dt.dispatch import PAYLOAD_DIR, _support_files
 from dt.jobs import JobEntry
 from dt.layout import LEGACY_LAYOUT, ROLE_LAYOUT

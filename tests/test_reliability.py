@@ -23,7 +23,9 @@ import dt.lifecycle as lifecycle
 import dt.sshio as sshio
 from typer.testing import CliRunner
 
-from dt import cli, pull_evidence
+from dt import cli, pull_evidence, pull_relay, transfers
+from dt.cli.commands import kill as kill_cmd
+from dt.cli.commands import pull as pull_cmd
 from dt.config import HeadConfig, LaptopConfig, Node, Project, QueueCfg
 from dt.dispatch import RunSpec, _try_nodes
 from dt.jobs import JobEntry
@@ -1569,7 +1571,7 @@ def test_kill_retries_uncertain_launch_cleanup_after_node_recovers(
     monkeypatch.setattr(cli, "run_on", confirmed_dead)
     monkeypatch.setattr(cli.time, "time", lambda: 1234.5)
 
-    outcome = cli._kill_one(cfg, entry.job_id, yes=True, force=False)
+    outcome = kill_cmd._kill_one(cfg, entry.job_id, yes=True, force=False)
 
     assert outcome == "ok"
     assert len(probes) == 1
@@ -1618,13 +1620,13 @@ def test_uncertain_launch_cleanup_keeps_failure_until_death_is_verified(
     )
     monkeypatch.setattr(cli, "run_on", lambda *args, **kwargs: next(responses))
 
-    assert cli._kill_one(cfg, entry.job_id, yes=True, force=False) == "unverified"
+    assert kill_cmd._kill_one(cfg, entry.job_id, yes=True, force=False) == "unverified"
     after_unverified = jobs.load(cfg, entry.job_id)
     assert after_unverified is not None
     assert after_unverified.status == "failed"
     assert after_unverified.reason == reason
 
-    assert cli._kill_one(cfg, entry.job_id, yes=True, force=True) == "alive"
+    assert kill_cmd._kill_one(cfg, entry.job_id, yes=True, force=True) == "alive"
     after_alive = jobs.load(cfg, entry.job_id)
     assert after_alive is not None
     assert after_alive.status == "failed"
@@ -2508,7 +2510,7 @@ def test_pull_multiple_ctrl_c_cancels_workers_and_prints_exact_resume(
         assert cancel_event.wait(timeout=1)
         return {}
 
-    monkeypatch.setattr(cli, "_pull_group_one", pull_one)
+    monkeypatch.setattr(pull_cmd, "_pull_group_one", pull_one)
 
     result = CliRunner().invoke(
         cli.app,
@@ -2593,7 +2595,7 @@ def test_pull_collection_uses_managed_root_and_job_subdirectories(
             "exit_code": 0,
         }
 
-    monkeypatch.setattr(cli, "_pull_group_one", pull_one)
+    monkeypatch.setattr(pull_cmd, "_pull_group_one", pull_one)
 
     result = CliRunner().invoke(
         cli.app,
@@ -3085,7 +3087,7 @@ def test_lite_pull_patterns_exclude_nested_caches_and_model_weights(tmp_path):
 
 
 def test_pull_output_probe_combines_existence_and_best_effort_size():
-    command = cli._pull_outputs_probe_command("dt/jobs/job with space/outputs")
+    command = transfers.pull_outputs_probe_command("dt/jobs/job with space/outputs")
 
     assert "test -d 'dt/jobs/job with space/outputs'" in command
     assert (
@@ -3093,10 +3095,10 @@ def test_pull_output_probe_combines_existence_and_best_effort_size():
         in command
     )
     assert "|| true" in command
-    assert cli._pull_outputs_probe_bytes("16106127360\toutputs\n") == 16106127360
-    assert cli._pull_outputs_probe_bytes("") is None
-    assert cli._pull_outputs_probe_bytes("unsupported\n") is None
-    assert cli._pull_outputs_probe_bytes("-1\n") is None
+    assert transfers.pull_outputs_probe_bytes("16106127360\toutputs\n") == 16106127360
+    assert transfers.pull_outputs_probe_bytes("") is None
+    assert transfers.pull_outputs_probe_bytes("unsupported\n") is None
+    assert transfers.pull_outputs_probe_bytes("-1\n") is None
 
 
 @pytest.mark.parametrize(
@@ -3186,10 +3188,10 @@ def test_pull_job_record_uses_only_terminal_timestamps():
         exit_code=0,
     )
 
-    assert cli._pull_job_record(running)["duration_s"] is None
-    assert cli._pull_job_record(finished)["duration_s"] == 2.5
+    assert transfers.pull_job_record(running)["duration_s"] is None
+    assert transfers.pull_job_record(finished)["duration_s"] == 2.5
     finished.started_at = float("nan")
-    assert cli._pull_job_record(finished)["duration_s"] is None
+    assert transfers.pull_job_record(finished)["duration_s"] is None
 
 
 def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypatch):
@@ -3896,9 +3898,9 @@ def _relay_pull_fixture(tmp_path, monkeypatch):
         "run_on",
         lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""),
     )
-    monkeypatch.setattr(cli.pull_relay, "decide_pull_route", lambda *a, **k: route)
-    monkeypatch.setattr(cli.pull_relay, "record_pull_leg", lambda *a, **k: None)
-    monkeypatch.setattr(cli.pull_relay, "cleanup_staging", lambda *a, **k: True)
+    monkeypatch.setattr(pull_relay, "decide_pull_route", lambda *a, **k: route)
+    monkeypatch.setattr(pull_relay, "record_pull_leg", lambda *a, **k: None)
+    monkeypatch.setattr(pull_relay, "cleanup_staging", lambda *a, **k: True)
     return cfg, entry, route
 
 
@@ -3914,7 +3916,7 @@ def test_pull_falls_back_to_direct_when_gateway_staging_fails(tmp_path, monkeypa
     def failing_stage(*args, **kwargs):
         raise pull_relay.RelayError("gateway disk full")
 
-    monkeypatch.setattr(cli.pull_relay, "stage_outputs", failing_stage)
+    monkeypatch.setattr(pull_relay, "stage_outputs", failing_stage)
 
     def fake_rsync(src, dst, **kwargs):
         sources.append(src)
@@ -3941,7 +3943,7 @@ def test_pull_falls_back_to_direct_when_staged_leg_fails(tmp_path, monkeypatch):
     """Leg B (head <- gateway) failing keeps the staged capsule for resume but
     still owes the user their data: retry over the direct route once."""
     _cfg_, entry, _route = _relay_pull_fixture(tmp_path, monkeypatch)
-    monkeypatch.setattr(cli.pull_relay, "stage_outputs", lambda *a, **k: None)
+    monkeypatch.setattr(pull_relay, "stage_outputs", lambda *a, **k: None)
     calls: list[str] = []
 
     def fake_rsync(src, dst, **kwargs):
@@ -4006,7 +4008,7 @@ def test_programmatic_pull_always_receives_a_transfer_failure_payload(
     result: dict[str, object] = {}
 
     with pytest.raises(cli.typer.Exit) as excinfo:
-        cli._pull_unlocked(  # noqa: SLF001
+        pull_cmd._pull_unlocked(  # noqa: SLF001
             "jid",
             str(tmp_path / "result"),
             None,
@@ -4792,7 +4794,7 @@ def test_head_single_pull_ctrl_c_keeps_partial_and_prints_exact_resume(
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
     monkeypatch.setattr(
-        cli,
+        pull_cmd,
         "_pull_unlocked",
         lambda *args, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt),
     )
@@ -4995,7 +4997,7 @@ def test_kill_keeps_job_running_when_remote_death_cannot_be_verified(
         ),
     )
 
-    outcome = cli._kill_one(cfg, "jid", yes=True, force=False)
+    outcome = kill_cmd._kill_one(cfg, "jid", yes=True, force=False)
 
     assert outcome == "unverified"
     assert jobs.load(cfg, "jid").status == "running"
@@ -5004,7 +5006,7 @@ def test_kill_keeps_job_running_when_remote_death_cannot_be_verified(
         raise RemoteError("n1", "timed out")
 
     monkeypatch.setattr(cli, "run_on", raise_disconnect)
-    outcome = cli._kill_one(cfg, "jid", yes=True, force=False)
+    outcome = kill_cmd._kill_one(cfg, "jid", yes=True, force=False)
 
     assert outcome == "unverified"
     assert jobs.load(cfg, "jid").status == "running"
@@ -5028,7 +5030,7 @@ def test_kill_records_queued_dequeue_as_a_complete_lifecycle(tmp_path, monkeypat
     jobs.save(cfg, entry)
     monkeypatch.setattr(cli.time, "time", lambda: 1234.5)
 
-    outcome = cli._kill_one(cfg, "queued", yes=True, force=False)
+    outcome = kill_cmd._kill_one(cfg, "queued", yes=True, force=False)
 
     assert outcome == "ok"
     killed = jobs.load(cfg, "queued")
@@ -5390,7 +5392,7 @@ def test_kill_records_confirmed_running_termination(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(cli.time, "time", lambda: 1234.5)
 
-    outcome = cli._kill_one(cfg, "running", yes=True, force=False)
+    outcome = kill_cmd._kill_one(cfg, "running", yes=True, force=False)
 
     assert outcome == "ok"
     killed = jobs.load(cfg, "running")
@@ -5449,7 +5451,7 @@ def test_confirmed_kill_wins_race_with_concurrent_status_refresh(tmp_path, monke
 
     kill_thread = threading.Thread(
         target=lambda: kill_results.append(
-            cli._kill_one(cfg, "racing", yes=True, force=False)
+            kill_cmd._kill_one(cfg, "racing", yes=True, force=False)
         )
     )
     kill_thread.start()
@@ -5636,7 +5638,9 @@ def test_queued_kill_cannot_be_overwritten_by_concurrent_dispatch(
     assert dispatch_saving.wait(timeout=2)
 
     def kill_job():
-        kill_results.append(cli._kill_one(cfg, entry.job_id, yes=True, force=False))
+        kill_results.append(
+            kill_cmd._kill_one(cfg, entry.job_id, yes=True, force=False)
+        )
         kill_finished.set()
 
     kill_thread = threading.Thread(target=kill_job)
@@ -5736,7 +5740,9 @@ def test_queued_kill_does_not_wait_for_slow_dispatch_and_cancels_launch(
     assert dispatch_inflight.wait(timeout=2)
 
     def kill_job():
-        kill_results.append(cli._kill_one(cfg, entry.job_id, yes=True, force=False))
+        kill_results.append(
+            kill_cmd._kill_one(cfg, entry.job_id, yes=True, force=False)
+        )
         kill_finished.set()
 
     kill_thread = threading.Thread(target=kill_job)
@@ -6641,7 +6647,7 @@ def test_kill_preserves_natural_completion_that_beat_the_signal(tmp_path, monkey
     monkeypatch.setattr(jobs, "run_on", fake_run_on)
     payload = {}
 
-    outcome = cli._kill_one(cfg, "wonrace", yes=True, force=False, result=payload)
+    outcome = kill_cmd._kill_one(cfg, "wonrace", yes=True, force=False, result=payload)
 
     assert outcome == "ok"
     assert payload["outcome"] == "completed"
@@ -6686,7 +6692,7 @@ def test_kill_records_probe_exit_code_when_completion_read_fails(tmp_path, monke
     monkeypatch.setattr(jobs, "run_on", fake_run_on)
     monkeypatch.setattr(cli.time, "time", lambda: 4321.5)
 
-    outcome = cli._kill_one(cfg, "wonfall", yes=True, force=False)
+    outcome = kill_cmd._kill_one(cfg, "wonfall", yes=True, force=False)
 
     assert outcome == "ok"
     stored = jobs.load(cfg, "wonfall")
@@ -6733,7 +6739,7 @@ def test_kill_of_completed_uncertain_launch_records_the_real_result(
     )
     monkeypatch.setattr(cli.time, "time", lambda: 4321.5)
 
-    outcome = cli._kill_one(cfg, "wonuncertain", yes=True, force=False)
+    outcome = kill_cmd._kill_one(cfg, "wonuncertain", yes=True, force=False)
 
     assert outcome == "ok"
     stored = jobs.load(cfg, "wonuncertain")
@@ -6788,7 +6794,7 @@ def test_kill_sweep_reaps_leftovers_of_terminal_job_without_rewriting_it(
     straggler = subprocess.Popen(["sleep", "30"], cwd=job_dir, start_new_session=True)
     payload = {}
     try:
-        outcome = cli._kill_one(
+        outcome = kill_cmd._kill_one(
             cfg, "sweptjob", yes=True, force=False, result=payload, sweep=True
         )
         deadline = time.monotonic() + 2
@@ -6852,7 +6858,7 @@ def test_kill_sweep_reports_survivors_and_keeps_terminal_record(tmp_path, monkey
     )
     payload = {}
     try:
-        outcome = cli._kill_one(
+        outcome = kill_cmd._kill_one(
             cfg,
             "stubbornjob",
             yes=True,
@@ -6935,7 +6941,7 @@ def test_kill_refuses_unsafe_capsule_without_remote_signal(tmp_path, monkeypatch
         ),
     )
 
-    assert cli._kill_one(cfg, entry.job_id, yes=True, force=False) == "unverified"
+    assert kill_cmd._kill_one(cfg, entry.job_id, yes=True, force=False) == "unverified"
     retained = jobs.load(cfg, entry.job_id)
     assert retained is not None
     assert retained.status == "running"
