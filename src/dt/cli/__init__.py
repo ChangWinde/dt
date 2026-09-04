@@ -3126,6 +3126,7 @@ from .commands.agent import agent_app  # noqa: E402
 from .commands.clean import clean  # noqa: E402
 from .commands.compact import compact  # noqa: E402
 from .commands.compare import compare  # noqa: E402
+from .commands.contract import contract_command  # noqa: E402
 from .commands.diagnose import diagnose  # noqa: E402
 from .commands.doctor import doctor  # noqa: E402
 from .commands.events import events  # noqa: E402
@@ -3152,6 +3153,7 @@ from .commands.wait import wait  # noqa: E402
 from .commands.watch import watch  # noqa: E402
 
 app.command("init", rich_help_panel="Setup")(init_config)
+app.command("contract", rich_help_panel="Setup")(contract_command)
 app.command("free", rich_help_panel="Everyday")(free)
 app.command("f", hidden=True)(free)
 # The `task` facade stays callable for compatibility but is hidden; its

@@ -3,6 +3,13 @@
 Use `dt` for every experiment on configured shared GPU nodes. Do not bypass its
 leases and registry with manual SSH placement or ad hoc `nvidia-smi` polling.
 
+Start from the contract, not from help text: `dt contract --json` describes
+every command, option, exit code, and the single error shape (`dt_cli_error_v1`
+with `error`, `message`, `exit_code`, `reasons`) that any `--json` failure
+returns. Add `--json` to every command you parse, and `-y` to `kill`, `clean`,
+and `compact`; without it a non-interactive call returns
+`confirmation_required` instead of prompting.
+
 ## Closed loop
 
 Always give a meaningful name:

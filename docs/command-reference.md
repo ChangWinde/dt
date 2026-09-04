@@ -47,6 +47,7 @@ This page helps operators choose a command and handle its result. Run
 | `dt clean` | Delete explicitly scoped old jobs, results, environments, or deployment trees |
 | `dt sync` | Incrementally stage project code or explicit large inputs |
 | `dt seed` | Seed approved caches and Python runtimes on slow-network nodes |
+| `dt contract` | Describe every command, option, exit code, and the error shape as one JSON document |
 
 `dt doctor --json` reports whether a GPU worker has a usable persistent
 runtime. A GPU job requires a user systemd scope and `Linger=yes`; a missing or
@@ -295,6 +296,17 @@ dt events -c CENTER --issues --json  # laptop: query one head
 truncated or malformed records were skipped. Raw command arguments and
 exception messages are deliberately absent; use the correlated job, request,
 or agent evidence for authorized detail.
+
+## Discovering the surface: `dt contract --json`
+
+`dt contract --json` returns one `dt_contract_v1` document derived from the
+same metadata that renders `--help`: every visible command with its arguments
+and options (name, flags, type, default, whether it repeats), whether it
+speaks `--json`, whether it is destructive and which flag replaces its prompt
+(`confirmation_flag`) or previews it (`plan_flag`), hidden short aliases, the
+exit-code table below, and the error document described next. Tool builders
+generate exact function definitions from it instead of scraping help text;
+`dt contract` without `--json` prints a compact summary for humans.
 
 ## Errors under `--json`
 
