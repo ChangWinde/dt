@@ -589,9 +589,15 @@ def find_center(
 
 
 def forward_call(head: str, argv: list[str], tty: bool = False) -> int:
-    """Run remote dt inheriting stdio (streams pass through, exit code kept)."""
+    """Run remote dt with stdout/stderr passing through and the exit code kept.
+
+    stdin passes through only for an interactive (``tty``) call; otherwise ssh
+    would drain whatever the caller's stdin holds - typically the rest of a
+    script piped into the laptop - and forward it to a head command that never
+    reads it.
+    """
     cmd = [*ssh_base(), *(["-t"] if tty else []), head, _head_dt_command(argv)]
-    return subprocess.call(cmd)
+    return subprocess.call(cmd, stdin=None if tty else subprocess.DEVNULL)
 
 
 def forward_capture_stdout(

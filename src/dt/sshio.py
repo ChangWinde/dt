@@ -1055,9 +1055,12 @@ def _run_bounded_process(
             raise
 
     try:
+        # Never inherit the caller's stdin: ssh would drain it and forward it
+        # to the remote command, which silently truncates a script piped into
+        # the head (`ssh head 'bash -s' < submit.sh`) at the first dt call.
         child = subprocess.Popen(
             cmd,
-            stdin=stdin_spool,
+            stdin=stdin_spool if stdin_spool is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=None if inherit_stderr else subprocess.PIPE,
             text=True,
