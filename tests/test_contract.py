@@ -101,3 +101,14 @@ def test_contract_human_view_lists_commands_on_stderr_only():
     assert result.exit_code == 0, result.output
     assert "command contract" in result.output
     assert "kill" in result.output and "yes (--yes)" in result.output
+
+
+def test_every_visible_command_has_a_row_in_the_command_reference():
+    docs = DOCS.read_text()
+    missing = [
+        command["name"]
+        for command in _document()["commands"]
+        if f"`dt {command['name']}`" not in docs
+        and f"`dt {command['path'][0]}`" not in docs
+    ]
+    assert not missing, missing

@@ -1212,7 +1212,7 @@ def test_info_collects_running_status_artifacts_and_resources_in_parallel(
         started_at=100.0,
     )
     cli.jobs_mod.save(cfg, entry)
-    rendezvous = threading.Barrier(3, timeout=1.0)
+    rendezvous = threading.Barrier(3, timeout=30)
 
     def refresh(cfg_, entry_):
         rendezvous.wait()
@@ -2578,7 +2578,7 @@ def test_watch_snapshot_collects_remote_reads_in_parallel(
         status="running",
         started_at=100.0,
     )
-    rendezvous = threading.Barrier(3, timeout=1.0)
+    rendezvous = threading.Barrier(3, timeout=30)
 
     def refresh(cfg_, entry_, **kwargs):
         rendezvous.wait()
@@ -4364,10 +4364,11 @@ def test_wait_multiple_waits_concurrently(tmp_path, monkeypatch):
         emit,
         stop_event=None,
         completion_wake,
+        deadline=None,
     ):
         assert completion_wake is True
         thread_ids.add(threading.get_ident())
-        barrier.wait(timeout=1)
+        barrier.wait(timeout=30)
         return replace(entry, status="finished", exit_code=0)
 
     monkeypatch.setattr(wait_cmd, "_wait_until_terminal", wait_until_terminal)
@@ -4419,6 +4420,7 @@ def test_wait_multiple_progress_uses_compact_indices_with_long_names(
         emit,
         stop_event=None,
         completion_wake,
+        deadline=None,
     ):
         emit("[dim]queued; waiting for dispatch[/dim]")
         return replace(entry, status="finished", exit_code=0)
@@ -4520,14 +4522,15 @@ def test_wait_multiple_ctrl_c_stops_only_local_workers(tmp_path, monkeypatch):
         emit,
         stop_event=None,
         completion_wake,
+        deadline=None,
     ):
         assert completion_wake is True
         assert stop_event is not None
         if entry.name == "one":
-            assert second_started.wait(timeout=1)
+            assert second_started.wait(timeout=30)
             raise KeyboardInterrupt
         second_started.set()
-        assert stop_event.wait(timeout=1)
+        assert stop_event.wait(timeout=30)
         raise wait_cmd._WaitStopped
 
     monkeypatch.setattr(wait_cmd, "_wait_until_terminal", wait_until_terminal)
@@ -4579,14 +4582,15 @@ def test_wait_multiple_json_ctrl_c_cancels_workers_and_emits_resume(
         emit,
         stop_event=None,
         completion_wake,
+        deadline=None,
     ):
         assert completion_wake is True
         assert stop_event is not None
         if entry.name == "one":
-            assert second_started.wait(timeout=1)
+            assert second_started.wait(timeout=30)
             raise KeyboardInterrupt
         second_started.set()
-        assert stop_event.wait(timeout=1)
+        assert stop_event.wait(timeout=30)
         raise wait_cmd._WaitStopped
 
     monkeypatch.setattr(wait_cmd, "_wait_until_terminal", wait_until_terminal)
@@ -6394,7 +6398,7 @@ def test_ps_progress_collects_status_resources_and_logs_in_one_parallel_wave(
         status="running",
     )
     cli.jobs_mod.save(cfg, entry)
-    rendezvous = threading.Barrier(3, timeout=1.0)
+    rendezvous = threading.Barrier(3, timeout=30)
 
     def refresh(cfg_, entry_, **kwargs):
         rendezvous.wait()

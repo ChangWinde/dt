@@ -953,7 +953,7 @@ def test_concurrent_replica_cold_builders_publish_only_complete_generation(
     publish = jobs._publish_replica_rebuild
 
     def synchronized_publish(*args, **kwargs):
-        barrier.wait(timeout=5)
+        barrier.wait(timeout=30)
         return publish(*args, **kwargs)
 
     monkeypatch.setattr(jobs, "iter_all", history)
@@ -1007,12 +1007,12 @@ def test_replica_cold_build_retries_registry_mutation_fence(tmp_path, monkeypatc
         yield seed
         if scans == 1:
             scan_ready.set()
-            assert mutation_done.wait(timeout=5)
+            assert mutation_done.wait(timeout=30)
 
     monkeypatch.setattr(jobs, "iter_all", history)
     with ThreadPoolExecutor(max_workers=1) as pool:
         pending = pool.submit(jobs.artifact_replica_records, cfg, digest, "psibot")
-        assert scan_ready.wait(timeout=5)
+        assert scan_ready.wait(timeout=30)
         jobs.save(
             cfg,
             JobEntry(

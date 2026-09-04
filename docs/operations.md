@@ -288,10 +288,14 @@ Stable `dt wait` terminal codes:
 | 67 | Job lost |
 | 68 | Failed before start |
 | 69 | Dependency predicate skipped the job |
+| 126 | `--timeout` elapsed; the job is still active and was not cancelled |
 
 The 65-69 band always means dt's own terminal semantics: an experiment
 that itself exits inside the band is reported as 64, and `dt wait --json`
-carries the untruncated `exit_code`.
+carries the untruncated `exit_code`. `dt wait --timeout SECONDS` bounds an
+automated wait: when it elapses the command prints the job's current state
+and an exact resume command, exits 126 (a code no experiment can produce,
+since results above 125 clamp to 125), and leaves the job running.
 
 Submission uses exit 2 for `--no-queue` capacity failure, 3 for environment
 failure, 4 for local not-found paths, and 5 for unreachable infrastructure.

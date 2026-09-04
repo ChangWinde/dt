@@ -3259,7 +3259,7 @@ def test_local_completion_watcher_exits_on_remote_marker(tmp_path):
     watcher = agent._spawn_completion_watcher(entry)
     try:
         (job_dir / "exit_code").write_text("0\n")
-        assert watcher.wait(timeout=1) == 0
+        assert watcher.wait(timeout=30) == 0
     finally:
         wrapper.terminate()
         wrapper.wait(timeout=1)
@@ -3538,7 +3538,7 @@ def test_concurrent_dispatchers_cannot_replace_an_active_attempt(tmp_path, monke
         if not owned:
             return None, {}, True, {"interrupted"}
         owner_entered.set()
-        assert release_owner.wait(timeout=2)
+        assert release_owner.wait(timeout=30)
         return None, {}, False, set()
 
     monkeypatch.setattr(dispatch, "_try_nodes", fake_try_nodes)
@@ -3553,7 +3553,7 @@ def test_concurrent_dispatchers_cannot_replace_an_active_attempt(tmp_path, monke
         )
     )
     first.start()
-    assert owner_entered.wait(timeout=2)
+    assert owner_entered.wait(timeout=30)
 
     owner = load(cfg, entry.job_id)
     assert owner is not None

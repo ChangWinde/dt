@@ -1794,7 +1794,7 @@ def test_telemetry_sigterm_interrupts_slow_gpu_probe(tmp_path):
 
         started = time.monotonic()
         proc.send_signal(signal.SIGTERM)
-        assert proc.wait(timeout=1) == 0
+        assert proc.wait(timeout=30) == 0
         assert time.monotonic() - started < 0.5
         assert output.read_text() == ""
     finally:

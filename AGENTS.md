@@ -210,6 +210,10 @@ General command codes:
 65-69 band is enforced: an experiment that itself exits 65-69 reports 64,
 and `--json` carries the untruncated `exit_code`.
 
+Bound every automated wait: `dt wait JOB --timeout 1800 --json` returns 126
+with the job's current state and a `resume` argv when the bound elapses, and
+the job keeps running.
+
 ## Development gate
 
 ```bash

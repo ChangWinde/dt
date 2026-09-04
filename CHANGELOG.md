@@ -8,6 +8,11 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Added
 
+- `dt wait --timeout SECONDS`: bound an automated wait. When the bound elapses
+  the command reports the job's current state and an exact resume command,
+  exits 126 (a code no experiment result can produce), and leaves the job
+  running; `--json` carries `wait_deadline_reached`, `wait_timeout_s`, and
+  `resume`. Multi-job waits apply the same deadline to every job.
 - `dt contract --json`: one `dt_contract_v1` document describing every visible
   command with its arguments, options (flags, type, default, repeat), `--json`
   support, destructive status with its confirmation and plan flags, aliases,

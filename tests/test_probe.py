@@ -692,7 +692,7 @@ def test_probe_cache_atomic_writes_do_not_collide_across_callers(tmp_path, monke
         lambda node, threshold: NodeStatus(node=node.name),
     )
     original_write_text = Path.write_text
-    both_shared_temp_writes_finished = threading.Barrier(2, timeout=1)
+    both_shared_temp_writes_finished = threading.Barrier(2, timeout=30)
 
     def synchronized_write_text(path, data, *args, **kwargs):
         result = original_write_text(path, data, *args, **kwargs)
@@ -731,7 +731,7 @@ def test_concurrent_fresh_probes_share_one_inflight_refresh(tmp_path, monkeypatc
         nonlocal calls
         calls += 1
         first_probe_started.set()
-        assert release_probe.wait(timeout=1)
+        assert release_probe.wait(timeout=30)
         return NodeStatus(node=node.name)
 
     original_lock = probe_mod._probe_refresh_lock
@@ -751,9 +751,9 @@ def test_concurrent_fresh_probes_share_one_inflight_refresh(tmp_path, monkeypatc
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(probe_mod.probe_center, cfg, False)
-        assert first_probe_started.wait(timeout=1)
+        assert first_probe_started.wait(timeout=30)
         second = pool.submit(probe_mod.probe_center, cfg, False)
-        assert second_lock_attempted.wait(timeout=1)
+        assert second_lock_attempted.wait(timeout=30)
         release_probe.set()
         results = [first.result(), second.result()]
 

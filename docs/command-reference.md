@@ -3,6 +3,13 @@
 This page helps operators choose a command and handle its result. Run
 `dt COMMAND --help` for the exact option set installed on a machine.
 
+## Setup commands
+
+| Command | Purpose |
+|---|---|
+| `dt init` | Write a head or laptop configuration from a few answers |
+| `dt contract` | Describe every command, option, exit code, and the error shape as one JSON document |
+
 ## Everyday commands
 
 | Command | Purpose |
@@ -47,7 +54,6 @@ This page helps operators choose a command and handle its result. Run
 | `dt clean` | Delete explicitly scoped old jobs, results, environments, or deployment trees |
 | `dt sync` | Incrementally stage project code or explicit large inputs |
 | `dt seed` | Seed approved caches and Python runtimes on slow-network nodes |
-| `dt contract` | Describe every command, option, exit code, and the error shape as one JSON document |
 
 `dt doctor --json` reports whether a GPU worker has a usable persistent
 runtime. A GPU job requires a user systemd scope and `Linger=yes`; a missing or
@@ -346,10 +352,12 @@ General command codes:
 | 3 | Remote environment or setup failure |
 | 4 | Requested local object or path not found |
 | 5 | Required host or center unreachable |
+| 126 | `dt wait --timeout` elapsed; the job is still active and was not cancelled |
 | 130 | Local interruption; registered remote jobs continue unless explicitly killed |
 
 `dt wait` reserves 65 through 69 for terminal job states, while 0 through 125
-otherwise carry the experiment result. The reservation is enforced: an
+otherwise carry the experiment result; `--timeout SECONDS` returns 126 with the
+job's current state and a resume command when the bound elapses. The reservation is enforced: an
 experiment process that itself exits 65 through 69 is reported as 64 (just as
 codes above 125 clamp to 125), and `--json` always carries the untruncated
 `exit_code`. See [Operations](operations.md) for the mapping.

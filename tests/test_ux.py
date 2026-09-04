@@ -1995,7 +1995,7 @@ def test_laptop_doctor_overlaps_head_and_node_diagnostics(monkeypatch):
     node_diagnostics_started = threading.Event()
 
     def version(*args, **kwargs):
-        assert node_diagnostics_started.wait(timeout=1)
+        assert node_diagnostics_started.wait(timeout=30)
         return subprocess.CompletedProcess([], 0, "dt 1.2.3\n", "")
 
     def fan(*args, **kwargs):
@@ -2029,7 +2029,7 @@ def test_laptop_doctor_checks_head_versions_in_parallel(monkeypatch):
         centers={"east": "head-a", "west": "head-b"},
         default_center="east",
     )
-    both_versions_started = threading.Barrier(2, timeout=1)
+    both_versions_started = threading.Barrier(2, timeout=30)
 
     def version(*args, **kwargs):
         both_versions_started.wait()

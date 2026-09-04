@@ -814,6 +814,7 @@ def test_task_follow_enters_watch_and_preserves_job_exit_code(tmp_path, monkeypa
         json_,
         primary_log_shown,
         completion_wake,
+        timeout=None,
     ):
         waited.append(
             (
@@ -881,6 +882,7 @@ def test_run_follow_uses_the_same_terminal_contract_as_task(tmp_path, monkeypatc
         json_,
         primary_log_shown,
         completion_wake,
+        timeout=None,
     ):
         waited.append(
             (
@@ -1031,6 +1033,7 @@ def test_task_follow_json_streams_submission_watch_and_terminal_result(
         json_,
         primary_log_shown,
         completion_wake,
+        timeout=None,
     ):
         waited.append(
             (

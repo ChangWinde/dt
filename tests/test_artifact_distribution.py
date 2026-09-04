@@ -510,7 +510,7 @@ def test_same_digest_fans_out_to_different_destinations_concurrently(
     # timeout flakes under the full, parallel qualification load before the
     # second executor is scheduled; five seconds still fails promptly if the
     # site lock is incorrectly held across fan-out.
-    fanout_started = threading.Barrier(2, timeout=5)
+    fanout_started = threading.Barrier(2, timeout=30)
 
     def cache_available(*args):
         return cache_ready

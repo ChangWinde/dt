@@ -10,6 +10,7 @@ import json
 import math
 import re
 import sys
+import shlex
 import time
 
 from rich.markup import escape
@@ -71,6 +72,13 @@ def _queued_reason_kind(reason: str | None) -> str | None:
     return "other"
 
 
+class _WaitDeadline(RuntimeError):
+    """``--timeout`` elapsed while the job was still active."""
+
+
+WAIT_DEADLINE_EXIT = 126  # never an experiment result: those clamp to 125
+
+
 class _WaitStopped(RuntimeError):
     """Internal signal used to wake group wait workers after local Ctrl-C."""
 
@@ -90,8 +98,14 @@ def _wait_until_terminal(
     emit: Callable[[str], None],
     stop_event: Event | None = None,
     completion_wake: bool,
+    deadline: float | None = None,
 ) -> jobs_mod.JobEntry:
-    """Wait through queue and runtime states using the canonical wait semantics."""
+    """Wait through queue and runtime states using the canonical wait semantics.
+
+    ``deadline`` is a ``time.monotonic()`` instant; reaching it while the job is
+    still active raises ``_WaitDeadline`` so the caller can report the current
+    state instead of blocking an automated caller forever.
+    """
     completion_signals = _root.CompletionSignals() if completion_wake else None
 
     def emit_job_edge(
@@ -109,16 +123,23 @@ def _wait_until_terminal(
             emit(f"[yellow]{escape(reason)}[/yellow]")
 
     def pause(seconds: float) -> None:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _WaitDeadline
+            seconds = min(seconds, remaining)
         if completion_signals is None:
             _wait_pause(seconds, stop_event)
-            return
-        outcome = completion_signals.wait(
-            [entry],
-            seconds,
-            stop_event=stop_event,
-        )
-        if outcome == "stopped":
-            raise _WaitStopped
+        else:
+            outcome = completion_signals.wait(
+                [entry],
+                seconds,
+                stop_event=stop_event,
+            )
+            if outcome == "stopped":
+                raise _WaitStopped
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _WaitDeadline
 
     try:
         if entry.status == "queued":
@@ -487,6 +508,30 @@ def _wait_terminal_result(
     return _submission_payload(entry, exit_code=code), code
 
 
+def _wait_deadline_result(
+    entry: jobs_mod.JobEntry,
+    *,
+    timeout: float,
+    resume: list[str],
+    emit: Callable[[str], None],
+) -> tuple[JsonDict, int]:
+    """Report the still-active job when ``--timeout`` elapses; nothing is cancelled."""
+    where = f" on {entry.node}" if entry.status == "running" else ""
+    emit(
+        f"[yellow]wait timeout of {timeout:g}s reached; job is still "
+        f"{entry.status}{escape(where)} and was not cancelled[/yellow]"
+    )
+    emit(f"[dim]resume: {escape(shlex.join(resume))}[/dim]")
+    payload = _submission_payload(
+        entry,
+        exit_code=WAIT_DEADLINE_EXIT,
+        wait_timeout_s=timeout,
+        wait_deadline_reached=True,
+        resume=list(resume),
+    )
+    return payload, WAIT_DEADLINE_EXIT
+
+
 def _wait_duration(entry: jobs_mod.JobEntry) -> float | None:
     if entry.started_at is None:
         return None
@@ -662,17 +707,33 @@ def wait(
         "-F",
         help="read one job ref per line; '-' reads stdin",
     ),
+    timeout: Optional[float] = typer.Option(
+        None,
+        "--timeout",
+        help=(
+            "stop waiting after this many seconds: exit 126 with the job's "
+            "current state and a resume command; the job keeps running"
+        ),
+    ),
 ) -> None:
     """Wait for jobs; return the first nonzero result in ref order.
 
     Ctrl-C stops only local waiting, preserves every remote job, and prints an
     exact resume command. With --json it emits one wait_interrupted object.
+    --timeout bounds the wait the same way for automated callers (exit 126).
     """
     refs = _job_refs(refs, file, operation="wait", json_=json_)
     if not math.isfinite(poll) or poll <= 0:
         _fail_submission(
             kind="invalid_argument",
             message="--poll must be positive",
+            exit_code=1,
+            json_=json_,
+        )
+    if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--timeout must be positive",
             exit_code=1,
             json_=json_,
         )
@@ -694,6 +755,8 @@ def wait(
             "--error-lines",
             str(error_lines),
         ]
+        if timeout is not None:
+            argv += ["--timeout", f"{timeout:g}"]
         if json_:
             argv.append("--json")
         if primary_log_shown:
@@ -728,6 +791,8 @@ def wait(
             "--error-lines",
             str(error_lines),
         ]
+        if timeout is not None:
+            argv += ["--timeout", f"{timeout:g}"]
         if json_:
             argv.append("--json")
         if primary_log_shown:
@@ -768,23 +833,33 @@ def wait(
             json_=json_,
         )
 
+    deadline = time.monotonic() + timeout if timeout is not None else None
     if len(entries) == 1:
         try:
-            entry = _wait_until_terminal(
-                cfg,
-                entries[0],
-                poll,
-                emit=err.print,
-                completion_wake=completion_wake,
-            )
-            payload, code = _wait_terminal_result(
-                entry,
-                error_lines,
-                emit=err.print,
-                write_tail=sys.stderr.write,
-                primary_log_shown=primary_log_shown,
-                display_ref=_display_ref_for_entry(cfg, entry),
-            )
+            try:
+                entry = _wait_until_terminal(
+                    cfg,
+                    entries[0],
+                    poll,
+                    emit=err.print,
+                    completion_wake=completion_wake,
+                    deadline=deadline,
+                )
+            except _WaitDeadline:
+                assert timeout is not None
+                current = jobs_mod.load(cfg, entries[0].job_id) or entries[0]
+                payload, code = _wait_deadline_result(
+                    current, timeout=timeout, resume=resume_argv(), emit=err.print
+                )
+            else:
+                payload, code = _wait_terminal_result(
+                    entry,
+                    error_lines,
+                    emit=err.print,
+                    write_tail=sys.stderr.write,
+                    primary_log_shown=primary_log_shown,
+                    display_ref=_display_ref_for_entry(cfg, entry),
+                )
         except KeyboardInterrupt:
             _wait_interrupted(
                 refs=refs,
@@ -805,14 +880,23 @@ def wait(
             # `_wait_until_terminal` owns this Rich-formatted status fragment.
             err.print(f"[dim]{index}/{len(entries)}[/dim] · {message}")
 
-        terminal_entry = _wait_until_terminal(
-            cfg,
-            entry,
-            poll,
-            emit=emit,
-            stop_event=stop_event,
-            completion_wake=completion_wake,
-        )
+        try:
+            terminal_entry = _wait_until_terminal(
+                cfg,
+                entry,
+                poll,
+                emit=emit,
+                stop_event=stop_event,
+                completion_wake=completion_wake,
+                deadline=deadline,
+            )
+        except _WaitDeadline:
+            assert timeout is not None
+            current = jobs_mod.load(cfg, entry.job_id) or entry
+            payload, code = _wait_deadline_result(
+                current, timeout=timeout, resume=resume_argv(), emit=emit
+            )
+            return current, payload, code
         payload, code = _wait_terminal_result(
             terminal_entry,
             error_lines,

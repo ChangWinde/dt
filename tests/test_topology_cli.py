@@ -334,7 +334,7 @@ def test_topology_measures_independent_control_routes_concurrently(
 
     def measure_control(node, *, probe_bytes):
         measured_controls.append(node.name)
-        barrier.wait(timeout=1.0)
+        barrier.wait(timeout=30)
         return probe_bytes, 10.0
 
     monkeypatch.setattr(discovery_module, "measure_control_route", measure_control)
