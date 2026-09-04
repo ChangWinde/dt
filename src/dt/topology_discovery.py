@@ -24,7 +24,7 @@ from pathlib import PurePosixPath
 from threading import Lock
 from typing import Callable
 
-from .config import HeadConfig, Node, Site
+from .config import ConfigError, HeadConfig, Node, Site
 from .jobs import artifact_replica_records
 from .layout import node_path, node_path_expression
 from .link_metrics import (
@@ -779,7 +779,8 @@ class TopologyDiscovery:
         for record in artifact_replica_records(self.cfg, digest, site.name):
             try:
                 node = self.topology.node(record.node)
-            except Exception:
+            except ConfigError:
+                # A replica recorded on a node that has since left the config.
                 continue
             if self.topology.site_for(node) != site or not node.artifact_seed:
                 continue
