@@ -5,6 +5,8 @@ promise and agents can pipe --json safely.
 
 from __future__ import annotations
 
+import os
+import sys
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any, TypeAlias
@@ -16,8 +18,21 @@ from rich.table import Table
 from .jsonvalue import as_int, as_number
 from .jobs import CANCEL_UNVERIFIED_PREFIX
 
-out = Console()
-err = Console(stderr=True)
+# A pipe has no width: Rich would fall back to 80 columns and ellipsize
+# names that a script then cannot use. Piped human output therefore gets an
+# effectively unbounded width (an explicit COLUMNS still wins), while a real
+# terminal keeps its measured size and the compaction policy of ADR 0008.
+UNBOUNDED_PIPE_WIDTH = 4096
+
+
+def _console_width(stream: object) -> int | None:
+    if os.environ.get("COLUMNS") or getattr(stream, "isatty", lambda: False)():
+        return None
+    return UNBOUNDED_PIPE_WIDTH
+
+
+out = Console(width=_console_width(sys.stdout))
+err = Console(stderr=True, width=_console_width(sys.stderr))
 
 STATUS_STYLE = {
     "queued": "bold magenta",

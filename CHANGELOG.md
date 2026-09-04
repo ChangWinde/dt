@@ -38,6 +38,10 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   identity marker that has sat for six hours with no runtime state behind it
   is retired on the spot, so a job blocked by a stale marker from an older
   build recovers instead of staying queued forever.
+- Human output written to a pipe is no longer wrapped or ellipsized to an
+  assumed 80 columns: `dt ps | awk '{print $1}'` now yields complete job ids
+  and names. A real terminal keeps its measured width and the compaction
+  policy of ADR 0008; an explicit `COLUMNS` still wins.
 - The agent retries blocked queue entries immediately when a running job
   ends, instead of leaving a freshly idle node unused until each entry's
   placement backoff (up to five minutes) expires.

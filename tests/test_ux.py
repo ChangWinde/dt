@@ -2730,6 +2730,9 @@ def test_doctor_human_suggests_seed_for_remote_slow_network(tmp_path, monkeypatc
     from dt import cli
     from dt.config import HeadConfig, Node
 
+    # this test checks the terminal width contract, so give the piped console
+    # a real terminal's width instead of the unbounded pipe default
+    monkeypatch.setattr(cli.err, "width", 80)
     cfg = HeadConfig(
         center="c",
         nodes=[
@@ -4599,3 +4602,70 @@ def test_ps_default_view_shows_why_a_queued_job_is_blocked():
     text = console.export_text()
     assert "queued blocked #3/9" in text
     assert "psibot-yw: GPU runtime requires" in text
+
+
+def test_piped_human_output_never_ellipsizes_job_identities(monkeypatch):
+    """Field report: `dt ps | awk` got refs cut to the terminal width and unusable."""
+    import io
+
+    from rich.console import Console
+
+    from dt import render
+
+    monkeypatch.delenv("COLUMNS", raising=False)
+    assert render._console_width(io.StringIO()) == render.UNBOUNDED_PIPE_WIDTH
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    assert render._console_width(Tty()) is None
+    monkeypatch.setenv("COLUMNS", "100")
+    assert render._console_width(io.StringIO()) is None
+
+    job_id = "20260905-0209_orl-scratch-a135-s4404_bb328622a19e01f8"
+    row = {
+        "job_id": job_id,
+        "name": "orl-scratch-a135-s4404-with-a-long-descriptive-name",
+        "status": "queued",
+        "reason": None,
+        "center": "c",
+        "node": "-",
+        "gpus_requested": 1,
+        "created_at": 1.0,
+        "display_ref": "01f8",
+        "queue_position": 1,
+        "queue_depth": 4,
+        "exit_code": None,
+        "cmd": "python train.py --lr 3e-4",
+    }
+    piped = Console(
+        width=render.UNBOUNDED_PIPE_WIDTH, record=True, force_terminal=False
+    )
+    piped.print(
+        render.ps_table(
+            [row],
+            wide=False,
+            caption=None,
+            show_progress=False,
+            show_issue=False,
+            title="jobs",
+            empty_text="none",
+        )
+    )
+    text = piped.export_text()
+    assert row["name"] in text and "…" not in text
+
+    terminal = Console(width=80, record=True, force_terminal=False)
+    terminal.print(
+        render.ps_table(
+            [row],
+            wide=False,
+            caption=None,
+            show_progress=False,
+            show_issue=False,
+            title="jobs",
+            empty_text="none",
+        )
+    )
+    assert max(map(len, terminal.export_text().splitlines())) <= 80
