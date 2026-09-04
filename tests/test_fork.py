@@ -716,6 +716,7 @@ def test_fork_cli_rejects_invalid_artifact_manifest_before_config(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "--artifact-manifest must be a lowercase SHA-256 digest",
         "reasons": {},
@@ -814,6 +815,7 @@ def test_fork_rejects_invalid_max_hours_before_loading_config(monkeypatch):
 
         assert result.exit_code == 1, result.output
         assert json.loads(result.stdout) == {
+            "schema_version": "dt_cli_error_v1",
             "error": "invalid_argument",
             "message": "--max-hours must be a finite positive number",
             "reasons": {},

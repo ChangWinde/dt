@@ -319,6 +319,7 @@ def test_compare_unknown_ref_preserves_json_error_contract(tmp_path, monkeypatch
 
     assert result.exit_code == cli.EXIT_NOT_FOUND
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "not_found",
         "message": "no job matching 'missing'",
         "reasons": {},

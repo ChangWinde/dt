@@ -108,6 +108,7 @@ def test_usage_error_is_machine_readable_when_json_precedes_separator(
         "error": "usage",
         "message": "No such option: --not-an-option",
         "exit_code": 1,
+        "reasons": {},
     }
 
 

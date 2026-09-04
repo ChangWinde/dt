@@ -2553,6 +2553,7 @@ def test_pull_multiple_ctrl_c_cancels_workers_and_prints_exact_resume(
         "--lite --exclude '*.mp4' --retries 0 --json"
     )
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "pull_interrupted",
         "message": (
             "pull stopped locally; completed and partial job directories were "
@@ -2795,6 +2796,7 @@ def test_laptop_pull_multiple_rejects_refs_across_centers(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": (
             "multi-job pull requires all refs in one center; "
@@ -2869,6 +2871,7 @@ def test_pull_rejects_negative_retries_before_loading_config(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "pull --retries must be non-negative",
         "reasons": {},
@@ -4780,6 +4783,7 @@ def test_laptop_pull_json_ctrl_c_emits_one_machine_clean_resume(monkeypatch):
 
     assert result.exit_code == 130, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "pull_interrupted",
         "message": (
             "pull stopped locally; head-side and partial result data were not "
@@ -4838,6 +4842,7 @@ def test_head_single_pull_ctrl_c_keeps_partial_and_prints_exact_resume(
         f"dt pull jid --to {destination} --lite --exclude '*.mp4' --retries 0 --json"
     )
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "pull_interrupted",
         "message": (
             "pull stopped locally; partial result data were not deleted. "
@@ -5221,6 +5226,7 @@ def test_kill_json_requires_noninteractive_confirmation(tmp_path, monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "confirmation_required",
         "message": "kill --json requires -y",
         "reasons": {},

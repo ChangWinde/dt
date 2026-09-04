@@ -177,20 +177,36 @@ def _json_error_requested() -> bool:
     return _argv_requests_json(sys.argv[1:])
 
 
+ERROR_SCHEMA_VERSION = "dt_cli_error_v1"
+
+
+def error_payload(
+    kind: str,
+    message: str,
+    *,
+    exit_code: int,
+    reasons: dict[str, str] | None = None,
+) -> JsonDict:
+    """The one failure document every command emits under ``--json``.
+
+    Always the same five keys: ``error`` is a stable machine kind, ``message``
+    the human explanation, ``exit_code`` the code the process exits with, and
+    ``reasons`` a (possibly empty) map of per-node or per-item detail.
+    """
+    return {
+        "schema_version": ERROR_SCHEMA_VERSION,
+        "error": kind,
+        "message": message,
+        "exit_code": exit_code,
+        "reasons": dict(reasons or {}),
+    }
+
+
 def _emit_cli_error(kind: str, message: str, *, exit_code: int = 1) -> None:
     """Emit one stable machine error or a human diagnostic, never both."""
     safe = redact_home_path(" ".join(message.split()))
     if _json_error_requested():
-        print(
-            json.dumps(
-                {
-                    "schema_version": "dt_cli_error_v1",
-                    "error": kind,
-                    "message": safe,
-                    "exit_code": exit_code,
-                }
-            )
-        )
+        print(json.dumps(error_payload(kind, safe, exit_code=exit_code)))
     else:
         err.print(f"[red]{escape(kind)} error:[/red] {escape(safe)}")
 
@@ -286,8 +302,7 @@ def init_config(
             return
         write_config(target, payload, force=force)
     except InitError as exc:
-        err.print(f"[red]init error:[/red] {escape(str(exc))}")
-        raise typer.Exit(1)
+        _fail_submission(kind="init", message=str(exc), exit_code=1, json_=json_)
 
     normalized_role = role.strip().lower()
     next_steps = (
@@ -722,12 +737,7 @@ def _fail_submission(
     if json_:
         print(
             json.dumps(
-                {
-                    "error": kind,
-                    "message": message,
-                    "reasons": reasons or {},
-                    "exit_code": exit_code,
-                }
+                error_payload(kind, message, exit_code=exit_code, reasons=reasons or {})
             )
         )
     else:
@@ -3238,12 +3248,9 @@ def main() -> None:
         if _argv_requests_json(argv):
             print(
                 json.dumps(
-                    {
-                        "schema_version": "dt_cli_error_v1",
-                        "error": "usage",
-                        "message": " ".join(exc.format_message().split()),
-                        "exit_code": 1,
-                    }
+                    error_payload(
+                        "usage", " ".join(exc.format_message().split()), exit_code=1
+                    )
                 )
             )
         else:

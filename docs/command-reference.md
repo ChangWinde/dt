@@ -296,6 +296,32 @@ truncated or malformed records were skipped. Raw command arguments and
 exception messages are deliberately absent; use the correlated job, request,
 or agent evidence for authorized detail.
 
+## Errors under `--json`
+
+Whatever fails before a command can produce its own payload — configuration,
+usage, an unknown reference, an unreachable head, a refused confirmation, a
+preflight rejection — stdout carries exactly one `dt_cli_error_v1` document
+and the process exits with the code it names:
+
+```json
+{"schema_version": "dt_cli_error_v1", "error": "confirmation_required",
+ "message": "non-interactive kill needs -y", "exit_code": 1, "reasons": {}}
+```
+
+The five keys are always present. `error` is a stable machine kind (for
+example `usage`, `configuration`, `not_found`, `unreachable`, `no_capacity`,
+`confirmation_required`, `invalid_argument`), `message` is the human
+explanation, and `reasons` maps nodes or items to their own detail when the
+failure has structured parts (placement rejections list every candidate
+node) and is empty otherwise. Commands that reach their own payload report
+failures inside it (`status: "error"` rows in `pull`, `wait`, `compare`),
+because those carry partial results that are still worth keeping.
+
+Destructive commands that would prompt (`kill`, `clean`, `compact`) never
+block a non-interactive caller: without `-y` they return
+`confirmation_required` immediately, and `--plan` remains the read-only
+preview.
+
 ## Exit codes
 
 General command codes:

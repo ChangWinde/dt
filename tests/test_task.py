@@ -206,6 +206,7 @@ def test_replay_submission_missing_ref_is_machine_readable(tmp_path, monkeypatch
 
     assert result.exit_code == cli.EXIT_NOT_FOUND
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "not_found",
         "message": "no job matching 'missing'",
         "reasons": {},
@@ -1591,6 +1592,7 @@ def test_laptop_task_follow_json_watch_ctrl_c_emits_detach_and_skips_wait(
     assert payloads == [
         {"job_id": job_id, "status": "running"},
         {
+            "schema_version": "dt_cli_error_v1",
             "error": "watch_interrupted",
             "message": (
                 "monitoring stopped; job was not cancelled. "
@@ -1649,6 +1651,7 @@ def test_laptop_task_follow_json_wait_ctrl_c_emits_wait_resume(monkeypatch):
     assert payloads == [
         {"job_id": job_id, "status": "running"},
         {
+            "schema_version": "dt_cli_error_v1",
             "error": "wait_interrupted",
             "message": (
                 "waiting stopped; job was not cancelled. "
@@ -2025,6 +2028,7 @@ def test_task_json_input_failures_are_machine_readable():
 
         assert result.exit_code == 1, result.output
         assert json.loads(result.stdout) == {
+            "schema_version": "dt_cli_error_v1",
             "error": "invalid_argument",
             "message": message,
             "reasons": {},
@@ -2180,6 +2184,7 @@ def test_run_json_rejects_invalid_inputs_before_loading_config(monkeypatch):
 
         assert result.exit_code == 1, result.output
         assert json.loads(result.stdout) == {
+            "schema_version": "dt_cli_error_v1",
             "error": "invalid_argument",
             "message": message,
             "reasons": {},
@@ -2288,6 +2293,7 @@ def test_task_rejects_invalid_resources_before_loading_config(monkeypatch):
 
         assert result.exit_code == 1, result.output
         assert json.loads(result.stdout) == {
+            "schema_version": "dt_cli_error_v1",
             "error": "invalid_argument",
             "message": message,
             "reasons": {},
@@ -2358,6 +2364,7 @@ def test_task_maps_pinned_unreachable_no_queue_to_stable_exit_5(tmp_path, monkey
     assert result.exit_code == 5
     payload = json.loads(result.stdout)
     assert payload == {
+        "schema_version": "dt_cli_error_v1",
         "error": "unreachable",
         "message": "no reachable node could take the job",
         "reasons": {"n1": "snapshot failed: ssh connection timed out"},
@@ -2394,6 +2401,7 @@ def test_task_keeps_real_no_capacity_on_exit_2(tmp_path, monkeypatch):
     assert result.exit_code == 2
     payload = json.loads(result.stdout)
     assert payload == {
+        "schema_version": "dt_cli_error_v1",
         "error": "no_capacity",
         "message": "no node could take the job",
         "reasons": {"n1": "0 free < 1 wanted"},
@@ -2444,6 +2452,7 @@ def test_task_json_environment_failure_is_machine_readable(tmp_path, monkeypatch
 
     assert result.exit_code == 3
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "environment",
         "message": "uv sync failed",
         "reasons": {},

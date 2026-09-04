@@ -1774,6 +1774,7 @@ def test_sync_cli_rejects_negative_retries_before_config(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "sync --retries must be non-negative",
         "reasons": {},
@@ -1799,6 +1800,7 @@ def test_sync_cli_rejects_excessive_retries_before_config(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "sync --retries must be at most 10",
         "reasons": {},
@@ -2307,6 +2309,7 @@ def test_head_multi_node_sync_ctrl_c_cancels_workers_and_emits_resume_json(
     assert cancel_events[0] is cancel_events[1]
     assert cancel_events[0].is_set()
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "sync_interrupted",
         "message": (
             "sync stopped locally; partial cache data were not deleted. "

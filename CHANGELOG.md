@@ -8,6 +8,14 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Changed
 
+- Every failure a command reports under `--json` before it can produce its own
+  payload is now one `dt_cli_error_v1` document with the same five keys
+  (`schema_version`, `error`, `message`, `exit_code`, `reasons`). Submission
+  errors gain `schema_version`; `seed`, `sync`, `events`, and `init` errors gain
+  `schema_version` and an empty `reasons`; `dt events` no longer labels its
+  error with the query schema id. `kill` and `clean` without `-y` in a
+  non-interactive session return `confirmation_required` (as `compact` already
+  did) instead of a human line and a bare exit code.
 - Best-effort failures that dt deliberately swallows (link-metrics
   bookkeeping, optional resource telemetry, tab-completion configuration, the
   agent pid read) are now noted once per kind in the agent log and, with

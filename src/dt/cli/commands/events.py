@@ -88,21 +88,9 @@ def events(
             exclude_operation_id=operation_log_mod.current_operation_id(),
         )
     except (ValueError, operation_log_mod.OperationJournalError) as exc:
-        operation_log_mod.mark_problem("operation_journal", exc)
-        if json_:
-            print(
-                json.dumps(
-                    {
-                        "schema_version": operation_log_mod.QUERY_SCHEMA_VERSION,
-                        "error": "operation_journal",
-                        "message": str(exc),
-                        "exit_code": 1,
-                    }
-                )
-            )
-        else:
-            err.print(f"[red]operation journal error:[/red] {escape(str(exc))}")
-        raise typer.Exit(1)
+        _fail_submission(
+            kind="operation_journal", message=str(exc), exit_code=1, json_=json_
+        )
 
     payload = {
         "schema_version": operation_log_mod.QUERY_SCHEMA_VERSION,

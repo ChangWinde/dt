@@ -786,6 +786,7 @@ def test_info_json_missing_job_is_machine_readable(tmp_path, monkeypatch):
 
     assert result.exit_code == cli.EXIT_NOT_FOUND, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "not_found",
         "message": "no job matching 'missing'",
         "reasons": {},
@@ -855,6 +856,7 @@ def test_info_json_missing_job_on_laptop_is_machine_readable(monkeypatch):
 
     assert result.exit_code == cli.EXIT_NOT_FOUND, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "not_found",
         "message": "no center's registry knows job 'missing'",
         "reasons": {},
@@ -1045,6 +1047,7 @@ def test_laptop_job_lookup_all_heads_unreachable_is_not_not_found(
     assert result.exit_code == cli.EXIT_UNREACHABLE, result.output
     payload = json.loads(result.stdout)
     assert payload == {
+        "schema_version": "dt_cli_error_v1",
         "error": "unreachable",
         "message": "cannot determine which center owns job 'job'",
         "reasons": {
@@ -1170,6 +1173,7 @@ def test_laptop_job_lookup_bad_head_json_is_lookup_failed(monkeypatch):
 
     assert result.exit_code == 1, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "lookup_failed",
         "message": "cannot determine which center owns job 'job'",
         "reasons": {
@@ -4011,6 +4015,7 @@ def test_wait_json_preflight_failures_are_machine_readable(tmp_path, monkeypatch
 
         assert result.exit_code == exit_code, result.output
         assert json.loads(result.stdout) == {
+            "schema_version": "dt_cli_error_v1",
             "error": kind,
             "message": message,
             "reasons": {},
@@ -4199,6 +4204,7 @@ def test_job_ref_file_rejects_direct_refs_and_empty_files(tmp_path):
 
     assert mixed.exit_code == 1
     assert json.loads(mixed.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "use either job arguments or --file, not both",
         "reasons": {},
@@ -4206,6 +4212,7 @@ def test_job_ref_file_rejects_direct_refs_and_empty_files(tmp_path):
     }
     assert empty.exit_code == 1
     assert json.loads(empty.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "pull has no job refs",
         "reasons": {},
@@ -4465,6 +4472,7 @@ def test_wait_single_json_ctrl_c_emits_machine_clean_resume(tmp_path, monkeypatc
 
     assert result.exit_code == 130, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "wait_interrupted",
         "message": (
             "waiting stopped; job was not cancelled. "
@@ -4599,6 +4607,7 @@ def test_wait_multiple_json_ctrl_c_cancels_workers_and_emits_resume(
 
     assert result.exit_code == 130, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "wait_interrupted",
         "message": (
             "waiting stopped; jobs were not cancelled. "
@@ -4699,6 +4708,7 @@ def test_wait_multiple_rejects_duplicate_resolved_jobs(tmp_path, monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "wait refs must resolve to distinct jobs",
         "reasons": {},
@@ -4769,6 +4779,7 @@ def test_laptop_wait_multiple_rejects_refs_across_centers(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": (
             "multi-job wait requires all refs in one center; "
@@ -5022,6 +5033,7 @@ def test_laptop_wait_json_ctrl_c_emits_machine_clean_resume(monkeypatch):
 
     assert result.exit_code == 130, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "wait_interrupted",
         "message": (
             "waiting stopped; job was not cancelled. "
@@ -5082,6 +5094,7 @@ def test_watch_json_preflight_failures_are_machine_readable(tmp_path, monkeypatc
 
         assert result.exit_code == exit_code, result.output
         assert json.loads(result.stdout) == {
+            "schema_version": "dt_cli_error_v1",
             "error": kind,
             "message": message,
             "reasons": {},
@@ -5318,6 +5331,7 @@ def test_watch_json_missing_job_on_laptop_is_machine_readable(monkeypatch):
 
     assert result.exit_code == cli.EXIT_NOT_FOUND, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "not_found",
         "message": "no center's registry knows job 'missing'",
         "reasons": {},
@@ -5486,6 +5500,7 @@ def test_laptop_watch_multiple_rejects_refs_across_centers(monkeypatch):
 
     assert result.exit_code == 1, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": (
             "multi-job watch requires all refs in one center; "
@@ -5592,6 +5607,7 @@ def test_watch_json_ctrl_c_appends_one_resumable_interruption_frame(
     assert frames == [
         {"job_id": "job-id", "status": "running"},
         {
+            "schema_version": "dt_cli_error_v1",
             "error": "watch_interrupted",
             "message": (
                 "monitoring stopped; job was not cancelled. "
@@ -5629,6 +5645,7 @@ def test_laptop_watch_json_ctrl_c_emits_one_resumable_interruption(monkeypatch):
 
     assert result.exit_code == 130, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "watch_interrupted",
         "message": (
             "monitoring stopped; job was not cancelled. "
@@ -6006,6 +6023,7 @@ def test_ps_watch_rejects_invalid_poll_before_gathering(tmp_path, monkeypatch, p
 
     assert json_result.exit_code == 1
     assert json.loads(json_result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "--poll must be positive",
         "reasons": {},
@@ -7512,6 +7530,7 @@ def test_ps_limit_rejects_nonpositive_values_with_machine_error(tmp_path, monkey
 
         assert result.exit_code == 1, result.output
         assert json.loads(result.stdout) == {
+            "schema_version": "dt_cli_error_v1",
             "error": "invalid_argument",
             "message": "--limit must be positive",
             "reasons": {},
@@ -7546,6 +7565,7 @@ def test_laptop_ps_unknown_center_has_machine_error(monkeypatch):
 
     assert result.exit_code == 1, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "unknown center 'west'; configured: ['east']",
         "reasons": {},
@@ -7571,6 +7591,7 @@ def test_ps_active_rejects_status_filter(tmp_path, monkeypatch):
 
     assert result.exit_code == 1, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "--active cannot be combined with --status",
         "reasons": {},
@@ -7627,6 +7648,7 @@ def test_laptop_ps_all_heads_unreachable_has_machine_error(monkeypatch):
 
     assert result.exit_code == cli.EXIT_UNREACHABLE, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "unreachable",
         "message": "cannot list jobs: every center query failed",
         "reasons": {
@@ -7657,6 +7679,7 @@ def test_laptop_ps_all_head_protocol_failures_exit_1(monkeypatch):
 
     assert result.exit_code == 1, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "center_query_failed",
         "message": "cannot list jobs: every center query failed",
         "reasons": {
@@ -7696,6 +7719,7 @@ def test_metrics_json_preflight_failures_are_machine_readable(tmp_path, monkeypa
 
         assert result.exit_code == exit_code, result.output
         assert json.loads(result.stdout) == {
+            "schema_version": "dt_cli_error_v1",
             "error": kind,
             "message": message,
             "reasons": {},
@@ -7744,6 +7768,7 @@ def test_metrics_rejects_dequeued_job_before_remote_access(tmp_path, monkeypatch
 
     assert json_result.exit_code == 1
     assert json.loads(json_result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "not_started",
         "message": (
             "dequeued never started (status killed); no resource telemetry exists"
@@ -7877,6 +7902,7 @@ def test_logs_json_preflight_failures_are_machine_readable(tmp_path, monkeypatch
 
         assert result.exit_code == exit_code, result.output
         assert json.loads(result.stdout) == {
+            "schema_version": "dt_cli_error_v1",
             "error": kind,
             "message": message,
             "reasons": {},
@@ -7919,6 +7945,7 @@ def test_logs_json_unreachable_is_machine_readable(tmp_path, monkeypatch):
 
     assert result.exit_code == cli.EXIT_UNREACHABLE
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "unreachable",
         "message": "ssh: No route to host",
         "reasons": {},
@@ -8178,6 +8205,7 @@ def test_logs_keeps_non_network_read_failure_exit(tmp_path, monkeypatch):
 
     assert json_result.exit_code == 1
     assert json.loads(json_result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "log_read_failed",
         "message": "tail: log missing",
         "reasons": {},
@@ -8973,6 +9001,7 @@ def test_metrics_maps_ssh_failure_to_unreachable_not_missing(tmp_path, monkeypat
 
     assert result.exit_code == cli.EXIT_UNREACHABLE
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "unreachable",
         "message": "cannot read telemetry from n1: ssh: No route to host",
         "reasons": {},
@@ -9080,6 +9109,7 @@ def test_laptop_metrics_ctrl_c_json_is_complete_and_resumable(monkeypatch):
     assert result.exit_code == 130, result.output
     payload = json.loads(result.stdout)
     assert payload == {
+        "schema_version": "dt_cli_error_v1",
         "error": "metrics_interrupted",
         "message": (
             "metrics stopped locally; no remote state was changed. "
@@ -9129,6 +9159,7 @@ def test_metrics_keeps_absent_telemetry_as_not_found(tmp_path, monkeypatch):
 
     assert json_result.exit_code == cli.EXIT_NOT_FOUND
     assert json.loads(json_result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "not_found",
         "message": (
             "no telemetry for old (job predates telemetry or sidecar could not start)"
@@ -9171,6 +9202,7 @@ def test_metrics_json_empty_telemetry_is_machine_readable(tmp_path, monkeypatch)
 
     assert result.exit_code == cli.EXIT_NOT_FOUND
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "not_found",
         "message": "empty telemetry is empty",
         "reasons": {},

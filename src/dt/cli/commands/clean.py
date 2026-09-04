@@ -534,8 +534,12 @@ def _clean_apply(
         return
     if not yes:
         if not sys.stdin.isatty():
-            err.print("[red]non-interactive clean needs -y[/red]")
-            raise typer.Exit(1)
+            _root._fail_submission(
+                kind="confirmation_required",
+                message="non-interactive clean needs -y (or use --plan)",
+                exit_code=1,
+                json_=json_,
+            )
         what = f"delete {n_victims} job dirs older than {before}"
         if results:
             what += f" + {len(managed_results)} verified managed results"
