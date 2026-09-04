@@ -46,8 +46,14 @@ def exec_job(
         "--request-id",
         help="retry-safe caller identity; reuse returns the original job",
     ),
-    no_queue: bool = typer.Option(False, "--no-queue"),
-    json_: bool = typer.Option(False, "--json"),
+    no_queue: bool = typer.Option(
+        False,
+        "--no-queue",
+        help="fail with exit 2 instead of queueing when nothing fits now",
+    ),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_submission_v1 object on stdout"
+    ),
 ) -> None:
     """Run a command in REF's exact snapshot and existing environment."""
     command = list(ctx.args)

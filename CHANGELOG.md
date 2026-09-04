@@ -8,11 +8,21 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Added
 
+- `dt agent start/stop/install --json` return one `dt_agent_control_v1` receipt
+  (`action`, `outcome`, and the pid, log path, or supervisor detail); a failed
+  start or an unavailable supervisor is the standard error document
+  (`agent_start_failed`, `agent_supervisor_unavailable`).
+- A job reference that matches nothing now names the nearest job names in the
+  `not_found` message and, under `--json`, in `reasons.did_you_mean`, across
+  `info`, `logs`, `metrics`, `wait`, `watch`, `compare`, `kill`, and every
+  `_find_or_die` reader.
 - `dt wait --timeout SECONDS`: bound an automated wait. When the bound elapses
   the command reports the job's current state and an exact resume command,
   exits 126 (a code no experiment result can produce), and leaves the job
   running; `--json` carries `wait_deadline_reached`, `wait_timeout_s`, and
-  `resume`. Multi-job waits apply the same deadline to every job.
+  `resume`. Multi-job waits apply the same deadline to every job. `dt watch
+  --timeout SECONDS` bounds a frame stream the same way (exit 126 after the
+  last frame shown).
 - `dt contract --json`: one `dt_contract_v1` document describing every visible
   command with its arguments, options (flags, type, default, repeat), `--json`
   support with the top-level shape and the schema ids it emits, destructive
@@ -23,6 +33,17 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Changed
 
+- `dt contract` publishes `minimum`/`maximum` for bounded integer options
+  (`run --retry`, `events --limit`, `topology --max-edges`).
+- Every command option and argument now carries help text (44 were silent,
+  mostly `--json`, `--yes`, `--no-queue`, and the batch/chain resource options);
+  `--json` help names the schema or shape each command emits. The contract test
+  fails on any future parameter without help.
+- `run --follow` calls the plain `run_watch` / `run_wait` implementations
+  instead of the Typer command functions, so adding an option to `wait` or
+  `watch` can no longer break the follow path; the forwarding-drift guard reads
+  those implementations. The test suite pins `umask 022` so mode assertions do
+  not depend on the developer's shell.
 - Every failure a command reports under `--json` before it can produce its own
   payload is now one `dt_cli_error_v1` document with the same five keys
   (`schema_version`, `error`, `message`, `exit_code`, `reasons`). Submission

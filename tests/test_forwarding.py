@@ -95,8 +95,9 @@ _FORWARDED_COMMANDS = [
     ("info", None, set(), set()),
     ("diagnose", None, set(), set()),
     ("compare", None, set(), {"file"}),
-    ("watch", None, set(), {"file"}),
-    ("wait", None, set(), {"file"}),
+    # watch/wait keep their chains in the plain implementations run --follow calls
+    ("watch", "run_watch", set(), {"file"}),
+    ("wait", "run_wait", set(), {"file"}),
     ("metrics", None, set(), set()),
     ("rerun", None, set(), set()),
     ("exec_job", None, set(), set()),

@@ -166,3 +166,54 @@ def test_wait_timeout_must_be_positive(tmp_path, monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout)["error"] == "invalid_argument"
+
+
+def test_watch_timeout_exits_126_after_the_last_frame(
+    tmp_path, monkeypatch, stub_job_refresh
+):
+    from dt.cli.commands import watch as watch_cmd
+
+    cfg = _cfg(tmp_path)
+    entry = _running("one")
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda cfg_, ref: entry)
+    monkeypatch.setattr(
+        watch_cmd,
+        "_watch_snapshot",
+        lambda cfg_, entry_, lines, compact=False: (
+            entry_,
+            {
+                "schema_version": "dt_watch_v1",
+                "job_id": entry_.job_id,
+                "status": "running",
+            },
+        ),
+    )
+    monkeypatch.setattr(watch_cmd.time, "sleep", lambda seconds: None)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "watch",
+            "one",
+            "--poll",
+            "0.01",
+            "--timeout",
+            "0.02",
+            "--no-completion-wake",
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == watch_cmd.WATCH_DEADLINE_EXIT == 126, result.output
+    frames = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    assert frames and all(frame["status"] == "running" for frame in frames)
+
+
+def test_watch_timeout_must_be_positive(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_cfg", lambda: _cfg(tmp_path))
+
+    result = CliRunner().invoke(cli.app, ["watch", "one", "--timeout", "-1", "--json"])
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["error"] == "invalid_argument"

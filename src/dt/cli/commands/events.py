@@ -50,7 +50,9 @@ def events(
         "--job-id",
         help="show operations correlated with one exact job id",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_operation_events_v1 object on stdout"
+    ),
 ) -> None:
     """Inspect the private, redacted DT operation journal."""
     cfg = _root._cfg()

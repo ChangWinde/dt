@@ -46,8 +46,8 @@ from .. import (
     _wait_interrupted,
     _watch_interrupted,
 )
-from .wait import wait
-from .watch import watch
+from .wait import run_wait
+from .watch import run_watch
 from ...dispatch import artifact_manifest_identity
 from ... import dispatch as dispatch_mod
 from ... import remote as remote_mod
@@ -627,7 +627,11 @@ def run(
         rich_help_panel="Everyday",
     ),
     project: Optional[str] = typer.Option(
-        None, "-p", "--project", rich_help_panel="Everyday"
+        None,
+        "-p",
+        "--project",
+        help="configured project name (default: the project containing the cwd)",
+        rich_help_panel="Everyday",
     ),
     node: Optional[str] = typer.Option(
         None,
@@ -789,7 +793,12 @@ def run(
         help="stdout/error lines used with --follow",
         rich_help_panel="Follow & output",
     ),
-    json_: bool = typer.Option(False, "--json", rich_help_panel="Follow & output"),
+    json_: bool = typer.Option(
+        False,
+        "--json",
+        help="emit one JSON object on stdout (dt_submission_v1, or dt_run_plan_v1 with --plan)",
+        rich_help_panel="Follow & output",
+    ),
 ) -> None:
     """Submit once: dt run -g 2 -n exp42 -- python train.py --lr 3e-4"""
     cmd = list(ctx.args)
@@ -1117,12 +1126,15 @@ def _follow_submitted_job(
     json_: bool,
 ) -> None:
     """Use the shared interactive view and stable terminal exit contract."""
-    # ``_job_refs`` preserves direct-string compatibility even though Typer's
-    # public annotation models repeated positional arguments as a list.
-    direct_ref = cast(list[str], job_id)
-    completed = watch(direct_ref, poll, lines, json_, True)
+    completed = run_watch([job_id], poll=poll, lines=lines, json_=json_)
     if completed:
-        wait(direct_ref, poll, lines, json_, True, True, timeout=None)
+        run_wait(
+            [job_id],
+            poll=poll,
+            error_lines=lines,
+            json_=json_,
+            primary_log_shown=True,
+        )
     else:
         _print_monitor_stopped(job_id)
 
@@ -1299,7 +1311,9 @@ def task(
         help="progress refresh/fallback interval",
     ),
     lines: int = typer.Option(20, "--lines", help="follow stdout lines"),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_submission_v1 object on stdout"
+    ),
 ) -> None:
     """Safe fast path: dt task gpu-node-1 "python train.py" -f.
 

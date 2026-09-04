@@ -288,7 +288,7 @@ Stable `dt wait` terminal codes:
 | 67 | Job lost |
 | 68 | Failed before start |
 | 69 | Dependency predicate skipped the job |
-| 126 | `--timeout` elapsed; the job is still active and was not cancelled |
+| 126 | `--timeout` elapsed (`wait` or `watch`); the jobs are still active and were not cancelled |
 
 The 65-69 band always means dt's own terminal semantics: an experiment
 that itself exits inside the band is reported as 64, and `dt wait --json`

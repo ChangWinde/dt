@@ -5903,7 +5903,12 @@ def test_watch_non_tty_final_frame_ends_with_newline(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(watch_cmd, "_watch_view", lambda snapshot: "frame")
 
-    assert cli.watch("done", 5.0, 20, False, False) is True
+    assert (
+        watch_cmd.run_watch(
+            "done", poll=5.0, lines=20, json_=False, completion_wake=False
+        )
+        is True
+    )
     assert stream.getvalue() == "frame\n"
 
 

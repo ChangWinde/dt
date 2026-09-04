@@ -35,7 +35,6 @@ from ...monitoring import (
 )
 from ...path_contract import job_path_contract as _job_path_contract
 from .. import (
-    EXIT_NOT_FOUND,
     INFO_COMMAND_PREVIEW_CHARS,
     INFO_MARK,
     INFO_PHASE_TAIL,
@@ -1035,7 +1034,9 @@ def _info_payload(
 
 def info(
     ref: str = REF_ARG,
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_job_info_v1 object on stdout"
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
@@ -1082,12 +1083,7 @@ def info(
         if json_:
             entry = jobs_mod.find(cfg, ref)
             if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=EXIT_NOT_FOUND,
-                    json_=True,
-                )
+                _root._no_job_matching(cfg, ref, json_=True)
         else:
             entry = _root._find_or_die(cfg, ref)
         registry_snapshot = jobs_mod.resolution_entries(cfg)

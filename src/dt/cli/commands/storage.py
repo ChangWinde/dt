@@ -147,7 +147,9 @@ def storage(
         "--details",
         help="show every managed storage class and path",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_storage_v1 object on stdout"
+    ),
 ) -> None:
     """Summarize DT-managed storage on the head and workers."""
     cfg = _root._cfg()

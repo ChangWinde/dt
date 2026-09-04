@@ -198,6 +198,9 @@ def _kill_one(
     entry = jobs_mod.find(cfg, ref)
     if entry is None:
         message = f"no job matching {ref!r}"
+        suggestions = _root._job_suggestions(cfg, ref)
+        if suggestions:
+            message += f"; did you mean {', '.join(suggestions)}?"
         err.print(f"[red]{escape(message)}[/red]")
         return finish("notfound", "not_found", None, message)
     if entry.status == "queued":
@@ -420,7 +423,12 @@ def _kill_via_laptop_human(
 
 def kill(
     refs: Optional[list[str]] = REFS_OPTIONAL_ARG,
-    yes: bool = typer.Option(False, "-y", "--yes"),
+    yes: bool = typer.Option(
+        False,
+        "-y",
+        "--yes",
+        help="skip the confirmation prompt (required when not on a TTY)",
+    ),
     force: bool = typer.Option(
         False, "--force", help="SIGKILL (for jobs that swallow TERM)"
     ),

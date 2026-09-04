@@ -21,7 +21,6 @@ from ...layout import display_node_path, local_node_path, node_path_expression
 from ...render import compact_path, err
 from ...sshio import RemoteError
 from .. import (
-    EXIT_NOT_FOUND,
     EXIT_UNREACHABLE,
     REF_ARG,
     _display_ref_for_entry,
@@ -293,7 +292,7 @@ def logs(
         "--follow",
         help="wait through queue, then stream to terminal; reconnect on SSH loss",
     ),
-    lines: int = typer.Option(100, "-n", "--lines"),
+    lines: int = typer.Option(100, "-n", "--lines", help="log lines to show"),
     json_: bool = typer.Option(
         False,
         "--json",
@@ -346,12 +345,7 @@ def logs(
     if json_:
         entry = jobs_mod.find(cfg, ref)
         if entry is None:
-            _fail_submission(
-                kind="not_found",
-                message=f"no job matching {ref!r}",
-                exit_code=EXIT_NOT_FOUND,
-                json_=True,
-            )
+            _root._no_job_matching(cfg, ref, json_=True)
     else:
         entry = _root._find_or_die(cfg, ref)
     display_ref = _display_ref_for_entry(cfg, entry)

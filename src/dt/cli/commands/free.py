@@ -806,7 +806,9 @@ def free(
         help="watch refresh interval in seconds",
     ),
     who: bool = typer.Option(False, "--who", help="show who occupies the busy cards"),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit a JSON array of rows on stdout"
+    ),
     explain: bool = typer.Option(
         False,
         "--explain",

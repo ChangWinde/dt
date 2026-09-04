@@ -529,12 +529,7 @@ def _compare_entries_on_head(
         for ref in refs:
             entry = jobs_mod.find(cfg, ref)
             if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=EXIT_NOT_FOUND,
-                    json_=json_,
-                )
+                _root._no_job_matching(cfg, ref, json_=json_)
             entries.append(entry)
     return entries
 
@@ -586,7 +581,12 @@ def compare(
         help="exit 1 unless both groups' metric spread is at most this percent",
         rich_help_panel="Gate",
     ),
-    json_: bool = typer.Option(False, "--json", rich_help_panel="Input & output"),
+    json_: bool = typer.Option(
+        False,
+        "--json",
+        help="emit one dt_compare_v2 object on stdout",
+        rich_help_panel="Input & output",
+    ),
     file: Optional[Path] = typer.Option(
         None,
         "--file",

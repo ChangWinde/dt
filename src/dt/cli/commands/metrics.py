@@ -223,7 +223,9 @@ def metrics(
     tail: int = typer.Option(
         3600, "--tail", help="summarize the last N samples (0 = all)"
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_resource_summary_v1 object on stdout"
+    ),
 ) -> None:
     """Summarize persisted per-job GPU/CPU/IO telemetry."""
     if tail < 0:
@@ -264,12 +266,7 @@ def metrics(
     if json_:
         entry = jobs_mod.find(cfg, ref)
         if entry is None:
-            _fail_submission(
-                kind="not_found",
-                message=f"no job matching {ref!r}",
-                exit_code=EXIT_NOT_FOUND,
-                json_=True,
-            )
+            _root._no_job_matching(cfg, ref, json_=True)
     else:
         entry = _root._find_or_die(cfg, ref)
     _refuse_unplaced(

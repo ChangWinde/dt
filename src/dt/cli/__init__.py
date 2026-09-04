@@ -10,6 +10,7 @@ progress and decoration go to stderr. Fixed exit codes:
 
 from __future__ import annotations
 
+import difflib
 import json
 import math
 import os
@@ -360,13 +361,67 @@ def _find_or_die(
                 exit_code=EXIT_NOT_FOUND,
                 json_=json_,
             )
-        _fail_submission(
-            kind="not_found",
-            message=f"no job matching {ref!r}",
-            exit_code=EXIT_NOT_FOUND,
-            json_=json_,
-        )
+        _no_job_matching(cfg, ref, json_=json_)
     return entry
+
+
+def _job_suggestions(cfg: HeadConfig, ref: str, *, limit: int = 3) -> list[str]:
+    """Close job names or ids for a reference that matched nothing.
+
+    A mistyped or truncated name is the common failure for an automated
+    caller; naming the nearest candidates lets it recover without listing
+    the whole registry.
+    """
+    entries = jobs_mod.resolution_entries(cfg)
+    by_name: dict[str, jobs_mod.JobEntry] = {}
+    for entry in sorted(entries, key=lambda e: e.created_at or 0.0, reverse=True):
+        by_name.setdefault(entry.name, entry)
+    wanted = ref.strip().lower()
+    scored: list[tuple[float, float, str]] = []
+    for name, entry in by_name.items():
+        candidate = name.lower()
+        if not wanted or not candidate:
+            continue
+        if (
+            candidate.startswith(wanted)
+            or wanted.startswith(candidate)
+            or wanted in candidate
+        ):
+            score = 1.0
+        else:
+            score = difflib.SequenceMatcher(None, wanted, candidate).ratio()
+        if score >= 0.6:
+            scored.append((score, entry.created_at or 0.0, name))
+    # best match first; among equals, the most recent job
+    scored.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    if not scored:
+        return []
+    display_refs = jobs_mod.compact_job_refs(entries)
+    return [
+        f"{name} ({display_refs.get(by_name[name].job_id, by_name[name].job_id)})"
+        for _score, _created, name in scored[:limit]
+    ]
+
+
+def _no_job_matching(
+    cfg: HeadConfig,
+    ref: str,
+    *,
+    json_: bool,
+    exit_code: int = EXIT_NOT_FOUND,
+) -> NoReturn:
+    """The one `not_found` document for a job reference, with nearby candidates."""
+    suggestions = _job_suggestions(cfg, ref)
+    message = f"no job matching {ref!r}"
+    if suggestions:
+        message += f"; did you mean {', '.join(suggestions)}?"
+    _fail_submission(
+        kind="not_found",
+        message=message,
+        exit_code=exit_code,
+        json_=json_,
+        reasons={"did_you_mean": ", ".join(suggestions)} if suggestions else None,
+    )
 
 
 def _display_ref_for_entry(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> str:
@@ -437,7 +492,8 @@ def _job_refs(
     if isinstance(file, str):
         file = Path(file)
     elif file is not None and not isinstance(file, Path):
-        # Typer option metadata is the default during direct Python calls.
+        # Tests call command functions directly, where an omitted option
+        # arrives as Typer's OptionInfo metadata rather than its default.
         file = None
     refs = [direct] if isinstance(direct, str) else list(direct or [])
     if refs and file is not None:

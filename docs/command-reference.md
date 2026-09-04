@@ -44,7 +44,7 @@ This page helps operators choose a command and handle its result. Run
 |---|---|
 | `dt doctor` | Verify SSH, tools, GPU runtime, transfer, and agent contracts |
 | `dt topology` | Probe and explain directed P2P data edges without transferring artifacts |
-| `dt agent` | Install, start, stop, inspect, or foreground the queue agent |
+| `dt agent` | Install, start, stop, inspect, or foreground the queue agent (`--json` receipts on every subcommand but `run`) |
 | `dt attach` | Enter the job's managed tmux session |
 | `dt kill` | Terminate and verify a complete job process group |
 | `dt events` | Query the bounded, redacted operation journal on this host or a head |
@@ -334,7 +334,8 @@ example `usage`, `configuration`, `not_found`, `unreachable`, `no_capacity`,
 kind this version can emit with its meaning), `message` is the human
 explanation, and `reasons` maps nodes or items to their own detail when the
 failure has structured parts (placement rejections list every candidate
-node) and is empty otherwise. Commands that reach their own payload report
+node; a `not_found` job reference carries `did_you_mean` with the nearest job
+names) and is empty otherwise. Commands that reach their own payload report
 failures inside it (`status: "error"` rows in `pull`, `wait`, `compare`),
 because those carry partial results that are still worth keeping.
 
@@ -355,12 +356,14 @@ General command codes:
 | 3 | Remote environment or setup failure |
 | 4 | Requested local object or path not found |
 | 5 | Required host or center unreachable |
-| 126 | `dt wait --timeout` elapsed; the job is still active and was not cancelled |
+| 126 | `dt wait`/`dt watch --timeout` elapsed; the jobs are still active and were not cancelled |
 | 130 | Local interruption; registered remote jobs continue unless explicitly killed |
 
 `dt wait` reserves 65 through 69 for terminal job states, while 0 through 125
 otherwise carry the experiment result; `--timeout SECONDS` returns 126 with the
-job's current state and a resume command when the bound elapses. The reservation is enforced: an
+job's current state and a resume command when the bound elapses. `dt watch
+--timeout SECONDS` stops the stream the same way: the last frame already shown
+is the state, and the exit code is 126. The reservation is enforced: an
 experiment process that itself exits 65 through 69 is reported as 64 (just as
 codes above 125 clamp to 125), and `--json` always carries the untruncated
 `exit_code`. See [Operations](operations.md) for the mapping.

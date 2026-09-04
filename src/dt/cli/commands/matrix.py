@@ -446,7 +446,9 @@ def matrix_plan(
         metavar="SPEC",
         help="YAML/JSON matrix spec; '-' reads stdin",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_matrix_plan_v1 object on stdout"
+    ),
 ) -> None:
     """Expand a matrix spec and preview every unit without submitting."""
     _text, spec = _load_matrix_spec(spec_file, json_=json_)
@@ -493,7 +495,9 @@ def matrix_run(
         "--center",
         help="(laptop) which center",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_matrix_v1 object on stdout"
+    ),
 ) -> None:
     """Submit every expanded unit under one retry-safe matrix request id."""
     text, spec = _load_matrix_spec(spec_file, json_=json_)
@@ -529,7 +533,9 @@ def matrix_status(
         "--center",
         help="(laptop) which center",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_matrix_status_v1 object on stdout"
+    ),
 ) -> None:
     """Summarize every matrix unit's durable receipt and registry row."""
     _validate_submission_request_id(request_id, json_=json_)

@@ -15,7 +15,9 @@ from .. import REF_ARG, _fail_submission
 
 def diagnose(
     ref: str = REF_ARG,
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_diagnosis_v1 object on stdout"
+    ),
 ) -> None:
     """Correlate bounded job, scheduler, node, and recovery evidence."""
     cfg = _root._cfg()

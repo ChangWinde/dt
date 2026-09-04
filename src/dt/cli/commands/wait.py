@@ -723,6 +723,30 @@ def wait(
     exact resume command. With --json it emits one wait_interrupted object.
     --timeout bounds the wait the same way for automated callers (exit 126).
     """
+    run_wait(
+        refs,
+        poll=poll,
+        error_lines=error_lines,
+        json_=json_,
+        primary_log_shown=primary_log_shown,
+        completion_wake=completion_wake,
+        file=file,
+        timeout=timeout,
+    )
+
+
+def run_wait(
+    refs: list[str] | str | None,
+    *,
+    poll: float,
+    error_lines: int,
+    json_: bool,
+    primary_log_shown: bool = False,
+    completion_wake: bool = True,
+    file: Path | None = None,
+    timeout: float | None = None,
+) -> None:
+    """`dt wait` with plain Python parameters; ``run --follow`` calls this."""
     refs = _job_refs(refs, file, operation="wait", json_=json_)
     if not math.isfinite(poll) or poll <= 0:
         _fail_submission(
@@ -814,12 +838,7 @@ def wait(
         for ref in refs:
             entry = jobs_mod.find(cfg, ref)
             if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=65,
-                    json_=json_,
-                )
+                _root._no_job_matching(cfg, ref, json_=json_, exit_code=65)
             entries.append(entry)
     if len({entry.job_id for entry in entries}) != len(entries):
         _fail_submission(

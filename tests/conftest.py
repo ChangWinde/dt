@@ -35,6 +35,10 @@ for _ambient_terminal_variable in (
 ):
     os.environ.pop(_ambient_terminal_variable, None)
 
+# Several tests assert the 0o755 / 0o644 modes dt creates under the default
+# umask; a stricter shell umask must not turn them into false failures.
+os.umask(0o022)
+
 # The suite must never touch the developer's real SSH state (control sockets,
 # generated config) nor reach a real host: the fixture below fails any test that
 # spawns ssh/rsync/scp unless it opts in with @pytest.mark.real_transport.

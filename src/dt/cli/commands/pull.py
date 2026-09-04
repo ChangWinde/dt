@@ -1109,7 +1109,11 @@ def _pull_unlocked(
         "--force",
         help="allow merging into a non-empty or differently owned directory",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False,
+        "--json",
+        help="emit one JSON object on stdout (dt_pull_v1 or dt_pull_group_v1)",
+    ),
     retries: int = typer.Option(
         2,
         "--retries",
@@ -1626,7 +1630,11 @@ def pull(
         "--force",
         help="allow merging into non-empty or differently owned job directories",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False,
+        "--json",
+        help="emit one JSON object on stdout (dt_pull_v1 or dt_pull_group_v1)",
+    ),
     retries: int = typer.Option(
         2,
         "--retries",

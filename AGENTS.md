@@ -212,7 +212,8 @@ and `--json` carries the untruncated `exit_code`.
 
 Bound every automated wait: `dt wait JOB --timeout 1800 --json` returns 126
 with the job's current state and a `resume` argv when the bound elapses, and
-the job keeps running.
+the job keeps running; `dt watch ... --timeout` bounds a frame stream the same
+way.
 
 ## Development gate
 

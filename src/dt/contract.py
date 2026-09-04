@@ -26,7 +26,10 @@ EXIT_CODE_MEANINGS: tuple[tuple[int, str], ...] = (
     (3, "Remote environment or setup failure"),
     (4, "Requested local object or path not found"),
     (5, "Required host or center unreachable"),
-    (126, "`dt wait --timeout` elapsed; the job is still active and was not cancelled"),
+    (
+        126,
+        "`dt wait`/`dt watch --timeout` elapsed; the jobs are still active and were not cancelled",
+    ),
     (
         130,
         "Local interruption; registered remote jobs continue unless explicitly killed",
@@ -77,6 +80,9 @@ COMMAND_EMITS: dict[str, JsonEmission] = {
     "topology": ("object", ("dt_topology_v1",)),
     "events": ("object", ("dt_operation_events_v1",)),
     "agent status": ("object", ("dt_agent_status_v1",)),
+    "agent start": ("object", ("dt_agent_control_v1",)),
+    "agent stop": ("object", ("dt_agent_control_v1",)),
+    "agent install": ("object", ("dt_agent_control_v1",)),
     "migrate layout": ("object", ("dt_layout_migration_v1",)),
     "init": ("object", ("dt_init_v1",)),
     "contract": ("object", (SCHEMA_VERSION,)),
@@ -97,6 +103,8 @@ ERROR_KINDS: dict[str, str] = {
     "unknown_node": "a named node is not in the configuration",
     "unknown_site": "a named site is not in the configuration",
     "unreachable": "the head, center, or node did not answer",
+    "agent_start_failed": "the background agent did not come up; run dt agent run to see why",
+    "agent_supervisor_unavailable": "no systemd user manager or crontab to install the agent under (exit 3)",
     "agent_incompatible": "the resident agent speaks an older protocol",
     "no_capacity": "no node can take the job now and --no-queue was set",
     "capacity_probe_failed": "no center could report its capacity",
@@ -183,6 +191,13 @@ def _parameter(param: Any) -> dict[str, Any]:
     choices = getattr(param.type, "choices", None)
     if choices:
         entry["choices"] = list(choices)
+    if param.type.name == "int range":
+        minimum = getattr(param.type, "min", None)
+        maximum = getattr(param.type, "max", None)
+        if minimum is not None:
+            entry["minimum"] = minimum
+        if maximum is not None:
+            entry["maximum"] = maximum
     if (
         getattr(param, "opts", None)
         and getattr(param, "param_type_name", "") == "option"
