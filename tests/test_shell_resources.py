@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 
 import pytest
@@ -73,3 +74,23 @@ def test_liveness_shell_composes_the_three_libraries_in_dependency_order():
         | LIBRARIES["runtime_scope.sh"]
         | LIBRARIES["liveness.sh"]
     )
+
+
+@pytest.mark.parametrize(
+    "name", ["probe_gpu.sh", "probe_apps.sh", "probe_system.sh", "cancel_sentinel.sh"]
+)
+def test_statement_resources_parse_under_posix_shells(name):
+    text = shell.load(name)
+
+    subprocess.run(["bash", "-n"], input=text, text=True, check=True)
+    if shutil.which("dash"):
+        subprocess.run(["dash", "-n"], input=text, text=True, check=True)
+
+
+def test_probe_resources_carry_the_markers_the_parser_expects():
+    from dt import probe
+
+    assert probe.GPU_ERROR in shell.load("probe_gpu.sh")
+    assert probe.APP_ERROR in shell.load("probe_apps.sh")
+    assert probe.GPU_Q in probe.PROBE_CMD and probe.APP_Q in probe.PROBE_CMD
+    assert probe.SYSTEM_Q in probe.PROBE_CMD
