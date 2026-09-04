@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.5 — 2026-09-05
+
 ### Fixed
 
 - dt no longer consumes the stdin of the script that invoked it: every child
