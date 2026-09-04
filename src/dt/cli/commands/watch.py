@@ -19,7 +19,6 @@ from ...forwarding import HeadCommand
 from ...jsonvalue import as_int, as_number
 from ...monitoring import safe_phase_name as _safe_phase_name
 from .. import (
-    EXIT_NOT_FOUND,
     JsonDict,
     LOG_SOURCE_MARK,
     REFS_OPTIONAL_ARG,
@@ -761,12 +760,7 @@ def run_watch(
             if json_:
                 entry = jobs_mod.find(cfg, ref)
                 if entry is None:
-                    _fail_submission(
-                        kind="not_found",
-                        message=f"no job matching {ref!r}",
-                        exit_code=EXIT_NOT_FOUND,
-                        json_=True,
-                    )
+                    _root._no_job_matching(cfg, ref, json_=True)
             else:
                 entry = _root._find_or_die(cfg, ref)
             entries.append(entry)

@@ -8,6 +8,10 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Added
 
+- A job reference that matches nothing now names the nearest job names in the
+  `not_found` message and, under `--json`, in `reasons.did_you_mean`, across
+  `info`, `logs`, `metrics`, `wait`, `watch`, `compare`, `kill`, and every
+  `_find_or_die` reader.
 - `dt wait --timeout SECONDS`: bound an automated wait. When the bound elapses
   the command reports the job's current state and an exact resume command,
   exits 126 (a code no experiment result can produce), and leaves the job

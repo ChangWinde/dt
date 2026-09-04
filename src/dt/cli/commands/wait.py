@@ -838,12 +838,7 @@ def run_wait(
         for ref in refs:
             entry = jobs_mod.find(cfg, ref)
             if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=65,
-                    json_=json_,
-                )
+                _root._no_job_matching(cfg, ref, json_=json_, exit_code=65)
             entries.append(entry)
     if len({entry.job_id for entry in entries}) != len(entries):
         _fail_submission(

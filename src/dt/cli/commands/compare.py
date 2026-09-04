@@ -529,12 +529,7 @@ def _compare_entries_on_head(
         for ref in refs:
             entry = jobs_mod.find(cfg, ref)
             if entry is None:
-                _fail_submission(
-                    kind="not_found",
-                    message=f"no job matching {ref!r}",
-                    exit_code=EXIT_NOT_FOUND,
-                    json_=json_,
-                )
+                _root._no_job_matching(cfg, ref, json_=json_)
             entries.append(entry)
     return entries
 

@@ -334,7 +334,8 @@ example `usage`, `configuration`, `not_found`, `unreachable`, `no_capacity`,
 kind this version can emit with its meaning), `message` is the human
 explanation, and `reasons` maps nodes or items to their own detail when the
 failure has structured parts (placement rejections list every candidate
-node) and is empty otherwise. Commands that reach their own payload report
+node; a `not_found` job reference carries `did_you_mean` with the nearest job
+names) and is empty otherwise. Commands that reach their own payload report
 failures inside it (`status: "error"` rows in `pull`, `wait`, `compare`),
 because those carry partial results that are still worth keeping.
 
