@@ -1613,6 +1613,8 @@ from .preview import (  # noqa: E402
     preview_submission as preview_submission,
 )
 from .launch import (  # noqa: E402
+    STALE_LAUNCH_IDENTITY_S as STALE_LAUNCH_IDENTITY_S,
+    _retire_stale_launch_identity as _retire_stale_launch_identity,
     _RecoveredLaunch as _RecoveredLaunch,
     _adopt_interrupted_queued_launch as _adopt_interrupted_queued_launch,
     _cancel_orphan as _cancel_orphan,
