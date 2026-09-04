@@ -8,6 +8,10 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Added
 
+- `dt agent start/stop/install --json` return one `dt_agent_control_v1` receipt
+  (`action`, `outcome`, and the pid, log path, or supervisor detail); a failed
+  start or an unavailable supervisor is the standard error document
+  (`agent_start_failed`, `agent_supervisor_unavailable`).
 - A job reference that matches nothing now names the nearest job names in the
   `not_found` message and, under `--json`, in `reasons.did_you_mean`, across
   `info`, `logs`, `metrics`, `wait`, `watch`, `compare`, `kill`, and every

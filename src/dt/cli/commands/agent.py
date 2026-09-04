@@ -13,7 +13,13 @@ from ... import cli as _root
 from ... import jobs as jobs_mod
 from ...config import ConfigError, HeadConfig, LaptopConfig, load
 from ...render import compact_path, err
-from .. import JsonDict, _format_transfer_bytes, _need_head, _typed_cli_decorator
+from .. import (
+    JsonDict,
+    _fail_submission,
+    _format_transfer_bytes,
+    _need_head,
+    _typed_cli_decorator,
+)
 from ... import agent as agent_mod
 
 agent_app = typer.Typer(
@@ -48,12 +54,27 @@ def agent_protocol() -> None:
     )
 
 
+AGENT_CONTROL_SCHEMA = "dt_agent_control_v1"
+
+
 def _agent_forward(argv: list[str], center: Optional[str]) -> None:
     """On a laptop, agent commands run on a center's head."""
     cfg = _root._cfg()
     if isinstance(cfg, LaptopConfig):
         head = cfg.centers[_root._laptop_center(cfg, center)]
         raise typer.Exit(_root.forward_call(head, ["agent", *argv]))
+
+
+def _control_receipt(action: str, outcome: str, **detail: object) -> str:
+    """One machine-readable receipt for start/stop/install."""
+    payload: dict[str, object] = {
+        "schema_version": AGENT_CONTROL_SCHEMA,
+        "action": action,
+        "outcome": outcome,
+        "exit_code": 0,
+    }
+    payload.update(detail)
+    return json.dumps(payload)
 
 
 @_typed_cli_decorator(agent_app.command("run"))
@@ -71,15 +92,30 @@ def agent_run(
 @_typed_cli_decorator(agent_app.command("start"))
 def agent_start(
     center: Optional[str] = typer.Option(None, "-c", "--center"),
+    json_: bool = typer.Option(False, "--json", help="emit one control receipt"),
 ) -> None:
     """Start the agent in the background (log path is shown on success)."""
-    _agent_forward(["start"], center)
+    _agent_forward(["start", *(["--json"] if json_ else [])], center)
 
     cfg = _need_head(_root._cfg())
-    if agent_mod.alive_pid(cfg) is not None:
-        err.print("agent already running")
+    running = agent_mod.alive_pid(cfg)
+    if running is not None:
+        if json_:
+            print(_control_receipt("start", "already_running", pid=running))
+        else:
+            err.print("agent already running")
         return
     if agent_mod.start_detached(cfg):
+        if json_:
+            print(
+                _control_receipt(
+                    "start",
+                    "started",
+                    pid=agent_mod.alive_pid(cfg),
+                    log_path=str(agent_mod.log_path(cfg)),
+                )
+            )
+            return
         from rich.markup import escape
 
         err.print(
@@ -87,19 +123,27 @@ def agent_start(
             f"(log: {escape(str(agent_mod.log_path(cfg)))})"
         )
     else:
-        err.print("[red]agent failed to start; try: dt agent run[/red]")
-        raise typer.Exit(1)
+        _fail_submission(
+            kind="agent_start_failed",
+            message="agent failed to start; try: dt agent run",
+            exit_code=1,
+            json_=json_,
+        )
 
 
 @_typed_cli_decorator(agent_app.command("stop"))
 def agent_stop(
     center: Optional[str] = typer.Option(None, "-c", "--center"),
+    json_: bool = typer.Option(False, "--json", help="emit one control receipt"),
 ) -> None:
     """Stop the running agent (queued jobs stay queued)."""
-    _agent_forward(["stop"], center)
+    _agent_forward(["stop", *(["--json"] if json_ else [])], center)
 
     cfg = _need_head(_root._cfg())
-    if agent_mod.stop_agent(cfg):
+    stopped = agent_mod.stop_agent(cfg)
+    if json_:
+        print(_control_receipt("stop", "stopped" if stopped else "not_running"))
+    elif stopped:
         err.print("[yellow]agent stopped[/yellow]")
     else:
         err.print("no agent running")
@@ -271,9 +315,10 @@ def _agent_status_table(
 @_typed_cli_decorator(agent_app.command("install"))
 def agent_install(
     center: Optional[str] = typer.Option(None, "-c", "--center"),
+    json_: bool = typer.Option(False, "--json", help="emit one control receipt"),
 ) -> None:
     """Install a restartable user service (or a visible cron fallback)."""
-    _agent_forward(["install"], center)
+    _agent_forward(["install", *(["--json"] if json_ else [])], center)
 
     cfg = _need_head(_root._cfg())
     result = agent_mod.install_supervisor(cfg)
@@ -284,15 +329,24 @@ def agent_install(
             capabilities.get("missing") if isinstance(capabilities, dict) else None
         )
         missing_text = ", ".join(str(item) for item in missing or []) or "unknown"
-        err.print(
-            "[red]cannot install a persistent DT agent[/red]: "
-            f"missing {escape(missing_text)}"
+        _fail_submission(
+            kind="agent_supervisor_unavailable",
+            message=(
+                f"cannot install a persistent DT agent: missing {missing_text}; "
+                "install bash plus either a systemd user manager or crontab, then retry"
+            ),
+            exit_code=3,
+            json_=json_,
+            reasons={"missing": missing_text},
         )
-        err.print(
-            "[dim]install bash plus either a systemd user manager or crontab, "
-            "then retry[/dim]"
-        )
-        raise typer.Exit(3)
+    if json_:
+        receipt = {
+            key: value
+            for key, value in result.items()
+            if key in {"supervisor", "path", "line", "warning", "linger_enabled"}
+        }
+        print(_control_receipt("install", "installed", **receipt))
+        return
     if result["supervisor"] == "systemd-user":
         err.print(
             f"[green]systemd user service installed[/green]: "

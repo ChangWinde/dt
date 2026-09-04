@@ -44,7 +44,7 @@ This page helps operators choose a command and handle its result. Run
 |---|---|
 | `dt doctor` | Verify SSH, tools, GPU runtime, transfer, and agent contracts |
 | `dt topology` | Probe and explain directed P2P data edges without transferring artifacts |
-| `dt agent` | Install, start, stop, inspect, or foreground the queue agent |
+| `dt agent` | Install, start, stop, inspect, or foreground the queue agent (`--json` receipts on every subcommand but `run`) |
 | `dt attach` | Enter the job's managed tmux session |
 | `dt kill` | Terminate and verify a complete job process group |
 | `dt events` | Query the bounded, redacted operation journal on this host or a head |
