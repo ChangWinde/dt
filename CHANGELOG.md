@@ -6,6 +6,14 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- `scripts/deploy.sh` reads the registry/dispatch authority from
+  `dt/jobs/__init__.py` as well as the pre-0.13.5 `dt/jobs.py`, so a 0.13.5
+  bundle activates instead of being refused and rolled back; the release gate
+  now runs the same probe (`deploy.sh --probe-wheel`) on the built wheel
+  before anything is tagged.
+
 ## 0.13.5 — 2026-09-05
 
 ### Fixed

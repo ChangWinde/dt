@@ -229,7 +229,7 @@ def _release(
         )
     )
     with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr("dt/jobs.py", jobs_source)
+        archive.writestr("dt/jobs/__init__.py", jobs_source)
         archive.writestr("fake-release-marker.txt", f"wheel {marker}\n")
     sdist.write_text(f"sdist {marker}\n", encoding="utf-8")
     (root / "runtime-constraints.txt").write_text("pyyaml==6.0\n", encoding="utf-8")
@@ -1341,3 +1341,46 @@ def test_rollback_refuses_non_symlink_current_before_activation(tmp_path):
     assert "current marker is not a symlink" in result.stderr
     assert _installed_version(remote_home) == "dt 0.9.1"
     assert sentinel.read_text("utf-8") == "untouched\n"
+
+
+def _probe(wheel: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(ROOT / "scripts" / "deploy.sh"), "--probe-wheel", str(wheel)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def test_probe_wheel_reads_the_registry_module_in_both_layouts(tmp_path):
+    """The activation probe must find dt/jobs whether it is a module or a package."""
+    real_source = (ROOT / "src" / "dt" / "jobs" / "__init__.py").read_text()
+    for layout in ("dt/jobs/__init__.py", "dt/jobs.py"):
+        wheel = tmp_path / f"{layout.replace('/', '_')}.whl"
+        with zipfile.ZipFile(wheel, "w") as archive:
+            archive.writestr(layout, real_source)
+        probe = _probe(wheel)
+        assert probe.returncode == 0, probe.stderr
+        assert (
+            "dispatch_protocol=dt_dispatch_attempt_v2 registry_schema=dt_job_registry_v1"
+            in probe.stdout
+        ), probe.stdout
+
+
+def test_probe_wheel_refuses_a_wheel_without_or_with_two_registry_modules(tmp_path):
+    none = tmp_path / "none.whl"
+    with zipfile.ZipFile(none, "w") as archive:
+        archive.writestr("dt/other.py", "x = 1\n")
+    both = tmp_path / "both.whl"
+    with zipfile.ZipFile(both, "w") as archive:
+        archive.writestr(
+            "dt/jobs.py", 'DISPATCH_PROTOCOL_VERSION = "dt_dispatch_attempt_v2"\n'
+        )
+        archive.writestr(
+            "dt/jobs/__init__.py",
+            'DISPATCH_PROTOCOL_VERSION = "dt_dispatch_attempt_v2"\n',
+        )
+    for wheel in (none, both):
+        probe = _probe(wheel)
+        assert probe.returncode == 1, probe.stdout
+        assert "lacks a readable registry/dispatch authority capability" in probe.stderr

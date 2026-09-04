@@ -12,6 +12,16 @@ if [[ "${1:-}" == "--plan" ]]; then
     PLAN=1
     shift
 fi
+if [[ "${1:-}" == "--probe-wheel" ]]; then
+    # Release gate hook: prove a built wheel carries the registry/dispatch
+    # authority capability the deploy activation will look for, so a layout
+    # change is caught before a tag instead of by the first host's rollback.
+    [[ $# -eq 2 ]] || {
+        echo "usage: scripts/deploy.sh --probe-wheel WHEEL" >&2
+        exit 2
+    }
+    PROBE_WHEEL="$2"
+fi
 if [[ "${1:-}" == "--rollback" ]]; then
     [[ $# -ge 3 ]] || {
         echo "usage: scripts/deploy.sh [--plan] --rollback VERSION HOST..." >&2
@@ -194,15 +204,21 @@ wheel = pathlib.Path(sys.argv[1])
 info = wheel.lstat()
 if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
     raise SystemExit(1)
+# The registry module is dt/jobs/__init__.py since 0.13.5 and dt/jobs.py in
+# every earlier release; a wheel must carry exactly one of them.
 with zipfile.ZipFile(wheel) as archive:
-    matches = [item for item in archive.infolist() if item.filename == "dt/jobs.py"]
+    matches = [
+        item
+        for item in archive.infolist()
+        if item.filename in ("dt/jobs/__init__.py", "dt/jobs.py")
+    ]
     if len(matches) != 1 or matches[0].file_size > 2 * 1024 * 1024:
         raise SystemExit(1)
     with archive.open(matches[0]) as stream:
         source = stream.read(2 * 1024 * 1024 + 1)
 if len(source) > 2 * 1024 * 1024:
     raise SystemExit(1)
-tree = ast.parse(source.decode("utf-8"), filename="dt/jobs.py")
+tree = ast.parse(source.decode("utf-8"), filename=matches[0].filename)
 expected = {"DISPATCH_PROTOCOL_VERSION", "REGISTRY_SCHEMA_VERSION"}
 values = {}
 for node in tree.body:
@@ -645,15 +661,21 @@ wheel = pathlib.Path(sys.argv[1])
 info = wheel.lstat()
 if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
     raise SystemExit(1)
+# The registry module is dt/jobs/__init__.py since 0.13.5 and dt/jobs.py in
+# every earlier release; a wheel must carry exactly one of them.
 with zipfile.ZipFile(wheel) as archive:
-    matches = [item for item in archive.infolist() if item.filename == "dt/jobs.py"]
+    matches = [
+        item
+        for item in archive.infolist()
+        if item.filename in ("dt/jobs/__init__.py", "dt/jobs.py")
+    ]
     if len(matches) != 1 or matches[0].file_size > 2 * 1024 * 1024:
         raise SystemExit(1)
     with archive.open(matches[0]) as stream:
         source = stream.read(2 * 1024 * 1024 + 1)
 if len(source) > 2 * 1024 * 1024:
     raise SystemExit(1)
-tree = ast.parse(source.decode("utf-8"), filename="dt/jobs.py")
+tree = ast.parse(source.decode("utf-8"), filename=matches[0].filename)
 expected = {"DISPATCH_PROTOCOL_VERSION", "REGISTRY_SCHEMA_VERSION"}
 values = {}
 for node in tree.body:
@@ -930,6 +952,19 @@ if [[ "$agent_was_running" == "1" ]] \
 fi
 REMOTE_BASH
 }
+
+if [[ -n "${PROBE_WHEEL:-}" ]]; then
+    # Run the exact probe the remote activation script will run, extracted
+    # from that script so the two can never disagree.
+    eval "$(remote_activate_script | sed -n '/^probe_release_authority_capability() {$/,/^}$/p')"
+    capability="$(probe_release_authority_capability "$PROBE_WHEEL")" || {
+        echo "deploy: wheel lacks a readable registry/dispatch authority capability: $PROBE_WHEEL" >&2
+        exit 1
+    }
+    IFS=$'\t' read -r probe_dispatch probe_registry <<< "$capability"
+    echo "deploy: capability dispatch_protocol=$probe_dispatch registry_schema=$probe_registry"
+    exit 0
+fi
 
 if [[ -n "$ROLLBACK_VERSION" ]]; then
     validate_version "$ROLLBACK_VERSION"

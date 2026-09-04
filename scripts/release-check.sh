@@ -140,6 +140,9 @@ uv export --preview-features sbom-export \
 
 cp "$SOURCE_TREE/bootstrap.sh" "$OUT_DIR/"
 cp "$BUILD_A/$WHEEL_NAME" "$OUT_DIR/"
+# The deploy activation reads the registry/dispatch authority out of the wheel;
+# prove the built wheel exposes it before anything is tagged or shipped.
+bash "$SOURCE_TREE/scripts/deploy.sh" --probe-wheel "$OUT_DIR/$WHEEL_NAME"
 cp "$BUILD_A/$SDIST_NAME" "$OUT_DIR/"
 
 python3 "$SOURCE_TREE/scripts/audit_release.py" \
