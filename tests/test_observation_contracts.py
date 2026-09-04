@@ -155,7 +155,16 @@ def test_compact_ps_preserves_bounded_head_partial_errors(monkeypatch):
 
 @pytest.mark.parametrize(
     "damage",
-    ["over_limit", "summary_key", "error_count", "partial_flag", "field_type"],
+    [
+        "over_limit",
+        "summary_key",
+        "error_count",
+        "partial_flag",
+        "field_type",
+        "generated_at_type",
+        "summary_total_type",
+        "created_at_type",
+    ],
 )
 def test_compact_ps_validator_rejects_total_contract_damage(damage):
     fields = ("job_id", "center", "created_at", "status")
@@ -190,6 +199,12 @@ def test_compact_ps_validator_rejects_total_contract_damage(damage):
         payload["partial"] = True
     elif damage == "field_type":
         payload["jobs"][0]["status"] = ["running"]
+    elif damage == "generated_at_type":
+        payload["generated_at"] = True
+    elif damage == "summary_total_type":
+        payload["summary"]["total"] = "2"
+    elif damage == "created_at_type":
+        payload["jobs"][0]["created_at"] = "2.0"
     else:
         payload["partial"] = True
 
@@ -250,10 +265,10 @@ def test_compact_ps_builder_bounds_large_partial_error_maps():
         expected_cursor=None,
     )
 
-    assert len(validated["errors"]) == ps_query.MAX_PARTIAL_ERRORS
-    assert any(key.startswith("_dt_errors_omitted") for key in validated["errors"])
-    assert max(map(len, validated["errors"])) <= 256
-    assert max(map(len, validated["errors"].values())) <= 1024
+    assert len(validated.errors) == ps_query.MAX_PARTIAL_ERRORS
+    assert any(key.startswith("_dt_errors_omitted") for key in validated.errors)
+    assert max(map(len, validated.errors)) <= 256
+    assert max(map(len, validated.errors.values())) <= 1024
 
     sanitized = ps_query.bounded_errors(
         {"registry:\x1b]0;spoof\x07": "bad\x1b[31mred\x1b[0m"}

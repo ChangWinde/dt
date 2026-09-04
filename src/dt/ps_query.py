@@ -13,7 +13,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime
 from typing import Any, TypeAlias, cast
 
-from .jsonvalue import as_number
+from .jsonvalue import as_int, as_number
 from .jobs import (
     JOB_STATUSES,
     MAX_JOB_COLLECTION_ITEMS,
@@ -744,6 +744,20 @@ def query_contract(
     }
 
 
+@dataclass(frozen=True)
+class ValidatedPage:
+    """One head's ps page after every v1 contract check passed."""
+
+    payload: JsonDict
+    summary: JsonDict
+    eligible: int
+    returned: int
+    next_cursor: str | None
+    jobs: list[JsonDict]
+    partial: bool
+    errors: dict[str, str]
+
+
 def validate_payload_contract(
     payload: object,
     *,
@@ -751,7 +765,7 @@ def validate_payload_contract(
     expected_query: JsonDict,
     expected_fields: tuple[str, ...],
     expected_cursor: str | None,
-) -> JsonDict:
+) -> ValidatedPage:
     """Validate every v1 query invariant before a laptop merges a head page.
 
     The schema version alone is insufficient: an older pre-release v1 ordered
@@ -780,11 +794,8 @@ def validate_payload_contract(
         raise QueryError("ps query response has the wrong owning center")
     if payload.get("query") != expected_query:
         raise QueryError("ps query contract does not match the request")
-    generated_at = payload.get("generated_at")
-    if not _finite_number(generated_at):
-        raise QueryError("invalid ps query generation time from head")
-    assert isinstance(generated_at, (int, float)) and not isinstance(generated_at, bool)
-    if float(generated_at) < 0:
+    generated_at = as_number(payload.get("generated_at"))
+    if generated_at is None or generated_at < 0:
         raise QueryError("invalid ps query generation time from head")
 
     summary = payload.get("summary")
@@ -797,35 +808,33 @@ def validate_payload_contract(
     }:
         raise QueryError("invalid ps query summary from head")
     merge_summaries([summary])
-    summary_total = summary.get("total")
-    assert isinstance(summary_total, int) and not isinstance(summary_total, bool)
-    by_status = summary.get("by_status")
-    by_result = summary.get("by_result_state")
-    by_center = summary.get("by_center")
-    by_node = summary.get("by_node")
-    assert all(
-        isinstance(counts, dict)
-        for counts in (by_status, by_result, by_center, by_node)
+    summary_total = as_int(summary.get("total"))
+    buckets = [
+        summary.get(key)
+        for key in ("by_status", "by_result_state", "by_center", "by_node")
+    ]
+    if summary_total is None or not all(isinstance(counts, dict) for counts in buckets):
+        raise QueryError("invalid ps query summary from head")
+    by_status, by_result, by_center, by_node = (
+        cast(dict[str, int], b) for b in buckets
     )
-    if not set(cast(dict[str, int], by_status)).issubset(JOB_STATUSES):
+    if not set(by_status).issubset(JOB_STATUSES):
         raise QueryError("invalid ps lifecycle bucket from head")
-    if not set(cast(dict[str, int], by_result)).issubset(RESULT_STATES):
+    if not set(by_result).issubset(RESULT_STATES):
         raise QueryError("invalid ps result bucket from head")
     expected_status = expected_query.get("status")
-    if isinstance(expected_status, str) and set(cast(dict[str, int], by_status)) - {
-        expected_status
-    }:
+    if isinstance(expected_status, str) and set(by_status) - {expected_status}:
         raise QueryError("ps summary violates its status filter")
-    if expected_query.get("active_only") is True and set(
-        cast(dict[str, int], by_status)
-    ) - {"queued", "running"}:
+    if expected_query.get("active_only") is True and set(by_status) - {
+        "queued",
+        "running",
+    }:
         raise QueryError("ps summary violates its active filter")
     if (
-        sum(cast(dict[str, int], by_status).values()) != summary_total
-        or cast(dict[str, int], by_center)
-        != ({center: summary_total} if summary_total else {})
-        or sum(cast(dict[str, int], by_result).values()) > summary_total
-        or sum(cast(dict[str, int], by_node).values()) > summary_total
+        sum(by_status.values()) != summary_total
+        or by_center != ({center: summary_total} if summary_total else {})
+        or sum(by_result.values()) > summary_total
+        or sum(by_node.values()) > summary_total
     ):
         raise QueryError("inconsistent ps query summary from head")
 
@@ -888,13 +897,8 @@ def validate_payload_contract(
             job_id = row.get("job_id")
             if not isinstance(job_id, str) or not job_id or len(job_id) > 512:
                 raise QueryError("invalid ps query job identity from head")
-            created_at = row.get("created_at")
-            if not _finite_number(created_at):
-                raise QueryError("invalid ps query ordering key from head")
-            assert isinstance(created_at, (int, float)) and not isinstance(
-                created_at, bool
-            )
-            if float(created_at) < 0:
+            created_at = as_number(row.get("created_at"))
+            if created_at is None or created_at < 0:
                 raise QueryError("invalid ps query ordering key from head")
             row_keys.append(row_key(row, ORDER_FIELD))
         if row_keys != sorted(row_keys, reverse=True) or len(row_keys) != len(
@@ -948,7 +952,16 @@ def validate_payload_contract(
         raise QueryError("invalid ps query error contract from head")
     if serialized_size(payload) > MAX_RESPONSE_BYTES:
         raise QueryError("ps query response exceeds its byte budget")
-    return payload
+    return ValidatedPage(
+        payload=payload,
+        summary=summary,
+        eligible=eligible,
+        returned=returned,
+        next_cursor=next_cursor,
+        jobs=cast(list[JsonDict], jobs),
+        partial=partial,
+        errors=cast(dict[str, str], errors),
+    )
 
 
 def build_payload(

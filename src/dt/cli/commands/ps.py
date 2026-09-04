@@ -794,7 +794,7 @@ def _ps_query_collect_centers(
         if center_payload is None:
             continue
         try:
-            center_payload = ps_query_mod.validate_payload_contract(
+            validated = ps_query_mod.validate_payload_contract(
                 center_payload,
                 center=center,
                 expected_query=expected_query,
@@ -804,15 +804,8 @@ def _ps_query_collect_centers(
         except ps_query_mod.QueryError as exc:
             fan_errors[center] = str(exc)
             continue
-        summary = center_payload.get("summary")
-        page = center_payload.get("page")
-        jobs = center_payload.get("jobs")
-        assert isinstance(summary, dict)
-        assert isinstance(page, dict)
-        assert isinstance(jobs, list)
-        typed_jobs = cast(list[JsonDict], jobs)
-        center_eligible = int(page["eligible"])
-        center_returned = int(page["returned"])
+        center_eligible = validated.eligible
+        center_returned = validated.returned
         if not summary_only and center_returned != min(limit, center_eligible):
             # A single head can safely continue its own byte-fitted page, but
             # that prefix is not enough to form a globally ordered page.  A
@@ -825,17 +818,11 @@ def _ps_query_collect_centers(
                 "retry with fewer --fields"
             )
             continue
-        summaries.append(cast(JsonDict, summary))
-        candidates.extend(typed_jobs)
+        summaries.append(validated.summary)
+        candidates.extend(validated.jobs)
         eligible += center_eligible
-        head_errors = center_payload["errors"]
-        assert isinstance(head_errors, dict)
         partial_errors.update(
-            {
-                f"{center}:{key}": value
-                for key, value in head_errors.items()
-                if isinstance(key, str) and isinstance(value, str)
-            }
+            {f"{center}:{key}": value for key, value in validated.errors.items()}
         )
     return summaries, candidates, partial_errors, eligible
 
