@@ -311,6 +311,7 @@ def _remote_command(
     *,
     apply: bool,
     now: float,
+    prune_modified: bool = False,
 ) -> str:
     """Return the census/prune shell program (no recursive broad-path delete).
 
@@ -363,11 +364,16 @@ def _remote_command(
             candidate.entry.job_dir,
             candidate.entry.storage_layout,
         )
+        started_marker = node_path_expression(
+            job_state_dir(candidate.entry.job_dir, candidate.entry.storage_layout)
+            + "/started_at"
+        )
         lines.extend(
             [
                 f"root={root}",
                 f"control={node_path_expression(control)}",
                 f"job_id={job_id}",
+                f"started_marker={started_marker}",
                 'code="$root/code"',
                 'receipt_path="$control/code-pruned.json"',
                 'jobs_root=$(dirname -- "$root")',
@@ -447,12 +453,39 @@ def _remote_command(
                     "2>/dev/null | awk 'NR == 1 {print $1}')"
                 ),
                 '  case "$bytes" in ""|*[!0-9]*) bytes=-1;; esac',
+                # The code copy is an immutable snapshot; a regular file newer
+                # than the job's start marker was written by the job itself
+                # (outputs that belong in $DT_OUTPUT_DIR). Deleting it would
+                # destroy results, so count and refuse unless told otherwise.
+                '  modified="0 0"',
+                '  if [ -f "$started_marker" ]; then',
+                (
+                    '    modified=$(timeout 60s find "$code" -xdev -type f '
+                    '-newer "$started_marker" -printf "%s\\n" 2>/dev/null '
+                    "| awk '{n++; b+=$1} END {printf \"%d %d\", n+0, b+0}')"
+                ),
+                "  fi",
+                "  modified_files=${modified%% *}; modified_bytes=${modified##* }",
+            ]
+        )
+        modified_guard = (
+            '  if [ "$modified_files" -gt 0 ]; then'
+            if not prune_modified
+            else "  if false; then"
+        )
+        lines.extend(
+            [
+                modified_guard,
+                (
+                    '    emit code_modified "$job_id" "$bytes" '
+                    '"${modified_files}_files_${modified_bytes}_bytes_written_after_start"'
+                ),
             ]
         )
         if apply:
             lines.extend(
                 [
-                    '  if [ ! -d "$control" ] || [ -L "$control" ]; then',
+                    '  elif [ ! -d "$control" ] || [ -L "$control" ]; then',
                     '    emit unsafe "$job_id" "$bytes" unsafe_control_dir',
                     "    compact_rc=1",
                     "  elif ! command -v sync >/dev/null 2>&1; then",
@@ -484,7 +517,13 @@ def _remote_command(
                 ]
             )
         else:
-            lines.append('  emit planned "$job_id" "$bytes" code_would_be_removed')
+            lines.extend(
+                [
+                    "  else",
+                    '    emit planned "$job_id" "$bytes" code_would_be_removed',
+                    "  fi",
+                ]
+            )
         lines.append("fi")
     lines.append('exit "$compact_rc"')
     return "\n".join(lines)
@@ -498,6 +537,7 @@ def _remote_rows(
     now: float,
     cutoff_ts: float,
     anchor: str = "created_at",
+    prune_modified: bool = False,
 ) -> tuple[list[dict[str, object]], list[str], set[str]]:
     rows: list[dict[str, object]] = []
     node_errors: list[str] = []
@@ -562,7 +602,9 @@ def _remote_rows(
                 if not stable:
                     continue
 
-                script = _remote_command(stable, apply=apply, now=now)
+                script = _remote_command(
+                    stable, apply=apply, now=now, prune_modified=prune_modified
+                )
                 try:
                     proc = run_on(
                         node_name,
@@ -688,8 +730,14 @@ def compact_jobs(
     before: str,
     apply: bool,
     anchor: str = "created_at",
+    prune_modified: bool = False,
 ) -> CompactReport:
-    """Plan or apply safe workdir compaction and return a stable JSON model."""
+    """Plan or apply safe workdir compaction and return a stable JSON model.
+
+    A code copy holding files written after the job started is reported as
+    ``code_modified`` and kept, unless ``prune_modified`` explicitly accepts
+    deleting outputs that were written into the disposable snapshot copy.
+    """
     checked = preflight(cfg, cutoff_ts, anchor=anchor)
     common: dict[str, object] = {
         "schema_version": "dt_compact_v1",
@@ -698,6 +746,7 @@ def compact_jobs(
         "cutoff_ts": cutoff_ts,
         "anchor": anchor,
         "mode": "apply" if apply else "plan",
+        "prune_modified": prune_modified,
         "eligible_jobs": len(checked.candidates),
         "eligible_snapshots": len(
             {candidate.digest for candidate in checked.candidates}
@@ -720,6 +769,7 @@ def compact_jobs(
         now=time.time(),
         cutoff_ts=cutoff_ts,
         anchor=anchor,
+        prune_modified=prune_modified,
     )
     counts = Counter(str(row["status"]) for row in rows)
     planned_bytes = sum(
@@ -738,6 +788,7 @@ def compact_jobs(
         "already_compact_jobs": counts["already_compact"],
         "missing_job_dirs": counts["missing"],
         "state_changed_jobs": counts["state_changed"],
+        "code_modified_jobs": counts["code_modified"],
         "failed_jobs": failed_jobs,
         "planned_code_bytes": planned_bytes,
         "node_errors": node_errors,

@@ -1303,6 +1303,14 @@ def _maybe_autocompact(cfg: HeadConfig, log: Callable[[str], None]) -> None:
     errors = payload.get("preflight_errors")
     if isinstance(failed, int) and failed:
         log(f"auto-compact: {failed} job(s) could not be compacted safely")
+    modified = payload.get("code_modified_jobs")
+    if isinstance(modified, int) and modified:
+        # The automatic sweep never accepts the loss on the operator's behalf.
+        log(
+            f"auto-compact: kept {modified} job(s) whose code copy holds files "
+            "written after start; recover them with dt pull or run "
+            "dt compact --prune-modified"
+        )
     if isinstance(errors, list) and errors:
         log(f"auto-compact: refused, recovery archive problem: {errors[0]}")
 

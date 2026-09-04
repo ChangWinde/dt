@@ -409,6 +409,13 @@ dt compact --before 2026-07-01 -y
 It retains job metadata, outputs, logs, checkpoints, payloads, and registry
 entries. Identity or recovery mismatch rejects the candidate.
 
+The code copy is an immutable snapshot, so any regular file newer than the
+job's start marker was written by the job itself — results that belong under
+`$DT_OUTPUT_DIR`. Compaction reports such trees as `code_modified` (with the
+file count and bytes) and keeps them; recover the files with `dt pull` or,
+to accept the loss, run `dt compact --before DATE -y --prune-modified`. The
+automatic sweep never prunes a modified tree; it logs how many it kept.
+
 The resident agent runs the same procedure automatically every six hours for
 jobs that have been terminal for longer than `queue.auto_compact_hours`
 (default 24; `false` disables). The sweep skips the newest dispatched job per

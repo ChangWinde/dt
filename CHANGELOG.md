@@ -6,6 +6,23 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- dt no longer consumes the stdin of the script that invoked it: every child
+  process gets `/dev/null` unless dt spools an explicit payload, and a
+  non-interactive laptop-to-head forward no longer attaches stdin. `ssh head
+  'bash -s' < submit.sh` used to lose the rest of the script to the first
+  `dt run`'s ssh session, submitting a fraction of the jobs and exiting 0.
+- `dt kill` dequeues a queued job that still carries a dispatch attempt (it
+  was placed once and bounced): the attempt is cancelled on its node the way
+  failover recovery does, then the row turns killed. It used to fail with
+  "only queued jobs may retain a dispatch attempt identity".
+- `dt compact` keeps a code copy that holds files written after the job
+  started (`code_modified` in the report, counted in `code_modified_jobs`)
+  instead of deleting results a job wrote into its snapshot copy;
+  `--prune-modified` accepts the loss explicitly. The automatic sweep never
+  prunes such trees.
+
 ### Added
 
 - `dt agent start/stop/install --json` return one `dt_agent_control_v1` receipt
