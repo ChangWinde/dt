@@ -91,7 +91,9 @@ def agent_run(
 
 @_typed_cli_decorator(agent_app.command("start"))
 def agent_start(
-    center: Optional[str] = typer.Option(None, "-c", "--center"),
+    center: Optional[str] = typer.Option(
+        None, "-c", "--center", help="(laptop) which center's head"
+    ),
     json_: bool = typer.Option(False, "--json", help="emit one control receipt"),
 ) -> None:
     """Start the agent in the background (log path is shown on success)."""
@@ -133,7 +135,9 @@ def agent_start(
 
 @_typed_cli_decorator(agent_app.command("stop"))
 def agent_stop(
-    center: Optional[str] = typer.Option(None, "-c", "--center"),
+    center: Optional[str] = typer.Option(
+        None, "-c", "--center", help="(laptop) which center's head"
+    ),
     json_: bool = typer.Option(False, "--json", help="emit one control receipt"),
 ) -> None:
     """Stop the running agent (queued jobs stay queued)."""
@@ -151,14 +155,18 @@ def agent_stop(
 
 @_typed_cli_decorator(agent_app.command("status"))
 def agent_status(
-    center: Optional[str] = typer.Option(None, "-c", "--center"),
+    center: Optional[str] = typer.Option(
+        None, "-c", "--center", help="(laptop) which center's head"
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
         "-v",
         help="show scheduler policy, log rotation, and the complete queue-head id",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_agent_status_v1 object on stdout"
+    ),
 ) -> None:
     """Agent liveness + queue depth."""
     cfg = _root._cfg()
@@ -314,7 +322,9 @@ def _agent_status_table(
 
 @_typed_cli_decorator(agent_app.command("install"))
 def agent_install(
-    center: Optional[str] = typer.Option(None, "-c", "--center"),
+    center: Optional[str] = typer.Option(
+        None, "-c", "--center", help="(laptop) which center's head"
+    ),
     json_: bool = typer.Option(False, "--json", help="emit one control receipt"),
 ) -> None:
     """Install a restartable user service (or a visible cron fallback)."""

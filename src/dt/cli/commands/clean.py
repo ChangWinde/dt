@@ -694,7 +694,12 @@ def clean(
         "--json",
         help="emit one dt_clean_v1 envelope on stdout (plan or apply)",
     ),
-    yes: bool = typer.Option(False, "-y", "--yes"),
+    yes: bool = typer.Option(
+        False,
+        "-y",
+        "--yes",
+        help="skip the confirmation prompt (required when not on a TTY)",
+    ),
 ) -> None:
     """Delete old job snapshots + logs on nodes and their registry entries."""
     selected_plan_modes = (

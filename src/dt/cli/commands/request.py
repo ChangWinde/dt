@@ -124,7 +124,9 @@ def request_status(
     center: Optional[str] = typer.Option(
         None, "-c", "--center", help="(laptop) which center's head"
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_submission_request_probe_v1 object on stdout"
+    ),
 ) -> None:
     """Inspect a retry-safe submission without creating another job."""
     _validate_submission_request_id(request_id, json_=json_)

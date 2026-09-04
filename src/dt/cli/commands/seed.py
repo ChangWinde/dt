@@ -303,7 +303,9 @@ def seed(
         "--plan",
         help="show local source size without remote access or writes",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit a JSON array of rows on stdout"
+    ),
     retries: int = typer.Option(
         1,
         "--retries",

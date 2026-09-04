@@ -286,7 +286,9 @@ def _render_doctor_actions(payload: JsonDict) -> None:
 
 
 def doctor(
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_doctor_v2 object on stdout"
+    ),
     rows_json: bool = typer.Option(False, "--rows-json", hidden=True),
 ) -> None:
     """Verify SSH, GPU, transfer tools, runtime contracts, and network."""

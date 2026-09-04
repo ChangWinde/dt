@@ -292,7 +292,7 @@ def logs(
         "--follow",
         help="wait through queue, then stream to terminal; reconnect on SSH loss",
     ),
-    lines: int = typer.Option(100, "-n", "--lines"),
+    lines: int = typer.Option(100, "-n", "--lines", help="log lines to show"),
     json_: bool = typer.Option(
         False,
         "--json",

@@ -840,7 +840,7 @@ def _inventory_command(
         "-F",
         help="one shell command per line; '-' reads stdin",
     ),
-    gpus: int = typer.Option(1, "-g", "--gpus"),
+    gpus: int = typer.Option(1, "-g", "--gpus", help="GPUs per item (0 = CPU)"),
     stage_gpus: list[int] | None = None,
     name_prefix: Optional[str] = typer.Option(
         None,
@@ -848,20 +848,26 @@ def _inventory_command(
         "--name-prefix",
         help="default: command-file stem or 'batch'",
     ),
-    project: Optional[str] = typer.Option(None, "-p", "--project"),
+    project: Optional[str] = typer.Option(
+        None, "-p", "--project", help="configured project name"
+    ),
     center: Optional[str] = typer.Option(
         None,
         "-c",
         "--center",
         help="(laptop) which center",
     ),
-    require_path: Optional[str] = typer.Option(None, "--require-path"),
+    require_path: Optional[str] = typer.Option(
+        None, "--require-path", help="path that must exist on the node"
+    ),
     require_disk_gib: Optional[int] = typer.Option(
         None,
         "--require-disk-gib",
         help="minimum free space needed by every item (GiB)",
     ),
-    max_hours: Optional[float] = typer.Option(None, "--max-hours"),
+    max_hours: Optional[float] = typer.Option(
+        None, "--max-hours", help="kill each item after N hours"
+    ),
     min_vram_mib: Optional[int] = typer.Option(
         None,
         "--min-vram-mib",
@@ -892,7 +898,9 @@ def _inventory_command(
         "--request-id",
         help="retry-safe identity for the complete multi-job submission",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_batch_v1 / dt_chain_v1 receipt on stdout"
+    ),
 ) -> None:
     """Submit one validated command inventory under the selected queue policy."""
     direct = commands or []
@@ -1065,7 +1073,13 @@ def batch(
         help="one shell command per line; '-' reads stdin",
         rich_help_panel="Input",
     ),
-    gpus: int = typer.Option(1, "-g", "--gpus", rich_help_panel="Resources & safety"),
+    gpus: int = typer.Option(
+        1,
+        "-g",
+        "--gpus",
+        help="GPUs per item (0 = CPU)",
+        rich_help_panel="Resources & safety",
+    ),
     name_prefix: Optional[str] = typer.Option(
         None,
         "-n",
@@ -1074,7 +1088,7 @@ def batch(
         rich_help_panel="Input",
     ),
     project: Optional[str] = typer.Option(
-        None, "-p", "--project", rich_help_panel="Input"
+        None, "-p", "--project", help="configured project name", rich_help_panel="Input"
     ),
     center: Optional[str] = typer.Option(
         None,
@@ -1084,7 +1098,10 @@ def batch(
         rich_help_panel="Input",
     ),
     require_path: Optional[str] = typer.Option(
-        None, "--require-path", rich_help_panel="Resources & safety"
+        None,
+        "--require-path",
+        help="path that must exist on the node",
+        rich_help_panel="Resources & safety",
     ),
     require_disk_gib: Optional[int] = typer.Option(
         None,
@@ -1093,7 +1110,10 @@ def batch(
         rich_help_panel="Resources & safety",
     ),
     max_hours: Optional[float] = typer.Option(
-        None, "--max-hours", rich_help_panel="Resources & safety"
+        None,
+        "--max-hours",
+        help="kill each item after N hours",
+        rich_help_panel="Resources & safety",
     ),
     min_vram_mib: Optional[int] = typer.Option(
         None,
@@ -1131,7 +1151,12 @@ def batch(
         help="retry-safe identity for the complete batch",
         rich_help_panel="Reliability",
     ),
-    json_: bool = typer.Option(False, "--json", rich_help_panel="Output"),
+    json_: bool = typer.Option(
+        False,
+        "--json",
+        help="emit one receipt object on stdout",
+        rich_help_panel="Output",
+    ),
 ) -> None:
     """Submit a same-node FIFO queue; runtime failures continue."""
     _inventory_command(
@@ -1169,7 +1194,13 @@ def chain(
         help="one shell stage per line; '-' reads stdin",
         rich_help_panel="Input",
     ),
-    gpus: int = typer.Option(1, "-g", "--gpus", rich_help_panel="Resources & safety"),
+    gpus: int = typer.Option(
+        1,
+        "-g",
+        "--gpus",
+        help="GPUs per item (0 = CPU)",
+        rich_help_panel="Resources & safety",
+    ),
     stage_gpus: Optional[list[int]] = typer.Option(
         None,
         "--stage-gpus",
@@ -1187,7 +1218,7 @@ def chain(
         rich_help_panel="Input",
     ),
     project: Optional[str] = typer.Option(
-        None, "-p", "--project", rich_help_panel="Input"
+        None, "-p", "--project", help="configured project name", rich_help_panel="Input"
     ),
     center: Optional[str] = typer.Option(
         None,
@@ -1197,7 +1228,10 @@ def chain(
         rich_help_panel="Input",
     ),
     require_path: Optional[str] = typer.Option(
-        None, "--require-path", rich_help_panel="Resources & safety"
+        None,
+        "--require-path",
+        help="path that must exist on the node",
+        rich_help_panel="Resources & safety",
     ),
     require_disk_gib: Optional[int] = typer.Option(
         None,
@@ -1206,7 +1240,10 @@ def chain(
         rich_help_panel="Resources & safety",
     ),
     max_hours: Optional[float] = typer.Option(
-        None, "--max-hours", rich_help_panel="Resources & safety"
+        None,
+        "--max-hours",
+        help="kill each item after N hours",
+        rich_help_panel="Resources & safety",
     ),
     min_vram_mib: Optional[int] = typer.Option(
         None,
@@ -1244,7 +1281,12 @@ def chain(
         help="retry-safe identity for the complete chain",
         rich_help_panel="Reliability",
     ),
-    json_: bool = typer.Option(False, "--json", rich_help_panel="Output"),
+    json_: bool = typer.Option(
+        False,
+        "--json",
+        help="emit one receipt object on stdout",
+        rich_help_panel="Output",
+    ),
 ) -> None:
     """Submit a success-gated chain; failed predecessors stop later stages."""
     _inventory_command(

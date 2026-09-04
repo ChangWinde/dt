@@ -223,7 +223,9 @@ def metrics(
     tail: int = typer.Option(
         3600, "--tail", help="summarize the last N samples (0 = all)"
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_resource_summary_v1 object on stdout"
+    ),
 ) -> None:
     """Summarize persisted per-job GPU/CPU/IO telemetry."""
     if tail < 0:

@@ -197,3 +197,14 @@ def test_error_kind_vocabulary_covers_every_kind_the_cli_can_emit():
     )
     document = _document()
     assert [k["kind"] for k in document["error"]["kinds"]] == list(contract.ERROR_KINDS)
+
+
+def test_every_parameter_explains_itself():
+    """An agent fills parameters from `help`; an empty string is a missing contract."""
+    silent = [
+        (command["name"], parameter["name"])
+        for command in _document()["commands"]
+        for parameter in [*command["options"], *command["arguments"]]
+        if not parameter["help"]
+    ]
+    assert silent == []

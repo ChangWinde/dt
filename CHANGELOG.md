@@ -33,6 +33,10 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Changed
 
+- Every command option and argument now carries help text (44 were silent,
+  mostly `--json`, `--yes`, `--no-queue`, and the batch/chain resource options);
+  `--json` help names the schema or shape each command emits. The contract test
+  fails on any future parameter without help.
 - `run --follow` calls the plain `run_watch` / `run_wait` implementations
   instead of the Typer command functions, so adding an option to `wait` or
   `watch` can no longer break the follow path; the forwarding-drift guard reads

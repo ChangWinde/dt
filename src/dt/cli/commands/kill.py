@@ -423,7 +423,12 @@ def _kill_via_laptop_human(
 
 def kill(
     refs: Optional[list[str]] = REFS_OPTIONAL_ARG,
-    yes: bool = typer.Option(False, "-y", "--yes"),
+    yes: bool = typer.Option(
+        False,
+        "-y",
+        "--yes",
+        help="skip the confirmation prompt (required when not on a TTY)",
+    ),
     force: bool = typer.Option(
         False, "--force", help="SIGKILL (for jobs that swallow TERM)"
     ),

@@ -298,7 +298,9 @@ def topology(
             "control route to measure real throughput (recorded for ranking)"
         ),
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_topology_v1 object on stdout"
+    ),
 ) -> None:
     """Discover direct node-to-node data edges without transferring artifacts."""
     cfg = _root._cfg()

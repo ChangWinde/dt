@@ -454,7 +454,10 @@ def fork(
         rich_help_panel="Everyday",
     ),
     no_queue: bool = typer.Option(
-        False, "--no-queue", rich_help_panel="Scheduling & safety"
+        False,
+        "--no-queue",
+        help="fail with exit 2 instead of queueing when nothing fits now",
+        rich_help_panel="Scheduling & safety",
     ),
     request_id: Optional[str] = typer.Option(
         None,
@@ -462,7 +465,12 @@ def fork(
         help="retry-safe identity for this fork or complete repeat group",
         rich_help_panel="Reliability",
     ),
-    json_: bool = typer.Option(False, "--json", rich_help_panel="Output"),
+    json_: bool = typer.Option(
+        False,
+        "--json",
+        help="emit one JSON object on stdout (dt_submission_v1 or dt_fork_repeat_v1)",
+        rich_help_panel="Output",
+    ),
 ) -> None:
     """Fork exact code; --repeat N preloads a same-node FIFO runway."""
     command = list(ctx.args)

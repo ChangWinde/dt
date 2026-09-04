@@ -1034,7 +1034,9 @@ def _info_payload(
 
 def info(
     ref: str = REF_ARG,
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_job_info_v1 object on stdout"
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",

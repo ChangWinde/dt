@@ -627,7 +627,11 @@ def run(
         rich_help_panel="Everyday",
     ),
     project: Optional[str] = typer.Option(
-        None, "-p", "--project", rich_help_panel="Everyday"
+        None,
+        "-p",
+        "--project",
+        help="configured project name (default: the project containing the cwd)",
+        rich_help_panel="Everyday",
     ),
     node: Optional[str] = typer.Option(
         None,
@@ -789,7 +793,12 @@ def run(
         help="stdout/error lines used with --follow",
         rich_help_panel="Follow & output",
     ),
-    json_: bool = typer.Option(False, "--json", rich_help_panel="Follow & output"),
+    json_: bool = typer.Option(
+        False,
+        "--json",
+        help="emit one JSON object on stdout (dt_submission_v1, or dt_run_plan_v1 with --plan)",
+        rich_help_panel="Follow & output",
+    ),
 ) -> None:
     """Submit once: dt run -g 2 -n exp42 -- python train.py --lr 3e-4"""
     cmd = list(ctx.args)
@@ -1302,7 +1311,9 @@ def task(
         help="progress refresh/fallback interval",
     ),
     lines: int = typer.Option(20, "--lines", help="follow stdout lines"),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_submission_v1 object on stdout"
+    ),
 ) -> None:
     """Safe fast path: dt task gpu-node-1 "python train.py" -f.
 

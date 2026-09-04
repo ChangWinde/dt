@@ -39,7 +39,9 @@ def compact(
         "--center",
         help="(laptop) which center's head",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_compact_v1 object on stdout"
+    ),
 ) -> None:
     """Remove recoverable code copies from old terminal job workdirs."""
     if json_ and not plan and not yes:

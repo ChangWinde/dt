@@ -39,7 +39,9 @@ def migrate_layout(
         "--center",
         help="(laptop) which center's head",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_layout_migration_v1 object on stdout"
+    ),
 ) -> None:
     """Move safe legacy records and terminal jobs into role namespaces."""
     if plan and yes:

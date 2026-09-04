@@ -32,7 +32,11 @@ def rerun(
     name: Optional[str] = typer.Option(
         None, "-n", "--name", help="new job name (default: same as before)"
     ),
-    no_queue: bool = typer.Option(False, "--no-queue"),
+    no_queue: bool = typer.Option(
+        False,
+        "--no-queue",
+        help="fail with exit 2 instead of queueing when nothing fits now",
+    ),
     min_vram_mib: Optional[int] = typer.Option(
         None,
         "--min-vram-mib",
@@ -43,7 +47,9 @@ def rerun(
         "--request-id",
         help="retry-safe identity for this rerun",
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit one dt_submission_v1 object on stdout"
+    ),
 ) -> None:
     """Resubmit once: same command/GPUs/pins, today's project code."""
     if min_vram_mib is not None and min_vram_mib <= 0:

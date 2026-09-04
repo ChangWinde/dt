@@ -197,7 +197,9 @@ def sync(
             "persistent artifact root (repeatable)"
         ),
     ),
-    json_: bool = typer.Option(False, "--json"),
+    json_: bool = typer.Option(
+        False, "--json", help="emit a JSON array of rows on stdout"
+    ),
     retries: int = typer.Option(
         2,
         "--retries",
