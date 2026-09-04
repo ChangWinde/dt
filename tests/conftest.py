@@ -49,3 +49,44 @@ def _compatible_idle_agent_protocol(monkeypatch):
         "_active_command_dispatch_protocol",
         lambda: DISPATCH_PROTOCOL_VERSION,
     )
+
+
+@pytest.fixture
+def stub_job_refresh(monkeypatch):
+    """Stub job status refresh on a module with a one-job function.
+
+    ``dt ps`` and the agent refresh through ``refresh_statuses`` (one probe
+    per node); ``dt wait``/``logs``/``kill`` still refresh one job through
+    ``refresh_status``. Tests keep writing ``refresh(cfg, entry)`` (optionally
+    accepting ``observation=``) and this stubs both entry points consistently.
+    """
+    import inspect
+
+    def stub(module, refresh):
+        takes_observation = any(
+            name == "observation" or param.kind is inspect.Parameter.VAR_KEYWORD
+            for name, param in inspect.signature(refresh).parameters.items()
+        )
+
+        def one(cfg, entry, timeout=8, *, observation=None):
+            if takes_observation:
+                return refresh(cfg, entry, observation=observation)
+            return refresh(cfg, entry)
+
+        def many(cfg, entries, timeout=8, *, observations=None):
+            refreshed = {}
+            for entry in entries:
+                observation = (
+                    {}
+                    if observations is None
+                    else observations.setdefault(entry.job_id, {})
+                )
+                observation.update(node_unreachable=False, status_probe_error=None)
+                refreshed[entry.job_id] = one(cfg, entry, observation=observation)
+            return refreshed
+
+        if hasattr(module, "refresh_status"):
+            monkeypatch.setattr(module, "refresh_status", one)
+        monkeypatch.setattr(module, "refresh_statuses", many)
+
+    return stub

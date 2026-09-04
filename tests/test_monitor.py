@@ -1180,7 +1180,9 @@ def test_laptop_job_lookup_bad_head_json_is_lookup_failed(monkeypatch):
 
 
 def test_info_collects_running_status_artifacts_and_resources_in_parallel(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     cfg = HeadConfig(
         center="c",
@@ -1221,7 +1223,7 @@ def test_info_collects_running_status_artifacts_and_resources_in_parallel(
         return {"gpus": [{"index": 0, "util": 90}], "system": None}
 
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", refresh)
+    stub_job_refresh(cli.jobs_mod, refresh)
     monkeypatch.setattr(info_cmd, "_info_live", live)
     monkeypatch.setattr(cli, "_job_resources", resources)
     monkeypatch.setattr(cli.time, "time", lambda: 112.5)
@@ -1406,7 +1408,9 @@ def test_info_metrics_tail_uses_the_shared_telemetry_query(tmp_path, monkeypatch
     )
 
 
-def test_info_marks_persisted_node_clock_duration_as_cross_clock(tmp_path, monkeypatch):
+def test_info_marks_persisted_node_clock_duration_as_cross_clock(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -1430,7 +1434,7 @@ def test_info_marks_persisted_node_clock_duration_as_cross_clock(tmp_path, monke
     )
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", lambda _cfg, current: current)
+    stub_job_refresh(cli.jobs_mod, lambda _cfg, current: current)
     monkeypatch.setattr(
         info_cmd, "_info_live", lambda _entry, *_args: {"unreachable": True}
     )
@@ -1602,7 +1606,9 @@ def test_active_ps_and_free_scheduler_context_do_not_decode_terminal_history(
     assert context["queue_head_job_id"] == "active-queued"
 
 
-def test_ps_does_not_probe_lost_jobs_after_the_rescue_window(tmp_path, monkeypatch):
+def test_ps_does_not_probe_lost_jobs_after_the_rescue_window(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -1627,9 +1633,8 @@ def test_ps_does_not_probe_lost_jobs_after_the_rescue_window(tmp_path, monkeypat
     )
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli.time, "time", lambda: 1000.0)
-    monkeypatch.setattr(
+    stub_job_refresh(
         cli.jobs_mod,
-        "refresh_status",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("expired lost jobs must not create remote ps probes")
         ),
@@ -1700,7 +1705,9 @@ def test_ps_queued_rows_report_fifo_position_depth_and_predecessor(
 
 
 def test_ps_queued_rows_explain_static_contention_beyond_global_position(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     """The global FIFO number alone misleads: a job pinned to a busy node can
     hold position 1 while a later job pinned elsewhere could start at once.
@@ -1775,11 +1782,7 @@ def test_ps_queued_rows_explain_static_contention_beyond_global_position(
             created_at=0.5,
         ),
     )
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda _cfg, entry, **_kwargs: entry,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda _cfg, entry, **_kwargs: entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
 
     result = CliRunner().invoke(cli.app, ["ps", "--active", "--json"])
@@ -1830,7 +1833,9 @@ def test_ps_queued_rows_explain_static_contention_beyond_global_position(
     assert rows["already-running"]["queue"] is None
 
 
-def test_info_json_marks_unreachable_job_over_max_hours(tmp_path, monkeypatch):
+def test_info_json_marks_unreachable_job_over_max_hours(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -1857,7 +1862,7 @@ def test_info_json_marks_unreachable_job_over_max_hours(tmp_path, monkeypatch):
     )
     cli.jobs_mod.save(cfg, entry)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", lambda cfg_, entry_: entry_)
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_: entry_)
     monkeypatch.setattr(info_cmd, "_info_live", lambda entry_: {"unreachable": True})
     monkeypatch.setattr(
         cli, "_job_resources", lambda cfg_, entry_: {"error": "offline"}
@@ -1874,7 +1879,9 @@ def test_info_json_marks_unreachable_job_over_max_hours(tmp_path, monkeypatch):
     assert data["max_hours_overdue_s"] == 6.4
 
 
-def test_watch_snapshot_combines_status_resources_and_log_tail(tmp_path, monkeypatch):
+def test_watch_snapshot_combines_status_resources_and_log_tail(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -1898,11 +1905,7 @@ def test_watch_snapshot_combines_status_resources_and_log_tail(tmp_path, monkeyp
         status="running",
         started_at=100.0,
     )
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry_, **kwargs: entry_,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kwargs: entry_)
     monkeypatch.setattr(
         cli,
         "_job_resources",
@@ -1987,7 +1990,9 @@ def test_watch_queued_tail_reports_live_fifo_reason_and_preserves_last_probe(
 
 
 def test_watch_presents_lost_within_recovery_window_as_reconciling(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     """An unfinalized lost verdict is identity reconciliation, not a terminal."""
     cfg = HeadConfig(
@@ -2020,9 +2025,7 @@ def test_watch_presents_lost_within_recovery_window_as_reconciling(
             terminal_finalized_at=finalized,
         )
 
-    monkeypatch.setattr(
-        cli.jobs_mod, "refresh_status", lambda cfg_, entry_, **kw: entry_
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kw: entry_)
     monkeypatch.setattr(cli, "_job_resources", lambda cfg_, entry_: None)
     monkeypatch.setattr(
         cli,
@@ -2053,7 +2056,9 @@ def test_watch_presents_lost_within_recovery_window_as_reconciling(
 
 
 def test_watch_reports_selected_log_age_without_an_extra_remote_probe(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     cfg = HeadConfig(
         center="c",
@@ -2094,9 +2099,7 @@ def test_watch_reports_selected_log_age_without_an_extra_remote_probe(
             "",
         )
 
-    monkeypatch.setattr(
-        cli.jobs_mod, "refresh_status", lambda cfg_, entry_, **kw: entry_
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kw: entry_)
     monkeypatch.setattr(cli, "_job_resources", lambda cfg_, entry_: None)
     monkeypatch.setattr(cli, "run_on", fake_run_on)
     monkeypatch.setattr(cli.time, "time", lambda: 225.25)
@@ -2127,7 +2130,9 @@ def test_watch_reports_selected_log_age_without_an_extra_remote_probe(
     assert "dt_log_mtime" in command
 
 
-def test_watch_reuses_log_probe_for_live_job_cpu_ram_and_io(tmp_path, monkeypatch):
+def test_watch_reuses_log_probe_for_live_job_cpu_ram_and_io(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -2182,9 +2187,7 @@ def test_watch_reuses_log_probe_for_live_job_cpu_ram_and_io(tmp_path, monkeypatc
             "",
         )
 
-    monkeypatch.setattr(
-        cli.jobs_mod, "refresh_status", lambda cfg_, entry_, **kw: entry_
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kw: entry_)
     monkeypatch.setattr(
         cli,
         "_job_resources",
@@ -2226,7 +2229,9 @@ def test_watch_reuses_log_probe_for_live_job_cpu_ram_and_io(tmp_path, monkeypatc
     assert "resources.jsonl" in command
 
 
-def test_watch_rejects_malformed_job_resource_sample(tmp_path, monkeypatch):
+def test_watch_rejects_malformed_job_resource_sample(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -2262,9 +2267,7 @@ def test_watch_rejects_malformed_job_resource_sample(tmp_path, monkeypatch):
         },
     }
 
-    monkeypatch.setattr(
-        cli.jobs_mod, "refresh_status", lambda cfg_, entry_, **kw: entry_
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kw: entry_)
     monkeypatch.setattr(
         cli,
         "_job_resources",
@@ -2321,7 +2324,9 @@ def test_watch_rejects_malformed_job_resource_sample(tmp_path, monkeypatch):
 
 
 def test_watch_terminal_transition_drops_the_last_live_job_sample(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     cfg = HeadConfig(
         center="c",
@@ -2353,9 +2358,7 @@ def test_watch_terminal_transition_drops_the_last_live_job_sample(
         "job": {"processes": 2, "threads": 2, "cpu_pct": 99.0, "rss_mib": 512},
     }
 
-    monkeypatch.setattr(
-        cli.jobs_mod, "refresh_status", lambda cfg_, entry_, **kw: finished
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kw: finished)
     monkeypatch.setattr(cli, "_job_resources", lambda cfg_, entry_: None)
     monkeypatch.setattr(cli, "_job_resource_summary", lambda entry_: None)
     monkeypatch.setattr(
@@ -2383,7 +2386,9 @@ def test_watch_terminal_transition_drops_the_last_live_job_sample(
 
 
 def test_watch_terminal_transition_includes_persisted_resource_summary(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     cfg = HeadConfig(
         center="c",
@@ -2440,7 +2445,7 @@ def test_watch_terminal_transition_includes_persisted_resource_summary(
         entry_.finished_at = 102.0
         return entry_
 
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", refresh)
+    stub_job_refresh(cli.jobs_mod, refresh)
     monkeypatch.setattr(
         cli,
         "_job_resources",
@@ -2543,7 +2548,9 @@ def test_watch_finished_without_telemetry_keeps_null_summary(tmp_path, monkeypat
     assert snapshot["resource_summary"] is None
 
 
-def test_watch_snapshot_collects_remote_reads_in_parallel(tmp_path, monkeypatch):
+def test_watch_snapshot_collects_remote_reads_in_parallel(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -2586,7 +2593,7 @@ def test_watch_snapshot_collects_remote_reads_in_parallel(tmp_path, monkeypatch)
             "step 7\n",
         )
 
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", refresh)
+    stub_job_refresh(cli.jobs_mod, refresh)
     monkeypatch.setattr(cli, "_job_resources", resources)
     monkeypatch.setattr(cli, "_read_job_log_tail", log_tail)
     monkeypatch.setattr(cli.time, "time", lambda: 112.5)
@@ -2598,7 +2605,9 @@ def test_watch_snapshot_collects_remote_reads_in_parallel(tmp_path, monkeypatch)
     assert snapshot["progress"] == {"step": 7}
 
 
-def test_watch_snapshot_surfaces_remote_log_probe_failure(tmp_path, monkeypatch):
+def test_watch_snapshot_surfaces_remote_log_probe_failure(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -2631,7 +2640,7 @@ def test_watch_snapshot_surfaces_remote_log_probe_failure(tmp_path, monkeypatch)
         )
         return entry_
 
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", refresh)
+    stub_job_refresh(cli.jobs_mod, refresh)
     monkeypatch.setattr(
         cli,
         "_job_resources",
@@ -2668,7 +2677,9 @@ def test_watch_snapshot_surfaces_remote_log_probe_failure(tmp_path, monkeypatch)
     assert "overdue by 6s" in rendered
 
 
-def test_watch_snapshot_surfaces_active_nested_log(tmp_path, monkeypatch):
+def test_watch_snapshot_surfaces_active_nested_log(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -2691,11 +2702,7 @@ def test_watch_snapshot_surfaces_active_nested_log(tmp_path, monkeypatch):
         status="running",
         started_at=100.0,
     )
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry_, **kwargs: entry_,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kwargs: entry_)
     monkeypatch.setattr(cli, "_job_resources", lambda cfg_, entry_: None)
     monkeypatch.setattr(
         cli,
@@ -3751,7 +3758,9 @@ def test_wait_reports_unreachable_referenced_failure_log(tmp_path, monkeypatch):
     assert "connection timed out" in result.output
 
 
-def test_wait_reports_link_loss_once_and_recovery_once(tmp_path, monkeypatch):
+def test_wait_reports_link_loss_once_and_recovery_once(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -3797,7 +3806,7 @@ def test_wait_reports_link_loss_once_and_recovery_once(tmp_path, monkeypatch):
         entry_.exit_code = 0
         return entry_
 
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", refresh)
+    stub_job_refresh(cli.jobs_mod, refresh)
 
     result = CliRunner().invoke(
         cli.app,
@@ -3811,7 +3820,9 @@ def test_wait_reports_link_loss_once_and_recovery_once(tmp_path, monkeypatch):
 
 
 def test_wait_reports_overdue_guard_once_when_node_is_unreachable(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     cfg = HeadConfig(
         center="c",
@@ -3858,7 +3869,7 @@ def test_wait_reports_overdue_guard_once_when_node_is_unreachable(
         entry_.exit_code = 0
         return entry_
 
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", refresh)
+    stub_job_refresh(cli.jobs_mod, refresh)
 
     result = CliRunner().invoke(
         cli.app,
@@ -3872,7 +3883,9 @@ def test_wait_reports_overdue_guard_once_when_node_is_unreachable(
 
 
 def test_wait_does_not_confirm_lost_from_unreachable_cached_state(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     cfg = HeadConfig(
         center="c",
@@ -3920,7 +3933,7 @@ def test_wait_does_not_confirm_lost_from_unreachable_cached_state(
         entry_.exit_code = 0
         return entry_
 
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", refresh)
+    stub_job_refresh(cli.jobs_mod, refresh)
 
     result = CliRunner().invoke(
         cli.app,
@@ -4807,7 +4820,9 @@ def test_wait_reports_uncertain_launch_without_claiming_it_never_started(
     assert "dt kill uncertain -y" in " ".join(result.output.split())
 
 
-def test_wait_surfaces_queued_reason_without_probe_detail_spam(tmp_path, monkeypatch):
+def test_wait_surfaces_queued_reason_without_probe_detail_spam(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -4856,7 +4871,7 @@ def test_wait_surfaces_queued_reason_without_probe_detail_spam(tmp_path, monkeyp
 
     monkeypatch.setattr(cli.jobs_mod, "load", load_entry)
     monkeypatch.setattr(cli.jobs_mod, "find", lambda cfg_, ref: entry)
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", refresh)
+    stub_job_refresh(cli.jobs_mod, refresh)
 
     result = CliRunner().invoke(
         cli.app,
@@ -4871,7 +4886,9 @@ def test_wait_surfaces_queued_reason_without_probe_detail_spam(tmp_path, monkeyp
     assert "started on n1" in result.output
 
 
-def test_wait_queue_edges_keep_actions_intact_with_long_job_id(tmp_path, monkeypatch):
+def test_wait_queue_edges_keep_actions_intact_with_long_job_id(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -4904,11 +4921,7 @@ def test_wait_queue_edges_keep_actions_intact_with_long_job_id(tmp_path, monkeyp
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli.jobs_mod, "find", lambda cfg_, ref: queued)
     monkeypatch.setattr(cli.jobs_mod, "load", lambda cfg_, job_id_: running)
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry_, observation=None: finished,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, observation=None: finished)
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
 
     result = CliRunner().invoke(
@@ -5765,7 +5778,9 @@ def test_watch_completion_wake_interrupts_long_refresh_interval(tmp_path, monkey
     assert closed == [True]
 
 
-def test_wait_completion_wake_interrupts_long_poll(tmp_path, monkeypatch):
+def test_wait_completion_wake_interrupts_long_poll(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -5800,11 +5815,7 @@ def test_wait_completion_wake_interrupts_long_poll(tmp_path, monkeypatch):
         def close(self):
             closed.append(True)
 
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda *args, **kwargs: next(refreshes),
-    )
+    stub_job_refresh(cli.jobs_mod, lambda *args, **kwargs: next(refreshes))
     monkeypatch.setattr(cli, "CompletionSignals", FakeSignals)
 
     result = wait_cmd._wait_until_terminal(
@@ -6151,7 +6162,9 @@ def test_ps_watch_json_applies_limit_on_every_refresh(tmp_path, monkeypatch):
     assert limits == [1, 1]
 
 
-def test_ps_progress_enrichment_uses_active_nested_log(tmp_path, monkeypatch):
+def test_ps_progress_enrichment_uses_active_nested_log(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -6175,11 +6188,7 @@ def test_ps_progress_enrichment_uses_active_nested_log(tmp_path, monkeypatch):
         status="running",
     )
     cli.jobs_mod.save(cfg, entry)
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry_, **kwargs: entry_,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kwargs: entry_)
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
@@ -6205,7 +6214,9 @@ def test_ps_progress_enrichment_uses_active_nested_log(tmp_path, monkeypatch):
     assert rows[0]["progress_error"] is None
 
 
-def test_ps_progress_treats_not_yet_created_log_as_loading(tmp_path, monkeypatch):
+def test_ps_progress_treats_not_yet_created_log_as_loading(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -6228,11 +6239,7 @@ def test_ps_progress_treats_not_yet_created_log_as_loading(tmp_path, monkeypatch
         status="running",
     )
     cli.jobs_mod.save(cfg, entry)
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry_, **kwargs: entry_,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kwargs: entry_)
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
@@ -6256,7 +6263,9 @@ def test_ps_progress_treats_not_yet_created_log_as_loading(tmp_path, monkeypatch
 
 
 def test_ps_live_resources_probe_each_node_once_and_filter_assigned_gpus(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     cfg = HeadConfig(
         center="c",
@@ -6285,11 +6294,7 @@ def test_ps_live_resources_probe_each_node_once_and_filter_assigned_gpus(
     ]
     for entry in entries:
         cli.jobs_mod.save(cfg, entry)
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry_, **kwargs: entry_,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kwargs: entry_)
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
@@ -6338,7 +6343,9 @@ def test_ps_live_resources_probe_each_node_once_and_filter_assigned_gpus(
 
 
 def test_ps_progress_collects_status_resources_and_logs_in_one_parallel_wave(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     cfg = HeadConfig(
         center="c",
@@ -6393,7 +6400,7 @@ def test_ps_progress_collects_status_resources_and_logs_in_one_parallel_wave(
             "step 5\n",
         )
 
-    monkeypatch.setattr(cli.jobs_mod, "refresh_status", refresh)
+    stub_job_refresh(cli.jobs_mod, refresh)
     monkeypatch.setattr(cli, "probe_node", probe)
     monkeypatch.setattr(cli, "_read_job_log_tail", log_tail)
 
@@ -6403,7 +6410,9 @@ def test_ps_progress_collects_status_resources_and_logs_in_one_parallel_wave(
     assert rows[0]["progress"] == {"step": 5}
 
 
-def test_ps_progress_cpu_task_includes_node_host_resources(tmp_path, monkeypatch):
+def test_ps_progress_cpu_task_includes_node_host_resources(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -6428,11 +6437,7 @@ def test_ps_progress_cpu_task_includes_node_host_resources(tmp_path, monkeypatch
         gpus_requested=0,
     )
     cli.jobs_mod.save(cfg, entry)
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry_, **kwargs: entry_,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry_, **kwargs: entry_)
     monkeypatch.setattr(
         cli,
         "_read_job_log_tail",
@@ -6872,7 +6877,9 @@ def test_laptop_ps_limit_is_applied_by_each_head_and_globally(monkeypatch):
     assert seen == [["ps", "--with-progress", "--limit", "2"]]
 
 
-def test_ps_window_json_keeps_active_and_reports_full_count(tmp_path, monkeypatch):
+def test_ps_window_json_keeps_active_and_reports_full_count(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -6914,11 +6921,7 @@ def test_ps_window_json_keeps_active_and_reports_full_count(tmp_path, monkeypatc
             ),
         )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry, observation=None: entry,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry, observation=None: entry)
 
     result = CliRunner().invoke(
         cli.app,
@@ -6951,6 +6954,7 @@ def test_ps_window_json_keeps_active_and_reports_full_count(tmp_path, monkeypatc
 def test_ps_window_without_negotiation_stays_v1_for_old_laptops(
     tmp_path,
     monkeypatch,
+    stub_job_refresh,
 ):
     cfg = HeadConfig(
         center="c",
@@ -6996,11 +7000,7 @@ def test_ps_window_without_negotiation_stays_v1_for_old_laptops(
             ),
         )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry, observation=None: entry,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry, observation=None: entry)
 
     result = CliRunner().invoke(cli.app, ["ps", "--window", "--json"])
 
@@ -7317,7 +7317,9 @@ def test_laptop_human_ps_uses_window_but_all_and_json_do_not(monkeypatch):
     assert calls == [True, False, False]
 
 
-def test_ps_active_json_returns_only_queued_and_running(tmp_path, monkeypatch):
+def test_ps_active_json_returns_only_queued_and_running(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -7343,11 +7345,7 @@ def test_ps_active_json_returns_only_queued_and_running(tmp_path, monkeypatch):
             ),
         )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry, observation=None: entry,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry, observation=None: entry)
 
     result = CliRunner().invoke(cli.app, ["ps", "--active", "--json"])
 
@@ -7357,7 +7355,9 @@ def test_ps_active_json_returns_only_queued_and_running(tmp_path, monkeypatch):
     assert {row["job_id"] for row in rows} == {"job-queued", "job-running"}
 
 
-def test_ps_human_defaults_to_active_and_history_is_explicit(tmp_path, monkeypatch):
+def test_ps_human_defaults_to_active_and_history_is_explicit(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = HeadConfig(
         center="c",
         nodes=[Node(name="n1")],
@@ -7385,11 +7385,7 @@ def test_ps_human_defaults_to_active_and_history_is_explicit(tmp_path, monkeypat
             ),
         )
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    monkeypatch.setattr(
-        cli.jobs_mod,
-        "refresh_status",
-        lambda cfg_, entry, observation=None: entry,
-    )
+    stub_job_refresh(cli.jobs_mod, lambda cfg_, entry, observation=None: entry)
 
     current = CliRunner().invoke(cli.app, ["ps"])
     recent = CliRunner().invoke(cli.app, ["ps", "--recent"])
@@ -8615,7 +8611,9 @@ def test_logs_follow_queue_failure_returns_stable_prestart_code(tmp_path, monkey
 
 
 def test_logs_follow_running_job_uses_wrapper_pid_and_returns_job_exit(
-    tmp_path, monkeypatch
+    tmp_path,
+    monkeypatch,
+    stub_job_refresh,
 ):
     cfg = HeadConfig(
         center="c",
@@ -8658,9 +8656,8 @@ def test_logs_follow_running_job_uses_wrapper_pid_and_returns_job_exit(
             commands.append(command) or subprocess.CompletedProcess([], 0, "", "")
         ),
     )
-    monkeypatch.setattr(
+    stub_job_refresh(
         cli.jobs_mod,
-        "refresh_status",
         lambda cfg_, entry_: replace(entry_, status="finished", exit_code=7),
     )
 
