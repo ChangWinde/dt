@@ -46,8 +46,8 @@ from .. import (
     _wait_interrupted,
     _watch_interrupted,
 )
-from .wait import wait
-from .watch import watch
+from .wait import run_wait
+from .watch import run_watch
 from ...dispatch import artifact_manifest_identity
 from ... import dispatch as dispatch_mod
 from ... import remote as remote_mod
@@ -1117,12 +1117,15 @@ def _follow_submitted_job(
     json_: bool,
 ) -> None:
     """Use the shared interactive view and stable terminal exit contract."""
-    # ``_job_refs`` preserves direct-string compatibility even though Typer's
-    # public annotation models repeated positional arguments as a list.
-    direct_ref = cast(list[str], job_id)
-    completed = watch(direct_ref, poll, lines, json_, True)
+    completed = run_watch([job_id], poll=poll, lines=lines, json_=json_)
     if completed:
-        wait(direct_ref, poll, lines, json_, True, True, timeout=None)
+        run_wait(
+            [job_id],
+            poll=poll,
+            error_lines=lines,
+            json_=json_,
+            primary_log_shown=True,
+        )
     else:
         _print_monitor_stopped(job_id)
 

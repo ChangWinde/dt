@@ -355,12 +355,14 @@ General command codes:
 | 3 | Remote environment or setup failure |
 | 4 | Requested local object or path not found |
 | 5 | Required host or center unreachable |
-| 126 | `dt wait --timeout` elapsed; the job is still active and was not cancelled |
+| 126 | `dt wait`/`dt watch --timeout` elapsed; the jobs are still active and were not cancelled |
 | 130 | Local interruption; registered remote jobs continue unless explicitly killed |
 
 `dt wait` reserves 65 through 69 for terminal job states, while 0 through 125
 otherwise carry the experiment result; `--timeout SECONDS` returns 126 with the
-job's current state and a resume command when the bound elapses. The reservation is enforced: an
+job's current state and a resume command when the bound elapses. `dt watch
+--timeout SECONDS` stops the stream the same way: the last frame already shown
+is the state, and the exit code is 126. The reservation is enforced: an
 experiment process that itself exits 65 through 69 is reported as 64 (just as
 codes above 125 clamp to 125), and `--json` always carries the untruncated
 `exit_code`. See [Operations](operations.md) for the mapping.

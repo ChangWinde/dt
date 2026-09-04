@@ -801,21 +801,23 @@ def test_task_follow_enters_watch_and_preserves_job_exit_code(tmp_path, monkeypa
     )
     monkeypatch.setattr(
         run_cmd,
-        "watch",
-        lambda ref, poll, lines, json_, completion_wake: (
-            watched.append((ref, poll, lines, json_, completion_wake)) or True
+        "run_watch",
+        lambda refs, *, poll, lines, json_, completion_wake=True, **_kw: (
+            watched.append((refs[0], poll, lines, json_, completion_wake)) or True
         ),
     )
 
     def fake_wait(
-        ref,
+        refs,
+        *,
         poll,
         error_lines,
         json_,
-        primary_log_shown,
-        completion_wake,
-        timeout=None,
+        primary_log_shown=False,
+        completion_wake=True,
+        **_kw,
     ):
+        ref = refs[0]
         waited.append(
             (
                 ref,
@@ -828,7 +830,7 @@ def test_task_follow_enters_watch_and_preserves_job_exit_code(tmp_path, monkeypa
         )
         raise typer.Exit(7)
 
-    monkeypatch.setattr(run_cmd, "wait", fake_wait)
+    monkeypatch.setattr(run_cmd, "run_wait", fake_wait)
 
     result = CliRunner().invoke(
         cli.app,
@@ -869,21 +871,23 @@ def test_run_follow_uses_the_same_terminal_contract_as_task(tmp_path, monkeypatc
     )
     monkeypatch.setattr(
         run_cmd,
-        "watch",
-        lambda ref, poll, lines, json_, completion_wake: (
-            watched.append((ref, poll, lines, json_, completion_wake)) or True
+        "run_watch",
+        lambda refs, *, poll, lines, json_, completion_wake=True, **_kw: (
+            watched.append((refs[0], poll, lines, json_, completion_wake)) or True
         ),
     )
 
     def fake_wait(
-        ref,
+        refs,
+        *,
         poll,
         error_lines,
         json_,
-        primary_log_shown,
-        completion_wake,
-        timeout=None,
+        primary_log_shown=False,
+        completion_wake=True,
+        **_kw,
     ):
+        ref = refs[0]
         waited.append(
             (
                 ref,
@@ -896,7 +900,7 @@ def test_run_follow_uses_the_same_terminal_contract_as_task(tmp_path, monkeypatc
         )
         raise typer.Exit(7)
 
-    monkeypatch.setattr(run_cmd, "wait", fake_wait)
+    monkeypatch.setattr(run_cmd, "run_wait", fake_wait)
 
     result = CliRunner().invoke(
         cli.app,
@@ -1021,20 +1025,23 @@ def test_task_follow_json_streams_submission_watch_and_terminal_result(
         lambda cfg_, spec, cwd, log, no_queue=False: _entry(spec),
     )
 
-    def fake_watch(ref, poll, lines, json_, completion_wake):
+    def fake_watch(refs, *, poll, lines, json_, completion_wake=True, **_kw):
+        ref = refs[0]
         watched.append((ref, poll, lines, json_, completion_wake))
         print(json.dumps({"job_id": ref, "status": "running"}))
         return True
 
     def fake_wait(
-        ref,
+        refs,
+        *,
         poll,
         error_lines,
         json_,
-        primary_log_shown,
-        completion_wake,
-        timeout=None,
+        primary_log_shown=False,
+        completion_wake=True,
+        **_kw,
     ):
+        ref = refs[0]
         waited.append(
             (
                 ref,
@@ -1048,8 +1055,8 @@ def test_task_follow_json_streams_submission_watch_and_terminal_result(
         print(json.dumps({"job_id": ref, "status": "finished", "exit_code": 7}))
         raise typer.Exit(7)
 
-    monkeypatch.setattr(run_cmd, "watch", fake_watch)
-    monkeypatch.setattr(run_cmd, "wait", fake_wait)
+    monkeypatch.setattr(run_cmd, "run_watch", fake_watch)
+    monkeypatch.setattr(run_cmd, "run_wait", fake_wait)
 
     result = CliRunner().invoke(
         cli.app,
@@ -1086,12 +1093,12 @@ def test_task_follow_does_not_repeat_primary_failure_but_keeps_referenced_log(
         lambda cfg_, spec, no_queue, json_, claimed_action=None: (entry, None),
     )
 
-    def watched(ref, poll, lines, json_, completion_wake):
+    def watched(refs, *, poll, lines, json_, completion_wake=True, **_kw):
         assert completion_wake is True
         cli.err.print(primary)
         return True
 
-    monkeypatch.setattr(run_cmd, "watch", watched)
+    monkeypatch.setattr(run_cmd, "run_watch", watched)
     responses = iter(
         [
             subprocess.CompletedProcess([], 0, f"{primary}\n", ""),
@@ -1124,13 +1131,13 @@ def test_task_follow_ctrl_c_explains_detach_and_recovery_commands(
     )
     monkeypatch.setattr(
         run_cmd,
-        "watch",
-        lambda ref, poll, lines, json_, completion_wake: False,
+        "run_watch",
+        lambda refs, *, poll, lines, json_, completion_wake=True, **_kw: False,
     )
     monkeypatch.setattr(
         run_cmd,
-        "wait",
-        lambda *args: waited.append(args),
+        "run_wait",
+        lambda *args, **kwargs: waited.append(args),
     )
 
     result = CliRunner().invoke(

@@ -34,6 +34,7 @@ from .. import (
     _resource_summary_rows,
     _watch_interrupted,
 )
+from ...render import err
 
 
 def _format_log_progress(progress: JsonDict) -> str:
@@ -612,6 +613,13 @@ def _watch_group_view(payload: JsonDict) -> Any:
     return Group(table, *panels)
 
 
+WATCH_DEADLINE_EXIT = 126  # shared with `dt wait --timeout`
+
+
+class _WatchDeadline(RuntimeError):
+    """``--timeout`` elapsed while a watched job was still active."""
+
+
 def watch(
     refs: Optional[list[str]] = REFS_OPTIONAL_ARG,
     poll: float = typer.Option(2.0, "--poll", help="seconds between refreshes"),
@@ -639,15 +647,45 @@ def watch(
             "(--compact remains an alias)"
         ),
     ),
+    timeout: Optional[float] = typer.Option(
+        None,
+        "--timeout",
+        help=(
+            "stop watching after this many seconds and exit 126 with the last "
+            "frame already shown; the jobs keep running"
+        ),
+    ),
 ) -> bool:
     """Monitor jobs until terminal; link loss auto-reconnects.
 
     With --json, Ctrl-C appends one watch_interrupted frame with exact resume
-    and stop commands, exits 130, and never cancels a remote job.
+    and stop commands, exits 130, and never cancels a remote job. --timeout
+    bounds the watch the same way for automated callers (exit 126).
     """
-    if not isinstance(compact, bool):
-        # Typer option metadata is the default during direct Python calls.
-        compact = False
+    return run_watch(
+        refs,
+        poll=poll,
+        lines=lines,
+        json_=json_,
+        completion_wake=completion_wake,
+        file=file,
+        compact=compact,
+        timeout=timeout,
+    )
+
+
+def run_watch(
+    refs: list[str] | str | None,
+    *,
+    poll: float,
+    lines: int,
+    json_: bool,
+    completion_wake: bool = True,
+    file: Path | None = None,
+    compact: bool = False,
+    timeout: float | None = None,
+) -> bool:
+    """`dt watch` with plain Python parameters; ``run --follow`` calls this."""
     if compact and not json_:
         _fail_submission(
             kind="invalid_argument",
@@ -660,6 +698,13 @@ def watch(
         _fail_submission(
             kind="invalid_argument",
             message="--poll and --lines must be positive",
+            exit_code=1,
+            json_=json_,
+        )
+    if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+        _fail_submission(
+            kind="invalid_argument",
+            message="--timeout must be positive",
             exit_code=1,
             json_=json_,
         )
@@ -686,6 +731,7 @@ def watch(
             .flag("--json", json_)
             .flag("--compact", compact)
             .flag("--no-completion-wake", not completion_wake)
+            .option("--timeout", timeout)
         )
         argv = route.argv()
         rc = _root._forward_monitor_with_reconnect(
@@ -735,11 +781,21 @@ def watch(
     terminal = {"finished", "killed", "lost", "failed", "skipped"}
     completion_signals = _root.CompletionSignals() if completion_wake else None
 
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
     def pause(current: list[jobs_mod.JobEntry]) -> None:
+        seconds = poll
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _WatchDeadline
+            seconds = min(seconds, remaining)
         if completion_signals is None:
-            time.sleep(poll)
+            time.sleep(seconds)
         else:
-            completion_signals.wait(current, poll)
+            completion_signals.wait(current, seconds)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _WatchDeadline
 
     try:
         if len(entries) > 1:
@@ -804,6 +860,14 @@ def watch(
             if not _root.out.is_terminal:
                 _root.out.print()
             return True
+    except _WatchDeadline:
+        assert timeout is not None
+        if not json_:
+            err.print(
+                f"[yellow]watch timeout of {timeout:g}s reached; jobs keep "
+                "running and were not cancelled[/yellow]"
+            )
+        raise typer.Exit(WATCH_DEADLINE_EXIT)
     except KeyboardInterrupt:
         if json_:
             _watch_interrupted(

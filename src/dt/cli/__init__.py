@@ -437,7 +437,8 @@ def _job_refs(
     if isinstance(file, str):
         file = Path(file)
     elif file is not None and not isinstance(file, Path):
-        # Typer option metadata is the default during direct Python calls.
+        # Tests call command functions directly, where an omitted option
+        # arrives as Typer's OptionInfo metadata rather than its default.
         file = None
     refs = [direct] if isinstance(direct, str) else list(direct or [])
     if refs and file is not None:

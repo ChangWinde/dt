@@ -12,7 +12,9 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   the command reports the job's current state and an exact resume command,
   exits 126 (a code no experiment result can produce), and leaves the job
   running; `--json` carries `wait_deadline_reached`, `wait_timeout_s`, and
-  `resume`. Multi-job waits apply the same deadline to every job.
+  `resume`. Multi-job waits apply the same deadline to every job. `dt watch
+  --timeout SECONDS` bounds a frame stream the same way (exit 126 after the
+  last frame shown).
 - `dt contract --json`: one `dt_contract_v1` document describing every visible
   command with its arguments, options (flags, type, default, repeat), `--json`
   support with the top-level shape and the schema ids it emits, destructive
@@ -23,6 +25,11 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Changed
 
+- `run --follow` calls the plain `run_watch` / `run_wait` implementations
+  instead of the Typer command functions, so adding an option to `wait` or
+  `watch` can no longer break the follow path; the forwarding-drift guard reads
+  those implementations. The test suite pins `umask 022` so mode assertions do
+  not depend on the developer's shell.
 - Every failure a command reports under `--json` before it can produce its own
   payload is now one `dt_cli_error_v1` document with the same five keys
   (`schema_version`, `error`, `message`, `exit_code`, `reasons`). Submission

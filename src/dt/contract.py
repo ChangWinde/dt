@@ -26,7 +26,10 @@ EXIT_CODE_MEANINGS: tuple[tuple[int, str], ...] = (
     (3, "Remote environment or setup failure"),
     (4, "Requested local object or path not found"),
     (5, "Required host or center unreachable"),
-    (126, "`dt wait --timeout` elapsed; the job is still active and was not cancelled"),
+    (
+        126,
+        "`dt wait`/`dt watch --timeout` elapsed; the jobs are still active and were not cancelled",
+    ),
     (
         130,
         "Local interruption; registered remote jobs continue unless explicitly killed",
