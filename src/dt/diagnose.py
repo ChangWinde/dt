@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, TypeVar
 
 from .sshio import RemoteError
+from . import agent
+from . import jobs
+from . import operation_log
+from . import submission_intent
+from .jobs import effective_result_state, is_uncertain_launch
+from .monitoring import ResourceTelemetryQuery
 
 if TYPE_CHECKING:
     from .config import HeadConfig
@@ -648,7 +654,6 @@ def _job_evidence(
 
 
 def _request_evidence(cfg: "HeadConfig", entry: "JobEntry") -> EvidenceSection:
-    from . import submission_intent
 
     if entry.request_id is None:
         return section(
@@ -688,7 +693,6 @@ def _request_evidence(cfg: "HeadConfig", entry: "JobEntry") -> EvidenceSection:
 
 
 def _operation_evidence(cfg: "HeadConfig", entry: "JobEntry") -> EvidenceSection:
-    from . import operation_log
 
     try:
         evidence = operation_log.query(
@@ -718,7 +722,6 @@ def _operation_evidence(cfg: "HeadConfig", entry: "JobEntry") -> EvidenceSection
 
 
 def _agent_evidence(cfg: "HeadConfig") -> EvidenceSection:
-    from . import agent
 
     try:
         status = agent.status(cfg)
@@ -761,7 +764,6 @@ def _agent_evidence(cfg: "HeadConfig") -> EvidenceSection:
 
 
 def _queue_evidence(cfg: "HeadConfig", entry: "JobEntry") -> EvidenceSection:
-    from . import jobs
 
     damage: list[jobs.RegistryDamage] = []
     try:
@@ -866,7 +868,6 @@ def _log_evidence(entry: "JobEntry", log_reader: LogReader) -> EvidenceSection:
 def _telemetry_evidence(
     entry: "JobEntry", runner: Callable[..., subprocess.CompletedProcess[str]]
 ) -> EvidenceSection:
-    from .monitoring import ResourceTelemetryQuery
 
     query = ResourceTelemetryQuery(entry, TELEMETRY_TAIL)
     try:
@@ -944,7 +945,6 @@ def _transfer_evidence(cfg: "HeadConfig", entry: "JobEntry") -> EvidenceSection:
 
 
 def _result_evidence(entry: "JobEntry") -> EvidenceSection:
-    from .jobs import effective_result_state, is_uncertain_launch
 
     return section(
         {
@@ -962,7 +962,6 @@ def _result_evidence(entry: "JobEntry") -> EvidenceSection:
 def _inferences(
     entry: "JobEntry", sections: Mapping[str, EvidenceSection]
 ) -> list[dict[str, object]]:
-    from .jobs import effective_result_state
 
     inferred: list[dict[str, object]] = []
     if not all(value.complete for value in sections.values()):
@@ -1020,7 +1019,6 @@ def _inferences(
 
 
 def _actions(entry: "JobEntry") -> list[dict[str, JsonValue]]:
-    from .jobs import effective_result_state, is_uncertain_launch
 
     job_id = entry.job_id
     values: list[dict[str, JsonValue]] = [
@@ -1106,8 +1104,6 @@ def collect(
     receives :data:`REMOTE_READ_TIMEOUT_S`; log and telemetry commands also
     cap their remote stdout before SSH can return it.
     """
-    from . import jobs
-    from .jobs import effective_result_state
 
     lifecycle_observation: dict[str, object] = {
         "attempted": False,

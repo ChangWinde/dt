@@ -257,6 +257,7 @@ def _valid_job_id(value: object) -> bool:
     """
     if not isinstance(value, str):
         return False
+    # Lazy import avoids the module cycle: jobs records operation events.
     from .jobs import JOB_ID_RE, MAX_JOB_ID_LENGTH
 
     return len(value) <= MAX_JOB_ID_LENGTH and JOB_ID_RE.fullmatch(value) is not None

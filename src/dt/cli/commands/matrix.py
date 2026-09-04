@@ -43,6 +43,8 @@ from .. import (
     _typed_cli_decorator,
     _validate_submission_request_id,
 )
+from ...dispatch import artifact_manifest_identity
+from ... import dispatch as dispatch_mod
 
 matrix_app = typer.Typer(
     no_args_is_help=True,
@@ -338,9 +340,9 @@ def _matrix_run_head(
         if artifact_node is None:
             raise AssertionError("matrix artifacts require a pinned node")
         try:
-            from ...dispatch import artifact_manifest_identity, resolve_project
-
-            project, project_cfg = resolve_project(cfg, project, Path.cwd())
+            project, project_cfg = dispatch_mod.resolve_project(
+                cfg, project, Path.cwd()
+            )
             outcome.project = project
             artifact_manifest = artifact_manifest_identity(
                 project,

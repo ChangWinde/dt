@@ -40,6 +40,7 @@ from . import (
     waiting_capacity_reason,
     waiting_unreachable_reason,
 )
+from ..scheduler import admission_decision
 
 
 def _preview_snapshot_bytes(cfg: HeadConfig, project_dir: Path) -> int:
@@ -252,8 +253,6 @@ def preview_submission(
     reasons: dict[str, str] = {}
     candidates: list[Node] = []
     statuses: list[NodeStatus] = []
-
-    from ..scheduler import admission_decision
 
     hypothetical = JobEntry(
         job_id="__preview__",

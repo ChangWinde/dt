@@ -81,6 +81,10 @@ from .private_state import (
     read_bounded,
     read_bounded_regular,
 )
+from .layout import ROLE_LAYOUT
+from .scheduler import scheduler_snapshot
+from . import compact as compact_mod
+from . import config as config_mod
 
 _completion_watch_command = completion_mod.completion_watch_command
 _spawn_completion_watcher = completion_mod.spawn_completion_watcher
@@ -117,7 +121,6 @@ def _runtime_identity(cfg: HeadConfig) -> tuple[str, str, str]:
 
 def _agent_state_dir(cfg: HeadConfig) -> Path:
     """agent_dir() without its mkdir side effect, for read-only probes."""
-    from .layout import ROLE_LAYOUT
 
     return cfg.head_root / "state" / "agent" if cfg.layout == ROLE_LAYOUT else cfg.root
 
@@ -631,7 +634,6 @@ def legacy_agent_lock_blocks_role_layout(cfg: HeadConfig) -> bool:
     are harmless migration residue; an unsafe/unreadable file is unprovable
     and therefore blocks mutation.
     """
-    from .layout import ROLE_LAYOUT
 
     if cfg.layout != ROLE_LAYOUT:
         return False
@@ -1273,11 +1275,10 @@ def _maybe_autocompact(cfg: HeadConfig, log: Callable[[str], None]) -> None:
     except PrivateStateError as exc:
         log(f"auto-compact skipped: sweep state unavailable ({type(exc).__name__})")
         return
-    from .compact import compact_jobs
 
     started = time.monotonic()
     cutoff = time.time() - hours * 3600
-    report = compact_jobs(
+    report = compact_mod.compact_jobs(
         cfg,
         cutoff,
         before=f"terminal>{hours:g}h",
@@ -1608,10 +1609,8 @@ def run_loop(cfg: HeadConfig) -> int:
             tick_failure: Exception | None = None
             try:
                 # reload config every tick so knob edits apply within a poll
-                from .config import HeadConfig as _HC, load as _load
-
-                fresh = _load()
-                if not isinstance(fresh, _HC):
+                fresh = config_mod.load()
+                if not isinstance(fresh, HeadConfig):
                     log(
                         "agent configuration no longer has the head role; "
                         "exiting instead of running against stale state"
@@ -2321,7 +2320,6 @@ def status(cfg: HeadConfig) -> dict[str, object]:
     except OSError:
         log_bytes = 0
     health = heartbeat_health(cfg, alive=pid is not None)
-    from .scheduler import scheduler_snapshot
 
     scheduler = scheduler_snapshot(
         cfg,

@@ -28,6 +28,7 @@ from ...topology_discovery import (
     TopologyDiscoveryError,
 )
 from .. import JsonDict, _fail_submission, _need_head
+from ...topology import TopologyRegistry
 
 
 def _topology_edge_sample(
@@ -332,8 +333,6 @@ def topology(
             exit_code=1,
             json_=json_,
         )
-
-    from ...topology import TopologyRegistry
 
     discovery = TopologyDiscovery(cfg, TopologyRegistry(cfg))
 

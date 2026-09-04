@@ -1581,7 +1581,7 @@ from .artifacts import (  # noqa: E402
     _is_common_artifact_transient as _is_common_artifact_transient,
     _private_remote_directories as _private_remote_directories,
     _publish_verified_artifact_manifest as _publish_verified_artifact_manifest,
-    _seed_cache_lock as _seed_cache_lock,
+    seed_cache_lock as seed_cache_lock,
     _sync_cache_lock as _sync_cache_lock,
     _sync_one_artifact as _sync_one_artifact,
     _sync_project_locked as _sync_project_locked,

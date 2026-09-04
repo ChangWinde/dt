@@ -51,6 +51,7 @@ from .sshio import (
     run_on,
 )
 from .topology import ArtifactSource, SourceKind, TopologyRegistry
+from . import sshio as sshio_mod
 
 _HOST_KEY_TYPE_RE = re.compile(r"^(?:ssh|ecdsa|sk)-[A-Za-z0-9@._+-]+$")
 _HOST_KEY_DATA_RE = re.compile(r"^[A-Za-z0-9+/]+={0,3}$")
@@ -542,7 +543,6 @@ def measure_control_route(
     pushes and cold cache uploads actually pay. The result feeds the same
     link-metrics store under the ``control`` scope.
     """
-    from .sshio import ssh_cmd
 
     if node.local:
         raise TopologyDiscoveryError(
@@ -550,8 +550,8 @@ def measure_control_route(
             "network to measure"
         )
     run = runner or subprocess.run
-    warmup_argv = ssh_cmd(node.name, "true", workload=SSHWorkload.ARTIFACT)
-    argv = ssh_cmd(node.name, "cat >/dev/null", workload=SSHWorkload.ARTIFACT)
+    warmup_argv = sshio_mod.ssh_cmd(node.name, "true", workload=SSHWorkload.ARTIFACT)
+    argv = sshio_mod.ssh_cmd(node.name, "cat >/dev/null", workload=SSHWorkload.ARTIFACT)
     try:
         warmup = run(
             warmup_argv,

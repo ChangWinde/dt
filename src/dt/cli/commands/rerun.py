@@ -24,6 +24,7 @@ from .. import (
     _submission_payload,
     _validate_submission_request_id,
 )
+from ...dispatch import spec_from_entry
 
 
 def rerun(
@@ -75,8 +76,6 @@ def rerun(
             request_id=request_id,
         )
         raise typer.Exit(rc)
-
-    from ...dispatch import spec_from_entry
 
     old = _root._find_or_die(cfg, ref, json_=json_)
     if min_vram_mib is not None and old.gpus_requested == 0:

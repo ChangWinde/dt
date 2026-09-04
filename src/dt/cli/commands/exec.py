@@ -23,6 +23,7 @@ from .. import (
     _submission_payload,
     _validate_submission_request_id,
 )
+from ... import dispatch as dispatch_mod
 
 
 def exec_job(
@@ -94,8 +95,6 @@ def exec_job(
             request_id=request_id,
         )
         raise typer.Exit(rc)
-
-    from ... import dispatch as dispatch_mod
 
     source = _root._find_or_die(cfg, ref, json_=json_)
     try:

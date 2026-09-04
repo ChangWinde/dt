@@ -52,7 +52,7 @@ from .topology_discovery import (
 )
 
 _GROUPED_INTEGER = r"([0-9][0-9,. \u00a0\u202f]*)"
-_TRANSFERRED_RE = re.compile(rf"Total transferred file size: {_GROUPED_INTEGER} bytes")
+TRANSFERRED_RE = re.compile(rf"Total transferred file size: {_GROUPED_INTEGER} bytes")
 _FILES_RE = re.compile(
     rf"Number of regular files transferred: {_GROUPED_INTEGER}(?:\r?$)",
     re.MULTILINE,
@@ -274,7 +274,7 @@ def _append_transfer_event(cfg: HeadConfig, event: dict[str, object]) -> str | N
     return None
 
 
-def _stat_total(pattern: re.Pattern[str], stdout: str) -> int | None:
+def stat_total(pattern: re.Pattern[str], stdout: str) -> int | None:
     return rsync_stat_total(pattern, stdout)
 
 
@@ -693,7 +693,7 @@ class TransferExecutor:
                 raise DistributionError(
                     f"cross-site cache transfer to {cache_node.name} failed: {detail}"
                 )
-            moved = _stat_total(_TRANSFERRED_RE, proc.stdout) or 0
+            moved = stat_total(TRANSFERRED_RE, proc.stdout) or 0
             self._record_link_sample(
                 CONTROL_LINK_SCOPE,
                 "head",
@@ -701,7 +701,7 @@ class TransferExecutor:
                 moved,
                 time.monotonic() - transfer_started,
             )
-            return moved, _stat_total(_FILES_RE, proc.stdout)
+            return moved, stat_total(_FILES_RE, proc.stdout)
 
         transferred = self._verified_transfer(
             transfer,
@@ -844,7 +844,7 @@ class TransferExecutor:
                     f"failed ({type(exc).__name__})"
                 ) from exc
             if last.returncode == 0:
-                moved = _stat_total(_TRANSFERRED_RE, last.stdout) or 0
+                moved = stat_total(TRANSFERRED_RE, last.stdout) or 0
                 if destination.name != cache_node.name:
                     self._record_link_sample(
                         site_link_scope(site),
@@ -853,7 +853,7 @@ class TransferExecutor:
                         moved,
                         time.monotonic() - attempt_started,
                     )
-                return moved, _stat_total(_FILES_RE, last.stdout)
+                return moved, stat_total(_FILES_RE, last.stdout)
             if attempt < 2 and rsync_failure_retryable(
                 last.returncode,
                 last.stdout or "",
@@ -979,7 +979,7 @@ class TransferExecutor:
                 )
                 raise error from exc
             if last.returncode == 0:
-                moved = _stat_total(_TRANSFERRED_RE, last.stdout) or 0
+                moved = stat_total(TRANSFERRED_RE, last.stdout) or 0
                 site = self.topology.site_for(source_node)
                 if site is not None and source_node.name != destination.name:
                     self._record_link_sample(
@@ -989,7 +989,7 @@ class TransferExecutor:
                         moved,
                         time.monotonic() - attempt_started,
                     )
-                return moved, _stat_total(_FILES_RE, last.stdout)
+                return moved, stat_total(_FILES_RE, last.stdout)
             if attempt < 2 and rsync_failure_retryable(
                 last.returncode,
                 last.stdout or "",
@@ -1506,7 +1506,7 @@ class TransferExecutor:
                 raise DistributionError(
                     f"explicit direct fallback to {destination.name} failed: {detail}"
                 )
-            moved = _stat_total(_TRANSFERRED_RE, proc.stdout) or 0
+            moved = stat_total(TRANSFERRED_RE, proc.stdout) or 0
             self._record_link_sample(
                 CONTROL_LINK_SCOPE,
                 "head",
@@ -1514,7 +1514,7 @@ class TransferExecutor:
                 moved,
                 time.monotonic() - transfer_started,
             )
-            return moved, _stat_total(_FILES_RE, proc.stdout)
+            return moved, stat_total(_FILES_RE, proc.stdout)
 
         transferred_bytes, transferred_files = self._verified_transfer(
             transfer,

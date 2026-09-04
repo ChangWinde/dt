@@ -51,6 +51,9 @@ from .. import (
     _validate_submission_request_id,
     _validate_submission_resources,
 )
+from ... import dispatch as dispatch_mod
+from ...dispatch import artifact_manifest_identity
+from ... import dispatch as dispatch
 
 
 @dataclass(frozen=True)
@@ -562,7 +565,6 @@ def _inventory_submit_items(
     json_: bool,
 ) -> None:
     """Submit every item not yet confirmed, forking from the first."""
-    from ... import dispatch as dispatch_mod
 
     entries = outcome.entries
     total = len(plan.items)
@@ -967,9 +969,7 @@ def _inventory_command(
     artifact_action: Callable[[], None] | None = None
     if artifacts:
         try:
-            from ...dispatch import artifact_manifest_identity, resolve_project
-
-            project, project_cfg = resolve_project(cfg, project, Path.cwd())
+            project, project_cfg = dispatch.resolve_project(cfg, project, Path.cwd())
             artifact_manifest = artifact_manifest_identity(
                 project,
                 project_cfg.path,

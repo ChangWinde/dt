@@ -68,6 +68,7 @@ from . import (
     waiting_placement_failure_reason,
     waiting_unreachable_reason,
 )
+from ..scheduler import admission_decision
 
 
 def dispatch_queued(
@@ -420,7 +421,6 @@ def _claim_queued_dispatch_attempt(
     advance through candidates while making every concurrent dispatcher stop
     before synchronization or launch.
     """
-    from ..scheduler import admission_decision
 
     expected_token = spec.dispatch_token
     expected_node = entry.dispatch_node if expected_token is not None else None

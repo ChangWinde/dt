@@ -25,7 +25,9 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   `staging`, `snapshots`, `artifacts`, `preview`); the lifecycle and doctor shell
   libraries ship as `src/dt/shell/*.sh` resources checked by shellcheck in
   CI; JSON numbers are narrowed through `dt.jsonvalue`; the ps contract
-  validator returns a typed page.
+  validator returns a typed page; modules import only public names from each
+  other, and test seams are explicit module attributes instead of function-local
+  imports (`tests/test_layering.py` keeps both).
 
 ## 0.13.4 — 2026-09-03
 

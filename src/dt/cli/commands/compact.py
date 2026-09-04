@@ -13,6 +13,7 @@ from ... import cli as _root
 from ...config import LaptopConfig
 from ...render import err
 from .. import _fail_submission, _format_transfer_bytes
+from ... import compact as compact_mod
 
 
 def compact(
@@ -88,9 +89,7 @@ def compact(
             abort=True,
         )
 
-    from ...compact import compact_jobs
-
-    report = compact_jobs(
+    report = compact_mod.compact_jobs(
         cfg,
         cutoff,
         before=before,
