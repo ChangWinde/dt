@@ -1129,7 +1129,7 @@ def test_successful_launch_records_stage_timings_and_environment_state(
 
     ticks = iter([10.0, 10.125, 20.0, 20.456])
     monkeypatch.setattr(dispatch, "launch", fake_launch)
-    monkeypatch.setattr(dispatch.time, "perf_counter", lambda: next(ticks))
+    monkeypatch.setattr(time, "perf_counter", lambda: next(ticks))
 
     entry, reasons, fatal, _failure_kinds = _try_nodes(
         cfg,
@@ -1172,7 +1172,7 @@ def test_try_nodes_preserves_submission_time_before_started_time(
         "launch",
         lambda *args, **kwargs: (0, {"gpus": [], "pgid": 42}),
     )
-    monkeypatch.setattr(dispatch.time, "time", lambda: 200.0)
+    monkeypatch.setattr(time, "time", lambda: 200.0)
 
     entry, reasons, fatal, _failure_kinds = _try_nodes(
         cfg,
@@ -1529,7 +1529,7 @@ def test_uncertain_direct_launch_is_registered_and_classified_unreachable(
         ),
     )
     failure_times = iter([100.0, 200.0])
-    monkeypatch.setattr(dispatch.time, "time", lambda: next(failure_times))
+    monkeypatch.setattr(time, "time", lambda: next(failure_times))
     source = tmp_path / "source-uncertain"
     source.mkdir()
     (source / "main.py").write_text("pass\n")
@@ -1779,7 +1779,7 @@ def test_direct_env_fail_persists_placed_failed_entry(tmp_path, monkeypatch):
         ),
     )
     failure_times = iter([100.0, 200.0])
-    monkeypatch.setattr(dispatch.time, "time", lambda: next(failure_times))
+    monkeypatch.setattr(time, "time", lambda: next(failure_times))
     source = tmp_path / "source-env-fail"
     source.mkdir()
     (source / "main.py").write_text("pass\n")

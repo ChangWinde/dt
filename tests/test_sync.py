@@ -14,6 +14,7 @@ import dt.sshio as sshio
 from dt.config import HeadConfig, LaptopConfig, Node, Project, Site
 from dt.private_state import PrivateStateError
 from dt.sshio import RemoteError
+from dt.jobs import job_lock
 
 
 def _cfg(tmp_path):
@@ -1582,7 +1583,7 @@ def test_previous_job_copy_baseline_holds_source_job_lock(tmp_path, monkeypatch)
 
     def acquire_source_lock():
         attempted.set()
-        with dispatch.job_lock(cfg, "previous"):
+        with job_lock(cfg, "previous"):
             acquired.set()
 
     worker = threading.Thread(target=acquire_source_lock, daemon=True)

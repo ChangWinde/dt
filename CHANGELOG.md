@@ -20,7 +20,9 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   probe library restarts the resident agent.
 - Internal restructuring with no behavior change: `src/dt/cli.py` is now the
   package `src/dt/cli/` (a 3.3k-line composition root plus one module per
-  command family under `cli/commands/`); the lifecycle and doctor shell
+  command family under `cli/commands/`) and `src/dt/dispatch.py` the package
+  `src/dt/dispatch/` (a 1.7k-line root plus `submission`, `queued`, `launch`,
+  `staging`, `snapshots`, `artifacts`, `preview`); the lifecycle and doctor shell
   libraries ship as `src/dt/shell/*.sh` resources checked by shellcheck in
   CI; JSON numbers are narrowed through `dt.jsonvalue`; the ps contract
   validator returns a typed page.

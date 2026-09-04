@@ -25,6 +25,8 @@ from dt.dispatch import (
 from dt.jobs import MAX_JOB_ID_LENGTH, JobEntry, remove_record, save
 from dt import submission_group as group_mod
 from dt import submission_intent as intent_mod
+from dt.lifecycle import LAUNCH_RECOVERY_MARK
+from dt.sshio import RemoteError
 
 
 def _cfg(tmp_path: Path) -> HeadConfig:
@@ -1559,7 +1561,7 @@ def test_request_remote_proof_combines_exact_marker_and_runtime_state(
     )
     stdout = (
         f"{dispatch.REQUEST_REMOTE_PROOF_MARK}\n{marker_state}\n"
-        f"boot-1\n{dispatch.LAUNCH_RECOVERY_MARK}\n{recovery}"
+        f"boot-1\n{LAUNCH_RECOVERY_MARK}\n{recovery}"
     )
 
     def fake_run_on(node, local, command, **kwargs):
@@ -1620,7 +1622,7 @@ def test_request_remote_proof_transport_failure_is_unavailable(tmp_path, monkeyp
     )
 
     def unavailable(*_args, **_kwargs):
-        raise dispatch.RemoteError("n1", "timed out")
+        raise RemoteError("n1", "timed out")
 
     monkeypatch.setattr(dispatch, "run_on", unavailable)
 

@@ -9,6 +9,7 @@ from dt import cli, custom_env, dispatch, jobs, ps_query, transfers
 from dt.config import HeadConfig, LaptopConfig, Node, Project
 from dt.dispatch import RunSpec, fork_spec_from_entry, spec_from_entry
 from dt.jobs import JobEntry
+from dt import private_env
 
 
 SECRET = "token-value-that-must-never-be-public"
@@ -271,7 +272,7 @@ def test_support_files_and_launch_transport_values_only_in_private_handoff(
     assert "DT_PRIVATE_ENV_STDIN=1" in command
     assert "DT_CUSTOM_ENV_PATH=" not in command
     assert SECRET not in command
-    assert dispatch.private_env_mod.decode(seen["stdin_bytes"]) == {
+    assert private_env.decode(seen["stdin_bytes"]) == {
         "HF_TOKEN": SECRET,
     }
 
@@ -308,7 +309,7 @@ def test_launch_keeps_every_private_value_out_of_argv(tmp_path, monkeypatch):
         cfg.webhook,
     ):
         assert private_value not in command
-    assert dispatch.private_env_mod.decode(seen["stdin_bytes"]) == {
+    assert private_env.decode(seen["stdin_bytes"]) == {
         "DT_LAUNCH_TOKEN": spec.dispatch_token,
         "DT_PROXY": cfg.proxy,
         "DT_WEBHOOK": cfg.webhook,
