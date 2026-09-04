@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -132,3 +133,67 @@ def test_contract_names_the_json_payloads_of_every_json_command():
         assert described[name]["json_shape"] == "array"
     assert described["run"]["emits"] == ["dt_submission_v1", "dt_run_plan_v1"]
     assert contract.COMMAND_EMITS.keys() <= set(described)
+
+
+def test_error_kind_vocabulary_covers_every_kind_the_cli_can_emit():
+    """A new failure kind must be named and explained in the contract."""
+    used: set[str] = set()
+    for path in (Path(cli.__file__).parent).rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            callee = ast.unparse(node.func)
+            if callee.endswith(
+                ("_fail_submission", "_emit_cli_error", "error_payload")
+            ):
+                target = next((k.value for k in node.keywords if k.arg == "kind"), None)
+                if target is None and node.args:
+                    target = node.args[0]
+            elif callee.endswith("_OperationFailure"):
+                target = node.args[0] if node.args else None
+            else:
+                continue
+            if target is None:
+                continue
+            keys = {
+                id(node.slice)
+                for node in ast.walk(target)
+                if isinstance(node, ast.Subscript)
+            }
+            for literal in ast.walk(target):
+                if id(literal) in keys:
+                    continue  # a dict key such as metric_data["error"], not a kind
+                if isinstance(literal, ast.Constant) and isinstance(literal.value, str):
+                    if re.fullmatch(r"[a-z][a-z0-9_]*", literal.value):
+                        used.add(literal.value)
+    # values only reachable through f-strings and dispatch errors
+    used |= {
+        f"{op}_interrupted"
+        for op in (
+            "compare",
+            "kill",
+            "metrics",
+            "pull",
+            "seed",
+            "sync",
+            "wait",
+            "watch",
+        )
+    }
+    used |= {"batch_submission_unknown", "chain_submission_unknown"}
+    used |= {"failed_before_start", "launch_outcome_unknown"}
+    # compare forwards its metric reader's error kinds
+    used |= {
+        m.group(1)
+        for m in re.finditer(
+            r'"error": "(metric_[a-z_]+)"',
+            (Path(cli.__file__).parent / "commands" / "compare.py").read_text(),
+        )
+    }
+    missing = sorted(used - set(contract.ERROR_KINDS))
+    assert not missing, (
+        f"document these error kinds in dt.contract.ERROR_KINDS: {missing}"
+    )
+    document = _document()
+    assert [k["kind"] for k in document["error"]["kinds"]] == list(contract.ERROR_KINDS)

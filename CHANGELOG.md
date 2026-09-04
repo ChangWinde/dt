@@ -17,7 +17,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   command with its arguments, options (flags, type, default, repeat), `--json`
   support with the top-level shape and the schema ids it emits, destructive
   status with its confirmation and plan flags, aliases, the exit-code table, and
-  the error document shape. It is derived from the
+  the error document shape together with every `error` kind this version can
+  emit and what each means. It is derived from the
   same metadata that renders `--help`, so it cannot drift from it.
 
 ### Changed

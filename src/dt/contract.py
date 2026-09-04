@@ -82,6 +82,71 @@ COMMAND_EMITS: dict[str, JsonEmission] = {
     "contract": ("object", (SCHEMA_VERSION,)),
 }
 
+# The `error` kinds a dt_cli_error_v1 document can carry in this version, with
+# what each means for the caller. tests/test_contract.py fails when the cli
+# introduces a kind that is missing here, so the vocabulary cannot drift.
+ERROR_KINDS: dict[str, str] = {
+    "usage": "the command line did not parse; fix the invocation",
+    "configuration": "the local dt configuration is missing or invalid",
+    "invalid_argument": "an option or argument value is not acceptable",
+    "invalid_request": "the request as a whole is inconsistent",
+    "confirmation_required": "a destructive command needs -y in a non-interactive session",
+    "not_found": "no job matches the reference",
+    "ambiguous_reference": "the reference matches more than one job",
+    "lookup_failed": "the head could not resolve the reference",
+    "unknown_node": "a named node is not in the configuration",
+    "unknown_site": "a named site is not in the configuration",
+    "unreachable": "the head, center, or node did not answer",
+    "agent_incompatible": "the resident agent speaks an older protocol",
+    "no_capacity": "no node can take the job now and --no-queue was set",
+    "capacity_probe_failed": "no center could report its capacity",
+    "center_query_failed": "no center answered the ps query",
+    "environment": "the remote environment or setup failed",
+    "failed_before_start": "the launch failed before the job process started",
+    "launch_outcome_unknown": "the launch was interrupted before its outcome was recorded",
+    "not_started": "the job has not started, so the requested data does not exist yet",
+    "not_ready": "the requested result is not available yet",
+    "dependency_not_found": "an --after-* reference matches no job",
+    "dependency_unsatisfied": "the dependency job ended in a state the predicate rejects",
+    "idempotency_conflict": "the request id was already used with a different intent",
+    "request_state_damaged": "the durable request receipt is unreadable",
+    "submission_protocol": "the head returned a submission payload dt cannot parse",
+    "submission_rejected": "the head refused the submission",
+    "submission_unknown": "the head may or may not have registered the submission",
+    "batch_submission_unknown": "a batch item may or may not have been registered",
+    "chain_submission_unknown": "a chain stage may or may not have been registered",
+    "matrix_submission_unknown": "a matrix unit may or may not have been registered",
+    "artifact_sync_failed": "an artifact could not be synchronized to the node",
+    "destination_conflict": "the pull destination holds another job's output",
+    "destination_unusable": "the pull destination cannot be written",
+    "clean_plan_invalid": "the clean plan is malformed or was created for another scope",
+    "clean_plan_unavailable": "the clean plan expired or does not exist",
+    "unsupported_plan_scope": "the plan scope cannot be applied by this command",
+    "plan_failed": "the submission preview could not be computed",
+    "log_read_failed": "the job log could not be read on the node",
+    "telemetry_read_failed": "the job telemetry could not be read on the node",
+    "telemetry_protocol": "the telemetry payload did not match its schema",
+    "diagnosis_protocol": "the head returned diagnosis evidence dt cannot parse",
+    "metric_artifact_not_found": "no output matched the compare metric glob",
+    "metric_artifact_ambiguous": "more than one output matched the compare metric glob",
+    "metric_read_failed": "the compare metric file could not be read",
+    "metric_not_finite_number": "the compare metric field is not a finite number",
+    "metric_protocol_error": "the head returned a compare metric payload dt cannot parse",
+    "query_too_large": "the ps query exceeds its byte budget; narrow it",
+    "operation_journal": "the operation journal could not be read",
+    "init": "the configuration could not be written",
+    "topology_discovery_failed": "no route could be discovered for the requested edges",
+    "topology_scope_invalid": "the topology filters select nothing",
+    "metrics_interrupted": "metrics collection was interrupted locally",
+    "pull_interrupted": "the pull was interrupted locally; outputs are unchanged",
+    "seed_interrupted": "seeding was interrupted locally",
+    "sync_interrupted": "sync was interrupted locally",
+    "wait_interrupted": "waiting was interrupted locally; the job keeps running",
+    "watch_interrupted": "watching was interrupted locally; the jobs keep running",
+    "compare_interrupted": "compare was interrupted locally",
+    "kill_interrupted": "kill was interrupted locally before the head confirmed it",
+}
+
 _TYPE_NAMES = {
     "int": "integer",
     "int range": "integer",
@@ -225,10 +290,14 @@ def describe(app: typer.Typer, *, dt_version: str) -> dict[str, Any]:
         "error": {
             "schema_version": "dt_cli_error_v1",
             "keys": ["schema_version", "error", "message", "exit_code", "reasons"],
+            "kinds": [
+                {"kind": kind, "meaning": meaning}
+                for kind, meaning in ERROR_KINDS.items()
+            ],
             "note": (
                 "Every failure reported under --json before a command produces "
                 "its own payload is one document with these keys; exit_code is "
-                "the process exit code."
+                "the process exit code. Branch on exit_code first, then on kind."
             ),
         },
         "exit_codes": [

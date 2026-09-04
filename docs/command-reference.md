@@ -330,7 +330,8 @@ and the process exits with the code it names:
 
 The five keys are always present. `error` is a stable machine kind (for
 example `usage`, `configuration`, `not_found`, `unreachable`, `no_capacity`,
-`confirmation_required`, `invalid_argument`), `message` is the human
+`confirmation_required`, `invalid_argument`; `dt contract --json` lists every
+kind this version can emit with its meaning), `message` is the human
 explanation, and `reasons` maps nodes or items to their own detail when the
 failure has structured parts (placement rejections list every candidate
 node) and is empty otherwise. Commands that reach their own payload report
