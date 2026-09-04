@@ -6200,6 +6200,9 @@ def test_ps_progress_enrichment_uses_active_nested_log(
         ),
     )
 
+    monkeypatch.setattr(
+        cli, "probe_node", lambda node, threshold: NodeStatus(node=node.name, gpus=[])
+    )
     rows, errors = ps_cmd._gather_ps_rows(cfg, status=None, include_progress=True)
 
     assert errors == {}
@@ -6256,6 +6259,9 @@ def test_ps_progress_treats_not_yet_created_log_as_loading(
         ),
     )
 
+    monkeypatch.setattr(
+        cli, "probe_node", lambda node, threshold: NodeStatus(node=node.name, gpus=[])
+    )
     rows, _errors = ps_cmd._gather_ps_rows(cfg, status=None, include_progress=True)
 
     assert rows[0]["progress"] is None
@@ -6494,6 +6500,9 @@ def test_laptop_ps_progress_is_collected_by_each_head(monkeypatch):
 
     monkeypatch.setattr(cli, "fan_json", fake_fan_json)
 
+    monkeypatch.setattr(
+        cli, "probe_node", lambda node, threshold: NodeStatus(node=node.name, gpus=[])
+    )
     rows, errors = ps_cmd._gather_ps_rows(cfg, status="running", include_progress=True)
 
     assert errors == {}

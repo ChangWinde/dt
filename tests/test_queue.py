@@ -754,9 +754,14 @@ def test_pin_bypasses_reserve():
     assert [n.name for n in pick_candidates(statuses, nodes, spec, reserve=4)] == ["n1"]
 
 
-def test_max_my_jobs_caps_agent(tmp_path):
+def test_max_my_jobs_caps_agent(tmp_path, stub_job_refresh):
+    import dt.agent as agent
+
     cfg = _cfg(tmp_path, max_my_jobs=1)
     save(cfg, _entry("run1", "running", created_at=1.0, node="n1"))
+    stub_job_refresh(
+        agent, lambda cfg_, entry_: entry_
+    )  # the running row stays running
     save(cfg, _entry("q1", "queued", created_at=2.0))
     logs = []
     assert process_once(cfg, logs.append) == [("q1", "capped")]

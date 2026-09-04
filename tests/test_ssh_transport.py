@@ -380,6 +380,7 @@ def test_generated_ssh_config_replaces_oversized_regular_state_without_reading_i
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
 
 
+@pytest.mark.real_transport
 def test_remote_timeout_reaps_ssh_and_proxyjump_process_group(tmp_path, monkeypatch):
     _transport_home(tmp_path, monkeypatch)
     popen_kwargs = {}
@@ -784,6 +785,7 @@ def test_diagnostic_excerpt_is_bounded_and_keeps_both_failure_boundaries():
     assert "[omitted]" in detail
 
 
+@pytest.mark.real_transport
 def test_repeated_interrupt_cannot_abandon_transport_cleanup(monkeypatch):
     signals = []
 
