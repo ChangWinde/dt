@@ -62,6 +62,7 @@ jobs:
           env -u FORCE_COLOR uv run --no-sync pytest -q --tb=short \
             -p no:cacheprovider \
             -W error::pytest.PytestUnhandledThreadExceptionWarning \
+            -W error::ResourceWarning -W error::DeprecationWarning \
             "${coverage_args[@]}" \
             2>&1 | tee "$RUNNER_TEMP/dt-pytest.log"
           test_status=${PIPESTATUS[0]}

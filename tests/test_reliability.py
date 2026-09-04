@@ -6259,6 +6259,8 @@ def test_dead_leader_signals_in_group_orphan_that_left_the_capsule(tmp_path):
             assert time.monotonic() < deadline, "in-group orphan survived the probe"
             time.sleep(0.05)
     finally:
+        if leader.stdout is not None:
+            leader.stdout.close()
         subprocess.run(
             ["kill", "-9", str(orphan_pid)], capture_output=True, check=False
         )
@@ -6306,6 +6308,8 @@ def test_termination_probe_signals_orphans_after_leader_death(tmp_path):
             assert time.monotonic() < deadline, "orphan survived the probe"
             time.sleep(0.05)
     finally:
+        if leader.stdout is not None:
+            leader.stdout.close()
         subprocess.run(
             ["kill", "-9", str(orphan_pid)],
             capture_output=True,
@@ -6445,6 +6449,8 @@ def test_zombie_leader_group_signal_reaches_wandering_orphan(tmp_path):
             assert time.monotonic() < deadline, "wandering orphan survived"
             time.sleep(0.05)
     finally:
+        if leader.stdout is not None:
+            leader.stdout.close()
         subprocess.run(
             ["kill", "-9", str(orphan_pid)], capture_output=True, check=False
         )
@@ -7038,6 +7044,8 @@ def test_termination_probe_signals_matching_process_group(tmp_path):
         ) == ("DEAD", None)
         assert owner.wait(timeout=30) == 143
     finally:
+        if owner.stdout is not None:
+            owner.stdout.close()
         if owner.poll() is None:
             owner.terminate()
             owner.wait(timeout=2)

@@ -173,6 +173,10 @@ def test_tail_does_not_wait_for_the_live_capture_stream_to_close(tmp_path):
         assert tail.returncode == 0, tail.stderr.decode()
         assert tail.stdout == b"live-line\n"
     finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        if process.stderr is not None:
+            process.stderr.close()
         if process.stdin is not None:
             process.stdin.close()
         process.wait(timeout=5)

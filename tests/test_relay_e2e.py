@@ -72,6 +72,8 @@ class _Sshd:
             self.daemon.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self.daemon.kill()
+        if self.daemon.stderr is not None:
+            self.daemon.stderr.close()
 
 
 def _spawn_sshd(root: Path, name: str) -> _Sshd:

@@ -73,6 +73,7 @@ def test_ci_fails_on_thread_exceptions_and_requires_relay_e2e_dependencies():
     ).read_text()
 
     assert "error::pytest.PytestUnhandledThreadExceptionWarning" in workflow
+    assert "-W error::ResourceWarning -W error::DeprecationWarning" in workflow
     assert 'DT_REQUIRE_RELAY_E2E: "1"' in workflow
     assert "openssh-server rsync shellcheck zsh" in workflow.replace("\\\n", " ")
     assert "shellcheck --shell=sh src/dt/shell/*.sh" in workflow
@@ -88,6 +89,7 @@ def test_ci_fails_on_thread_exceptions_and_requires_relay_e2e_dependencies():
         Path(__file__).parents[1] / "scripts" / "release-check.sh"
     ).read_text()
     assert "error::pytest.PytestUnhandledThreadExceptionWarning" in release_gate
+    assert "-W error::ResourceWarning -W error::DeprecationWarning" in release_gate
     assert "--cov=dt --cov-branch" in release_gate
 
     release_guide = (Path(__file__).parents[1] / "docs" / "releasing.md").read_text()

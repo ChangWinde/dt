@@ -1160,6 +1160,8 @@ def test_interactive_probe_does_not_wait_behind_another_process_refresh(
         )
         assert statuses[0].gpus[0].free is False
     finally:
+        if holder.stdout is not None:
+            holder.stdout.close()
         holder.terminate()
         holder.wait(timeout=5)
 
