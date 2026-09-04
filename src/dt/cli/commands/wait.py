@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from threading import Event
-from typing import Callable, Optional
+from typing import Callable, Optional, TypedDict
 import json
 import math
 import re
@@ -493,9 +493,24 @@ def _wait_duration(entry: jobs_mod.JobEntry) -> float | None:
     return max(0.0, (entry.finished_at or time.time()) - entry.started_at)
 
 
+class _WaitGroupSummary(TypedDict):
+    total: int
+    succeeded: int
+    issues: int
+    aggregate_exit_code: int
+
+
+class _WaitGroupPayload(TypedDict):
+    """The ``dt_wait_group_v1`` contract; serialized as-is for ``--json``."""
+
+    schema_version: str
+    summary: _WaitGroupSummary
+    jobs: list[JsonDict]
+
+
 def _wait_group_payload(
     results: list[tuple[jobs_mod.JobEntry, JsonDict, int]],
-) -> JsonDict:
+) -> _WaitGroupPayload:
     """Build the stable terminal contract for multi-job wait."""
     jobs: list[JsonDict] = []
     aggregate_exit_code = 0
@@ -527,19 +542,13 @@ def _write_group_failure_tail(text: str) -> None:
         sys.stderr.write("\n")
 
 
-def _render_wait_group(payload: JsonDict) -> None:
+def _render_wait_group(payload: _WaitGroupPayload) -> None:
     from rich.table import Table
 
     summary = payload["summary"]
-    assert isinstance(summary, dict)
     jobs = payload["jobs"]
-    assert isinstance(jobs, list)
     display_refs = jobs_mod.compact_refs(
-        [
-            (str(raw["job_id"]), str(raw["name"]))
-            for raw in jobs
-            if isinstance(raw, dict)
-        ]
+        [(str(raw["job_id"]), str(raw["name"])) for raw in jobs]
     )
     table = Table(
         title=(
@@ -556,7 +565,6 @@ def _render_wait_group(payload: JsonDict) -> None:
     table.add_column("elapsed", justify="right", no_wrap=True)
     table.add_column("reason")
     for raw in jobs:
-        assert isinstance(raw, dict)
         status = str(raw["status"])
         code = as_int(raw.get("exit_code"))
         if code == 0:
@@ -589,7 +597,6 @@ def _render_wait_group(payload: JsonDict) -> None:
     err.print(table)
 
     for raw in jobs:
-        assert isinstance(raw, dict)
         failure_log = raw.get("failure_log")
         if not isinstance(failure_log, dict):
             continue
@@ -839,6 +846,4 @@ def wait(
         print(json.dumps(group_payload))
     else:
         _render_wait_group(group_payload)
-    summary = group_payload["summary"]
-    assert isinstance(summary, dict)
-    raise typer.Exit(int(summary["aggregate_exit_code"]))
+    raise typer.Exit(group_payload["summary"]["aggregate_exit_code"])

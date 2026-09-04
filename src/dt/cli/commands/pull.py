@@ -1344,10 +1344,26 @@ def _pull_top_level_entries(destination: Path) -> list[str]:
     return entries
 
 
+class _PullGroupSummary(TypedDict):
+    total: int
+    pulled: int
+    issues: int
+    aggregate_exit_code: int
+
+
+class _PullGroupPayload(TypedDict):
+    """The ``dt_pull_group_v1`` contract; serialized as-is for ``--json``."""
+
+    schema_version: str
+    root: str
+    summary: _PullGroupSummary
+    jobs: list[JsonDict]
+
+
 def _pull_group_payload(
     root: Path,
     results: list[JsonDict],
-) -> JsonDict:
+) -> _PullGroupPayload:
     aggregate_exit_code = 0
     pulled = 0
     for result in results:
@@ -1369,12 +1385,11 @@ def _pull_group_payload(
     }
 
 
-def _render_pull_group(payload: JsonDict) -> None:
+def _render_pull_group(payload: _PullGroupPayload) -> None:
     from rich.markup import escape
     from rich.table import Table
 
     summary = payload["summary"]
-    assert isinstance(summary, dict)
     table = Table(
         title=(
             f"pull complete · {summary['pulled']}/{summary['total']} recovered"
@@ -1388,10 +1403,7 @@ def _render_pull_group(payload: JsonDict) -> None:
     table.add_column("node", no_wrap=True)
     table.add_column("records", justify="right", no_wrap=True)
     table.add_column("destination / issue")
-    jobs = payload["jobs"]
-    assert isinstance(jobs, list)
-    for raw in jobs:
-        assert isinstance(raw, dict)
+    for raw in payload["jobs"]:
         code = int(raw.get("exit_code", 1))
         pulled = code == 0
         records = raw.get("records")
@@ -1586,9 +1598,7 @@ def _pull_group(
         print(json.dumps(group_payload))
     else:
         _render_pull_group(group_payload)
-    summary = group_payload["summary"]
-    assert isinstance(summary, dict)
-    raise typer.Exit(int(summary["aggregate_exit_code"]))
+    raise typer.Exit(group_payload["summary"]["aggregate_exit_code"])
 
 
 def pull(
