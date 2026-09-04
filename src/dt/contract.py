@@ -40,6 +40,48 @@ DESTRUCTIVE_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
     {("kill",), ("clean",), ("compact",), ("migrate", "layout")}
 )
 
+# What each command prints on stdout under --json: the top-level shape and the
+# schema ids a consumer may meet there. "array" outputs are bare row lists and
+# carry no schema_version; every listed id must exist in the source tree
+# (tests/test_contract.py checks both properties and that no --json command is
+# missing from this table).
+JsonEmission = tuple[str, tuple[str, ...]]
+COMMAND_EMITS: dict[str, JsonEmission] = {
+    "run": ("object", ("dt_submission_v1", "dt_run_plan_v1")),
+    "batch": ("object", ("dt_batch_v1",)),
+    "chain": ("object", ("dt_chain_v1",)),
+    "matrix plan": ("object", ("dt_matrix_plan_v1",)),
+    "matrix run": ("object", ("dt_matrix_v1",)),
+    "matrix status": ("object", ("dt_matrix_status_v1",)),
+    "rerun": ("object", ("dt_submission_v1",)),
+    "exec": ("object", ("dt_submission_v1",)),
+    "fork": ("object", ("dt_submission_v1", "dt_fork_repeat_v1")),
+    "request": ("object", ("dt_submission_request_probe_v1",)),
+    "ps": ("array", ("dt_ps_query_v1", "dt_ps_window_v2")),
+    "info": ("object", ("dt_job_info_v1",)),
+    "logs": ("object", ("dt_job_logs_v1",)),
+    "diagnose": ("object", ("dt_diagnosis_v1",)),
+    "metrics": ("object", ("dt_resource_summary_v1",)),
+    "wait": ("object", ("dt_submission_v1", "dt_wait_group_v1")),
+    "watch": ("object", ("dt_watch_group_v1", "dt_watch_group_compact_v1")),
+    "compare": ("object", ("dt_compare_v2",)),
+    "free": ("array", ("dt_free_explain_v1", "dt_stream_event_v1")),
+    "kill": ("array", ()),
+    "pull": ("object", ("dt_pull_v1", "dt_pull_group_v1")),
+    "clean": ("object", ("dt_clean_v1", "dt_clean_plan_v1")),
+    "compact": ("object", ("dt_compact_v1",)),
+    "sync": ("array", ()),
+    "seed": ("array", ()),
+    "storage": ("object", ("dt_storage_v1",)),
+    "doctor": ("object", ("dt_doctor_v2",)),
+    "topology": ("object", ("dt_topology_v1",)),
+    "events": ("object", ("dt_operation_events_v1",)),
+    "agent status": ("object", ("dt_agent_status_v1",)),
+    "migrate layout": ("object", ("dt_layout_migration_v1",)),
+    "init": ("object", ("dt_init_v1",)),
+    "contract": ("object", (SCHEMA_VERSION,)),
+}
+
 _TYPE_NAMES = {
     "int": "integer",
     "int range": "integer",
@@ -109,6 +151,7 @@ def _command(
     flags = {flag for option in options for flag in option.get("flags", [])}
     confirmation = "--yes" if "--yes" in flags else ("-y" if "-y" in flags else None)
     settings = getattr(command, "context_settings", None) or {}
+    emission = COMMAND_EMITS.get(" ".join(path))
     return {
         "name": " ".join(path),
         "path": list(path),
@@ -116,6 +159,8 @@ def _command(
         "panel": panel,
         "help": " ".join((command.help or "").split()),
         "json": "--json" in flags,
+        "json_shape": emission[0] if emission and "--json" in flags else None,
+        "emits": list(emission[1]) if emission and "--json" in flags else [],
         # `dt run -- python train.py`: the command line after `--` is the job
         "passthrough": bool(settings.get("allow_extra_args")),
         "destructive": path in DESTRUCTIVE_COMMANDS,

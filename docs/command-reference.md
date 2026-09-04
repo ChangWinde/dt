@@ -308,9 +308,11 @@ or agent evidence for authorized detail.
 `dt contract --json` returns one `dt_contract_v1` document derived from the
 same metadata that renders `--help`: every visible command with its arguments
 and options (name, flags, type, default, whether it repeats), whether it
-speaks `--json`, whether it is destructive and which flag replaces its prompt
-(`confirmation_flag`) or previews it (`plan_flag`), hidden short aliases, the
-exit-code table below, and the error document described next. Tool builders
+speaks `--json` and what it prints there (`json_shape` is `object` or `array`;
+`emits` lists the `schema_version` ids a consumer can meet), whether it is
+destructive and which flag replaces its prompt (`confirmation_flag`) or
+previews it (`plan_flag`), hidden short aliases, the exit-code table below, and
+the error document described next. Tool builders
 generate exact function definitions from it instead of scraping help text;
 `dt contract` without `--json` prints a compact summary for humans.
 

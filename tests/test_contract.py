@@ -112,3 +112,23 @@ def test_every_visible_command_has_a_row_in_the_command_reference():
         and f"`dt {command['path'][0]}`" not in docs
     ]
     assert not missing, missing
+
+
+def test_contract_names_the_json_payloads_of_every_json_command():
+    source = "\n".join(
+        path.read_text() for path in (Path(cli.__file__).parents[1]).rglob("*.py")
+    )
+    described = {c["name"]: c for c in _document()["commands"]}
+    for name, command in described.items():
+        if command["json"]:
+            assert command["json_shape"] in {"object", "array"}, name
+            assert command["emits"] or command["json_shape"] == "array", name
+        else:
+            assert command["json_shape"] is None and command["emits"] == [], name
+        for schema_id in command["emits"]:
+            assert f'"{schema_id}"' in source, (name, schema_id)
+    # bare arrays cannot carry a schema id
+    for name in ("kill", "sync", "seed"):
+        assert described[name]["json_shape"] == "array"
+    assert described["run"]["emits"] == ["dt_submission_v1", "dt_run_plan_v1"]
+    assert contract.COMMAND_EMITS.keys() <= set(described)

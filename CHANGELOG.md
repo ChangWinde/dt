@@ -15,8 +15,9 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   `resume`. Multi-job waits apply the same deadline to every job.
 - `dt contract --json`: one `dt_contract_v1` document describing every visible
   command with its arguments, options (flags, type, default, repeat), `--json`
-  support, destructive status with its confirmation and plan flags, aliases,
-  the exit-code table, and the error document shape. It is derived from the
+  support with the top-level shape and the schema ids it emits, destructive
+  status with its confirmation and plan flags, aliases, the exit-code table, and
+  the error document shape. It is derived from the
   same metadata that renders `--help`, so it cannot drift from it.
 
 ### Changed
