@@ -18,7 +18,6 @@ import pytest
 
 import dt.payload.artifact_verify as artifact_verify
 from dt.dispatch import (
-    RUNTIME_PAYLOAD_NAMES,
     RunSpec,
     _support_files,
     environment_key,
@@ -27,8 +26,9 @@ from dt.dispatch import (
 )
 from dt.jobs import JobEntry
 from dt.payload.artifact_verify import verify as verify_artifacts
-from dt.payload_hash import payload_files_from_dir
+from dt.payload_hash import RUNTIME_PAYLOAD_NAMES, payload_files_from_dir
 from dt.private_env import encode as encode_private_env
+from dt import private_env
 
 PAYLOAD = Path(__file__).parent.parent / "src" / "dt" / "payload"
 LAUNCHER = (PAYLOAD / "launcher.sh").read_text()
@@ -215,7 +215,7 @@ def test_dispatch_remote_command_enters_capsule_before_launcher_exec(
 
     assert code == 0
     assert seen["command"].startswith('cd "$HOME"/dt/jobs/job1 && ')
-    assert dispatch.private_env_mod.decode(seen["stdin_bytes"]) == {}
+    assert private_env.decode(seen["stdin_bytes"]) == {}
 
 
 def _cancel_supersede_block() -> str:

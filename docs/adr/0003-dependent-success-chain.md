@@ -68,7 +68,7 @@ declares `runtime_failure_policy: stop` and contains the dependency edges.
 ## Impact
 
 - `jobs.py` owns the backward-compatible persisted edge.
-- `dispatch.py` validates and resolves dependency state before placement.
+- `dispatch/` validates and resolves dependency state before placement.
 - `agent.py` continues past dependency-waiting entries so unrelated work is not
   starved.
 - `cli.py` owns inventory submission and the `dt_chain_v1` receipt.

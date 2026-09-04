@@ -33,6 +33,8 @@ from dt.jobs import (
     save,
 )
 from dt.probe import Gpu, NodeStatus, SystemStats
+from dt.lifecycle import LAUNCH_RECOVERY_MARK
+from dt.sshio import BULK_TRANSFER_TIMEOUT_S
 
 
 def _cfg(tmp_path: Path, **queue_kw) -> HeadConfig:
@@ -1195,7 +1197,7 @@ def test_cross_node_predecessor_outputs_materialize_before_launch(
     pull, push = calls["rsync"]
     assert pull[0] == "n3:dt/jobs/pred/outputs/"
     assert pull[1].startswith(str(cfg.queue_dir()))
-    assert pull[2]["timeout"] == dispatch_mod.BULK_TRANSFER_TIMEOUT_S
+    assert pull[2]["timeout"] == BULK_TRANSFER_TIMEOUT_S
     assert pull[2]["retries"] == 2
     assert pull[2]["safe_links"] is True
     assert push[0] == pull[1]
@@ -3708,7 +3710,7 @@ def test_dispatch_queued_adopts_interrupted_running_launch_before_capacity_probe
             dispatch.REQUEST_REMOTE_PROOF_MARK,
             "MATCH",
             boot_id,
-            dispatch.LAUNCH_RECOVERY_MARK,
+            LAUNCH_RECOVERY_MARK,
             "RUNNING",
             "4321",
             "3",
@@ -3767,7 +3769,7 @@ def test_dispatch_queued_keeps_unproven_interrupted_launch_fail_closed(
             dispatch.REQUEST_REMOTE_PROOF_MARK,
             "MATCH",
             "01234567-89ab-cdef-0123-456789abcdef",
-            dispatch.LAUNCH_RECOVERY_MARK,
+            LAUNCH_RECOVERY_MARK,
             "UNPROVEN",
             "",
         ]
@@ -3823,7 +3825,7 @@ def test_dispatch_queued_never_replays_after_identity_marker_without_runtime_sta
             dispatch.REQUEST_REMOTE_PROOF_MARK,
             "MATCH",
             "01234567-89ab-cdef-0123-456789abcdef",
-            dispatch.LAUNCH_RECOVERY_MARK,
+            LAUNCH_RECOVERY_MARK,
             "NONE",
             "",
         ]
@@ -3879,7 +3881,7 @@ def test_dispatch_queued_recovers_a_marker_only_attempt_after_verified_cancel(
             dispatch.REQUEST_REMOTE_PROOF_MARK,
             "MATCH",
             "01234567-89ab-cdef-0123-456789abcdef",
-            dispatch.LAUNCH_RECOVERY_MARK,
+            LAUNCH_RECOVERY_MARK,
             "NONE",
             "",
         ]
@@ -3990,7 +3992,7 @@ def test_dispatch_queued_recovers_a_claim_whose_owner_died(
             dispatch.REQUEST_REMOTE_PROOF_MARK,
             "ABSENT",
             "01234567-89ab-cdef-0123-456789abcdef",
-            dispatch.LAUNCH_RECOVERY_MARK,
+            LAUNCH_RECOVERY_MARK,
             "NONE",
             "",
         ]
