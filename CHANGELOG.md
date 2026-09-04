@@ -70,7 +70,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   package `src/dt/cli/` (a 3.3k-line composition root plus one module per
   command family under `cli/commands/`) and `src/dt/dispatch.py` the package
   `src/dt/dispatch/` (a 1.7k-line root plus `submission`, `queued`, `launch`,
-  `staging`, `snapshots`, `artifacts`, `preview`); the lifecycle and doctor shell
+  `staging`, `snapshots`, `artifacts`, `preview`) and `src/dt/jobs.py` the package
+  `src/dt/jobs/` (root plus `status` probes and `active_index`); the lifecycle and doctor shell
   libraries and the node probe's GPU, compute-app, and host-capacity queries
   ship as `src/dt/shell/*.sh` resources checked by shellcheck in CI; JSON numbers are narrowed through `dt.jsonvalue`; the ps contract
   validator returns a typed page; modules import only public names from each

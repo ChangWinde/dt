@@ -337,7 +337,7 @@ defines the boundary and acceptance criteria.
 
 | Area | Modules |
 |---|---|
-| Configuration and state | `config.py`, `layout.py`, `path_contract.py`, `onboarding.py`, `jobs.py`, `submission.py`, `submission_intent.py`, `submission_group.py`, `operation_log.py` |
+| Configuration and state | `config.py`, `layout.py`, `path_contract.py`, `onboarding.py`, `jobs/` (root: registry rows, locks, references, queue context; `status` probes, `active_index` derived indexes), `submission.py`, `submission_intent.py`, `submission_group.py`, `operation_log.py` |
 | Placement and queueing | `dispatch/` (root: specs, errors, placement predicates, spec builders; `submission`, `queued`, `launch`, `staging`, `snapshots`, `artifacts`, `preview`), `agent.py`, `scheduler.py`, `probe.py`, `completion.py` |
 | Remote boundaries | `remote.py`, `forwarding.py`, `sshio.py`, `topology.py`, `artifact_distribution.py`, `lifecycle.py` |
 | Observation | `monitoring.py`, `ps_query.py`, `doctor.py`, `render.py` |
@@ -345,11 +345,11 @@ defines the boundary and acceptance criteria.
 | Identity | `snapshot_hash.py`, `snapshot_store.py`, `payload_hash.py` |
 | Node runtime | `payload/`, `shell/` |
 
-`dt.dispatch` follows the same package contract as `dt.cli`: concern modules
+`dt.dispatch` and `dt.jobs` follow the same package contract as `dt.cli`: concern modules
 reach infrastructure that tests stub through `dt.dispatch`, and anything a
 sibling module owns, as `_root.<name>` at call time, so the root remains the
 one import surface and the modules cannot form import cycles;
-`tests/test_dispatch_package.py` enforces it.
+`tests/test_package_contracts.py` enforces it.
 
 Domain modules expose typed or pure boundaries where practical. Subprocess,
 SSH, filesystem, registry, and terminal rendering remain explicit seams so

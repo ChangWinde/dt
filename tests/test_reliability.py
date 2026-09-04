@@ -559,7 +559,9 @@ def test_status_probe_bounds_job_writable_fields():
         pgid=4242,
     )
     state_dir = "~/dt/worker/jobs/probe-fields/state"
-    state = jobs.node_path_expression(state_dir)
+    from dt.layout import node_path_expression
+
+    state = node_path_expression(state_dir)
 
     script = jobs._status_probe_script(entry, state_dir)
 
