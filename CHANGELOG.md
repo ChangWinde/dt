@@ -27,8 +27,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   command family under `cli/commands/`) and `src/dt/dispatch.py` the package
   `src/dt/dispatch/` (a 1.7k-line root plus `submission`, `queued`, `launch`,
   `staging`, `snapshots`, `artifacts`, `preview`); the lifecycle and doctor shell
-  libraries ship as `src/dt/shell/*.sh` resources checked by shellcheck in
-  CI; JSON numbers are narrowed through `dt.jsonvalue`; the ps contract
+  libraries and the node probe's GPU, compute-app, and host-capacity queries
+  ship as `src/dt/shell/*.sh` resources checked by shellcheck in CI; JSON numbers are narrowed through `dt.jsonvalue`; the ps contract
   validator returns a typed page; modules import only public names from each
   other, and test seams are explicit module attributes instead of function-local
   imports (`tests/test_layering.py` keeps both).
