@@ -32,9 +32,9 @@ from pathlib import Path, PurePosixPath
 from threading import Event
 from typing import Any, Callable, Mapping, cast
 
-from . import custom_env as custom_env_mod
-from . import private_env as private_env_mod
-from .config import (
+from .. import custom_env as custom_env_mod
+from .. import private_env as private_env_mod
+from ..config import (
     ConfigError,
     HeadConfig,
     Node,
@@ -43,15 +43,15 @@ from .config import (
     head_bwlimit_kbps,
     revalidate_project_root,
 )
-from .artifact_distribution import DistributionError, TransferExecutor
-from .lifecycle import (
+from ..artifact_distribution import DistributionError, TransferExecutor
+from ..lifecycle import (
     LAUNCH_RECOVERY_MARK,
     launch_recovery_probe,
     termination_probe,
     termination_verdict,
     validate_job_capsule,
 )
-from .layout import (
+from ..layout import (
     LEGACY_LAYOUT,
     ROLE_LAYOUT,
     display_node_path,
@@ -66,7 +66,7 @@ from .layout import (
     normalize_node_root,
     rsync_destination,
 )
-from .maintenance import (
+from ..maintenance import (
     BeforeRegistryRemove,
     CleanAuthorization,
     CleanReport,
@@ -74,7 +74,7 @@ from .maintenance import (
     clean_jobs as _clean_jobs,
     environment_retention_lock,
 )
-from .jobs import (
+from ..jobs import (
     DISPATCH_PROTOCOL_VERSION,
     LOST_RECHECK_S,
     MAX_RETRY_LIMIT,
@@ -101,17 +101,17 @@ from .jobs import (
     save,
     transition_terminal,
 )
-from . import git_provenance as git_provenance_mod
-from . import payload_hash as payload_hash_mod
-from . import snapshot_hash as snapshot_hash_mod
-from .payload_hash import (
+from .. import git_provenance as git_provenance_mod
+from .. import payload_hash as payload_hash_mod
+from .. import snapshot_hash as snapshot_hash_mod
+from ..payload_hash import (
     PAYLOAD_INTEGRITY_EXIT,
     RUNTIME_PAYLOAD_NAMES,
     payload_files_from_dir as _payload_files_from_dir,
     payload_sha256 as _payload_sha256,
 )
-from .probe import Gpu, NodeStatus, probe_center, probe_node
-from .private_state import (
+from ..probe import Gpu, NodeStatus, probe_center, probe_node
+from ..private_state import (
     PrivateStateError,
     atomic_write,
     decode_strict_json,
@@ -121,17 +121,17 @@ from .private_state import (
     private_lock,
     read_bounded,
 )
-from .snapshot_hash import tree_sha256
-from .snapshot_store import (
+from ..snapshot_hash import tree_sha256
+from ..snapshot_store import (
     code_path as _snapshot_path,
     load_state as _load_snapshot_store_state,
     lock as _snapshot_store_lock,
     save_state as _save_snapshot_store_state,
 )
-from . import submission_intent as intent_mod
-from . import sync_relay
-from .pull_relay import RelayRoute
-from .sshio import (
+from .. import submission_intent as intent_mod
+from .. import sync_relay
+from ..pull_relay import RelayRoute
+from ..sshio import (
     BULK_TRANSFER_TIMEOUT_S,
     RSYNC_UNREACHABLE_EXIT_CODES,
     RemoteError,
@@ -142,7 +142,7 @@ from .sshio import (
     run_on,
 )
 
-PAYLOAD_DIR = Path(__file__).parent / "payload"
+PAYLOAD_DIR = Path(__file__).parent.parent / "payload"
 GPU_PULSE_MEMORY_MIB = 512
 # Cross-node predecessor handoff copies a finished dependency's outputs onto
 # the launch candidate through the head. Refuse trees above this apparent
@@ -1594,7 +1594,7 @@ class RequestRejected(DispatchError):
 def _active_command_dispatch_protocol() -> str | None:
     """Return the protocol advertised by the command an idle agent would run."""
     # Lazy import avoids the module cycle: agent imports ``dispatch_queued``.
-    from . import agent as agent_mod
+    from .. import agent as agent_mod
 
     return agent_mod.active_command_dispatch_protocol(active_dt_command())
 
@@ -1608,7 +1608,7 @@ def require_compatible_resident_agent(cfg: HeadConfig) -> None:
     so missing, corrupt, or different runtime evidence fails closed.
     """
     # Lazy import avoids the module cycle: agent imports ``dispatch_queued``.
-    from . import agent as agent_mod
+    from .. import agent as agent_mod
 
     if agent_mod.legacy_agent_lock_blocks_role_layout(cfg):
         raise ConfigError(
@@ -3874,7 +3874,7 @@ def preview_submission(
     candidates: list[Node] = []
     statuses: list[NodeStatus] = []
 
-    from .scheduler import admission_decision
+    from ..scheduler import admission_decision
 
     hypothetical = JobEntry(
         job_id="__preview__",
@@ -5987,7 +5987,7 @@ def _submit_prepared(
             # Single- and multi-job requests share one public identity
             # namespace and the same lock.  A key claimed by a parent group
             # must never be silently reused for an unrelated single launch.
-            from . import submission_group as group_mod
+            from .. import submission_group as group_mod
 
             group_record = group_mod.load(cfg, request_id)
             record = intent_mod.load(cfg, request_id)
@@ -6894,7 +6894,7 @@ def _claim_queued_dispatch_attempt(
     advance through candidates while making every concurrent dispatcher stop
     before synchronization or launch.
     """
-    from .scheduler import admission_decision
+    from ..scheduler import admission_decision
 
     expected_token = spec.dispatch_token
     expected_node = entry.dispatch_node if expected_token is not None else None
