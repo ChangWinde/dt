@@ -55,8 +55,8 @@ def compact(
 
     A code copy that gained files after the job started is reported as
     code_modified and kept: those files are results the job wrote into its
-    disposable snapshot copy. Recover them (dt pull) or pass --prune-modified
-    to accept the loss.
+    disposable snapshot copy, which dt pull does not fetch. Copy them out of
+    <job_dir>/code on the node, or pass --prune-modified to accept the loss.
     """
     if json_ and not plan and not yes:
         _fail_submission(
@@ -151,8 +151,9 @@ def compact(
         if isinstance(modified, int) and modified:
             err.print(
                 f"[yellow]kept {modified} job(s) whose code copy holds files written "
-                "after start (outputs in the disposable snapshot copy); recover them "
-                "with dt pull, or rerun with --prune-modified to delete anyway[/yellow]"
+                "after start (results in the disposable snapshot copy, which dt pull "
+                "does not fetch); copy them out of <job_dir>/code on the node first, "
+                "or rerun with --prune-modified to delete them anyway[/yellow]"
             )
         skipped = payload["skipped"]
         if isinstance(skipped, dict) and skipped:

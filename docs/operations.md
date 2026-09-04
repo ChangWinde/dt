@@ -421,9 +421,13 @@ entries. Identity or recovery mismatch rejects the candidate.
 The code copy is an immutable snapshot, so any regular file newer than the
 job's start marker was written by the job itself — results that belong under
 `$DT_OUTPUT_DIR`. Compaction reports such trees as `code_modified` (with the
-file count and bytes) and keeps them; recover the files with `dt pull` or,
-to accept the loss, run `dt compact --before DATE -y --prune-modified`. The
-automatic sweep never prunes a modified tree; it logs how many it kept.
+file count and bytes) and keeps them. `dt pull` fetches `outputs/`, not
+`code/`, so copy such files out of `<job_dir>/code` on the node yourself (the
+path is in `dt info REF --json` under `paths`), or accept the loss with
+`dt compact --before DATE -y --prune-modified`, which also leaves the list of
+deleted files (size and path) next to the receipt as
+`code-pruned.modified.tsv`. The automatic sweep never prunes a modified tree;
+it logs how many it kept.
 
 The resident agent runs the same procedure automatically every six hours for
 jobs that have been terminal for longer than `queue.auto_compact_hours`

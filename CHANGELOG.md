@@ -20,8 +20,11 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 - `dt compact` keeps a code copy that holds files written after the job
   started (`code_modified` in the report, counted in `code_modified_jobs`)
   instead of deleting results a job wrote into its snapshot copy;
-  `--prune-modified` accepts the loss explicitly. The automatic sweep never
-  prunes such trees.
+  `--prune-modified` accepts the loss explicitly and leaves the list of deleted
+  files (size and path) beside the receipt as `code-pruned.modified.tsv`. The
+  automatic sweep never prunes such trees. `dt info` warns when a job wrote
+  files into its code copy (`code_modified_files` / `code_modified_bytes` in
+  `--json`) and dates its placement-failure reasons ("as of ... (last attempt)").
 - `dt ps` shows why a queued job is blocked or offline in its default view
   (the issue column appears whenever such a row is visible), compacted to the
   node and the specific reason ("psibot-yw: GPU runtime requires loginctl

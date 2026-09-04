@@ -482,6 +482,21 @@ def _remote_command(
                 ),
             ]
         )
+        if apply and prune_modified:
+            # The operator accepted the loss; leave what was lost on record
+            # (size, path) beside the receipt before anything is deleted.
+            lines.extend(
+                [
+                    '  elif [ "$modified_files" -gt 0 ] && [ -d "$control" ] '
+                    '&& [ ! -L "$control" ] && ! { '
+                    '(umask 077; timeout 60s find "$code" -xdev -type f '
+                    '-newer "$started_marker" -printf "%s\\t%P\\n" 2>/dev/null '
+                    '| head -n 10000 >"$control/code-pruned.modified.tsv") '
+                    '&& [ -s "$control/code-pruned.modified.tsv" ]; }; then',
+                    '    emit failed "$job_id" "$bytes" modified_list_not_recorded',
+                    "    compact_rc=1",
+                ]
+            )
         if apply:
             lines.extend(
                 [

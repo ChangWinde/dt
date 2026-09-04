@@ -109,6 +109,9 @@ def test_apply_prunes_a_modified_tree_only_when_told_to(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert rows[0][1] == "compacted"
     assert not code.exists()
+    control = Path(job_control_dir(str(tmp_path / "jobs" / "old"), None))
+    listing = (control / "code-pruned.modified.tsv").read_text()
+    assert listing.strip() == "4096\tartifacts/bundle.bin"
 
 
 def test_an_untouched_snapshot_copy_still_compacts(tmp_path):

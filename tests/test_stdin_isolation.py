@@ -64,12 +64,27 @@ def test_non_interactive_forward_call_does_not_drain_the_callers_stdin():
     assert out.strip() == "rc 0"  # nothing but our own line: cat printed nothing
 
 
-def test_interactive_forward_call_keeps_stdin_attached():
+def test_interactive_forward_call_keeps_a_real_terminal_attached():
     out = _child_sees(
         """
+        import sys
         import dt.remote as remote
         remote.ssh_base = lambda: ["sh", "-c", "cat", "ssh"]
+        sys.stdin.isatty = lambda: True  # pretend the pipe is a terminal
         remote.forward_call("head", ["attach"], tty=True)
         """
     )
     assert "REST-OF-SCRIPT" in out
+
+
+def test_tty_forward_from_a_pipe_does_not_drain_the_script_either():
+    """`dt kill` in a piped script: the head prompt could never be answered."""
+    out = _child_sees(
+        """
+        import dt.remote as remote
+        remote.ssh_base = lambda: ["sh", "-c", "cat", "ssh"]
+        rc = remote.forward_call("head", ["kill", "job"], tty=True)
+        print("rc", rc)
+        """
+    )
+    assert out.strip() == "rc 0"

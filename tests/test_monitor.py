@@ -1,4 +1,5 @@
 import json
+import re
 import io
 import os
 import subprocess
@@ -9217,3 +9218,91 @@ def test_metrics_json_empty_telemetry_is_machine_readable(tmp_path, monkeypatch)
         "reasons": {},
         "exit_code": cli.EXIT_NOT_FOUND,
     }
+
+
+def test_info_warns_about_results_written_into_the_code_copy(tmp_path, monkeypatch):
+    """Files newer than the start marker inside code/ are results at risk."""
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entry = JobEntry(
+        job_id="code-writer",
+        name="code-writer",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/code-writer",
+        session="dt_code_writer",
+        cmd="python train.py",
+        status="finished",
+        exit_code=0,
+        created_at=100.0,
+        started_at=110.0,
+        finished_at=120.0,
+        placement_failures={
+            "n2": "node-unfit: GPU runtime requires loginctl Linger=yes"
+        },
+        updated_at=130.0,
+    )
+    cli.jobs_mod.save(cfg, entry)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        info_cmd,
+        "_info_live",
+        lambda *args, **kwargs: {
+            "outputs_size": "0",
+            "code_modified_files": 3,
+            "code_modified_bytes": 3 * 2**20,
+        },
+    )
+    monkeypatch.setattr(cli, "_job_resources", lambda cfg_, entry_: None)
+
+    result = CliRunner().invoke(cli.app, ["info", "code-writer", "--json"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["code_modified_files"] == 3
+    assert data["code_modified_bytes"] == 3 * 2**20
+
+    human = CliRunner().invoke(cli.app, ["info", "code-writer"])
+    assert human.exit_code == 0, human.output
+    flat = " ".join(human.output.split())
+    assert "results in code/" in flat and "3 file(s)" in flat
+    assert "dt pull does not fetch code/" in flat
+    assert "as of" in flat and "(last attempt)" in flat
+
+
+def test_info_live_parses_the_code_modified_field(monkeypatch):
+    entry = JobEntry(
+        job_id="live-probe",
+        name="live-probe",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/live-probe",
+        session="dt_live_probe",
+        cmd="true",
+        status="running",
+    )
+    captured = {}
+
+    def run_on(node, local, command, **kwargs):
+        captured["command"] = command
+        marker = re.search(r"@@DT-[0-9a-f]{32}@@", command).group(0)
+        fields = ["110.5", "", "1M", "", "", "", "", "", "", "2 4096"]
+        return subprocess.CompletedProcess(
+            [], 0, f"\n{marker}\n".join(fields) + "\n", ""
+        )
+
+    monkeypatch.setattr(cli, "run_on", run_on)
+
+    live = info_cmd._info_live(entry)
+
+    assert live["code_modified_files"] == 2 and live["code_modified_bytes"] == 4096
+    assert "-newer" in captured["command"] and "/code" in captured["command"]
