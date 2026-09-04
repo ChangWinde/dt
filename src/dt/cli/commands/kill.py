@@ -29,6 +29,7 @@ from .. import (
     _job_refs,
     _need_head,
 )
+from ...dispatch import remove_staging
 
 
 def _kill_locked(
@@ -126,7 +127,7 @@ def _kill_locked(
         # sanitized exit code when that read is unavailable (also the
         # only completion path for an uncertain launch, whose failed
         # status the refresh probe deliberately leaves alone).
-        entry = jobs_mod._refresh_status_locked(cfg, entry)
+        entry = jobs_mod.refresh_status_locked(cfg, entry)
         if entry.status != "finished":
             entry.status = "finished"
             entry.exit_code = int(detail) if detail is not None else None
@@ -207,7 +208,6 @@ def _kill_one(
             typer.confirm(
                 f"remove queued job {entry.job_id} from the queue?", abort=True
             )
-        from ...dispatch import remove_staging
 
         with jobs_mod.job_lock(cfg, entry.job_id):
             # The queue agent may have started this job after our first read.

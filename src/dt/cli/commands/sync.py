@@ -31,6 +31,7 @@ from .. import (
     _rsync_retry_observer,
     _validated_retries,
 )
+from ... import dispatch as dispatch_mod
 
 
 @dataclass(frozen=True)
@@ -53,9 +54,7 @@ class _SyncRequest:
         cancel_event: Event,
     ) -> tuple[JsonDict, int | None, list[str]]:
         """Sync one node; returns (row, failure exit code, human messages)."""
-        # Resolved at call time so tests can stub dispatch.sync_* per case.
-        from ...dispatch import sync_artifacts, sync_project
-
+        # dispatch_mod.* resolves at call time so tests can stub dispatch.sync_*.
         name = node.name
         messages: list[str] = []
         retry_events: list[JsonDict] = []
@@ -66,7 +65,7 @@ class _SyncRequest:
                 def artifact_progress(message: str) -> None:
                     err.print(f"[dim]{escape(name)}: {escape(message)}[/dim]")
 
-                row = sync_artifacts(
+                row = dispatch_mod.sync_artifacts(
                     cfg,
                     self.project_name,
                     self.project_path,
@@ -81,7 +80,7 @@ class _SyncRequest:
                     cancel_event=cancel_event,
                 )
             else:
-                row = sync_project(
+                row = dispatch_mod.sync_project(
                     cfg,
                     self.project_name,
                     self.project_path,
@@ -325,8 +324,6 @@ def sync(
             )
         raise typer.Exit(rc)
 
-    from ...dispatch import resolve_project
-
     def preflight_error(kind: str, message: str) -> NoReturn:
         if json_:
             print(
@@ -343,7 +340,9 @@ def sync(
         raise typer.Exit(1)
 
     try:
-        project_name, project_cfg = resolve_project(cfg, project, Path.cwd())
+        project_name, project_cfg = dispatch_mod.resolve_project(
+            cfg, project, Path.cwd()
+        )
     except ConfigError as e:
         preflight_error("configuration", str(e))
     by_name = {node.name: node for node in cfg.nodes}

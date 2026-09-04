@@ -29,6 +29,8 @@ from .. import (
     _rsync_retry_observer,
     _validated_retries,
 )
+from ...dispatch import seed_cache_lock
+from ...dispatch import transferred_bytes
 
 
 def _local_tree_apparent_bytes(path: Path) -> int:
@@ -111,7 +113,6 @@ class _SeedRequest:
         }
 
     def seed_node(self, node: Node, *, cancel_event: Event) -> JsonDict:
-        from ...dispatch import transferred_bytes
 
         name = node.name
         retry_events: list[JsonDict] = []
@@ -386,8 +387,6 @@ def seed(
     names = list(dict.fromkeys(nodes))
     cancel_event = Event()
 
-    from ...dispatch import _seed_cache_lock
-
     home = Path.home()
     components: list[JsonDict] = []
     for component_name, src, rel in (
@@ -435,7 +434,7 @@ def seed(
         node = by_name[name]
         if node.local or not components or plan:
             return request.seed_node(node, cancel_event=cancel_event)
-        with _seed_cache_lock(cfg, node, cancel_event=cancel_event):
+        with seed_cache_lock(cfg, node, cancel_event=cancel_event):
             return request.seed_node(node, cancel_event=cancel_event)
 
     def run_all() -> list[JsonDict]:

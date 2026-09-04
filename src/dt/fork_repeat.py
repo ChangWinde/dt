@@ -25,6 +25,8 @@ from .dispatch import (
     NoReachableNode,
     RunSpec,
 )
+from . import agent as agent_mod
+from . import dispatch as dispatch_mod
 
 EXIT_ENV = 3
 EXIT_UNREACHABLE = 5
@@ -34,7 +36,7 @@ JsonDict: TypeAlias = dict[str, Any]
 SCHEMA = "dt_fork_repeat_v1"
 
 
-def _member_name(prefix: str, index: int, repeat: int) -> str:
+def member_name(prefix: str, index: int, repeat: int) -> str:
     """Zero-pad a member index to the width of the largest index.
 
     max(3, ...) keeps names byte-identical for the common repeat<=999 case (so
@@ -435,7 +437,6 @@ class _RepeatProgress:
     def ensure_agent(self, cfg: HeadConfig, entry: jobs_mod.JobEntry) -> None:
         if self.agent_checked:
             return
-        from . import agent as agent_mod
 
         started = agent_mod.ensure_for_queued_job(cfg, entry)
         if entry.status == "queued":
@@ -457,7 +458,6 @@ def _verify_terminal_replay(
     json_: bool,
 ) -> None:
     """Prove a confirmed group's first member still resolves to the same job."""
-    from . import dispatch as dispatch_mod
 
     if request_id is None:
         host.fail_submission(
@@ -467,7 +467,7 @@ def _verify_terminal_replay(
             json_=json_,
         )
     try:
-        replay_spec = build_spec(_member_name(prefix, 1, repeat))
+        replay_spec = build_spec(member_name(prefix, 1, repeat))
         replay_spec.request_id = group_mod.item_request_id(request_id, 1)
         verified_entry = dispatch_mod.submit_fork(
             cfg,
@@ -539,13 +539,12 @@ def _submit_repeat_items(
     json_: bool,
 ) -> None:
     """Submit every member not yet confirmed, in strict prefix order."""
-    from . import dispatch as dispatch_mod
 
     for index in range(len(progress.entries) + 1, repeat + 1):
         if progress.failure is not None or progress.group_terminal_replay:
             break
         item_spec = (
-            spec if index == 1 else build_spec(_member_name(prefix, index, repeat))
+            spec if index == 1 else build_spec(member_name(prefix, index, repeat))
         )
         item_spec.request_id = (
             group_mod.item_request_id(request_id, index)

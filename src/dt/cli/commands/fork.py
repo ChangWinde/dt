@@ -32,6 +32,7 @@ from .. import (
     _submission_payload,
     _validate_submission_request_id,
 )
+from ... import dispatch as dispatch_mod
 
 
 def _fork_repeat_host() -> fork_repeat_mod.Host:
@@ -117,7 +118,6 @@ def _build_fork_spec(
     max_job_memory_mib: int | None,
 ) -> RunSpec:
     """Build one fork RunSpec, applying the cold-cache wrapper and overrides."""
-    from ... import dispatch as dispatch_mod
 
     if inherit_cache:
         item_spec = dispatch_mod.inherited_cache_fork_spec_from_entry(
@@ -505,8 +505,6 @@ def fork(
             json_=json_,
         )
 
-    from ... import dispatch as dispatch_mod
-
     old = _root._find_or_die(cfg, ref, json_=json_)
     old_display_ref = _display_ref_for_entry(cfg, old)
     if max_vram_mib is not None and old.gpus_requested == 0:
@@ -552,9 +550,7 @@ def fork(
         )
 
     prefix = jobs_mod.sanitize_name((name or f"{old.name}-fork").strip())
-    first_name = (
-        name if repeat == 1 else fork_repeat_mod._member_name(prefix, 1, repeat)
-    )
+    first_name = name if repeat == 1 else fork_repeat_mod.member_name(prefix, 1, repeat)
     try:
         spec = build_spec(first_name)
         if repeat == 1:

@@ -24,6 +24,7 @@ from ...render import doctor_table, err
 from ...sshio import RemoteError
 from ...version import parse_version_identity, version_text
 from .. import EXIT_UNREACHABLE, JsonDict
+from ... import agent as agent_mod
 
 _DOCTOR_DEPENDENCIES = (
     "gpu",
@@ -292,7 +293,6 @@ def doctor(
     cfg = _root._cfg()
     if isinstance(cfg, HeadConfig):
         rows = _root.doctor_center(cfg)
-        from ... import agent as agent_mod
 
         n_queued = len(jobs_mod.queued_entries(cfg))
         agent_state = agent_mod.status(cfg)

@@ -97,6 +97,8 @@ from ..install_identity import (
     payload_digest as payload_digest,
 )
 from ..version import version_text
+from .. import agent as agent_mod
+from .. import dispatch as dispatch_mod
 
 EXIT_NO_GPU = 2
 EXIT_ENV = 3
@@ -1249,10 +1251,10 @@ def _sync_task_artifacts_raw(
     """Sync explicit inputs to one task node and return its immutable binding."""
     from rich.markup import escape
 
-    from ..dispatch import resolve_project, sync_artifacts
-
     try:
-        project_name, project_cfg = resolve_project(cfg, project, Path.cwd())
+        project_name, project_cfg = dispatch_mod.resolve_project(
+            cfg, project, Path.cwd()
+        )
     except ConfigError as exc:
         raise _OperationFailure("configuration", str(exc), 1) from exc
     by_name = {node.name: node for node in cfg.nodes}
@@ -1271,7 +1273,7 @@ def _sync_task_artifacts_raw(
         err.print(f"[dim]{escape(server)}: {escape(message)}[/dim]")
 
     try:
-        row = sync_artifacts(
+        row = dispatch_mod.sync_artifacts(
             cfg,
             project_name,
             project_cfg.path,
@@ -1520,7 +1522,6 @@ def _ensure_agent_for(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> bool | None:
 
     Returns None when no start was needed, else start_detached's verdict.
     """
-    from .. import agent as agent_mod
 
     return agent_mod.ensure_for_queued_job(cfg, entry)
 

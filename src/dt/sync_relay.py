@@ -16,7 +16,7 @@ from collections.abc import Callable
 from pathlib import PurePosixPath
 from threading import Event
 
-from .artifact_distribution import _TRANSFERRED_RE, _stat_total, inner_lan_ssh
+from .artifact_distribution import TRANSFERRED_RE, stat_total, inner_lan_ssh
 from .config import HeadConfig, Node
 from .jobs import sanitize_name
 from .link_metrics import PersistentLinkMetrics, site_link_scope
@@ -24,8 +24,8 @@ from .pull_relay import (
     ROUTE_MODES as ROUTE_MODES,
     RelayError as RelayError,
     RelayRoute,
-    _dials_favor_relay,
-    _direct,
+    dials_favor_relay,
+    direct_route,
     relay_topology,
 )
 from .sshio import (
@@ -55,7 +55,7 @@ def decide_sync_route(
     if mode not in ROUTE_MODES:
         raise ValueError(f"unsupported sync route mode: {mode!r}")
     if mode == "direct":
-        return _direct("forced by --route direct")
+        return direct_route("forced by --route direct")
     topology = relay_topology(cfg, node_name)
     if topology.route != "gateway":
         return topology
@@ -67,7 +67,7 @@ def decide_sync_route(
             topology.site,
             "forced by --route gateway",
         )
-    verdict = _dials_favor_relay(topology, resolver)
+    verdict = dials_favor_relay(topology, resolver)
     if verdict is not None:
         return verdict
     return RelayRoute(
@@ -394,7 +394,7 @@ def _retrying_push(
             _record_push_sample(
                 cfg,
                 route,
-                _stat_total(_TRANSFERRED_RE, last.stdout or "") or 0,
+                stat_total(TRANSFERRED_RE, last.stdout or "") or 0,
                 time.monotonic() - started,
             )
             return last

@@ -37,6 +37,8 @@ from ...redaction import redact_home_path
 from ...render import err
 from ...sshio import diagnostic_excerpt
 from .. import JsonDict
+from ... import dispatch as dispatch_mod
+from ...maintenance import clean_deployments
 
 
 @dataclass(frozen=True)
@@ -308,7 +310,6 @@ def _clean_scope_before(
     json_: bool,
 ) -> _CleanScope:
     """Select the live registry rows (and owned results) older than ``before``."""
-    from ...dispatch import clean_job_victims
 
     try:
         cutoff = datetime.strptime(before, "%Y-%m-%d").timestamp()
@@ -319,7 +320,7 @@ def _clean_scope_before(
             exit_code=1,
             json_=json_,
         )
-    preview_victims = clean_job_victims(cfg, cutoff, projects=projects)
+    preview_victims = dispatch_mod.clean_job_victims(cfg, cutoff, projects=projects)
     return _CleanScope(
         before=before,
         cutoff=cutoff,
@@ -498,7 +499,6 @@ def _clean_apply(
     victims = scope.victims
     managed_results = scope.managed_results
     n_victims = len(victims)
-    from ...dispatch import clean_jobs
 
     removed_results = 0
 
@@ -567,7 +567,7 @@ def _clean_apply(
                 shutil.rmtree(expected.path)
                 removed_results += 1
 
-    report = clean_jobs(
+    report = dispatch_mod.clean_jobs(
         cfg,
         cutoff,
         envs=envs,
@@ -579,8 +579,6 @@ def _clean_apply(
     removed_deployments = 0
     deployment_failures = []
     if deployments:
-        from ...maintenance import clean_deployments
-
         deployment_report = clean_deployments(
             cfg,
             cutoff,

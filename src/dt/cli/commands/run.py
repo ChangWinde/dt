@@ -48,6 +48,9 @@ from .. import (
 )
 from .wait import wait
 from .watch import watch
+from ...dispatch import artifact_manifest_identity
+from ... import dispatch as dispatch_mod
+from ... import remote as remote_mod
 
 
 def _read_custom_env_envelope() -> dict[str, str]:
@@ -438,12 +441,11 @@ def _resolve_laptop_run_center(
             "center, pick it explicitly[/red]"
         )
         raise typer.Exit(1)
-    from ...remote import best_center
 
     with err.status("probing all centers..."):
         raw_rows, errors = _root.fan_json(cfg, ["free", "--scheduler-context"])
         rows = cast(list[JsonDict], raw_rows)
-    picked = best_center(
+    picked = remote_mod.best_center(
         rows,
         gpus,
         require_disk_gib=require_disk_gib or 0,
@@ -1043,10 +1045,11 @@ def _submit_request(
                 json_=json_,
             )
         artifact_node = node
-        from ...dispatch import artifact_manifest_identity, resolve_project
 
         try:
-            project, project_cfg = resolve_project(cfg, project, Path.cwd())
+            project, project_cfg = dispatch_mod.resolve_project(
+                cfg, project, Path.cwd()
+            )
             artifact_manifest = artifact_manifest_identity(
                 project,
                 project_cfg.path,

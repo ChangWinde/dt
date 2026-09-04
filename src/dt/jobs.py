@@ -3041,7 +3041,7 @@ def refresh_status(
         current = load(cfg, entry.job_id)
         if current is not None:
             entry = current
-        return _refresh_status_locked(
+        return refresh_status_locked(
             cfg,
             entry,
             timeout,
@@ -3467,7 +3467,7 @@ def _mark_lost_from_probe(
     save(cfg, entry)
 
 
-def _refresh_status_locked(
+def refresh_status_locked(
     cfg: HeadConfig,
     entry: JobEntry,
     timeout: float = 8,

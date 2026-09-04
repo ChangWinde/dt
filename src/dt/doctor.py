@@ -13,6 +13,9 @@ from . import shell
 from .config import ConfigError, HeadConfig, Node, revalidate_project_root
 from .redaction import redact_remote_detail
 from .sshio import RemoteError, run_on
+from .jobs import registry_row_count
+from . import topology_discovery as topology_discovery_mod
+from . import agent as agent_mod
 
 # The node-side capability census; see src/dt/shell/doctor_check.sh.
 CHECK_SNIPPET = shell.load("doctor_check.sh")
@@ -36,9 +39,8 @@ def default_project_status(cfg: HeadConfig) -> str:
 
 def head_capability_checks() -> dict[str, str]:
     """Structured head prerequisites for doctor/automation consumers."""
-    from .agent import supervisor_capabilities
 
-    capabilities = supervisor_capabilities()
+    capabilities = agent_mod.supervisor_capabilities()
     return {
         "bash": "ok" if capabilities["bash"] else "missing",
         "supervisor": (
@@ -156,19 +158,17 @@ def annotate_control_route_classes(
     that bulk data would ride the tunnel too, with the raw observed peer
     addresses never rendered (ADR 0024).
     """
-    from .topology_discovery import (
-        classify_control_route,
-        local_interface_addresses,
-        resolved_ssh_options,
-        safe_connection_address,
-    )
 
-    head_addresses = local_interface_addresses()
+    head_addresses = topology_discovery_mod.local_interface_addresses()
     nodes = {node.name: node for node in cfg.nodes}
     for row in rows:
         checks = row.get("checks", {})
-        client = safe_connection_address(checks.pop("peer", None))
-        server = safe_connection_address(checks.pop("peer_server", None))
+        client = topology_discovery_mod.safe_connection_address(
+            checks.pop("peer", None)
+        )
+        server = topology_discovery_mod.safe_connection_address(
+            checks.pop("peer_server", None)
+        )
         node = nodes.get(str(row.get("node")))
         if node is None:
             continue
@@ -177,11 +177,11 @@ def annotate_control_route_classes(
             continue
         if checks.get("ssh") != "ok":
             continue
-        route_class = classify_control_route(
+        route_class = topology_discovery_mod.classify_control_route(
             node,
             client_address=client,
             server_address=server,
-            ssh_options=resolved_ssh_options(node),
+            ssh_options=topology_discovery_mod.resolved_ssh_options(node),
             head_addresses=head_addresses,
         )
         if route_class.label in {"relayed", "proxied"}:
@@ -227,7 +227,6 @@ REGISTRY_ADVISORY_ROWS = 2000
 
 def registry_growth_status(cfg: HeadConfig) -> str:
     """One advisory label about registry size for the head's doctor row."""
-    from .jobs import registry_row_count
 
     rows = registry_row_count(cfg)
     if rows < REGISTRY_ADVISORY_ROWS:

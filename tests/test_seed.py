@@ -29,7 +29,7 @@ def _local_seed_sources(tmp_path):
 
 
 def test_seed_cache_lock_serializes_same_node(tmp_path):
-    from dt.dispatch import _seed_cache_lock
+    from dt.dispatch import seed_cache_lock
 
     cfg = _cfg(tmp_path)
     node = cfg.nodes[0]
@@ -39,14 +39,14 @@ def test_seed_cache_lock_serializes_same_node(tmp_path):
     release_first = threading.Event()
 
     def first():
-        with _seed_cache_lock(cfg, node):
+        with seed_cache_lock(cfg, node):
             first_entered.set()
             assert release_first.wait(1)
 
     def second():
         assert first_entered.wait(1)
         second_attempted.set()
-        with _seed_cache_lock(cfg, node):
+        with seed_cache_lock(cfg, node):
             second_entered.set()
 
     first_thread = threading.Thread(target=first)

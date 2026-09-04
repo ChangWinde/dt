@@ -12,10 +12,10 @@ from dt.artifact_distribution import (
     DistributionError,
     TransferExecutor,
     _FILES_RE,
-    _TRANSFERRED_RE,
+    TRANSFERRED_RE,
     _destination_prepare_rsync_path,
     _route_failure_kind,
-    _stat_total,
+    stat_total,
 )
 from dt.config import HeadConfig, Node, Site
 from dt.jobs import JobEntry, job_lock, save
@@ -84,12 +84,12 @@ def _stats(bytes_: int, files: int) -> str:
     ("pattern", "line", "expected"),
     [
         (
-            _TRANSFERRED_RE,
+            TRANSFERRED_RE,
             "Total transferred file size: 3.145.728 bytes\n",
             3_145_728,
         ),
         (
-            _TRANSFERRED_RE,
+            TRANSFERRED_RE,
             "Total transferred file size: 9,007,199,254,740,993 bytes\n",
             9_007_199_254_740_993,
         ),
@@ -101,7 +101,7 @@ def _stats(bytes_: int, files: int) -> str:
     ],
 )
 def test_rsync_stats_parse_localized_integral_counts_exactly(pattern, line, expected):
-    assert _stat_total(pattern, line) == expected
+    assert stat_total(pattern, line) == expected
 
 
 def _topology_cfg(tmp_path):

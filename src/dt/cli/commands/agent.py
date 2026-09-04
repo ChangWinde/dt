@@ -14,6 +14,7 @@ from ... import jobs as jobs_mod
 from ...config import ConfigError, HeadConfig, LaptopConfig, load
 from ...render import compact_path, err
 from .. import JsonDict, _format_transfer_bytes, _need_head, _typed_cli_decorator
+from ... import agent as agent_mod
 
 agent_app = typer.Typer(
     no_args_is_help=True, help="Queue agent: dispatches queued jobs when cards free up."
@@ -63,7 +64,6 @@ def agent_run(
 ) -> None:
     """Run the agent loop in the foreground (what crontab @reboot starts)."""
     _agent_forward(["run"], center)
-    from ... import agent as agent_mod
 
     raise typer.Exit(agent_mod.run_loop(_need_head(_root._cfg())))
 
@@ -74,7 +74,6 @@ def agent_start(
 ) -> None:
     """Start the agent in the background (log path is shown on success)."""
     _agent_forward(["start"], center)
-    from ... import agent as agent_mod
 
     cfg = _need_head(_root._cfg())
     if agent_mod.alive_pid(cfg) is not None:
@@ -98,7 +97,6 @@ def agent_stop(
 ) -> None:
     """Stop the running agent (queued jobs stay queued)."""
     _agent_forward(["stop"], center)
-    from ... import agent as agent_mod
 
     cfg = _need_head(_root._cfg())
     if agent_mod.stop_agent(cfg):
@@ -130,7 +128,6 @@ def agent_status(
                 + (["--json"] if json_ else []),
             )
         )
-    from ... import agent as agent_mod
 
     head_cfg = _need_head(cfg)
     st = agent_mod.status(head_cfg)
@@ -277,7 +274,6 @@ def agent_install(
 ) -> None:
     """Install a restartable user service (or a visible cron fallback)."""
     _agent_forward(["install"], center)
-    from ... import agent as agent_mod
 
     cfg = _need_head(_root._cfg())
     result = agent_mod.install_supervisor(cfg)

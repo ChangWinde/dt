@@ -47,6 +47,7 @@ from .private_state import (
 )
 from .snapshot_store import load_state, lock, save_state
 from .sshio import diagnostic_excerpt
+from .config import Node
 
 Log = Callable[[str], None]
 BeforeRegistryRemove = Callable[[JobEntry], None]
@@ -892,7 +893,6 @@ def _managed_job_dir(cfg: HeadConfig, entry: JobEntry) -> str | None:
         if node is None:
             if entry.node != "-":
                 return None
-            from .config import Node
 
             node = Node(name="-")
         if entry.worker_root is None:

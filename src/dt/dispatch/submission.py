@@ -69,6 +69,7 @@ from . import (
     waiting_capacity_reason,
     waiting_unreachable_reason,
 )
+from .. import submission_group as group_mod
 
 
 def _predecessor_outputs_destination(job_dir: str, layout: str | None) -> str:
@@ -884,8 +885,6 @@ def _submit_prepared(
             # Single- and multi-job requests share one public identity
             # namespace and the same lock.  A key claimed by a parent group
             # must never be silently reused for an unrelated single launch.
-            from .. import submission_group as group_mod
-
             group_record = group_mod.load(cfg, request_id)
             record = intent_mod.load(cfg, request_id)
         except (intent_mod.RequestRecordError, group_mod.GroupRequestError) as exc:

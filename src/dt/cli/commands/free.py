@@ -25,6 +25,8 @@ from .. import (
     _fan_failure_exit_code,
     _sleep_for_poll_interval,
 )
+from ... import agent as agent_mod
+from ...scheduler import scheduler_snapshot
 
 
 def _free_scheduler_context(
@@ -32,7 +34,6 @@ def _free_scheduler_context(
     resources: list[JsonDict] | None = None,
 ) -> JsonDict:
     """One local registry read that explains dt-owned idle or queued capacity."""
-    from ... import agent as agent_mod
 
     try:
         damage: list[jobs_mod.RegistryDamage] = []
@@ -45,7 +46,6 @@ def _free_scheduler_context(
         head = queued[0] if queued else None
         agent_pid = agent_mod.alive_pid(cfg)
         health = agent_mod.heartbeat_health(cfg, alive=agent_pid is not None)
-        from ...scheduler import scheduler_snapshot
 
         model = scheduler_snapshot(
             cfg,

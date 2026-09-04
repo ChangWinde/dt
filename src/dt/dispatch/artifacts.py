@@ -469,7 +469,7 @@ def _private_remote_directories(*paths: str) -> str:
 
 
 @contextmanager
-def _seed_cache_lock(
+def seed_cache_lock(
     cfg: HeadConfig,
     node: Node,
     *,

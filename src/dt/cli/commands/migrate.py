@@ -12,6 +12,7 @@ from ...config import LaptopConfig
 from ...layout import ROLE_LAYOUT
 from ...render import err
 from .. import _fail_submission, _format_transfer_bytes, _typed_cli_decorator
+from ...migration import apply_layout, plan_layout
 
 migrate_app = typer.Typer(
     no_args_is_help=True,
@@ -69,8 +70,6 @@ def migrate_layout(
             exit_code=1,
             json_=json_,
         )
-
-    from ...migration import apply_layout, plan_layout
 
     payload = (
         apply_layout(
