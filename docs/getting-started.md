@@ -13,7 +13,11 @@ worker hosts require:
 - non-interactive OpenSSH connectivity;
 - rsync, tmux, flock, and timeout;
 - an organization-approved `uv` installation;
-- NVIDIA drivers and `nvidia-smi` on GPU nodes.
+- NVIDIA drivers and `nvidia-smi` on GPU nodes;
+- on GPU nodes, a user systemd instance with lingering enabled for the dt
+  account (`loginctl enable-linger "$(id -un)"`, usually allowed without
+  sudo). GPU jobs fail closed as `node-unfit` on a node without it; `dt doctor`
+  reports the state and the fix.
 
 DistTrainer assumes the same trusted Unix identity across the configured hosts.
 Read the [security policy](../.github/SECURITY.md) before operating across a
