@@ -706,7 +706,9 @@ def test_control_capture_budget_bounds_32_concurrent_hostile_streams():
                 pool.map(
                     lambda _index: sshio.run_local(
                         command,
-                        timeout=5,
+                        # 32 interpreters under full-suite load need headroom; the
+                        # property under test is the capture bound, not speed
+                        timeout=30,
                         workload=sshio.SSHWorkload.CONTROL,
                     ),
                     range(32),
