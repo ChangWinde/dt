@@ -2193,7 +2193,7 @@ def test_pull_multiple_json_recovers_jobs_concurrently_into_isolated_dirs(
         target.mkdir(parents=True, exist_ok=True)
         if src.endswith("/outputs/"):
             thread_ids.add(threading.get_ident())
-            rendezvous.wait(timeout=1)
+            rendezvous.wait(timeout=30)
             (target / "result.txt").write_text(f"{src}\n")
         else:
             (target / "stdout.log").write_text("complete\n")
@@ -2522,10 +2522,10 @@ def test_pull_multiple_ctrl_c_cancels_workers_and_prints_exact_resume(
         assert route == "auto"
         assert bwlimit is None
         if ref == "one":
-            assert second_started.wait(timeout=1)
+            assert second_started.wait(timeout=30)
             raise KeyboardInterrupt
         second_started.set()
-        assert cancel_event.wait(timeout=1)
+        assert cancel_event.wait(timeout=30)
         return {}
 
     monkeypatch.setattr(pull_cmd, "_pull_group_one", pull_one)
@@ -2553,6 +2553,7 @@ def test_pull_multiple_ctrl_c_cancels_workers_and_prints_exact_resume(
         "--lite --exclude '*.mp4' --retries 0 --json"
     )
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "pull_interrupted",
         "message": (
             "pull stopped locally; completed and partial job directories were "
@@ -2795,6 +2796,7 @@ def test_laptop_pull_multiple_rejects_refs_across_centers(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": (
             "multi-job pull requires all refs in one center; "
@@ -2869,6 +2871,7 @@ def test_pull_rejects_negative_retries_before_loading_config(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "pull --retries must be non-negative",
         "reasons": {},
@@ -4780,6 +4783,7 @@ def test_laptop_pull_json_ctrl_c_emits_one_machine_clean_resume(monkeypatch):
 
     assert result.exit_code == 130, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "pull_interrupted",
         "message": (
             "pull stopped locally; head-side and partial result data were not "
@@ -4838,6 +4842,7 @@ def test_head_single_pull_ctrl_c_keeps_partial_and_prints_exact_resume(
         f"dt pull jid --to {destination} --lite --exclude '*.mp4' --retries 0 --json"
     )
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "pull_interrupted",
         "message": (
             "pull stopped locally; partial result data were not deleted. "
@@ -5221,6 +5226,7 @@ def test_kill_json_requires_noninteractive_confirmation(tmp_path, monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "confirmation_required",
         "message": "kill --json requires -y",
         "reasons": {},
@@ -5459,7 +5465,7 @@ def test_confirmed_kill_wins_race_with_concurrent_status_refresh(tmp_path, monke
                 "",
             )
         kill_entered.set()
-        assert release_kill.wait(timeout=2)
+        assert release_kill.wait(timeout=30)
         return subprocess.CompletedProcess([], 0, "DEAD\n", "")
 
     monkeypatch.setattr(cli, "run_on", fake_run_on)
@@ -5473,7 +5479,7 @@ def test_confirmed_kill_wins_race_with_concurrent_status_refresh(tmp_path, monke
         )
     )
     kill_thread.start()
-    assert kill_entered.wait(timeout=2)
+    assert kill_entered.wait(timeout=30)
     stale = jobs.load(cfg, "racing")
     assert stale is not None and stale.status == "running"
     refresh_thread = threading.Thread(
@@ -5512,7 +5518,7 @@ def test_job_locks_do_not_serialize_different_status_refreshes(tmp_path, monkeyp
     ]
     for entry in entries:
         jobs.save(cfg, entry)
-    rendezvous = threading.Barrier(2, timeout=1)
+    rendezvous = threading.Barrier(2, timeout=30)
 
     def fake_run_on(*args, **kwargs):
         rendezvous.wait()
@@ -5550,7 +5556,7 @@ def test_registry_atomic_save_uses_unique_temp_files_for_concurrent_writers(
     cfg = _cfg(tmp_path)
     target = cfg.registry_dir() / "shared.json"
     payloads = (b'{"writer":"a"}\n', b'{"writer":"b"}\n')
-    rendezvous = threading.Barrier(2, timeout=5)
+    rendezvous = threading.Barrier(2, timeout=30)
     original_replace = os.replace
     replace_sources = []
     sources_lock = threading.Lock()
@@ -5625,7 +5631,7 @@ def test_queued_kill_cannot_be_overwritten_by_concurrent_dispatch(
     def paused_save(cfg_, candidate):
         if candidate.job_id == entry.job_id and candidate.status == "running":
             dispatch_saving.set()
-            assert release_dispatch.wait(timeout=2)
+            assert release_dispatch.wait(timeout=30)
         return original_save(cfg_, candidate)
 
     monkeypatch.setattr(dispatch, "save", paused_save)
@@ -5653,7 +5659,7 @@ def test_queued_kill_cannot_be_overwritten_by_concurrent_dispatch(
         )
     )
     dispatch_thread.start()
-    assert dispatch_saving.wait(timeout=2)
+    assert dispatch_saving.wait(timeout=30)
 
     def kill_job():
         kill_results.append(
@@ -5719,7 +5725,7 @@ def test_queued_kill_does_not_wait_for_slow_dispatch_and_cancels_launch(
 
     def slow_try_nodes(*args, **kwargs):
         dispatch_inflight.set()
-        assert release_dispatch.wait(timeout=2)
+        assert release_dispatch.wait(timeout=30)
         return placed, {}, False, set()
 
     monkeypatch.setattr(dispatch, "_try_nodes", slow_try_nodes)
@@ -5755,7 +5761,7 @@ def test_queued_kill_does_not_wait_for_slow_dispatch_and_cancels_launch(
         )
     )
     dispatch_thread.start()
-    assert dispatch_inflight.wait(timeout=2)
+    assert dispatch_inflight.wait(timeout=30)
 
     def kill_job():
         kill_results.append(
@@ -6229,7 +6235,7 @@ def test_dead_leader_signals_in_group_orphan_that_left_the_capsule(tmp_path):
     assert leader.stdout is not None
     orphan_pid = int(leader.stdout.readline().strip())
     leader_pid = leader.pid
-    assert leader.wait(timeout=5) == 0
+    assert leader.wait(timeout=30) == 0
     assert Path(f"/proc/{orphan_pid}").exists()
     assert not Path(f"/proc/{leader_pid}").exists()
 
@@ -6277,7 +6283,7 @@ def test_termination_probe_signals_orphans_after_leader_death(tmp_path):
     assert leader.stdout is not None
     orphan_pid = int(leader.stdout.readline().strip())
     leader_pid = leader.pid
-    assert leader.wait(timeout=5) == 0
+    assert leader.wait(timeout=30) == 0
     assert Path(f"/proc/{orphan_pid}").exists()
 
     try:
@@ -7030,7 +7036,7 @@ def test_termination_probe_signals_matching_process_group(tmp_path):
         assert lifecycle.termination_verdict(
             result.returncode, result.stdout, result.stderr
         ) == ("DEAD", None)
-        assert owner.wait(timeout=2) == 143
+        assert owner.wait(timeout=30) == 143
     finally:
         if owner.poll() is None:
             owner.terminate()

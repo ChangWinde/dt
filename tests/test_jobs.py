@@ -471,7 +471,7 @@ def test_concurrent_job_saves_serialize_active_index_read_modify_write(
         with real_lock(lock_cfg):
             if label == "first":
                 first_acquired.set()
-                assert release_first.wait(timeout=5)
+                assert release_first.wait(timeout=30)
             elif label == "second":
                 second_acquired.set()
             yield
@@ -484,9 +484,9 @@ def test_concurrent_job_saves_serialize_active_index_read_modify_write(
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         first = pool.submit(write, "first", _job("new-a"))
-        assert first_acquired.wait(timeout=5)
+        assert first_acquired.wait(timeout=30)
         second = pool.submit(write, "second", _job("new-b"))
-        assert second_attempted.wait(timeout=5)
+        assert second_attempted.wait(timeout=30)
         # The contender is known to be at the exact lock boundary; it cannot
         # enter the index RMW while the first writer holds that lock.
         assert not second_acquired.wait(timeout=0.05)

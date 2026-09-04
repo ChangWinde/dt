@@ -143,6 +143,7 @@ def test_seed_rejects_negative_retries_before_config(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "seed --retries must be non-negative",
         "reasons": {},
@@ -470,9 +471,11 @@ def test_seed_json_rejects_unknown_nodes_before_remote_access(tmp_path, monkeypa
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "unknown_node",
         "message": "unknown node(s) ['missing']; configured: ['n1']",
         "exit_code": 1,
+        "reasons": {},
     }
 
 

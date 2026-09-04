@@ -454,6 +454,14 @@ def kill(
             json_=True,
         )
     cfg = _root._cfg()
+    if not yes and not sys.stdin.isatty():
+        # No prompt can be answered; say so once, in the caller's format.
+        _fail_submission(
+            kind="confirmation_required",
+            message="non-interactive kill needs -y",
+            exit_code=1,
+            json_=json_,
+        )
     if isinstance(cfg, LaptopConfig):
         if json_:
             _kill_via_laptop_json(cfg, refs, force=force, sweep=sweep)

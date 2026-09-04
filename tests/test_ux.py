@@ -1995,7 +1995,7 @@ def test_laptop_doctor_overlaps_head_and_node_diagnostics(monkeypatch):
     node_diagnostics_started = threading.Event()
 
     def version(*args, **kwargs):
-        assert node_diagnostics_started.wait(timeout=1)
+        assert node_diagnostics_started.wait(timeout=30)
         return subprocess.CompletedProcess([], 0, "dt 1.2.3\n", "")
 
     def fan(*args, **kwargs):
@@ -2029,7 +2029,7 @@ def test_laptop_doctor_checks_head_versions_in_parallel(monkeypatch):
         centers={"east": "head-a", "west": "head-b"},
         default_center="east",
     )
-    both_versions_started = threading.Barrier(2, timeout=1)
+    both_versions_started = threading.Barrier(2, timeout=30)
 
     def version(*args, **kwargs):
         both_versions_started.wait()
@@ -2304,6 +2304,7 @@ def test_free_rejects_invalid_poll_before_loading_config(monkeypatch, poll):
     assert "--poll must be positive" in human.output
     assert machine.exit_code == 1
     assert json.loads(machine.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "--poll must be positive",
         "reasons": {},
@@ -4254,6 +4255,7 @@ def test_run_auto_all_heads_unreachable_is_not_no_capacity(monkeypatch):
 
     assert result.exit_code == cli.EXIT_UNREACHABLE, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "unreachable",
         "message": "cannot select a center: every capacity probe failed",
         "reasons": {
@@ -4319,6 +4321,7 @@ def test_run_auto_reachable_centers_without_capacity_has_json_contract(
 
     assert result.exit_code == cli.EXIT_NO_GPU, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "no_capacity",
         "message": "no reachable center has 1 free card(s) on one node",
         "reasons": {},

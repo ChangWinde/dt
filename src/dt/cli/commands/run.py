@@ -1122,7 +1122,7 @@ def _follow_submitted_job(
     direct_ref = cast(list[str], job_id)
     completed = watch(direct_ref, poll, lines, json_, True)
     if completed:
-        wait(direct_ref, poll, lines, json_, True, True)
+        wait(direct_ref, poll, lines, json_, True, True, timeout=None)
     else:
         _print_monitor_stopped(job_id)
 

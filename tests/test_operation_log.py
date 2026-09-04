@@ -398,6 +398,7 @@ def test_events_head_rejects_center_with_json_error(tmp_path, monkeypatch):
 
     assert result.exit_code == 1, result.output
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "--center is available only in laptop mode",
         "reasons": {},

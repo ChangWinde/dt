@@ -96,6 +96,7 @@ _FORWARDED_COMMANDS = [
     ("diagnose", None, set(), set()),
     ("compare", None, set(), {"file"}),
     ("watch", None, set(), {"file"}),
+    ("wait", None, set(), {"file"}),
     ("metrics", None, set(), set()),
     ("rerun", None, set(), set()),
     ("exec_job", None, set(), set()),

@@ -14,7 +14,10 @@ CI shell exporting them flips dozens of rendering assertions. Drop them so
 the suite always observes DT's own defaults.
 """
 
+import atexit
 import os
+import shutil
+import tempfile
 
 import pytest
 
@@ -31,6 +34,45 @@ for _ambient_terminal_variable in (
     "CLICOLOR_FORCE",
 ):
     os.environ.pop(_ambient_terminal_variable, None)
+
+# The suite must never touch the developer's real SSH state (control sockets,
+# generated config) nor reach a real host: the fixture below fails any test that
+# spawns ssh/rsync/scp unless it opts in with @pytest.mark.real_transport.
+_SSH_STATE = tempfile.mkdtemp(prefix="dt-test-ssh-")
+os.environ["DT_SSH_STATE_DIR"] = _SSH_STATE
+atexit.register(shutil.rmtree, _SSH_STATE, True)
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_transport: the test deliberately runs the real ssh/rsync binary",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_real_transport(request):
+    """Fail a test that reaches a real ssh/rsync/scp process without opting in."""
+    import dt.sshio as sshio
+
+    spawned: list[list[str]] = []
+    original = sshio._run_bounded_process
+
+    def guarded(cmd, **kwargs):
+        if cmd and os.path.basename(cmd[0]) in {"ssh", "rsync", "scp"}:
+            spawned.append([str(part)[:80] for part in cmd[:8]])
+        return original(cmd, **kwargs)
+
+    sshio._run_bounded_process = guarded
+    try:
+        yield
+    finally:
+        sshio._run_bounded_process = original
+    if spawned and request.node.get_closest_marker("real_transport") is None:
+        pytest.fail(
+            "test spawned a real transport process; stub the seam it reached "
+            f"(sshio.run_on, dispatch stubs, ...) or mark real_transport: {spawned[:3]}"
+        )
 
 
 @pytest.fixture(autouse=True)

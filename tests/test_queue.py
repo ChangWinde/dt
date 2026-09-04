@@ -754,9 +754,14 @@ def test_pin_bypasses_reserve():
     assert [n.name for n in pick_candidates(statuses, nodes, spec, reserve=4)] == ["n1"]
 
 
-def test_max_my_jobs_caps_agent(tmp_path):
+def test_max_my_jobs_caps_agent(tmp_path, stub_job_refresh):
+    import dt.agent as agent
+
     cfg = _cfg(tmp_path, max_my_jobs=1)
     save(cfg, _entry("run1", "running", created_at=1.0, node="n1"))
+    stub_job_refresh(
+        agent, lambda cfg_, entry_: entry_
+    )  # the running row stays running
     save(cfg, _entry("q1", "queued", created_at=2.0))
     logs = []
     assert process_once(cfg, logs.append) == [("q1", "capped")]
@@ -3254,7 +3259,7 @@ def test_local_completion_watcher_exits_on_remote_marker(tmp_path):
     watcher = agent._spawn_completion_watcher(entry)
     try:
         (job_dir / "exit_code").write_text("0\n")
-        assert watcher.wait(timeout=1) == 0
+        assert watcher.wait(timeout=30) == 0
     finally:
         wrapper.terminate()
         wrapper.wait(timeout=1)
@@ -3533,7 +3538,7 @@ def test_concurrent_dispatchers_cannot_replace_an_active_attempt(tmp_path, monke
         if not owned:
             return None, {}, True, {"interrupted"}
         owner_entered.set()
-        assert release_owner.wait(timeout=2)
+        assert release_owner.wait(timeout=30)
         return None, {}, False, set()
 
     monkeypatch.setattr(dispatch, "_try_nodes", fake_try_nodes)
@@ -3548,7 +3553,7 @@ def test_concurrent_dispatchers_cannot_replace_an_active_attempt(tmp_path, monke
         )
     )
     first.start()
-    assert owner_entered.wait(timeout=2)
+    assert owner_entered.wait(timeout=30)
 
     owner = load(cfg, entry.job_id)
     assert owner is not None

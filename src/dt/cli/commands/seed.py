@@ -371,19 +371,7 @@ def seed(
     unknown = [name for name in nodes if name not in by_name]
     if unknown:
         message = f"unknown node(s) {unknown}; configured: {list(by_name)}"
-        if json_:
-            print(
-                json.dumps(
-                    {
-                        "error": "unknown_node",
-                        "message": message,
-                        "exit_code": 1,
-                    }
-                )
-            )
-        else:
-            err.print(f"[red]{escape(message)}[/red]")
-        raise typer.Exit(1)
+        _fail_submission(kind="unknown_node", message=message, exit_code=1, json_=json_)
     names = list(dict.fromkeys(nodes))
     cancel_event = Event()
 

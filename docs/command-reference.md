@@ -3,6 +3,13 @@
 This page helps operators choose a command and handle its result. Run
 `dt COMMAND --help` for the exact option set installed on a machine.
 
+## Setup commands
+
+| Command | Purpose |
+|---|---|
+| `dt init` | Write a head or laptop configuration from a few answers |
+| `dt contract` | Describe every command, option, exit code, and the error shape as one JSON document |
+
 ## Everyday commands
 
 | Command | Purpose |
@@ -296,6 +303,46 @@ truncated or malformed records were skipped. Raw command arguments and
 exception messages are deliberately absent; use the correlated job, request,
 or agent evidence for authorized detail.
 
+## Discovering the surface: `dt contract --json`
+
+`dt contract --json` returns one `dt_contract_v1` document derived from the
+same metadata that renders `--help`: every visible command with its arguments
+and options (name, flags, type, default, whether it repeats), whether it
+speaks `--json` and what it prints there (`json_shape` is `object` or `array`;
+`emits` lists the `schema_version` ids a consumer can meet), whether it is
+destructive and which flag replaces its prompt (`confirmation_flag`) or
+previews it (`plan_flag`), hidden short aliases, the exit-code table below, and
+the error document described next. Tool builders
+generate exact function definitions from it instead of scraping help text;
+`dt contract` without `--json` prints a compact summary for humans.
+
+## Errors under `--json`
+
+Whatever fails before a command can produce its own payload — configuration,
+usage, an unknown reference, an unreachable head, a refused confirmation, a
+preflight rejection — stdout carries exactly one `dt_cli_error_v1` document
+and the process exits with the code it names:
+
+```json
+{"schema_version": "dt_cli_error_v1", "error": "confirmation_required",
+ "message": "non-interactive kill needs -y", "exit_code": 1, "reasons": {}}
+```
+
+The five keys are always present. `error` is a stable machine kind (for
+example `usage`, `configuration`, `not_found`, `unreachable`, `no_capacity`,
+`confirmation_required`, `invalid_argument`; `dt contract --json` lists every
+kind this version can emit with its meaning), `message` is the human
+explanation, and `reasons` maps nodes or items to their own detail when the
+failure has structured parts (placement rejections list every candidate
+node) and is empty otherwise. Commands that reach their own payload report
+failures inside it (`status: "error"` rows in `pull`, `wait`, `compare`),
+because those carry partial results that are still worth keeping.
+
+Destructive commands that would prompt (`kill`, `clean`, `compact`) never
+block a non-interactive caller: without `-y` they return
+`confirmation_required` immediately, and `--plan` remains the read-only
+preview.
+
 ## Exit codes
 
 General command codes:
@@ -308,10 +355,12 @@ General command codes:
 | 3 | Remote environment or setup failure |
 | 4 | Requested local object or path not found |
 | 5 | Required host or center unreachable |
+| 126 | `dt wait --timeout` elapsed; the job is still active and was not cancelled |
 | 130 | Local interruption; registered remote jobs continue unless explicitly killed |
 
 `dt wait` reserves 65 through 69 for terminal job states, while 0 through 125
-otherwise carry the experiment result. The reservation is enforced: an
+otherwise carry the experiment result; `--timeout SECONDS` returns 126 with the
+job's current state and a resume command when the bound elapses. The reservation is enforced: an
 experiment process that itself exits 65 through 69 is reported as 64 (just as
 codes above 125 clamp to 125), and `--json` always carries the untruncated
 `exit_code`. See [Operations](operations.md) for the mapping.

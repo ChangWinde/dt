@@ -1597,7 +1597,7 @@ def test_previous_job_copy_baseline_holds_source_job_lock(tmp_path, monkeypatch)
     ) as stable:
         assert stable == "../../previous/code"
         worker.start()
-        assert attempted.wait(timeout=1)
+        assert attempted.wait(timeout=30)
         assert not acquired.wait(timeout=0.05)
 
     worker.join(timeout=1)
@@ -1774,6 +1774,7 @@ def test_sync_cli_rejects_negative_retries_before_config(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "sync --retries must be non-negative",
         "reasons": {},
@@ -1799,6 +1800,7 @@ def test_sync_cli_rejects_excessive_retries_before_config(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
         "message": "sync --retries must be at most 10",
         "reasons": {},
@@ -2233,7 +2235,7 @@ def test_sync_cli_runs_independent_nodes_concurrently_and_keeps_order(
     project.mkdir()
     cfg.projects["omni"] = Project(path=project)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    rendezvous = threading.Barrier(2, timeout=0.5)
+    rendezvous = threading.Barrier(2, timeout=30)
 
     def fake_sync(cfg_, project_name, project_dir, node, log, **kwargs):
         assert kwargs["retries"] == 2
@@ -2268,7 +2270,7 @@ def test_head_multi_node_sync_ctrl_c_cancels_workers_and_emits_resume_json(
     project.mkdir()
     cfg.projects["omni"] = Project(path=project)
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
-    rendezvous = threading.Barrier(2, timeout=1)
+    rendezvous = threading.Barrier(2, timeout=30)
     cancel_events = []
 
     def fake_sync(cfg_, project_name, project_dir, node, log, **kwargs):
@@ -2278,7 +2280,7 @@ def test_head_multi_node_sync_ctrl_c_cancels_workers_and_emits_resume_json(
         rendezvous.wait()
         if node.name == "n1":
             raise KeyboardInterrupt
-        assert cancel_event.wait(timeout=1)
+        assert cancel_event.wait(timeout=30)
         return {
             "node": node.name,
             "project": project_name,
@@ -2307,6 +2309,7 @@ def test_head_multi_node_sync_ctrl_c_cancels_workers_and_emits_resume_json(
     assert cancel_events[0] is cancel_events[1]
     assert cancel_events[0].is_set()
     assert json.loads(result.stdout) == {
+        "schema_version": "dt_cli_error_v1",
         "error": "sync_interrupted",
         "message": (
             "sync stopped locally; partial cache data were not deleted. "

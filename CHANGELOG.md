@@ -6,8 +6,31 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `dt wait --timeout SECONDS`: bound an automated wait. When the bound elapses
+  the command reports the job's current state and an exact resume command,
+  exits 126 (a code no experiment result can produce), and leaves the job
+  running; `--json` carries `wait_deadline_reached`, `wait_timeout_s`, and
+  `resume`. Multi-job waits apply the same deadline to every job.
+- `dt contract --json`: one `dt_contract_v1` document describing every visible
+  command with its arguments, options (flags, type, default, repeat), `--json`
+  support with the top-level shape and the schema ids it emits, destructive
+  status with its confirmation and plan flags, aliases, the exit-code table, and
+  the error document shape together with every `error` kind this version can
+  emit and what each means. It is derived from the
+  same metadata that renders `--help`, so it cannot drift from it.
+
 ### Changed
 
+- Every failure a command reports under `--json` before it can produce its own
+  payload is now one `dt_cli_error_v1` document with the same five keys
+  (`schema_version`, `error`, `message`, `exit_code`, `reasons`). Submission
+  errors gain `schema_version`; `seed`, `sync`, `events`, and `init` errors gain
+  `schema_version` and an empty `reasons`; `dt events` no longer labels its
+  error with the query schema id. `kill` and `clean` without `-y` in a
+  non-interactive session return `confirmation_required` (as `compact` already
+  did) instead of a human line and a bare exit code.
 - Best-effort failures that dt deliberately swallows (link-metrics
   bookkeeping, optional resource telemetry, tab-completion configuration, the
   agent pid read) are now noted once per kind in the agent log and, with

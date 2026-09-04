@@ -325,19 +325,7 @@ def sync(
         raise typer.Exit(rc)
 
     def preflight_error(kind: str, message: str) -> NoReturn:
-        if json_:
-            print(
-                json.dumps(
-                    {
-                        "error": kind,
-                        "message": message,
-                        "exit_code": 1,
-                    }
-                )
-            )
-        else:
-            err.print(f"[red]{escape(message)}[/red]")
-        raise typer.Exit(1)
+        _fail_submission(kind=kind, message=message, exit_code=1, json_=json_)
 
     try:
         project_name, project_cfg = dispatch_mod.resolve_project(

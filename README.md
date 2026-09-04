@@ -133,6 +133,11 @@ dt ps --compact --active --limit 50 --json
 dt ps --compact --issues --fields job_id,status,node,reason --limit 50 --json
 ```
 
+For a tool builder, `dt contract --json` describes every command, option,
+exit code, and the one error shape (`dt_cli_error_v1`) any `--json` failure
+returns; `dt wait JOB --timeout 1800 --json` bounds a wait and reports the
+job's state with exit 126 instead of blocking.
+
 ## Command map
 
 | Goal | Commands |
@@ -141,6 +146,7 @@ dt ps --compact --issues --fields job_id,status,node,reason --limit 50 --json
 | Submit work | `dt run`, `dt batch`, `dt chain`, `dt request` |
 | Observe work | `dt events`, `dt ps`, `dt info`, `dt diagnose`, `dt logs`, `dt metrics` |
 | Wait or recover | `dt wait`, `dt pull`, `dt attach` |
+| Build tools on dt | `dt contract` |
 | Iterate | `dt rerun`, `dt fork`, `dt exec`, `dt compare` |
 | Operate the service | `dt agent`, `dt storage`, `dt migrate`, `dt compact`, `dt clean`, `dt kill` |
 | Prepare remote data | `dt sync`, `dt seed` |

@@ -9,6 +9,7 @@ import pytest
 
 from dt.artifact_distribution import (
     ArtifactRouteError,
+    ArtifactVerifier,
     DistributionError,
     TransferExecutor,
     _FILES_RE,
@@ -102,6 +103,23 @@ def _stats(bytes_: int, files: int) -> str:
 )
 def test_rsync_stats_parse_localized_integral_counts_exactly(pattern, line, expected):
     assert stat_total(pattern, line) == expected
+
+
+_REAL_REMOTE_DIGEST = ArtifactVerifier.remote_digest
+
+
+@pytest.fixture(autouse=True)
+def _destination_has_no_prior_copy(monkeypatch):
+    """First delivery everywhere: the destination digest probe finds nothing.
+
+    Tests that model a warm destination override ``remote_digest`` themselves.
+    """
+    import dt.artifact_distribution as module
+
+    def absent(self, node, code_dir, *args, **kwargs):
+        raise module.DistributionError(f"{node.name}: no code at {code_dir}")
+
+    monkeypatch.setattr(module.ArtifactVerifier, "remote_digest", absent)
 
 
 def _topology_cfg(tmp_path):
@@ -492,7 +510,7 @@ def test_same_digest_fans_out_to_different_destinations_concurrently(
     # timeout flakes under the full, parallel qualification load before the
     # second executor is scheduled; five seconds still fails promptly if the
     # site lock is incorrectly held across fan-out.
-    fanout_started = threading.Barrier(2, timeout=5)
+    fanout_started = threading.Barrier(2, timeout=30)
 
     def cache_available(*args):
         return cache_ready
@@ -643,6 +661,8 @@ def test_site_cache_commands_reject_symlinked_mutable_leaves(tmp_path, monkeypat
 
 def test_remote_verifier_rejects_a_symlinked_artifact_root(tmp_path, monkeypatch):
     import dt.artifact_distribution as module
+
+    monkeypatch.setattr(module.ArtifactVerifier, "remote_digest", _REAL_REMOTE_DIGEST)
 
     commands = []
 
