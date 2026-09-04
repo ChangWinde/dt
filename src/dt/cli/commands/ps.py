@@ -21,7 +21,7 @@ from ...config import HeadConfig, LaptopConfig, Node
 from ...jsonvalue import as_int
 from ...probe import NodeStatus
 from ...remote import FanErrors
-from ...render import err, ps_table
+from ...render import queued_anomaly, err, ps_table
 from .. import (
     EXIT_UNREACHABLE,
     JsonDict,
@@ -1572,7 +1572,13 @@ def _ps_human_mode(
             show_progress=view.with_progress,
             show_issue=(
                 not view.with_progress
-                and (view.issues or status in ("failed", "lost", "skipped"))
+                and (
+                    view.issues
+                    or status in ("failed", "lost", "skipped")
+                    # a blocked or offline queue row is an anomaly; its reason
+                    # is the next action, so the default view shows it
+                    or any(queued_anomaly(row) for row in visible)
+                )
             ),
             title=view.view_title,
             empty_text=view.empty_text,

@@ -22,6 +22,12 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   instead of deleting results a job wrote into its snapshot copy;
   `--prune-modified` accepts the loss explicitly. The automatic sweep never
   prunes such trees.
+- `dt ps` shows why a queued job is blocked or offline in its default view
+  (the issue column appears whenever such a row is visible), compacted to the
+  node and the specific reason ("psibot-yw: GPU runtime requires loginctl
+  Linger=yes") instead of requiring `dt info` per job. `dt doctor`'s linger
+  remediation is now a copy-pasteable `loginctl enable-linger "$(id -un)"`,
+  and a missing `--artifact` path names the project root it was resolved under.
 
 ### Added
 

@@ -4548,3 +4548,54 @@ def test_main_wrapper_translates_a_failing_typer_exit(monkeypatch, capsys):
     assert excinfo.value.code == 1
     payload = json.loads(capsys.readouterr().out)
     assert "--retry" in payload["message"]
+
+
+def test_ps_default_view_shows_why_a_queued_job_is_blocked():
+    """A blocked queue row is an anomaly; its reason is the next action."""
+    from rich.console import Console
+
+    from dt.render import _compact_queue_reason, ps_table, queued_anomaly
+
+    reason = (
+        "blocked: psibot-yw: node-unfit: [launcher] node-unfit: "
+        "GPU runtime requires loginctl Linger=yes"
+    )
+    assert (
+        _compact_queue_reason(reason)
+        == "psibot-yw: GPU runtime requires loginctl Linger=yes"
+    )
+    assert _compact_queue_reason("waiting: n1 unreachable: ssh timed out") == (
+        "n1 unreachable: ssh timed out"
+    )
+    row = {
+        "job_id": "20260905-0001_skfu-cell_ab12",
+        "name": "skfu-cell",
+        "status": "queued",
+        "reason": reason,
+        "center": "c",
+        "node": "-",
+        "gpus_requested": 1,
+        "created_at": 1.0,
+        "display_ref": "ab12",
+        "queue_position": 3,
+        "queue_depth": 9,
+        "exit_code": None,
+        "cmd": "python x.py",
+    }
+    assert queued_anomaly(row) is True
+    assert queued_anomaly({**row, "reason": "waiting: capacity"}) is False
+    console = Console(width=120, record=True, force_terminal=False)
+    console.print(
+        ps_table(
+            [row],
+            wide=False,
+            caption=None,
+            show_progress=False,
+            show_issue=any(queued_anomaly(r) for r in [row]),
+            title="jobs",
+            empty_text="none",
+        )
+    )
+    text = console.export_text()
+    assert "queued blocked #3/9" in text
+    assert "psibot-yw: GPU runtime requires" in text

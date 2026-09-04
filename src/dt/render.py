@@ -456,6 +456,38 @@ def _progress_parts(row: JsonRow, *, wide: bool) -> list[str]:
     return parts
 
 
+def _compact_queue_reason(reason: str) -> str:
+    """One readable line for a queued row's blocked/waiting reason.
+
+    The status cell already says "blocked", and placement failures repeat
+    their kind per stage ("node-unfit: [launcher] node-unfit: ..."), so keep
+    the node and the last, most specific explanation.
+    """
+    text = reason.strip()
+    for prefix in ("blocked: ", "waiting: "):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
+    marker = "node-unfit:"
+    if marker in text:
+        # "psibot-yw: node-unfit: [launcher] node-unfit: GPU runtime requires
+        # loginctl Linger=yes" -> "psibot-yw: GPU runtime requires ..."
+        head, _sep, tail = text.partition(marker)
+        tail = tail.rsplit(marker, 1)[-1].strip()
+        text = f"{head.strip()} {tail}".strip() if tail else text
+    return text
+
+
+def queued_anomaly(row: JsonRow) -> bool:
+    """True for a queued row the operator should look at (blocked or offline)."""
+    reason = row.get("reason")
+    return (
+        row.get("status") == "queued"
+        and isinstance(reason, str)
+        and (reason.startswith("blocked:") or "unreachable:" in reason)
+    )
+
+
 def _row_issue(row: JsonRow, *, display_ref: str) -> object:
     """The one diagnostic worth a table cell for this row, if any."""
     status = row.get("status", "?")
@@ -463,6 +495,8 @@ def _row_issue(row: JsonRow, *, display_ref: str) -> object:
     reason_issue = (
         row.get("reason") if status in ("queued", "failed", "lost", "skipped") else None
     )
+    if status == "queued" and isinstance(reason_issue, str):
+        reason_issue = _compact_queue_reason(reason_issue)
     issue = row.get("progress_error") or reason_issue or row.get("status_probe_error")
     if not issue and status == "lost":
         # Old registries may predate persisted lost diagnostics. Keep the
