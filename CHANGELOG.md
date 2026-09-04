@@ -8,6 +8,10 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Changed
 
+- Best-effort failures that dt deliberately swallows (link-metrics
+  bookkeeping, optional resource telemetry, tab-completion configuration, the
+  agent pid read) are now noted once per kind in the agent log and, with
+  `DT_DEBUG_SUPPRESSED=1`, on stderr; behavior is otherwise unchanged.
 - `dt ps` and the resident agent re-verify running jobs with one status probe
   per node instead of one SSH session per job (`jobs.refresh_statuses`). On a
   node with 32 running jobs the refresh drops from about one to two seconds

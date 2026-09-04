@@ -85,6 +85,7 @@ from .layout import ROLE_LAYOUT
 from .scheduler import scheduler_snapshot
 from . import compact as compact_mod
 from . import config as config_mod
+from .operation_log import note_suppressed, set_suppressed_sink
 
 _completion_watch_command = completion_mod.completion_watch_command
 _spawn_completion_watcher = completion_mod.spawn_completion_watcher
@@ -618,7 +619,8 @@ def alive_pid(cfg: HeadConfig) -> int | None:
                     max_bytes=64,
                 ).strip()
             )
-        except Exception:
+        except Exception as exc:
+            note_suppressed("agent_pid_read", exc)
             return -1  # locked but pid unknown
     fcntl.flock(fd, fcntl.LOCK_UN)
     os.close(fd)
@@ -1567,6 +1569,9 @@ def run_loop(cfg: HeadConfig) -> int:
             # autoclean, the one thing that can free space again. Logging is
             # best-effort; the poll loop keeps running.
             pass
+
+    # Best-effort failures the code swallows on purpose still show up here once.
+    set_suppressed_sink(log)
 
     def rotate_log() -> None:
         try:

@@ -50,6 +50,7 @@ from .topology_discovery import (
     TopologyDiscovery,
     TopologyDiscoveryError,
 )
+from .operation_log import note_suppressed
 
 _GROUPED_INTEGER = r"([0-9][0-9,. \u00a0\u202f]*)"
 TRANSFERRED_RE = re.compile(rf"Total transferred file size: {_GROUPED_INTEGER} bytes")
@@ -1651,7 +1652,8 @@ class TransferExecutor:
             original_error = exc
             try:
                 fallback_site = self.topology.site_for(destination)
-            except Exception:
+            except Exception as lookup_exc:
+                note_suppressed("fallback_site_lookup", lookup_exc)
                 fallback_site = None
             if (
                 isinstance(exc, DistributionError)
