@@ -191,6 +191,13 @@ def _parameter(param: Any) -> dict[str, Any]:
     choices = getattr(param.type, "choices", None)
     if choices:
         entry["choices"] = list(choices)
+    if param.type.name == "int range":
+        minimum = getattr(param.type, "min", None)
+        maximum = getattr(param.type, "max", None)
+        if minimum is not None:
+            entry["minimum"] = minimum
+        if maximum is not None:
+            entry["maximum"] = maximum
     if (
         getattr(param, "opts", None)
         and getattr(param, "param_type_name", "") == "option"

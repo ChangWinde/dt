@@ -208,3 +208,13 @@ def test_every_parameter_explains_itself():
         if not parameter["help"]
     ]
     assert silent == []
+
+
+def test_bounded_integer_options_publish_their_range():
+    described = {c["name"]: c for c in _document()["commands"]}
+    retry = next(o for o in described["run"]["options"] if o["name"] == "retry")
+    assert (retry["type"], retry["minimum"], retry["maximum"]) == ("integer", 0, 10)
+    limit = next(o for o in described["events"]["options"] if o["name"] == "limit")
+    assert (limit["minimum"], limit["maximum"]) == (1, 1000)
+    gpus = next(o for o in described["run"]["options"] if o["name"] == "gpus")
+    assert "minimum" not in gpus

@@ -33,6 +33,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Changed
 
+- `dt contract` publishes `minimum`/`maximum` for bounded integer options
+  (`run --retry`, `events --limit`, `topology --max-edges`).
 - Every command option and argument now carries help text (44 were silent,
   mostly `--json`, `--yes`, `--no-queue`, and the batch/chain resource options);
   `--json` help names the schema or shape each command emits. The contract test
