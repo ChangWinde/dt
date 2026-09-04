@@ -29,6 +29,7 @@ from .. import (
     _job_refs,
     _need_head,
 )
+from ... import dispatch as dispatch_mod
 from ...dispatch import remove_staging
 
 
@@ -220,6 +221,25 @@ def _kill_one(
             if current is not None:
                 entry = current
             if entry.status == "queued":
+                if entry.dispatch_node is not None:
+                    # A bounced placement may still have a launcher in flight
+                    # on that node; plant the cancel sentinel and prove death
+                    # before the row can shed its attempt identity.
+                    problem = dispatch_mod.cancel_queued_attempt(cfg, entry)
+                    if problem is not None:
+                        message = (
+                            f"{entry.job_id} keeps a dispatch attempt on "
+                            f"{entry.dispatch_node} that could not be cancelled: "
+                            f"{problem}"
+                        )
+                        err.print(f"[red]{escape(message)}[/red]")
+                        return finish(
+                            "unverified", "dispatch_attempt_unverified", entry, message
+                        )
+                    entry.dispatch_node = None
+                    entry.dispatch_token = None
+                    entry.dispatch_owner = None
+                    entry.dispatch_claimed_at = None
                 entry.status = "killed"
                 entry.result_state = "cancelled"
                 entry.finished_at = time.time()

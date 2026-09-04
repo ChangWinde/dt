@@ -662,6 +662,38 @@ def inspect_request_remote_proof(
     return proof("invalid")
 
 
+def cancel_queued_attempt(cfg: HeadConfig, entry: JobEntry) -> str | None:
+    """Cancel the dispatch attempt a queued row still carries; None on success.
+
+    A queued job that was placed once and bounced (node unfit, launcher
+    failure) keeps its attempt identity so the next dispatch can recover the
+    remote state. Dequeuing such a row must first plant the cancellation
+    sentinel on that node and prove nothing survived, exactly as a failover
+    does; the caller clears the identity only after this returns None.
+    Returns the reason the attempt could not be proven cancelled otherwise.
+    """
+    if entry.dispatch_node is None:
+        return None
+    configured = next(
+        (node for node in cfg.nodes if node.name == entry.dispatch_node), None
+    )
+    if configured is None:
+        return f"dispatch node {entry.dispatch_node!r} is no longer configured"
+    node = _root._queued_node(cfg, entry, configured)
+    node_job_dir = (
+        cfg.worker_job_dir(node, entry.job_id)
+        if entry.storage_layout == ROLE_LAYOUT
+        else entry.job_dir
+    )
+    return _root._cancel_orphan(
+        node,
+        node_job_dir,
+        entry.session,
+        layout=entry.storage_layout,
+        dispatch_token=entry.dispatch_token,
+    )
+
+
 def _queued_node(cfg: HeadConfig, entry: JobEntry, node: Node) -> Node:
     """Rebind a queued placement to its submit-time worker-root policy."""
     if entry.storage_layout != ROLE_LAYOUT:

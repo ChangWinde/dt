@@ -1654,6 +1654,7 @@ from .submission import (  # noqa: E402
     submit_fork as submit_fork,
 )
 from .queued import (  # noqa: E402
+    cancel_queued_attempt as cancel_queued_attempt,
     _QueuedStage as _QueuedStage,
     _StageInterrupted as _StageInterrupted,
     _StageUnusable as _StageUnusable,
