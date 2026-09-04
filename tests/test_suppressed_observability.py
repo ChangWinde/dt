@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -104,6 +105,6 @@ def test_agent_installs_its_log_as_the_sink(tmp_path):
         ]
     )
     proc = subprocess.run(
-        ["python", "-c", source], capture_output=True, text=True, check=True
+        [sys.executable, "-c", source], capture_output=True, text=True, check=True
     )
     assert proc.stdout.strip() == "True"  # nothing installs a sink at import time
