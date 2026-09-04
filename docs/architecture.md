@@ -77,7 +77,15 @@ single-job launch boundary. A registered job contains:
 
 The resident agent reconciles queued and running entries. A restartable user
 systemd service is preferred, with a visible cron compatibility fallback; its
-heartbeat distinguishes an owned lock from a responsive scheduler. GPU runtime
+heartbeat distinguishes an owned lock from a responsive scheduler. Running and
+recently lost jobs are re-verified with one status probe per node (`dt ps` and
+the agent tick both use `jobs.refresh_statuses`): every job's section of the
+probe emits a fixed six-line frame behind a per-call nonce delimiter, and its
+evidence is applied under the job lock only while the row still names the
+probed process, so a kill or relaunch that lands mid-probe wins. One probe per
+job would exceed OpenSSH's default ten multiplexed sessions as soon as a node
+holds ten running jobs and start failing outright. Single-job readers
+(`dt wait`, `dt logs`, `dt kill`) keep the one-job `refresh_status`. GPU runtime
 is stricter than agent supervision: every GPU job requires a proved independent
 user scope and `Linger=yes`, so logout cannot tear down its user manager. CPU
 jobs retain a visibly weaker portable tmux path.

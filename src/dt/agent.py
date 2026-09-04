@@ -33,7 +33,6 @@ import tempfile
 import time
 import urllib.request
 from urllib.parse import urlsplit
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -67,7 +66,7 @@ from .jobs import (
     load as load_job,
     occupies_quota,
     quota_occupancy,
-    refresh_status,
+    refresh_statuses,
     registry_row_count,
     retry_blocked_reason,
     retry_pending_fence,
@@ -716,24 +715,18 @@ def _reconcile_jobs(
     if not candidates:
         return entries
 
-    def reconcile(entry: JobEntry) -> tuple[str, JobEntry, Exception | None]:
-        before = entry.status
-        try:
-            refreshed = refresh_status(cfg, entry)
-            return before, refreshed, None
-        except Exception as exc:
-            return before, entry, exc
-
-    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as pool:
-        transitions = list(pool.map(reconcile, candidates))
+    statuses_before = {entry.job_id: entry.status for entry in candidates}
+    try:
+        refreshed = refresh_statuses(cfg, candidates)
+    except Exception as exc:
+        detail = " ".join(str(exc).split())[:512] or type(exc).__name__
+        log(f"status refresh failed: {detail}")
+        return entries
 
     by_job_id = {entry.job_id: index for index, entry in enumerate(entries)}
-    for before, entry, error in transitions:
-        if error is not None:
-            detail = " ".join(str(error).split())[:512] or type(error).__name__
-            log(f"{entry.job_id} status refresh failed: {detail}")
-            continue
-        entries[by_job_id[entry.job_id]] = entry
+    for job_id, before in statuses_before.items():
+        entry = refreshed[job_id]
+        entries[by_job_id[job_id]] = entry
         if entry.status == before:
             continue
         if entry.status == "finished":

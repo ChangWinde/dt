@@ -24,6 +24,7 @@ import shlex
 import stat
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields
@@ -3048,19 +3049,195 @@ def refresh_status(
         )
 
 
-def _status_probe_script(entry: JobEntry, state_dir: str) -> str:
-    """The bash probe that reports completion or liveness for one job."""
-    state = node_path_expression(state_dir)
-    wrapper_pid = int(entry.pgid) if entry.pgid is not None else 0
-    # Every field below comes from a job-writable file. dt_probe_field
-    # flattens it to one bounded line so an embedded newline (for example a
-    # forged status marker followed by a fake token stream) cannot change the
-    # probe's line protocol and rewrite a running job into a terminal state.
-    probe = (
+# Jobs per SSH round trip. Every section adds ~600 characters to the probe;
+# 32 keeps the whole command well inside remote ARG_MAX while still turning a
+# node with dozens of running jobs into one or two connections instead of one
+# per job (OpenSSH refuses more than MaxSessions=10 channels on one mux).
+STATUS_PROBE_BATCH = 32
+
+
+@dataclass(frozen=True)
+class _ProbeTarget:
+    """One job's snapshot at probe time; evidence applies only if it still holds."""
+
+    entry: JobEntry
+    state_dir: str
+
+
+def refresh_statuses(
+    cfg: HeadConfig,
+    entries: list[JobEntry],
+    timeout: float = 8,
+    *,
+    observations: dict[str, dict[str, object]] | None = None,
+) -> dict[str, JobEntry]:
+    """Refresh many jobs with one probe per node instead of one per job.
+
+    Returns every input job by id, refreshed where trusted evidence arrived.
+    ``observations`` (job id -> dict) receives the same transient probe health
+    ``refresh_status`` reports for a single job. Evidence is applied under
+    the job lock only while the row still describes the process that was
+    probed (same lifecycle state, wrapper pid, and job directory); a kill or
+    relaunch that landed in between wins and the next refresh re-probes.
+    """
+    refreshed = {entry.job_id: entry for entry in entries}
+
+    def note(job_id: str) -> dict[str, object] | None:
+        if observations is None:
+            return None
+        observation = observations.setdefault(job_id, {})
+        observation.clear()
+        observation.update(node_unreachable=False, status_probe_error=None)
+        return observation
+
+    by_node: dict[tuple[str, bool], list[_ProbeTarget]] = {}
+    for entry in entries:
+        observation = note(entry.job_id)
+        if entry.status not in ("running", "lost"):
+            continue
+        try:
+            validate_job_capsule(entry.job_dir, job_id=entry.job_id)
+        except ValueError as exc:
+            if observation is not None:
+                observation.update(node_unreachable=False, status_probe_error=str(exc))
+            continue
+        state_dir = job_state_dir(entry.job_dir, entry.storage_layout)
+        by_node.setdefault((entry.node, entry.node_local), []).append(
+            _ProbeTarget(entry, state_dir)
+        )
+
+    batches = [
+        (node, node_local, targets[start : start + STATUS_PROBE_BATCH])
+        for (node, node_local), targets in by_node.items()
+        for start in range(0, len(targets), STATUS_PROBE_BATCH)
+    ]
+    if not batches:
+        return refreshed
+
+    def probe_batch(
+        node: str, node_local: bool, targets: list[_ProbeTarget]
+    ) -> list[_StatusProbe | None]:
+        delimiter = f"@@DT_PROBE_{secrets.token_hex(8)}@@"
+        script = _batched_status_probe_script(
+            [_status_probe_section(t.entry, t.state_dir) for t in targets],
+            delimiter=delimiter,
+        )
+        try:
+            proc = run_on(
+                node,
+                node_local,
+                script,
+                timeout=timeout + 0.2 * len(targets),
+            )
+        except Exception as exc:
+            detail = " ".join(str(exc).split()) or type(exc).__name__
+            for target in targets:
+                observation = _observation_for(observations, target.entry.job_id)
+                if observation is not None:
+                    observation.update(node_unreachable=True, status_probe_error=detail)
+            return [None] * len(targets)
+        if proc.returncode != 0:
+            detail = " ".join(
+                (
+                    proc.stderr
+                    or proc.stdout
+                    or f"status probe exited {proc.returncode}"
+                ).split()
+            )
+            for target in targets:
+                observation = _observation_for(observations, target.entry.job_id)
+                if observation is not None:
+                    observation.update(node_unreachable=True, status_probe_error=detail)
+            return [None] * len(targets)
+        sections = _split_probe_sections(
+            (proc.stdout or "").splitlines(), delimiter=delimiter, count=len(targets)
+        )
+        return [
+            _parse_status_probe(
+                section, observation=_observation_for(observations, target.entry.job_id)
+            )
+            for target, section in zip(targets, sections, strict=True)
+        ]
+
+    with ThreadPoolExecutor(max_workers=min(16, len(batches))) as pool:
+        outcomes = list(
+            pool.map(lambda batch: (batch[2], probe_batch(*batch)), batches)
+        )
+
+    for targets, probes in outcomes:
+        for target, tokens in zip(targets, probes, strict=True):
+            if tokens is None:
+                continue
+            job_id = target.entry.job_id
+            with job_lock(cfg, job_id):
+                current = load(cfg, job_id) or target.entry
+                refreshed[job_id] = current
+                if (
+                    current.status not in ("running", "lost")
+                    or current.pgid != target.entry.pgid
+                    or current.job_dir != target.entry.job_dir
+                ):
+                    # The row moved on while the probe was in flight; its
+                    # evidence describes a process this row no longer claims.
+                    continue
+                refreshed[job_id] = _apply_status_probe(
+                    cfg,
+                    current,
+                    tokens,
+                    target.state_dir,
+                    observation=_observation_for(observations, job_id),
+                )
+    return refreshed
+
+
+def _observation_for(
+    observations: dict[str, dict[str, object]] | None, job_id: str
+) -> dict[str, object] | None:
+    return None if observations is None else observations.setdefault(job_id, {})
+
+
+def _split_probe_sections(
+    lines: list[str], *, delimiter: str, count: int
+) -> list[list[str]]:
+    """Cut a batched probe's stdout at its nonce delimiters, one list per job.
+
+    A section that never appeared (the shell died early) is returned empty,
+    so its parser reports the missing marker and the row is retained.
+    """
+    sections: list[list[str]] = [[] for _ in range(count)]
+    current: list[str] | None = None
+    for line in lines:
+        if line.startswith(delimiter + " "):
+            try:
+                index = int(line[len(delimiter) + 1 :])
+            except ValueError:
+                index = -1
+            current = sections[index] if 0 <= index < count else None
+            continue
+        if current is not None:
+            current.append(line)
+    return sections
+
+
+def _status_probe_prelude() -> str:
+    """Shell functions every status probe needs, emitted once per script."""
+    # Every job-writable field goes through dt_probe_field, which flattens it
+    # to one bounded line so an embedded newline (for example a forged status
+    # marker followed by a fake token stream) cannot change the probe's line
+    # protocol and rewrite a running job into a terminal state.
+    return (
         liveness_shell() + "dt_probe_field() { "
         'if [ -f "$1" ]; then head -c 128 -- "$1" 2>/dev/null '
         "| tr -d '\\r\\n'; echo; else echo UNKNOWN; fi; }; "
-        + f"DT_WPID={wrapper_pid}; "
+    )
+
+
+def _status_probe_section(entry: JobEntry, state_dir: str) -> str:
+    """The per-job probe body: exactly six stdout lines, marker second."""
+    state = node_path_expression(state_dir)
+    wrapper_pid = int(entry.pgid) if entry.pgid is not None else 0
+    return (
+        f"DT_WPID={wrapper_pid}; "
         + f"DT_WIDENT={state}/process_start_ticks; "
         + f"DT_WJOB={node_path_expression(entry.job_dir)}; "
         + f"DT_WBOOT={shlex.quote(entry.boot_id or '')}; "
@@ -3082,13 +3259,40 @@ def _status_probe_script(entry: JobEntry, state_dir: str) -> str:
         f"echo UNVERIFIED; dt_probe_field {state}/started_at; echo UNKNOWN; "
         "else "
         f"echo LOST; dt_probe_field {state}/started_at; echo UNKNOWN; fi; "
-        f"dt_probe_field {state}/result_state"
+        f"dt_probe_field {state}/result_state; "
     )
+
+
+def _bash_probe(script: str) -> str:
     # Remote login shells may be zsh, whose default does not word-split the
     # procfs tail used by process_identity_shell. Pin the parser to bash just
     # like destructive lifecycle callers do.
-    probe = f"env LC_ALL=C bash -c {shlex.quote(probe)}"
-    return probe
+    return f"env LC_ALL=C bash -c {shlex.quote(script)}"
+
+
+def _status_probe_script(entry: JobEntry, state_dir: str) -> str:
+    """The bash probe that reports completion or liveness for one job."""
+    return _bash_probe(
+        _status_probe_prelude() + _status_probe_section(entry, state_dir)
+    )
+
+
+def _batched_status_probe_script(
+    sections: list[str],
+    *,
+    delimiter: str,
+) -> str:
+    """One probe for every job on a node; ``delimiter`` opens each section.
+
+    The delimiter carries a per-call nonce, so a job cannot have written it
+    into a state file ahead of time; the parser additionally anchors every
+    section on its own trusted STATUS_MARK line.
+    """
+    body = "".join(
+        f"echo {shlex.quote(f'{delimiter} {index}')}; {section}"
+        for index, section in enumerate(sections)
+    )
+    return _bash_probe(_status_probe_prelude() + body)
 
 
 def _positive_timestamp(value: str) -> float | None:
@@ -3142,7 +3346,17 @@ def _run_status_probe(
                 status_probe_error=" ".join(detail.split()),
             )
         return None  # ssh/shell failure is not evidence that the job died
-    tokens = (proc.stdout or "").strip().splitlines()
+    return _parse_status_probe(
+        (proc.stdout or "").strip().splitlines(), observation=observation
+    )
+
+
+def _parse_status_probe(
+    tokens: list[str],
+    *,
+    observation: dict[str, object] | None,
+) -> _StatusProbe | None:
+    """Anchor one probe response on its trusted marker; None keeps the row."""
     if STATUS_MARK not in tokens:
         # This command always emits STATUS_MARK before reading any
         # job-writable field. Missing framing therefore means the remote shell
@@ -3290,6 +3504,18 @@ def _refresh_status_locked(
     tokens = _run_status_probe(entry, probe, timeout=timeout, observation=observation)
     if tokens is None:
         return entry
+    return _apply_status_probe(cfg, entry, tokens, state_dir, observation=observation)
+
+
+def _apply_status_probe(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    tokens: _StatusProbe,
+    state_dir: str,
+    *,
+    observation: dict[str, object] | None,
+) -> JobEntry:
+    """Turn trusted probe evidence into the row's next lifecycle state."""
     token = tokens.token
     current_boot_id = tokens.boot_id
     result_token = tokens.result

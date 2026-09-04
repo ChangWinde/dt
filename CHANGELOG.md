@@ -6,6 +6,25 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Changed
+
+- `dt ps` and the resident agent re-verify running jobs with one status probe
+  per node instead of one SSH session per job (`jobs.refresh_statuses`). On a
+  node with 32 running jobs the refresh drops from about one to two seconds
+  with several probes refused by OpenSSH's default `MaxSessions=10` to a
+  single 0.3–1.0 s round trip with none refused; probe evidence is applied
+  under each job's lock only while the row still names the probed process.
+  `dt wait`, `dt logs`, and `dt kill` keep the one-job probe.
+- The agent's self-upgrade fingerprint covers every shipped source file,
+  including `dt/shell/*.sh` and subpackages, so a deploy that changes only a
+  probe library restarts the resident agent.
+- Internal restructuring with no behavior change: `src/dt/cli.py` is now the
+  package `src/dt/cli/` (a 3.3k-line composition root plus one module per
+  command family under `cli/commands/`); the lifecycle and doctor shell
+  libraries ship as `src/dt/shell/*.sh` resources checked by shellcheck in
+  CI; JSON numbers are narrowed through `dt.jsonvalue`; the ps contract
+  validator returns a typed page.
+
 ## 0.13.4 — 2026-09-03
 
 ### Fixed

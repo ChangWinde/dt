@@ -249,7 +249,9 @@ def test_started_notifies_webhook(tmp_path, monkeypatch):
     assert events == ["started"]
 
 
-def test_agent_reconciles_running_job_without_a_queue(tmp_path, monkeypatch):
+def test_agent_reconciles_running_job_without_a_queue(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = _cfg(tmp_path)
     cfg.webhook = "http://example/hook"
     save(
@@ -274,7 +276,7 @@ def test_agent_reconciles_running_job_without_a_queue(tmp_path, monkeypatch):
         save(cfg_, entry_)
         return entry_
 
-    monkeypatch.setattr(agent, "refresh_status", finish, raising=False)
+    stub_job_refresh(agent, finish)
     monkeypatch.setattr(
         agent, "notify", lambda cfg_, payload, log=None: events.append(payload)
     )
@@ -286,7 +288,9 @@ def test_agent_reconciles_running_job_without_a_queue(tmp_path, monkeypatch):
     assert sum("run" in message and "finished" in message for message in logs) == 1
 
 
-def test_agent_reconciliation_releases_stale_running_cap(tmp_path, monkeypatch):
+def test_agent_reconciliation_releases_stale_running_cap(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = _cfg(tmp_path, max_my_jobs=1)
     save(
         cfg,
@@ -307,7 +311,7 @@ def test_agent_reconciliation_releases_stale_running_cap(tmp_path, monkeypatch):
         save(cfg_, entry_)
         return entry_
 
-    monkeypatch.setattr(agent, "refresh_status", finish, raising=False)
+    stub_job_refresh(agent, finish)
     monkeypatch.setattr(
         agent,
         "dispatch_queued",
@@ -317,7 +321,7 @@ def test_agent_reconciliation_releases_stale_running_cap(tmp_path, monkeypatch):
     assert process_once(cfg, lambda message: None) == [("next", "started")]
 
 
-def test_agent_lost_transition_notifies_once(tmp_path, monkeypatch):
+def test_agent_lost_transition_notifies_once(tmp_path, monkeypatch, stub_job_refresh):
     cfg = _cfg(tmp_path)
     cfg.webhook = "http://example/hook"
     save(
@@ -341,7 +345,7 @@ def test_agent_lost_transition_notifies_once(tmp_path, monkeypatch):
             save(cfg_, entry_)
         return entry_
 
-    monkeypatch.setattr(agent, "refresh_status", lose, raising=False)
+    stub_job_refresh(agent, lose)
     monkeypatch.setattr(
         agent, "notify", lambda cfg_, payload, log=None: events.append(payload)
     )
@@ -354,7 +358,9 @@ def test_agent_lost_transition_notifies_once(tmp_path, monkeypatch):
     assert sum("vanished" in message and "lost" in message for message in logs) == 1
 
 
-def test_agent_unreachable_refresh_keeps_running_without_noise(tmp_path, monkeypatch):
+def test_agent_unreachable_refresh_keeps_running_without_noise(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = _cfg(tmp_path)
     save(
         cfg,
@@ -374,7 +380,7 @@ def test_agent_unreachable_refresh_keeps_running_without_noise(tmp_path, monkeyp
         calls.append(entry_.job_id)
         return entry_
 
-    monkeypatch.setattr(agent, "refresh_status", unreachable, raising=False)
+    stub_job_refresh(agent, unreachable)
 
     process_once(cfg, logs.append)
 
@@ -383,7 +389,7 @@ def test_agent_unreachable_refresh_keeps_running_without_noise(tmp_path, monkeyp
     assert logs == []
 
 
-def test_agent_only_rechecks_recent_lost_jobs(tmp_path, monkeypatch):
+def test_agent_only_rechecks_recent_lost_jobs(tmp_path, monkeypatch, stub_job_refresh):
     cfg = _cfg(tmp_path)
     save(
         cfg,
@@ -411,19 +417,16 @@ def test_agent_only_rechecks_recent_lost_jobs(tmp_path, monkeypatch):
     )
     calls = []
     monkeypatch.setattr(agent.time, "time", lambda: 1_000.0)
-    monkeypatch.setattr(
-        agent,
-        "refresh_status",
-        lambda cfg_, entry_: calls.append(entry_.job_id) or entry_,
-        raising=False,
-    )
+    stub_job_refresh(agent, lambda cfg_, entry_: calls.append(entry_.job_id) or entry_)
 
     process_once(cfg, lambda message: None)
 
     assert calls == ["recent"]
 
 
-def test_agent_refresh_error_does_not_block_queue_walk(tmp_path, monkeypatch):
+def test_agent_refresh_error_does_not_block_queue_walk(
+    tmp_path, monkeypatch, stub_job_refresh
+):
     cfg = _cfg(tmp_path)
     save(
         cfg,
@@ -438,11 +441,8 @@ def test_agent_refresh_error_does_not_block_queue_walk(tmp_path, monkeypatch):
     )
     save(cfg, _entry("ready", "queued", created_at=2.0))
     logs = []
-    monkeypatch.setattr(
-        agent,
-        "refresh_status",
-        lambda cfg_, entry_: (_ for _ in ()).throw(RuntimeError("probe bug")),
-        raising=False,
+    stub_job_refresh(
+        agent, lambda cfg_, entry_: (_ for _ in ()).throw(RuntimeError("probe bug"))
     )
     monkeypatch.setattr(
         agent,
@@ -453,7 +453,7 @@ def test_agent_refresh_error_does_not_block_queue_walk(tmp_path, monkeypatch):
     assert process_once(cfg, logs.append) == [("ready", "started")]
     assert (
         sum(
-            "broken-probe" in message and "status refresh failed" in message
+            "status refresh failed" in message and "probe bug" in message
             for message in logs
         )
         == 1

@@ -545,14 +545,32 @@ def test_refresh_status_ignores_forged_marker_in_job_writable_fields(
 
 
 def test_status_probe_bounds_job_writable_fields():
-    """Probe fields from job-writable files are flattened to one line."""
-    import inspect
+    """Every job-writable state file is read through the one-line flattener."""
+    entry = JobEntry(
+        job_id="probe-fields",
+        name="probe-fields",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/probe-fields",
+        session="dt_probe",
+        cmd="true",
+        pgid=4242,
+    )
+    state_dir = "~/dt/worker/jobs/probe-fields/state"
+    state = jobs.node_path_expression(state_dir)
 
-    source = inspect.getsource(jobs._status_probe_script)
+    script = jobs._status_probe_script(entry, state_dir)
 
-    assert "dt_probe_field" in source
-    assert "cat {state}/exit_code" not in source
-    assert "cat {state}/result_state" not in source
+    for name in ("exit_code", "started_at", "finished_at", "result_state"):
+        assert f"dt_probe_field {state}/{name}" in script
+        assert f"cat {state}/{name}" not in script
+        assert f"head -n 1 {state}/{name}" not in script
+    # The trusted marker is emitted by the probe itself, before any field.
+    assert script.index("/proc/sys/kernel/random/boot_id") < script.index(
+        jobs.STATUS_MARK
+    )
 
 
 def test_refresh_status_rejects_out_of_range_exit_code_with_observation(

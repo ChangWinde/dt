@@ -481,29 +481,19 @@ def _gather_ps_rows(
     configured_nodes = {node.name: node for node in cfg.nodes}
     node_statuses: dict[str, NodeStatus] = {}
     progress_by_id: dict[str, JsonDict] = {}
-
-    def refresh(
-        entry: jobs_mod.JobEntry,
-    ) -> tuple[str, jobs_mod.JobEntry, JsonDict]:
-        observation: JsonDict = {}
-        refreshed = jobs_mod.refresh_status(
-            cfg,
-            entry,
-            observation=observation,
-        )
-        return entry.job_id, refreshed, observation
-
     if stale:
         node_names = (
             sorted({entry.node for entry in stale if entry.node in configured_nodes})
             if include_progress
             else []
         )
-        work_items = (
-            len(stale) + len(node_names) + (len(stale) if include_progress else 0)
-        )
+        # One status probe per node (refresh_statuses fans out internally),
+        # plus the optional per-node resource probe and per-job log reads.
+        work_items = 1 + len(node_names) + (len(stale) if include_progress else 0)
         with ThreadPoolExecutor(max_workers=min(32, max(1, work_items))) as pool:
-            refresh_futures = [pool.submit(refresh, entry) for entry in stale]
+            refresh_future = pool.submit(
+                jobs_mod.refresh_statuses, cfg, stale, observations=observations
+            )
             probe_futures = {
                 node_name: pool.submit(
                     _root.probe_node,
@@ -520,7 +510,7 @@ def _gather_ps_rows(
                 if include_progress
                 else {}
             )
-            refreshed_rows = [future.result() for future in refresh_futures]
+            refreshed_by_id = refresh_future.result()
             node_statuses = {
                 node_name: future.result()
                 for node_name, future in probe_futures.items()
@@ -528,12 +518,6 @@ def _gather_ps_rows(
             progress_by_id = {
                 job_id: future.result() for job_id, future in progress_futures.items()
             }
-        refreshed_by_id = {
-            job_id: refreshed for job_id, refreshed, _observation in refreshed_rows
-        }
-        observations = {
-            job_id: observation for job_id, _refreshed, observation in refreshed_rows
-        }
         entries = [refreshed_by_id.get(entry.job_id, entry) for entry in entries]
     queue_contexts = jobs_mod.queue_contexts(entries)
     queue_placements = jobs_mod.queue_placement_contexts(cfg, entries)
