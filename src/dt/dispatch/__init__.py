@@ -1422,28 +1422,40 @@ def pick_candidates(
         if status is not None and disk_rejection_reason(status, spec) is not None:
             return []
         return [by_name[spec.node]]
+    usable = [
+        s
+        for s in statuses
+        if s.error is None
+        and disk_rejection_reason(s, spec) is None
+        and s.node in by_name
+        and not by_name[s.node].drained
+    ]
+    if spec.gpus == 0:
+        # CPU work takes no card, so ranking it by idle cards sent a head's
+        # own `-g 0` job to a remote GPU box (a code transfer over the WAN and
+        # a host about to be wanted by GPU work) while the head sat idle.
+        # Prefer the cheapest node to reach, then the least loaded host, then
+        # the one with the fewest idle cards, so GPU hosts stay for GPU work.
+        def cpu_rank(s: NodeStatus) -> tuple[float, float, int]:
+            node = by_name[s.node]
+            load = (
+                s.system.cpu_load1 / max(1, s.system.cpu_cores)
+                if s.system is not None
+                else 1.0
+            )
+            return (0.0 if node.local else node.transfer_cost, load, len(s.free_gpus))
+
+        return [by_name[s.node] for s in sorted(usable, key=cpu_rank)]
     ranked = sorted(
-        (
-            s
-            for s in statuses
-            if s.error is None and disk_rejection_reason(s, spec) is None
-        ),
+        usable,
         key=lambda s: (len(eligible_free_gpus(s, spec)), len(s.free_gpus)),
         reverse=True,
     )
-    if spec.gpus == 0:
-        return [
-            by_name[s.node]
-            for s in ranked
-            if s.node in by_name and not by_name[s.node].drained
-        ]
     return [
         by_name[s.node]
         for s in ranked
         if len(eligible_free_gpus(s, spec)) >= spec.gpus
         and len(s.free_gpus) - spec.gpus >= reserve
-        and s.node in by_name
-        and not by_name[s.node].drained
     ]
 
 

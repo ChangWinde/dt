@@ -4104,7 +4104,7 @@ def test_pinned_submit_records_job_specific_block_before_agent_tick(
         ),
     )
 
-    def block_queued_job(cfg_, entry, _log):
+    def block_queued_job(cfg_, entry, _log, **_kwargs):
         entry.reason = "blocked: n1: path-missing: /data/libero"
         dispatch.save(cfg_, entry)
         return "blocked", "path-missing: /data/libero"

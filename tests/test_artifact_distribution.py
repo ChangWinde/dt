@@ -1291,6 +1291,7 @@ def test_topology_aware_does_not_upload_when_replica_route_is_unknown(
         "route",
         lambda *args: (_ for _ in ()).throw(TopologyDiscoveryError("no direct subnet")),
     )
+    monkeypatch.setattr(executor, "_cache_available", lambda *args: False)
     monkeypatch.setattr(
         executor,
         "_populate_cache",
@@ -1299,13 +1300,76 @@ def test_topology_aware_does_not_upload_when_replica_route_is_unknown(
         ),
     )
 
-    with pytest.raises(DistributionError, match="P2P state is uncertain"):
+    with pytest.raises(DistributionError, match="P2P state is uncertain") as refused:
         executor.ensure(
             tmp_path / "snapshot",
             "3" * 64,
             cfg.nodes[2],
             "~/dt/worker/jobs/new/code",
         )
+    assert "site cache on" in str(refused.value)
+    assert "does not hold it" in str(refused.value)
+
+
+def test_topology_aware_serves_from_the_site_cache_when_peer_routes_are_unavailable(
+    tmp_path, monkeypatch
+):
+    """Field observation: a CPU job bounced off a node with "artifact ... exists
+    inside site psibot, but its P2P state is uncertain: direct route psibot-ds
+    -> psibot-ys failed (authentication)". The siblings have no credentials
+    for each other, but the site cache node already held the digest: serving
+    from it costs no WAN bytes and keeps the node usable."""
+    import dt.artifact_distribution as module
+
+    cfg = _topology_cfg(tmp_path)
+    executor = TransferExecutor(cfg)
+    peer = ArtifactReplica(
+        kind="peer",
+        node=cfg.nodes[1],
+        code_dir="~/dt/worker/jobs/prior/code",
+        recorded_at=10.0,
+    )
+    monkeypatch.setattr(executor.discovery, "replicas", lambda *args: [peer])
+    monkeypatch.setattr(executor.discovery, "replica_present", lambda *args: True)
+    routes: list[str] = []
+
+    def route(replica, destination):
+        routes.append(replica.kind)
+        if replica.kind == "peer":
+            raise TopologyDiscoveryError(
+                f"direct route {replica.node.name} -> {destination.name} failed "
+                "(authentication)"
+            )
+        return _direct_route(replica, destination)
+
+    monkeypatch.setattr(executor.discovery, "route", route)
+    monkeypatch.setattr(executor, "_cache_available", lambda *args: True)
+    monkeypatch.setattr(
+        executor,
+        "_populate_cache",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("the cache already holds the digest: no WAN upload")
+        ),
+    )
+    monkeypatch.setattr(module.ArtifactVerifier, "require", lambda *args: None)
+    monkeypatch.setattr(executor, "_p2p_transfer", lambda *args, **kwargs: (900, 9))
+    logs: list[str] = []
+
+    result = executor.ensure(
+        tmp_path / "snapshot",
+        "3" * 64,
+        cfg.nodes[2],
+        "~/dt/worker/jobs/new/code",
+        log=logs.append,
+    )
+
+    assert result.cache_hit is True
+    assert result.cross_site_bytes == 0
+    assert result.site_bytes == 900
+    assert result.plan.source.kind == "site-cache"
+    assert routes == ["peer", "site-cache"]
+    assert any("serving" in m and "from the site cache on" in m for m in logs)
+    assert any("failed (authentication)" in m for m in logs)
 
 
 def test_topology_aware_does_not_upload_when_replica_verification_is_uncertain(
@@ -1336,6 +1400,7 @@ def test_topology_aware_does_not_upload_when_replica_verification_is_uncertain(
         "_populate_cache",
         lambda *args: uploads.append(True),
     )
+    monkeypatch.setattr(executor, "_cache_available", lambda *args: False)
 
     with pytest.raises(DistributionError, match="P2P state is uncertain"):
         executor.ensure(

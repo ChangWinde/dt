@@ -8,6 +8,26 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- A node whose sibling holds the snapshot but cannot be reached from it is no
+  longer unusable. Field observation: a job bounced off a node with "artifact
+  ... exists inside site SITE, but its P2P state is uncertain: direct route
+  NODE-A -> NODE-B failed (authentication)" — the siblings have no SSH
+  credentials for each other. When the peer routes are unavailable, the
+  transfer now serves the destination from the site cache node when that node
+  already holds the digest (no WAN bytes); only when the cache lacks it too
+  does dt still refuse to start a cold cross-site upload, and the error says
+  so.
+- An inline `dt run` no longer probes the whole center twice. It probed the
+  fleet to decide whether to enqueue, then the placement probed it again
+  seconds later (2.8 s of a 9.7 s CPU submission on a 13-node head); the
+  placement now reuses the probe the submission just took. The agent's own
+  ticks probe as before, and the launcher's locked capacity check is
+  unchanged.
+- Unpinned CPU work (`-g 0`) is placed by reach — the local node first, then
+  remote nodes by `transfer_cost`, ties broken by host load and fewest idle
+  cards — instead of by idle cards, which sent a head's own `-g 0 -- true` to
+  a remote GPU box (a WAN code transfer) while the head sat idle. GPU work
+  keeps the idle-cards-first ranking.
 - The agent log names a pinned node that is off the network as what it is:
   "JOB waits for an unreachable node (gc6d: ssh: connect ... Connection
   refused); trying jobs behind it" instead of "JOB blocked (...)". The job is

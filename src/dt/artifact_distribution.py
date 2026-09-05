@@ -1381,10 +1381,26 @@ class TransferExecutor:
                     failed_attempts=tuple(failed_attempts),
                 )
             if outcome.unavailable_replicas:
+                # A sibling holds the digest but no peer route to it could be
+                # established (field case: the siblings have no SSH
+                # credentials for each other). A cold cross-site upload is
+                # still not started while a copy may be inside the site, but
+                # the site cache costs no WAN bytes: when the cache node
+                # already holds the digest, serve the destination from there
+                # instead of failing the placement.
                 detail = outcome.unavailable_replicas[-1]
-                raise DistributionError(
-                    f"artifact {digest[:12]} exists inside site {site.name}, "
-                    f"but its P2P state is uncertain: {detail}"
+                if not self._cache_available(site, cache_node, digest):
+                    raise DistributionError(
+                        f"artifact {digest[:12]} exists inside site {site.name}, "
+                        f"but its P2P state is uncertain: {detail}; the site cache "
+                        f"on {cache_node.name} does not hold it, and a cold "
+                        "cross-site upload is not started while a sibling copy "
+                        "may serve it"
+                    )
+                log(
+                    f"peer routes for {digest[:12]} are unavailable ({detail}); "
+                    f"serving {destination.name} from the site cache on "
+                    f"{cache_node.name}"
                 )
 
             # Another destination may already be uploading this digest. The

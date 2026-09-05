@@ -336,6 +336,52 @@ def test_pick_candidates_enforces_known_disk_contract_but_allows_unknown_state()
     assert pick_candidates(statuses, nodes, spec) == []
 
 
+def test_pick_candidates_sends_cpu_work_to_the_nearest_idle_host_not_the_idlest_gpu():
+    """Field observation: a head's own `-g 0 -- true` went to a remote GPU box
+    that happened to have a free card (a WAN code transfer plus a P2P detour)
+    while the head itself sat idle. CPU work ranks by reach, then host load,
+    then fewest idle cards; GPU work keeps the idle-cards-first ranking."""
+
+    def loaded(status: NodeStatus, load1: float) -> NodeStatus:
+        status.system = SystemStats(
+            cpu_cores=32,
+            cpu_load1=load1,
+            mem_used_mib=1024,
+            mem_total_mib=65536,
+            disk_free_gib=500.0,
+            disk_total_gib=1000.0,
+            io_pressure=0.0,
+        )
+        return status
+
+    nodes = [
+        Node(name="remote-idle-gpu"),
+        Node(name="head", local=True),
+        Node(name="remote-busy-host", transfer_cost=0.5),
+        Node(name="far", transfer_cost=3.0),
+    ]
+    statuses = [
+        loaded(_status("remote-idle-gpu", free=1, total=1), 2.0),
+        loaded(_status("head", free=0, total=1), 16.0),
+        loaded(_status("remote-busy-host", free=0, total=2), 30.0),
+        _status("far", free=2, total=2),  # no host stats: ranks after known hosts
+    ]
+
+    cpu = RunSpec(name="cpu", gpus=0, cmd=["true"])
+    assert [node.name for node in pick_candidates(statuses, nodes, cpu)] == [
+        "head",
+        "remote-busy-host",
+        "remote-idle-gpu",
+        "far",
+    ]
+
+    gpu = RunSpec(name="gpu", gpus=1, cmd=["true"])
+    assert [node.name for node in pick_candidates(statuses, nodes, gpu)] == [
+        "far",
+        "remote-idle-gpu",
+    ]
+
+
 # -- config ------------------------------------------------------------------
 
 
@@ -3812,7 +3858,7 @@ def test_no_queue_preserves_a_concurrently_claimed_attempt(tmp_path, monkeypatch
         lambda *args, **kwargs: NodeStatus(node="n1"),
     )
 
-    def concurrent_claim(cfg_, pending, _log):
+    def concurrent_claim(cfg_, pending, _log, **_kwargs):
         with job_lock(cfg_, pending.job_id):
             current = load(cfg_, pending.job_id)
             assert current is not None
@@ -3870,7 +3916,7 @@ def test_no_queue_reports_bounded_launch_failure_instead_of_cpu_capacity(
     )
     raw_failure = "exit -15: launcher terminated; cancelled on node " + "x" * 8192
 
-    def failed_dispatch(cfg_, pending, _log):
+    def failed_dispatch(cfg_, pending, _log, **_kwargs):
         with job_lock(cfg_, pending.job_id):
             current = load(cfg_, pending.job_id)
             assert current is not None
@@ -4821,6 +4867,59 @@ def test_pinned_queued_busy_stops_before_snapshot(tmp_path, monkeypatch):
         "waiting: no free capacity "
         "(n1: 0 free < 1 wanted; busy: gpu0 ? 68.4/80.0GiB util0%)"
     )
+
+
+def test_dispatch_queued_reuses_a_probe_the_caller_just_took(tmp_path, monkeypatch):
+    """An inline `dt run` probed the whole center to decide to enqueue, then
+    dispatch_queued probed it all again seconds later: 2.8 s of a 9.7 s CPU
+    submission on the local head. The carried probe is used instead; an
+    agent call without one still probes."""
+    import dt.dispatch as dispatch
+
+    cfg = _cfg(tmp_path)
+    probes = {"center": 0, "node": 0}
+
+    def probe_center(cfg_, **kwargs):
+        probes["center"] += 1
+        return [_status("n1", free=0, total=1)]
+
+    def probe_node(node, threshold, **kwargs):
+        probes["node"] += 1
+        return _status(node.name, free=0, total=1)
+
+    monkeypatch.setattr(dispatch, "probe_center", probe_center)
+    monkeypatch.setattr(dispatch, "probe_node", probe_node)
+    monkeypatch.setattr(
+        dispatch,
+        "_try_nodes",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("a busy center must not snapshot or launch")
+        ),
+    )
+    carried = [_status("n1", free=0, total=1)]
+
+    unpinned = _entry("q-carried", "queued", created_at=1.0)
+    (dispatch.stage_dir(cfg, unpinned.job_id) / "code").mkdir(parents=True)
+    save(cfg, unpinned)
+    outcome, _ = dispatch.dispatch_queued(
+        cfg, unpinned, lambda message: None, statuses=carried
+    )
+    assert outcome == "busy"
+    assert probes == {"center": 0, "node": 0}
+
+    pinned = _entry("q-carried-pin", "queued", created_at=2.0, pin_node="n1")
+    (dispatch.stage_dir(cfg, pinned.job_id) / "code").mkdir(parents=True)
+    save(cfg, pinned)
+    outcome, _ = dispatch.dispatch_queued(
+        cfg, pinned, lambda message: None, statuses=carried
+    )
+    assert outcome == "busy"
+    assert probes == {"center": 0, "node": 0}
+
+    # The agent carries nothing and probes as before.
+    outcome, _ = dispatch.dispatch_queued(cfg, unpinned, lambda message: None)
+    assert outcome == "busy"
+    assert probes == {"center": 1, "node": 0}
 
 
 def test_queued_transport_drop_after_probe_persists_wait_reason(tmp_path, monkeypatch):

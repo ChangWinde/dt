@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 import os
 import re
 import shlex
@@ -16,6 +16,7 @@ from .. import dispatch as _root
 from .. import submission_intent as intent_mod
 from ..artifact_distribution import DistributionError
 from ..config import ConfigError, HeadConfig, Node
+from ..probe import NodeStatus
 from ..jobs import (
     JobEntry,
     RegistryDamage,
@@ -75,13 +76,22 @@ def dispatch_queued(
     cfg: HeadConfig,
     entry: JobEntry,
     log: Callable[[str], None],
+    *,
+    statuses: Sequence[NodeStatus] | None = None,
 ) -> tuple[str, str | None]:
     """Try to place a queued job now. Returns (outcome, detail) with outcome in:
-    started | finished | busy | waiting | blocked | failed | skipped | killed |
-    cancel-failed.
+    started | finished | busy | waiting | blocked | unreachable | failed |
+    skipped | killed | cancel-failed.
     ``waiting`` is a cheap local dependency wait; ``blocked`` is a
     job-specific placement blocker whose retry re-probes nodes, so the agent
-    may back it off. Called by the agent (and tests)."""
+    may back it off; ``unreachable`` is a pinned node off the network (same
+    backoff, named as an outage). Called by the agent (and tests).
+
+    ``statuses`` carries a probe the caller took moments ago (an inline
+    submission probes the center to decide whether to enqueue at all), so
+    the placement does not repeat a fleet-wide probe seconds later; the
+    launcher's own locked capacity check still guards the placement.
+    """
     _root._finalize_dependency_rows(
         cfg,
         (entry.after_success, entry.after_complete, entry.after_result),
@@ -270,7 +280,9 @@ def dispatch_queued(
                 current.reason = None
                 _root.save(cfg, current)
         entry.__dict__.update(current.__dict__)
-    return _root._dispatch_queued_active(cfg, entry, log)
+    if statuses is None:
+        return _root._dispatch_queued_active(cfg, entry, log)
+    return _root._dispatch_queued_active(cfg, entry, log, statuses=statuses)
 
 
 def _existing_dispatch_outcome(entry: JobEntry) -> tuple[str, str | None]:
@@ -1190,6 +1202,8 @@ def _dispatch_queued_active(
     cfg: HeadConfig,
     entry: JobEntry,
     log: Callable[[str], None],
+    *,
+    statuses: Sequence[NodeStatus] | None = None,
 ) -> tuple[str, str | None]:
     """Dispatch one queued entry with atomic, cancellation-aware transitions."""
 
@@ -1249,9 +1263,13 @@ def _dispatch_queued_active(
         pinned = by_name.get(spec.node)
         if pinned is None:
             return fail(f"unknown node {spec.node!r}; configured: {list(by_name)}")
-        statuses = [_root._probe_pinned_node(cfg, pinned)]
+        carried = [s for s in statuses or () if s.node == spec.node]
+        probed = carried or [_root._probe_pinned_node(cfg, pinned)]
+    elif statuses is None:
+        probed = _root.probe_center(cfg, use_cache=False)
     else:
-        statuses = _root.probe_center(cfg, use_cache=False)
+        probed = list(statuses)
+    statuses = probed
     probe_reasons = {
         status.node: probe_rejection_reason(status, spec) for status in statuses
     }
