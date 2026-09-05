@@ -62,6 +62,9 @@ class Host:
     escape: Callable[[str], str]
 
 
+_SOURCE_PLACEMENT = object()
+
+
 def build_receipt(
     host: Host,
     *,
@@ -78,7 +81,12 @@ def build_receipt(
     exit_code: int,
     request_id: str | None = None,
     idempotent_replay: bool = False,
+    placement: str | None | object = _SOURCE_PLACEMENT,
 ) -> JsonDict:
+    """``placement`` is the pin the members carry: the source job's node by
+    default, another node when the operator moved the group (``--node``), or
+    ``None`` when they handed placement to the scheduler (``--anywhere``)."""
+    node = source.node if placement is _SOURCE_PLACEMENT else placement
     uncertain = isinstance(error, dict) and error.get("kind") in {
         "fork_repeat_submission_interrupted",
         "submission_unknown",
@@ -115,7 +123,7 @@ def build_receipt(
         "repeat_ref_job_id": old.job_id,
         "source_job_id": source.job_id,
         "project": entries[0].project if entries else old.project,
-        "node": source.node,
+        "node": node,
         "name_prefix": name_prefix,
         "requested": requested,
         "submitted": len(entries),
@@ -829,6 +837,7 @@ def run(
         exit_code=progress.failure_code,
         request_id=request_id,
         idempotent_replay=progress.group_terminal_replay,
+        placement=spec.node,
     )
     if json_:
         print(json.dumps(receipt))

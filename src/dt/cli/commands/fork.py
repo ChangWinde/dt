@@ -116,6 +116,8 @@ def _build_fork_spec(
     min_vram_mib: int | None,
     max_vram_mib: int | None,
     max_job_memory_mib: int | None,
+    node: str | None = None,
+    anywhere: bool = False,
 ) -> RunSpec:
     """Build one fork RunSpec, applying the cold-cache wrapper and overrides."""
 
@@ -153,6 +155,14 @@ def _build_fork_spec(
         item_spec.max_vram_mib = max_vram_mib
     if max_job_memory_mib is not None:
         item_spec.max_job_memory_mib = max_job_memory_mib
+    # A fork pins the source job's node so A/B runs keep their hardware; the
+    # operator may move it (that node is full or offline) or hand placement
+    # back to the scheduler. The exact snapshot lives on the head, so it can
+    # be dispatched anywhere.
+    if node is not None:
+        item_spec.node = node
+    elif anywhere:
+        item_spec.node = None
     return item_spec
 
 
@@ -170,9 +180,25 @@ def _validate_fork_options(
     clone_cache: str | None,
     no_queue: bool,
     json_: bool,
+    node: str | None = None,
+    anywhere: bool = False,
 ) -> None:
     """Reject invalid or contradictory `dt fork` options before any I/O."""
     _validate_submission_request_id(request_id, json_=json_)
+    if node is not None and anywhere:
+        _fail_submission(
+            kind="invalid_argument",
+            message="use either --node or --anywhere, not both",
+            exit_code=1,
+            json_=json_,
+        )
+    if node is not None and not node.strip():
+        _fail_submission(
+            kind="invalid_argument",
+            message="--node needs a configured node name",
+            exit_code=1,
+            json_=json_,
+        )
     if max_hours is not None and (not math.isfinite(max_hours) or max_hours <= 0):
         _fail_submission(
             kind="invalid_argument",
@@ -262,12 +288,16 @@ def _forward_fork_to_head(
     no_queue: bool,
     command: list[str],
     json_: bool,
+    node: str | None = None,
+    anywhere: bool = False,
 ) -> NoReturn:
     """Laptop `dt fork`: replay the invocation on the head that owns ``ref``."""
     _, head = _root._locate(cfg, ref, json_=json_)
     route = (
         HeadCommand.start(head, "fork", ref)
         .option("-n", name or None)
+        .option("--node", node)
+        .flag("--anywhere", anywhere)
         .option("--repeat", repeat if repeat > 1 else None)
         .option("--reuse-cache", reuse_cache or None)
         .option("--cache-env", cache_env if reuse_cache else None)
@@ -447,6 +477,18 @@ def fork(
         help="override the source job's host-memory guard for the new fork(s)",
         rich_help_panel="Scheduling & safety",
     ),
+    node: Optional[str] = typer.Option(
+        None,
+        "--node",
+        help="place the fork(s) on this node instead of the source job's node",
+        rich_help_panel="Scheduling & safety",
+    ),
+    anywhere: bool = typer.Option(
+        False,
+        "--anywhere",
+        help="let the scheduler place the fork(s) instead of pinning the source node",
+        rich_help_panel="Scheduling & safety",
+    ),
     repeat: int = typer.Option(
         1,
         "--repeat",
@@ -489,6 +531,8 @@ def fork(
         clone_cache=clone_cache,
         no_queue=no_queue,
         json_=json_,
+        node=node,
+        anywhere=anywhere,
     )
 
     cfg = _root._cfg()
@@ -497,6 +541,8 @@ def fork(
             cfg,
             ref,
             name=name,
+            node=node,
+            anywhere=anywhere,
             repeat=repeat,
             reuse_cache=reuse_cache,
             clone_cache=clone_cache,
@@ -538,6 +584,29 @@ def fork(
         json_=json_,
     )
     source_display_ref = _display_ref_for_entry(cfg, source)
+    source_node = source.node if source.node != "-" else source.pin_node
+    moves = anywhere or (node is not None and node != source_node)
+    if moves and (inherit_cache or reuse_cache or clone_cache):
+        # A reused or cloned cache is a directory on the source job's node.
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                "cache reuse is node-local: a fork that reuses or clones "
+                f"{escape(source.name)}'s cache must run on {source_node}; drop "
+                "--node/--anywhere or the cache option"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
+    if node is not None and node not in {n.name for n in cfg.nodes}:
+        _fail_submission(
+            kind="invalid_argument",
+            message=(
+                f"unknown node {node!r}; configured: {[n.name for n in cfg.nodes]}"
+            ),
+            exit_code=1,
+            json_=json_,
+        )
 
     def build_spec(item_name: str | None) -> RunSpec:
         return _build_fork_spec(
@@ -555,6 +624,8 @@ def fork(
             min_vram_mib=min_vram_mib,
             max_vram_mib=max_vram_mib,
             max_job_memory_mib=max_job_memory_mib,
+            node=node,
+            anywhere=anywhere,
         )
 
     prefix = jobs_mod.sanitize_name((name or f"{old.name}-fork").strip())
