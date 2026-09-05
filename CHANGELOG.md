@@ -6,6 +6,31 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `uplink_kbps` (head config): a head-wide upload budget for every transfer
+  leg that leaves the head — the dispatcher's code snapshots, artifact
+  publication, pulls — under a site's `bwlimit_kbps` and a command's
+  `--bwlimit`, which win where present. A workstation head on a home line
+  saturates its uplink with one unthrottled rsync and stalls its own SSH and
+  remote desktop; the dispatcher's snapshot was the one leg no existing
+  budget could reach.
+
+### Fixed
+
+- Jobs of one project no longer run one at a time per node. The launcher took
+  the environment lock exclusively to `uv sync` on every launch, while each
+  running job's wrapper holds that lock shared for its lifetime — so the
+  second job of a project waited for the first to finish (a 31-minute
+  `environment` phase with an eight-line `env.log`), a two-card node ran one
+  card, and the dispatcher sat inside that wait instead of placing other
+  work. An environment already built for the job's surface (key plus project
+  table, stamped after a successful build) is now entered shared with no sync
+  at all; a build that cannot take the lock within `DT_ENV_BUILD_WAIT_S`
+  (90 s) reports `busy` with the reason and the dispatcher moves on. Imports
+  were never at stake: the wrapper pins each job's own `code/` and `code/src`
+  ahead of the shared install.
+
 ## 0.13.11 — 2026-09-06
 
 ### Added

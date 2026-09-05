@@ -365,8 +365,13 @@ pull with `--bwlimit`.
 transfer legs (rsync `--bwlimit`, KiB/s) so a checkpoint recovery cannot
 starve interactive sessions sharing the head's uplink.
 `sites.<name>.bwlimit_kbps` sets a per-site default; the flag overrides it.
-The budget deliberately never throttles intra-site LAN replays — those are
-the legs gateway staging exists to keep fast.
+`uplink_kbps` at the top of the head configuration is the floor under both:
+it reaches every leg that leaves the head, including the dispatcher's own
+code snapshots, which no flag can name. A workstation head on a home line
+(a 52 Mbit/s uplink is about 6,500 KiB/s) saturates it with one unthrottled
+rsync and stalls its own SSH and remote desktop; `uplink_kbps: 4500` leaves
+room for them. The budget deliberately never throttles intra-site LAN
+replays — those are the legs gateway staging exists to keep fast.
 
 ### Draining a node for maintenance
 

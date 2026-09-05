@@ -15,7 +15,7 @@ import uuid
 from .. import dispatch as _root
 from .. import submission_intent as intent_mod
 from ..artifact_distribution import DistributionError
-from ..config import ConfigError, HeadConfig, Node
+from ..config import ConfigError, HeadConfig, Node, head_bwlimit_kbps
 from ..probe import NodeStatus
 from ..jobs import (
     JobEntry,
@@ -865,6 +865,7 @@ def _sync_queued_job_to_node(
                 return _root.rsync(
                     f"{staged_code}/",
                     _root._code_endpoint(node, node_job_dir),
+                    bwlimit_kbps=head_bwlimit_kbps(cfg, node.name, None),
                     link_dest=link_dest,
                     copy_dest=stable_copy_dest,
                     timeout=BULK_TRANSFER_TIMEOUT_S,
@@ -891,6 +892,7 @@ def _sync_queued_job_to_node(
                 retries=2,
                 on_retry=_retry_logger(log, node.name, "queued snapshot"),
                 checksum=True,
+                bwlimit_kbps=head_bwlimit_kbps(cfg, node.name, None),
             )
     if proc.returncode != 0:
         raise DispatchError(f"snapshot to {node.name} failed: {proc.stderr.strip()}")
@@ -928,6 +930,7 @@ def _sync_queued_job_to_node(
             retries=2,
             on_retry=_retry_logger(log, node.name, "queued code convergence"),
             checksum=True,
+            bwlimit_kbps=head_bwlimit_kbps(cfg, node.name, None),
         )
     if proc.returncode != 0:
         raise DispatchError(

@@ -370,6 +370,7 @@ external collector.
 |---|---:|---|
 | `mem_threshold_mib` | 500 | GPU memory threshold used when classifying capacity |
 | `gpu_resident_processes` | empty | Compute processes, by `ps -o comm=` name, that may live on a card without making it busy |
+| `uplink_kbps` | unthrottled | Head-wide upload budget (KiB/s) for every transfer leg that leaves this head — code snapshots, artifact publication, pulls; a site's `bwlimit_kbps` or a command's `--bwlimit` wins where present |
 | `disk_min_gib` | 10 | Minimum free space required for every remote start |
 | `snapshot_warn_gib` | 2 | Warn when a source snapshot exceeds this transfer size |
 | `snapshot_excludes` | empty | Additional rsync-style source exclusions |

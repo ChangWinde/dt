@@ -16,7 +16,7 @@ from .. import dispatch as _root
 from .. import custom_env as custom_env_mod
 from .. import snapshot_hash as snapshot_hash_mod
 from ..artifact_distribution import DistributionError
-from ..config import ConfigError, HeadConfig, Node
+from ..config import ConfigError, HeadConfig, Node, head_bwlimit_kbps
 from ..layout import ROLE_LAYOUT, node_path_expression, rsync_destination
 from ..payload_hash import (
     RUNTIME_PAYLOAD_NAMES,
@@ -352,6 +352,7 @@ def snapshot(
                     on_retry=_retry_logger(log, node.name, "snapshot code"),
                     stats=True,
                     checksum=checksum,
+                    bwlimit_kbps=head_bwlimit_kbps(cfg, node.name, None),
                 )
 
             proc, observed = _verified_tree_transfer(

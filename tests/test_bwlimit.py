@@ -94,6 +94,70 @@ def test_effective_budget_prefers_flag_then_site_default(tmp_path):
     assert head_bwlimit_kbps(_cfg(tmp_path, site_limit=None), "worker", None) is None
 
 
+def test_head_uplink_budget_backs_every_leg_a_site_does_not_name(tmp_path):
+    """A workstation head on a home line shares one thin uplink between every
+    transfer and the operator's own SSH and remote desktop; one unthrottled
+    rsync stalls both. `uplink_kbps` is the head-wide floor: a site's own
+    budget or a --bwlimit still wins."""
+    cfg = _cfg(tmp_path, site_limit=None)
+    cfg.uplink_kbps = 5000
+
+    assert head_bwlimit_kbps(cfg, "lone", None) == 5000
+    assert head_bwlimit_kbps(cfg, "worker", None) == 5000
+    assert head_bwlimit_kbps(cfg, "worker", 800) == 800
+    with_site = _cfg(tmp_path, site_limit=4000)
+    with_site.uplink_kbps = 5000
+    assert head_bwlimit_kbps(with_site, "worker", None) == 4000
+    assert head_bwlimit_kbps(with_site, "lone", None) == 5000
+
+    parsed = parse({"center": "c", "nodes": ["a"], "projects": {}, "uplink_kbps": 6000})
+    assert isinstance(parsed, HeadConfig) and parsed.uplink_kbps == 6000
+    assert parse({"center": "c", "nodes": ["a"], "projects": {}}).uplink_kbps is None
+    from dt.config import ConfigError
+
+    for bad in (0, -1, "fast", 10**9 + 1):
+        with pytest.raises(ConfigError):
+            parse({"center": "c", "nodes": ["a"], "projects": {}, "uplink_kbps": bad})
+
+
+def test_dispatch_code_snapshot_carries_the_head_budget(tmp_path, monkeypatch):
+    """The dispatcher's code snapshot to a node is an upload from the head like
+    any other; it was the one leg no budget reached, so a home-line head could
+    still saturate its own uplink dispatching a job."""
+    cfg = _cfg(tmp_path, site_limit=None)
+    cfg.uplink_kbps = 3000
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "train.py").write_text("print(1)\n")
+    calls = []
+    monkeypatch.setattr(
+        dispatch, "run_on", lambda *a, **k: subprocess.CompletedProcess([], 0, "", "")
+    )
+    monkeypatch.setattr(dispatch, "_snapshot_baselines", lambda *a, **k: (None, None))
+    monkeypatch.setattr(dispatch, "_remote_tree_sha256", lambda *a: "a" * 64)
+    monkeypatch.setattr(dispatch, "_remember_snapshot", lambda *a: None)
+
+    def fake_rsync(src, dst, **kwargs):
+        calls.append((dst, kwargs.get("bwlimit_kbps")))
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(dispatch, "rsync", fake_rsync)
+
+    dispatch.snapshot(
+        cfg,
+        "omni",
+        project,
+        cfg.nodes[2],
+        "jid",
+        "dt/jobs/jid",
+        dispatch.RunSpec(name="jid", gpus=1, cmd=["true"], project="omni"),
+        {},
+    )
+
+    code_legs = [budget for dst, budget in calls if dst.endswith("/code/")]
+    assert code_legs and all(budget == 3000 for budget in code_legs)
+
+
 def test_config_validates_site_bwlimit():
     base = {
         "center": "c",
