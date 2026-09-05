@@ -632,9 +632,10 @@ def test_agent_autocompact_reports_a_recovery_archive_problem_once(
                 "planned_code_bytes": 0,
                 "skipped": {"snapshot_policy_rejected": 1},
                 "failed_jobs": 0,
-                "preflight_errors": list(errors),
+                "preflight_errors": [],
+                "policy_rejected_snapshots": list(errors),
             },
-            exit_code=1,
+            exit_code=0,
         ),
     )
     monkeypatch.setattr(agent, "_ARCHIVE_PROBLEMS_REPORTED", set())
@@ -4718,12 +4719,67 @@ def test_pinned_queued_unreachable_stops_before_snapshot(tmp_path, monkeypatch):
         lambda message: None,
     )
 
-    assert outcome == "blocked"
+    # Skipped with backoff like a blocked job, but named as the outage it is.
+    assert outcome == "unreachable"
     assert detail == "n2: ssh: No route to host"
     assert probed == ["n2"]
     current = load(cfg, entry.job_id)
     assert current.status == "queued"
     assert current.reason == ("waiting: n2 unreachable: ssh: No route to host")
+
+
+def test_agent_logs_an_unreachable_pin_as_an_outage_and_backs_off(
+    tmp_path, monkeypatch
+):
+    """Field observation: while the tunnel to a node was down, the agent log
+    read "blocked (gc6d: ssh: connect to host 127.0.0.1 port 7013: Connection
+    refused)" for every job pinned there, as if the jobs were at fault."""
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("pinned", "queued", created_at=1.0, pin_node="n1"))
+    save(cfg, _entry("behind", "queued", created_at=2.0, pin_node="n2"))
+    dispatched: list[str] = []
+
+    def fake_dispatch(cfg_, entry, log):
+        dispatched.append(entry.job_id)
+        if entry.job_id == "pinned":
+            return (
+                "unreachable",
+                "n1: ssh: connect to host 127.0.0.1 port 7013: Connection refused",
+            )
+        return "started", "n2"
+
+    monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
+    monkeypatch.setattr(
+        agent, "_reconcile_jobs", lambda cfg_, log_, entries=None: entries or []
+    )
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(agent.time, "monotonic", lambda: clock["now"])
+    messages: list[str] = []
+    backoff: dict[str, tuple[int, float]] = {}
+    log_state: dict[str, str] = {}
+
+    outcomes, _ = agent._process_once_with_snapshot(
+        cfg, messages.append, blocked_log_state=log_state, blocked_backoff=backoff
+    )
+
+    assert outcomes == [("pinned", "unreachable"), ("behind", "started")]
+    assert dispatched == ["pinned", "behind"]
+    assert (
+        "pinned waits for an unreachable node (n1: ssh: connect to host 127.0.0.1 "
+        "port 7013: Connection refused); trying jobs behind it"
+    ) in messages
+    assert not any("blocked" in m for m in messages)
+    assert "pinned" in backoff  # retried on the blocked-job backoff, not every tick
+
+    clock["now"] = 1002.0
+    dispatched.clear()
+    outcomes, _ = agent._process_once_with_snapshot(
+        cfg, messages.append, blocked_log_state=log_state, blocked_backoff=backoff
+    )
+    assert ("pinned", "blocked") in outcomes  # inside the backoff window: not probed
+    assert dispatched == ["behind"]  # the fake leaves "behind" queued; only it is tried
 
 
 def test_pinned_queued_busy_stops_before_snapshot(tmp_path, monkeypatch):

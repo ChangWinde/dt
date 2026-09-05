@@ -518,7 +518,11 @@ def test_compact_names_the_jobs_a_legacy_snapshot_pins_and_how_to_retire_them(
     assert report.payload["compacted_jobs"] == 1
     assert not (healthy_root / "code").exists()
     assert (pinned_root / "code" / "train.py").is_file()
-    (problem,) = report.payload["preflight_errors"]
+    # A stable fact with a remedy, not a failure: routine `dt compact --plan`
+    # must not exit 1 forever because of one pre-policy archive.
+    assert report.exit_code == 0
+    assert report.payload["preflight_errors"] == []
+    (problem,) = report.payload["policy_rejected_snapshots"]
     assert problem.startswith(
         f"{legacy_digest}: recovery snapshot violates the current"
     )

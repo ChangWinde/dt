@@ -90,7 +90,11 @@ class CompactPreflight:
     candidates: tuple[CompactCandidate, ...]
     skipped: dict[str, int]
     registry_damage: tuple[RegistryDamage, ...]
+    # Archives that are corrupt or unreadable: a fail-visible condition.
     errors: tuple[str, ...]
+    # Intact archives that today's snapshot policy refuses to re-verify: their
+    # jobs are kept, named, and given a remedy; nothing is broken.
+    policy_rejections: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -253,6 +257,7 @@ def preflight(
         candidates.append(candidate)
 
     errors: list[str] = []
+    policy_rejections: list[str] = []
     unverified: set[str] = set()
     policy_rejected: set[str] = set()
     by_digest: dict[str, list[CompactCandidate]] = defaultdict(list)
@@ -262,7 +267,7 @@ def preflight(
         try:
             observed = tree_sha256(covered[0].archive_code)
         except SnapshotPolicyError as exc:
-            errors.append(_policy_rejected_error(digest, exc, covered))
+            policy_rejections.append(_policy_rejected_error(digest, exc, covered))
             policy_rejected.add(digest)
             continue
         except (OSError, ValueError) as exc:
@@ -296,6 +301,7 @@ def preflight(
         skipped=dict(sorted(skipped.items())),
         registry_damage=tuple(damage),
         errors=tuple(errors),
+        policy_rejections=tuple(policy_rejections),
     )
 
 
@@ -810,11 +816,14 @@ def compact_jobs(
             for item in checked.registry_damage
         ],
         "preflight_errors": list(checked.errors),
+        "policy_rejected_snapshots": list(checked.policy_rejections),
     }
     # Unverifiable archives are already excluded from ``checked.candidates`` and
     # surfaced in ``preflight_errors``; the healthy candidates still proceed so
     # one corrupt object cannot wedge the sweep.  The error stays fail-visible
-    # through a non-zero exit for the interactive command.
+    # through a non-zero exit for the interactive command.  A policy rejection
+    # is a stable fact with a remedy, not a failure: it is reported without
+    # turning every routine `dt compact --plan` into exit 1.
     rows, node_errors, failure_kinds = _remote_rows(
         cfg,
         list(checked.candidates),

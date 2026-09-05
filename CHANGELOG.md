@@ -6,6 +6,20 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- The agent log names a pinned node that is off the network as what it is:
+  "JOB waits for an unreachable node (gc6d: ssh: connect ... Connection
+  refused); trying jobs behind it" instead of "JOB blocked (...)". The job is
+  still skipped with the same backoff so it neither holds the FIFO nor probes
+  a dead tunnel every tick (`dispatch_queued` outcome `unreachable`).
+- `dt compact` exits 0 when the only thing it could not verify is a recovery
+  snapshot that predates the current snapshot policy. Such archives are
+  reported under `policy_rejected_snapshots` (yellow "recovery archive
+  skipped" in the human view) with their jobs and remedy; `preflight_errors`
+  and exit 1 are kept for archives that are corrupt or unreadable. One
+  pre-policy snapshot used to make every routine `dt compact --plan` exit 1.
+
 ## 0.13.9 — 2026-09-05
 
 ### Fixed

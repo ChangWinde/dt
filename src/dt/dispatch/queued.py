@@ -1266,9 +1266,12 @@ def _dispatch_queued_active(
         detail = "; ".join(
             f"{node}: {reason}" for node, reason in probe_reasons.items()
         )
+        # A pinned job whose node is off the network must not hold the FIFO
+        # (it is skipped with backoff like a blocked job), but it is an outage,
+        # not a fault of the job: the agent names it as such in its log.
         return hold(
             waiting_unreachable_reason(probe_reasons),
-            ("blocked", detail) if spec.node is not None else ("busy", None),
+            ("unreachable", detail) if spec.node is not None else ("busy", None),
         )
     if pin_is_busy(statuses, spec):
         candidates = []

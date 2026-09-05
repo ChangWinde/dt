@@ -997,6 +997,8 @@ def _process_once_with_snapshot(
       it cannot starve the jobs behind it; each retry re-probes every node
       and restages, so persistently blocked entries retry on a capped
       exponential backoff instead of at full cost every tick
+    - unreachable (a pinned node off the network): the same skip and backoff,
+      logged as the outage it is rather than as a fault of the job
     - busy (GPU capacity): preserve FIFO for every job that could use the same
       capacity; a pinned wait may be skipped only for later work pinned to a
       different node
@@ -1100,9 +1102,13 @@ def _process_once_with_snapshot(
             _bump_blocked_backoff(blocked_backoff, entry.job_id)
             continue
         results.append((entry.job_id, outcome))
-        if blocked_log_state is not None and outcome not in ("blocked", "waiting"):
+        if blocked_log_state is not None and outcome not in (
+            "blocked",
+            "unreachable",
+            "waiting",
+        ):
             blocked_log_state.pop(entry.job_id, None)
-        if blocked_backoff is not None and outcome != "blocked":
+        if blocked_backoff is not None and outcome not in ("blocked", "unreachable"):
             blocked_backoff.pop(entry.job_id, None)
         if outcome in {
             "started",
@@ -1119,13 +1125,21 @@ def _process_once_with_snapshot(
             running = quota_occupancy(cfg, entries=entries, damage=damage)
         if outcome in _REPORTED_DISPATCH_OUTCOMES:
             _report_dispatch_outcome(cfg, entry, outcome, detail, log)
-        elif outcome == "blocked":
+        elif outcome in ("blocked", "unreachable"):
+            # Both skip the job with backoff so it neither holds the FIFO nor
+            # burns the fleet every tick; only the words differ. An unreachable
+            # pin is an outage, not a fault of the job.
             blocked_detail = detail or "reason unavailable"
+            verb = (
+                "waits for an unreachable node"
+                if outcome == "unreachable"
+                else "blocked"
+            )
             if (
                 blocked_log_state is None
                 or blocked_log_state.get(entry.job_id) != blocked_detail
             ):
-                log(f"{entry.job_id} blocked ({blocked_detail}); trying jobs behind it")
+                log(f"{entry.job_id} {verb} ({blocked_detail}); trying jobs behind it")
             if blocked_log_state is not None:
                 blocked_log_state[entry.job_id] = blocked_detail
             _bump_blocked_backoff(blocked_backoff, entry.job_id)
@@ -1348,8 +1362,15 @@ def _maybe_autocompact(cfg: HeadConfig, log: Callable[[str], None]) -> None:
             "written after start; copy them out of <job_dir>/code on the node "
             "(dt pull does not fetch code/) or run dt compact --prune-modified"
         )
+    rejected = payload.get("policy_rejected_snapshots")
     _report_archive_problems(
-        [str(item) for item in errors] if isinstance(errors, list) else [], log
+        [
+            str(item)
+            for group in (errors, rejected)
+            if isinstance(group, list)
+            for item in group
+        ],
+        log,
     )
 
 
