@@ -255,6 +255,15 @@ is present, every path read or installed by the hook must be listed. Missing an
 input can produce incorrect environment reuse; remove `setup_inputs` to return
 to whole-snapshot isolation if the dependency boundary is uncertain.
 
+Whole-snapshot isolation has a cost worth knowing before choosing it: every
+edited snapshot gets its own environment, built under the node's environment
+lock, so launches of that project on one node build and wait for each other
+for the length of a full `uv sync`. `dt doctor` reports such projects as
+`env_reuse: per-snapshot: NAME, ...` (a warning, exit code unchanged). A hook
+that only runs `uv sync` can simply be removed — `dt` already syncs every
+`uv.lock` project — and a hook that installs local packages should list what
+it reads (`pyproject.toml`, `uv.lock`, the package directories).
+
 Absolute paths and `..` are rejected in `setup_inputs`.
 
 ### Managed paths

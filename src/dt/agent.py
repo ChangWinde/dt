@@ -1019,17 +1019,21 @@ def _process_once_with_snapshot(
         )
         blocked_backoff.clear()
     for item in damage:
-        if item.path == "registry":
-            # Directory-level verdict from the active-index rebuild (a writer
-            # committed mid-scan): nothing is broken, but one row may have
-            # been missed, so a slot is held for it this tick.
+        if item.transient:
+            # A writer committed mid-scan: nothing is broken, but one row may
+            # have been missed, so a slot is held for it this tick.
             log(
-                f"registry changed while the active index was rebuilt "
-                f"({item.detail}); holding one job slot this tick"
+                "registry changed while the active index was rebuilt; "
+                "holding one job slot this tick"
             )
             continue
+        subject = (
+            "registry directory"
+            if item.path == "registry"
+            else f"registry entry {item.path}"
+        )
         log(
-            f"registry entry {item.path} is unreadable ({item.detail}); "
+            f"{subject} is unreadable ({item.detail}); "
             "counting it as a running job until it is repaired"
         )
     _submit_retries(cfg, entries, log)
@@ -2375,11 +2379,15 @@ def status(cfg: HeadConfig) -> dict[str, object]:
         key=lambda entry: entry.created_at,
     )
     running = sum(entry.status == "running" for entry in entries)
+    # A writer committing while the active index was rebuilt is not damage a
+    # controller must act on: the next call reads a stable registry. Only rows
+    # that cannot be decoded make a handoff unsafe.
+    durable_damage = [item for item in damage if not item.transient]
     handoff_state, handoff_reason = _adaptive_handoff_state(
         alive=pid is not None,
         queued=len(q),
         running=running,
-        registry_damage=len(damage),
+        registry_damage=len(durable_damage),
     )
     try:
         log_bytes = log_path(cfg).stat().st_size

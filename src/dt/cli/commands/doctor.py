@@ -16,6 +16,7 @@ from ... import jobs as jobs_mod
 from ...config import HeadConfig
 from ...doctor import (
     default_project_status,
+    environment_reuse_status,
     head_capability_checks,
     registry_growth_status,
 )
@@ -191,6 +192,19 @@ def _doctor_contract(rows: list[JsonDict], *, exit_code: int) -> JsonDict:
                 observed=default_project,
                 action={"type": "config_edit", "field": "default_project"},
             )
+        env_reuse = str(checks.get("env_reuse", ""))
+        if env_reuse.startswith("per-snapshot"):
+            add(
+                node=node,
+                kind="environment_per_snapshot",
+                severity="warning",
+                check="env_reuse",
+                observed=env_reuse,
+                action={
+                    "type": "declare_setup_inputs",
+                    "projects": env_reuse.partition(": ")[2],
+                },
+            )
         link = str(checks.get("link", ""))
         if link.startswith(("relayed", "proxied")):
             add(
@@ -284,6 +298,15 @@ def _render_doctor_actions(payload: JsonDict) -> None:
                 "(allowed for your own account on most systems; otherwise ask an "
                 "administrator)[/dim]"
             )
+        elif action_type == "declare_setup_inputs":
+            err.print(
+                f"[dim]{prefix} declare projects[].setup_inputs for "
+                f"{escape(str(action.get('projects')))}: a setup hook without them "
+                "gives every edited snapshot its own environment, so launches of "
+                "one project on one node build and wait for each other; list the "
+                "files the hook reads (pyproject.toml, uv.lock, ...), or drop a "
+                "hook that only runs uv sync - dt already syncs uv.lock projects[/dim]"
+            )
 
 
 def doctor(
@@ -314,6 +337,7 @@ def doctor(
         capability_checks = head_capability_checks()
         identity_checks = _install_identity_checks()
         project_status = default_project_status(cfg)
+        env_reuse = environment_reuse_status(cfg)
         local_names = {n.name for n in cfg.nodes if n.local}
         drained_names = {n.name for n in cfg.nodes if n.drained}
         attached = False
@@ -326,6 +350,7 @@ def doctor(
                 r["checks"].update(capability_checks)
                 r["checks"].update(identity_checks)
                 r["checks"]["default_project"] = project_status
+                r["checks"]["env_reuse"] = env_reuse
                 if relay_status is not None:
                     r["checks"]["relay"] = relay_status
                 attached = True
@@ -341,6 +366,7 @@ def doctor(
                 **capability_checks,
                 **identity_checks,
                 "default_project": project_status,
+                "env_reuse": env_reuse,
             }
             if relay_status is not None:
                 checks["relay"] = relay_status

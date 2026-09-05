@@ -6,6 +6,25 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `dt doctor` reports projects whose `setup` hook has no `setup_inputs` as
+  `env_reuse: per-snapshot: NAME, ...` (a warning) with the remedy. Such a
+  hook folds the whole snapshot into the environment identity, so every
+  edited snapshot builds its own environment under the node's environment
+  lock and launches of one project on one node wait for each other. Field
+  observation: an operator kept three copies of one project, differing only
+  in a hook comment, to obtain three environment keys.
+
+### Fixed
+
+- `dt agent status` no longer reports `handoff_state: registry_degraded`
+  when its registry scan merely raced a writer (the active-index rebuild
+  saw the directory change). That verdict is transient and holds one job
+  slot for the tick; only rows that cannot be decoded make a handoff unsafe.
+  The agent log says "registry directory is unreadable" for a directory
+  that really cannot be read instead of "registry entry registry".
+
 ## 0.13.7 — 2026-09-05
 
 ### Added

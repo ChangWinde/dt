@@ -60,6 +60,55 @@ def test_default_project_status_is_actionable_without_disclosing_its_path(tmp_pa
     assert str(missing) not in status
 
 
+def test_environment_reuse_status_names_projects_whose_hook_has_no_inputs(tmp_path):
+    """Field observation: three projects with one path, differing only in a
+    hook comment, existed to obtain three environment keys - because a hook
+    without setup_inputs gives every edited snapshot its own environment."""
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="head", local=True)],
+        projects={
+            "plain": Project(path=tmp_path),
+            "declared": Project(
+                path=tmp_path, setup="uv sync --frozen", setup_inputs=["uv.lock"]
+            ),
+            "slot-c": Project(path=tmp_path, setup="# slot-c\nuv sync --frozen"),
+            "slot-b": Project(path=tmp_path, setup="# slot-b\nuv sync --frozen"),
+        },
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+
+    assert doctor.environment_reuse_status(cfg) == "per-snapshot: slot-b, slot-c"
+
+    cfg.projects["slot-b"].setup_inputs = ["pyproject.toml", "uv.lock"]
+    cfg.projects["slot-c"].setup = None
+    assert doctor.environment_reuse_status(cfg) == "ok"
+
+    payload = doctor_cmd._doctor_contract(  # noqa: SLF001
+        [
+            {
+                "node": "head",
+                "checks": {"ssh": "ok", "env_reuse": "per-snapshot: slot-b, slot-c"},
+                "unreachable": False,
+            }
+        ],
+        exit_code=0,
+    )
+    (issue,) = payload["issues"]
+    assert issue["kind"] == "environment_per_snapshot"
+    assert issue["severity"] == "warning"
+    assert payload["actions"] == [
+        {
+            "issue_kind": "environment_per_snapshot",
+            "node": "head",
+            "type": "declare_setup_inputs",
+            "projects": "slot-b, slot-c",
+        }
+    ]
+
+
 def test_doctor_contract_reports_default_project_and_indirect_bulk_route():
     rows = [
         {

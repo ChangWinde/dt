@@ -22,6 +22,7 @@ from dt.agent import (
 from dt.config import ConfigError, HeadConfig, LaptopConfig, Node, QueueCfg, parse
 from dt.dispatch import RunSpec, dispatch_queued, pick_candidates
 from dt.jobs import (
+    ACTIVE_INDEX_REBUILD_RACE,
     LOST_RECHECK_S,
     JobEntry,
     RegistryError,
@@ -670,12 +671,10 @@ def test_agent_describes_a_mid_rebuild_registry_change_as_such(tmp_path, monkeyp
     def rebuilt(cfg_, *, damage=None, **kwargs):
         if damage is not None:
             damage.append(
-                RegistryDamage(
-                    path="registry",
-                    detail="registry changed during active-index rebuild",
-                )
+                RegistryDamage(path="registry", detail=ACTIVE_INDEX_REBUILD_RACE)
             )
             damage.append(RegistryDamage(path="jobs/x.json", detail="not json"))
+            damage.append(RegistryDamage(path="registry", detail="EACCES: registry"))
         return []
 
     monkeypatch.setattr(agent, "active_entries", rebuilt)
@@ -685,14 +684,53 @@ def test_agent_describes_a_mid_rebuild_registry_change_as_such(tmp_path, monkeyp
     agent._process_once_with_snapshot(cfg, messages.append)
 
     assert (
-        "registry changed while the active index was rebuilt (registry changed "
-        "during active-index rebuild); holding one job slot this tick"
+        "registry changed while the active index was rebuilt; holding one job "
+        "slot this tick"
     ) in messages
     assert (
         "registry entry jobs/x.json is unreadable (not json); counting it as a "
         "running job until it is repaired"
     ) in messages
+    assert (
+        "registry directory is unreadable (EACCES: registry); counting it as a "
+        "running job until it is repaired"
+    ) in messages
     assert not any("registry entry registry" in m for m in messages)
+
+
+def test_agent_status_handoff_ignores_a_mid_rebuild_registry_change(
+    tmp_path, monkeypatch
+):
+    """`dt agent status` polled during a registry write reported
+    handoff_state=registry_degraded ("registry damage prevents a safe
+    handoff") for that one call; a controller acting on it would stop
+    submitting for no reason. Only undecodable rows degrade the handoff."""
+    import dt.agent as agent
+    from dt.jobs import RegistryDamage
+
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("queued-one", "queued", created_at=1.0))
+    damage_to_report: list[RegistryDamage] = [
+        RegistryDamage(path="registry", detail=ACTIVE_INDEX_REBUILD_RACE)
+    ]
+    real_active_entries = agent.active_entries
+
+    def racing(cfg_, *, damage=None, **kwargs):
+        entries = real_active_entries(cfg_, damage=damage, **kwargs)
+        if damage is not None:
+            damage.extend(damage_to_report)
+        return entries
+
+    monkeypatch.setattr(agent, "active_entries", racing)
+    monkeypatch.setattr(agent, "alive_pid", lambda cfg_: 4242)
+
+    status = agent.status(cfg)
+    assert status["handoff_state"] == "covered"
+    assert status["registry_damage"] == 1  # still a fact about this call
+
+    damage_to_report[:] = [RegistryDamage(path="jobs/x.json", detail="not json")]
+    degraded = agent.status(cfg)
+    assert degraded["handoff_state"] == "registry_degraded"
 
 
 def test_agent_autocompact_is_off_when_configured_false(tmp_path, monkeypatch):
