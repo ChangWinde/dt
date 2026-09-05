@@ -441,10 +441,19 @@ fi
 
 stop_agent_bounded() {
     local command="$1"
-    local command_dir
+    local command_dir attempt
     command_dir="$(dirname "$command")"
-    timeout -k 2 30 env PATH="$command_dir${PATH:+:$PATH}" \
-        "$command" agent stop >/dev/null
+    # The agent finishes an in-flight dispatch (snapshot transfer plus launch)
+    # before it honours a stop, and `dt agent stop` exits 1 while it is still
+    # running. Three rounds cover a slow launch; restarting into an agent that
+    # is still the old one could only fail attestation and roll back.
+    for attempt in 1 2 3; do
+        if timeout -k 2 60 env PATH="$command_dir${PATH:+:$PATH}" \
+            "$command" agent stop >/dev/null; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 start_agent_bounded() {
@@ -862,10 +871,19 @@ activate_release() {
 
 stop_agent_bounded() {
     local command="$1"
-    local command_dir
+    local command_dir attempt
     command_dir="$(dirname "$command")"
-    timeout -k 2 30 env PATH="$command_dir${PATH:+:$PATH}" \
-        "$command" agent stop >/dev/null
+    # The agent finishes an in-flight dispatch (snapshot transfer plus launch)
+    # before it honours a stop, and `dt agent stop` exits 1 while it is still
+    # running. Three rounds cover a slow launch; restarting into an agent that
+    # is still the old one could only fail attestation and roll back.
+    for attempt in 1 2 3; do
+        if timeout -k 2 60 env PATH="$command_dir${PATH:+:$PATH}" \
+            "$command" agent stop >/dev/null; then
+            return 0
+        fi
+    done
+    return 1
 }
 
 start_agent_bounded() {

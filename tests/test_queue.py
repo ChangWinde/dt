@@ -2299,7 +2299,7 @@ def test_stop_agent_falls_back_to_manual_pid_when_systemd_stop_is_a_noop(
     monkeypatch.setattr(agent.os, "kill", lambda pid, sig: signals.append((pid, sig)))
     monkeypatch.setattr(agent.time, "sleep", lambda _seconds: None)
 
-    assert agent.stop_agent(cfg) is True
+    assert agent.stop_agent(cfg, wait_s=5.0) == "stopped"
     assert signals == [(4321, agent.signal.SIGTERM)]
 
 
@@ -2331,8 +2331,31 @@ def test_agent_systemctl_timeout_is_a_stable_start_stop_status_failure(
 
     assert agent.start_detached(cfg) is False
     monkeypatch.setattr(agent, "alive_pid", lambda _cfg: 4321)
-    assert agent.stop_agent(cfg) is False
+    assert agent.stop_agent(cfg) == "still_running"
     assert agent._supervisor_status()["supervisor_state"] == "query-failed"
+
+
+def test_stop_agent_tells_still_running_apart_from_not_running(tmp_path, monkeypatch):
+    """Field observation: a deploy stopped the agent while it was finishing a
+    dispatch; `dt agent stop` waited five seconds, reported "no agent running"
+    and exited 0, the deploy started "the agent" (already running, old code),
+    attestation failed and the release rolled back."""
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(agent, "systemd_unit_path", lambda: tmp_path / "absent.unit")
+    monkeypatch.setattr(agent.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(agent.os, "kill", lambda _pid, _sig: None)
+
+    monkeypatch.setattr(agent, "alive_pid", lambda _cfg: None)
+    assert agent.stop_agent(cfg) == "not_running"
+
+    monkeypatch.setattr(agent, "alive_pid", lambda _cfg: 4321)
+    assert agent.stop_agent(cfg, wait_s=1.0) == "still_running"
+
+    probes = iter([4321, 4321, 4321, None, None])
+    monkeypatch.setattr(agent, "alive_pid", lambda _cfg: next(probes))
+    assert agent.stop_agent(cfg, wait_s=1.0) == "stopped"
 
 
 def test_stopped_incompatible_supervisor_is_not_started(tmp_path, monkeypatch):

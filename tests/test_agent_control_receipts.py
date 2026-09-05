@@ -64,12 +64,48 @@ def test_start_failure_is_an_error_document(tmp_path, monkeypatch):
 
 def test_stop_receipt_reports_whether_anything_was_running(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_cfg", lambda: _cfg(tmp_path))
-    monkeypatch.setattr(agent_cmd.agent_mod, "stop_agent", lambda cfg: False)
+    monkeypatch.setattr(agent_cmd.agent_mod, "alive_pid", lambda cfg: None)
+    monkeypatch.setattr(
+        agent_cmd.agent_mod, "stop_agent", lambda cfg, *, wait_s: "not_running"
+    )
 
     result = CliRunner().invoke(cli.app, ["agent", "stop", "--json"])
 
     assert result.exit_code == 0
     assert _receipt(result)["outcome"] == "not_running"
+
+
+def test_stop_that_outlives_its_wait_is_an_exit_one_still_running_receipt(
+    tmp_path, monkeypatch
+):
+    """An agent finishing its in-flight dispatch is still running; saying
+    "no agent running" (exit 0) sent a deploy into a restart that failed."""
+    monkeypatch.setattr(cli, "_cfg", lambda: _cfg(tmp_path))
+    monkeypatch.setattr(agent_cmd.agent_mod, "alive_pid", lambda cfg: 4321)
+    waits: list[float] = []
+
+    def stop_agent(cfg, *, wait_s):
+        waits.append(wait_s)
+        return "still_running"
+
+    monkeypatch.setattr(agent_cmd.agent_mod, "stop_agent", stop_agent)
+
+    result = CliRunner().invoke(cli.app, ["agent", "stop", "--json", "--timeout", "7"])
+
+    assert result.exit_code == 1, result.output
+    receipt = _receipt(result)
+    assert receipt["outcome"] == "still_running"
+    assert receipt["pid"] == 4321 and receipt["exit_code"] == 1
+    assert waits == [7.0]
+
+    human = CliRunner().invoke(cli.app, ["agent", "stop"])
+    assert human.exit_code == 1
+    assert "still running after 25s" in human.output
+    assert "retry dt agent stop" in human.output
+
+    bad = CliRunner().invoke(cli.app, ["agent", "stop", "--timeout", "0", "--json"])
+    assert bad.exit_code == 1
+    assert json.loads(bad.stdout)["error"] == "invalid_argument"
 
 
 def test_install_receipt_and_unavailable_supervisor(tmp_path, monkeypatch):
@@ -107,7 +143,9 @@ def test_install_receipt_and_unavailable_supervisor(tmp_path, monkeypatch):
 
 def test_human_mode_is_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "_cfg", lambda: _cfg(tmp_path))
-    monkeypatch.setattr(agent_cmd.agent_mod, "stop_agent", lambda cfg: True)
+    monkeypatch.setattr(
+        agent_cmd.agent_mod, "stop_agent", lambda cfg, *, wait_s: "stopped"
+    )
 
     result = CliRunner().invoke(cli.app, ["agent", "stop"])
 

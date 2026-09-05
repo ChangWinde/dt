@@ -16,6 +16,14 @@ The agent owns queue reconciliation and dispatch. It does not invent
 experiments. When stopped, running jobs continue and queued jobs remain
 registered.
 
+`dt agent stop` waits up to 25 seconds (`--timeout SECONDS` to change it):
+the agent finishes a dispatch it is in the middle of — snapshot transfer plus
+launch — before it exits, so a launch is never abandoned half-way. If it is
+still running when the wait ends, the command says so and exits 1
+(`--json`: `outcome: still_running` with the pid) rather than reporting "no
+agent running"; retry, or give it longer. `scripts/deploy.sh` retries the
+stop three times before it restarts the agent on the new release.
+
 Installation creates
 `disttrainer-agent.service` with `Restart=always`. Runtime tmux creation enters
 an independent user scope so stopping the agent's invoking service does not
