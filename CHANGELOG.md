@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.6 — 2026-09-05
+
 ### Fixed
 
 - Piped human output (`ssh head dt ps`, `dt free | less`, an agent's tool
