@@ -164,6 +164,15 @@ def agent_status(
         "-v",
         help="show scheduler policy, log rotation, and the complete queue-head id",
     ),
+    brief: bool = typer.Option(
+        False,
+        "--brief",
+        help=(
+            "JSON: omit the per-job scheduler.queue array (counts, next job, "
+            "and handoff stay). A long queue makes the full document tens or "
+            "hundreds of KiB; deploy and routine agent polling only need alive."
+        ),
+    ),
     json_: bool = typer.Option(
         False, "--json", help="emit one dt_agent_status_v1 object on stdout"
     ),
@@ -177,6 +186,7 @@ def agent_status(
                 head,
                 ["agent", "status"]
                 + (["--verbose"] if verbose else [])
+                + (["--brief"] if brief else [])
                 + (["--json"] if json_ else []),
             )
         )
@@ -184,7 +194,8 @@ def agent_status(
     head_cfg = _need_head(cfg)
     st = agent_mod.status(head_cfg)
     if json_:
-        print(json.dumps({"schema_version": "dt_agent_status_v1", **st}))
+        payload = _brief_status(st) if brief else st
+        print(json.dumps({"schema_version": "dt_agent_status_v1", **payload}))
         return
     queue_label = None
     queue_head = st.get("queue_head")
@@ -200,6 +211,27 @@ def agent_status(
             queue_label=queue_label,
         )
     )
+
+
+def _brief_status(status: dict[str, Any]) -> dict[str, Any]:
+    """The liveness contract without the per-job queue that grows it without bound.
+
+    Field report: 79 queued jobs made ``dt agent status --json`` 84 KiB; 156
+    jobs made 117 KiB. Deploy and routine agent polling only need ``alive``,
+    counts, and the next job. The full ``scheduler.queue`` array stays the
+    default so existing consumers are unchanged.
+    """
+    brief = dict(status)
+    scheduler = status.get("scheduler")
+    if isinstance(scheduler, dict):
+        scheduler = dict(scheduler)
+        queue = scheduler.get("queue")
+        omitted = len(queue) if isinstance(queue, list) else 0
+        scheduler["queue"] = []
+        scheduler["queue_omitted"] = omitted
+        brief["scheduler"] = scheduler
+    brief["brief"] = True
+    return brief
 
 
 def _agent_queue_label(job_id: str) -> str:

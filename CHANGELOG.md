@@ -16,6 +16,9 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   document from a temp file and only refuses a document larger than 16 MiB or
   one whose `alive` field is not a boolean. Deploying 0.13.6 to psibot-hm
   was refused by this check until the script was repaired.
+- `dt agent status --json --brief` omits the per-job `scheduler.queue` array
+  (`queue: []`, `queue_omitted: N`, `brief: true`) so routine polling and
+  deploy stay a few hundred bytes. The full document remains the default.
 
 ## 0.13.6 — 2026-09-05
 

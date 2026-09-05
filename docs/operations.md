@@ -62,7 +62,10 @@ entering a restart loop. Re-run `dt agent install` after moving `paths.root` so
 the supervisor's append-only log target also follows the new root.
 
 `dt agent status --json` reports queue depth, the queue head, registry size,
-agent log bounds, and handoff state:
+agent log bounds, and handoff state. Add `--brief` to omit the per-job
+`scheduler.queue` array (it is replaced with `queue: []` and `queue_omitted`);
+that is the document deploy and routine agent polling should request — a long
+queue otherwise makes the full document tens or hundreds of KiB:
 
 | State | Meaning |
 |---|---|

@@ -45,13 +45,17 @@ agent dispatches queued work as capacity becomes available.
 dt free --json
 dt ps --summary --json
 dt ps --compact --active --limit 50 --json
-dt agent status --json
+dt agent status --json --brief
 ```
 
-Use the bounded `dt_ps_query_v1` response for routine agent polling. Follow
+Use the bounded `dt_ps_query_v1` response for routine job polling. Follow
 `page.next_cursor` when more rows are needed, use `--since` for lifecycle
 changes, and request expensive fields explicitly with `--fields`. Reserve the
 legacy full-array `dt ps --json` contract for offline inventory or compatibility.
+`dt agent status --json --brief` is the matching liveness document: counts,
+next job, and handoff, without the per-job `scheduler.queue` array that grows
+with the queue (79 jobs: 84 KiB). Omit `--brief` only when the full schedule
+is the question.
 
 `dt run --no-queue` restores fail-fast behavior and returns exit 2 when no
 capacity fits. A job-specific blocker does not hold up runnable work behind it
