@@ -20,6 +20,10 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 - `dt agent status --json --brief` omits the per-job `scheduler.queue` array
   (`queue: []`, `queue_omitted: N`, `brief: true`) so routine polling and
   deploy stay a few hundred bytes. The full document remains the default.
+- A node snapshot that fails now logs the remote reason (`n snapshot failed
+  ([n] connection refused), trying next node`) instead of the bare
+  `snapshot failed`. When the job is then dequeued or killed, that line is
+  the only record; `placement_failures` never persist.
 
 ## 0.13.6 — 2026-09-05
 

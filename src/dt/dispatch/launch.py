@@ -758,12 +758,18 @@ def _try_nodes(
         except RemoteError as e:
             failure_kinds.add("unreachable")
             reasons[node.name] = f"snapshot failed: {e}"
-            log(f"{node.name} snapshot failed, trying next node")
+            log(
+                f"{node.name} snapshot failed "
+                f"({diagnostic_excerpt(str(e), limit=512)}), trying next node"
+            )
             continue
         except DispatchError as e:
             failure_kinds.add("dispatch")
             reasons[node.name] = f"snapshot failed: {e}"
-            log(f"{node.name} snapshot failed, trying next node")
+            log(
+                f"{node.name} snapshot failed "
+                f"({diagnostic_excerpt(str(e), limit=512)}), trying next node"
+            )
             continue
         snapshot_duration_s = max(0.0, time.perf_counter() - snapshot_started)
         predecessor_outputs_dir: str | None = None

@@ -1804,6 +1804,38 @@ def test_snapshot_failure_fails_over(tmp_path, monkeypatch):
     assert "snapshot failed" in reasons["n1"]
 
 
+def test_snapshot_failure_logs_the_remote_reason(tmp_path, monkeypatch):
+    """Field report: a 1–2s snapshot failure logged only
+    'n snapshot failed, trying next node'. The job was then dequeued, so
+    placement_failures never persisted and the log was the only record."""
+    cfg = _cfg(tmp_path)
+    logged: list[str] = []
+
+    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
+        return 0, {"gpus": [0], "pgid": 42}
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+
+    def sync(node):
+        if node.name == "n1":
+            raise RemoteError("n1", "connection refused")
+
+    entry, reasons, _fatal, _failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=sync,
+        log=logged.append,
+    )
+
+    assert entry is not None and entry.node == "n2"
+    assert reasons["n1"] == "snapshot failed: [n1] connection refused"
+    assert "n1 snapshot failed ([n1] connection refused), trying next node" in logged
+
+
 def test_all_snapshot_link_failures_are_classified_unreachable(tmp_path):
     cfg = _cfg(tmp_path)
 
