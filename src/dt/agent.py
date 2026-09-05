@@ -1827,20 +1827,38 @@ def ensure_for_queued_job(cfg: HeadConfig, entry: JobEntry) -> bool | None:
     return start_detached(cfg)
 
 
-def stop_agent(cfg: HeadConfig) -> bool:
+# How long `dt agent stop` waits for the agent to exit. The agent finishes an
+# in-flight dispatch before it honours SIGTERM (a launch is never abandoned
+# half-way), and a snapshot transfer plus launch takes tens of seconds.
+STOP_WAIT_S = 25.0
+
+
+def _wait_agent_gone(cfg: HeadConfig, wait_s: float) -> bool:
+    for _ in range(max(1, int(wait_s / 0.1))):
+        if alive_pid(cfg) is None:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def stop_agent(cfg: HeadConfig, *, wait_s: float = STOP_WAIT_S) -> str:
+    """Ask the agent to exit; report ``stopped``, ``not_running``, or
+    ``still_running``.
+
+    ``still_running`` is the truth when the agent outlives the wait because it
+    is finishing a dispatch; it used to be reported as "no agent running",
+    which let a deploy proceed to a restart that could only fail.
+    """
     pid = alive_pid(cfg)
     if pid is None:
-        return False
+        return "not_running"
     if systemd_unit_path().is_file() and _systemd_user_available():
         try:
             proc = _systemctl("stop", SYSTEMD_UNIT)
         except (OSError, subprocess.TimeoutExpired):
             proc = None
-        if proc is not None and proc.returncode == 0:
-            for _ in range(50):
-                if alive_pid(cfg) is None:
-                    return True
-                time.sleep(0.1)
+        if proc is not None and proc.returncode == 0 and _wait_agent_gone(cfg, wait_s):
+            return "stopped"
         # The unit may exist while the lock is held by a manually launched
         # compatibility agent. A successful systemctl no-op must not turn
         # `dt agent stop` into a false "no agent" report.
@@ -1850,11 +1868,9 @@ def stop_agent(cfg: HeadConfig) -> bool:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-    for _ in range(50):
-        if alive_pid(cfg) is None:
-            return True
-        time.sleep(0.1)
-    return alive_pid(cfg) is None
+    if _wait_agent_gone(cfg, wait_s) or alive_pid(cfg) is None:
+        return "stopped"
+    return "still_running"
 
 
 def install_crontab(cfg: HeadConfig | None = None) -> str:

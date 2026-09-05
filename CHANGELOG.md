@@ -6,6 +6,17 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- `dt agent stop` no longer reports "no agent running" (exit 0) for an agent
+  that is still finishing its in-flight dispatch. It now waits up to 25
+  seconds (`--timeout SECONDS`) and, when the agent outlives the wait, says so
+  and exits 1 (`--json`: `outcome: still_running` with the pid). Field
+  observation: a deploy stopped the agent mid-dispatch, took the false "not
+  running" at face value, started "the agent" (already running, old code),
+  failed attestation and rolled the release back. `scripts/deploy.sh` retries
+  the stop three times before restarting the agent.
+
 ## 0.13.8 — 2026-09-05
 
 ### Added

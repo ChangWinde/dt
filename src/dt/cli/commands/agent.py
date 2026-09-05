@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 import json
+import math
 import os
 
 from rich.markup import escape
@@ -138,16 +139,51 @@ def agent_stop(
     center: Optional[str] = typer.Option(
         None, "-c", "--center", help="(laptop) which center's head"
     ),
+    timeout: float = typer.Option(
+        agent_mod.STOP_WAIT_S,
+        "--timeout",
+        help=(
+            "seconds to wait for the agent to finish its in-flight dispatch and "
+            "exit; exit 1 with outcome still_running when it has not"
+        ),
+    ),
     json_: bool = typer.Option(False, "--json", help="emit one control receipt"),
 ) -> None:
     """Stop the running agent (queued jobs stay queued)."""
-    _agent_forward(["stop", *(["--json"] if json_ else [])], center)
+    _agent_forward(
+        [
+            "stop",
+            *(["--timeout", str(timeout)] if timeout != agent_mod.STOP_WAIT_S else []),
+            *(["--json"] if json_ else []),
+        ],
+        center,
+    )
 
     cfg = _need_head(_root._cfg())
-    stopped = agent_mod.stop_agent(cfg)
+    if not math.isfinite(timeout) or timeout <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--timeout must be a finite positive number of seconds",
+            exit_code=1,
+            json_=json_,
+        )
+    pid = agent_mod.alive_pid(cfg)
+    outcome = agent_mod.stop_agent(cfg, wait_s=timeout)
+    if outcome == "still_running":
+        # The agent finishes its in-flight dispatch before it exits; saying
+        # "no agent running" here let deploys restart into a certain failure.
+        if json_:
+            print(_control_receipt("stop", outcome, pid=pid, exit_code=1))
+        else:
+            err.print(
+                f"[yellow]agent (pid {pid}) is still running after {timeout:g}s: it "
+                "finishes its in-flight dispatch before exiting; retry dt agent "
+                "stop, or give it longer with --timeout[/yellow]"
+            )
+        raise typer.Exit(1)
     if json_:
-        print(_control_receipt("stop", "stopped" if stopped else "not_running"))
-    elif stopped:
+        print(_control_receipt("stop", outcome))
+    elif outcome == "stopped":
         err.print("[yellow]agent stopped[/yellow]")
     else:
         err.print("no agent running")
