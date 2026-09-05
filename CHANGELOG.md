@@ -13,7 +13,7 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   Field observation: a remote-desktop encoder (`rustdesk`, 424 MiB, 0%
   utilization) held a CUDA context on a workstation head's only GPU, so `dt
   free` showed 0/1 and eight jobs pinned there waited forever as "busy: gpu0
-  starcosmos 0.4/48.0GiB util0%". The head's probe and the node's launcher
+  <user> 0.4/48.0GiB util0%". The head's probe and the node's launcher
   apply the same list: a resident process is not an occupant and the memory
   the driver attributes to it does not count against `mem_threshold_mib`;
   any other process or unattributed memory still does. `dt free --json` rows
@@ -24,6 +24,16 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- CPU-only work is no longer held behind GPU jobs waiting for another node's
+  cards. Field report: four jobs pinned to a full GPU node waited for a card
+  while a `-g 0 --node HEAD` job behind them sat queued as "waiting: FIFO
+  capacity is reserved for earlier job ..." although that node was idle. The admission
+  gate treated any 0-GPU candidate as overlapping every older waiter, and the
+  agent stopped its whole pass at an unpinned GPU waiter. All three layers
+  (admission, agent pass, `dt free --explain`) now apply one rule: CPU work
+  takes no card from anyone and is always attempted; a later GPU job that
+  could use a waiter's card keeps its FIFO place, recorded as busy without a
+  dispatch attempt instead of being left out of the pass.
 - Piped `dt free` is content-sized again. 0.13.6 sized a table printed
   directly into a pipe (`dt ps`) but `dt free` prints
   `Group(resource table, scheduler grid)`, and the hook only inspected the

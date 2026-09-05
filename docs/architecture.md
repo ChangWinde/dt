@@ -101,10 +101,13 @@ false dependency never consumes a GPU lease.
 
 Capacity waits retain FIFO fairness among jobs that can use the same capacity.
 A busy pinned node preserves FIFO for later jobs on that node but does not
-hold jobs pinned to different nodes behind it. Unpinned capacity waits still
-stop the walk because they may compete for every eligible node. Missing
-required paths or incompatible pins likewise do not block unrelated
-candidates.
+hold jobs pinned to different nodes behind it. An unpinned capacity wait holds
+every later GPU job, because the waiter may compete for every eligible node,
+but the walk goes on: CPU-only work takes no card from anyone and is always
+attempted, whatever GPU work waits ahead of it. The submission-time admission
+gate, the resident agent, and the `dt free --explain` explanation apply one
+overlap rule. Missing required paths or incompatible pins likewise do not
+block unrelated candidates.
 
 ## Data plane
 
