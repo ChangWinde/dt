@@ -261,6 +261,18 @@ Preload a same-node runway:
 dt fork baseline -n repeated --repeat 4
 ```
 
+A fork pins the source job's node so an A/B pair keeps its hardware. When that
+node is full or offline, move the fork or hand placement back to the
+scheduler — the exact snapshot lives on the head and dispatches anywhere:
+
+```bash
+dt fork baseline -n candidate --node gpu-node-2
+dt fork baseline -n candidate --anywhere
+```
+
+`--reuse-cache`, `--clone-cache`, and `--inherit-cache` refer to a directory
+on the source job's node, so they cannot be combined with a move.
+
 `rerun` has a different contract:
 
 ```bash

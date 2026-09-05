@@ -6,6 +6,36 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `dt fork --node NODE` places the fork(s) on another node and `--anywhere`
+  hands placement to the scheduler; a fork used to pin the source job's
+  actual node with no way to say otherwise (field report: nineteen forks of
+  one job queued behind one card, one behind an offline node). Cache reuse
+  (`--reuse-cache`, `--clone-cache`, `--inherit-cache`) is node-local and is
+  refused together with a move. Repeat-group receipts report the placement
+  the members carry.
+- `dt doctor` reports projects whose `setup` hook has no `setup_inputs` as
+  `env_reuse: per-snapshot: NAME, ...` (a warning) with the remedy. Such a
+  hook folds the whole snapshot into the environment identity, so every
+  edited snapshot builds its own environment under the node's environment
+  lock and launches of one project on one node wait for each other. Field
+  observation: an operator kept three copies of one project, differing only
+  in a hook comment, to obtain three environment keys.
+
+### Fixed
+
+- `dt doctor`'s `net` label names what it measures: `slow(pypi 90KB/s)`
+  instead of `slow(90KB/s)`. The figure is the node's own download speed from
+  PyPI, what a cold `uv sync` sees; a field report compared it with the
+  head-to-node rsync rate (11 MB/s) and read the node as mis-measured.
+- `dt agent status` no longer reports `handoff_state: registry_degraded`
+  when its registry scan merely raced a writer (the active-index rebuild
+  saw the directory change). That verdict is transient and holds one job
+  slot for the tick; only rows that cannot be decoded make a handoff unsafe.
+  The agent log says "registry directory is unreadable" for a directory
+  that really cannot be read instead of "registry entry registry".
+
 ## 0.13.7 — 2026-09-05
 
 ### Added

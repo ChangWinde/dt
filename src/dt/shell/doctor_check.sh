@@ -9,9 +9,13 @@ doctor_net() {
             else printf "<1KB/s" }'
     }
     if curl -m 3 -sI https://pypi.org >/dev/null 2>&1; then
-        # reachability is not usability: measure actual download speed
+        # reachability is not usability: measure actual download speed. This
+        # is the node's own path to PyPI - what uv sync sees on a cold
+        # environment - not the head-to-node transfer link (dt topology and
+        # dt seed measure that one); the label names the peer so the two are
+        # not compared.
         spd=$(curl -m 8 -so /dev/null -w "%{speed_download}" https://pypi.org/simple/pip/ 2>/dev/null)
-        label=$(fmt_speed "$spd")
+        label="pypi $(fmt_speed "$spd")"
         if awk -v s="${spd:-0}" 'BEGIN{exit !(s >= 1048576)}'; then
             echo "DT_NET=ok($label)"
         else

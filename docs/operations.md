@@ -499,6 +499,12 @@ the agent log shows `suppressed <kind>: <ExceptionType>: <redacted detail>`
 once per kind and exception type per process, and any command prints the same
 line to stderr for every occurrence when `DT_DEBUG_SUPPRESSED=1` is set.
 
+Each node's `net` check measures the node's own download speed from PyPI
+(`ok(pypi 4MB/s)`, `slow(pypi 90KB/s)`, `mirror`, `blocked`) — the path a cold
+`uv sync` takes, which is why a slow node earns the `dt seed NODE --plan` hint.
+It says nothing about the head-to-node transfer link; `dt topology` measures
+that, and `dt sync`/`dt seed` report what they achieved.
+
 The head row's `registry` check reports how much job history is retained.
 Active scheduling, status, `free`, and the default active `ps` view use the
 derived active index instead of scanning terminal history. Past a few thousand

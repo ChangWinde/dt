@@ -1021,12 +1021,25 @@ def _read_entry_path(
     )
 
 
+ACTIVE_INDEX_REBUILD_RACE = "registry changed during active-index rebuild"
+
+
 @dataclass(frozen=True)
 class RegistryDamage:
-    """A registry file that exists but cannot be decoded into a JobEntry."""
+    """A registry file that exists but cannot be decoded into a JobEntry.
+
+    ``path == "registry"`` marks a directory-level verdict of the active-index
+    rebuild instead of a row; with ``detail == ACTIVE_INDEX_REBUILD_RACE`` it is
+    a writer committing mid-scan - nothing is broken, one row may have been
+    missed, so admission holds a slot for it this tick.
+    """
 
     path: str
     detail: str
+
+    @property
+    def transient(self) -> bool:
+        return self.path == "registry" and self.detail == ACTIVE_INDEX_REBUILD_RACE
 
 
 @dataclass(frozen=True)
@@ -1777,10 +1790,7 @@ def active_entries(
         stable = before is not None and before == after
         if before is not None and after is not None and not stable:
             found_damage.append(
-                RegistryDamage(
-                    path="registry",
-                    detail="registry changed during active-index rebuild",
-                )
+                RegistryDamage(path="registry", detail=ACTIVE_INDEX_REBUILD_RACE)
             )
         if publish_index and stable:
             assert after is not None

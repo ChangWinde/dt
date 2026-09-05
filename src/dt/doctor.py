@@ -37,6 +37,29 @@ def default_project_status(cfg: HeadConfig) -> str:
     return f"ok: {name}"
 
 
+def environment_reuse_status(cfg: HeadConfig) -> str:
+    """Name the projects whose environment identity follows every code edit.
+
+    A ``setup`` hook without ``setup_inputs`` folds the whole snapshot into
+    the environment key, so each edited snapshot builds - and holds the env
+    lock for - a fresh venv, and concurrent launches of that project on one
+    node wait on one another for the length of a full build. Field
+    observation: an operator cloned a project under three names differing
+    only in a hook comment to obtain three keys, tripling the builds.
+    """
+    per_snapshot = sorted(
+        name
+        for name, project in cfg.projects.items()
+        if project.setup and not project.setup_inputs
+    )
+    if not per_snapshot:
+        return "ok"
+    listed = ", ".join(per_snapshot[:3])
+    if len(per_snapshot) > 3:
+        listed += f", +{len(per_snapshot) - 3} more"
+    return f"per-snapshot: {listed}"
+
+
 def head_capability_checks() -> dict[str, str]:
     """Structured head prerequisites for doctor/automation consumers."""
 

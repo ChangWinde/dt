@@ -660,6 +660,91 @@ def test_fork_cli_overrides_command_and_reports_exact_snapshot(tmp_path, monkeyp
     assert payload["reason"] is None
 
 
+def test_fork_cli_moves_or_unpins_the_fork_and_keeps_cache_reuse_node_local(
+    tmp_path, monkeypatch
+):
+    """Field report: nineteen forks of one job all queued behind one card and
+    one behind an offline node, because a fork always pins the source job's
+    node and nothing could say otherwise. --node moves the fork, --anywhere
+    hands placement to the scheduler; a reused cache stays where it lives."""
+    cfg = _cfg(tmp_path)
+    cfg.nodes.append(Node(name="n2"))
+    old = _entry()
+    seen = {}
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli, "_find_or_die", lambda cfg_, ref, **_kwargs: old)
+
+    def fake_submit_fork(cfg_, source, spec, log, no_queue=False):
+        seen["spec"] = spec
+        return _entry(
+            job_id="20260724-0410_moved_ef01",
+            name=spec.name,
+            node=spec.node or "n2",
+            status="running",
+            forked_from=old.job_id,
+        )
+
+    monkeypatch.setattr(dispatch, "submit_fork", fake_submit_fork)
+
+    default = CliRunner().invoke(cli.app, ["fork", old.job_id, "--json"])
+    assert default.exit_code == 0, default.output
+    assert seen["spec"].node == "n1"  # the source job's node, as before
+
+    moved = CliRunner().invoke(cli.app, ["fork", old.job_id, "--node", "n2", "--json"])
+    assert moved.exit_code == 0, moved.output
+    assert seen["spec"].node == "n2"
+    assert json.loads(moved.stdout)["node"] == "n2"
+
+    unpinned = CliRunner().invoke(cli.app, ["fork", old.job_id, "--anywhere", "--json"])
+    assert unpinned.exit_code == 0, unpinned.output
+    assert seen["spec"].node is None
+
+    unknown = CliRunner().invoke(
+        cli.app, ["fork", old.job_id, "--node", "n9", "--json"]
+    )
+    assert unknown.exit_code == 1
+    assert "unknown node 'n9'" in json.loads(unknown.stdout)["message"]
+
+    both = CliRunner().invoke(
+        cli.app, ["fork", old.job_id, "--node", "n2", "--anywhere", "--json"]
+    )
+    assert both.exit_code == 1
+    assert "either --node or --anywhere" in json.loads(both.stdout)["message"]
+
+    (tmp_path / "outputs-marker").write_text("")
+    cached_away = CliRunner().invoke(
+        cli.app,
+        [
+            "fork",
+            old.job_id,
+            "--node",
+            "n2",
+            "--reuse-cache",
+            "outputs/.cache/torchinductor",
+            "--json",
+        ],
+    )
+    assert cached_away.exit_code == 1, cached_away.output
+    assert "cache reuse is node-local" in json.loads(cached_away.stdout)["message"]
+    assert "must run on n1" in json.loads(cached_away.stdout)["message"]
+
+    cached_home = CliRunner().invoke(
+        cli.app,
+        [
+            "fork",
+            old.job_id,
+            "--node",
+            "n1",
+            "--reuse-cache",
+            "outputs/.cache/torchinductor",
+            "--json",
+        ],
+    )
+    assert cached_home.exit_code == 0, cached_home.output
+    assert seen["spec"].node == "n1"
+    assert seen["spec"].cache_source_job == old.job_id
+
+
 def test_fork_cli_overrides_artifact_manifest_and_reports_effective_value(
     tmp_path,
     monkeypatch,
