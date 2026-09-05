@@ -56,6 +56,8 @@ from .jobs import (
     REGISTRY_SCHEMA_VERSION,
     JobEntry,
     RegistryDamage,
+    AGENT_WAKE_ARTIFACTS_REPUBLISHED,
+    AGENT_WAKE_MAX_BYTES,
     active_entries,
     agent_wake_path,
     effective_result_state,
@@ -1394,13 +1396,56 @@ def _report_archive_problems(problems: list[str], log: Callable[[str], None]) ->
 
 
 def _consume_agent_wake(cfg: HeadConfig) -> bool:
+    return _consume_agent_wake_reasons(cfg) is not None
+
+
+def _consume_agent_wake_reasons(cfg: HeadConfig) -> frozenset[str] | None:
+    """Take the pending wake, returning the reasons it named (None: no wake)."""
+    path = agent_wake_path(cfg)
+    reasons: frozenset[str] = frozenset()
     try:
-        agent_wake_path(cfg).unlink()
+        with open(path, "rb", buffering=0) as stream:
+            raw = stream.read(AGENT_WAKE_MAX_BYTES)
+        reasons = frozenset(
+            line for line in raw.decode("ascii", "replace").split() if line
+        )
     except FileNotFoundError:
-        return False
+        return None
     except OSError:
-        return False
-    return True
+        pass
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    return reasons
+
+
+def _release_backoff_for_republished_artifacts(
+    blocked_backoff: dict[str, tuple[int, float]] | None,
+    blocked_log_state: dict[str, str] | None,
+    log: Callable[[str], None],
+) -> None:
+    """An artifact store was just republished: the jobs it blocked can go now.
+
+    Their diagnosis said `artifact-unverified`; without this they would wait
+    out a backoff of up to five minutes on a node that is already repaired.
+    """
+    if not blocked_backoff or not blocked_log_state:
+        return
+    released = [
+        job_id
+        for job_id, detail in blocked_log_state.items()
+        if job_id in blocked_backoff and "artifact-unverified" in detail
+    ]
+    for job_id in released:
+        blocked_backoff.pop(job_id, None)
+    if released:
+        log(
+            f"artifacts republished: retrying {len(released)} job(s) blocked on "
+            "artifact-unverified without waiting for their backoff"
+        )
 
 
 def _stop_completion_watchers(
@@ -1716,7 +1761,11 @@ def run_loop(cfg: HeadConfig) -> int:
                     return AGENT_CONFIG_RESTART_EXIT
                 cfg = fresh
                 _write_heartbeat(cfg)
-                _consume_agent_wake(cfg)
+                wake_reasons = _consume_agent_wake_reasons(cfg)
+                if wake_reasons and AGENT_WAKE_ARTIFACTS_REPUBLISHED in wake_reasons:
+                    _release_backoff_for_republished_artifacts(
+                        blocked_backoff, blocked_log_state, log
+                    )
                 _, entries = _process_once_with_snapshot(
                     cfg,
                     log,

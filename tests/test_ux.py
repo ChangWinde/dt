@@ -2761,6 +2761,44 @@ def test_doctor_table_surfaces_missing_contract_runtime_at_80_columns():
     assert max(map(len, rendered.splitlines())) <= 80
 
 
+def test_doctor_table_shows_a_gpu_node_without_lingering_in_its_control_column():
+    """Field report: a node whose GPU jobs fail closed on Linger=no showed a
+    clean table row; the verdict lived only in the hint below it."""
+    from dt import render
+    from dt.render import doctor_table
+
+    def row(node: str, **checks: str) -> dict:
+        return {
+            "center": "c",
+            "node": node,
+            "checks": {"ssh": "ok", "uv": "ok", "tmux": "ok", **checks},
+        }
+
+    rows = [
+        row("gpu-no-linger", gpu="570.1", linger="no"),
+        row("gpu-lingering", gpu="570.1", linger="yes"),
+        row("gpu-unknown", gpu="570.1", linger="unavailable"),
+        row("cpu-only", gpu="missing", linger="no"),
+    ]
+    # The piped layout: content-sized, nothing ellipsized.
+    console = render.human_console(
+        width=render.UNBOUNDED_PIPE_WIDTH,
+        record=True,
+        force_terminal=False,
+        color_system=None,
+    )
+    console.print(doctor_table(rows))
+    control = {
+        line.split()[0]: line.split()[-1]
+        for line in console.export_text().splitlines()[1:]
+    }
+
+    assert control["gpu-no-linger"] == "linger:no"
+    assert control["gpu-lingering"] == "-"
+    assert control["gpu-unknown"] == "linger:unavailable"
+    assert control["cpu-only"] == "-"  # CPU work keeps its portable fallback
+
+
 def test_doctor_human_suggests_seed_for_remote_slow_network(tmp_path, monkeypatch):
     from typer.testing import CliRunner
 

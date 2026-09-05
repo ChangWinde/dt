@@ -4869,6 +4869,76 @@ def test_pinned_queued_busy_stops_before_snapshot(tmp_path, monkeypatch):
     )
 
 
+def test_artifact_republish_wakes_the_agent_and_releases_only_artifact_backoffs(
+    tmp_path, monkeypatch
+):
+    """After `dt sync --artifact` repairs a node's store, the jobs blocked on
+    artifact-unverified there could run, but they sat out a backoff of up to
+    five minutes. The publication now wakes the agent with a reason; the agent
+    releases exactly those backoffs, leaving other blocked entries alone."""
+    import dt.agent as agent
+    from dt.jobs import (
+        AGENT_WAKE_ARTIFACTS_REPUBLISHED,
+        agent_wake_path,
+        request_agent_wake,
+    )
+
+    cfg = _cfg(tmp_path)
+    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
+
+    assert agent._consume_agent_wake_reasons(cfg) is None
+    request_agent_wake(cfg)  # a plain submission nudge names nothing
+    assert agent._consume_agent_wake_reasons(cfg) == frozenset()
+    request_agent_wake(cfg)
+    request_agent_wake(cfg, reason=AGENT_WAKE_ARTIFACTS_REPUBLISHED)
+    request_agent_wake(cfg, reason="something-else")
+    assert agent._consume_agent_wake_reasons(cfg) == frozenset(
+        {AGENT_WAKE_ARTIFACTS_REPUBLISHED, "something-else"}
+    )
+    assert not agent_wake_path(cfg).exists()
+
+    backoff = {"artifact-job": (2, 9e9), "dataset-job": (2, 9e9), "clean": (1, 9e9)}
+    detail = {
+        "artifact-job": (
+            "gc6d: artifact-unverified: [launcher] artifact-unverified: store drifted"
+        ),
+        "dataset-job": "n1: path-missing: /data/libero",
+    }
+    messages: list[str] = []
+    agent._release_backoff_for_republished_artifacts(backoff, detail, messages.append)
+    assert set(backoff) == {"dataset-job", "clean"}
+    assert messages == [
+        "artifacts republished: retrying 1 job(s) blocked on artifact-unverified "
+        "without waiting for their backoff"
+    ]
+    agent._release_backoff_for_republished_artifacts(backoff, detail, messages.append)
+    assert len(messages) == 1  # nothing left to release: silent
+
+
+def test_submission_accepts_a_center_probe_that_is_seconds_old(tmp_path, monkeypatch):
+    """A full center probe is the slowest node's round trip (3-8 s on a head
+    with jump-host nodes) and every `dt run` paid it, although the agent had
+    probed the same fleet moments earlier. A probe within CACHE_TTL_S is
+    accepted; the launcher's locked capacity check still guards placement."""
+    import dt.dispatch as dispatch
+
+    cfg = _cfg(tmp_path)
+    seen: list[bool] = []
+
+    def probe_center(cfg_, use_cache=True, **kwargs):
+        seen.append(use_cache)
+        return [_status("n1", free=1, total=1)]
+
+    monkeypatch.setattr(dispatch, "probe_center", probe_center)
+    spec = RunSpec(name="fast-submit", gpus=1, cmd=["true"])
+
+    statuses, reasons = dispatch._probe_for_submission(cfg, spec, lambda m: None)
+
+    assert [s.node for s in statuses] == ["n1"]
+    assert "n1" in reasons
+    assert seen == [True]
+
+
 def test_dispatch_queued_reuses_a_probe_the_caller_just_took(tmp_path, monkeypatch):
     """An inline `dt run` probed the whole center to decide to enqueue, then
     dispatch_queued probed it all again seconds later: 2.8 s of a 9.7 s CPU
