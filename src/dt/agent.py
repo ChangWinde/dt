@@ -1045,7 +1045,7 @@ def _process_once_with_snapshot(
     # An unpinned GPU job waiting for a card could use a card on any node, so
     # every later GPU job overlaps it and keeps its FIFO place untried. CPU
     # work takes no card from anyone and is still attempted (field report: a
-    # `-g 0 --node star-0` job sat behind GPU jobs waiting for another node).
+    # `-g 0 --node HEAD` job sat behind GPU jobs waiting for another node).
     unpinned_gpu_wait = False
     for entry in queue:
         cap = cfg.queue.max_my_jobs

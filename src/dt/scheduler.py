@@ -51,8 +51,8 @@ def _capacity_overlaps(
 
     CPU work on either side never overlaps: a 0-GPU candidate takes no card
     from anyone, and a 0-GPU older job is not waiting for one. Treating it as
-    overlapping held a `-g 0 --node star-0` job behind four jobs pinned to a
-    full gc6d ("FIFO capacity is reserved for earlier job ...").
+    overlapping held a `-g 0 --node HEAD` job behind four jobs pinned to a
+    full GPU node ("FIFO capacity is reserved for earlier job ...").
     """
     if older.gpus_requested <= 0 or candidate.gpus_requested <= 0:
         return False
