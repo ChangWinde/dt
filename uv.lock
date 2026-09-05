@@ -206,7 +206,7 @@ wheels = [
 
 [[package]]
 name = "disttrainer"
-version = "0.13.6"
+version = "0.13.7"
 source = { editable = "." }
 dependencies = [
     { name = "pyyaml" },
