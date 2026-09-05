@@ -82,6 +82,8 @@ paths:
 
 mem_threshold_mib: 500
 disk_min_gib: 10
+gpu_resident_processes:
+  - rustdesk
 snapshot_warn_gib: 2
 snapshot_excludes:
   - /private-data/
@@ -338,11 +340,26 @@ external collector.
 | Key | Default | Meaning |
 |---|---:|---|
 | `mem_threshold_mib` | 500 | GPU memory threshold used when classifying capacity |
+| `gpu_resident_processes` | empty | Compute processes, by `ps -o comm=` name, that may live on a card without making it busy |
 | `disk_min_gib` | 10 | Minimum free space required for every remote start |
 | `snapshot_warn_gib` | 2 | Warn when a source snapshot exceeds this transfer size |
 | `snapshot_excludes` | empty | Additional rsync-style source exclusions |
 | `webhook` | disabled | Trusted HTTP(S) endpoint for job lifecycle notifications; other URL schemes are rejected |
 | `proxy` | disabled | HTTP(S) proxy injected into environment setup and jobs |
+
+A card is free when no compute process runs on it, its used memory is below
+`mem_threshold_mib`, and dt holds no lease on it. Some processes live on a
+card without doing a job's work — a remote-desktop encoder such as `rustdesk`,
+a display server holding a CUDA context — and would otherwise keep a
+workstation head's only GPU busy forever. `gpu_resident_processes` names them
+as `ps -o comm=` prints them (the executable's basename, at most 15
+characters). The head's probe and the node's launcher apply the same list: a
+resident process is not an occupant, and the memory the driver attributes to
+it does not count against `mem_threshold_mib`. Everything else on the card
+still does, so a training process beside the encoder keeps the card busy.
+`dt free --json` reports what was disregarded per card (`resident_procs`,
+`resident_mib`, `residents`) and `dt free --who` shows `rustdesk resident×1`
+beside the owners of busy cards.
 
 Do not store secrets in project configuration. Proxy and webhook values are
 treated as trusted operator inputs and may reach remote jobs.

@@ -384,6 +384,43 @@ def test_free_table_gpu_availability_is_self_explanatory_at_80_columns():
     assert len(rendered.splitlines()) == 2
 
 
+def test_free_who_names_the_resident_process_a_free_card_still_carries():
+    """A card counted free despite a configured resident process (a remote
+    desktop encoder) says so in --who, next to the owners of busy cards."""
+    from rich.console import Console
+
+    from dt.render import free_table
+
+    row = {
+        "center": "star",
+        "node": "star-0",
+        "gpus": [
+            {
+                "index": 0,
+                "free": True,
+                "procs": 0,
+                "leased": False,
+                "users": [],
+                "mem_used": 424,
+                "mem_total": 49140,
+                "util": 0,
+                "temperature": 41,
+                "resident_procs": 1,
+                "resident_mib": 424,
+                "residents": ["rustdesk"],
+            }
+        ],
+        "system": {},
+    }
+    console = Console(width=120, record=True, color_system=None)
+    console.print(free_table([row], who=True))
+    rendered = console.export_text()
+
+    assert "1/1 [0]" in rendered
+    assert "rustdesk resident×1" in rendered
+    assert "×" not in rendered.replace("rustdesk resident×1", "")
+
+
 def test_free_table_preserves_resource_values_at_60_columns():
     from rich.console import Console
 

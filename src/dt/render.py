@@ -450,9 +450,29 @@ def free_table(rows: list[JsonRow], who: bool = False) -> Table:
             io,
         ]
         if who:
-            values.append(f"[dim]{busy_owners(gpus)}[/dim]")
+            owners = " ".join(
+                part for part in (busy_owners(gpus), resident_note(gpus)) if part
+            )
+            values.append(f"[dim]{owners}[/dim]")
         t.add_row(*values)
     return t
+
+
+def resident_note(gpus: list[JsonRow]) -> str:
+    """'rustdesk resident ×1' - configured processes disregarded on the cards.
+
+    Shown beside the owners so an operator sees why a card that carries a
+    CUDA context still counts as free.
+    """
+    counts: dict[str, int] = {}
+    for g in gpus:
+        for name in g.get("residents") or []:
+            label = escape(str(name))
+            counts[label] = counts.get(label, 0) + 1
+    return " ".join(
+        f"{name} resident\u00d7{n}"
+        for name, n in sorted(counts.items(), key=lambda kv: -kv[1])
+    )
 
 
 def _job_display_status(row: JsonRow) -> tuple[str, str]:

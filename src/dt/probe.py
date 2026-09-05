@@ -23,7 +23,7 @@ from dataclasses import asdict, dataclass, field, replace
 import fcntl
 from pathlib import Path
 from threading import Event
-from typing import Iterator, TypeAlias
+from typing import Any, Iterator, Sequence, TypeAlias
 
 from .config import HeadConfig, Node
 from .layout import ROLE_LAYOUT, node_path_expression
@@ -143,6 +143,11 @@ class Gpu:
     free: bool = False
     users: list[str] = field(default_factory=list)  # owners of compute procs
     temperature: int | None = None
+    # Configured gpu_resident_processes seen on the card: they neither occupy
+    # it nor count their memory against mem_threshold_mib.
+    resident_procs: int = 0
+    resident_mib: int = 0
+    residents: list[str] = field(default_factory=list)
 
     @property
     def mem_total_mib(self) -> int:
@@ -184,7 +189,9 @@ class NodeStatus:
 def _parse_probe_inventory(
     text: str,
     mem_threshold_mib: int,
+    resident_processes: Sequence[str] = (),
 ) -> tuple[list[Gpu], str | None]:
+    resident_names = frozenset(resident_processes)
     gpu_part, _, remainder = text.partition(SEP)
     app_part, _, _ = remainder.partition(SYS_SEP)
     gpus: dict[str, Gpu] = {}
@@ -282,6 +289,19 @@ def _parse_probe_inventory(
                 continue
             if pid:
                 processes.add(process)
+            # Rows from probe_apps.sh: uuid,pid,user,comm,used_mib. A resident
+            # process is recorded, not counted: it lives on the card without
+            # doing a job's work, so it must not hold the card busy.
+            comm = parts[3] if len(parts) > 3 else ""
+            if comm and comm in resident_names:
+                card = gpus[uuid]
+                card.resident_procs += 1
+                used_text = parts[4] if len(parts) > 4 else ""
+                if used_text.isdigit():
+                    card.resident_mib += int(used_text)
+                if comm not in card.residents:
+                    card.residents.append(comm)
+                continue
             gpus[uuid].procs += 1
             candidate_user = parts[2] if len(parts) > 2 and parts[2] else "?"
             user = (
@@ -293,7 +313,10 @@ def _parse_probe_inventory(
                 gpus[uuid].users.append(user)
     out = sorted(gpus.values(), key=lambda g: g.index)
     for g in out:
-        g.free = g.procs == 0 and g.mem_used < mem_threshold_mib and not g.leased
+        # Memory a resident process holds is not a sign of foreign work; what
+        # remains after it is what the threshold judges.
+        foreign_mib = max(0, g.mem_used - g.resident_mib)
+        g.free = g.procs == 0 and foreign_mib < mem_threshold_mib and not g.leased
         if g.leased and "dt-lease" not in g.users:
             g.users.append("dt-lease")
     noun = "row" if malformed_rows == 1 else "rows"
@@ -305,9 +328,13 @@ def _parse_probe_inventory(
     return out, inventory_error
 
 
-def parse_probe_output(text: str, mem_threshold_mib: int) -> list[Gpu]:
+def parse_probe_output(
+    text: str,
+    mem_threshold_mib: int,
+    resident_processes: Sequence[str] = (),
+) -> list[Gpu]:
     """Parse schedulable cards while retaining the historical list API."""
-    return _parse_probe_inventory(text, mem_threshold_mib)[0]
+    return _parse_probe_inventory(text, mem_threshold_mib, resident_processes)[0]
 
 
 def parse_system_output(text: str) -> SystemStats | None:
@@ -376,6 +403,7 @@ def probe_node(
     *,
     lease_root: str | None = None,
     cancel_event: Event | None = None,
+    resident_processes: Sequence[str] = (),
 ) -> NodeStatus:
     probe_timeout = node.probe_timeout_s if timeout is None else timeout
     try:
@@ -431,6 +459,7 @@ def probe_node(
     gpus, inventory_error = _parse_probe_inventory(
         proc.stdout,
         mem_threshold_mib,
+        resident_processes,
     )
     if APP_ERROR in proc.stdout:
         # The compute-app query failed, so GPU occupancy is unknown. Fail closed
@@ -446,28 +475,47 @@ def probe_node(
     )
 
 
+def resident_probe_options(cfg: HeadConfig) -> dict[str, Any]:
+    """``probe_node`` keywords for the head's resident-process list.
+
+    Empty when nothing is configured, like the ``cancel_event`` handling
+    below: a caller (or a two-argument test double) that predates the option
+    keeps its shape until an operator actually names a resident process.
+    """
+    residents = cfg.gpu_resident_processes
+    return {"resident_processes": residents} if residents else {}
+
+
 def _probe_configured_node(
     cfg: HeadConfig,
     node: Node,
     *,
     cancel_event: Event | None = None,
 ) -> NodeStatus:
+    residents = resident_probe_options(cfg)
     if cfg.layout == ROLE_LAYOUT:
         if cancel_event is None:
             return probe_node(
                 node,
                 cfg.mem_threshold_mib,
                 lease_root=cfg.lease_root_for(node),
+                **residents,
             )
         return probe_node(
             node,
             cfg.mem_threshold_mib,
             lease_root=cfg.lease_root_for(node),
             cancel_event=cancel_event,
+            **residents,
         )
     if cancel_event is None:
-        return probe_node(node, cfg.mem_threshold_mib)
-    return probe_node(node, cfg.mem_threshold_mib, cancel_event=cancel_event)
+        return probe_node(node, cfg.mem_threshold_mib, **residents)
+    return probe_node(
+        node,
+        cfg.mem_threshold_mib,
+        cancel_event=cancel_event,
+        **residents,
+    )
 
 
 def _probe_cache_signature(cache_file: Path) -> CacheSignature | None:

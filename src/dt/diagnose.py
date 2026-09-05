@@ -1193,6 +1193,14 @@ def collect(
                     lease_root=(
                         cfg.lease_root_for(node) if cfg.layout == "role-v1" else None
                     ),
+                    # Same convention as probe.resident_probe_options, which
+                    # this module does not import: the keyword only travels
+                    # when an operator named a resident process.
+                    **(
+                        {"resident_processes": cfg.gpu_resident_processes}
+                        if cfg.gpu_resident_processes
+                        else {}
+                    ),
                 )
                 log_future = pool.submit(read_log)
                 telemetry_future = pool.submit(_telemetry_evidence, entry, runner)

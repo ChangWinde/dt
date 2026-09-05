@@ -6,6 +6,22 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `gpu_resident_processes` (head config): compute processes, named as
+  `ps -o comm=` prints them, that may live on a card without making it busy.
+  Field observation: a remote-desktop encoder (`rustdesk`, 424 MiB, 0%
+  utilization) held a CUDA context on a workstation head's only GPU, so `dt
+  free` showed 0/1 and eight jobs pinned there waited forever as "busy: gpu0
+  starcosmos 0.4/48.0GiB util0%". The head's probe and the node's launcher
+  apply the same list: a resident process is not an occupant and the memory
+  the driver attributes to it does not count against `mem_threshold_mib`;
+  any other process or unattributed memory still does. `dt free --json` rows
+  gain `resident_procs`, `resident_mib`, and `residents`; `dt free --who`
+  shows `rustdesk resident×1` beside the owners of busy cards. The probe now
+  also widens the `ps` user column, which procps clipped to eight characters
+  ("starcos+") once a further column followed it.
+
 ### Fixed
 
 - Piped `dt free` is content-sized again. 0.13.6 sized a table printed

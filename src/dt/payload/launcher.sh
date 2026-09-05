@@ -3,7 +3,7 @@
 # Contract (env in):  DT_JOB_DIR DT_GPUS DT_SESSION DT_ENVS_DIR DT_MEM_MIB
 #                     DT_DISK_GIB [DT_RESERVE] [DT_REQUIRE_PATH] [DT_MAX_HOURS]
 #                     [DT_MIN_VRAM_MIB] [DT_MAX_VRAM_MIB]
-#                     [DT_MAX_JOB_MEMORY_MIB]
+#                     [DT_MAX_JOB_MEMORY_MIB] [DT_GPU_RESIDENT_PROCESSES]
 #                     [DT_WEBHOOK DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME]
 #                     [DT_ARTIFACT_ROOT DT_ARTIFACT_MANIFEST DT_ARTIFACT_TARGETS]
 #                     [DT_ENV_MODE=sync|reuse]
@@ -98,6 +98,12 @@ DT_GPU_LEASE_ROOT=$(dt_absolutize \
     "${DT_GPU_LEASE_ROOT:-$HOME/dt/gpu-leases}")
 DT_REQUIRE_PATH="${DT_REQUIRE_PATH:-}"
 DT_REQUIRE_PATH="${DT_REQUIRE_PATH/#\~/$HOME}"
+# Comma list of `ps -o comm=` names that may live on a card without making it
+# busy (head config gpu_resident_processes); must match the head's probe.
+DT_GPU_RESIDENT_PROCESSES="${DT_GPU_RESIDENT_PROCESSES:-}"
+case "$DT_GPU_RESIDENT_PROCESSES" in
+    *[!A-Za-z0-9._+,-]*) log "invalid resident process list"; exit 13 ;;
+esac
 DT_ARTIFACT_ROOT="${DT_ARTIFACT_ROOT:-}"
 DT_ARTIFACT_MANIFEST="${DT_ARTIFACT_MANIFEST:-}"
 DT_ARTIFACT_TARGETS="${DT_ARTIFACT_TARGETS:-}"
@@ -1337,16 +1343,69 @@ fi
 # otherwise hold it almost continuously and a "busy" verdict could take
 # minutes. Advisory only - the authoritative recheck stays inside the
 # launch lock below.
-quick_gpu_counts() {
-    local busy rows detail idx uuid used total
-    local free_count=0 fitting_free_count=0 capable_count=0
-    local seen_indices="" seen_uuids=""
-    busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>&1)
+
+# Compute apps split into foreign ones, which make their card busy, and
+# resident ones (DT_GPU_RESIDENT_PROCESSES by `ps -o comm=` name), which
+# neither occupy the card nor count their memory against DT_MEM_MIB. Sets
+# GPU_BUSY_UUIDS (one uuid per line) and GPU_RESIDENT_MIB ("uuid mib" per
+# line). The head's probe applies the same rule, so both sides agree on what
+# is free; otherwise a card the head counts free bounces every launch as busy.
+GPU_BUSY_UUIDS=""
+GPU_RESIDENT_MIB=""
+gpu_app_occupancy() {
+    local apps detail pids names uuid pid used comm
+    apps=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory \
+        --format=csv,noheader,nounits 2>&1)
     if [ $? -ne 0 ]; then
-        detail=${busy##*$'\n'}
+        detail=${apps##*$'\n'}
         log "node-unfit: GPU process query failed: ${detail:-unknown nvidia-smi error}"
         return 15
     fi
+    GPU_BUSY_UUIDS=""
+    GPU_RESIDENT_MIB=""
+    apps=${apps// /}
+    [ -n "$apps" ] || return 0
+    names=""
+    if [ -n "$DT_GPU_RESIDENT_PROCESSES" ]; then
+        pids=$(awk -F, '$2 ~ /^[0-9]+$/ && !seen[$2]++ { printf "%s%s", (n++ ? "," : ""), $2 }' <<<"$apps")
+        if [ -n "$pids" ]; then
+            names=$(ps -o pid=,comm= -p "$pids" 2>/dev/null)
+        fi
+    fi
+    while IFS=, read -r uuid pid used; do
+        [ -n "$uuid" ] || continue
+        comm=""
+        if [ -n "$names" ] && [[ "$pid" =~ ^[0-9]+$ ]]; then
+            comm=$(awk -v p="$pid" '$1 == p { $1 = ""; sub(/^ +/, ""); print; exit }' <<<"$names")
+        fi
+        if [ -n "$comm" ] && [[ ",$DT_GPU_RESIDENT_PROCESSES," == *",$comm,"* ]]; then
+            case "$used" in
+                ''|*[!0-9]*) used=0 ;;
+            esac
+            GPU_RESIDENT_MIB+="$uuid $used"$'\n'
+        else
+            GPU_BUSY_UUIDS+="$uuid"$'\n'
+        fi
+    done <<<"$apps"
+}
+
+# Memory on a card that foreign work holds: what remains once the resident
+# processes' share is taken off, never below zero.
+foreign_used_mib() {
+    local uuid=$1 used=$2 resident
+    resident=$(awk -v u="$uuid" '$1 == u { s += $2 } END { print s + 0 }' <<<"$GPU_RESIDENT_MIB")
+    if [ "$resident" -ge "$used" ]; then
+        printf '0\n'
+    else
+        printf '%s\n' "$((used - resident))"
+    fi
+}
+
+quick_gpu_counts() {
+    local rows detail idx uuid used total foreign
+    local free_count=0 fitting_free_count=0 capable_count=0
+    local seen_indices="" seen_uuids=""
+    gpu_app_occupancy || return $?
     rows=$(nvidia-smi --query-gpu=index,uuid,memory.used,memory.total \
         --format=csv,noheader,nounits 2>&1)
     if [ $? -ne 0 ]; then
@@ -1354,7 +1413,6 @@ quick_gpu_counts() {
         log "node-unfit: GPU query failed: ${detail:-unknown nvidia-smi error}"
         return 15
     fi
-    busy=${busy// /}
     while IFS=, read -r idx uuid used total; do
         idx=${idx// /}; uuid=${uuid// /}; used=${used// /}; total=${total// /}
         if [ -z "$uuid" ]; then
@@ -1378,7 +1436,9 @@ quick_gpu_counts() {
         if [ "$total" -ge "$DT_MIN_VRAM_MIB" ]; then
             capable_count=$((capable_count + 1))
         fi
-        if [ "$used" -lt "$DT_MEM_MIB" ] && ! grep -qF "$uuid" <<<"$busy" \
+        foreign=$(foreign_used_mib "$uuid" "$used")
+        if [ "$foreign" -lt "$DT_MEM_MIB" ] \
+           && ! grep -qxF "$uuid" <<<"$GPU_BUSY_UUIDS" \
            && lease_available "$idx"; then
             free_count=$((free_count + 1))
             if [ "$total" -ge "$DT_MIN_VRAM_MIB" ]; then
@@ -1636,14 +1696,9 @@ ENV_DURATION_MS=$(($(now_ms) - ENV_STARTED_MS))
 
 # -- helpers ----------------------------------------------------------------
 free_gpu_indices() {
-    local busy rows detail idx uuid used total
+    local rows detail idx uuid used total foreign
     local seen_indices="" seen_uuids=""
-    busy=$(nvidia-smi --query-compute-apps=gpu_uuid --format=csv,noheader 2>&1)
-    if [ $? -ne 0 ]; then
-        detail=${busy##*$'\n'}
-        log "node-unfit: GPU process query failed: ${detail:-unknown nvidia-smi error}"
-        return 15
-    fi
+    gpu_app_occupancy || return $?
     rows=$(nvidia-smi --query-gpu=index,uuid,memory.used,memory.total \
         --format=csv,noheader,nounits 2>&1)
     if [ $? -ne 0 ]; then
@@ -1651,7 +1706,6 @@ free_gpu_indices() {
         log "node-unfit: GPU query failed: ${detail:-unknown nvidia-smi error}"
         return 15
     fi
-    busy=${busy// /}
     while IFS=, read -r idx uuid used total; do
         idx=${idx// /}; uuid=${uuid// /}; used=${used// /}; total=${total// /}
         if [ -z "$uuid" ]; then
@@ -1672,7 +1726,9 @@ free_gpu_indices() {
         fi
         seen_indices+="${idx}"$'\n'
         seen_uuids+="${uuid}"$'\n'
-        if [ "$used" -lt "$DT_MEM_MIB" ] && ! grep -qF "$uuid" <<<"$busy" \
+        foreign=$(foreign_used_mib "$uuid" "$used")
+        if [ "$foreign" -lt "$DT_MEM_MIB" ] \
+           && ! grep -qxF "$uuid" <<<"$GPU_BUSY_UUIDS" \
            && lease_available "$idx"; then
             printf '%s %s\n' "$idx" "$total"
         fi

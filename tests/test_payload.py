@@ -423,7 +423,8 @@ def _run_launcher_with_fake_uv(
         nvidia_smi.write_text(
             "#!/usr/bin/env bash\n"
             'case " $* " in\n'
-            '  *" --query-compute-apps=gpu_uuid "*) exit 0 ;;\n'
+            # Compute apps as "gpu_uuid, pid, used_mib" rows; empty = idle cards.
+            '  *" --query-compute-apps="*) printf "%s" "${DT_TEST_GPU_APPS:-}"; exit 0 ;;\n'
             "esac\n"
             f"printf '%s\\n' {shlex.quote(gpu_rows)}\n"
         )
@@ -1031,6 +1032,67 @@ def test_launcher_selects_only_cards_that_meet_minimum_total_memory(tmp_path):
 
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)["gpus"] == [1]
+
+
+def test_launcher_does_not_count_configured_resident_processes_as_occupants(
+    tmp_path,
+):
+    """Field observation: a remote-desktop encoder (rustdesk, 424 MiB, 0% util)
+    held a CUDA context on a workstation head's only card, so every job pinned
+    there waited forever as "busy: gpu0 ... 0.4/48.0GiB util0%". Names listed
+    in gpu_resident_processes reach the launcher as DT_GPU_RESIDENT_PROCESSES;
+    such a process neither occupies the card nor counts its memory against
+    DT_MEM_MIB. Any other foreign process still does."""
+    resident_bin = tmp_path / "resident-bin"
+    resident_bin.mkdir()
+    # comm is the basename of the path handed to execve, so a symlink named
+    # like the encoder gives the sleeper the `ps -o comm=` name "rustdesk".
+    (resident_bin / "rustdesk").symlink_to("/bin/sleep")
+    encoder = subprocess.Popen([str(resident_bin / "rustdesk"), "60"])
+    try:
+        apps = f"GPU-fit, {encoder.pid}, 424\n"
+
+        def launch(used_mib: int = 900, **env: str) -> subprocess.CompletedProcess:
+            for stale in ("job", "home", "bin", "state"):
+                shutil.rmtree(tmp_path / stale, ignore_errors=True)
+            return _run_launcher_with_fake_uv(
+                tmp_path,
+                "plain",
+                gpu_rows=f"0, GPU-fit, {used_mib}, 81920",
+                env_overrides={
+                    "DT_GPUS": "1",
+                    "DT_MEM_MIB": "500",
+                    "DT_TEST_GPU_APPS": apps,
+                    **env,
+                },
+            )
+
+        # 900 MiB in use on the card, 424 of it the encoder's.
+        busy = launch()
+        assert busy.returncode == 10, busy.stderr
+        assert "busy (pre-check)" in busy.stderr
+
+        other_name = launch(DT_GPU_RESIDENT_PROCESSES="Xorg,gnome-shell")
+        assert other_name.returncode == 10, other_name.stderr
+
+        # Disregarding the encoder leaves 476 MiB of foreign memory: under the
+        # 500 MiB threshold, and no foreign process, so the card is free.
+        exempt = launch(DT_GPU_RESIDENT_PROCESSES="Xorg,rustdesk")
+        assert exempt.returncode == 0, exempt.stderr
+        assert json.loads(exempt.stdout)["gpus"] == [0]
+        assert (tmp_path / "state" / "tmux-new-session").exists()
+
+        # Memory the encoder does not account for still counts: 1500 - 424
+        # leaves a 1 GiB foreign context, and the card stays busy.
+        heavy = launch(used_mib=1500, DT_GPU_RESIDENT_PROCESSES="rustdesk")
+        assert heavy.returncode == 10, heavy.stderr
+
+        malformed = launch(DT_GPU_RESIDENT_PROCESSES="rustdesk;rm -rf /")
+        assert malformed.returncode == 13
+        assert "invalid resident process list" in malformed.stderr
+    finally:
+        encoder.kill()
+        encoder.wait()
 
 
 @pytest.mark.parametrize(
