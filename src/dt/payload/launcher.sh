@@ -48,6 +48,13 @@ DT_GPU_ISOLATION="${DT_GPU_ISOLATION:-advisory}"
 DT_MIN_VRAM_MIB="${DT_MIN_VRAM_MIB:-0}"
 DT_LAUNCH_TOKEN="${DT_LAUNCH_TOKEN:-}"
 DT_PRIVATE_ENV_STDIN="${DT_PRIVATE_ENV_STDIN:-0}"
+# Longest the launcher waits for the environment lock (a build in progress, or
+# running jobs holding it shared while this job needs a build) before it
+# reports busy and lets the dispatcher place other work first.
+ENV_BUILD_WAIT_S="${DT_ENV_BUILD_WAIT_S:-90}"
+case "$ENV_BUILD_WAIT_S" in
+    *[!0-9]*|"") ENV_BUILD_WAIT_S=90 ;;
+esac
 case "$DT_ENV_MODE" in
     sync|reuse) : ;;
     *) log "invalid environment mode: $DT_ENV_MODE"; exit 13 ;;
@@ -1515,13 +1522,57 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
             ENV_PREEXISTING=true
         fi
         mkdir -p "$DT_ENVS_DIR"
+        # The environment lock is held shared by every wrapper running inside
+        # the environment (for the job's lifetime, so `dt clean --envs` cannot
+        # remove a venv from under a process) and exclusively here to build.
+        # Taking it exclusively for every launch made a running job block the
+        # next launch of its environment for the job's whole runtime: a two-card
+        # node ran one card while the queue waited behind an idle card, and the
+        # dispatcher sat inside this wait instead of placing other work.
+        #
+        # A sync changes the environment only when its surface changed: uv.lock,
+        # extras and the setup hook are sealed in the environment key, and the
+        # project table (console scripts, metadata) is stamped below. An
+        # environment already built for this exact surface is entered shared,
+        # exactly like the wrapper does; the exclusive build lock is taken only
+        # when a build is needed, and never for longer than a bounded wait -
+        # past that the job reports busy and the dispatcher places other work
+        # first. Imports never depend on the sync: the wrapper pins this job's
+        # own code/ and code/src on PYTHONPATH ahead of the shared install.
+        env_surface_stamp="$UV_ENV/.dt-surface-$lockhash"
+        if [ -f "$DT_JOB_DIR/code/pyproject.toml" ]; then
+            env_surface=$(sha256sum "$DT_JOB_DIR/code/pyproject.toml" | cut -c1-64)
+        else
+            env_surface="no-pyproject"
+        fi
+        env_needs_build=1
+        if [ "$ENV_PREEXISTING" = true ] && [ -x "$UV_ENV/bin/python" ] \
+           && [ -f "$env_surface_stamp" ] \
+           && [ "$(tr -d '[:space:]' < "$env_surface_stamp")" = "$env_surface" ]; then
+            if [ -f "$DT_CONTROL_DIR/setup.sh" ]; then
+                smark_probe="$UV_ENV/.dt-setup-$(sha256sum "$DT_CONTROL_DIR/setup.sh" | cut -c1-8)"
+                [ -f "$smark_probe" ] && env_needs_build=0
+            else
+                env_needs_build=0
+            fi
+        fi
+        if [ "$env_needs_build" -eq 0 ]; then
+            log "entering env $lockhash, already built for this surface"
+            # Only a builder holds this exclusively; wait for it to finish.
+            if ! flock -s -w "$ENV_BUILD_WAIT_S" --close \
+                    "$DT_ENVS_DIR/$lockhash.lock" true; then
+                log "environment $lockhash is being rebuilt; could not enter it within ${ENV_BUILD_WAIT_S}s"
+                exit 10
+            fi
+        else
         log "syncing env $lockhash"
         # only-managed: system interpreters lack dev headers (Python.h), which
         # breaks sdist builds; uv-managed toolchains ship them (design doc 6).
         # setup.sh (optional project hook, e.g. install local libs/ packages that
         # uv.lock cannot describe) runs under the same env lock, once per env per
         # setup content (marker), never editable - the job dir is disposable.
-        if ! flock --close "$DT_ENVS_DIR/$lockhash.lock" \
+        env_build_rc=0
+        flock -w "$ENV_BUILD_WAIT_S" -E 213 --close "$DT_ENVS_DIR/$lockhash.lock" \
         env UV_PROJECT_ENVIRONMENT="$UV_ENV" UV_SYSTEM_CERTS=1 \
             UV_PYTHON_PREFERENCE=only-managed DT_JOB_DIR="$DT_JOB_DIR" UV_BIN="$UV_BIN" \
             DT_EXTRAS="${DT_EXTRAS:-}" \
@@ -1654,13 +1705,22 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
                 # packages a concurrent job with more extras relies on
                 sync_with_cache_repair || exit 1
             fi' \
-            >>"$DT_JOB_DIR/logs/env.log" 2>&1; then
+            >>"$DT_JOB_DIR/logs/env.log" 2>&1 || env_build_rc=$?
+        if [ "$env_build_rc" -eq 213 ]; then
+            log "environment $lockhash is in use by a running job and needs a build; could not take the build lock within ${ENV_BUILD_WAIT_S}s"
+            exit 10
+        fi
+        if [ "$env_build_rc" -ne 0 ]; then
             log "uv sync / setup failed, see logs/env.log"
             exit 13
         fi
         if [ -f "$SETUP_RAN_MARK" ]; then
             SETUP_RAN=true
             rm -f "$SETUP_RAN_MARK"
+        fi
+        # Written only after a successful sync and setup: the next launcher for
+        # this key with the same project table enters the environment shared.
+        printf '%s\n' "$env_surface" >"$env_surface_stamp" 2>/dev/null || true
         fi
     fi
     # last-used stamp: `dt clean --envs` reaps envs whose mtime went stale

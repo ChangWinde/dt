@@ -259,6 +259,14 @@ The wrapper owns advisory GPU lease file descriptors for its lifetime. A GPU
 can therefore be reserved during CPU-only initialization even when
 `nvidia-smi` shows no CUDA process.
 
+The wrapper also holds the job's environment lock shared for its lifetime.
+The launcher takes that lock exclusively only to build (sync plus setup hook)
+and stamps the built surface; a launch whose surface is already stamped enters
+the environment shared and never syncs, so one running job never serializes
+the next launch of its environment. A build that cannot take the lock within a
+bounded wait reports `busy` rather than holding the dispatcher inside the
+launch (see "Environments on the node" in the configuration reference).
+
 The bare-process lease is not physical device isolation. `CUDA_VISIBLE_DEVICES`
 controls CUDA enumeration, while Vulkan, EGL, OpenGL, and direct NVIDIA/DRM
 device-node access remain outside that environment-variable boundary. DT does

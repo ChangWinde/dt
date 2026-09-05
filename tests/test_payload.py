@@ -1,6 +1,7 @@
 """Regression guards for the node-side payload and job support files -
 every entry here is a lesson from the first real-project run (OmniStack)."""
 
+import contextlib
 import hashlib
 import json
 import os
@@ -353,6 +354,51 @@ def test_launcher_setup_hook_contract():
     assert '"$DT_CONTROL_DIR/env-key"' in LAUNCHER
 
 
+def _prebuild_environment(
+    env_dir: Path,
+    *,
+    pyproject: str | None,
+    setup: Path | None,
+    setup_text: str,
+) -> None:
+    """Leave behind what a finished launcher leaves: an interpreter, the
+    surface stamp for this pyproject, and the setup marker when a hook exists."""
+    interpreter = env_dir / "bin" / "python"
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    interpreter.write_text("#!/usr/bin/env bash\nexit 0\n")
+    interpreter.chmod(0o755)
+    surface = (
+        hashlib.sha256(pyproject.encode()).hexdigest()
+        if pyproject is not None
+        else "no-pyproject"
+    )
+    (env_dir / f".dt-surface-{env_dir.name}").write_text(surface + "\n")
+    if setup is not None:
+        marker = hashlib.sha256(setup_text.encode()).hexdigest()[:8]
+        (env_dir / f".dt-setup-{marker}").write_text("")
+
+
+@contextlib.contextmanager
+def _holding_environment_lock(lock: Path, *, shared: bool):
+    """A process holding the environment lock the way a running job's wrapper
+    (shared) or another launcher's build (exclusive) does."""
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    flag = "-s" if shared else "-x"
+    holder = subprocess.Popen(
+        ["flock", flag, str(lock), "-c", "echo held; exec sleep 30"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline() == "held\n"
+        yield
+    finally:
+        holder.kill()
+        holder.wait()
+        holder.stdout.close()
+
+
 def _run_launcher_with_fake_uv(
     tmp_path: Path,
     mode: str,
@@ -363,12 +409,24 @@ def _run_launcher_with_fake_uv(
     private_env: dict[str, str] | None = None,
     systemd_scope: bool = True,
     linger: bool = True,
+    prebuilt: bool = False,
+    pyproject: str | None = None,
+    prebuilt_pyproject: str | None = None,
 ) -> subprocess.CompletedProcess:
     job = tmp_path / "job"
     code = job / "code"
     code.mkdir(parents=True)
     (code / "uv.lock").write_text("version = 1\n")
+    if pyproject is not None:
+        (code / "pyproject.toml").write_text(pyproject)
     (job / "env-key").write_text("0123456789ab\n")
+    if prebuilt:
+        _prebuild_environment(
+            tmp_path / "envs" / "0123456789ab",
+            pyproject=prebuilt_pyproject or pyproject,
+            setup=(job / "setup.sh") if mode == "setup" else None,
+            setup_text="true\n",
+        )
     if custom_env:
         custom_path = job / "custom-env"
         custom_path.write_bytes(
@@ -726,6 +784,103 @@ def test_cpu_launcher_marks_portable_unproven_fallback(tmp_path):
     assert (tmp_path / "job" / "runtime_containment").read_text() == (
         "portable_unproven\n"
     )
+
+
+_PYPROJECT = '[project]\nname = "demo"\nversion = "1"\n'
+
+
+def test_launcher_enters_a_built_environment_without_syncing_or_waiting(tmp_path):
+    """Field report: a running job holds the environment lock shared for its
+    lifetime, and every launch used to take it exclusively to sync, so the
+    second job of a project waited for the first to finish - a two-card node
+    ran one card. An environment already built for this surface is entered
+    shared, past any running job, with no sync at all."""
+    lock = tmp_path / "envs" / "0123456789ab.lock"
+    with _holding_environment_lock(lock, shared=True):
+        proc = _run_launcher_with_fake_uv(
+            tmp_path,
+            "setup",
+            prebuilt=True,
+            pyproject=_PYPROJECT,
+            env_overrides={"DT_ENV_BUILD_WAIT_S": "2"},
+        )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "already built for this surface" in proc.stderr
+    assert not (tmp_path / "state" / "sync-count").exists()
+    assert (tmp_path / "state" / "tmux-new-session").exists()
+    result = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert result["env_preexisting"] is True
+    assert result["setup_ran"] is False
+    assert result["launch_phases_ms"]["environment"] < 2000
+
+
+def test_launcher_rebuilds_when_the_project_table_changed(tmp_path):
+    """The stamp seals pyproject.toml: a new console script or metadata edit
+    that leaves uv.lock alone still reaches the environment through a sync."""
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "setup",
+        prebuilt=True,
+        prebuilt_pyproject=_PYPROJECT,
+        pyproject=_PYPROJECT + '[project.scripts]\ndemo = "demo:main"\n',
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert (tmp_path / "state" / "sync-count").read_text() == "1\n"
+    stamp = tmp_path / "envs" / "0123456789ab" / ".dt-surface-0123456789ab"
+    expected = hashlib.sha256(
+        (_PYPROJECT + '[project.scripts]\ndemo = "demo:main"\n').encode()
+    ).hexdigest()
+    assert stamp.read_text() == expected + "\n"
+
+
+def test_launcher_stamps_only_a_successful_build(tmp_path):
+    ok = _run_launcher_with_fake_uv(tmp_path, "plain", pyproject=_PYPROJECT)
+    assert ok.returncode == 0, ok.stderr
+    stamp = tmp_path / "envs" / "0123456789ab" / ".dt-surface-0123456789ab"
+    assert stamp.read_text() == hashlib.sha256(_PYPROJECT.encode()).hexdigest() + "\n"
+
+    failed = _run_launcher_with_fake_uv(tmp_path / "second", "setup_failure")
+    assert failed.returncode == 13, failed.stderr
+    assert not list((tmp_path / "second" / "envs").glob("*/.dt-surface-*"))
+
+
+def test_launcher_reports_busy_instead_of_blocking_the_dispatcher_on_a_held_env(
+    tmp_path,
+):
+    """When a build is genuinely needed while a job runs in the environment,
+    the launcher waits a bounded time and then reports busy (exit 10) so the
+    dispatcher places other work and retries, instead of sitting inside the
+    launch for the running job's whole lifetime."""
+    lock = tmp_path / "envs" / "0123456789ab.lock"
+    with _holding_environment_lock(lock, shared=True):
+        proc = _run_launcher_with_fake_uv(
+            tmp_path,
+            "plain",
+            env_overrides={"DT_ENV_BUILD_WAIT_S": "1"},
+        )
+
+    assert proc.returncode == 10, proc.stderr
+    assert "in use by a running job and needs a build" in proc.stderr
+    assert not (tmp_path / "state" / "sync-count").exists()
+    assert not (tmp_path / "state" / "tmux-new-session").exists()
+
+
+def test_launcher_waits_for_a_builder_before_entering_a_built_env(tmp_path):
+    lock = tmp_path / "envs" / "0123456789ab.lock"
+    with _holding_environment_lock(lock, shared=False):
+        proc = _run_launcher_with_fake_uv(
+            tmp_path,
+            "plain",
+            prebuilt=True,
+            pyproject=_PYPROJECT,
+            env_overrides={"DT_ENV_BUILD_WAIT_S": "1"},
+        )
+
+    assert proc.returncode == 10, proc.stderr
+    assert "is being rebuilt" in proc.stderr
+    assert not (tmp_path / "state" / "tmux-new-session").exists()
 
 
 def test_gpu_wrapper_rejects_symlinked_containment_attestation(tmp_path):
