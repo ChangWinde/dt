@@ -4742,6 +4742,38 @@ def test_piped_tables_are_content_sized_instead_of_padded_to_the_pipe_width():
     assert max(map(len, terminal.export_text().splitlines())) <= 80
 
 
+def test_piped_grouped_tables_are_content_sized_like_dt_free():
+    """Field observation on 0.13.6: `dt ps | cat` was content-sized but
+    `dt free | cat` padded every line to 4096 columns. The command prints
+    Group(resource_table, scheduler_grid); the hook only saw the Group."""
+    from rich.console import Group
+    from rich.table import Table
+
+    from dt import render
+
+    resources = render.free_table([_node("psibot", "psibot-ds", 1, total=1)])
+    scheduler = Table.grid(padding=(0, 1), pad_edge=False)
+    scheduler.add_column(style="bold cyan", no_wrap=True)
+    scheduler.add_column()
+    scheduler.add_row(
+        "dt", "0/1 GPU free · 0 running · 8 queued · waiting for capacity"
+    )
+    piped = render.human_console(
+        width=render.UNBOUNDED_PIPE_WIDTH,
+        record=True,
+        force_terminal=False,
+        color_system=None,
+    )
+    piped.print(Group(resources, scheduler))
+    text = piped.export_text()
+    lines = text.splitlines()
+    widest = max(len(line) for line in lines)
+    assert widest == max(len(line.rstrip()) for line in lines)
+    assert widest < 256
+    assert "psibot-ds" in text
+    assert "0/1 GPU free" in text
+
+
 def test_force_color_zero_disables_styles_in_piped_output(monkeypatch):
     """Agent tool shells export FORCE_COLOR=0 to mean "no colour"; Rich reads
     any non-empty value as "force styles", which put SGR codes into `dt ps |

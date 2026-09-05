@@ -8,6 +8,11 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- Piped `dt free` is content-sized again. 0.13.6 sized a table printed
+  directly into a pipe (`dt ps`) but `dt free` prints
+  `Group(resource table, scheduler grid)`, and the hook only inspected the
+  Group. Nested tables now shrink the same way; a 4096-column padded
+  `ssh head dt free` is what this closes.
 - `scripts/deploy.sh` no longer treats a healthy head with a long queue as
   having an invalid agent-status contract. `dt agent status --json` carries
   one row per queued job (79 jobs: 84 KiB; 156 jobs: well past 128 KiB), and
