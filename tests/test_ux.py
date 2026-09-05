@@ -4716,7 +4716,7 @@ def test_piped_tables_are_content_sized_instead_of_padded_to_the_pipe_width():
         "exit_code": None,
         "cmd": "python train.py",
     }
-    piped = render.HumanConsole(
+    piped = render.human_console(
         width=render.UNBOUNDED_PIPE_WIDTH,
         record=True,
         force_terminal=False,
@@ -4735,7 +4735,7 @@ def test_piped_tables_are_content_sized_instead_of_padded_to_the_pipe_width():
     )
     assert "…" not in text
 
-    terminal = render.HumanConsole(
+    terminal = render.human_console(
         width=80, record=True, force_terminal=False, color_system=None
     )
     terminal.print(render.ps_table([row], show_issue=True, title="Active jobs"))

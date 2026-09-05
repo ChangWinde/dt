@@ -9,14 +9,12 @@ import copy
 import dataclasses
 import os
 import sys
-from collections.abc import Iterable
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Any, TypeAlias
+from typing import Any, TypeAlias, cast
 
-from rich.console import Console, ConsoleOptions, RenderableType
+from rich.console import Console, ConsoleRenderable, RenderHook
 from rich.markup import escape
-from rich.segment import Segment
 from rich.table import Table
 
 from .jsonvalue import as_int, as_number
@@ -61,20 +59,35 @@ def content_sized(table: Table) -> Table:
     return sized
 
 
-class HumanConsole(Console):
-    """Rich console whose piped output is content-sized, not terminal-shaped."""
+class _ContentSizedInPipes:
+    """Rich render hook: tables printed into a pipe are content-sized.
 
-    def render(
-        self,
-        renderable: RenderableType,
-        options: ConsoleOptions | None = None,
-    ) -> Iterable[Segment]:
-        if (
-            isinstance(renderable, Table)
-            and (options or self.options).max_width >= UNBOUNDED_PIPE_WIDTH
-        ):
-            renderable = content_sized(renderable)
-        return super().render(renderable, options)
+    The console's width decides at print time, so a test that pins ``width``
+    to a terminal size gets the terminal layout from the same console.
+    """
+
+    def __init__(self, console: Console) -> None:
+        self._console = console
+
+    def process_renderables(
+        self, renderables: list[ConsoleRenderable]
+    ) -> list[ConsoleRenderable]:
+        if self._console.width < UNBOUNDED_PIPE_WIDTH:
+            return renderables
+        return [
+            content_sized(item) if isinstance(item, Table) else item
+            for item in renderables
+        ]
+
+
+def human_console(**options: Any) -> Console:
+    """A Rich console for human output; in a pipe its tables are content-sized."""
+    console = Console(**options)
+    # Rich declares RenderHook as an ABC, not a Protocol; the hook above is
+    # structurally complete and subclassing would be "subclassing Any" under
+    # the CI's --follow-imports=skip.
+    console.push_render_hook(cast(RenderHook, _ContentSizedInPipes(console)))
+    return console
 
 
 def _force_terminal() -> bool | None:
@@ -86,9 +99,9 @@ def _force_terminal() -> bool | None:
     return False if value in {"0", "false", "no", "off"} else None
 
 
-def _human_console(stream: object, *, stderr: bool = False) -> HumanConsole:
+def _human_console(stream: object, *, stderr: bool = False) -> Console:
     width, height = _console_geometry(stream)
-    return HumanConsole(
+    return human_console(
         stderr=stderr,
         width=width,
         height=height,
