@@ -305,8 +305,25 @@ is recorded as retryable and rerunning the same `--request-id` resumes the
 transfer instead of replaying a rejection — but the two-phase form gives the
 transfer its own retry loop and keeps submission latency predictable.
 
-The content manifest is verified before setup and execution. Drift fails before
-start rather than silently evaluating a different input.
+The content manifest is verified before setup and execution. Drift never
+silently evaluates a different input: a node whose artifact store no longer
+matches the manifest (a job wrote through its workspace link, someone edited
+the store, the manifest was never published there) refuses the launch as
+`artifact-unverified`. That is a node condition, not a job failure — placement
+moves on to the next node, and when no node holds the manifest the job stays
+queued as `blocked` with the drift and the remedy in `dt ps` / `dt info`:
+
+```text
+gc6d: ~/dt/worker/artifacts/policy drifted from manifest 3f9c0a12b7de
+(artifact directory contains symlink: .../models/victim/migrated/migrated);
+republish it with dt sync --artifact before jobs pinned to it can start here
+```
+
+Republishing with `dt sync NODE --artifact PATH` restores the store; the
+blocked jobs retry on their own. Treat `$DT_ARTIFACT_ROOT` and every
+`--artifact-target` link as read-only inside a job — anything written there
+lands in the shared store and blocks every later job of the project on that
+node until it is republished.
 
 Programs that expect repo-relative paths do not need hand-rolled symlink
 bridges from `$DT_ARTIFACT_ROOT`. Declare the workspace link instead:

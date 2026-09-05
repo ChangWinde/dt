@@ -21,6 +21,7 @@
 #                     13 env-fail | 14 internal | 15 node-unfit
 #                     16 cache-missing | 17 payload-integrity
 #                     18 identity-conflict (retryable: foreign live marker)
+#                     19 artifact-unverified (retryable: node store drifted)
 # On success prints one JSON line with placement, environment cache state,
 # setup execution, and node boot identity.
 set -u
@@ -1259,15 +1260,32 @@ if [ -n "$DT_ARTIFACT_MANIFEST" ]; then
         exit 15
     fi
     artifact_manifest_path="$DT_ARTIFACT_ROOT/.dt/manifests/$DT_ARTIFACT_MANIFEST.json"
+    # Whether this node holds the manifest is a node condition rather than a
+    # job failure: another node may hold it verbatim and a publish repairs
+    # this one. Refuse with a retryable code that names the gap and the
+    # remedy instead of failing the job and the whole queue behind it.
+    if [ ! -f "$artifact_manifest_path" ]; then
+        log "artifact-unverified: $DT_ARTIFACT_ROOT holds no manifest ${DT_ARTIFACT_MANIFEST:0:12}; publish it with dt sync --artifact before jobs pinned to it can start here"
+        exit 19
+    fi
     log "verifying artifact manifest ${DT_ARTIFACT_MANIFEST:0:12}"
     artifact_verify_started_ms=$(now_ms)
-    if ! python3 -I "$DT_PAYLOAD_DIR/artifact_verify.py" \
+    # The store is shared by every job of the project on this node and stays
+    # writable for republication, so a job writing through its workspace link
+    # (or an operator editing files) can make it drift from the manifest this
+    # job was pinned to.
+    if ! artifact_verify_error=$(python3 -I "$DT_PAYLOAD_DIR/artifact_verify.py" \
         --root "$DT_ARTIFACT_ROOT" \
         --manifest "$artifact_manifest_path" \
         --expected-sha256 "$DT_ARTIFACT_MANIFEST" \
-        >>"$DT_JOB_DIR/logs/env.log" 2>&1; then
-        log "artifact integrity failed; see logs/env.log"
-        exit 13
+        2>&1 >>"$DT_JOB_DIR/logs/env.log"); then
+        artifact_verify_error=${artifact_verify_error##*$'\n'}
+        artifact_verify_error=${artifact_verify_error#artifact verification failed: }
+        : "${artifact_verify_error:=verifier exited without a reason}"
+        printf 'artifact verification failed: %s\n' "$artifact_verify_error" \
+            >>"$DT_JOB_DIR/logs/env.log"
+        log "artifact-unverified: $DT_ARTIFACT_ROOT drifted from manifest ${DT_ARTIFACT_MANIFEST:0:12} ($artifact_verify_error); republish it with dt sync --artifact before jobs pinned to it can start here"
+        exit 19
     fi
     ARTIFACT_VERIFY_DURATION_MS=$(($(now_ms) - artifact_verify_started_ms))
 fi

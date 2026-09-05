@@ -2242,6 +2242,84 @@ def test_artifact_verifier_handles_directory_artifacts_in_isolated_mode(tmp_path
     assert "mismatch" in drifted.stderr
 
 
+def _publish_artifact_store(root: Path, project_relative: str) -> str:
+    """Write a manifest for ``root/project_relative`` the way `dt sync` does."""
+    import dt.dispatch as dispatch
+
+    sources = dispatch._artifact_sources(root, [project_relative])  # noqa: SLF001
+    manifest_bytes, manifest_sha256 = dispatch._artifact_manifest(  # noqa: SLF001
+        "ratimage",
+        sources,
+    )
+    manifest = root / ".dt" / "manifests" / f"{manifest_sha256}.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_bytes(manifest_bytes)
+    return manifest_sha256
+
+
+def test_launcher_treats_a_drifted_artifact_store_as_a_node_condition(tmp_path):
+    """Field report: two cells of one job raced ``ln -s`` through the job's
+    workspace link and planted ``models/victim/migrated/migrated`` inside the
+    node's shared artifact store. Every later job of the project then died at
+    launch as ``env-fail: artifact integrity failed; see logs/env.log`` - five
+    in twenty minutes - although nothing about those jobs was wrong. The
+    launcher now refuses with a retryable code that names the drift and the
+    remedy, so the queue holds the jobs until the store is republished."""
+    root = tmp_path / "artifacts"
+    victims = root / "models" / "victim" / "migrated"
+    victims.mkdir(parents=True)
+    (victims / "door-open-v2_DRQV2_500000.pt").write_bytes(b"weights")
+    manifest_sha256 = _publish_artifact_store(root, "models/victim")
+
+    def launch(env_overrides: dict[str, str]) -> subprocess.CompletedProcess:
+        job = tmp_path / "job"
+        if job.exists():
+            shutil.rmtree(job)
+            shutil.rmtree(tmp_path / "home")
+            shutil.rmtree(tmp_path / "bin")
+            shutil.rmtree(tmp_path / "state")
+        job.mkdir()
+        support = _support_files(["true"], {})
+        (job / "artifact_verify.py").write_text(support["artifact_verify.py"])
+        (job / "snapshot_hash.py").write_text(support["snapshot_hash.py"])
+        return _run_launcher_with_fake_uv(
+            tmp_path, "plain", env_overrides=env_overrides
+        )
+
+    binding = {
+        "DT_ARTIFACT_ROOT": str(root),
+        "DT_ARTIFACT_MANIFEST": manifest_sha256,
+    }
+    intact = launch(binding)
+    assert intact.returncode == 0, intact.stderr
+    assert (tmp_path / "state" / "tmux-new-session").exists()
+
+    (victims / "migrated").symlink_to(victims, target_is_directory=True)
+    drifted = launch(binding)
+    assert drifted.returncode == 19, drifted.stderr
+    assert not (tmp_path / "state" / "tmux-new-session").exists()
+    refusal = [
+        line for line in drifted.stderr.splitlines() if "artifact-unverified" in line
+    ]
+    assert len(refusal) == 1
+    assert f"{root} drifted from manifest {manifest_sha256[:12]}" in refusal[0]
+    assert "artifact directory contains symlink" in refusal[0]
+    assert str(victims / "migrated") in refusal[0]
+    assert "republish it with dt sync --artifact" in refusal[0]
+    env_log = (tmp_path / "job" / "logs" / "env.log").read_text()
+    assert (
+        "artifact verification failed: artifact directory contains symlink" in env_log
+    )
+    assert "env-fail" not in drifted.stderr and "see logs/env.log" not in drifted.stderr
+
+    unpublished = launch({**binding, "DT_ARTIFACT_MANIFEST": "f" * 64})
+    assert unpublished.returncode == 19, unpublished.stderr
+    assert f"{root} holds no manifest {'f' * 12}; publish it with dt sync" in (
+        unpublished.stderr
+    )
+    assert not (tmp_path / "state" / "tmux-new-session").exists()
+
+
 def test_artifact_verifier_refuses_symlinked_trust_roots(tmp_path):
     real_root = tmp_path / "real-artifacts"
     real_root.mkdir()
