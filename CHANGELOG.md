@@ -6,6 +6,19 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- Queued jobs launch with the dispatching head's runtime payload. A job
+  queued before an upgrade kept the launcher it was submitted with for as
+  long as it waited, so a launcher fix never reached the backlog (one head had
+  86 queued jobs that would all have kept serializing behind the environment
+  lock after 0.13.12 shipped). The row's `payload_sha256` is refreshed at
+  stage time and logged; the node still attests the delivered payload against
+  it, and a tampered staged payload is refused before the refresh.
+- `uplink_kbps` no longer budgets the head's own `local: true` node: that leg
+  is a disk-to-disk copy, and throttling it slowed local snapshots to the
+  uplink rate.
+
 ## 0.13.12 — 2026-09-06
 
 ### Added

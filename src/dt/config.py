@@ -87,13 +87,17 @@ def head_bwlimit_kbps(
     An explicit CLI value wins; then the node's site default; then the head's
     own uplink budget (`uplink_kbps`), which exists because a head on a home
     line shares one thin uplink between every transfer, the remote-desktop
-    session, and SSH itself. None means unthrottled.
+    session, and SSH itself. The uplink budget never reaches the head's own
+    local node: that leg is a disk-to-disk copy that leaves no uplink. None
+    means unthrottled.
     """
     if override is not None:
         return override
     site = site_of_node(cfg, node_name)
     if site is not None and site.bwlimit_kbps is not None:
         return site.bwlimit_kbps
+    if any(node.local for node in cfg.nodes if node.name == node_name):
+        return None
     return cfg.uplink_kbps
 
 
