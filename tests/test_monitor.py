@@ -373,6 +373,68 @@ def test_info_json_includes_finished_job_telemetry_summary(tmp_path, monkeypatch
     assert "cross-clock intervals are approximate" in human.output
 
 
+def test_info_carries_the_process_group_and_the_provisional_status_verdict(
+    tmp_path, monkeypatch, stub_job_refresh
+):
+    """Field observation: `dt ps` showed a running job as `running?` with
+    "wrapper process identity or survivor census is unverified" for its whole
+    runtime, yet `dt info --json` had neither that verdict nor the pgid an
+    operator needs to look at the process on the node."""
+    cfg = HeadConfig(
+        center="c",
+        nodes=[Node(name="n1")],
+        projects={},
+        default_project=None,
+        root=tmp_path / "dt",
+        envs="~/dt/envs",
+    )
+    entry = JobEntry(
+        job_id="j",
+        name="job",
+        center="c",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/j",
+        session="dt_j",
+        cmd="true",
+        gpus=[0],
+        status="running",
+        pgid=1790766,
+        started_at=100.0,
+    )
+    cli.jobs_mod.save(cfg, entry)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    verdict = (
+        "wrapper process identity or survivor census is unverified; registry retained"
+    )
+
+    def refresh(cfg_, entry_, observation=None):
+        if observation is not None:
+            observation.update(node_unreachable=False, status_probe_error=verdict)
+        return entry_
+
+    stub_job_refresh(cli.jobs_mod, refresh)
+    monkeypatch.setattr(cli, "_job_resources", lambda cfg_, entry_: None)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+
+    result = CliRunner().invoke(cli.app, ["info", "j", "--json"])
+
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.stdout)
+    assert data["pgid"] == 1790766
+    assert data["status_probe_error"] == verdict
+    assert data["node_unreachable"] is False
+
+    human = CliRunner().invoke(cli.app, ["info", "j"])
+    assert human.exit_code == 0, human.output
+    assert "status unverified: wrapper process identity" in human.output
+
+
 def test_info_actions_are_typed_and_never_suggest_double_runs():
     def entry(status: str, **kwargs) -> JobEntry:
         return JobEntry(

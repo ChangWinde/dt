@@ -650,6 +650,12 @@ def _render_info_table(
         status_txt += f"  [{reason_style}]{escape(entry.reason)}[/{reason_style}]"
     if data["node_unreachable"]:
         status_txt += "  [yellow](node unreachable, registry view)[/yellow]"
+    elif isinstance(data.get("status_probe_error"), str):
+        # The same provisional verdict `dt ps` marks as `running?`.
+        status_txt += (
+            f"  [yellow](status unverified: {escape(data['status_probe_error'])})"
+            "[/yellow]"
+        )
     if entry.gpus:
         gpus_txt = ",".join(map(str, entry.gpus))
     elif entry.gpus_requested == 0:
@@ -904,9 +910,15 @@ def _info_gather(
     Returns ``(entry, live, resources, failure_log)``.
     """
     initial_status = entry.status
+    # Probe health ("wrapper process identity ... is unverified", a refused
+    # ssh) is what `dt ps` renders as `running?`; keep it beside the row so
+    # the detail view can say why the status is provisional.
+    probe_observation: dict[str, object] = {}
     with ThreadPoolExecutor(max_workers=4) as pool:
         status_future = (
-            pool.submit(jobs_mod.refresh_status, cfg, entry)
+            pool.submit(
+                jobs_mod.refresh_status, cfg, entry, observation=probe_observation
+            )
             if initial_status in ("running", "lost")
             else None
         )
@@ -932,6 +944,11 @@ def _info_gather(
         if status_future is not None:
             entry = status_future.result()
         live = live_future.result() if live_future is not None else {}
+        probe_error = probe_observation.get("status_probe_error")
+        if isinstance(probe_error, str) and probe_error:
+            live["status_probe_error"] = probe_error
+        if probe_observation.get("node_unreachable"):
+            live["unreachable"] = True
         try:
             resources = (
                 resources_future.result()
@@ -1029,6 +1046,7 @@ def _info_payload(
         "max_hours_overdue_s": _max_hours_overdue(entry.max_hours, timing.duration),
         "exit_code": entry.exit_code,
         "session": entry.session,
+        "pgid": entry.pgid,
         "job_dir": entry.job_dir,
         "paths": _job_path_contract(cfg, entry),
         "outputs_size": live.get("outputs_size"),
@@ -1053,6 +1071,7 @@ def _info_payload(
         "pin_node": entry.pin_node,
         "placement_failures": dict(entry.placement_failures),
         "node_unreachable": live.get("unreachable", False),
+        "status_probe_error": live.get("status_probe_error"),
         "resources": resources,
         "resource_summary": resource_summary,
         "resource_summary_error": resource_summary_error,
