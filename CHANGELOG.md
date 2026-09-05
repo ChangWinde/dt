@@ -6,6 +6,17 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- `scripts/deploy.sh` no longer treats a healthy head with a long queue as
+  having an invalid agent-status contract. `dt agent status --json` carries
+  one row per queued job (79 jobs: 84 KiB; 156 jobs: well past 128 KiB), and
+  the probe used to pipe the document through `head -c 65537` into a Python
+  argv — both of which truncate it into invalid JSON. The probe now reads the
+  document from a temp file and only refuses a document larger than 16 MiB or
+  one whose `alive` field is not a boolean. Deploying 0.13.6 to psibot-hm
+  was refused by this check until the script was repaired.
+
 ## 0.13.6 — 2026-09-05
 
 ### Fixed
