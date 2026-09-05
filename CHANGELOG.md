@@ -8,6 +8,43 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ### Fixed
 
+- Piped human output (`ssh head dt ps`, `dt free | less`, an agent's tool
+  shell) is exactly as wide as its content again. 0.13.5 gave a pipe a 4096
+  column console so identities would never be ellipsized, but Rich then padded
+  every line to 4096 spaces and spread the columns across them. Tables printed
+  into a pipe are now content-sized: no padding, no ellipsis, full reasons.
+  The same path honours `COLUMNS` and works under `TERM=dumb` (Rich ignores an
+  explicit width there unless the height is explicit too), and `FORCE_COLOR=0`
+  disables styles the way supports-color defines it instead of forcing SGR
+  codes into piped output.
+- A node whose shared artifact store no longer matches the manifest a job was
+  pinned to refuses the launch as `artifact-unverified` (launcher exit 19, a
+  retryable placement reason) instead of failing the job as `env-fail:
+  artifact integrity failed; see logs/env.log`. Field report: two cells of one
+  job raced `ln -s` through their workspace link and planted a symlink inside
+  the store; the next five queued jobs of the project all died at launch. Now
+  placement tries the next node, and when none holds the manifest the job
+  stays queued as blocked with the drift and the remedy ("... drifted from
+  manifest bad47033458e (artifact directory contains symlink: ...); republish
+  it with dt sync --artifact ..."). A manifest that was never published to the
+  node is reported the same way instead of as a job failure.
+- `dt compact` tells a recovery snapshot that violates today's snapshot policy
+  apart from a corrupt one. A snapshot captured before dt began rejecting
+  symlinks that escape the tree (2026-08-15) holds exactly the bytes that were
+  dispatched but can never be re-verified; every sweep reported it as "cannot
+  be read" with no way out. The report now names the jobs it pins and the
+  command that retires them (`dt clean --before DATE -p PROJECT`), counts them
+  as `snapshot_policy_rejected`, and the CLI says "recovery archive skipped"
+  instead of "preflight refused" since the sweep goes on. The agent logs such a
+  problem when it appears and when it clears, not every six hours, and no
+  longer calls the sweep "refused".
+- `dt info --json` carries `pgid` and `status_probe_error`; the human view
+  marks a provisional status ("status unverified: wrapper process identity or
+  survivor census is unverified") the way `dt ps` marks it `running?`, instead
+  of showing a plain `running`.
+- The agent log describes a registry that changed while its active index was
+  being rebuilt as such; it used to say "registry entry registry is
+  unreadable".
 - `scripts/deploy.sh` reads the registry/dispatch authority from
   `dt/jobs/__init__.py` as well as the pre-0.13.5 `dt/jobs.py`, so a 0.13.5
   bundle activates instead of being refused and rolled back; the release gate

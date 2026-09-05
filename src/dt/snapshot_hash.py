@@ -20,6 +20,16 @@ def _bytes_field(value: bytes) -> bytes:
     return len(value).to_bytes(8, "big") + value
 
 
+class SnapshotPolicyError(ValueError):
+    """The tree is intact but breaks a rule dt enforces on snapshots.
+
+    Symlink targets and size budgets are policy, not integrity: an archive
+    captured before a rule existed still holds exactly the bytes that were
+    dispatched, yet it can no longer be re-verified. Callers that keep history
+    (compaction) tell those apart from a corrupt or unreadable archive.
+    """
+
+
 def tree_sha256(root: Path) -> str:
     """Hash paths, types, modes, link targets, and regular-file contents.
 
@@ -48,7 +58,9 @@ def tree_sha256(root: Path) -> str:
         for name in filenames:
             discovered.append(parent_path / name)
         if len(discovered) > MAX_SNAPSHOT_ENTRIES:
-            raise ValueError(f"snapshot exceeds entry budget {MAX_SNAPSHOT_ENTRIES}")
+            raise SnapshotPolicyError(
+                f"snapshot exceeds entry budget {MAX_SNAPSHOT_ENTRIES}"
+            )
     entries = sorted(
         discovered,
         key=lambda path: os.fsencode(path.relative_to(root).as_posix()),
@@ -57,10 +69,14 @@ def tree_sha256(root: Path) -> str:
     for path in entries:
         relative_path = path.relative_to(root)
         if len(relative_path.parts) > MAX_SNAPSHOT_DEPTH:
-            raise ValueError(f"snapshot path exceeds depth budget: {relative_path}")
+            raise SnapshotPolicyError(
+                f"snapshot path exceeds depth budget: {relative_path}"
+            )
         relative = os.fsencode(relative_path.as_posix())
         if len(relative) > MAX_SNAPSHOT_PATH_BYTES:
-            raise ValueError(f"snapshot path exceeds byte budget: {relative_path}")
+            raise SnapshotPolicyError(
+                f"snapshot path exceeds byte budget: {relative_path}"
+            )
         metadata = path.lstat()
         mode = stat.S_IMODE(metadata.st_mode)
         if stat.S_ISDIR(metadata.st_mode):
@@ -71,29 +87,33 @@ def tree_sha256(root: Path) -> str:
             payload_size = metadata.st_size
             total_bytes += payload_size
             if total_bytes > MAX_SNAPSHOT_BYTES:
-                raise ValueError(
+                raise SnapshotPolicyError(
                     f"snapshot exceeds regular-file byte budget {MAX_SNAPSHOT_BYTES}"
                 )
         elif stat.S_ISLNK(metadata.st_mode):
             kind = b"l"
             target_text = os.readlink(path)
             if os.path.isabs(target_text):
-                raise ValueError(f"snapshot symlink has an absolute target: {path}")
+                raise SnapshotPolicyError(
+                    f"snapshot symlink has an absolute target: {path}"
+                )
             try:
                 resolved_target = (path.parent / target_text).resolve(strict=True)
                 resolved_target.relative_to(resolved_root)
             except (OSError, RuntimeError, ValueError) as exc:
-                raise ValueError(
+                raise SnapshotPolicyError(
                     f"snapshot symlink is broken or escapes the root: {path}"
                 ) from exc
             if os.readlink(path) != target_text:
                 raise OSError(f"snapshot symlink changed while hashing: {path}")
             target = os.fsencode(target_text)
             if len(target) > MAX_SNAPSHOT_PATH_BYTES:
-                raise ValueError(f"snapshot symlink target is too long: {path}")
+                raise SnapshotPolicyError(
+                    f"snapshot symlink target is too long: {path}"
+                )
             payload_size = len(target)
         else:
-            raise ValueError(f"unsupported snapshot entry type: {path}")
+            raise SnapshotPolicyError(f"unsupported snapshot entry type: {path}")
 
         digest.update(kind)
         digest.update(mode.to_bytes(4, "big"))

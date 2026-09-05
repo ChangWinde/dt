@@ -1019,6 +1019,15 @@ def _process_once_with_snapshot(
         )
         blocked_backoff.clear()
     for item in damage:
+        if item.path == "registry":
+            # Directory-level verdict from the active-index rebuild (a writer
+            # committed mid-scan): nothing is broken, but one row may have
+            # been missed, so a slot is held for it this tick.
+            log(
+                f"registry changed while the active index was rebuilt "
+                f"({item.detail}); holding one job slot this tick"
+            )
+            continue
         log(
             f"registry entry {item.path} is unreadable ({item.detail}); "
             "counting it as a running job until it is repaired"
@@ -1324,8 +1333,28 @@ def _maybe_autocompact(cfg: HeadConfig, log: Callable[[str], None]) -> None:
             "written after start; copy them out of <job_dir>/code on the node "
             "(dt pull does not fetch code/) or run dt compact --prune-modified"
         )
-    if isinstance(errors, list) and errors:
-        log(f"auto-compact: refused, recovery archive problem: {errors[0]}")
+    _report_archive_problems(
+        [str(item) for item in errors] if isinstance(errors, list) else [], log
+    )
+
+
+# Recovery archive problems are stable facts (a legacy snapshot violating the
+# current policy stays that way until an operator retires its jobs). Reporting
+# them once per change, not every sweep, keeps the log a record of events.
+_ARCHIVE_PROBLEMS_REPORTED: set[str] = set()
+
+
+def _report_archive_problems(problems: list[str], log: Callable[[str], None]) -> None:
+    current = set(problems)
+    for message in sorted(current - _ARCHIVE_PROBLEMS_REPORTED):
+        log(
+            "auto-compact: jobs behind an unverifiable recovery archive keep "
+            f"their code copy: {message}"
+        )
+    if _ARCHIVE_PROBLEMS_REPORTED and not current:
+        log("auto-compact: every recovery archive verifies again")
+    _ARCHIVE_PROBLEMS_REPORTED.clear()
+    _ARCHIVE_PROBLEMS_REPORTED.update(current)
 
 
 def _consume_agent_wake(cfg: HeadConfig) -> bool:

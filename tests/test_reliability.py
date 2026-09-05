@@ -1115,6 +1115,50 @@ def test_retryable_refusal_binds_the_cancellation_of_its_own_marker(
     assert "retryable" in failure_kinds
 
 
+def test_drifted_artifact_store_fails_over_instead_of_failing_the_job(
+    tmp_path, monkeypatch
+):
+    """Field report: a node whose shared artifact store had been written into
+    failed five queued jobs in a row with a fatal env-fail. The store is a node
+    condition: try the next node, and when none holds the manifest the job is
+    blocked with the drift and the remedy, never failed."""
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(dispatch, "_cancel_orphan", lambda *args, **kwargs: None)
+    attempted: list[str] = []
+    refusal = (
+        "[launcher] artifact-unverified: /home/u/dt/worker/artifacts/ratimage "
+        "drifted from manifest bad47033458e (artifact directory contains symlink: "
+        "/home/u/dt/worker/artifacts/ratimage/models/victim/migrated/migrated); "
+        "republish it with dt sync --artifact before jobs pinned to it can start here"
+    )
+
+    def fake_launch(cfg, node, job_id, job_dir, session, spec, reserve=0, **kwargs):
+        attempted.append(node.name)
+        return 19, refusal
+
+    monkeypatch.setattr(dispatch, "launch", fake_launch)
+    entry, reasons, fatal, failure_kinds = _try_nodes(
+        cfg,
+        cfg.nodes,
+        _spec(),
+        "jid",
+        "dt/jobs/jid",
+        "dt_jid",
+        sync_to_node=lambda node: "a" * 64,
+        log=lambda m: None,
+    )
+
+    assert entry is None
+    assert not fatal, "a drifted node store must never fail the job"
+    assert attempted == ["n1", "n2"]
+    assert failure_kinds == {"retryable"}
+    assert reasons == {
+        "n1": f"artifact-unverified: {refusal}",
+        "n2": f"artifact-unverified: {refusal}",
+    }
+    assert dispatch.blocked_not_busy(reasons)
+
+
 def test_identity_conflict_stops_failover_without_cancel_or_failure(
     tmp_path, monkeypatch
 ):

@@ -61,6 +61,7 @@ def _entry(job_id: str, status: str, created_at: float, **kw) -> JobEntry:
 def test_blocked_not_busy_classification():
     assert blocked_not_busy({"n1": "path-missing: /data gone"})
     assert blocked_not_busy({"n1": "node-unfit", "n2": "disk-full"})
+    assert blocked_not_busy({"n1": "artifact-unverified: /a drifted from manifest b"})
     assert not blocked_not_busy({"n1": "busy: need 2, found 0"})
     assert not blocked_not_busy({"n1": "path-missing", "n2": "busy"})
     assert not blocked_not_busy({})  # nothing tried = capacity wait

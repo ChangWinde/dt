@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -469,6 +471,61 @@ def test_compact_isolates_a_corrupt_archive_and_still_frees_healthy_jobs(
     assert report.payload["compacted_jobs"] == 1
     assert not (healthy_root / "code").exists()
     assert (poisoned_root / "code" / "train.py").is_file()
+
+
+def test_compact_names_the_jobs_a_legacy_snapshot_pins_and_how_to_retire_them(
+    tmp_path, monkeypatch
+):
+    """Field observation: a snapshot captured on 2026-08-14, one day before dt
+    began rejecting symlinks that escape the tree, holds
+    ``code/models/victim -> ../artifacts/...``. Its bytes are exactly what was
+    dispatched, yet every sweep reported it as "cannot be read" with no way out.
+    Policy rejections are told apart from corruption and carry the remedy."""
+    cfg = _cfg(tmp_path)
+    healthy_digest = _archive(cfg, text="print('healthy')\n")
+    staging = cfg.root / "legacy-staging"
+    code = staging / "code"
+    (code / "models").mkdir(parents=True)
+    (code / "train.py").write_text("print('legacy')\n")
+    (code / "models" / "victim").symlink_to("../artifacts/inputs/checkpoints/victim")
+    legacy_digest = "1" * 64  # recorded by the hasher that predates the rule
+    root = cfg.snapshots_dir() / legacy_digest
+    staging.replace(root)
+    (root / "meta.json").write_text(
+        json.dumps({"snapshot_sha256": legacy_digest, "project": "p"}) + "\n"
+    )
+    aug_14 = datetime(2026, 8, 14, 22, 36).timestamp()
+    pinned = _entry(
+        legacy_digest,
+        job_id="20260814-2236_rpo-rat-e0005-window-close-s12345_aefb18980604f253",
+        created_at=aug_14,
+        finished_at=aug_14 + 60,
+    )
+    healthy = _entry(healthy_digest, job_id="20260720-1200_healthy_abcd")
+    for entry in (pinned, healthy):
+        save(cfg, entry)
+    node_home = tmp_path / "node-home"
+    pinned_root = _workdir(node_home, pinned)
+    healthy_root = _workdir(node_home, healthy)
+    monkeypatch.setattr(compact_mod, "run_on", _node_runner(node_home))
+
+    report = compact_mod.compact_jobs(
+        cfg, cutoff_ts=time.time(), before="2026-09-05", apply=True
+    )
+
+    assert report.payload["skipped"]["snapshot_policy_rejected"] == 1
+    assert "snapshot_unverified" not in report.payload["skipped"]
+    assert report.payload["compacted_jobs"] == 1
+    assert not (healthy_root / "code").exists()
+    assert (pinned_root / "code" / "train.py").is_file()
+    (problem,) = report.payload["preflight_errors"]
+    assert problem.startswith(
+        f"{legacy_digest}: recovery snapshot violates the current"
+    )
+    assert "snapshot symlink is broken or escapes the root" in problem
+    assert "cannot be read" not in problem and "corrupt" not in problem
+    assert "1 job(s) keep their node-side code copy (20260814-2236_rpo-rat" in problem
+    assert "dt clean --before 2026-08-15 -p p retires them and the snapshot" in problem
 
 
 def test_compact_preflight_rejects_oversized_snapshot_metadata(tmp_path):

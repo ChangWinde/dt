@@ -121,6 +121,11 @@ RETRYABLE = {
     15: "node-unfit",
     16: "cache-missing",
     18: "identity-conflict",
+    # The node's shared artifact store no longer matches the manifest the job
+    # was pinned to (a job wrote through its workspace link, an operator
+    # edited files). Another node may hold it verbatim and a republish
+    # repairs this one, so the job waits instead of failing.
+    19: "artifact-unverified",
 }
 # A live foreign launch identity for the same job. Unlike the other retryable
 # refusals this is not a property of the node: another attempt of this job may
@@ -512,6 +517,7 @@ _JOB_SPECIFIC = (
     "node-unfit",
     "cache-missing",
     "resource-mismatch",
+    "artifact-unverified",
 )
 # Backward-compatible public name; the authoritative predicate and duration
 # live in jobs.py.

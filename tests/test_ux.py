@@ -2772,8 +2772,12 @@ def test_doctor_human_suggests_seed_for_remote_slow_network(tmp_path, monkeypatc
     ]
     monkeypatch.setattr(cli, "_cfg", lambda: cfg)
     monkeypatch.setattr(cli, "doctor_center", lambda cfg_: rows)
+    # An 80-column terminal; the console geometry is fixed at import, so a
+    # COLUMNS override in the runner's environment would not reach Rich.
+    monkeypatch.setattr(cli.out, "width", 80)
+    monkeypatch.setattr(cli.err, "width", 80)
 
-    result = CliRunner().invoke(cli.app, ["doctor"], env={"COLUMNS": "80"})
+    result = CliRunner().invoke(cli.app, ["doctor"])
 
     # The network hints remain visible, but a pure head with no resident
     # scheduler is now a doctor failure instead of an invisible idle state.
@@ -4570,6 +4574,17 @@ def test_ps_default_view_shows_why_a_queued_job_is_blocked():
     assert _compact_queue_reason("waiting: n1 unreachable: ssh timed out") == (
         "n1 unreachable: ssh timed out"
     )
+    drift = (
+        "/home/u/dt/worker/artifacts/ratimage drifted from manifest bad47033458e "
+        "(artifact directory contains symlink: .../models/victim/migrated/migrated); "
+        "republish it with dt sync --artifact before jobs pinned to it can start here"
+    )
+    assert (
+        _compact_queue_reason(
+            f"blocked: gc6d: artifact-unverified: [launcher] artifact-unverified: {drift}"
+        )
+        == f"gc6d: {drift}"
+    )
     row = {
         "job_id": "20260905-0001_skfu-cell_ab12",
         "name": "skfu-cell",
@@ -4613,15 +4628,20 @@ def test_piped_human_output_never_ellipsizes_job_identities(monkeypatch):
     from dt import render
 
     monkeypatch.delenv("COLUMNS", raising=False)
-    assert render._console_width(io.StringIO()) == render.UNBOUNDED_PIPE_WIDTH
+    # A pipe gets an explicit geometry: Rich ignores an explicit width under
+    # TERM=dumb unless the height is explicit too.
+    assert render._console_geometry(io.StringIO()) == (render.UNBOUNDED_PIPE_WIDTH, 25)
 
     class Tty(io.StringIO):
         def isatty(self):
             return True
 
-    assert render._console_width(Tty()) is None
+    assert render._console_geometry(Tty()) == (None, None)
     monkeypatch.setenv("COLUMNS", "100")
-    assert render._console_width(io.StringIO()) is None
+    assert render._console_geometry(io.StringIO()) == (100, 25)
+    assert render._console_geometry(Tty()) == (None, None)
+    monkeypatch.setenv("COLUMNS", "0")
+    assert render._console_geometry(io.StringIO()) == (render.UNBOUNDED_PIPE_WIDTH, 25)
 
     job_id = "20260905-0209_orl-scratch-a135-s4404_bb328622a19e01f8"
     row = {
@@ -4669,3 +4689,82 @@ def test_piped_human_output_never_ellipsizes_job_identities(monkeypatch):
         )
     )
     assert max(map(len, terminal.export_text().splitlines())) <= 80
+
+
+def test_piped_tables_are_content_sized_instead_of_padded_to_the_pipe_width():
+    """Field observation: `ssh head dt ps` and `dt free` printed every line
+    padded to 4096 columns with the cells spread across them. A pipe gets rows
+    exactly as wide as their content: no padding, no ellipsis, full reasons."""
+    from dt import render
+
+    reason = (
+        "blocked: gc6d: node-unfit: [launcher] node-unfit: GPU runtime requires "
+        "loginctl Linger=yes for user psibot on this node"
+    )
+    row = {
+        "job_id": "20260905-0531_c20-calql-div-s1103_ea62a6c3e35546e4",
+        "name": "c20p-demoreset-omni-s5505-replay-omni-s4404-bcinit-sp1of2-s1103",
+        "status": "queued",
+        "reason": reason,
+        "center": "c",
+        "node": "-",
+        "gpus_requested": 1,
+        "created_at": 1.0,
+        "display_ref": "46e4",
+        "queue_position": 1,
+        "queue_depth": 4,
+        "exit_code": None,
+        "cmd": "python train.py",
+    }
+    piped = render.human_console(
+        width=render.UNBOUNDED_PIPE_WIDTH,
+        record=True,
+        force_terminal=False,
+        color_system=None,
+    )
+    piped.print(render.ps_table([row], show_issue=True, title="Active jobs"))
+    piped.print(render.free_table([_node("psibot", "psibot-ds", 1, total=1)]))
+    text = piped.export_text()
+    lines = text.splitlines()
+    widest = max(len(line) for line in lines)
+    assert widest == max(len(line.rstrip()) for line in lines)
+    assert widest < 256
+    assert row["name"] in text
+    assert (
+        "GPU runtime requires loginctl Linger=yes for user psibot on this node" in text
+    )
+    assert "…" not in text
+
+    terminal = render.human_console(
+        width=80, record=True, force_terminal=False, color_system=None
+    )
+    terminal.print(render.ps_table([row], show_issue=True, title="Active jobs"))
+    assert max(map(len, terminal.export_text().splitlines())) <= 80
+
+
+def test_force_color_zero_disables_styles_in_piped_output(monkeypatch):
+    """Agent tool shells export FORCE_COLOR=0 to mean "no colour"; Rich reads
+    any non-empty value as "force styles", which put SGR codes into `dt ps |
+    grep`. dt follows the supports-color convention instead."""
+    import io
+
+    from dt import render
+
+    monkeypatch.delenv("COLUMNS", raising=False)
+    monkeypatch.delenv("TTY_COMPATIBLE", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "0")
+    monkeypatch.setenv("TERM", "xterm-256color")
+    plain = render._human_console(io.StringIO())
+    plain.file = io.StringIO()
+    plain.print("[bold]jobs[/bold]")
+    assert plain.file.getvalue() == "jobs\n"
+
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    forced = render._human_console(io.StringIO())
+    forced.file = io.StringIO()
+    forced.print("[bold]jobs[/bold]")
+    assert "\x1b[1m" in forced.file.getvalue()
+
+    monkeypatch.delenv("FORCE_COLOR")
+    auto = render._human_console(io.StringIO())
+    assert auto.width == render.UNBOUNDED_PIPE_WIDTH and auto.size.height == 25
