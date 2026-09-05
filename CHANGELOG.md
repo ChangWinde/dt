@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.10 — 2026-09-06
+
 ### Fixed
 
 - A node whose sibling holds the snapshot but cannot be reached from it is no
