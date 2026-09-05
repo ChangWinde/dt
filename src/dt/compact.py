@@ -16,6 +16,7 @@ import time
 from collections import Counter, defaultdict
 from contextlib import ExitStack
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .config import HeadConfig, Node
@@ -42,7 +43,7 @@ from .layout import (
 )
 from .lifecycle import liveness_shell
 from .private_state import PrivateStateError, read_bounded_regular
-from .snapshot_hash import tree_sha256
+from .snapshot_hash import SnapshotPolicyError, tree_sha256
 from .sshio import RemoteError, run_on
 
 _TERMINAL_STATUSES = frozenset({"finished", "killed", "lost", "failed", "skipped"})
@@ -253,12 +254,17 @@ def preflight(
 
     errors: list[str] = []
     unverified: set[str] = set()
-    by_digest: dict[str, CompactCandidate] = {}
+    policy_rejected: set[str] = set()
+    by_digest: dict[str, list[CompactCandidate]] = defaultdict(list)
     for candidate in candidates:
-        by_digest.setdefault(candidate.digest, candidate)
-    for digest, candidate in sorted(by_digest.items()):
+        by_digest[candidate.digest].append(candidate)
+    for digest, covered in sorted(by_digest.items()):
         try:
-            observed = tree_sha256(candidate.archive_code)
+            observed = tree_sha256(covered[0].archive_code)
+        except SnapshotPolicyError as exc:
+            errors.append(_policy_rejected_error(digest, exc, covered))
+            policy_rejected.add(digest)
+            continue
         except (OSError, ValueError) as exc:
             errors.append(f"{digest}: recovery snapshot cannot be read: {exc}")
             unverified.add(digest)
@@ -277,6 +283,9 @@ def preflight(
     # the unverified archives so an operator can rebuild or quarantine them.
     verified: list[CompactCandidate] = []
     for candidate in candidates:
+        if candidate.digest in policy_rejected:
+            skipped["snapshot_policy_rejected"] += 1
+            continue
         if candidate.digest in unverified:
             skipped["snapshot_unverified"] += 1
             continue
@@ -287,6 +296,35 @@ def preflight(
         skipped=dict(sorted(skipped.items())),
         registry_damage=tuple(damage),
         errors=tuple(errors),
+    )
+
+
+def _policy_rejected_error(
+    digest: str,
+    exc: SnapshotPolicyError,
+    covered: list[CompactCandidate],
+) -> str:
+    """One stable, actionable line for an archive today's snapshot policy refuses.
+
+    The archive is intact - it holds exactly the bytes that were dispatched -
+    but it was captured before the rule existed (or altered since), so exact
+    recovery could never re-dispatch it and compaction must keep the node-side
+    copy it would otherwise fall back on. Nothing about that changes between
+    sweeps, so name the jobs it pins and the one command that retires them.
+    """
+    job_ids = sorted(candidate.entry.job_id for candidate in covered)
+    listed = ", ".join(job_ids[:3])
+    if len(job_ids) > 3:
+        listed += f", +{len(job_ids) - 3} more"
+    newest = max(candidate.entry.created_at for candidate in covered)
+    before = (datetime.fromtimestamp(newest).date() + timedelta(days=1)).isoformat()
+    project = covered[0].entry.project
+    return (
+        f"{digest}: recovery snapshot violates the current snapshot policy "
+        f"({exc}); it was captured before that rule or altered since, so "
+        f"{len(job_ids)} job(s) keep their node-side code copy ({listed}); "
+        f"dt clean --before {before} -p {shlex.quote(project)} retires them and "
+        "the snapshot"
     )
 
 

@@ -122,7 +122,8 @@ def compact(
         errors = payload["preflight_errors"]
         assert isinstance(errors, list)
         for message in errors:
-            err.print(f"[red]preflight refused:[/red] {escape(str(message))}")
+            # Only the jobs behind that archive are skipped; the sweep went on.
+            err.print(f"[red]recovery archive skipped:[/red] {escape(str(message))}")
         rows = payload["rows"]
         assert isinstance(rows, list)
         for row in rows[:20]:

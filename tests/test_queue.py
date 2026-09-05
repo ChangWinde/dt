@@ -601,6 +601,100 @@ def test_agent_autocompact_sweeps_terminal_code_with_the_terminal_anchor(
     assert len(calls) == 1
 
 
+def test_agent_autocompact_reports_a_recovery_archive_problem_once(
+    tmp_path, monkeypatch
+):
+    """Field observation: one legacy snapshot made every 6-hourly sweep log
+    "auto-compact: refused, recovery archive problem: ..." for weeks, although
+    the sweep had gone on and nothing about the archive ever changed. A stable
+    problem is reported when it appears and when it clears, not every sweep."""
+    import dt.agent as agent
+    import dt.compact as compact_mod
+
+    cfg = _cfg(tmp_path)
+    cfg.queue.auto_compact_hours = 24
+    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
+    problem = (
+        "17f6e717aa06...: recovery snapshot violates the current snapshot policy "
+        "(snapshot symlink is broken or escapes the root: .../code/models/victim); "
+        "it was captured before that rule or altered since, so 1 job(s) keep their "
+        "node-side code copy (20260814-2236_rpo-rat_aefb18980604f253); "
+        "dt clean --before 2026-08-15 -p ratimage_rpo_rat retires them and the snapshot"
+    )
+    errors: list[str] = [problem]
+    monkeypatch.setattr(
+        compact_mod,
+        "compact_jobs",
+        lambda *a, **k: compact_mod.CompactReport(
+            payload={
+                "compacted_jobs": 0,
+                "planned_code_bytes": 0,
+                "skipped": {"snapshot_policy_rejected": 1},
+                "failed_jobs": 0,
+                "preflight_errors": list(errors),
+            },
+            exit_code=1,
+        ),
+    )
+    monkeypatch.setattr(agent, "_ARCHIVE_PROBLEMS_REPORTED", set())
+    messages: list[str] = []
+
+    def sweep() -> list[str]:
+        (cfg.agent_dir() / "last_autocompact").unlink(missing_ok=True)
+        messages.clear()
+        agent._maybe_autocompact(cfg, messages.append)
+        return [m for m in messages if "recovery archive" in m]
+
+    first = sweep()
+    assert first == [
+        "auto-compact: jobs behind an unverifiable recovery archive keep their "
+        f"code copy: {problem}"
+    ]
+    assert not any("refused" in m for m in messages)
+    assert sweep() == []
+    assert sweep() == []
+
+    errors.clear()
+    assert sweep() == ["auto-compact: every recovery archive verifies again"]
+    assert sweep() == []
+
+
+def test_agent_describes_a_mid_rebuild_registry_change_as_such(tmp_path, monkeypatch):
+    """The directory-level verdict of an active-index rebuild used to be logged
+    as "registry entry registry is unreadable", as if a row were damaged."""
+    import dt.agent as agent
+    from dt.jobs import RegistryDamage
+
+    cfg = _cfg(tmp_path)
+
+    def rebuilt(cfg_, *, damage=None, **kwargs):
+        if damage is not None:
+            damage.append(
+                RegistryDamage(
+                    path="registry",
+                    detail="registry changed during active-index rebuild",
+                )
+            )
+            damage.append(RegistryDamage(path="jobs/x.json", detail="not json"))
+        return []
+
+    monkeypatch.setattr(agent, "active_entries", rebuilt)
+    monkeypatch.setattr(agent, "_reconcile_jobs", lambda cfg_, log_, entries=None: [])
+    messages: list[str] = []
+
+    agent._process_once_with_snapshot(cfg, messages.append)
+
+    assert (
+        "registry changed while the active index was rebuilt (registry changed "
+        "during active-index rebuild); holding one job slot this tick"
+    ) in messages
+    assert (
+        "registry entry jobs/x.json is unreadable (not json); counting it as a "
+        "running job until it is repaired"
+    ) in messages
+    assert not any("registry entry registry" in m for m in messages)
+
+
 def test_agent_autocompact_is_off_when_configured_false(tmp_path, monkeypatch):
     import dt.agent as agent
     import dt.compact as compact_mod
