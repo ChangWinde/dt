@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.8 — 2026-09-05
+
 ### Added
 
 - `dt fork --node NODE` places the fork(s) on another node and `--anywhere`
