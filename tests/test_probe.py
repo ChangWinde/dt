@@ -75,6 +75,66 @@ def test_threshold_boundary():
     assert by_idx[2].free  # 800 MiB < 1000 threshold
 
 
+RESIDENT_SAMPLE = f"""0, GPU-aaa, 900, 49140, 0
+1, GPU-bbb, 900, 49140, 0
+{SEP}
+GPU-aaa, 9368, starcosmos, rustdesk, 424
+GPU-bbb, 9368, starcosmos, rustdesk, 424
+GPU-bbb, 169821, starcosmos, python, 470
+{SYS_SEP}
+"""
+
+
+def test_configured_resident_processes_neither_occupy_nor_count_memory():
+    """Field observation: a remote-desktop encoder (rustdesk, 424 MiB, util 0%)
+    held a CUDA context on a workstation head's only card, so `dt free` showed
+    0/1 and eight pinned jobs waited forever as "busy: gpu0 starcosmos
+    0.4/48.0GiB util0%". A name listed in gpu_resident_processes is recorded,
+    not counted, and its memory does not weigh against mem_threshold_mib."""
+    default = {g.index: g for g in parse_probe_output(RESIDENT_SAMPLE, 500)}
+    assert not default[0].free and default[0].procs == 1
+    assert default[0].users == ["starcosmos"]
+    assert default[0].resident_procs == 0
+
+    exempt = {
+        g.index: g
+        for g in parse_probe_output(
+            RESIDENT_SAMPLE, 500, resident_processes=["rustdesk"]
+        )
+    }
+    # 900 MiB used, 424 of it the encoder's: 476 MiB of foreign memory remain.
+    assert exempt[0].free
+    assert exempt[0].procs == 0 and exempt[0].users == []
+    assert exempt[0].resident_procs == 1
+    assert exempt[0].resident_mib == 424
+    assert exempt[0].residents == ["rustdesk"]
+    assert exempt[0].mem_used == 900  # what the card really holds stays visible
+    # A foreign process beside the encoder still occupies the card.
+    assert not exempt[1].free
+    assert exempt[1].procs == 1 and exempt[1].users == ["starcosmos"]
+    assert exempt[1].resident_procs == 1
+
+    tight = parse_probe_output(RESIDENT_SAMPLE, 400, resident_processes=["rustdesk"])
+    assert not tight[0].free  # 476 MiB foreign > 400 MiB threshold
+
+
+def test_resident_process_without_a_memory_figure_keeps_the_threshold_honest():
+    """Inside a container the driver reports [N/A] per process (probe_apps.sh
+    emits an empty field): the process is disregarded, its memory is not."""
+    text = f"0, GPU-aaa, 700, 49140, 0\n{SEP}\nGPU-aaa, 9368, starcosmos, rustdesk,\n"
+    exempt = parse_probe_output(text, 500, resident_processes=["rustdesk"])[0]
+    assert exempt.procs == 0 and exempt.resident_procs == 1
+    assert exempt.resident_mib == 0
+    assert not exempt.free  # 700 MiB with nothing attributable stays busy
+
+    legacy = parse_probe_output(
+        f"0, GPU-aaa, 100, 49140, 0\n{SEP}\nGPU-aaa, 9368, starcosmos\n",
+        500,
+        resident_processes=["rustdesk"],
+    )[0]
+    assert legacy.procs == 1 and not legacy.free  # no comm field: never exempt
+
+
 def test_empty_apps_section():
     text = f"0, GPU-x, 0, 81920, 0\n{SEP}\n"
     gpus = parse_probe_output(text, 500)
@@ -132,6 +192,52 @@ def test_probe_batches_owner_lookup_and_deduplicates_apps(tmp_path):
     assert calls.read_text().splitlines() == ["call"]
     assert gpu.procs == 30
     assert gpu.users == ["batchuser"]
+
+
+def test_probe_reports_process_names_and_memory_for_resident_exemption(tmp_path):
+    """The shipped probe resolves each compute app's `ps -o comm=` name and
+    per-process memory in the same ps call, with the user column widened so a
+    ten-letter account is not clipped to "starcos+" once comm follows it."""
+    resident_bin = tmp_path / "resident-bin"
+    resident_bin.mkdir()
+    (resident_bin / "rustdesk").symlink_to("/bin/sleep")
+    encoder = subprocess.Popen([str(resident_bin / "rustdesk"), "60"])
+    try:
+        fake_commands = f"""
+        nvidia-smi() {{
+            case "$*" in
+              *--query-gpu=*) echo "0, GPU-test, 900, 49140, 0, 42" ;;
+              *--query-compute-apps=*)
+                echo "GPU-test, {encoder.pid}, 424"
+                echo "GPU-test, 999999999, [N/A]"
+                ;;
+              *) return 1 ;;
+            esac
+        }}
+        """
+        proc = subprocess.run(
+            ["bash", "-c", f"{fake_commands}\n{PROBE_CMD}"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    finally:
+        encoder.kill()
+        encoder.wait()
+
+    me = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    apps = proc.stdout.partition(SEP)[2].partition(SYS_SEP)[0].strip().splitlines()
+    assert apps[0] == f"GPU-test,{encoder.pid},{me},rustdesk,424"
+    assert apps[1] == "GPU-test,999999999,?,,"  # dead pid: unknown, no figure
+
+    occupied = parse_probe_output(proc.stdout, 500)[0]
+    assert occupied.procs == 2 and not occupied.free
+
+    exempt = parse_probe_output(proc.stdout, 500, resident_processes=["rustdesk"])[0]
+    assert exempt.resident_procs == 1 and exempt.resident_mib == 424
+    assert exempt.procs == 1  # the unknown dead pid still counts as foreign
+    assert not exempt.free
 
 
 def test_probe_overlaps_independent_nvidia_smi_queries(tmp_path):

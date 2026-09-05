@@ -46,9 +46,16 @@ def _capacity_overlaps(
     candidate: JobEntry,
     candidate_node: str,
 ) -> bool:
-    """Mirror the agent's permitted pinned-queue bypass, conservatively."""
+    """Could admitting ``candidate`` on ``candidate_node`` take a card the
+    older waiter is queued for? Mirrors the agent's pass exactly.
+
+    CPU work on either side never overlaps: a 0-GPU candidate takes no card
+    from anyone, and a 0-GPU older job is not waiting for one. Treating it as
+    overlapping held a `-g 0 --node HEAD` job behind four jobs pinned to a
+    full GPU node ("FIFO capacity is reserved for earlier job ...").
+    """
     if older.gpus_requested <= 0 or candidate.gpus_requested <= 0:
-        return True
+        return False
     if candidate.pin_node is None:
         return True
     return older.pin_node is None or older.pin_node == candidate_node
@@ -569,18 +576,14 @@ def scheduler_snapshot(
             )
 
         fifo_owner: str | None = None
-        if state == "runnable":
+        if state == "runnable" and entry.gpus_requested > 0:
+            # CPU work takes no card from an earlier waiter and is always
+            # attempted; only GPU work can overlap one (see _capacity_overlaps).
             if unpinned_capacity_wait is not None:
-                # The agent stops the whole pass at an unpinned capacity
-                # waiter, so even 0-GPU work behind it is not attempted.
                 fifo_owner = unpinned_capacity_wait
-            elif entry.gpus_requested > 0 and entry.pin_node is None and busy_pins:
+            elif entry.pin_node is None and busy_pins:
                 fifo_owner = next(iter(busy_pins.values()))
-            elif (
-                entry.gpus_requested > 0
-                and entry.pin_node is not None
-                and entry.pin_node in busy_pins
-            ):
+            elif entry.pin_node is not None and entry.pin_node in busy_pins:
                 fifo_owner = busy_pins[entry.pin_node]
         if fifo_owner is not None:
             state = "waiting_fifo"

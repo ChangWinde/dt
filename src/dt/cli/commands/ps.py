@@ -499,6 +499,7 @@ def _gather_ps_rows(
                     _root.probe_node,
                     configured_nodes[node_name],
                     cfg.mem_threshold_mib,
+                    **_root.resident_probe_options(cfg),
                 )
                 for node_name in node_names
             }

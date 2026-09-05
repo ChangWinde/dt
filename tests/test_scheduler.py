@@ -388,27 +388,70 @@ def test_pinned_job_is_exempt_from_the_unpinned_reserve(tmp_path):
     assert by_id["unpinned"]["state"] in {"waiting_capacity", "waiting_fifo"}
 
 
-def test_unpinned_capacity_wait_also_holds_zero_gpu_work(tmp_path):
-    """The agent breaks the whole pass at an unpinned capacity waiter, so a
-    0-GPU job behind it must not be explained as runnable (audit F3)."""
+def test_zero_gpu_work_is_not_held_behind_a_gpu_capacity_waiter(tmp_path):
+    """Field report: four jobs pinned to a full gc6d waited for a card while a
+    `-g 0 --node star-0` job behind them sat as "FIFO capacity is reserved for
+    earlier job ...". CPU work takes no card from anyone, so neither a pinned
+    nor an unpinned GPU waiter reserves capacity against it; a later GPU job
+    that could use the waiter's card still keeps its place in line."""
     cfg = _cfg(tmp_path)
+    cfg.queue.reserve_free_per_node = 1
+    # n2's one free card is the node reserve: an unpinned job cannot take it,
+    # a job pinned to n2 could - which is what the FIFO then has to hold back.
     resources = [
         {"node": "n1", "gpus": [{"free": False}, {"free": False}], "error": None},
+        {"node": "n2", "gpus": [{"free": True}], "error": None},
     ]
-    waiter = _entry("gpu-waiter", 1, gpus_requested=1)
-    cpu_job = _entry("cpu-job", 2, gpus_requested=0)
+    unpinned_waiter = _entry("gpu-waiter", 1, gpus_requested=1)
+    pinned_waiter = _entry("pinned-waiter", 2, gpus_requested=1, pin_node="n1")
+    cpu_job = _entry("cpu-job", 3, gpus_requested=0, pin_node="n2")
+    later_gpu = _entry("later-gpu", 4, gpus_requested=1, pin_node="n2")
 
     snapshot = scheduler_snapshot(
         cfg,
-        [waiter, cpu_job],
+        [unpinned_waiter, pinned_waiter, cpu_job, later_gpu],
         resources=resources,
         agent_alive=True,
         agent_heartbeat_stale=False,
     )
     by_id = {row["job_id"]: row for row in snapshot["queue"]}
     assert by_id["gpu-waiter"]["state"] == "waiting_capacity"
-    assert by_id["cpu-job"]["state"] == "waiting_fifo"
-    assert "gpu-waiter" in by_id["cpu-job"]["reason"]
+    assert by_id["cpu-job"]["state"] == "runnable"
+    assert by_id["cpu-job"]["selected_node"] == "n2"
+    assert by_id["later-gpu"]["state"] == "waiting_fifo"
+    assert "gpu-waiter" in by_id["later-gpu"]["reason"]
+
+    for candidate in (cpu_job, later_gpu):
+        decision = admission_decision(
+            cfg,
+            candidate,
+            [unpinned_waiter, pinned_waiter, cpu_job, later_gpu],
+            candidate_node="n2",
+        )
+        assert decision.allowed is (candidate is cpu_job), candidate.job_id
+    assert (
+        admission_decision(
+            cfg,
+            later_gpu,
+            [unpinned_waiter, pinned_waiter, cpu_job, later_gpu],
+            candidate_node="n2",
+        ).reason
+        == "FIFO capacity is reserved for earlier job gpu-waiter"
+    )
+
+
+def test_admission_never_reserves_capacity_for_an_older_cpu_job(tmp_path):
+    """An older 0-GPU job waits on nothing a card could satisfy, so it is not a
+    FIFO owner either: a GPU job behind it is admitted on its own merits."""
+    cfg = _cfg(tmp_path)
+    older_cpu = _entry("older-cpu", 1, gpus_requested=0)
+    gpu_job = _entry("gpu-job", 2, gpus_requested=1, pin_node="n1")
+
+    decision = admission_decision(
+        cfg, gpu_job, [older_cpu, gpu_job], candidate_node="n1"
+    )
+
+    assert decision.allowed is True
 
 
 def test_disjoint_pin_stays_runnable_behind_a_different_busy_pin(tmp_path):

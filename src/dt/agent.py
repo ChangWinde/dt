@@ -1042,19 +1042,28 @@ def _process_once_with_snapshot(
     running = quota_occupancy(cfg, entries=entries, damage=damage)
     results: list[tuple[str, str]] = []
     busy_pins: set[str] = set()
+    # An unpinned GPU job waiting for a card could use a card on any node, so
+    # every later GPU job overlaps it and keeps its FIFO place untried. CPU
+    # work takes no card from anyone and is still attempted (field report: a
+    # `-g 0 --node HEAD` job sat behind GPU jobs waiting for another node).
+    unpinned_gpu_wait = False
     for entry in queue:
         cap = cfg.queue.max_my_jobs
         entry_owns_slot = occupies_quota(entry)
         if cap is not None and running - int(entry_owns_slot) >= cap:
             results.append((entry.job_id, "capped"))
             break
-        if busy_pins and entry.gpus_requested > 0:
-            if entry.pin_node is None:
-                # An unpinned GPU job could consume capacity on every busy
-                # pin, so it overlaps the earlier waiter and restores the
-                # normal FIFO stop.
+        if entry.gpus_requested > 0:
+            if unpinned_gpu_wait:
                 results.append((entry.job_id, "busy"))
-                break
+                continue
+            if busy_pins and entry.pin_node is None:
+                # An unpinned GPU job could consume capacity on every busy
+                # pin, so it overlaps the earlier pinned waiters; from here on
+                # only CPU work is attempted.
+                results.append((entry.job_id, "busy"))
+                unpinned_gpu_wait = True
+                continue
             if entry.pin_node in busy_pins:
                 # This job competes for the same capacity as an earlier pinned
                 # waiter. Keep its FIFO position while still reaching jobs
@@ -1125,10 +1134,12 @@ def _process_once_with_snapshot(
                 log(f"{entry.job_id} waiting ({waiting_detail}); trying jobs behind it")
             if blocked_log_state is not None:
                 blocked_log_state[entry.job_id] = waiting_detail
-        elif outcome == "busy":
+        elif outcome == "busy" and entry.gpus_requested > 0:
+            # A busy CPU job reserves nothing: no card would satisfy it.
             if entry.pin_node is None:
-                break
-            busy_pins.add(entry.pin_node)
+                unpinned_gpu_wait = True
+            else:
+                busy_pins.add(entry.pin_node)
     queued_ids = {entry.job_id for entry in queue}
     for state in (blocked_log_state, blocked_backoff):
         if state is None:

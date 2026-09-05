@@ -103,6 +103,10 @@ def launch(
         "DT_JOB_LOG_MAX_BYTES": str(cfg.job_logs.max_file_mib * 1024 * 1024),
         "DT_JOB_LOG_KEEP_FILES": str(cfg.job_logs.keep_files),
     }
+    if cfg.gpu_resident_processes:
+        # The launcher's own free-card test must agree with the head's probe;
+        # otherwise a card the head counts free bounces every launch as busy.
+        envs["DT_GPU_RESIDENT_PROCESSES"] = ",".join(cfg.gpu_resident_processes)
     if spec.project:
         envs["DT_ARTIFACT_ROOT"] = _root.artifact_root_rel(spec.project, cfg, node)
     if spec.artifact_manifest:

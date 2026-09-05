@@ -1011,13 +1011,15 @@ def _submission_meta(
 
 def _probe_pinned_node(cfg: HeadConfig, pinned: Node) -> NodeStatus:
     """Probe one pinned node, honouring the role layout's lease root."""
+    residents = _root.resident_probe_options(cfg)
     if cfg.layout == ROLE_LAYOUT:
         return _root.probe_node(
             pinned,
             cfg.mem_threshold_mib,
             lease_root=cfg.lease_root_for(pinned),
+            **residents,
         )
-    return _root.probe_node(pinned, cfg.mem_threshold_mib)
+    return _root.probe_node(pinned, cfg.mem_threshold_mib, **residents)
 
 
 def _probe_for_submission(

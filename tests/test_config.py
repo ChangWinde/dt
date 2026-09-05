@@ -395,6 +395,15 @@ def test_config_collections_have_explicit_resource_bounds(
                 "snapshot_excludes": ["a", "b"],
             },
         ),
+        (
+            "MAX_GPU_RESIDENT_PROCESSES",
+            "gpu_resident_processes",
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "gpu_resident_processes": ["rustdesk", "Xorg"],
+            },
+        ),
     ],
 )
 def test_config_nested_lists_have_explicit_resource_bounds(
@@ -557,11 +566,36 @@ def test_malformed_config_shapes_raise_config_error(payload):
         {"snapshot_excludes": ["cache\x00escape"]},
         {"snapshot_excludes": ["cache\nother"]},
         {"snapshot_excludes": ["x" * 4097]},
+        {"gpu_resident_processes": "rustdesk"},
+        {"gpu_resident_processes": [""]},
+        {"gpu_resident_processes": ["rust desk"]},
+        {"gpu_resident_processes": ["rustdesk,Xorg"]},
+        {"gpu_resident_processes": ["/usr/share/rustdesk/rustdesk"]},
+        {"gpu_resident_processes": ["x" * 65]},
     ],
 )
 def test_head_config_rejects_wrong_nested_types(field):
     with pytest.raises(ConfigError):
         parse({"center": "c", "nodes": ["n1"], **field})
+
+
+def test_head_config_keeps_resident_gpu_process_names_as_a_deduplicated_list():
+    """Field observation: a remote-desktop encoder held a CUDA context on a
+    workstation head's only card, so the card never counted as free. The
+    operator names it once; the list is what the probe and launcher share."""
+    cfg = parse(
+        {
+            "center": "c",
+            "nodes": ["n1"],
+            "gpu_resident_processes": ["rustdesk", " Xorg ", "rustdesk"],
+        }
+    )
+    assert isinstance(cfg, HeadConfig)
+    assert cfg.gpu_resident_processes == ["rustdesk", "Xorg"]
+
+    default = parse({"center": "c", "nodes": ["n1"]})
+    assert isinstance(default, HeadConfig)
+    assert default.gpu_resident_processes == []
 
 
 @pytest.mark.parametrize(

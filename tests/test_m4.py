@@ -84,17 +84,21 @@ def test_blocked_head_does_not_starve_queue(tmp_path, monkeypatch):
     assert outcomes == [("stuck", "blocked"), ("ready", "started")]
 
 
-def test_busy_head_stops_the_walk(tmp_path, monkeypatch):
+def test_busy_head_holds_later_gpu_work_without_trying_it(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     save(cfg, _entry("big", "queued", created_at=1.0))
     save(cfg, _entry("small", "queued", created_at=2.0))
+    dispatched = []
 
     def fake_dispatch(cfg_, entry, log):
+        dispatched.append(entry.job_id)
         return "busy", None
 
     monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
     outcomes = process_once(cfg, lambda m: None)
-    assert outcomes == [("big", "busy")]  # strict FIFO for capacity
+    # strict FIFO for capacity: the later GPU job keeps its place untried
+    assert outcomes == [("big", "busy"), ("small", "busy")]
+    assert dispatched == ["big"]
 
 
 def test_busy_pinned_head_does_not_block_a_disjoint_pin(tmp_path, monkeypatch):
@@ -193,7 +197,9 @@ def test_busy_pin_stops_at_later_unpinned_gpu_work(tmp_path, monkeypatch):
 
     monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
     outcomes = process_once(cfg, lambda m: None)
-    assert outcomes == [("local", "busy"), ("anywhere", "busy")]
+    # "anywhere" could use n1's cards, so it and every GPU job behind it keep
+    # their FIFO places; none of them is tried this pass.
+    assert outcomes == [("local", "busy"), ("anywhere", "busy"), ("remote", "busy")]
     assert dispatched == ["local"]
 
 
@@ -231,6 +237,42 @@ def test_busy_pin_does_not_hold_cpu_only_work_on_the_same_node(
     monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
     outcomes = process_once(cfg, lambda m: None)
     assert outcomes == [("gpu", "busy"), ("cpu", "started")]
+
+
+def test_unpinned_busy_gpu_waiter_holds_gpu_work_but_not_cpu_work(
+    tmp_path,
+    monkeypatch,
+):
+    """Field report: a `-g 0 --node star-0` job sat queued behind GPU jobs
+    waiting for another node's cards. The pass used to stop dead at an
+    unpinned GPU waiter; now every later GPU job keeps its FIFO place without
+    a dispatch attempt, while CPU work - which takes no card - is tried."""
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("anywhere", "queued", created_at=1.0, gpus_requested=1))
+    save(
+        cfg,
+        _entry("pinned-gpu", "queued", created_at=2.0, pin_node="n2", gpus_requested=1),
+    )
+    save(cfg, _entry("cpu", "queued", created_at=3.0, pin_node="n1", gpus_requested=0))
+    save(cfg, _entry("later-gpu", "queued", created_at=4.0, gpus_requested=2))
+    dispatched = []
+
+    def fake_dispatch(cfg_, entry, log):
+        dispatched.append(entry.job_id)
+        if entry.gpus_requested:
+            return "busy", None
+        return "started", "n1"
+
+    monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
+    outcomes = process_once(cfg, lambda m: None)
+
+    assert outcomes == [
+        ("anywhere", "busy"),
+        ("pinned-gpu", "busy"),
+        ("cpu", "started"),
+        ("later-gpu", "busy"),
+    ]
+    assert dispatched == ["anywhere", "cpu"]
 
 
 def test_started_notifies_webhook(tmp_path, monkeypatch):

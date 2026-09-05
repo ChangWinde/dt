@@ -66,6 +66,7 @@ from ..private_state import PrivateStateError, read_bounded_regular
 from ..probe import (
     probe_center as probe_center,
     probe_node as probe_node,
+    resident_probe_options as resident_probe_options,
     status_as_dict as status_as_dict,
 )
 from ..redaction import redact_home_path
@@ -2524,14 +2525,16 @@ def _job_resources(cfg: HeadConfig, entry: jobs_mod.JobEntry) -> JsonDict | None
     node = next((node for node in cfg.nodes if node.name == entry.node), None)
     if node is None:
         return {"error": f"node {entry.node!r} is no longer configured"}
+    residents = resident_probe_options(cfg)
     status = (
         probe_node(
             node,
             cfg.mem_threshold_mib,
             lease_root=cfg.lease_root_for(node),
+            **residents,
         )
         if cfg.layout == ROLE_LAYOUT
-        else probe_node(node, cfg.mem_threshold_mib)
+        else probe_node(node, cfg.mem_threshold_mib, **residents)
     )
     if status.error:
         return {"error": status.error}

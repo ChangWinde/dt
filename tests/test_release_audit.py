@@ -190,3 +190,18 @@ def test_changelog_has_no_internal_deployment_references():
     assert match is None, (
         f"internal deployment reference in CHANGELOG.md: {match.group()!r}"
     )
+
+
+def test_shipped_sources_have_no_internal_deployment_references():
+    """Every file under src/ ships in the sdist too, comments included; a
+    field-report host name in a docstring is only caught by CI's package
+    build unless this test catches it first."""
+    root = Path(__file__).parents[1] / "src"
+    offenders = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        match = audit_release.INTERNAL_PATTERN.search(path.read_bytes())
+        if match is not None:
+            offenders.append(f"{path.relative_to(root.parent)}: {match.group()!r}")
+    assert offenders == []

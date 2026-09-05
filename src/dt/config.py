@@ -37,6 +37,11 @@ MAX_PROJECT_EXTRAS = 64
 MAX_SETUP_INPUTS = 256
 MAX_SNAPSHOT_EXCLUDES = 256
 MAX_SNAPSHOT_EXCLUDE_BYTES = 4096
+MAX_GPU_RESIDENT_PROCESSES = 32
+# `ps -o comm=` names: the executable's basename, which the kernel truncates to
+# 15 bytes. The value travels as a comma list in a launcher environment
+# variable and as CSV fields in the probe, so it must stay a plain token.
+_GPU_RESIDENT_PROCESS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 MAX_SSH_DESTINATION_LENGTH = 512
 MAX_QUEUE_POLL_S = 24 * 3600
 MAX_QUEUE_ACTIVE_POLL_S = 3600.0
@@ -270,6 +275,10 @@ class HeadConfig:
     )
     mem_threshold_mib: int = 500
     disk_min_gib: int = 10
+    # Compute processes (by `ps -o comm=` name) that live on a card without
+    # doing the job's work - a remote-desktop encoder, a display server with a
+    # CUDA context. Their presence and memory do not make the card busy.
+    gpu_resident_processes: list[str] = field(default_factory=list)
     queue: QueueCfg = field(default_factory=QueueCfg)
     operations: OperationsCfg = field(default_factory=OperationsCfg)
     job_logs: JobLogsCfg = field(default_factory=JobLogsCfg)
@@ -497,6 +506,33 @@ def _snapshot_exclude(value: object) -> str:
     if any(ord(character) < 0x20 or ord(character) == 0x7F for character in pattern):
         raise ConfigError("`snapshot_excludes[]` must not contain control characters")
     return pattern
+
+
+def _gpu_resident_process(value: object) -> str:
+    """Validate one resident process name as a plain `ps -o comm=` token."""
+    name = _nonempty_string(value, "gpu_resident_processes[]")
+    if _GPU_RESIDENT_PROCESS_RE.fullmatch(name) is None:
+        raise ConfigError(
+            f"`gpu_resident_processes[]` {name!r} is not a process name: use the "
+            "executable's basename as `ps -o comm=` prints it (letters, digits, "
+            "and . _ + -)"
+        )
+    return name
+
+
+def _parse_gpu_resident_processes(data: dict[str, Any]) -> list[str]:
+    raw = data.get("gpu_resident_processes")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError("`gpu_resident_processes` must be a list of process names")
+    _require_item_limit(len(raw), "gpu_resident_processes", MAX_GPU_RESIDENT_PROCESSES)
+    names: list[str] = []
+    for item in raw:
+        name = _gpu_resident_process(item)
+        if name not in names:
+            names.append(name)
+    return names
 
 
 def _require_rooted_path(text: str, label: str) -> None:
@@ -1233,6 +1269,7 @@ class _HeadLimits:
     disk_min_gib: int
     snapshot_warn_gib: float
     snapshot_excludes: list[str]
+    gpu_resident_processes: list[str]
     webhook: str | None
     proxy: str | None
 
@@ -1282,6 +1319,7 @@ def _parse_head_limits(data: dict[str, Any]) -> _HeadLimits:
         disk_min_gib=disk_min_gib,
         snapshot_warn_gib=snapshot_warn_gib,
         snapshot_excludes=excludes,
+        gpu_resident_processes=_parse_gpu_resident_processes(data),
         webhook=webhook,
         proxy=proxy,
     )
@@ -1342,6 +1380,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 "paths",
                 "mem_threshold_mib",
                 "disk_min_gib",
+                "gpu_resident_processes",
                 "queue",
                 "operations",
                 "job_logs",
@@ -1380,6 +1419,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             results_root=head_paths.results_root,
             mem_threshold_mib=limits.mem_threshold_mib,
             disk_min_gib=limits.disk_min_gib,
+            gpu_resident_processes=limits.gpu_resident_processes,
             queue=queue,
             operations=_parse_operations(data),
             job_logs=_parse_job_logs(data),

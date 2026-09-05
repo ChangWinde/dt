@@ -56,6 +56,7 @@ from ..probe import (
     NodeStatus,
     probe_center as probe_center,
     probe_node as probe_node,
+    resident_probe_options as resident_probe_options,
 )
 from ..private_state import (
     PrivateStateError,
