@@ -5,14 +5,18 @@ promise and agents can pipe --json safely.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 import os
 import sys
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any, TypeAlias
 
-from rich.console import Console
+from rich.console import Console, ConsoleOptions, RenderableType
 from rich.markup import escape
+from rich.segment import Segment
 from rich.table import Table
 
 from .jsonvalue import as_int, as_number
@@ -25,14 +29,75 @@ from .jobs import CANCEL_UNVERIFIED_PREFIX
 UNBOUNDED_PIPE_WIDTH = 4096
 
 
-def _console_width(stream: object) -> int | None:
-    if os.environ.get("COLUMNS") or getattr(stream, "isatty", lambda: False)():
-        return None
-    return UNBOUNDED_PIPE_WIDTH
+def _console_geometry(stream: object) -> tuple[int | None, int | None]:
+    """Rich ``(width, height)``: measured on a terminal, explicit in a pipe.
+
+    Rich honours an explicit width under TERM=dumb (agent tool shells, Emacs,
+    some CI) only when the height is explicit as well; otherwise it silently
+    falls back to 80 columns and ellipsizes again. Height only matters to
+    full-screen renderables, which piped output never uses.
+    """
+    if getattr(stream, "isatty", lambda: False)():
+        return None, None
+    columns = os.environ.get("COLUMNS", "")
+    width = int(columns) if columns.isdigit() and int(columns) > 0 else None
+    return width or UNBOUNDED_PIPE_WIDTH, 25
 
 
-out = Console(width=_console_width(sys.stdout))
-err = Console(stderr=True, width=_console_width(sys.stderr))
+def content_sized(table: Table) -> Table:
+    """A copy of ``table`` that is exactly as wide as its cells.
+
+    ``expand`` spreads the columns over the console width and ``width`` /
+    ``max_width`` caps cut cells to a terminal budget. Neither makes sense in
+    a pipe: the first pads every line to UNBOUNDED_PIPE_WIDTH spaces, the
+    second ellipsizes the identities and reasons a script or agent needs.
+    """
+    sized = copy.copy(table)
+    sized.expand = False
+    sized.columns = [
+        dataclasses.replace(column, width=None, max_width=None)
+        for column in table.columns
+    ]
+    return sized
+
+
+class HumanConsole(Console):
+    """Rich console whose piped output is content-sized, not terminal-shaped."""
+
+    def render(
+        self,
+        renderable: RenderableType,
+        options: ConsoleOptions | None = None,
+    ) -> Iterable[Segment]:
+        if (
+            isinstance(renderable, Table)
+            and (options or self.options).max_width >= UNBOUNDED_PIPE_WIDTH
+        ):
+            renderable = content_sized(renderable)
+        return super().render(renderable, options)
+
+
+def _force_terminal() -> bool | None:
+    # Rich reads any non-empty FORCE_COLOR, "0" included, as "emit styles";
+    # the wider convention (supports-color, chalk, agent tool shells that
+    # export FORCE_COLOR=0) is that 0/false disables them. Piped output
+    # with SGR codes inside is unusable to the scripts that read it.
+    value = os.environ.get("FORCE_COLOR", "").strip().lower()
+    return False if value in {"0", "false", "no", "off"} else None
+
+
+def _human_console(stream: object, *, stderr: bool = False) -> HumanConsole:
+    width, height = _console_geometry(stream)
+    return HumanConsole(
+        stderr=stderr,
+        width=width,
+        height=height,
+        force_terminal=_force_terminal(),
+    )
+
+
+out = _human_console(sys.stdout)
+err = _human_console(sys.stderr, stderr=True)
 
 STATUS_STYLE = {
     "queued": "bold magenta",
@@ -483,13 +548,14 @@ def _compact_queue_reason(reason: str) -> str:
         if text.startswith(prefix):
             text = text[len(prefix) :]
             break
-    marker = "node-unfit:"
-    if marker in text:
-        # "psibot-yw: node-unfit: [launcher] node-unfit: GPU runtime requires
-        # loginctl Linger=yes" -> "psibot-yw: GPU runtime requires ..."
-        head, _sep, tail = text.partition(marker)
-        tail = tail.rsplit(marker, 1)[-1].strip()
-        text = f"{head.strip()} {tail}".strip() if tail else text
+    for marker in ("node-unfit:", "artifact-unverified:"):
+        if marker in text:
+            # "psibot-yw: node-unfit: [launcher] node-unfit: GPU runtime requires
+            # loginctl Linger=yes" -> "psibot-yw: GPU runtime requires ..."
+            head, _sep, tail = text.partition(marker)
+            tail = tail.rsplit(marker, 1)[-1].strip()
+            text = f"{head.strip()} {tail}".strip() if tail else text
+            break
     return text
 
 
