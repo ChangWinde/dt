@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.7 — 2026-09-05
+
 ### Added
 
 - `gpu_resident_processes` (head config): compute processes, named as
