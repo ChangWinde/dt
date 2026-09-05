@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.11 — 2026-09-06
+
 ### Added
 
 - `docs/agent-playbook.md`: how a program or an AI agent drives dt — discover
