@@ -96,7 +96,15 @@ backoff — 5 s doubling to at most 300 s — so a permanently blocked entry doe
 not re-probe the fleet every tick. The moment any running job ends, the agent
 drops every pending backoff and retries the blocked entries on the next tick,
 so a node that just freed up is never left idle behind a five-minute wait.
-`dt ps` shows the blocked reason in its issue column.
+`dt ps` shows the blocked reason in its issue column. A pinned job whose node
+is off the network is skipped on the same backoff, logged as "waits for an
+unreachable node" and shown as `waiting: NODE unreachable`.
+
+Unpinned GPU work is placed on the node with the most idle cards that fit.
+Unpinned CPU work (`-g 0`) takes no card, so it is placed by reach instead: the
+local node first, then remote nodes by `transfer_cost`, ties broken by host
+load and then by fewest idle cards, so a GPU host stays available for GPU work
+and the head's own CPU jobs do not pay for a code transfer.
 
 
 ```bash

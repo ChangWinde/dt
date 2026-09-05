@@ -124,6 +124,12 @@ def compact(
         for message in errors:
             # Only the jobs behind that archive are skipped; the sweep went on.
             err.print(f"[red]recovery archive skipped:[/red] {escape(str(message))}")
+        rejected = payload["policy_rejected_snapshots"]
+        assert isinstance(rejected, list)
+        for message in rejected:
+            err.print(
+                f"[yellow]recovery archive skipped:[/yellow] {escape(str(message))}"
+            )
         rows = payload["rows"]
         assert isinstance(rows, list)
         for row in rows[:20]:

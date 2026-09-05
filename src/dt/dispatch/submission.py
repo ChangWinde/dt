@@ -1357,7 +1357,9 @@ def _submit_prepared_once(
     # conservatively refuse the in-flight launch; there is no registry-less
     # process window and no second placement authority.
     pending = enqueue("capacity available", reason=None)
-    outcome, _detail = _root.dispatch_queued(cfg, pending, log)
+    # The center was probed moments ago to decide this very enqueue; hand that
+    # probe over instead of paying for a second fleet-wide one.
+    outcome, _detail = _root.dispatch_queued(cfg, pending, log, statuses=statuses)
     if pending.status in {"running", "finished"}:
         return pending
     if pending.status == "failed":
