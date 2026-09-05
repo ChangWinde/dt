@@ -84,13 +84,17 @@ def head_bwlimit_kbps(
 ) -> int | None:
     """Effective head-side transfer budget for one counterpart node.
 
-    An explicit CLI value wins; otherwise the node's site default applies.
-    None means unthrottled, exactly today's behavior.
+    An explicit CLI value wins; then the node's site default; then the head's
+    own uplink budget (`uplink_kbps`), which exists because a head on a home
+    line shares one thin uplink between every transfer, the remote-desktop
+    session, and SSH itself. None means unthrottled.
     """
     if override is not None:
         return override
     site = site_of_node(cfg, node_name)
-    return site.bwlimit_kbps if site is not None else None
+    if site is not None and site.bwlimit_kbps is not None:
+        return site.bwlimit_kbps
+    return cfg.uplink_kbps
 
 
 def config_path() -> Path:
@@ -279,6 +283,10 @@ class HeadConfig:
     # doing the job's work - a remote-desktop encoder, a display server with a
     # CUDA context. Their presence and memory do not make the card busy.
     gpu_resident_processes: list[str] = field(default_factory=list)
+    # Head-side upload budget (KiB/s) for every transfer leg that leaves this
+    # head unless a site or the command names its own: a workstation head on a
+    # home line saturates its uplink with one rsync and stalls SSH itself.
+    uplink_kbps: int | None = None
     queue: QueueCfg = field(default_factory=QueueCfg)
     operations: OperationsCfg = field(default_factory=OperationsCfg)
     job_logs: JobLogsCfg = field(default_factory=JobLogsCfg)
@@ -1270,8 +1278,19 @@ class _HeadLimits:
     snapshot_warn_gib: float
     snapshot_excludes: list[str]
     gpu_resident_processes: list[str]
+    uplink_kbps: int | None
     webhook: str | None
     proxy: str | None
+
+
+def _parse_uplink_kbps(data: dict[str, Any]) -> int | None:
+    raw = data.get("uplink_kbps")
+    if raw is None:
+        return None
+    value = _integer(raw, "uplink_kbps")
+    if not 1 <= value <= 10**9:
+        raise ConfigError("`uplink_kbps` must be between 1 and 10^9 (KiB/s)")
+    return value
 
 
 def _parse_head_limits(data: dict[str, Any]) -> _HeadLimits:
@@ -1320,6 +1339,7 @@ def _parse_head_limits(data: dict[str, Any]) -> _HeadLimits:
         snapshot_warn_gib=snapshot_warn_gib,
         snapshot_excludes=excludes,
         gpu_resident_processes=_parse_gpu_resident_processes(data),
+        uplink_kbps=_parse_uplink_kbps(data),
         webhook=webhook,
         proxy=proxy,
     )
@@ -1381,6 +1401,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
                 "mem_threshold_mib",
                 "disk_min_gib",
                 "gpu_resident_processes",
+                "uplink_kbps",
                 "queue",
                 "operations",
                 "job_logs",
@@ -1420,6 +1441,7 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
             mem_threshold_mib=limits.mem_threshold_mib,
             disk_min_gib=limits.disk_min_gib,
             gpu_resident_processes=limits.gpu_resident_processes,
+            uplink_kbps=limits.uplink_kbps,
             queue=queue,
             operations=_parse_operations(data),
             job_logs=_parse_job_logs(data),

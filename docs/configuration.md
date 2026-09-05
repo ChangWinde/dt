@@ -256,15 +256,35 @@ input can produce incorrect environment reuse; remove `setup_inputs` to return
 to whole-snapshot isolation if the dependency boundary is uncertain.
 
 Whole-snapshot isolation has a cost worth knowing before choosing it: every
-edited snapshot gets its own environment, built under the node's environment
-lock, so launches of that project on one node build and wait for each other
-for the length of a full `uv sync`. `dt doctor` reports such projects as
-`env_reuse: per-snapshot: NAME, ...` (a warning, exit code unchanged). A hook
-that only runs `uv sync` can simply be removed — `dt` already syncs every
-`uv.lock` project — and a hook that installs local packages should list what
-it reads (`pyproject.toml`, `uv.lock`, the package directories).
+edited snapshot gets its own environment, built for the length of a full
+`uv sync` and setup hook before its first job starts. `dt doctor` reports such
+projects as `env_reuse: per-snapshot: NAME, ...` (a warning, exit code
+unchanged). A hook that only runs `uv sync` can simply be removed — `dt`
+already syncs every `uv.lock` project — and a hook that installs local
+packages should list what it reads (`pyproject.toml`, `uv.lock`, the package
+directories).
 
 Absolute paths and `..` are rejected in `setup_inputs`.
+
+#### Environments on the node
+
+Each environment lives at `envs/<key>` under the worker root and is built
+once. The launcher syncs and runs the setup hook under the environment's lock
+held exclusively, then stamps the environment with the surface it satisfies
+(the key already seals `uv.lock`, extras and the hook; the stamp adds the
+project table in `pyproject.toml`, so a new console script still reaches the
+environment). Every later launch for that surface enters the environment with
+the lock held shared — the same lease each running job's wrapper holds for its
+lifetime so `dt clean --envs` cannot remove a venv in use — and runs no sync at
+all. Jobs of one project therefore start concurrently on a multi-card node;
+their imports are pinned to their own snapshot (`code/` and `code/src` lead
+`PYTHONPATH`), never to whichever job synced last.
+
+When a build is needed while jobs are running in the environment (the first
+launch after an upgrade, or a changed project table under the same lock), the
+launcher waits `DT_ENV_BUILD_WAIT_S` (90 s) for the lock and then reports
+`busy` with the reason, so the dispatcher places other work and retries the
+job instead of waiting inside the launch for the running job to finish.
 
 ### Managed paths
 
@@ -350,6 +370,7 @@ external collector.
 |---|---:|---|
 | `mem_threshold_mib` | 500 | GPU memory threshold used when classifying capacity |
 | `gpu_resident_processes` | empty | Compute processes, by `ps -o comm=` name, that may live on a card without making it busy |
+| `uplink_kbps` | unthrottled | Head-wide upload budget (KiB/s) for every transfer leg that leaves this head — code snapshots, artifact publication, pulls; a site's `bwlimit_kbps` or a command's `--bwlimit` wins where present |
 | `disk_min_gib` | 10 | Minimum free space required for every remote start |
 | `snapshot_warn_gib` | 2 | Warn when a source snapshot exceeds this transfer size |
 | `snapshot_excludes` | empty | Additional rsync-style source exclusions |

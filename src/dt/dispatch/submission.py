@@ -16,7 +16,13 @@ import time
 from .. import dispatch as _root
 from .. import git_provenance as git_provenance_mod
 from .. import submission_intent as intent_mod
-from ..config import ConfigError, HeadConfig, Node, revalidate_project_root
+from ..config import (
+    ConfigError,
+    HeadConfig,
+    Node,
+    head_bwlimit_kbps,
+    revalidate_project_root,
+)
 from ..jobs import (
     JobEntry,
     RegistryError,
@@ -224,6 +230,7 @@ def _materialize_predecessor_outputs(
         pushed = _root.rsync(
             f"{staging}/",
             rsync_destination(node.name, node.local, destination, directory=True),
+            bwlimit_kbps=head_bwlimit_kbps(cfg, node.name, None),
             delete=True,
             timeout=BULK_TRANSFER_TIMEOUT_S,
             retries=2,
