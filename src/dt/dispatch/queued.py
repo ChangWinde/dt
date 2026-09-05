@@ -1086,6 +1086,38 @@ class _QueuedStage:
     spec: RunSpec
 
 
+def _refresh_queued_payload(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    log: Callable[[str], None],
+) -> Path | None:
+    """Launch a queued job with the runtime payload of the head dispatching it.
+
+    The payload (launcher, wrapper, telemetry) is dt's own runtime, not the
+    job's code. A job queued before an upgrade otherwise kept the launcher it
+    was submitted with for as long as it waited, so a launcher fix never
+    reached the backlog and the dispatcher ran a protocol the node side no
+    longer matched. The row records the payload that actually launches; the
+    staged bundle re-derives its identity documents from the row.
+    """
+    runtime_files = _root._runtime_payload_files()
+    current = _root.payload_sha256(runtime_files)
+    if current == entry.payload_sha256:
+        return None
+    payload_dir = _root._stored_payload_dir(cfg, current, runtime_files)
+    previous = entry.payload_sha256 or "-"
+    entry.payload_sha256 = current
+    committed = _root._commit_queued_transition(cfg, entry)
+    if committed is not None:
+        entry.__dict__.update(committed.__dict__)
+        raise _StageInterrupted()
+    log(
+        f"{entry.job_id} · runtime payload {previous[:12]} queued with an "
+        f"earlier dt; launching with {current[:12]}"
+    )
+    return payload_dir
+
+
 def _prepare_queued_stage(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -1145,6 +1177,10 @@ def _prepare_queued_stage(
             if current is not None:
                 entry.__dict__.update(current.__dict__)
                 raise _StageInterrupted()
+    if entry.storage_layout == ROLE_LAYOUT and entry.payload_sha256:
+        refreshed = _refresh_queued_payload(cfg, entry, log)
+        if refreshed is not None:
+            staged_payload_dir = refreshed
 
     spec = _queued_run_spec(entry)
     effective_disk_floor = max(cfg.disk_min_gib, spec.require_disk_gib or 0)

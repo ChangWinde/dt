@@ -1692,6 +1692,7 @@ from .queued import (  # noqa: E402
     _queued_node as _queued_node,
     _queued_run_spec as _queued_run_spec,
     _recover_claimed_dispatch as _recover_claimed_dispatch,
+    _refresh_queued_payload as _refresh_queued_payload,
     _request_remote_proof_command as _request_remote_proof_command,
     _sync_queued_job_to_node as _sync_queued_job_to_node,
     dispatch_owner_identity as dispatch_owner_identity,

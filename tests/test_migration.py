@@ -790,6 +790,63 @@ def test_role_queue_bundle_leaves_an_intact_bundle_untouched(tmp_path):
     assert logs == []
 
 
+def test_queued_job_launches_with_the_dispatching_heads_runtime_payload(tmp_path):
+    """A job queued before an upgrade carried the launcher it was submitted
+    with for as long as it waited, so a launcher fix never reached the backlog
+    (86 queued jobs on one head kept serializing behind the environment lock
+    after the fix shipped). The dispatcher refreshes the payload identity at
+    stage time; tampering with the staged payload is still refused first."""
+    from dt import dispatch
+    from dt.jobs import save
+
+    cfg, entry, spec, staged, stored = _role_queue_fixture(tmp_path)
+    current_digest = entry.payload_sha256
+    older_runtime = {
+        name: content.replace("#!/usr/bin/env bash", "#!/usr/bin/env bash\n# older", 1)
+        if name.endswith(".sh")
+        else content
+        for name, content in _runtime_payload_files().items()
+    }
+    older_digest = payload_sha256(older_runtime)
+    assert older_digest != current_digest
+    _stored_payload_dir(cfg, older_digest, older_runtime)
+    entry.payload_sha256 = older_digest
+    reference = staged / ".dt" / "source.json"
+    reference.write_text(
+        json.dumps(
+            {
+                "schema_version": "dt_queue_source_v1",
+                "snapshot_sha256": stored.sha256,
+                "payload_sha256": older_digest,
+            }
+        )
+    )
+    save(cfg, entry)
+    logs: list[str] = []
+
+    stage = dispatch._prepare_queued_stage(cfg, entry, logs.append)  # noqa: SLF001
+
+    assert stage.staged_payload_dir == cfg.payloads_dir() / current_digest
+    assert stage.spec.payload_sha256 == current_digest
+    assert entry.payload_sha256 == current_digest
+    persisted = load(cfg, entry.job_id)
+    assert persisted is not None and persisted.payload_sha256 == current_digest
+    assert json.loads(reference.read_text())["payload_sha256"] == current_digest
+    assert (
+        json.loads((staged / ".dt" / "meta.json").read_text())["payload_sha256"]
+        == current_digest
+    )
+    assert any(
+        f"runtime payload {older_digest[:12]} queued with an earlier dt" in line
+        for line in logs
+    )
+
+    # A second pass finds nothing to refresh and leaves the bundle alone.
+    again: list[str] = []
+    dispatch._prepare_queued_stage(cfg, entry, again.append)  # noqa: SLF001
+    assert again == []
+
+
 def test_runtime_payload_store_self_heals_from_attested_source(tmp_path):
     cfg = _cfg(tmp_path)
     runtime = _runtime_payload_files()

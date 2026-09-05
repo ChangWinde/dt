@@ -371,7 +371,20 @@ code snapshots, which no flag can name. A workstation head on a home line
 (a 52 Mbit/s uplink is about 6,500 KiB/s) saturates it with one unthrottled
 rsync and stalls its own SSH and remote desktop; `uplink_kbps: 4500` leaves
 room for them. The budget deliberately never throttles intra-site LAN
-replays — those are the legs gateway staging exists to keep fast.
+replays — those are the legs gateway staging exists to keep fast — nor the
+head's own `local: true` node, whose "transfer" is a disk-to-disk copy.
+
+### Queued jobs and dt upgrades
+
+A queued job launches with the runtime payload (launcher, wrapper, telemetry)
+of the head that dispatches it, not the one it was submitted with. The
+dispatcher refreshes the row's `payload_sha256` at stage time, rebuilds the
+bundle's identity documents from the row, and logs
+`runtime payload <old> queued with an earlier dt; launching with <new>`; the
+node still attests the delivered payload against the recorded digest. A
+launcher fix therefore reaches the whole backlog on the next tick after a
+deploy. Tampering with a staged payload is refused before the refresh, as
+before.
 
 ### Draining a node for maintenance
 

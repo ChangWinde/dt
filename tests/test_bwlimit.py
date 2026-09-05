@@ -109,6 +109,10 @@ def test_head_uplink_budget_backs_every_leg_a_site_does_not_name(tmp_path):
     with_site.uplink_kbps = 5000
     assert head_bwlimit_kbps(with_site, "worker", None) == 4000
     assert head_bwlimit_kbps(with_site, "lone", None) == 5000
+    # The head's own node is a disk-to-disk copy: no uplink, no budget.
+    cfg.nodes.append(Node(name="head", local=True))
+    assert head_bwlimit_kbps(cfg, "head", None) is None
+    assert head_bwlimit_kbps(cfg, "head", 800) == 800
 
     parsed = parse({"center": "c", "nodes": ["a"], "projects": {}, "uplink_kbps": 6000})
     assert isinstance(parsed, HeadConfig) and parsed.uplink_kbps == 6000
