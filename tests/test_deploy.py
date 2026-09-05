@@ -304,7 +304,19 @@ if [[ "\${1:-}" == "agent" ]]; then
         exit 0
     fi
     if [[ "\${2:-}" == "status" && "\${DT_FAKE_AGENT_STATUS_MODE:-}" == "oversized" ]]; then
-        printf '%*s' 70000 '' | tr ' ' x
+        printf '{"alive":false,"pid":null,"pad":"'
+        head -c 17000000 /dev/zero | tr '\\0' x
+        printf '"}\\n'
+        exit 0
+    fi
+    if [[ "\${2:-}" == "status" && "\${DT_FAKE_AGENT_STATUS_MODE:-}" == "long_queue" ]]; then
+        # 200 queued rows: ~200 KiB, past MAX_ARG_STRLEN and the old 64 KiB cap.
+        printf '{"alive":false,"pid":null,"scheduler":{"queue":['
+        for row in \$(seq 1 200); do
+            [[ "\$row" == 1 ]] || printf ','
+            printf '{"job_id":"20260905-1421_dp-sparse1of4-s%04d_c26e35537a985cef","position":%d,"reason":"%s"}' "\$row" "\$row" "\$(printf '%*s' 900 '' | tr ' ' w)"
+        done
+        printf ']}}\\n'
         exit 0
     fi
     if [[ "\${2:-}" == "status" && "\${DT_FAKE_AGENT_RACE:-0}" == "1" ]]; then
@@ -804,6 +816,24 @@ def test_deploy_rejects_invalid_and_oversized_agent_preflight(tmp_path):
     base = remote_home / ".local" / "share" / "disttrainer"
     assert (base / "current").readlink() == Path("releases/0.9.0")
     assert not (base / "releases" / "0.9.1").exists()
+
+
+def test_deploy_accepts_a_status_document_grown_by_a_long_queue(tmp_path):
+    """Field report: with 79 queued jobs `dt agent status --json` was 84 KiB;
+    the 64 KiB cap truncated it into invalid JSON and every deploy to that
+    head was refused as "invalid status contract"."""
+    env, remote_home = _transport(tmp_path)
+    previous = _release(tmp_path, "0.9.0")
+    current = _release(tmp_path, "0.9.1")
+    assert _deploy(env, str(previous), "head").returncode == 0
+    env["DT_FAKE_AGENT_STATUS_MODE"] = "long_queue"
+
+    upgraded = _deploy(env, str(current), "head")
+
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+    assert _installed_version(remote_home) == "dt 0.9.1"
+    base = remote_home / ".local" / "share" / "disttrainer"
+    assert (base / "current").readlink() == Path("releases/0.9.1")
 
 
 def test_deploy_converges_agent_started_between_preflight_and_activation(tmp_path):

@@ -2298,6 +2298,54 @@ def test_agent_status_json_carries_schema_version(tmp_path, monkeypatch):
     assert payload["alive"] is False
 
 
+def test_agent_status_brief_omits_the_per_job_queue(tmp_path, monkeypatch):
+    """Field report: 79 queued jobs made the full document 84 KiB and blocked
+    deploy; routine polling only needs alive, counts, and the next job."""
+    import dt.agent as agent_mod
+
+    cfg = _cfg(tmp_path)
+    queue = [
+        {
+            "job_id": f"20260905-1421_dp-sparse1of4-s{i:04d}_c26e35537a985cef",
+            "position": i,
+            "reason": "waiting: no free capacity " + ("w" * 400),
+        }
+        for i in range(1, 80)
+    ]
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        agent_mod,
+        "status",
+        lambda cfg_: {
+            "alive": True,
+            "queued": 79,
+            "queue_head": queue[0]["job_id"],
+            "running": 4,
+            "scheduler": {
+                "queue_depth": 79,
+                "next_job_id": queue[0]["job_id"],
+                "queue": queue,
+            },
+        },
+    )
+
+    full = json.loads(CliRunner().invoke(cli.app, ["agent", "status", "--json"]).stdout)
+    brief = json.loads(
+        CliRunner().invoke(cli.app, ["agent", "status", "--json", "--brief"]).stdout
+    )
+
+    assert full["scheduler"]["queue"] == queue
+    assert "brief" not in full
+    assert brief["schema_version"] == "dt_agent_status_v1"
+    assert brief["alive"] is True and brief["brief"] is True
+    assert brief["queued"] == 79 and brief["running"] == 4
+    assert brief["scheduler"]["queue"] == []
+    assert brief["scheduler"]["queue_omitted"] == 79
+    assert brief["scheduler"]["next_job_id"] == queue[0]["job_id"]
+    assert brief["queue_head"] == queue[0]["job_id"]
+    assert len(json.dumps(brief)) < 1024 < len(json.dumps(full))
+
+
 def test_watch_documents_no_tails_and_keeps_compact_alias():
     import re
 

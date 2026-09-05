@@ -167,28 +167,49 @@ if [[ -f "$base/active-command" && ! -L "$base/active-command" ]]; then
         active_command="$recorded_command"
     fi
 fi
+# The status document carries one row per queued job, so a long queue makes
+# it large (80 queued jobs: 84 KiB). It travels through a file rather than
+# argv (MAX_ARG_STRLEN is 128 KiB) and is bounded far above any realistic
+# size; a truncated document would only ever be invalid JSON.
+AGENT_STATUS_MAX_BYTES=$((16 * 1024 * 1024))
+
+capture_agent_status() {
+    local command="$1" status_file="$2"
+    local command_dir
+    command_dir="$(dirname "$command")"
+    timeout -k 1 1 env PATH="$command_dir${PATH:+:$PATH}" \
+        "$command" agent status --json >"$status_file" 2>/dev/null
+}
+
 probe_agent_state() {
     local command="$1"
-    local command_dir status_json
-    command_dir="$(dirname "$command")"
-    status_json="$(
-        timeout -k 1 1 env PATH="$command_dir${PATH:+:$PATH}" \
-            "$command" agent status --json 2>/dev/null \
-            | head -c 65537
-    )" || return 1
-    [[ "${#status_json}" -le 65536 ]] || return 1
-    python3 - "$status_json" <<'PY'
+    local status_file state
+    status_file="$(mktemp "${TMPDIR:-/tmp}/dt-agent-status.XXXXXX")" || return 1
+    if capture_agent_status "$command" "$status_file" \
+       && state="$(python3 - "$status_file" "$AGENT_STATUS_MAX_BYTES" <<'PY'
 import json
+import os
 import sys
 
+path, limit = sys.argv[1], int(sys.argv[2])
 try:
-    row = json.loads(sys.argv[1])
-except json.JSONDecodeError:
+    if os.path.getsize(path) > limit:
+        raise SystemExit(1)
+    with open(path, "rb") as stream:
+        row = json.load(stream)
+except (OSError, ValueError):
     raise SystemExit(1)
 if not isinstance(row, dict) or type(row.get("alive")) is not bool:
     raise SystemExit(1)
 print("running" if row["alive"] else "stopped")
 PY
+    )"; then
+        rm -f -- "$status_file"
+        printf '%s\n' "$state"
+        return 0
+    fi
+    rm -f -- "$status_file"
+    return 1
 }
 
 probe_release_authority_capability() {
@@ -436,19 +457,14 @@ start_agent_bounded() {
 
 restart_and_attest_agent() {
     local command="$1"
-    local command_dir
-    command_dir="$(dirname "$command")"
+    local status_file
     stop_agent_bounded "$command" || return 1
     start_agent_bounded "$command" || return 1
+    status_file="$(mktemp "${TMPDIR:-/tmp}/dt-agent-status.XXXXXX")" || return 1
     verified=0
     for _attempt in {1..50}; do
-        if status_json="$(
-                timeout -k 1 1 env PATH="$command_dir${PATH:+:$PATH}" \
-                    "$command" agent status --json 2>/dev/null \
-                    | head -c 65537
-            )" \
-           && [[ "${#status_json}" -le 65536 ]] \
-           && python3 - "$command" "$status_json" <<'PY'
+        if capture_agent_status "$command" "$status_file" \
+           && python3 - "$command" "$status_file" "$AGENT_STATUS_MAX_BYTES" <<'PY'
 import json
 import os
 import pathlib
@@ -456,7 +472,14 @@ import subprocess
 import sys
 
 command = pathlib.Path(sys.argv[1])
-row = json.loads(sys.argv[2])
+path, limit = sys.argv[2], int(sys.argv[3])
+try:
+    if os.path.getsize(path) > limit:
+        raise SystemExit(1)
+    with open(path, "rb") as stream:
+        row = json.load(stream)
+except (OSError, ValueError):
+    raise SystemExit(1)
 if not isinstance(row, dict) or row.get("alive") is not True:
     raise SystemExit(1)
 if "runtime_command_available" in row:
@@ -508,6 +531,7 @@ PY
         fi
         sleep 0.1
     done
+    rm -f -- "$status_file"
     [[ "$verified" == "1" ]]
 }
 
@@ -624,28 +648,49 @@ if [[ -f "$base/active-command" && ! -L "$base/active-command" ]]; then
         active_before="$active"
     fi
 fi
+# The status document carries one row per queued job, so a long queue makes
+# it large (80 queued jobs: 84 KiB). It travels through a file rather than
+# argv (MAX_ARG_STRLEN is 128 KiB) and is bounded far above any realistic
+# size; a truncated document would only ever be invalid JSON.
+AGENT_STATUS_MAX_BYTES=$((16 * 1024 * 1024))
+
+capture_agent_status() {
+    local command="$1" status_file="$2"
+    local command_dir
+    command_dir="$(dirname "$command")"
+    timeout -k 1 1 env PATH="$command_dir${PATH:+:$PATH}" \
+        "$command" agent status --json >"$status_file" 2>/dev/null
+}
+
 probe_agent_state() {
     local command="$1"
-    local command_dir status_json
-    command_dir="$(dirname "$command")"
-    status_json="$(
-        timeout -k 1 1 env PATH="$command_dir${PATH:+:$PATH}" \
-            "$command" agent status --json 2>/dev/null \
-            | head -c 65537
-    )" || return 1
-    [[ "${#status_json}" -le 65536 ]] || return 1
-    python3 - "$status_json" <<'PY'
+    local status_file state
+    status_file="$(mktemp "${TMPDIR:-/tmp}/dt-agent-status.XXXXXX")" || return 1
+    if capture_agent_status "$command" "$status_file" \
+       && state="$(python3 - "$status_file" "$AGENT_STATUS_MAX_BYTES" <<'PY'
 import json
+import os
 import sys
 
+path, limit = sys.argv[1], int(sys.argv[2])
 try:
-    row = json.loads(sys.argv[1])
-except json.JSONDecodeError:
+    if os.path.getsize(path) > limit:
+        raise SystemExit(1)
+    with open(path, "rb") as stream:
+        row = json.load(stream)
+except (OSError, ValueError):
     raise SystemExit(1)
 if not isinstance(row, dict) or type(row.get("alive")) is not bool:
     raise SystemExit(1)
 print("running" if row["alive"] else "stopped")
 PY
+    )"; then
+        rm -f -- "$status_file"
+        printf '%s\n' "$state"
+        return 0
+    fi
+    rm -f -- "$status_file"
+    return 1
 }
 
 probe_release_authority_capability() {
@@ -833,19 +878,14 @@ start_agent_bounded() {
 
 restart_and_attest_agent() {
     local command="$1"
-    local command_dir
-    command_dir="$(dirname "$command")"
+    local status_file
     stop_agent_bounded "$command" || return 1
     start_agent_bounded "$command" || return 1
+    status_file="$(mktemp "${TMPDIR:-/tmp}/dt-agent-status.XXXXXX")" || return 1
     verified=0
     for _attempt in {1..50}; do
-        if status_json="$(
-                timeout -k 1 1 env PATH="$command_dir${PATH:+:$PATH}" \
-                    "$command" agent status --json 2>/dev/null \
-                    | head -c 65537
-            )" \
-           && [[ "${#status_json}" -le 65536 ]] \
-           && python3 - "$command" "$status_json" <<'PY'
+        if capture_agent_status "$command" "$status_file" \
+           && python3 - "$command" "$status_file" "$AGENT_STATUS_MAX_BYTES" <<'PY'
 import json
 import os
 import pathlib
@@ -853,7 +893,14 @@ import subprocess
 import sys
 
 command = pathlib.Path(sys.argv[1])
-row = json.loads(sys.argv[2])
+path, limit = sys.argv[2], int(sys.argv[3])
+try:
+    if os.path.getsize(path) > limit:
+        raise SystemExit(1)
+    with open(path, "rb") as stream:
+        row = json.load(stream)
+except (OSError, ValueError):
+    raise SystemExit(1)
 if not isinstance(row, dict) or row.get("alive") is not True:
     raise SystemExit(1)
 if "runtime_command_available" in row:
@@ -901,6 +948,7 @@ PY
         fi
         sleep 0.1
     done
+    rm -f -- "$status_file"
     [[ "$verified" == "1" ]]
 }
 
