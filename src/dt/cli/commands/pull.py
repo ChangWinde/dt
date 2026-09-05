@@ -30,16 +30,21 @@ from ...private_state import (
 )
 from ...render import err
 from ...sshio import (
+    MAX_CAPTURE_BYTES,
     RSYNC_RETRYABLE_EXIT_CODES,
     RSYNC_UNREACHABLE_EXIT_CODES,
     RemoteError,
+    SSHWorkload,
     diagnostic_excerpt,
 )
 from ...transfers import (
     collection_parts as _collection_parts,
     collection_root as _collection_root,
     ensure_collection_root as _ensure_collection_root,
+    parse_pull_outputs_census as _parse_pull_outputs_census,
+    pull_census_mismatches as _pull_census_mismatches,
     pull_job_record as _pull_job_record,
+    pull_outputs_census_command as _pull_outputs_census_command,
     pull_outputs_probe_bytes as _pull_outputs_probe_bytes,
     pull_outputs_probe_command as _pull_outputs_probe_command,
 )
@@ -117,6 +122,12 @@ def _pull_interrupted(
     err.print(f"[yellow]{escape(message)}[/yellow]")
     err.print(f"[dim]resume: {escape(resume_text)}[/dim]")
     raise typer.Exit(130)
+
+
+# The transport's capture ceiling: ~130k census rows of ~120 bytes. The census
+# caps its own row count below that, so a larger outputs tree is verified on
+# its first rows and the remainder is counted, never truncated mid-row.
+PULL_CENSUS_CAPTURE_BYTES = MAX_CAPTURE_BYTES
 
 
 class _PullPhaseError(Exception):
@@ -235,13 +246,9 @@ def _validate_pull_destination(
             existing_job_id = None
         if existing_job_id != entry.job_id:
             message = (
-                f"{dst} belongs to job {existing_job_id}; "
-                "use --force to merge or overwrite files"
+                f"{dst} belongs to job {existing_job_id}; {FORCE_SEMANTICS}"
                 if existing_job_id
-                else (
-                    f"{dst} has an unreadable dt/job.json; "
-                    "use --force to merge or overwrite files"
-                )
+                else (f"{dst} has an unreadable dt/job.json; {FORCE_SEMANTICS}")
             )
             raise _PullPhaseError(
                 "destination_conflict", message, 1, existing_job_id=existing_job_id
@@ -258,12 +265,19 @@ def _validate_pull_destination(
     if destination_nonempty:
         raise _PullPhaseError(
             "destination_conflict",
-            f"{dst} is non-empty and has no dt/job.json; "
-            "use --force to merge or overwrite files",
+            f"{dst} is non-empty and has no dt/job.json; {FORCE_SEMANTICS}",
             1,
             existing_job_id=None,
         )
     return records_dir
+
+
+# What --force does, spelled out where the refusal names it (field report: the
+# message left "merge or overwrite" ambiguous).
+FORCE_SEMANTICS = (
+    "--force claims the directory for this job: files with the same relative "
+    "path are overwritten, other files are kept, nothing is deleted"
+)
 
 
 def _probe_remote_outputs(
@@ -380,7 +394,13 @@ def _rsync_with_status(
     destination: str,
     **kwargs: Any,
 ) -> subprocess.CompletedProcess[str]:
-    """Run one pull rsync, showing a progress status only for human output."""
+    """Run one pull rsync, showing a progress status only for human output.
+
+    Pulls ride their own SSH pool (``BULK_PULL``): a multi-gigabyte recovery
+    on the dispatcher's multiplexed stream starved the code snapshot into
+    rsync's io timeout and left the queue behind idle cards (field report).
+    """
+    kwargs.setdefault("workload", SSHWorkload.BULK_PULL)
     if json_:
         return _root.rsync(source, destination, **kwargs)
     with err.status(status):
@@ -655,7 +675,106 @@ def _transfer_outputs(
         pull_evidence_mod.validate_materialized_tree(dst)
     except (OSError, ValueError) as exc:
         raise _PullPhaseError("unsafe_output", str(exc), 1) from exc
+    _verify_pulled_outputs(
+        entry,
+        outputs_rel,
+        dst,
+        excludes_active=bool(excludes),
+        json_=json_,
+    )
     return pull_route, relay_error
+
+
+def _remote_outputs_census(
+    entry: jobs_mod.JobEntry, outputs_rel: str
+) -> subprocess.CompletedProcess[str]:
+    """The worker's own listing of the regular files under ``outputs/``."""
+    return _root.run_on(
+        entry.node,
+        entry.node_local,
+        _pull_outputs_census_command(outputs_rel),
+        timeout=200,
+        capture_limit_bytes=PULL_CENSUS_CAPTURE_BYTES,
+    )
+
+
+def _verify_pulled_outputs(
+    entry: jobs_mod.JobEntry,
+    outputs_rel: str,
+    dst: Path,
+    *,
+    excludes_active: bool,
+    json_: bool,
+) -> None:
+    """Compare the materialized tree with the worker's own file census.
+
+    rsync's exit status says the protocol completed, not that every file
+    arrived: a field pull over a tunnel returned 0 with one truncated 8 MiB
+    file of a 45 MiB checkpoint and nineteen siblings missing. A full pull
+    must hold every regular file the worker has, byte-for-byte in size; with
+    excludes in effect only the files that did arrive are checked, since the
+    filter semantics live in rsync.
+    """
+    try:
+        census_proc = _root._remote_outputs_census(entry, outputs_rel)
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        detail = " ".join(str(exc).split()) or type(exc).__name__
+        raise _PullPhaseError(
+            "unverified",
+            f"transfer finished but the outputs could not be verified against "
+            f"{entry.node}: {detail}",
+            EXIT_UNREACHABLE,
+            records_fresh=False,
+            human_plain=True,
+            hint="rerun dt pull once the node answers; it resumes and re-verifies",
+        ) from exc
+    census = _parse_pull_outputs_census(census_proc.stdout or "")
+    if census_proc.returncode != 0 or census is None:
+        detail = " ".join(
+            (census_proc.stderr or f"census exited {census_proc.returncode}").split()
+        )
+        raise _PullPhaseError(
+            "unverified",
+            f"transfer finished but {entry.node} produced no usable file census: "
+            f"{detail}",
+            1,
+            records_fresh=False,
+            human_plain=True,
+            hint="rerun dt pull; a second pass resumes and re-verifies",
+        )
+    if not census.files and census.total_files == 0:
+        return  # nothing on the node to hold
+    local_only = set()
+    if excludes_active:
+        for path in dst.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                local_only.add(path.relative_to(dst).as_posix())
+    problems = _pull_census_mismatches(
+        census,
+        dst,
+        excluded=(lambda relative: excludes_active and relative not in local_only),
+    )
+    if not problems:
+        if census.truncated and not json_:
+            err.print(
+                f"[dim]verified the first {len(census.files):,} of "
+                f"{census.total_files:,} files against {escape(entry.node)}[/dim]"
+            )
+        return
+    shown = "; ".join(problems[:5])
+    more = f"; +{len(problems) - 5} more" if len(problems) > 5 else ""
+    raise _PullPhaseError(
+        "incomplete_transfer",
+        f"{len(problems)} of {len(census.files)} files differ from {entry.node} "
+        f"after the transfer ({shown}{more})",
+        1,
+        records_fresh=False,
+        human_plain=True,
+        hint=(
+            "the local copy is incomplete and must not be trusted; rerun dt pull "
+            "to resume (partial files are completed in place)"
+        ),
+    )
 
 
 def _recover_runtime_evidence(

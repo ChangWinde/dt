@@ -140,6 +140,31 @@ def test_tail_is_globally_byte_bounded(tmp_path):
     assert proc.stdout.endswith(b"last\n")
 
 
+def test_tail_reads_a_launcher_written_log_that_has_no_capture_lock(tmp_path):
+    """Field report: `dt logs REF` on an env-fail job printed "unsafe or
+    unavailable log storage" because logs/env.log is written by the launcher's
+    redirect, not by this module, and has no rotation lock file. A log with
+    no lock is read without one; ownership and regular-file checks stay."""
+    logs = tmp_path / "logs"
+    logs.mkdir(mode=0o700)
+    env_log = logs / "env.log"
+    env_log.write_bytes(
+        b"artifact verification failed: artifact directory contains symlink: "
+        b"/home/u/dt/worker/artifacts/p/models/victim/migrated/migrated\n"
+    )
+
+    proc = _tail(env_log, lines=5, limit=4096)
+
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.endswith(b"migrated/migrated\n")
+
+    escape = logs / "escape.log"
+    escape.symlink_to("/etc/hostname")
+    refused = _tail(escape, lines=5, limit=4096)
+    assert refused.returncode != 0
+    assert b"unsafe" in refused.stderr.lower()
+
+
 def test_tail_does_not_wait_for_the_live_capture_stream_to_close(tmp_path):
     log = tmp_path / "logs" / "stdout.log"
     log.parent.mkdir(mode=0o700)

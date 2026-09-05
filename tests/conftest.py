@@ -97,6 +97,31 @@ def _compatible_idle_agent_protocol(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _pull_census_matches_local_tree(monkeypatch):
+    """Make the post-pull census agree with whatever the (stubbed) transfer left.
+
+    `dt pull` verifies the materialized tree against the worker's file census;
+    the pull tests stub rsync and never create remote files, so the census is
+    answered from the local destination. Tests of the check itself override
+    ``cli._remote_outputs_census`` with a census the local tree does not match.
+    """
+    import subprocess
+
+    from dt import cli, transfers
+
+    def census(entry, outputs_rel):
+        del entry, outputs_rel
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            f"{transfers.PULL_CENSUS_MARK}\n{transfers.PULL_CENSUS_MARK}\n0\n",
+            "",
+        )
+
+    monkeypatch.setattr(cli, "_remote_outputs_census", census)
+
+
 @pytest.fixture
 def stub_job_refresh(monkeypatch):
     """Stub job status refresh on a module with a one-job function.

@@ -1530,7 +1530,12 @@ def _ps_human_mode(
             "all history: dt ps -a"
         )
     elif view.all_:
-        caption = f"{len(visible)} jobs · narrow with: dt ps -s STATUS"
+        # Names are ellipsized to the terminal width here; a script that
+        # deduplicated on them mistook `...-s1` for `...-s10` (field report).
+        caption = (
+            f"{len(visible)} jobs · narrow with: dt ps -s STATUS · "
+            "whole names: dt ps -a --json"
+        )
     elif status is not None:
         status_count = (
             f"{len(visible)}/{total}" if len(visible) != total else str(total)

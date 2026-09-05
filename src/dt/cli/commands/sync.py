@@ -32,6 +32,7 @@ from .. import (
     _validated_retries,
 )
 from ... import dispatch as dispatch_mod
+from ... import jobs as jobs_mod
 
 
 @dataclass(frozen=True)
@@ -402,6 +403,10 @@ def sync(
         rows.append(row)
         if failure_code is not None:
             failure_codes.append(failure_code)
+        if artifacts and failure_code is None:
+            row["superseded_manifests"] = _superseded_manifest_jobs(
+                cfg, project_name, name, row
+            )
         if json_:
             continue
         for message in messages:
@@ -410,7 +415,65 @@ def sync(
             err.print(f"[red]{escape(name)}: {escape(str(row['error']))}[/red]")
             continue
         _print_sync_row(name, row, plan=plan)
+        if artifacts:
+            _print_artifact_manifest_notes(name, row, plan=plan)
     if json_:
         print(json.dumps(rows))
     if failure_codes:
         raise typer.Exit(1 if 1 in failure_codes else EXIT_UNREACHABLE)
+
+
+def _superseded_manifest_jobs(
+    cfg: HeadConfig, project_name: str, node_name: str, row: JsonDict
+) -> list[JsonDict]:
+    """Queued jobs of this project pinned to a manifest this sync replaced.
+
+    An artifact store holds one manifest per publication; republishing the
+    same paths with changed content gives a new digest, and every queued job
+    still carrying the old one will bounce off this node as
+    ``artifact-unverified`` until it is resubmitted. Field report: two cards
+    sat idle for hours behind such jobs. Name them here, at the moment the
+    operator can still act.
+    """
+    published = row.get("artifact_manifest_sha256")
+    if not isinstance(published, str):
+        return []
+    superseded: list[JsonDict] = []
+    for entry in jobs_mod.queued_entries(cfg):
+        if (
+            entry.project != project_name
+            or entry.artifact_manifest is None
+            or entry.artifact_manifest == published
+            or (entry.pin_node is not None and entry.pin_node != node_name)
+        ):
+            continue
+        superseded.append(
+            {
+                "job_id": entry.job_id,
+                "name": entry.name,
+                "artifact_manifest": entry.artifact_manifest,
+                "pin_node": entry.pin_node,
+            }
+        )
+    return superseded
+
+
+def _print_artifact_manifest_notes(name: str, row: JsonDict, *, plan: bool) -> None:
+    manifest = row.get("artifact_manifest_sha256")
+    if isinstance(manifest, str) and not plan:
+        # --artifact-manifest takes the whole digest; the 12-character prefix
+        # in the summary line is for reading, this line is for pasting.
+        err.print(f"[dim]{escape(name)}: --artifact-manifest {escape(manifest)}[/dim]")
+    superseded = row.get("superseded_manifests")
+    if not isinstance(superseded, list) or not superseded:
+        return
+    shown = ", ".join(str(item.get("name")) for item in superseded[:4])
+    if len(superseded) > 4:
+        shown += f", +{len(superseded) - 4} more"
+    verb = "would leave" if plan else "leaves"
+    err.print(
+        f"[yellow]{escape(name)}: this publication {verb} {len(superseded)} queued "
+        f"job(s) pinned to an older manifest ({escape(shown)}); they will bounce "
+        "off this node as artifact-unverified until resubmitted with the new "
+        "--artifact-manifest, or killed[/yellow]"
+    )
