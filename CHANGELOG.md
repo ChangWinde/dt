@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.9 — 2026-09-05
+
 ### Fixed
 
 - `dt agent stop` no longer reports "no agent running" (exit 0) for an agent
