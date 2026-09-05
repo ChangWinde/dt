@@ -354,7 +354,17 @@ relative SOURCE (SOURCE defaults to TARGET). Links are created only after the
 manifest verifies, and the launch fails closed before the job starts if a
 target already exists in the snapshot, a source is missing, or a declaration
 is unsafe. Targets persist with the job: queued dispatch, `fork`, and `rerun`
-recreate the same links.
+recreate the same links. `dt batch` and `dt chain` take the same
+`--artifact-target` and apply it to every item, so a payload never has to
+create its own links — a hand-rolled `ln -s` racing across two cells of one
+job once planted a symlink inside the node's artifact store and blocked every
+later job of the project (the store is verified whole-directory).
+
+Republishing changed content under the same paths produces a new manifest.
+Jobs still queued with the old digest bounce off that node as
+`artifact-unverified` until resubmitted; `dt sync --artifact` names them when
+it finishes (`superseded_manifests` in `--json`) and prints the whole new
+digest ready to paste into `--artifact-manifest`.
 
 ## Compare evidence
 

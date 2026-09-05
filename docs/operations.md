@@ -339,9 +339,25 @@ dt pull JOB --exclude checkpoints/
 ```
 
 `--lite` skips checkpoints, cache directories, and raw profiler traces. Pull is
-resumable and preserves partial data on interruption. `--force` can merge into
-a nonempty or differently owned directory and should be reserved for a
-reviewed recovery case.
+resumable and preserves partial data on interruption. `--force` claims a
+nonempty or differently owned directory for this job: files with the same
+relative path are overwritten, other files are kept, nothing is deleted; it
+should be reserved for a reviewed recovery case.
+
+A pull exits 0 only when the local tree matches the worker: after the
+transfer dt asks the node for its own census of `outputs/` (every regular
+file with its size) and compares. A missing or truncated file is
+`incomplete_transfer` (exit 1) with the offending paths named, and the local
+copy must not be trusted until a rerun completes it; a node that cannot be
+asked is `unverified` (exit 5). rsync's own exit status was never evidence
+that every file arrived — a field pull over a tunnel returned 0 with one
+truncated checkpoint and nineteen siblings missing.
+
+Pulls ride their own SSH connection pool, separate from the dispatcher's code
+snapshots: a multi-gigabyte recovery on the shared stream once starved the
+snapshot into rsync's 60-second io timeout and left queued jobs behind idle
+cards. They still share the physical link, so on a slow tunnel pair a large
+pull with `--bwlimit`.
 
 ### Transfer bandwidth budget
 

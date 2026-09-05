@@ -85,6 +85,12 @@ class SSHWorkload(str, Enum):
     # the operator's general agent would expose every key it contains to another
     # same-identity process on that gateway.
     ARTIFACT_RELAY = "artifact-relay"
+    # Operator-initiated bulk recovery (`dt pull`). Multi-gigabyte pulls used
+    # to ride the same multiplexed stream as the dispatcher's code snapshot,
+    # so one pull starved the snapshot into rsync's 60 s io timeout and the
+    # queue sat behind idle cards. Its own pool keeps the dispatcher's small
+    # transfers on their own TCP connection; the pull is also paced (below).
+    BULK_PULL = "bulk-pull"
 
 
 def _capture_limit_for_workload(workload: SSHWorkload) -> int:
@@ -1245,6 +1251,7 @@ def rsync(
     bwlimit_kbps: int | None = None,
     cancel_event: Event | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
+    workload: SSHWorkload = SSHWorkload.ARTIFACT,
 ) -> subprocess.CompletedProcess[str]:
     """--partial keeps interrupted transfers resumable; with retries > 0 a
     network-ish failure is retried and resumes where it stopped (large
@@ -1267,7 +1274,7 @@ def rsync(
         "--partial",
         "--timeout=60",
         "-e",
-        shlex.join(ssh_base(SSHWorkload.ARTIFACT)),
+        shlex.join(ssh_base(workload)),
     ]
     if stats:
         cmd.append("--stats")

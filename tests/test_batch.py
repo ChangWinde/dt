@@ -70,6 +70,72 @@ def _entry(
         extras=list(spec.extras or []),
         forked_from=spec.forked_from,
         after_success=spec.after_success,
+        artifact_targets=dict(spec.artifact_targets or {}),
+    )
+
+
+def test_batch_links_verified_artifacts_into_every_item_workspace(
+    tmp_path, monkeypatch
+):
+    """Field report: `dt batch` had no --artifact-target, so a payload rolled
+    its own `ln -s "$DT_ARTIFACT_ROOT/<rel>" <rel>` and, racing across two
+    cells, planted a symlink inside the node's artifact store. The same
+    declaration `dt run` accepts now reaches every item, first job and forks."""
+    cfg = _cfg(tmp_path)
+    seen = {"forks": []}
+    manifest = "d" * 64
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(agent, "alive_pid", lambda cfg_: 123)
+
+    def fake_submit(cfg_, spec, cwd, log, no_queue=False):
+        seen["first"] = spec
+        return _entry(spec, index=1, status="running")
+
+    def fake_submit_fork(cfg_, source, spec, log, no_queue=False, force_queue=False):
+        seen["forks"].append(spec)
+        return _entry(spec, index=len(seen["forks"]) + 1, status="queued")
+
+    monkeypatch.setattr(cli, "submit", fake_submit)
+    monkeypatch.setattr(dispatch, "submit_fork", fake_submit_fork)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "batch",
+            "n1",
+            "-p",
+            "p",
+            "-n",
+            "cells",
+            "--artifact-manifest",
+            manifest,
+            "--artifact-target",
+            "models/victim/migrated",
+            "--artifact-target",
+            "data/il_demos=datasets/il_demos",
+            "--json",
+            "bash cell.sh 1",
+            "bash cell.sh 2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    expected = {
+        "models/victim/migrated": "models/victim/migrated",
+        "data/il_demos": "datasets/il_demos",
+    }
+    assert seen["first"].artifact_manifest == manifest
+    assert dict(seen["first"].artifact_targets or {}) == expected
+    assert [dict(spec.artifact_targets or {}) for spec in seen["forks"]] == [expected]
+
+    without_manifest = CliRunner().invoke(
+        cli.app,
+        ["batch", "n1", "-p", "p", "--artifact-target", "models/x", "--json", "true"],
+    )
+    assert without_manifest.exit_code == 1
+    assert (
+        "requires --artifact or --artifact-manifest"
+        in (json.loads(without_manifest.stdout)["message"])
     )
 
 

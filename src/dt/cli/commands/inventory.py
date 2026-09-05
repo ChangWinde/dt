@@ -25,7 +25,11 @@ from ...dispatch import (
 )
 from ...private_state import PrivateStateError
 from ...render import err
-from ...submission import derive_task_name as _derived_task_name
+from ...submission import (
+    SubmissionValidationError,
+    derive_task_name as _derived_task_name,
+    parse_artifact_targets,
+)
 from .. import (
     BATCH_MAX_COMMAND_BYTES,
     BATCH_MAX_INPUT_BYTES,
@@ -396,6 +400,7 @@ class _InventoryPlan:
     max_job_memory_mib: int | None
     artifact_manifest: str | None
     request_id: str | None
+    artifact_targets: dict[str, str] | None = None
 
     def item_request_id(self, index: int) -> str | None:
         if self.request_id is None:
@@ -419,6 +424,9 @@ class _InventoryPlan:
             max_vram_mib=self.max_vram_mib if gpus > 0 else None,
             max_job_memory_mib=self.max_job_memory_mib,
             artifact_manifest=self.artifact_manifest,
+            artifact_targets=(
+                dict(self.artifact_targets) if self.artifact_targets else None
+            ),
             request_id=self.item_request_id(index),
         )
 
@@ -440,6 +448,11 @@ class _InventoryPlan:
                 "max_vram_mib": self.max_vram_mib,
                 "max_job_memory_mib": self.max_job_memory_mib,
                 "artifact_manifest": self.artifact_manifest,
+                "artifact_targets": (
+                    sorted(self.artifact_targets.items())
+                    if self.artifact_targets
+                    else None
+                ),
             }
         )
 
@@ -893,6 +906,15 @@ def _inventory_command(
         "--artifact",
         help="sync this project-relative input once and bind every item (repeatable)",
     ),
+    artifact_target: Optional[list[str]] = typer.Option(
+        None,
+        "--artifact-target",
+        help=(
+            "link TARGET (or TARGET=SOURCE) inside every item's workspace to the "
+            "verified artifact content (repeatable; requires --artifact or "
+            "--artifact-manifest)"
+        ),
+    ),
     request_id: Optional[str] = typer.Option(
         None,
         "--request-id",
@@ -925,6 +947,19 @@ def _inventory_command(
         request_id=request_id,
         json_=json_,
     )
+    try:
+        artifact_targets = parse_artifact_targets(
+            artifact_target or [],
+            artifacts=artifacts,
+            artifact_manifest=artifact_manifest,
+        )
+    except SubmissionValidationError as exc:
+        _fail_submission(
+            kind="invalid_argument",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
     default_prefix = (
         file.stem
         if file is not None and str(file) != "-" and file.stem
@@ -948,6 +983,10 @@ def _inventory_command(
             .option("--max-job-memory-mib", max_job_memory_mib)
             .option("--artifact-manifest", artifact_manifest or None)
             .repeat("--artifact", artifacts)
+            .repeat(
+                "--artifact-target",
+                [f"{target}={source}" for target, source in artifact_targets.items()],
+            )
             .option("--request-id", request_id or None)
             .flag("--json", True)
             .passthrough(items)
@@ -1011,6 +1050,7 @@ def _inventory_command(
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
         request_id=request_id,
+        artifact_targets=artifact_targets or None,
     )
     outcome.project = plan.project
 
@@ -1145,6 +1185,16 @@ def batch(
         help="sync this project-relative input once and bind every item (repeatable)",
         rich_help_panel="Reproducibility",
     ),
+    artifact_target: Optional[list[str]] = typer.Option(
+        None,
+        "--artifact-target",
+        help=(
+            "link TARGET (or TARGET=SOURCE) inside every item's workspace to the "
+            "verified artifact content (repeatable; requires --artifact or "
+            "--artifact-manifest)"
+        ),
+        rich_help_panel="Reproducibility",
+    ),
     request_id: Optional[str] = typer.Option(
         None,
         "--request-id",
@@ -1176,6 +1226,7 @@ def batch(
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
         artifact=artifact,
+        artifact_target=artifact_target,
         request_id=request_id,
         json_=json_,
     )
@@ -1275,6 +1326,16 @@ def chain(
         help="sync this project-relative input once and bind every stage (repeatable)",
         rich_help_panel="Reproducibility",
     ),
+    artifact_target: Optional[list[str]] = typer.Option(
+        None,
+        "--artifact-target",
+        help=(
+            "link TARGET (or TARGET=SOURCE) inside every item's workspace to the "
+            "verified artifact content (repeatable; requires --artifact or "
+            "--artifact-manifest)"
+        ),
+        rich_help_panel="Reproducibility",
+    ),
     request_id: Optional[str] = typer.Option(
         None,
         "--request-id",
@@ -1307,6 +1368,7 @@ def chain(
         max_job_memory_mib=max_job_memory_mib,
         artifact_manifest=artifact_manifest,
         artifact=artifact,
+        artifact_target=artifact_target,
         request_id=request_id,
         json_=json_,
     )

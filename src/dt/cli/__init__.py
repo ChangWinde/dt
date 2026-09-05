@@ -3200,7 +3200,10 @@ from .commands.matrix import matrix_app  # noqa: E402
 from .commands.metrics import metrics  # noqa: E402
 from .commands.migrate import migrate_app  # noqa: E402
 from .commands.ps import ps  # noqa: E402
-from .commands.pull import pull  # noqa: E402
+from .commands.pull import (  # noqa: E402
+    _remote_outputs_census as _remote_outputs_census,
+    pull,
+)
 from .commands.request import request_status  # noqa: E402
 from .commands.rerun import rerun  # noqa: E402
 from .commands.run import run, task  # noqa: E402

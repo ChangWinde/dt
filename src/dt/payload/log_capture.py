@@ -335,14 +335,22 @@ def _read_suffix_at(directory_fd: int, name: str, max_bytes: int) -> bytes:
 
 
 def tail(path: Path, *, lines: int, max_bytes: int) -> bytes:
-    """Return one bounded logical tail over retained generations."""
+    """Return one bounded logical tail over retained generations.
+
+    The lock file exists only for logs this module captured (rotation needs
+    it). ``env.log`` is written by the launcher's own redirect and has none,
+    so a failed-before-start job's only explanation could not be read: `dt
+    logs` printed "unsafe or unavailable log storage". A log without a lock
+    is read without one; the regular-file and ownership checks still apply.
+    """
     if path.name in {"", ".", ".."}:
         raise LogCaptureError("unsafe log file")
     directory_fd = _open_directory(path.parent)
     lock_fd = -1
     try:
-        lock_fd = _open_lock(directory_fd, path.name, create=False)
-        fcntl.flock(lock_fd, fcntl.LOCK_SH)
+        if _safe_regular_at(directory_fd, f".{path.name}.lock") is not None:
+            lock_fd = _open_lock(directory_fd, path.name, create=False)
+            fcntl.flock(lock_fd, fcntl.LOCK_SH)
         remaining = max_bytes
         newest_first: list[bytes] = []
         for name in [path.name] + [

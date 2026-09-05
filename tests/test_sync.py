@@ -1791,6 +1791,88 @@ def test_sync_cli_routes_explicit_artifacts_without_syncing_code(
     assert row["mode"] == "artifacts"
 
 
+def test_sync_artifacts_names_queued_jobs_pinned_to_the_superseded_manifest(
+    tmp_path, monkeypatch
+):
+    """Field report: republishing the same artifact paths with new content
+    gave a new manifest; every queued job still pinned to the old one bounced
+    off the node as artifact-unverified for hours, and the summary line showed
+    only a 12-character prefix that --artifact-manifest refuses. The sync now
+    prints the whole digest and names the jobs it strands."""
+    import dt.cli as cli
+    from dt.jobs import JobEntry, save
+
+    cfg = _cfg(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    cfg.projects["omni"] = Project(path=project)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    old, new = "c" * 64, "3" * 64
+
+    def queued(job_id: str, **overrides):
+        values = {
+            "job_id": job_id,
+            "name": job_id,
+            "center": "test",
+            "project": "omni",
+            "node": "-",
+            "node_local": False,
+            "job_dir": f"dt/jobs/{job_id}",
+            "session": f"dt_{job_id}",
+            "cmd": "true",
+            "status": "queued",
+            "created_at": 1.0,
+            "artifact_manifest": old,
+        }
+        values.update(overrides)
+        save(cfg, JobEntry(**values))
+
+    queued("stranded-anywhere")
+    queued("stranded-here", pin_node="n1")
+    queued("elsewhere", pin_node="n2")  # another node: its store is untouched
+    queued("current", artifact_manifest=new)
+    queued("other-project", project="p")
+    queued("no-manifest", artifact_manifest=None)
+
+    monkeypatch.setattr(
+        dispatch,
+        "sync_artifacts",
+        lambda cfg_, project_name, project_dir, node, artifacts, log, **kwargs: {
+            "node": node.name,
+            "project": project_name,
+            "mode": "artifacts",
+            "path": "~/dt/artifacts/omni",
+            "transferred_bytes": 7,
+            "transferred_gib": 7 / 2**30,
+            "deleted_files": 0,
+            "transferred_files": 1,
+            "artifacts": [],
+            "artifact_manifest_sha256": new,
+            "artifact_manifest_path": f"~/dt/artifacts/omni/.dt/manifests/{new}.json",
+        },
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["sync", "n1", "-p", "omni", "--artifact", "outputs/model.pt", "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    row = json.loads(result.stdout)[0]
+    assert [item["job_id"] for item in row["superseded_manifests"]] == [
+        "stranded-anywhere",
+        "stranded-here",
+    ]
+    assert row["superseded_manifests"][0]["artifact_manifest"] == old
+
+    human = CliRunner().invoke(
+        cli.app, ["sync", "n1", "-p", "omni", "--artifact", "outputs/model.pt"]
+    )
+    assert human.exit_code == 0, human.output
+    assert f"--artifact-manifest {new}" in human.output
+    assert "leaves 2 queued job(s) pinned to an older manifest" in human.output
+    assert "stranded-anywhere, stranded-here" in human.output
+
+
 def test_sync_cli_rejects_unknown_route_modes(monkeypatch):
     import dt.cli as cli
 

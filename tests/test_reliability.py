@@ -29,7 +29,7 @@ from dt.cli.commands import pull as pull_cmd
 from dt.config import HeadConfig, LaptopConfig, Node, Project, QueueCfg
 from dt.dispatch import RunSpec, _try_nodes
 from dt.jobs import JobEntry
-from dt.sshio import RemoteError
+from dt.sshio import RemoteError, SSHWorkload
 
 
 def _cfg(tmp_path: Path) -> HeadConfig:
@@ -3457,6 +3457,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
                 "safe_links": True,
                 "stats": False,
                 "bwlimit_kbps": None,
+                "workload": SSHWorkload.BULK_PULL,
             },
         ),
         (
@@ -3468,6 +3469,7 @@ def test_pull_lite_recovers_all_run_logs_and_registry_record(tmp_path, monkeypat
                 "retries": 2,
                 "safe_links": True,
                 "bwlimit_kbps": None,
+                "workload": SSHWorkload.BULK_PULL,
             },
         ),
     ]
@@ -3553,6 +3555,7 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
                 "retries": 2,
                 "safe_links": True,
                 "bwlimit_kbps": None,
+                "workload": SSHWorkload.BULK_PULL,
             },
         )
     ]
@@ -4510,6 +4513,178 @@ def test_pull_json_transfer_failure_keeps_partial_contract(tmp_path, monkeypatch
     assert json.loads((destination / "dt" / "job.json").read_text())["job_id"] == "jid"
 
 
+def test_pull_census_parser_and_mismatch_report(tmp_path):
+    census_text = (
+        f"{transfers.PULL_CENSUS_MARK}\n"
+        "45795397\tmodels/victim/dagger2_seed1/window-open-v2_DRQV2.pt\n"
+        "239\tmodels/victim/dagger2_seed1/window-open-v2_DRQV2.pt.manifest.json\n"
+        "12\tnotes.txt\n"
+        "7\t../escape\n"
+        "bad\tnot-a-size\n"
+        f"{transfers.PULL_CENSUS_MARK}\n3\n"
+    )
+    census = transfers.parse_pull_outputs_census(census_text)
+    assert census is not None
+    assert census.files == {
+        "models/victim/dagger2_seed1/window-open-v2_DRQV2.pt": 45795397,
+        "models/victim/dagger2_seed1/window-open-v2_DRQV2.pt.manifest.json": 239,
+        "notes.txt": 12,
+    }
+    assert census.total_files == 3 and census.truncated is False
+    assert transfers.parse_pull_outputs_census("no markers here") is None
+
+    local = tmp_path / "pulled"
+    (local / "models" / "victim" / "dagger2_seed1").mkdir(parents=True)
+    (
+        local / "models" / "victim" / "dagger2_seed1" / "window-open-v2_DRQV2.pt"
+    ).write_bytes(
+        b"x" * 8124568  # the truncated field artefact
+    )
+    (local / "notes.txt").write_text("twelve bytes")
+    problems = transfers.pull_census_mismatches(census, local)
+    assert problems == [
+        "size mismatch: models/victim/dagger2_seed1/window-open-v2_DRQV2.pt "
+        "(8124568 bytes locally, 45795397 on the node)",
+        "missing: models/victim/dagger2_seed1/window-open-v2_DRQV2.pt.manifest.json",
+    ]
+    assert (
+        transfers.pull_census_mismatches(
+            census,
+            local,
+            excluded=lambda relative: relative.endswith((".pt", ".json")),
+        )
+        == []
+    )
+
+    truncated = transfers.parse_pull_outputs_census(
+        f"{transfers.PULL_CENSUS_MARK}\n12\tnotes.txt\n{transfers.PULL_CENSUS_MARK}\n250000\n"
+    )
+    assert (
+        truncated is not None
+        and truncated.truncated
+        and truncated.total_files == 250000
+    )
+
+
+def test_pull_census_runs_through_the_real_local_transport(tmp_path, monkeypatch):
+    """The census command must be accepted by run_on as dt ships it (a first
+    version asked for a capture limit above the transport's ceiling, which
+    every stubbed test hid and the first real pull tripped)."""
+    from dt.cli.commands import pull as pull_cmd
+
+    outputs = tmp_path / "job" / "outputs"
+    (outputs / "models").mkdir(parents=True)
+    (outputs / "models" / "weights.pt").write_bytes(b"w" * 1234)
+    (outputs / "notes.txt").write_text("hi")
+    (outputs / "models" / "link.pt").symlink_to("weights.pt")  # not listed
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="local",
+        node_local=True,
+        job_dir=str(tmp_path / "job"),
+        session="dt_jid",
+        cmd="true",
+        status="finished",
+        exit_code=0,
+    )
+
+    proc = pull_cmd._remote_outputs_census(entry, str(outputs))
+
+    assert proc.returncode == 0, proc.stderr
+    census = transfers.parse_pull_outputs_census(proc.stdout)
+    assert census is not None
+    assert census.files == {"models/weights.pt": 1234, "notes.txt": 2}
+    assert census.total_files == 2 and not census.truncated
+    assert transfers.pull_census_mismatches(census, outputs) == []
+
+
+def test_pull_refuses_to_report_success_when_the_local_tree_does_not_match_the_node(
+    tmp_path, monkeypatch
+):
+    """Field report: `dt pull` over a tunnel exited 0 with one 8 MiB file of a
+    45 MiB checkpoint on disk (mtime 1970) and nineteen siblings missing; a
+    downstream script trusted the exit code and skipped the job for good. The
+    worker's own census is now compared with what arrived."""
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+        status="finished",
+        exit_code=1,
+    )
+    destination = tmp_path / "result"
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda _node, _local, command, **_kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            ""
+            if pull_evidence.PULL_EVIDENCE_MARK in command
+            else "45795636\toutputs\n",
+            "",
+        ),
+    )
+
+    def truncated_transfer(*args, **kwargs):
+        target = Path(args[1])
+        if kwargs.get("safe_links"):  # the outputs leg
+            model = target / "models" / "victim" / "dagger2_seed1"
+            model.mkdir(parents=True, exist_ok=True)
+            (model / "window-open-v2_DRQV2.pt").write_bytes(b"x" * 8124568)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(cli, "rsync", truncated_transfer)
+    monkeypatch.setattr(
+        cli,
+        "_remote_outputs_census",
+        lambda _entry, _rel: subprocess.CompletedProcess(
+            [],
+            0,
+            f"{transfers.PULL_CENSUS_MARK}\n"
+            "45795397\tmodels/victim/dagger2_seed1/window-open-v2_DRQV2.pt\n"
+            "239\tmodels/victim/dagger2_seed1/window-open-v2_DRQV2.pt.manifest.json\n"
+            f"{transfers.PULL_CENSUS_MARK}\n2\n",
+            "",
+        ),
+    )
+
+    result = CliRunner().invoke(
+        cli.app, ["pull", "jid", "--to", str(destination), "--json"]
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "error"
+    assert payload["error"] == "incomplete_transfer"
+    assert "2 of 2 files differ from n1" in payload["message"]
+    assert (
+        "size mismatch: models/victim/dagger2_seed1/window-open-v2_DRQV2.pt"
+        in (payload["message"])
+    )
+    assert (
+        "missing: models/victim/dagger2_seed1/window-open-v2_DRQV2.pt.manifest.json"
+        in (payload["message"])
+    )
+    assert payload["partial"] is True
+
+    human = CliRunner().invoke(cli.app, ["pull", "jid", "--to", str(destination)])
+    assert human.exit_code == 1
+    assert "must not be trusted" in human.output
+
+
 def test_pull_refuses_destination_owned_by_different_job_before_remote_access(
     tmp_path, monkeypatch
 ):
@@ -4558,8 +4733,9 @@ def test_pull_refuses_destination_owned_by_different_job_before_remote_access(
         "status": "error",
         "error": "destination_conflict",
         "message": (
-            f"{destination} belongs to job other-job; "
-            "use --force to merge or overwrite files"
+            f"{destination} belongs to job other-job; --force claims the directory "
+            "for this job: files with the same relative path are overwritten, "
+            "other files are kept, nothing is deleted"
         ),
         "exit_code": 1,
     }

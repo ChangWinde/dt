@@ -17,9 +17,44 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 - `dt doctor`'s table shows `linger:no` (or `linger:unavailable`) in the
   control column of a GPU node whose user manager does not linger; the
   verdict used to live only in the hint below the table.
+- `dt batch` and `dt chain` accept `--artifact-target TARGET[=SOURCE]` with
+  `dt run`'s semantics, applied to every item. The gap made a payload roll its
+  own `ln -s "$DT_ARTIFACT_ROOT/<rel>" <rel>`, which, racing across two cells
+  of one job, planted a symlink inside the node's artifact store and blocked
+  every later job of the project (field report).
+- `dt sync --artifact` prints the whole manifest digest ready to paste into
+  `--artifact-manifest` (the summary line keeps its 12-character prefix), and
+  names the queued jobs of the project still pinned to a manifest the
+  publication superseded (`superseded_manifests` in `--json`); they would
+  bounce off the node as `artifact-unverified` until resubmitted. Two cards
+  sat idle for hours behind such jobs (field report).
 
 ### Fixed
 
+- `dt pull` no longer reports success for an incomplete transfer. rsync's
+  exit status says the protocol completed, not that every file arrived: a pull
+  over a tunnel returned 0 with one truncated 8 MiB file of a 45 MiB
+  checkpoint (mtime 1970) and nineteen siblings missing, and a downstream
+  script trusted the exit code. After the transfer dt asks the worker for its
+  census of `outputs/` (regular files with sizes) and compares: a missing or
+  truncated file is `incomplete_transfer` (exit 1) naming the paths, a node
+  that cannot be asked is `unverified` (exit 5). With `--exclude`/`--lite`
+  only the files that did arrive are checked.
+- `dt pull` rides its own SSH connection pool (`bulk-pull`), separate from
+  the dispatcher's code snapshots. A 2.4 GB pull on the shared multiplexed
+  stream starved a queued job's snapshot into rsync's 60 s io timeout and
+  the scheduler sat 210 s behind two idle cards.
+- `dt logs REF` reads `logs/env.log` for a job that failed before start. The
+  tail helper required the rotation lock file that only captured logs have;
+  the launcher-written env log has none, so the one file explaining an
+  `env-fail` printed "unsafe or unavailable log storage". A log without a lock
+  is read without one; the regular-file and ownership checks remain.
+- `dt ps -a` says where whole names are (`whole names: dt ps -a --json`) in
+  its caption; ellipsized names made `...-s1` and `...-s10` indistinguishable
+  to a deduplication script, which resubmitted a finished cell.
+- `dt pull`'s destination refusal spells out what `--force` does: it claims
+  the directory for this job, overwrites files with the same relative path,
+  keeps other files, deletes nothing.
 - Republishing an artifact store (`dt sync NODE --artifact PATH`, or the
   publication inside `dt run --artifact`) wakes the resident agent with a
   reason, and the agent releases the backoff of exactly the jobs blocked on
