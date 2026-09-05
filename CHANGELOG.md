@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.12 — 2026-09-06
+
 ### Added
 
 - `uplink_kbps` (head config): a head-wide upload budget for every transfer
