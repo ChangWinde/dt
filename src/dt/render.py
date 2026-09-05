@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Any, TypeAlias, cast
 
-from rich.console import Console, ConsoleRenderable, RenderHook
+from rich.console import Console, ConsoleRenderable, Group, RenderHook
 from rich.markup import escape
 from rich.table import Table
 
@@ -75,9 +75,28 @@ class _ContentSizedInPipes:
         if self._console.width < UNBOUNDED_PIPE_WIDTH:
             return renderables
         return [
-            content_sized(item) if isinstance(item, Table) else item
+            cast(ConsoleRenderable, _content_size_renderable(item))
             for item in renderables
         ]
+
+
+def _content_size_renderable(item: object) -> object:
+    """Tables nested in a Group (``dt free``) must shrink too.
+
+    The hook only sees the top-level renderable. ``dt free`` prints
+    ``Group(free_table, scheduler_grid)``, so a Table-only check left the
+    resource table expanding to UNBOUNDED_PIPE_WIDTH spaces — the layout
+    0.13.6 claimed to have fixed.
+    """
+    if isinstance(item, Table):
+        return content_sized(item)
+    if isinstance(item, Group):
+        children = [
+            cast(ConsoleRenderable, _content_size_renderable(child))
+            for child in item.renderables
+        ]
+        return Group(*children, fit=item.fit)
+    return item
 
 
 def human_console(**options: Any) -> Console:
