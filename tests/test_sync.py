@@ -230,6 +230,61 @@ def test_sync_artifacts_preserves_relative_file_path(tmp_path, monkeypatch):
     ]
 
 
+def test_sync_artifacts_publication_wakes_the_agent_for_blocked_jobs(
+    tmp_path, monkeypatch
+):
+    """Jobs blocked on artifact-unverified for a node are placeable the moment
+    its store is republished; the publication tells the agent so instead of
+    leaving them to a backoff of up to five minutes. A plan repairs nothing."""
+    from dt.jobs import AGENT_WAKE_ARTIFACTS_REPUBLISHED
+
+    cfg = _cfg(tmp_path)
+    project = tmp_path / "project"
+    checkpoint = project / "outputs" / "model.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"weights")
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "rsync",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            "Number of deleted files: 0\nNumber of regular files transferred: 1\n"
+            "Total transferred file size: 7 bytes\n",
+            "",
+        ),
+    )
+    import dt.dispatch.artifacts as artifacts_mod
+
+    wakes: list[str | None] = []
+    monkeypatch.setattr(
+        artifacts_mod,
+        "request_agent_wake",
+        lambda cfg_, reason=None: wakes.append(reason),
+    )
+
+    dispatch.sync_artifacts(
+        cfg, "omni", project, Node(name="n1"), ["outputs/model.pt"], lambda m: None
+    )
+    assert wakes == [AGENT_WAKE_ARTIFACTS_REPUBLISHED]
+
+    dispatch.sync_artifacts(
+        cfg,
+        "omni",
+        project,
+        Node(name="n1"),
+        ["outputs/model.pt"],
+        lambda m: None,
+        plan=True,
+    )
+    assert wakes == [AGENT_WAKE_ARTIFACTS_REPUBLISHED]
+
+
 def test_sync_artifact_directory_is_an_exact_mirror(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     project = tmp_path / "project"

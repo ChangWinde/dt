@@ -138,11 +138,29 @@ def agent_wake_path(cfg: HeadConfig) -> Path:
     return cfg.agent_dir() / "agent.wake"
 
 
-def request_agent_wake(cfg: HeadConfig) -> None:
+# A wake may name what changed. The agent releases the blocked-job backoff of
+# the entries that change could unblock, instead of every blocked entry (a
+# submission burst would otherwise re-probe the fleet for each of them).
+AGENT_WAKE_ARTIFACTS_REPUBLISHED = "artifacts-republished"
+AGENT_WAKE_MAX_BYTES = 256
+
+
+def request_agent_wake(cfg: HeadConfig, reason: str | None = None) -> None:
     """Best-effort nudge for the resident queue agent."""
     descriptor = -1
     try:
         descriptor = _open_private_lock(agent_wake_path(cfg))
+        if reason is not None:
+            existing = os.pread(descriptor, AGENT_WAKE_MAX_BYTES, 0)
+            reasons = {
+                line for line in existing.decode("ascii", "replace").split() if line
+            }
+            reasons.add(reason)
+            payload = ("\n".join(sorted(reasons)) + "\n").encode("ascii")[
+                :AGENT_WAKE_MAX_BYTES
+            ]
+            os.ftruncate(descriptor, 0)
+            os.pwrite(descriptor, payload, 0)
         os.utime(descriptor)
     except (OSError, RegistryError):
         pass

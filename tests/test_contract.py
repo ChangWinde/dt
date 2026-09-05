@@ -105,12 +105,13 @@ def test_contract_human_view_lists_commands_on_stderr_only():
 
 
 def test_every_visible_command_has_a_row_in_the_command_reference():
+    """Subcommands included: an agent reading the reference for `dt agent
+    stop` or `dt matrix status` must find them, not just their parent."""
     docs = DOCS.read_text()
     missing = [
         command["name"]
         for command in _document()["commands"]
         if f"`dt {command['name']}`" not in docs
-        and f"`dt {command['path'][0]}`" not in docs
     ]
     assert not missing, missing
 

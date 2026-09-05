@@ -900,6 +900,16 @@ def doctor_table(rows: list[JsonRow]) -> Table:
             value = str(checks.get(name, "-"))
             if value != "-":
                 values.append(f"{name}:{paint(value)}")
+        # GPU jobs fail closed without Linger=yes; a field report found the
+        # verdict only in the "next:" hint below the table, never in it.
+        gpu = str(checks.get("gpu", "-"))
+        linger = str(checks.get("linger", "-"))
+        if (
+            gpu not in ("-", "missing")
+            and not gpu.startswith("error")
+            and linger not in ("-", "yes")
+        ):
+            values.append(f"linger:{paint(linger)}")
         return " ".join(values) or "-"
 
     one_center = len({r.get("center") for r in rows}) <= 1

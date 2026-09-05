@@ -22,7 +22,7 @@ import uuid
 from .. import dispatch as _root
 from .. import sync_relay
 from ..config import HeadConfig, Node, head_bwlimit_kbps
-from ..jobs import sanitize_name
+from ..jobs import AGENT_WAKE_ARTIFACTS_REPUBLISHED, request_agent_wake, sanitize_name
 from ..layout import (
     ROLE_LAYOUT,
     display_node_path,
@@ -1162,6 +1162,10 @@ def sync_artifacts(
                 on_retry=on_retry,
                 cancel_event=cancel_event,
             )
+            # Jobs blocked on artifact-unverified for this node are placeable
+            # again; without the nudge they sit out a backoff of up to five
+            # minutes on a store that is already repaired.
+            request_agent_wake(cfg, reason=AGENT_WAKE_ARTIFACTS_REPUBLISHED)
 
     manifest_path = f"{root_rel}/.dt/manifests/{manifest_sha256}.json"
     result: dict[str, object] = {

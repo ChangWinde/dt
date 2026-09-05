@@ -6,6 +6,35 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `docs/agent-playbook.md`: how a program or an AI agent drives dt — discover
+  the surface with `dt contract --json`, the submit / bounded-wait / read /
+  recover loop, how to read a queued job's `reason` and what remedies each
+  one has, error documents and exit codes, and what dt guarantees so the
+  caller need not (content-sized piped output, untouched stdin, durable
+  submissions, backoff release on capacity or artifact changes).
+- `dt doctor`'s table shows `linger:no` (or `linger:unavailable`) in the
+  control column of a GPU node whose user manager does not linger; the
+  verdict used to live only in the hint below the table.
+
+### Fixed
+
+- Republishing an artifact store (`dt sync NODE --artifact PATH`, or the
+  publication inside `dt run --artifact`) wakes the resident agent with a
+  reason, and the agent releases the backoff of exactly the jobs blocked on
+  `artifact-unverified`; they used to wait up to five minutes on a store that
+  was already repaired. Other blocked entries keep their backoff, so a
+  submission burst still does not re-probe the fleet for each of them.
+- `dt run` accepts a center probe taken within the last three seconds (the
+  agent refreshes it every two seconds while jobs are queued) instead of
+  always paying for a fresh fleet-wide probe — the slowest node's round trip,
+  3–8 s on a head with jump-host nodes. The launcher's locked capacity check
+  still guards every placement.
+- `docs/command-reference.md` lists every `dt agent` and `dt matrix`
+  subcommand by name; the contract test now requires an exact row per
+  subcommand rather than accepting the parent.
+
 ## 0.13.10 — 2026-09-06
 
 ### Fixed

@@ -28,7 +28,7 @@ This page helps operators choose a command and handle its result. Run
 | Command | Purpose |
 |---|---|
 | `dt batch` | Submit independent same-node, same-snapshot items |
-| `dt matrix` | Expand a declarative YAML/JSON sweep into retry-safe per-unit submissions |
+| `dt matrix plan` / `dt matrix run` / `dt matrix status` | Expand a declarative YAML/JSON sweep into retry-safe per-unit submissions: preview it, submit it, or read its durable receipt |
 | `dt chain` | Submit stages gated on predecessor success |
 | `dt fork` | Submit from an exact historical snapshot |
 | `dt rerun` | Submit the historical command with current project code |
@@ -44,7 +44,7 @@ This page helps operators choose a command and handle its result. Run
 |---|---|
 | `dt doctor` | Verify SSH, tools, GPU runtime, transfer, and agent contracts |
 | `dt topology` | Probe and explain directed P2P data edges without transferring artifacts |
-| `dt agent` | Install, start, stop, inspect, or foreground the queue agent (`--json` receipts on every subcommand but `run`) |
+| `dt agent install` / `dt agent start` / `dt agent stop` / `dt agent status` / `dt agent run` | Install, start, stop, inspect, or foreground the queue agent (`--json` receipts on every subcommand but `run`; `stop` waits for an in-flight dispatch and exits 1 with `still_running` when the agent outlives `--timeout`) |
 | `dt attach` | Enter the job's managed tmux session |
 | `dt kill` | Terminate and verify a complete job process group |
 | `dt events` | Query the bounded, redacted operation journal on this host or a head |

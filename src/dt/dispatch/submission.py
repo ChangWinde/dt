@@ -1040,8 +1040,13 @@ def _probe_for_submission(
         pinned = by_name[spec.node]
         statuses = [_probe_pinned_node(cfg, pinned)]
     else:
+        # A probe the agent or another command took within CACHE_TTL_S (3 s)
+        # is as good as one taken now: the launcher re-checks capacity under
+        # its lock either way, and a full center probe is the slowest node's
+        # round trip (3-8 s on a head with jump-host nodes), paid by every
+        # submission. Only a cache that fresh is accepted; older is re-probed.
         log(f"probing {cfg.center} nodes")
-        statuses = _root.probe_center(cfg, use_cache=False)
+        statuses = _root.probe_center(cfg, use_cache=True)
     probe_reasons = {
         s.node: probe_rejection_reason(s, spec)
         for s in statuses

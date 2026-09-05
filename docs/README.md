@@ -12,6 +12,7 @@ while developing and validating DistTrainer.
 | Design queues, chains, forks, and comparisons | [Experiment workflows](workflows.md) |
 | Operate the queue agent and recover failures | [Operations](operations.md) |
 | Choose commands and handle exit codes | [Command reference](command-reference.md) |
+| Drive dt from a program or an AI agent | [Agent playbook](agent-playbook.md) |
 | Understand control and data flow | [Architecture](architecture.md) |
 | Build and promote a release | [Release procedure](releasing.md) |
 
