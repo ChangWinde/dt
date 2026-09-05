@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.13 — 2026-09-06
+
 ### Fixed
 
 - Queued jobs launch with the dispatching head's runtime payload. A job
