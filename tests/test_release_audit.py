@@ -181,3 +181,12 @@ def test_bundle_audit_final_open_does_not_follow_replacement_symlink(
 
     with pytest.raises(ValueError, match="changed|regular|symlink"):
         audit_release.audit_bundle(str(bundle), set())
+
+
+def test_changelog_has_no_internal_deployment_references():
+    """CHANGELOG ships in the sdist; a host name there fails package-check."""
+    content = (Path(__file__).parents[1] / "CHANGELOG.md").read_bytes()
+    match = audit_release.INTERNAL_PATTERN.search(content)
+    assert match is None, (
+        f"internal deployment reference in CHANGELOG.md: {match.group()!r}"
+    )

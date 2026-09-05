@@ -14,8 +14,9 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   the probe used to pipe the document through `head -c 65537` into a Python
   argv — both of which truncate it into invalid JSON. The probe now reads the
   document from a temp file and only refuses a document larger than 16 MiB or
-  one whose `alive` field is not a boolean. Deploying 0.13.6 to psibot-hm
-  was refused by this check until the script was repaired.
+  one whose `alive` field is not a boolean. Deploying 0.13.6 onto a
+  production head with a long queue was refused by this check until the
+  script was repaired.
 - `dt agent status --json --brief` omits the per-job `scheduler.queue` array
   (`queue: []`, `queue_omitted: N`, `brief: true`) so routine polling and
   deploy stay a few hundred bytes. The full document remains the default.
