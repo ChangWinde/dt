@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.16 — 2026-09-06
+
 ### Changed
 
 - Artifact verification at job start reuses the previous verification of an
