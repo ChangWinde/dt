@@ -74,6 +74,12 @@ ARTIFACT_LOCK_CHMOD = "a-w"
 # first and the list stays short.
 ARTIFACT_LINK_DEST_LIMIT = 4
 ARTIFACT_LINK_DEST_PROBE_TIMEOUT_S = 20
+# The node re-hashes every published byte before the manifest goes live. A
+# fixed five-minute ceiling fitted small stores; a 40 GB store on a spinning
+# disk needs longer, so the bound grows with the bytes at a deliberately
+# pessimistic disk rate and stays under the bulk-transfer ceiling.
+ARTIFACT_VERIFY_MIN_TIMEOUT_S = 300
+ARTIFACT_VERIFY_BYTES_PER_S = 50 * 1024 * 1024
 _ARTIFACT_STORE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 # Head-side memory of every verified publication: which manifests exist on
 # which node, so `--artifact-manifest` can resolve a unique digest prefix.
@@ -818,6 +824,14 @@ def resolve_artifact_manifest_reference(
     )
 
 
+def artifact_verify_timeout_s(source_bytes: int) -> float:
+    """How long the node may take to re-hash ``source_bytes`` at publish time."""
+    scaled = max(0, source_bytes) / ARTIFACT_VERIFY_BYTES_PER_S
+    return float(
+        min(BULK_TRANSFER_TIMEOUT_S, max(ARTIFACT_VERIFY_MIN_TIMEOUT_S, scaled))
+    )
+
+
 def _publish_verified_artifact_manifest(
     node: Node,
     root_rel: str,
@@ -828,6 +842,7 @@ def _publish_verified_artifact_manifest(
     bwlimit_kbps: int | None,
     on_retry: Callable[[RsyncRetryEvent], None] | None,
     cancel_event: Event | None,
+    verify_timeout_s: float = ARTIFACT_VERIFY_MIN_TIMEOUT_S,
 ) -> None:
     """Verify remote artifact bytes before atomically publishing their manifest.
 
@@ -931,7 +946,7 @@ def _publish_verified_artifact_manifest(
         f"chmod 700 {node_path_expression(manifest_rel)}; "
         f"mv -f -- {node_path_expression(incoming_manifest_rel)} "
         f"{node_path_expression(manifest_path)}",
-        timeout=300,
+        timeout=verify_timeout_s,
     )
     if verified.returncode != 0:
         detail = diagnostic_excerpt(
@@ -1702,6 +1717,9 @@ def sync_artifacts(
                 bwlimit_kbps=effective_bwlimit,
                 on_retry=on_retry,
                 cancel_event=cancel_event,
+                verify_timeout_s=artifact_verify_timeout_s(
+                    sum(source_bytes for _r, _s, _d, source_bytes, *_ in sources)
+                ),
             )
             try:
                 _set_artifact_store_lock(node, root_rel, relatives, lock=True)

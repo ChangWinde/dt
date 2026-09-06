@@ -352,8 +352,14 @@ and the second and third syncs finish in the time it takes the node to
 checksum them, not the 24 minutes the WAN transfer took. The hard links are
 safe because the store is read-only: a republication that changes a file
 writes a new inode into that project's store only, and the sibling keeps its
-verified bytes. The `--json` row reports the sibling stores used under
+verified bytes. A sibling store published by an older release (files still
+writable) is copied on the node instead of hard-linked — also without a
+network transfer — until its own next sync locks it. The `--json` row
+reports the sibling stores used under
 `reused_from`; `store_locked` says whether the read-only guard is in place.
+To remove a store by hand on the node, reopen it first
+(`chmod -R u+w ~/dt/worker/artifacts/PROJECT && rm -rf ~/dt/worker/artifacts/PROJECT`);
+`dt storage` already counts hard-linked bytes once.
 
 Programs that expect repo-relative paths do not need hand-rolled symlink
 bridges from `$DT_ARTIFACT_ROOT`. Declare the workspace link instead:

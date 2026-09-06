@@ -454,6 +454,34 @@ def test_artifact_push_matches_direct_semantics():
     assert "10.0.0.7:" in single
 
 
+def test_artifact_push_locks_the_store_and_carries_link_dest_baselines():
+    node = Node(name="worker", site="lab", lan_address="10.0.0.7")
+
+    pushed = sync_relay.push_artifact_command(
+        node,
+        "omni",
+        "data",
+        "dt/artifacts/omni/data",
+        is_dir=True,
+        link_dests=["../../alpha/data", "../../beta/data"],
+    )
+
+    assert "--chmod=a-w" in pushed
+    assert "--link-dest=../../alpha/data --link-dest=../../beta/data" in pushed
+    # rsync resolves relative baselines against the receiving directory, so
+    # they must precede the destination and never be shell-expanded there.
+    assert pushed.index("--link-dest=") < pushed.index("10.0.0.7:")
+    with pytest.raises(RelayError, match="link-dest"):
+        sync_relay.push_artifact_command(
+            node,
+            "omni",
+            "data",
+            "dt/artifacts/omni/data",
+            is_dir=True,
+            link_dests=["--rsync-path=evil"],
+        )
+
+
 def test_artifact_push_requires_a_lan_address():
     with pytest.raises(RelayError):
         sync_relay.push_artifact_command(

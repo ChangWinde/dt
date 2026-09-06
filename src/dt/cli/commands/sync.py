@@ -150,10 +150,28 @@ def _sync_transfer_summary(row: JsonDict, *, plan: bool) -> str:
     manifest = row.get("artifact_manifest_sha256")
     if isinstance(manifest, str):
         moved += f" · manifest {manifest[:12]}"
+    reused_from = _reused_stores(row)
+    if reused_from:
+        moved += f" · reused from {', '.join(reused_from)}"
     duration = as_number(row.get("duration_s"))
     if duration is not None:
         moved += f" · {_fmt_short_duration(duration)}"
     return moved
+
+
+def _reused_stores(row: JsonDict) -> list[str]:
+    """Sibling stores whose identical content was hard-linked, in row order."""
+    stores: list[str] = []
+    artifacts = row.get("artifacts")
+    if not isinstance(artifacts, list):
+        return stores
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        for name in artifact.get("reused_from") or []:
+            if isinstance(name, str) and name not in stores:
+                stores.append(name)
+    return stores
 
 
 def _print_sync_row(name: str, row: JsonDict, *, plan: bool) -> None:
@@ -461,9 +479,15 @@ def _superseded_manifest_jobs(
 def _print_artifact_manifest_notes(name: str, row: JsonDict, *, plan: bool) -> None:
     manifest = row.get("artifact_manifest_sha256")
     if isinstance(manifest, str) and not plan:
-        # --artifact-manifest takes the whole digest; the 12-character prefix
-        # in the summary line is for reading, this line is for pasting.
+        # The 12-character prefix in the summary line is the shortest
+        # --artifact-manifest this head resolves; this line is the whole
+        # digest for scripts and for other heads.
         err.print(f"[dim]{escape(name)}: --artifact-manifest {escape(manifest)}[/dim]")
+    if row.get("store_locked") is False and not plan:
+        err.print(
+            f"[yellow]{escape(name)}: the artifact store could not be made "
+            "read-only; jobs may write into it until the next sync locks it[/yellow]"
+        )
     superseded = row.get("superseded_manifests")
     if not isinstance(superseded, list) or not superseded:
         return

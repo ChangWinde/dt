@@ -437,6 +437,32 @@ def test_link_dest_probe_ranks_exact_digest_stores_first_through_a_real_shell(
         "0 ../escape\n2 late\nnope\n1 ok.store\n"
     ) == ["ok.store"]
 
+    # Gateway mirrors: one level deeper (<project>/artifacts), no manifests.
+    mirrors = home / ".dt" / "sync-staging"
+    (mirrors / "ratimage" / "artifacts" / "data" / "il_demos").mkdir(parents=True)
+    (mirrors / "ratimage_c" / "artifacts").mkdir(parents=True)
+    (mirrors / "lrd" / "code").mkdir(parents=True)
+    mirror_probe = sshio.run_local(
+        dispatch.link_dest_probe_command(
+            ".dt/sync-staging",
+            "ratimage_c",
+            "data/il_demos",
+            is_dir=True,
+            digest=digest,
+            root_suffix="/artifacts",
+            manifests_subdir=None,
+        ),
+        timeout=10,
+    )
+    assert dispatch.parse_link_dest_probe(mirror_probe.stdout) == ["ratimage"]
+    assert dispatch.link_dest_paths(
+        ["ratimage"],
+        parent_rel=".dt/sync-staging",
+        destination_dir_rel=".dt/sync-staging/ratimage_c/artifacts/data/il_demos",
+        directory_rel="data/il_demos",
+        root_suffix="/artifacts",
+    ) == ["../../../../ratimage/artifacts/data/il_demos"]
+
 
 def test_artifact_store_permission_command_locks_only_the_stores_own_directories(
     tmp_path, monkeypatch
@@ -2043,6 +2069,48 @@ def test_sync_cli_routes_explicit_artifacts_without_syncing_code(
     assert row["mode"] == "artifacts"
 
 
+def test_sync_cli_human_summary_names_reused_stores_and_an_unlocked_store(
+    tmp_path, monkeypatch
+):
+    import dt.cli as cli
+
+    cfg = _cfg(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    cfg.projects["omni"] = Project(path=project)
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        dispatch,
+        "sync_artifacts",
+        lambda cfg_, project_name, project_dir, node, artifacts, log, **kwargs: {
+            "node": node.name,
+            "project": project_name,
+            "mode": "artifacts",
+            "path": "~/dt/artifacts/omni",
+            "transferred_bytes": 0,
+            "transferred_gib": 0.0,
+            "deleted_files": 0,
+            "transferred_files": 0,
+            "artifacts": [
+                {"source": "data", "reused_from": ["alpha", "beta"]},
+                {"source": "model.pt", "reused_from": ["alpha"]},
+            ],
+            "artifact_manifest_sha256": "c" * 64,
+            "artifact_manifest_path": "~/dt/artifacts/omni/.dt/manifests/c.json",
+            "store_locked": False,
+        },
+    )
+
+    result = CliRunner().invoke(
+        cli.app, ["sync", "n1", "-p", "omni", "--artifact", "data"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "reused from alpha, beta" in result.output
+    assert "manifest cccccccccccc" in result.output
+    assert "could not be made read-only" in result.output
+
+
 def test_sync_artifacts_names_queued_jobs_pinned_to_the_superseded_manifest(
     tmp_path, monkeypatch
 ):
@@ -2836,3 +2904,10 @@ def test_sync_cli_generic_failure_dominates_mixed_nodes(tmp_path, monkeypatch):
         "sync_failed",
     ]
     assert [row["exit_code"] for row in rows] == [cli.EXIT_UNREACHABLE, 1]
+
+
+def test_artifact_verify_timeout_grows_with_the_bytes_the_node_must_rehash():
+    assert dispatch.artifact_verify_timeout_s(0) == 300
+    assert dispatch.artifact_verify_timeout_s(7_900_000_000) == 300
+    assert dispatch.artifact_verify_timeout_s(40 * 2**30) == 40 * 2**30 / (50 * 2**20)
+    assert dispatch.artifact_verify_timeout_s(2**60) == sshio.BULK_TRANSFER_TIMEOUT_S
