@@ -18,7 +18,7 @@ from typing import Callable, Iterator
 from uuid import uuid4
 
 from . import snapshot_hash as snapshot_hash_mod
-from .config import HeadConfig, Node, Site
+from .config import HeadConfig, Node, Site, head_bwlimit_kbps
 from .jobs import job_lock, load
 from .layout import node_path, node_path_expression, rsync_destination
 from .link_metrics import (
@@ -684,6 +684,11 @@ class TransferExecutor:
                 timeout=BULK_TRANSFER_TIMEOUT_S,
                 retries=2,
                 on_retry=on_retry,
+                # The cold upload is the one cross-site leg of a topology-aware
+                # placement and leaves the head like any direct snapshot; the
+                # head's uplink budget must pace it too (field report: an
+                # unpaced site-cache upload stalled the operator's desktop).
+                bwlimit_kbps=head_bwlimit_kbps(self.cfg, cache_node.name, None),
             )
             if proc.returncode != 0:
                 detail = diagnostic_excerpt(
@@ -1513,6 +1518,7 @@ class TransferExecutor:
                 # The site route already exhausted its own bounded retries. One
                 # fallback attempt avoids multiplying congestion on both routes.
                 retries=0,
+                bwlimit_kbps=head_bwlimit_kbps(self.cfg, destination.name, None),
             )
             if proc.returncode != 0:
                 detail = diagnostic_excerpt(

@@ -332,10 +332,34 @@ republish it with dt sync --artifact before jobs pinned to it can start here
 ```
 
 Republishing with `dt sync NODE --artifact PATH` restores the store; the
-blocked jobs retry on their own. Treat `$DT_ARTIFACT_ROOT` and every
-`--artifact-target` link as read-only inside a job — anything written there
-lands in the shared store and blocks every later job of the project on that
-node until it is republished.
+blocked jobs retry on their own. The store *is* read-only inside a job:
+`dt sync --artifact` publishes every file without write bits (`0444`, or
+`0555` for executables) and every directory as `0555`, then reopens only its
+own directories for the next publication. A job that writes through
+`$DT_ARTIFACT_ROOT` or an `--artifact-target` link, appends to an input, or
+plants a symlink beside one gets `Permission denied` at the write instead of
+silently poisoning the store for every later job of the project on that node.
+The manifest identity (`dt_artifact_manifest_v2`) ignores write bits, so the
+writable source on the head and the locked copy on the node share one digest.
+
+Identical content is stored once per node. Before transferring an artifact,
+`dt sync` asks the node which sibling project stores already hold that path
+(a store whose published manifest carries the same digest is preferred) and
+lets rsync hard-link every byte-identical file from there instead of sending
+it again; only the files that really differ cross the network. Three projects
+that point at one code path therefore cost one copy of their 7.9 GB of inputs
+and the second and third syncs finish in the time it takes the node to
+checksum them, not the 24 minutes the WAN transfer took. The hard links are
+safe because the store is read-only: a republication that changes a file
+writes a new inode into that project's store only, and the sibling keeps its
+verified bytes. A sibling store published by an older release (files still
+writable) is copied on the node instead of hard-linked — also without a
+network transfer — until its own next sync locks it. The `--json` row
+reports the sibling stores used under
+`reused_from`; `store_locked` says whether the read-only guard is in place.
+To remove a store by hand on the node, reopen it first
+(`chmod -R u+w ~/dt/worker/artifacts/PROJECT && rm -rf ~/dt/worker/artifacts/PROJECT`);
+`dt storage` already counts hard-linked bytes once.
 
 Programs that expect repo-relative paths do not need hand-rolled symlink
 bridges from `$DT_ARTIFACT_ROOT`. Declare the workspace link instead:
@@ -365,6 +389,17 @@ Jobs still queued with the old digest bounce off that node as
 `artifact-unverified` until resubmitted; `dt sync --artifact` names them when
 it finishes (`superseded_manifests` in `--json`) and prints the whole new
 digest ready to paste into `--artifact-manifest`.
+
+`--artifact-manifest` also accepts a unique prefix of at least 12 hex
+characters — the width `dt sync` and `dt info` print. The head expands it
+against every manifest it has published (its publication journal) or pinned
+to a job for the project; an ambiguous prefix fails with the candidate
+digests listed, an unknown one asks for the digest `dt sync` printed. From a
+laptop the prefix is forwarded verbatim and resolved on the head.
+
+```bash
+dt run --node gpu-node-1 --artifact-manifest 3f9c0a12b7de -n evaluation -- python evaluate.py
+```
 
 ## Compare evidence
 

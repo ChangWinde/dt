@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -171,6 +172,84 @@ def parse_pull_outputs_census(stdout: str) -> PullCensus | None:
         total_files=max(total_files, len(files)),
         truncated=total_files > len(files),
     )
+
+
+_UNMODELLED_EXCLUDE_SYNTAX = re.compile(r"[\[\]\\]|\*\*\*")
+
+
+def _rsync_glob_regex(pattern: str) -> str:
+    """Translate one rsync wildcard pattern into a regular expression body.
+
+    ``**`` crosses directory boundaries, ``*`` and ``?`` do not, and a leading
+    ``**/`` also matches zero directories (wildmatch semantics).
+    """
+    pieces: list[str] = []
+    index = 0
+    while index < len(pattern):
+        if pattern.startswith("**/", index):
+            pieces.append("(?:.*/)?")
+            index += 3
+        elif pattern.startswith("**", index):
+            pieces.append(".*")
+            index += 2
+        elif pattern[index] == "*":
+            pieces.append("[^/]*")
+            index += 1
+        elif pattern[index] == "?":
+            pieces.append("[^/]")
+            index += 1
+        else:
+            pieces.append(re.escape(pattern[index]))
+            index += 1
+    return "".join(pieces)
+
+
+class PullExcludeFilter:
+    """Which census rows rsync's ``--exclude`` patterns would have skipped.
+
+    A missing local file is only evidence of a broken transfer when no
+    exclude pattern covers it. This models the ``--exclude`` subset dt and its
+    operators use (basename globs, ``dir/`` rules, anchored ``/dt/``,
+    ``**/`` paths); ``exact`` turns false when a pattern uses syntax that is
+    not modelled (character classes, escapes, ``***``, filter-rule prefixes),
+    and callers then fall back to checking only the files that did arrive.
+    """
+
+    def __init__(self, patterns: list[str]) -> None:
+        self.exact = True
+        self._rules: list[tuple[re.Pattern[str], bool]] = []
+        for raw in patterns:
+            pattern = raw.strip()
+            if (
+                not pattern
+                or pattern == "!"
+                or pattern.startswith(("+ ", "- "))
+                or _UNMODELLED_EXCLUDE_SYNTAX.search(pattern) is not None
+            ):
+                self.exact = False
+                continue
+            directory_only = pattern.endswith("/")
+            anchored = pattern.startswith("/")
+            body = pattern.strip("/")
+            if not body:
+                self.exact = False
+                continue
+            regex = _rsync_glob_regex(body)
+            expression = f"^{regex}$" if anchored else f"^(?:.*/)?{regex}$"
+            self._rules.append((re.compile(expression), directory_only))
+
+    def excludes(self, relative: str) -> bool:
+        """Whether ``relative`` (an outputs-relative file) is excluded."""
+        parts = relative.split("/")
+        for depth in range(1, len(parts)):
+            ancestor = "/".join(parts[:depth])
+            if any(rule.match(ancestor) for rule, _directory_only in self._rules):
+                return True
+        return any(
+            rule.match(relative)
+            for rule, directory_only in self._rules
+            if not directory_only
+        )
 
 
 def pull_census_mismatches(

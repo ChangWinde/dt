@@ -691,3 +691,61 @@ def test_laptop_seed_ctrl_c_json_is_one_complete_resume_payload(
     assert "remote caches and partial data were not deleted" in payload["message"]
     assert "dt seed n1 --hf -c test --json" in payload["message"]
     assert result.stdout.count("\n") == 1
+
+
+def test_seed_paces_every_head_leg_with_the_uplink_budget(tmp_path, monkeypatch):
+    """`dt seed` ships the head's whole uv cache to a node, yet it was the one
+    head-side bulk transfer without a bandwidth budget: on a home uplink it
+    saturated the line like an unbudgeted snapshot. The site default and the
+    head's uplink budget now apply, and --bwlimit overrides both."""
+    from dt.config import Site
+
+    nodes = [
+        Node(name="worker", site="lab"),
+        Node(name="lone"),
+        Node(name="head", local=True),
+    ]
+    cfg = _cfg(tmp_path, nodes)
+    cfg.sites["lab"] = Site(
+        name="lab",
+        nodes=("worker",),
+        gateway="worker",
+        cache_node="worker",
+        bwlimit_kbps=4000,
+    )
+    cfg.uplink_kbps = 4500
+    _local_seed_sources(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        cli, "run_on", lambda *a, **k: subprocess.CompletedProcess([], 0, "", "")
+    )
+    budgets = []
+
+    def fake_rsync(src, dst, **kwargs):
+        budgets.append((dst.split(":")[0], kwargs.get("bwlimit_kbps")))
+        return subprocess.CompletedProcess(
+            [], 0, "Total transferred file size: 1 bytes\n", ""
+        )
+
+    monkeypatch.setattr(cli, "rsync", fake_rsync)
+
+    result = CliRunner().invoke(cli.app, ["seed", "worker", "lone", "head", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert dict(budgets) == {"worker": 4000, "lone": 4500}
+    rows = json.loads(result.stdout)
+    assert rows[2]["status"] == "skipped"  # the head never seeds itself
+
+    budgets.clear()
+    result = CliRunner().invoke(
+        cli.app, ["seed", "worker", "--bwlimit", "800", "--json"]
+    )
+    assert result.exit_code == 0, result.output
+    assert dict(budgets) == {"worker": 800}
+
+    rejected = CliRunner().invoke(
+        cli.app, ["seed", "worker", "--bwlimit", "0", "--json"]
+    )
+    assert rejected.exit_code == 1
+    assert "positive KiB/s" in json.loads(rejected.stdout)["message"]

@@ -40,6 +40,7 @@ from .. import (
     _fmt_short_duration,
     _format_transfer_bytes,
     _head_command,
+    _resolve_artifact_manifest_option,
     _submission_payload,
     _validate_submission_request_id,
     _validate_submission_resources,
@@ -678,7 +679,10 @@ def run(
     artifact_manifest: Optional[str] = typer.Option(
         None,
         "--artifact-manifest",
-        help="bind a dt sync --artifact content manifest SHA-256",
+        help=(
+            "bind a dt sync --artifact content manifest: the SHA-256 digest or "
+            "a unique prefix of at least 12 hex characters"
+        ),
         rich_help_panel="Reproducibility",
     ),
     artifact: Optional[list[str]] = typer.Option(
@@ -936,6 +940,12 @@ def run(
             json_=json_,
         )
 
+    artifact_manifest = _resolve_artifact_manifest_option(
+        cfg,
+        artifact_manifest,
+        project=project,
+        json_=json_,
+    )
     request = SubmissionRequest(
         name=picked_name,
         gpus=gpus,
@@ -1263,7 +1273,10 @@ def task(
     artifact_manifest: Optional[str] = typer.Option(
         None,
         "--artifact-manifest",
-        help="bind a dt sync --artifact content manifest SHA-256",
+        help=(
+            "bind a dt sync --artifact content manifest: the SHA-256 digest or "
+            "a unique prefix of at least 12 hex characters"
+        ),
     ),
     artifact: Optional[list[str]] = typer.Option(
         None,
@@ -1394,6 +1407,12 @@ def task(
         )
         raise typer.Exit(rc)
 
+    artifact_manifest = _resolve_artifact_manifest_option(
+        cfg,
+        artifact_manifest,
+        project=project,
+        json_=json_,
+    )
     request = SubmissionRequest(
         name=picked_name,
         gpus=gpus,

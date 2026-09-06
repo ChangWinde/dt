@@ -291,3 +291,47 @@ def test_sync_project_budgets_head_legs_only(tmp_path, monkeypatch):
     # The LAN replay command never carries a --bwlimit.
     pushes = [cmd for cmd in relay_commands if "rsync" in cmd]
     assert pushes and all("--bwlimit" not in cmd for cmd in pushes)
+
+
+def test_site_cache_upload_and_direct_fallback_carry_the_head_budget(
+    tmp_path, monkeypatch
+):
+    """The cold cross-site upload of a topology-aware placement and its explicit
+    direct fallback leave the head exactly like a direct snapshot, yet neither
+    carried the uplink budget: on a home line the unpaced upload stalled the
+    operator's remote desktop while the code snapshot crawled into a site
+    cache (field report). The head's own local node stays unbudgeted."""
+    import dt.artifact_distribution as module
+
+    cfg = _cfg(tmp_path, site_limit=None)
+    cfg.uplink_kbps = 4500
+    cfg.nodes.append(Node(name="head", local=True))
+    budgets = []
+
+    def fake_rsync(src, dst, **kwargs):
+        budgets.append((dst, kwargs.get("bwlimit_kbps")))
+        return subprocess.CompletedProcess(
+            [], 0, "Total transferred file size: 1,024 bytes\n", ""
+        )
+
+    monkeypatch.setattr(module, "rsync", fake_rsync)
+    monkeypatch.setattr(
+        module,
+        "run_on",
+        lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(module.ArtifactVerifier, "require", lambda *args: None)
+    executor = module.TransferExecutor(cfg)
+
+    executor._populate_cache(
+        tmp_path / "snapshot", cfg.sites["lab"], cfg.nodes[1], "f" * 64, None
+    )
+    executor._direct_fallback(
+        tmp_path / "snapshot", "f" * 64, cfg.nodes[0], "dt/jobs/j/code", None, 0.0
+    )
+    executor._direct_fallback(
+        tmp_path / "snapshot", "f" * 64, cfg.nodes[3], "dt/jobs/j/code", None, 0.0
+    )
+
+    assert [budget for _dst, budget in budgets] == [4500, 4500, None]
+    assert budgets[0][0].startswith("gw:") and budgets[1][0].startswith("worker:")

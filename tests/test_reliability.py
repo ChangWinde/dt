@@ -3587,6 +3587,13 @@ def test_pull_prestart_failure_recovers_job_and_env_log_without_outputs(
         "route_gateway": None,
         "route_reason": "node belongs to no configured site",
         "application_outputs_recovered": False,
+        "logs_verification": {
+            "status": "verified",
+            "scope": "excluded_files_skipped",
+            "files_checked": 0,
+            "files_on_node": 0,
+            "census_truncated": False,
+        },
         "records_scope": "dt_control_allowlist",
         "evidence_provenance": None,
         "outputs_present": False,
@@ -3678,6 +3685,20 @@ def test_pull_json_success_contract(tmp_path, monkeypatch):
         "route_gateway": None,
         "route_reason": "node belongs to no configured site",
         "application_outputs_recovered": True,
+        "verification": {
+            "status": "verified",
+            "scope": "excluded_files_skipped",
+            "files_checked": 0,
+            "files_on_node": 0,
+            "census_truncated": False,
+        },
+        "logs_verification": {
+            "status": "verified",
+            "scope": "excluded_files_skipped",
+            "files_checked": 0,
+            "files_on_node": 0,
+            "census_truncated": False,
+        },
         "records_scope": "dt_control_allowlist",
         "evidence_provenance": None,
         "records": ["dt/job.json"],
@@ -4566,6 +4587,76 @@ def test_pull_census_parser_and_mismatch_report(tmp_path):
     )
 
 
+@pytest.mark.real_transport
+def test_pull_exclude_filter_agrees_with_rsync(tmp_path):
+    """The census judges a missing file by the same --exclude patterns rsync
+    applied; the model must agree with the real rsync on the patterns dt ships
+    (--lite, the reserved /dt/) and the shapes operators type."""
+    import os
+
+    source = tmp_path / "outputs"
+    for relative in (
+        "a.pt",
+        "top.txt",
+        "notes/top.txt",
+        "dt/resources.jsonl",
+        "x/dt/y.bin",
+        "checkpoints/c1.bin",
+        "deep/checkpoints/c2.bin",
+        "q/.cache/w",
+        "models/m.safetensors",
+        "profiler/trace.json.gz",
+        "runs/r1/profiler/xtrace.json",
+        "runs/r1/profiler/other.txt",
+        "sub/a.log",
+        "sub/deeper/b.log",
+        "mid/f",
+        "k/mid/g",
+        "bar/foo",
+        "bar/foo2",
+        "deep/x",
+        "w/deep/x",
+    ):
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("d")
+    everything = {
+        os.path.relpath(os.path.join(root, name), source)
+        for root, _dirs, names in os.walk(source)
+        for name in names
+    }
+    for patterns in (
+        [*cli.LITE_PULL_EXCLUDES, *cli.PULL_RESERVED_EXCLUDES],
+        ["sub/*.log"],
+        ["**/deep/x"],
+        ["foo"],
+        ["/top.txt"],
+        ["mid/"],
+        ["deep/x"],
+        ["r?ns/"],
+    ):
+        argv = ["rsync", "-a", "--dry-run", "--out-format=%n"]
+        for pattern in patterns:
+            argv += ["--exclude", pattern]
+        listing = subprocess.run(
+            [*argv, f"{source}/", str(tmp_path / "dst") + "/"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        rsync_would_send = {
+            line for line in listing.splitlines() if line and not line.endswith("/")
+        }
+        exclude_filter = transfers.PullExcludeFilter(patterns)
+        assert exclude_filter.exact, patterns
+        assert {
+            relative for relative in everything if not exclude_filter.excludes(relative)
+        } == rsync_would_send, patterns
+
+    assert transfers.PullExcludeFilter(["eval/[st]*"]).exact is False
+    assert transfers.PullExcludeFilter(["- foo"]).exact is False
+
+
 def test_pull_census_runs_through_the_real_local_transport(tmp_path, monkeypatch):
     """The census command must be accepted by run_on as dt ships it (a first
     version asked for a capture limit above the transport's ceiling, which
@@ -4669,7 +4760,7 @@ def test_pull_refuses_to_report_success_when_the_local_tree_does_not_match_the_n
     payload = json.loads(result.stdout)
     assert payload["status"] == "error"
     assert payload["error"] == "incomplete_transfer"
-    assert "2 of 2 files differ from n1" in payload["message"]
+    assert "2 of 2 outputs files differ from n1" in payload["message"]
     assert (
         "size mismatch: models/victim/dagger2_seed1/window-open-v2_DRQV2.pt"
         in (payload["message"])
@@ -4683,6 +4774,223 @@ def test_pull_refuses_to_report_success_when_the_local_tree_does_not_match_the_n
     human = CliRunner().invoke(cli.app, ["pull", "jid", "--to", str(destination)])
     assert human.exit_code == 1
     assert "must not be trusted" in human.output
+
+
+def _census_pull_setup(tmp_path, monkeypatch, *, status, census_rows, transfer):
+    cfg = _cfg(tmp_path)
+    entry = JobEntry(
+        job_id="jid",
+        name="job",
+        center="test",
+        project="p",
+        node="n1",
+        node_local=False,
+        job_dir="dt/jobs/jid",
+        session="dt_jid",
+        cmd="true",
+        status=status,
+        exit_code=None if status == "running" else 0,
+    )
+    destination = tmp_path / "result"
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+    monkeypatch.setattr(cli.jobs_mod, "find", lambda _cfg, _ref: entry)
+    monkeypatch.setattr(
+        cli,
+        "run_on",
+        lambda _node, _local, command, **_kwargs: subprocess.CompletedProcess(
+            [],
+            0,
+            "" if pull_evidence.PULL_EVIDENCE_MARK in command else "4096\toutputs\n",
+            "",
+        ),
+    )
+
+    def fake_rsync(*args, **kwargs):
+        if kwargs.get("safe_links") and "excludes" in kwargs:
+            transfer(Path(args[1]))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(cli, "rsync", fake_rsync)
+    rows = "".join(f"{size}\t{path}\n" for path, size in census_rows)
+
+    def census(_entry, remote_rel):
+        # The run record (logs/) is answered empty; the rows describe outputs/.
+        listing, count = (
+            (rows, len(census_rows)) if remote_rel.endswith("/outputs") else ("", 0)
+        )
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            f"{transfers.PULL_CENSUS_MARK}\n{listing}{transfers.PULL_CENSUS_MARK}\n{count}\n",
+            "",
+        )
+
+    monkeypatch.setattr(cli, "_remote_outputs_census", census)
+    return destination
+
+
+def test_pull_census_does_not_demand_the_reserved_outputs_dt_directory(
+    tmp_path, monkeypatch
+):
+    """The worker keeps `outputs/dt/resources.jsonl` (legacy layout) and the pull
+    excludes `/dt/` because that name is the local records directory. The census
+    lists that file; demanding it under the outputs tree failed every such pull
+    as incomplete_transfer although rsync had done exactly what it was told."""
+
+    def transfer(target):
+        (target / "metrics.json").write_bytes(b"m" * 12)
+
+    destination = _census_pull_setup(
+        tmp_path,
+        monkeypatch,
+        status="finished",
+        census_rows=[("dt/resources.jsonl", 900), ("metrics.json", 12)],
+        transfer=transfer,
+    )
+
+    result = CliRunner().invoke(
+        cli.app, ["pull", "jid", "--to", str(destination), "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["verification"] == {
+        "status": "verified",
+        "scope": "excluded_files_skipped",
+        "files_checked": 1,
+        "files_on_node": 2,
+        "census_truncated": False,
+    }
+
+
+def test_pull_census_reports_files_missing_despite_excludes(tmp_path, monkeypatch):
+    """With `--lite` or `--exclude` active the census used to judge only files
+    that arrived, so a checkpoint-free pull with a missing metrics file passed.
+    Excluded rows are now recognised by pattern and every other row is due."""
+
+    def transfer(target):
+        (target / "metrics.json").write_bytes(b"m" * 12)
+
+    destination = _census_pull_setup(
+        tmp_path,
+        monkeypatch,
+        status="finished",
+        census_rows=[
+            ("checkpoints/last.pt", 40_000_000),
+            ("metrics.json", 12),
+            ("eval/summary.json", 77),
+        ],
+        transfer=transfer,
+    )
+
+    result = CliRunner().invoke(
+        cli.app, ["pull", "jid", "--lite", "--to", str(destination), "--json"]
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "incomplete_transfer"
+    assert "1 of 2 outputs files differ" in payload["message"]
+    assert "missing: eval/summary.json" in payload["message"]
+    assert "last.pt" not in payload["message"]
+
+    # A pattern the local model does not cover keeps the old, narrower check.
+    result = CliRunner().invoke(
+        cli.app,
+        ["pull", "jid", "--exclude", "eval/[st]*", "--to", str(destination), "--json"],
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["verification"]["scope"] == "arrived_files_only"
+
+
+def test_pull_verifies_the_run_record_leg_against_the_worker_census(
+    tmp_path, monkeypatch
+):
+    """`logs/` rode the same tunnel as the outputs and was the one leg with no
+    census: a truncated env.log that arrived with exit 0 is exactly the silent
+    loss the outputs check exists for, and the run record is what an operator
+    reads first after a failure."""
+    destination = _census_pull_setup(
+        tmp_path,
+        monkeypatch,
+        status="failed",
+        census_rows=[],
+        transfer=lambda target: None,
+    )
+
+    def census(_entry, remote_rel):
+        if remote_rel.endswith("/logs"):
+            rows = "4096\tenv.log\n20\tresources.jsonl\n"
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                f"{transfers.PULL_CENSUS_MARK}\n{rows}{transfers.PULL_CENSUS_MARK}\n2\n",
+                "",
+            )
+        return subprocess.CompletedProcess(
+            [],
+            0,
+            f"{transfers.PULL_CENSUS_MARK}\n{transfers.PULL_CENSUS_MARK}\n0\n",
+            "",
+        )
+
+    monkeypatch.setattr(cli, "_remote_outputs_census", census)
+
+    def truncated_logs(*args, **kwargs):
+        if kwargs.get("excludes") == cli.PULL_LOG_RESERVED_EXCLUDES:
+            Path(args[1]).mkdir(parents=True, exist_ok=True)
+            (Path(args[1]) / "env.log").write_bytes(b"e" * 512)
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(cli, "rsync", truncated_logs)
+
+    result = CliRunner().invoke(
+        cli.app, ["pull", "jid", "--to", str(destination), "--json"]
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["error"] == "incomplete_transfer"
+    assert "1 of 1 run record files differ" in payload["message"]
+    assert (
+        "size mismatch: env.log (512 bytes locally, 4096 on the node)"
+        in (payload["message"])
+    )
+    # resources.jsonl is a reserved name the logs leg never copies.
+    assert "resources.jsonl" not in payload["message"]
+
+
+def test_pull_of_a_running_job_reports_progress_instead_of_a_broken_transfer(
+    tmp_path, monkeypatch
+):
+    """A running job keeps appending to its outputs, so a file that grew between
+    rsync and the census is progress, not truncation: the copy is a snapshot."""
+
+    def transfer(target):
+        (target / "train.log").write_bytes(b"l" * 100)
+
+    destination = _census_pull_setup(
+        tmp_path,
+        monkeypatch,
+        status="running",
+        census_rows=[("train.log", 160), ("eval/new.json", 5)],
+        transfer=transfer,
+    )
+
+    result = CliRunner().invoke(
+        cli.app, ["pull", "jid", "--to", str(destination), "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "pulled"
+    assert payload["verification"]["status"] == "in_progress"
+    assert payload["verification"]["differences"] == 2
+
+    human = CliRunner().invoke(cli.app, ["pull", "jid", "--to", str(destination)])
+    assert human.exit_code == 0, human.output
+    assert "is still running" in human.output
+    assert "point-in-time snapshot" in human.output
 
 
 def test_pull_refuses_destination_owned_by_different_job_before_remote_access(

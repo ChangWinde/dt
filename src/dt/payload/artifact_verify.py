@@ -16,20 +16,40 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, cast
 
 _tree_sha256_candidate: object
+_artifact_tree_sha256_candidate: object
+_mode_mask_candidate: object
 try:
     from .. import snapshot_hash as _snapshot_hash
 except ImportError:  # standalone copy beside snapshot_hash.py on compute nodes
     sibling = Path(__file__).with_name("snapshot_hash.py")
     namespace = runpy.run_path(str(sibling))
     _tree_sha256_candidate = namespace.get("tree_sha256")
+    _artifact_tree_sha256_candidate = namespace.get("artifact_tree_sha256")
+    _mode_mask_candidate = namespace.get("ARTIFACT_MODE_MASK")
 else:
     _tree_sha256_candidate = _snapshot_hash.tree_sha256
+    _artifact_tree_sha256_candidate = _snapshot_hash.artifact_tree_sha256
+    _mode_mask_candidate = _snapshot_hash.ARTIFACT_MODE_MASK
 
-if not callable(_tree_sha256_candidate):  # pragma: no cover - corrupt payload bundle
-    raise ImportError("tree_sha256 is missing from the payload bundle")
+if (
+    not callable(_tree_sha256_candidate)
+    or not callable(_artifact_tree_sha256_candidate)
+    or type(_mode_mask_candidate) is not int
+):  # pragma: no cover - corrupt payload bundle
+    raise ImportError("tree hash helpers are missing from the payload bundle")
 tree_sha256 = cast(Callable[[Path], str], _tree_sha256_candidate)
+artifact_tree_sha256 = cast(Callable[[Path], str], _artifact_tree_sha256_candidate)
+ARTIFACT_MODE_MASK: int = _mode_mask_candidate
 
+# v1 recorded the source's own modes and hashed directories with the snapshot
+# tree hash. v2 stores are published read-only: modes carry no write bits and
+# directories use the write-bit-agnostic artifact tree hash, so the writable
+# source on the head and the locked copy on the node share one identity.
 MANIFEST_SCHEMA_VERSION = "dt_artifact_manifest_v1"
+MANIFEST_SCHEMA_VERSION_V2 = "dt_artifact_manifest_v2"
+MANIFEST_SCHEMA_VERSIONS = frozenset(
+    {MANIFEST_SCHEMA_VERSION, MANIFEST_SCHEMA_VERSION_V2}
+)
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_MANIFEST_ARTIFACTS = 4096
 MAX_PROJECT_BYTES = 64
@@ -174,7 +194,7 @@ def _canonical_path(value: object) -> PurePosixPath:
     return path
 
 
-def _decode_manifest(manifest_bytes: bytes) -> list[ManifestEntry]:
+def _decode_manifest(manifest_bytes: bytes) -> tuple[str, list[ManifestEntry]]:
     payload = json.loads(
         manifest_bytes,
         object_pairs_hook=_strict_object,
@@ -182,8 +202,12 @@ def _decode_manifest(manifest_bytes: bytes) -> list[ManifestEntry]:
     )
     if not isinstance(payload, dict) or set(payload) != _TOP_LEVEL_FIELDS:
         raise ValueError("invalid dt artifact manifest fields")
-    if payload["schema_version"] != MANIFEST_SCHEMA_VERSION:
+    schema_version = payload["schema_version"]
+    if not isinstance(schema_version, str) or schema_version not in (
+        MANIFEST_SCHEMA_VERSIONS
+    ):
         raise ValueError("invalid dt artifact manifest schema")
+    locked = schema_version == MANIFEST_SCHEMA_VERSION_V2
     project = payload["project"]
     if (
         not isinstance(project, str)
@@ -212,6 +236,8 @@ def _decode_manifest(manifest_bytes: bytes) -> list[ManifestEntry]:
             raise ValueError("invalid artifact manifest kind")
         if type(mode) is not int or not 0 <= mode <= 0o7777:
             raise ValueError("invalid artifact manifest mode")
+        if locked and mode & ARTIFACT_MODE_MASK != mode:
+            raise ValueError("invalid artifact manifest mode: write bits in a v2 entry")
         if (
             type(size_bytes) is not int
             or not 0 <= size_bytes <= MAX_ARTIFACT_SIZE_BYTES
@@ -238,7 +264,7 @@ def _decode_manifest(manifest_bytes: bytes) -> list[ManifestEntry]:
                 f"artifact manifest paths overlap: {entry.path.as_posix()!r}"
             )
         seen.add(entry.path)
-    return entries
+    return schema_version, entries
 
 
 def _directory_bytes(path: Path) -> int:
@@ -268,7 +294,8 @@ def verify(root: Path, manifest_path: Path, expected_sha256: str) -> dict[str, o
             "artifact manifest hash mismatch: "
             f"expected {expected_sha256}, got {actual_manifest_sha256}"
         )
-    entries = _decode_manifest(manifest_bytes)
+    schema_version, entries = _decode_manifest(manifest_bytes)
+    locked = schema_version == MANIFEST_SCHEMA_VERSION_V2
 
     verified = 0
     for entry in entries:
@@ -286,7 +313,15 @@ def verify(root: Path, manifest_path: Path, expected_sha256: str) -> dict[str, o
         resolved.relative_to(root)
         metadata = cursor.lstat()
         actual_mode = stat.S_IMODE(metadata.st_mode)
-        if actual_mode != entry.mode:
+        # A v2 identity ignores write bits (the store is published read-only;
+        # the digest of a directory cannot see them either). A v1 entry names
+        # the source mode; the same store may since have been locked by a v2
+        # publication, which a v1 manifest of a file must survive.
+        if locked:
+            mode_ok = actual_mode & ARTIFACT_MODE_MASK == entry.mode
+        else:
+            mode_ok = actual_mode in {entry.mode, entry.mode & ARTIFACT_MODE_MASK}
+        if not mode_ok:
             raise ValueError(
                 f"artifact mode mismatch for {relative_raw}: "
                 f"expected {entry.mode:o}, got {actual_mode:o}"
@@ -300,7 +335,9 @@ def verify(root: Path, manifest_path: Path, expected_sha256: str) -> dict[str, o
             if not stat.S_ISDIR(metadata.st_mode):
                 raise ValueError(f"artifact is not a directory: {relative_raw}")
             actual_bytes = _directory_bytes(resolved)
-            actual_sha256 = tree_sha256(resolved)
+            actual_sha256 = (
+                artifact_tree_sha256(resolved) if locked else tree_sha256(resolved)
+            )
         if actual_bytes != entry.size_bytes:
             raise ValueError(
                 f"artifact size mismatch for {relative_raw}: "
@@ -316,6 +353,7 @@ def verify(root: Path, manifest_path: Path, expected_sha256: str) -> dict[str, o
     return {
         "schema_version": "dt_artifact_verification_v1",
         "manifest_sha256": actual_manifest_sha256,
+        "manifest_schema": schema_version,
         "artifacts": verified,
     }
 

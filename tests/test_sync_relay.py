@@ -454,6 +454,34 @@ def test_artifact_push_matches_direct_semantics():
     assert "10.0.0.7:" in single
 
 
+def test_artifact_push_locks_the_store_and_carries_link_dest_baselines():
+    node = Node(name="worker", site="lab", lan_address="10.0.0.7")
+
+    pushed = sync_relay.push_artifact_command(
+        node,
+        "omni",
+        "data",
+        "dt/artifacts/omni/data",
+        is_dir=True,
+        link_dests=["../../alpha/data", "../../beta/data"],
+    )
+
+    assert "--chmod=a-w" in pushed
+    assert "--link-dest=../../alpha/data --link-dest=../../beta/data" in pushed
+    # rsync resolves relative baselines against the receiving directory, so
+    # they must precede the destination and never be shell-expanded there.
+    assert pushed.index("--link-dest=") < pushed.index("10.0.0.7:")
+    with pytest.raises(RelayError, match="link-dest"):
+        sync_relay.push_artifact_command(
+            node,
+            "omni",
+            "data",
+            "dt/artifacts/omni/data",
+            is_dir=True,
+            link_dests=["--rsync-path=evil"],
+        )
+
+
 def test_artifact_push_requires_a_lan_address():
     with pytest.raises(RelayError):
         sync_relay.push_artifact_command(
@@ -505,11 +533,15 @@ def test_sync_artifacts_stages_each_artifact_through_the_gateway(tmp_path, monke
     staged = [dst for _src, dst in rsync_calls if dst.startswith("gw:")]
     assert any("sync-staging/omni/artifacts/data" in dst for dst in staged)
     assert not any(dst.startswith("worker:") for _src, dst in rsync_calls[:2])
-    # Prepare once (no rsync), then one LAN push per artifact.
-    prepares = [cmd for cmd in relay_calls if "rsync" not in cmd]
+    # Prepare once (no rsync), one sibling-mirror probe per artifact (read-only,
+    # so the WAN leg can hard-link identical content), then one LAN push each.
+    prepares = [cmd for cmd in relay_calls if "rsync" not in cmd and "sort" not in cmd]
+    probes = [cmd for cmd in relay_calls if cmd.startswith("sh -c ")]
     pushes = [cmd for cmd in relay_calls if "rsync" in cmd]
     assert len(prepares) == 1 and "sync-staging" in prepares[0]
+    assert len(probes) == 2 and all("cd .dt/sync-staging " in cmd for cmd in probes)
     assert len(pushes) == 2
+    assert all("--chmod=a-w" in cmd for cmd in pushes)
     assert row["route"] == "gateway"
     assert row["route_gateway"] == "gw"
     assert "relay_error" not in row
@@ -544,6 +576,11 @@ def test_gateway_mirror_lock_spans_staging_and_lan_replay(tmp_path, monkeypatch)
         sync_relay,
         "prepare_artifact_mirror",
         lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        sync_relay,
+        "run_on",
+        lambda *args, **kwargs: subprocess.CompletedProcess([], 0, "", ""),
     )
 
     def push(*args, **kwargs):

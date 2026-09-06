@@ -2579,6 +2579,112 @@ def _verify_raw_manifest(root, tmp_path, raw):
     return verify_artifacts(root, manifest, hashlib.sha256(raw).hexdigest())
 
 
+def _manifest_bytes(schema, entries, project="omni"):
+    return json.dumps(
+        {"schema_version": schema, "project": project, "artifacts": entries},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+
+
+def test_artifact_verifier_v2_identity_ignores_write_bits_and_v1_survives_a_lock(
+    tmp_path,
+):
+    """Stores are published read-only, so a v2 manifest must verify the
+    writable source on the head and the locked copy on the node alike, and a
+    v1 manifest of a file must keep verifying after a later v2 publication
+    locked the same store (its recorded mode still carries the write bit)."""
+    from dt.snapshot_hash import artifact_tree_sha256, tree_sha256
+
+    root = tmp_path / "store"
+    dataset = root / "data"
+    dataset.mkdir(parents=True)
+    (dataset / "shard.bin").write_bytes(b"s" * 64)
+    (dataset / "shard.bin").chmod(0o644)
+    dataset.chmod(0o755)
+    model = root / "model.pt"
+    model.write_bytes(b"weights")
+    model.chmod(0o644)
+
+    v2 = _manifest_bytes(
+        "dt_artifact_manifest_v2",
+        [
+            {
+                "path": "data",
+                "kind": "directory",
+                "mode": 0o555,
+                "size_bytes": 64,
+                "sha256": artifact_tree_sha256(dataset),
+            },
+            {
+                "path": "model.pt",
+                "kind": "file",
+                "mode": 0o444,
+                "size_bytes": 7,
+                "sha256": hashlib.sha256(b"weights").hexdigest(),
+            },
+        ],
+    )
+    v1_file = _manifest_bytes(
+        "dt_artifact_manifest_v1",
+        [
+            {
+                "path": "model.pt",
+                "kind": "file",
+                "mode": 0o644,
+                "size_bytes": 7,
+                "sha256": hashlib.sha256(b"weights").hexdigest(),
+            }
+        ],
+    )
+    v1_dir = _manifest_bytes(
+        "dt_artifact_manifest_v1",
+        [
+            {
+                "path": "data",
+                "kind": "directory",
+                "mode": 0o755,
+                "size_bytes": 64,
+                "sha256": tree_sha256(dataset),
+            }
+        ],
+    )
+
+    # Unlocked (the head's own source, or a store synced by an older release).
+    assert _verify_raw_manifest(root, tmp_path, v2)["manifest_schema"] == (
+        "dt_artifact_manifest_v2"
+    )
+    assert _verify_raw_manifest(root, tmp_path, v1_file)["artifacts"] == 1
+    assert _verify_raw_manifest(root, tmp_path, v1_dir)["artifacts"] == 1
+
+    # Locked, as `dt sync --artifact` now publishes.
+    for path in (dataset / "shard.bin", model):
+        path.chmod(0o444)
+    dataset.chmod(0o555)
+    root.chmod(0o555)
+    try:
+        assert _verify_raw_manifest(root, tmp_path, v2)["artifacts"] == 2
+        assert _verify_raw_manifest(root, tmp_path, v1_file)["artifacts"] == 1
+        # A v1 directory digest included the writable modes; it cannot be
+        # recovered from the locked tree, which is the documented upgrade note.
+        with pytest.raises(ValueError, match="SHA-256 mismatch for data"):
+            _verify_raw_manifest(root, tmp_path, v1_dir)
+    finally:
+        root.chmod(0o755)
+        dataset.chmod(0o755)
+
+    # A v2 entry may not carry write bits at all.
+    with pytest.raises(ValueError, match="write bits"):
+        _verify_raw_manifest(
+            root,
+            tmp_path,
+            _manifest_bytes(
+                "dt_artifact_manifest_v2",
+                [_raw_manifest_entry("model.pt", mode=0o644)],
+            ),
+        )
+
+
 def test_artifact_verifier_rejects_duplicate_json_even_when_raw_hash_matches(tmp_path):
     root = tmp_path / "artifacts"
     root.mkdir()

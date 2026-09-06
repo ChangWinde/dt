@@ -38,6 +38,7 @@ from ...sshio import (
     diagnostic_excerpt,
 )
 from ...transfers import (
+    PullExcludeFilter as _PullExcludeFilter,
     collection_parts as _collection_parts,
     collection_root as _collection_root,
     ensure_collection_root as _ensure_collection_root,
@@ -417,8 +418,11 @@ def _transfer_run_logs(
     effective_bwlimit: int | None,
     retry_events: list[JsonDict],
     cancel_kwargs: Mapping[str, Any],
-) -> None:
-    """Recover the worker's run record (logs/) into the local records dir."""
+) -> JsonDict:
+    """Recover the worker's run record (logs/) into the local records dir.
+
+    Returns the census verification summary of what landed.
+    """
     logs_proc = _rsync_with_status(
         json_,
         f"pulling run record from {entry.node}...",
@@ -463,6 +467,7 @@ def _transfer_run_logs(
             "run logs contain a special file that DT refused to materialize",
             1,
         )
+    return _verify_pulled_logs(entry, records_dir, json_=json_)
 
 
 def _transfer_outputs(
@@ -483,12 +488,13 @@ def _transfer_outputs(
     cancel_kwargs: Mapping[str, Any],
     cancel_event: Event | None,
     pull_route: pull_relay.PullRoute,
-) -> tuple[pull_relay.PullRoute, str | None]:
+) -> tuple[pull_relay.PullRoute, str | None, JsonDict]:
     """Recover ``outputs/`` over the decided route, degrading to direct.
 
-    Returns the route actually used and the relay error (if the gateway leg
-    was attempted and failed).  Both gateway legs (ADR 0025) fall back to the
-    unchanged direct pull so a relay problem never costs the user their data.
+    Returns the route actually used, the relay error (if the gateway leg was
+    attempted and failed), and the census verification summary.  Both gateway
+    legs (ADR 0025) fall back to the unchanged direct pull so a relay problem
+    never costs the user their data.
     """
     relay_error: str | None = None
     src = rsync_destination(
@@ -675,14 +681,14 @@ def _transfer_outputs(
         pull_evidence_mod.validate_materialized_tree(dst)
     except (OSError, ValueError) as exc:
         raise _PullPhaseError("unsafe_output", str(exc), 1) from exc
-    _verify_pulled_outputs(
+    verification = _verify_pulled_outputs(
         entry,
         outputs_rel,
         dst,
-        excludes_active=bool(excludes),
+        output_excludes=output_excludes,
         json_=json_,
     )
-    return pull_route, relay_error
+    return pull_route, relay_error, verification
 
 
 def _remote_outputs_census(
@@ -703,25 +709,72 @@ def _verify_pulled_outputs(
     outputs_rel: str,
     dst: Path,
     *,
-    excludes_active: bool,
+    output_excludes: list[str],
     json_: bool,
-) -> None:
-    """Compare the materialized tree with the worker's own file census.
+) -> JsonDict:
+    """Compare the materialized outputs with the worker's own file census.
 
     rsync's exit status says the protocol completed, not that every file
     arrived: a field pull over a tunnel returned 0 with one truncated 8 MiB
     file of a 45 MiB checkpoint and nineteen siblings missing. A full pull
-    must hold every regular file the worker has, byte-for-byte in size; with
-    excludes in effect only the files that did arrive are checked, since the
-    filter semantics live in rsync.
+    must hold every regular file the worker has, byte-for-byte in size.
+    Files an ``--exclude`` pattern covers are not expected locally (the
+    reserved ``/dt/`` rule included: a worker's ``outputs/dt/`` evidence lands
+    under the records directory, not the outputs tree); when a pattern uses
+    syntax the local model does not cover, only the files that did arrive are
+    judged. A job that is still running keeps writing, so a difference is
+    reported as work in progress instead of a broken transfer.
+
+    Returns the ``verification`` summary for the success payload.
     """
+    return _verify_pulled_tree(
+        entry,
+        outputs_rel,
+        dst,
+        excludes=output_excludes,
+        what="outputs",
+        json_=json_,
+    )
+
+
+def _verify_pulled_logs(
+    entry: jobs_mod.JobEntry,
+    records_dir: Path,
+    *,
+    json_: bool,
+) -> JsonDict:
+    """The same census check for the run record (``logs/``).
+
+    The run record is what an operator reads first after a failure; a
+    truncated ``env.log`` or ``stdout.log`` that arrived with exit 0 is the
+    same silent loss as a truncated checkpoint.
+    """
+    return _verify_pulled_tree(
+        entry,
+        f"{entry.job_dir}/logs",
+        records_dir,
+        excludes=PULL_LOG_RESERVED_EXCLUDES,
+        what="run record",
+        json_=json_,
+    )
+
+
+def _verify_pulled_tree(
+    entry: jobs_mod.JobEntry,
+    remote_rel: str,
+    local_root: Path,
+    *,
+    excludes: list[str],
+    what: str,
+    json_: bool,
+) -> JsonDict:
     try:
-        census_proc = _root._remote_outputs_census(entry, outputs_rel)
+        census_proc = _root._remote_outputs_census(entry, remote_rel)
     except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
         detail = " ".join(str(exc).split()) or type(exc).__name__
         raise _PullPhaseError(
             "unverified",
-            f"transfer finished but the outputs could not be verified against "
+            f"transfer finished but the {what} could not be verified against "
             f"{entry.node}: {detail}",
             EXIT_UNREACHABLE,
             records_fresh=False,
@@ -735,37 +788,62 @@ def _verify_pulled_outputs(
         )
         raise _PullPhaseError(
             "unverified",
-            f"transfer finished but {entry.node} produced no usable file census: "
-            f"{detail}",
+            f"transfer finished but {entry.node} produced no usable file census "
+            f"for the {what}: {detail}",
             1,
             records_fresh=False,
             human_plain=True,
             hint="rerun dt pull; a second pass resumes and re-verifies",
         )
+    exclude_filter = _PullExcludeFilter(excludes)
+    scope = "excluded_files_skipped" if exclude_filter.exact else "arrived_files_only"
+    if exclude_filter.exact:
+        excluded = exclude_filter.excludes
+    else:
+        local_only = {
+            path.relative_to(local_root).as_posix()
+            for path in local_root.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        excluded = lambda relative: relative not in local_only  # noqa: E731
+    checked = sum(1 for relative in census.files if not excluded(relative))
+    summary: JsonDict = {
+        "status": "verified",
+        "scope": scope,
+        "files_checked": checked,
+        "files_on_node": census.total_files,
+        "census_truncated": census.truncated,
+    }
     if not census.files and census.total_files == 0:
-        return  # nothing on the node to hold
-    local_only = set()
-    if excludes_active:
-        for path in dst.rglob("*"):
-            if path.is_file() and not path.is_symlink():
-                local_only.add(path.relative_to(dst).as_posix())
-    problems = _pull_census_mismatches(
-        census,
-        dst,
-        excluded=(lambda relative: excludes_active and relative not in local_only),
-    )
+        return summary  # nothing on the node to hold
+    problems = _pull_census_mismatches(census, local_root, excluded=excluded)
     if not problems:
         if census.truncated and not json_:
             err.print(
                 f"[dim]verified the first {len(census.files):,} of "
-                f"{census.total_files:,} files against {escape(entry.node)}[/dim]"
+                f"{census.total_files:,} {what} files against {escape(entry.node)}[/dim]"
             )
-        return
+        return summary
     shown = "; ".join(problems[:5])
     more = f"; +{len(problems) - 5} more" if len(problems) > 5 else ""
+    if entry.status == "running":
+        # The worker is still writing: a file that grew or appeared since
+        # rsync read it is the job's progress, not a transfer fault. This copy
+        # is a point-in-time snapshot; say so and let the operator pull again
+        # after the job finishes.
+        summary["status"] = "in_progress"
+        summary["differences"] = len(problems)
+        if not json_:
+            err.print(
+                f"[yellow]{escape(entry.job_id)} is still running: {len(problems)} of "
+                f"{checked:,} {what} files on {escape(entry.node)} changed since the "
+                f"transfer ({escape(shown)}{escape(more)}); this copy is a "
+                "point-in-time snapshot, rerun dt pull after the job finishes[/yellow]"
+            )
+        return summary
     raise _PullPhaseError(
         "incomplete_transfer",
-        f"{len(problems)} of {len(census.files)} files differ from {entry.node} "
+        f"{len(problems)} of {checked} {what} files differ from {entry.node} "
         f"after the transfer ({shown}{more})",
         1,
         records_fresh=False,
@@ -1022,6 +1100,8 @@ def _pull_success_payload(
     evidence_provenance: str | None,
     retry_events: list[JsonDict],
     records: list[str],
+    verification: JsonDict | None = None,
+    logs_verification: JsonDict | None = None,
 ) -> JsonDict:
     """The dt_pull_v1 success envelope."""
     return {
@@ -1057,6 +1137,14 @@ def _pull_success_payload(
             else {}
         ),
         "application_outputs_recovered": outputs_present,
+        # How the materialized tree compared with the worker's file census:
+        # `verified`, or `in_progress` when the job is still writing.
+        **({"verification": verification} if verification is not None else {}),
+        **(
+            {"logs_verification": logs_verification}
+            if logs_verification is not None
+            else {}
+        ),
         "records_scope": "dt_control_allowlist",
         "evidence_provenance": evidence_provenance,
         **({"outputs_present": False} if not outputs_present else {}),
@@ -1350,9 +1438,10 @@ def _pull_unlocked(
     )
     effective_bwlimit = head_bwlimit_kbps(cfg, entry.node, bwlimit)
     relay_error: str | None = None
+    verification: JsonDict | None = None
     if outputs_present:
         try:
-            pull_route, relay_error = _transfer_outputs(
+            pull_route, relay_error, verification = _transfer_outputs(
                 cfg,
                 entry,
                 ref=ref,
@@ -1380,7 +1469,7 @@ def _pull_unlocked(
     report.records = report.confirmed_records()
 
     try:
-        _transfer_run_logs(
+        logs_verification = _transfer_run_logs(
             entry,
             ref=ref,
             records_dir=records_dir,
@@ -1435,6 +1524,8 @@ def _pull_unlocked(
         evidence_provenance=evidence_provenance,
         retry_events=report.retry_events,
         records=records,
+        verification=verification,
+        logs_verification=logs_verification,
     )
     if _result is not None:
         _result.update(payload)

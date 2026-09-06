@@ -51,6 +51,7 @@ from .. import (
     _head_command,
     _read_bounded_text_input,
     _record_group_job,
+    _resolve_artifact_manifest_option,
     _submission_payload,
     _validate_submission_request_id,
     _validate_submission_resources,
@@ -899,7 +900,10 @@ def _inventory_command(
     artifact_manifest: Optional[str] = typer.Option(
         None,
         "--artifact-manifest",
-        help="bind one existing artifact manifest to every item",
+        help=(
+            "bind one existing artifact manifest (digest or unique 12+ hex "
+            "prefix) to every item"
+        ),
     ),
     artifact: Optional[list[str]] = typer.Option(
         None,
@@ -1012,6 +1016,12 @@ def _inventory_command(
             json_=json_,
         )
 
+    artifact_manifest = _resolve_artifact_manifest_option(
+        cfg,
+        artifact_manifest,
+        project=project,
+        json_=json_,
+    )
     outcome = _GroupOutcome(project=project)
     artifact_action: Callable[[], None] | None = None
     if artifacts:
@@ -1176,7 +1186,10 @@ def batch(
     artifact_manifest: Optional[str] = typer.Option(
         None,
         "--artifact-manifest",
-        help="bind one existing artifact manifest to every item",
+        help=(
+            "bind one existing artifact manifest (digest or unique 12+ hex "
+            "prefix) to every item"
+        ),
         rich_help_panel="Reproducibility",
     ),
     artifact: Optional[list[str]] = typer.Option(
@@ -1317,7 +1330,10 @@ def chain(
     artifact_manifest: Optional[str] = typer.Option(
         None,
         "--artifact-manifest",
-        help="bind one existing artifact manifest to every stage",
+        help=(
+            "bind one existing artifact manifest (digest or unique 12+ hex "
+            "prefix) to every stage"
+        ),
         rich_help_panel="Reproducibility",
     ),
     artifact: Optional[list[str]] = typer.Option(

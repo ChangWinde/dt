@@ -16,7 +16,7 @@ from rich.markup import escape
 import typer
 
 from ... import cli as _root
-from ...config import LaptopConfig, Node
+from ...config import HeadConfig, LaptopConfig, Node, head_bwlimit_kbps
 from ...render import err
 from ...sshio import RSYNC_UNREACHABLE_EXIT_CODES
 from .. import (
@@ -79,6 +79,9 @@ class _SeedRequest:
     hf: bool
     plan: bool
     retries: int
+    # Explicit --bwlimit; None lets the node's site default or the head's
+    # own uplink budget pace the transfer (config.head_bwlimit_kbps).
+    bwlimit: int | None = None
 
     def failure_row(
         self,
@@ -112,10 +115,22 @@ class _SeedRequest:
             **({"retry_events": retry_events} if retry_events else {}),
         }
 
-    def seed_node(self, node: Node, *, cancel_event: Event) -> JsonDict:
-
+    def seed_node(
+        self,
+        node: Node,
+        *,
+        cancel_event: Event,
+        cfg: HeadConfig | None = None,
+    ) -> JsonDict:
         name = node.name
         retry_events: list[JsonDict] = []
+        # A seed ships the head's whole uv cache; unpaced it saturates a thin
+        # uplink exactly like an unbudgeted snapshot would.
+        effective_bwlimit = (
+            head_bwlimit_kbps(cfg, name, self.bwlimit)
+            if cfg is not None
+            else self.bwlimit
+        )
         if cancel_event.is_set():
             return self.failure_row(
                 name,
@@ -218,6 +233,7 @@ class _SeedRequest:
                     ),
                     stats=True,
                     private_destination=True,
+                    bwlimit_kbps=effective_bwlimit,
                     cancel_event=cancel_event,
                 )
             except Exception as exc:
@@ -311,6 +327,14 @@ def seed(
         "--retries",
         help="link retries after the first attempt (0 = fail fast)",
     ),
+    bwlimit: Optional[int] = typer.Option(
+        None,
+        "--bwlimit",
+        help=(
+            "cap head-side transfer legs at KBPS KiB/s (default: "
+            "sites.<name>.bwlimit_kbps, then the head's uplink_kbps)"
+        ),
+    ),
 ) -> None:
     """Seed caches for slow-network nodes.
 
@@ -324,6 +348,14 @@ def seed(
         operation="seed",
         json_=json_,
     )
+    bwlimit = bwlimit if isinstance(bwlimit, int) else None
+    if bwlimit is not None and bwlimit <= 0:
+        _fail_submission(
+            kind="invalid_argument",
+            message="seed --bwlimit must be a positive KiB/s integer",
+            exit_code=1,
+            json_=json_,
+        )
     cfg = _root._cfg()
     if isinstance(cfg, LaptopConfig):
         head = cfg.centers[_root._laptop_center(cfg, center)]
@@ -332,6 +364,8 @@ def seed(
             argv.append("--plan")
         if retries != 1:
             argv += ["--retries", str(retries)]
+        if bwlimit is not None:
+            argv += ["--bwlimit", str(bwlimit)]
         if json_:
             argv.append("--json")
         _preflight_retryable_head_operation(
@@ -355,6 +389,8 @@ def seed(
                 resume_argv.append("--plan")
             if retries != 1:
                 resume_argv += ["--retries", str(retries)]
+            if bwlimit is not None:
+                resume_argv += ["--bwlimit", str(bwlimit)]
             if json_:
                 resume_argv.append("--json")
             _fail_submission(
@@ -418,14 +454,15 @@ def seed(
         hf=hf,
         plan=plan,
         retries=retries,
+        bwlimit=bwlimit,
     )
 
     def seed_one(name: str) -> JsonDict:
         node = by_name[name]
         if node.local or not components or plan:
-            return request.seed_node(node, cancel_event=cancel_event)
+            return request.seed_node(node, cancel_event=cancel_event, cfg=cfg)
         with seed_cache_lock(cfg, node, cancel_event=cancel_event):
-            return request.seed_node(node, cancel_event=cancel_event)
+            return request.seed_node(node, cancel_event=cancel_event, cfg=cfg)
 
     def run_all() -> list[JsonDict]:
         if len(names) == 1:

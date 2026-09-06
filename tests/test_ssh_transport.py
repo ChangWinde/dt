@@ -256,6 +256,50 @@ def test_rsync_preserves_default_destination_permissions(monkeypatch):
     assert not any(value.startswith("--chmod=") for value in seen["cmd"])
 
 
+def test_rsync_renders_link_dest_baselines_and_an_explicit_chmod(monkeypatch):
+    seen = {}
+
+    def fake_run(cmd, timeout, cancel_event):
+        seen["cmd"] = cmd
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(sshio, "_run_rsync_attempt", fake_run)
+
+    sshio.rsync(
+        "source/",
+        "worker:target/",
+        link_dest=["../alpha/data", "../beta/data"],
+        chmod="a-w",
+    )
+    cmd = seen["cmd"]
+    assert cmd[cmd.index("--") - 2 :] == [
+        "--link-dest=../alpha/data",
+        "--link-dest=../beta/data",
+        "--",
+        "source/",
+        "worker:target/",
+    ]
+    assert "--chmod=a-w" in cmd
+
+    sshio.rsync("source/", "worker:target/", link_dest="../single")
+    assert seen["cmd"].count("--link-dest=../single") == 1
+
+    with pytest.raises(ValueError, match="at most"):
+        sshio.rsync(
+            "source/",
+            "worker:target/",
+            link_dest=[f"../s{i}" for i in range(sshio.MAX_LINK_DESTS + 1)],
+        )
+    with pytest.raises(ValueError, match="non-empty paths"):
+        sshio.rsync("source/", "worker:target/", link_dest=["--rsync-path=x"])
+    with pytest.raises(ValueError, match="only one of"):
+        sshio.rsync("source/", "worker:target/", chmod="a-w", private_destination=True)
+    with pytest.raises(ValueError, match="chmod"):
+        sshio.rsync("source/", "worker:target/", chmod="a-w --delete")
+    with pytest.raises(ValueError, match="only one of"):
+        sshio.rsync("source/", "worker:target/", link_dest=["../a"], copy_dest="../b")
+
+
 def test_deep_state_root_relocates_mux_sockets_within_sun_path(tmp_path, monkeypatch):
     # A state root deeper than the sun_path budget (long $HOME, containerized
     # state dirs) must not silently lose multiplexing: every mux attempt

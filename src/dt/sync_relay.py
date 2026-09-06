@@ -39,6 +39,11 @@ from .operation_log import note_suppressed
 
 PUSH_TIMEOUT_S = 4 * 3600
 PUSH_ATTEMPTS = 3
+# Gateway-side root of every project mirror, relative to the gateway's home.
+SYNC_STAGING_REL = ".dt/sync-staging"
+# The LAN replay publishes the node's artifact store read-only, exactly like
+# the direct push (see dispatch.artifacts.ARTIFACT_LOCK_CHMOD).
+ARTIFACT_PUSH_CHMOD = "a-w"
 
 
 def decide_sync_route(
@@ -82,7 +87,7 @@ def decide_sync_route(
 
 def mirror_relative(project_name: str) -> str:
     """The gateway-side mirror, relative to the gateway's home."""
-    return f".dt/sync-staging/{sanitize_name(project_name)}/code"
+    return f"{SYNC_STAGING_REL}/{sanitize_name(project_name)}/code"
 
 
 def artifact_mirror_relative(project_name: str) -> str:
@@ -92,7 +97,7 @@ def artifact_mirror_relative(project_name: str) -> str:
     LAN leg is a straight copy with the same file/directory semantics the
     direct push uses.
     """
-    return f".dt/sync-staging/{sanitize_name(project_name)}/artifacts"
+    return f"{SYNC_STAGING_REL}/{sanitize_name(project_name)}/artifacts"
 
 
 def _relative_parent(relative: str) -> str:
@@ -111,6 +116,7 @@ def prepare_artifact_mirror_command(project_name: str, relatives: list[str]) -> 
     relay costs a single control round trip instead of one per artifact.
     """
     project = shlex.quote(sanitize_name(project_name))
+    staging = shlex.quote(SYNC_STAGING_REL)
     parents = sorted({_relative_parent(relative) for relative in relatives} - {""})
     prefixes = sorted(
         {
@@ -126,7 +132,7 @@ def prepare_artifact_mirror_command(project_name: str, relatives: list[str]) -> 
     )
     script = (
         "umask 077; "
-        'root="$HOME/.dt/sync-staging"; '
+        f'root="$HOME"/{staging}; '
         f'project="$root"/{project}; '
         'mirror="$project/artifacts"; '
         "dt_ensure_private_dir() { "
@@ -154,7 +160,7 @@ def prepare_mirror_command(project_name: str) -> str:
     mirror = shlex.quote(mirror_relative(project_name))
     script = (
         "umask 077; "
-        'root="$HOME/.dt/sync-staging"; '
+        f'root="$HOME"/{shlex.quote(SYNC_STAGING_REL)}; '
         f'mirror="$HOME"/{mirror}; '
         # Refuse symlinks before mkdir so nothing is created behind a
         # planted link.
@@ -214,14 +220,21 @@ def push_artifact_command(
     destination_rel: str,
     *,
     is_dir: bool,
+    link_dests: list[str] | None = None,
 ) -> str:
     """Build the LAN push for one staged artifact.
 
     The semantics mirror the direct push exactly: a directory is replayed
-    into its own target with ``--delete``, a file lands in its parent.
+    into its own target with ``--delete``, a file lands in its parent, the
+    store lands read-only, and ``link_dests`` (baselines relative to the
+    node-side destination directory) let identical files already in a
+    sibling store be hard-linked instead of copied over the LAN.
     """
     if node.lan_address is None:
         raise RelayError(f"node {node.name} advertises no LAN address")
+    baselines = list(link_dests or [])
+    if any(not baseline or baseline.startswith("-") for baseline in baselines):
+        raise RelayError("artifact push link-dest baselines must be non-empty paths")
     mirror = shlex.quote(artifact_mirror_relative(project_name))
     argv = [
         "rsync",
@@ -231,9 +244,11 @@ def push_artifact_command(
         "--timeout=60",
         "--stats",
         "--checksum",
+        f"--chmod={ARTIFACT_PUSH_CHMOD}",
     ]
     if is_dir:
         argv.append("--delete")
+    argv += [f"--link-dest={baseline}" for baseline in baselines]
     argv += ["-e", inner_lan_ssh(node.lan_port)]
     target = f"{node.lan_address}:{_remote_target_path(destination_rel)}"
     staged = f'"$mirror"/{shlex.quote(relative)}' + ("/" if is_dir else "")
@@ -323,6 +338,25 @@ def prepare_artifact_mirror(
     )
 
 
+def run_gateway_probe(
+    route: RelayRoute,
+    command: str,
+    *,
+    timeout: float,
+    runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
+    cancel_event: Event | None = None,
+) -> "subprocess.CompletedProcess[str]":
+    """Run one read-only gateway query; raises RelayError like the other legs."""
+    return _run_gateway_command(
+        route,
+        command,
+        what="probe",
+        timeout=timeout,
+        runner=runner,
+        cancel_event=cancel_event,
+    )
+
+
 def push_artifact(
     cfg: HeadConfig,
     route: RelayRoute,
@@ -331,6 +365,7 @@ def push_artifact(
     destination_rel: str,
     *,
     is_dir: bool,
+    link_dests: list[str] | None = None,
     runner: Callable[..., "subprocess.CompletedProcess[str]"] | None = None,
     cancel_event: Event | None = None,
 ) -> "subprocess.CompletedProcess[str]":
@@ -343,6 +378,7 @@ def push_artifact(
         relative,
         destination_rel,
         is_dir=is_dir,
+        link_dests=link_dests,
     )
     return _retrying_push(
         cfg,
