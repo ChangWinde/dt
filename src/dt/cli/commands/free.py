@@ -599,8 +599,8 @@ def _free_launch_progress_text(context: JsonDict) -> str | None:
     )
     if observation is None:
         return None
-    text = escape(observation.summary())
-    claimed = observation.claimed_text()
+    text: str = escape(str(observation.summary()))
+    claimed = str(observation.claimed_text() or "")
     if claimed:
         text += f" [dim]({claimed})[/dim]"
     return text
