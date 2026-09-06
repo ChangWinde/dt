@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.14 — 2026-09-06
+
 ### Added
 
 - Node artifact stores deduplicate identical content across projects. A user
