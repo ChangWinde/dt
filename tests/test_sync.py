@@ -508,6 +508,60 @@ def test_artifact_store_permission_command_locks_only_the_stores_own_directories
     assert sshio.run_local(absent, timeout=10).returncode == 0
 
 
+def test_sync_artifacts_relocks_the_store_when_the_transfer_fails(
+    tmp_path, monkeypatch
+):
+    """A publication reopens the store's directories; a transfer that dies
+    halfway must not leave them writable to jobs until someone reruns the sync."""
+    cfg = _cfg(tmp_path)
+    project = tmp_path / "project"
+    (project / "data").mkdir(parents=True)
+    (project / "data" / "a.bin").write_bytes(b"a")
+    commands: list[str] = []
+    monkeypatch.setattr(
+        dispatch,
+        "run_on",
+        lambda _node, _local, command, **_kwargs: (
+            commands.append(command),
+            subprocess.CompletedProcess([], 0, "", ""),
+        )[1],
+    )
+    monkeypatch.setattr(
+        dispatch,
+        "rsync",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            [], 23, "", "rsync: write failed: No space left on device"
+        ),
+    )
+    messages: list[str] = []
+
+    with pytest.raises(dispatch.DispatchError, match="No space left"):
+        dispatch.sync_artifacts(
+            cfg, "omni", project, Node(name="n1"), ["data"], messages.append
+        )
+
+    assert "chmod u+w dt/artifacts/omni " in commands[0]
+    assert "chmod a-w dt/artifacts/omni " in commands[-1]
+    assert not any("artifact_verify.py" in command for command in commands)
+
+    # An unreachable node during the relock is reported, not raised over the
+    # transfer error the operator actually needs to see.
+    commands.clear()
+
+    def flaky_run_on(_node, _local, command, **_kwargs):
+        commands.append(command)
+        if "chmod a-w" in command:
+            raise RemoteError("n1", "connection lost", 255)
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(dispatch, "run_on", flaky_run_on)
+    with pytest.raises(dispatch.DispatchError, match="No space left"):
+        dispatch.sync_artifacts(
+            cfg, "omni", project, Node(name="n1"), ["data"], messages.append
+        )
+    assert any("left writable after the failed sync" in m for m in messages)
+
+
 def test_sync_artifacts_publication_wakes_the_agent_for_blocked_jobs(
     tmp_path, monkeypatch
 ):
