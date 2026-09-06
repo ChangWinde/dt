@@ -1,6 +1,6 @@
 [project]
 name = "disttrainer"
-version = "0.13.19"
+version = "0.13.20"
 description = "dt: AI-native SSH execution control plane for idle remote compute"
 readme = "docs/package-readme.md"
 requires-python = ">=3.10,<3.12"

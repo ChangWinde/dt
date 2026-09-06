@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.20 — 2026-09-07
+
 ### Added
 
 - `scripts/deploy.sh dist local` deploys (and `--rollback ... local` restores)
