@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.15 — 2026-09-06
+
 ### Fixed
 
 - A job's Python can verify TLS peers again. The session whitelist exported
