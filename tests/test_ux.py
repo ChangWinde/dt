@@ -2923,6 +2923,68 @@ def test_ps_table_defaults_to_one_compact_row_per_job_at_80_columns(monkeypatch)
     assert len([line for line in rendered.splitlines() if "short-canary" in line]) == 1
 
 
+def _history_rows(count: int) -> list[dict]:
+    return [
+        {
+            "name": f"exp-{index:04d}-with-a-deliberately-long-name-suffix",
+            "job_id": f"20260906-{index:04d}_exp-{index:04d}_{'ab' * 8}",
+            "center": "c",
+            "node": "worker",
+            "gpus": [0],
+            "status": "finished",
+            "exit_code": 0,
+            "created_at": 1_788_600_000 + index,
+            "cmd": "python train.py",
+        }
+        for index in range(count)
+    ]
+
+
+def test_long_ps_tables_render_flat_with_the_same_columns_and_pipe_contract():
+    """A full job history spent longer in rich's per-cell layout than reading
+    the registry (about half a millisecond per row, 1.7 s for 3,000 jobs).
+    Past FLAT_TABLE_ROWS the table is emitted as pre-aligned text: same
+    header, same truncation on a terminal, whole names in a pipe."""
+    import time
+
+    from rich.console import Console
+
+    import dt.render as render
+
+    rows = _history_rows(render.FLAT_TABLE_ROWS + 50)
+    table = render.ps_table(rows, title="All jobs", caption="done")
+
+    terminal = Console(width=100, record=True, color_system=None, force_terminal=True)
+    started = time.perf_counter()
+    render.print_table(terminal, table)
+    elapsed = time.perf_counter() - started
+    rendered = terminal.export_text()
+    lines = rendered.splitlines()
+    assert lines[0] == "All jobs"
+    assert lines[1].split()[:3] == ["name", "ref", "node"]
+    assert len([line for line in lines if line.startswith("exp-")]) == len(rows)
+    # The name column keeps its terminal cap and ellipsis.
+    first = next(line for line in lines if line.startswith("exp-0000"))
+    assert "…" in first and "long-name-suffix" not in first
+    assert "worker" in first and "finished/0" in first
+    assert lines[-1] == "done"
+    assert elapsed < 2.0
+
+    pipe = Console(width=render.UNBOUNDED_PIPE_WIDTH, record=True, color_system=None)
+    render.print_table(pipe, table)
+    piped = pipe.export_text().splitlines()
+    assert any(
+        line.startswith("exp-0000-with-a-deliberately-long-name-suffix")
+        for line in piped
+    )
+    assert all(len(line) < 200 for line in piped)  # no padding to the pipe width
+
+    # Short tables keep rich's layout untouched.
+    short = Console(width=100, record=True, color_system=None, force_terminal=True)
+    render.print_table(short, render.ps_table(rows[:3], title="All jobs"))
+    assert "All jobs" in short.export_text()
+
+
 def test_ps_table_preserves_complete_historical_date_at_80_columns(monkeypatch):
     from datetime import datetime
 

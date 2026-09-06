@@ -6,6 +6,28 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Changed
+
+- Artifact verification at job start reuses the previous verification of an
+  unchanged store. Every launch re-hashed the whole store byte for byte —
+  10–14 s per job for a multi-gigabyte store on a busy node (field
+  measurement), the dominant cost of starting a job. The verifier now records
+  each artifact's evidence (device, inode, mode, owner, size, mtime, ctime of
+  every entry) beside the store's manifests (`.dt/verified/<manifest>.cache`,
+  mode 0600) after a successful verification and accepts an artifact whose
+  every entry still matches; anything else is hashed again, a tampered or
+  foreign cache is discarded, and — like git's racy-index rule — an entry
+  whose timestamps are not strictly older than the cache is never trusted.
+  The verification receipt gains `reused`.
+- Long `dt ps` tables render flat. Past 200 rows rich's per-cell layout cost
+  more than reading the registry (about 0.5 ms per row; 1.7 s for a 3,000-job
+  history); the same columns, truncation and styles are now emitted as
+  pre-aligned text in ~0.1 s. Pipes keep whole names as before.
+- The head configuration is parsed with libyaml when PyYAML ships it (3 ms
+  instead of 15 ms per command); the duplicate-key guard is unchanged.
+- `dt doctor` caps each node's PyPI download probe at 4 s instead of 8, so a
+  slow node no longer holds the whole report for the full budget.
+
 ## 0.13.15 — 2026-09-06
 
 ### Fixed

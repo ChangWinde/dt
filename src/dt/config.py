@@ -1460,7 +1460,13 @@ def parse(data: object) -> HeadConfig | LaptopConfig:
     raise ConfigError("config must contain `centers` (laptop) or `center` (head)")
 
 
-class _UniqueKeyLoader(yaml.SafeLoader):  # type: ignore[misc]  # yaml is untyped
+# libyaml parses a few-hundred-line head configuration in ~3 ms where the pure
+# Python parser takes ~15 ms; every dt command pays this once. Both produce
+# the same node tree, so the duplicate-key guard below applies unchanged.
+_SafeLoaderBase: type = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+class _UniqueKeyLoader(_SafeLoaderBase):  # type: ignore[misc]  # yaml is untyped
     """safe_load that rejects duplicate mapping keys instead of last-wins.
 
     YAML keeps only the final occurrence of a repeated key, so a stricter
