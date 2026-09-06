@@ -369,7 +369,7 @@ external collector.
 | Key | Default | Meaning |
 |---|---:|---|
 | `mem_threshold_mib` | 500 | GPU memory threshold used when classifying capacity |
-| `gpu_resident_processes` | empty | Compute processes, by `ps -o comm=` name, that may live on a card without making it busy |
+| `gpu_resident_processes` | empty | Compute processes, by `ps -o comm=` name, that may live on a card without making it busy. NVIDIA's MPS daemons (`nvidia-cuda-mps-server`, `nvidia-cuda-mps-control`) are always resident. The kernel keeps 15 bytes of a process name, so a longer name is matched as `ps` shows it (`nvidia-cuda-mps`) |
 | `uplink_kbps` | unthrottled | Head-wide upload budget (KiB/s) for every transfer leg that leaves this head — code snapshots (including the cold upload into a site cache and its direct fallback), artifact publication, pulls, cache seeding; a site's `bwlimit_kbps` or a command's `--bwlimit` wins where present, and the head's own `local: true` node (a disk-to-disk copy) is never budgeted |
 | `disk_min_gib` | 10 | Minimum free space required for every remote start |
 | `snapshot_warn_gib` | 2 | Warn when a source snapshot exceeds this transfer size |

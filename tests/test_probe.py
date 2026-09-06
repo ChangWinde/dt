@@ -118,6 +118,49 @@ def test_configured_resident_processes_neither_occupy_nor_count_memory():
     assert not tight[0].free  # 476 MiB foreign > 400 MiB threshold
 
 
+def test_nvidia_mps_daemons_are_resident_without_configuration():
+    """Field report: a node running NVIDIA MPS keeps an `nvidia-cuda-mps-server`
+    (about 28 MiB, no compute) on the card after the first client; `dt free`
+    reported 0/1 free with the card idle and sixty queued jobs never reached
+    it. NVIDIA's daemons never do a job's work, so they are resident on every
+    node without a configuration entry; a real client beside them still
+    occupies the card."""
+    from dt.probe import BUILTIN_GPU_RESIDENT_PROCESSES
+
+    assert set(BUILTIN_GPU_RESIDENT_PROCESSES) == {
+        "nvidia-cuda-mps-server",
+        "nvidia-cuda-mps-control",
+    }
+    # `ps -o comm=` keeps 15 bytes: the node reports `nvidia-cuda-mps` for
+    # both daemons (observed on a production node), never the full name.
+    text = (
+        f"0, GPU-aaa, 28, 24576, 0\n1, GPU-bbb, 2100, 24576, 40\n{SEP}\n"
+        "GPU-aaa, 4242, psibot, nvidia-cuda-mps, 28\n"
+        "GPU-bbb, 4242, psibot, nvidia-cuda-mps, 28\n"
+        "GPU-bbb, 5151, psibot, python, 2072\n"
+        f"{SYS_SEP}\n"
+    )
+    by_index = {g.index: g for g in parse_probe_output(text, 500)}
+    assert by_index[0].free
+    assert by_index[0].procs == 0 and by_index[0].resident_procs == 1
+    assert by_index[0].residents == ["nvidia-cuda-mps"]
+    assert by_index[0].resident_mib == 28
+    assert not by_index[1].free
+    assert by_index[1].procs == 1 and by_index[1].users == ["psibot"]
+
+    # Configured names add to the built-ins rather than replacing them, and a
+    # configured name longer than ps can show still matches its comm.
+    both = parse_probe_output(text, 500, resident_processes=["rustdesk"])
+    assert both[0].free and both[0].resident_procs == 1
+    long_name = (
+        f"0, GPU-aaa, 300, 24576, 0\n{SEP}\nGPU-aaa, 7, me, remote-desktop-, 300\n"
+    )
+    exempt = parse_probe_output(
+        long_name, 500, resident_processes=["remote-desktop-encoder"]
+    )[0]
+    assert exempt.free and exempt.residents == ["remote-desktop-"]
+
+
 def test_resident_process_without_a_memory_figure_keeps_the_threshold_honest():
     """Inside a container the driver reports [N/A] per process (probe_apps.sh
     emits an empty field): the process is disregarded, its memory is not."""

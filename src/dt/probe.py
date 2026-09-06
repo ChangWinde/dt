@@ -186,12 +186,32 @@ class NodeStatus:
         return [g for g in self.gpus if g.free]
 
 
+# NVIDIA's own daemons live on a card without doing any job's work: the MPS
+# control daemon and the server it leaves behind after the first client (about
+# 28 MiB, no compute). A node running MPS otherwise reported 0 free cards while
+# its queue waited (field report). Always resident, on top of the configured
+# `gpu_resident_processes`; the launcher applies the same names.
+BUILTIN_GPU_RESIDENT_PROCESSES: tuple[str, ...] = (
+    "nvidia-cuda-mps-server",
+    "nvidia-cuda-mps-control",
+)
+# The kernel keeps 15 bytes of a process name; `ps -o comm=` on the node
+# reports `nvidia-cuda-mps` for both daemons, and any configured name longer
+# than that is matched by what ps can actually show.
+COMM_MAX_LEN = 15
+
+
+def resident_process_names(resident_processes: Sequence[str] = ()) -> frozenset[str]:
+    names = set(resident_processes) | set(BUILTIN_GPU_RESIDENT_PROCESSES)
+    return frozenset(names | {name[:COMM_MAX_LEN] for name in names})
+
+
 def _parse_probe_inventory(
     text: str,
     mem_threshold_mib: int,
     resident_processes: Sequence[str] = (),
 ) -> tuple[list[Gpu], str | None]:
-    resident_names = frozenset(resident_processes)
+    resident_names = resident_process_names(resident_processes)
     gpu_part, _, remainder = text.partition(SEP)
     app_part, _, _ = remainder.partition(SYS_SEP)
     gpus: dict[str, Gpu] = {}
