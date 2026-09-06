@@ -93,9 +93,6 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   `env-lease:KEY` to the job's state directory and waits the environment
   build budget (`DT_ENV_BUILD_WAIT_S`, 90 s); the launcher reads the marker,
   extends its wait for the wrapper by that budget, and reports the phase.
-
-### Fixed
-
 - Node artifact stores are read-only to jobs. A job script's
   `ln -s "$DT_ARTIFACT_ROOT/<rel>" <rel>`, racing across two cells of one
   job, planted a symlink inside the worker's directory artifact and every
