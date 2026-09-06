@@ -18,6 +18,7 @@ capacity poll remains the fallback for external GPU users and broken links.
 
 from __future__ import annotations
 
+import copy
 import fcntl
 import json
 import math
@@ -32,11 +33,12 @@ import sys
 import tempfile
 import time
 import urllib.request
+from concurrent.futures import Future, ThreadPoolExecutor
 from urllib.parse import urlsplit
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from types import FrameType
 from typing import Callable
 
@@ -881,6 +883,174 @@ def _bump_blocked_backoff(
 _REPORTED_DISPATCH_OUTCOMES = frozenset(
     {"started", "finished", "failed", "skipped", "killed", "cancel-failed"}
 )
+_QUOTA_CHANGING_OUTCOMES = _REPORTED_DISPATCH_OUTCOMES
+# Concurrent dispatches the resident agent runs, one per target node. A cold
+# environment build or a slow snapshot on one node used to hold the whole
+# tick inside `launch()` for minutes while other nodes sat idle with queued
+# work ("scheduler stalled · 210s since last tick", field report).
+DISPATCH_WORKERS = 4
+
+
+@dataclass
+class _InflightDispatch:
+    """One dispatch running off the tick thread."""
+
+    entry: JobEntry
+    future: Future[tuple[str, str | None]]
+    started_at: float
+    pin_node: str | None
+
+
+class DispatchPool:
+    """Runs ``dispatch_queued`` for several jobs at once, one per target node.
+
+    The tick thread never blocks on a launch: it submits, keeps reconciling
+    and heartbeating, and harvests outcomes on the next pass. Safety rests on
+    what already protected two dispatcher processes (an inline `dt run`
+    racing the agent): the registry claim is a compare-and-swap under the job
+    lock, the launcher's node lock decides GPU ownership, and a claim owned
+    by a thread of this process is live for as long as that thread runs.
+
+    Placement stays FIFO-shaped exactly as in the synchronous pass: a job
+    whose target node already has a dispatch in flight waits for it, an
+    unpinned job waits while an in-flight dispatch has not yet chosen its
+    node, and an unpinned GPU job in flight makes later GPU work wait just as
+    a busy one did.
+    """
+
+    def __init__(self, workers: int = DISPATCH_WORKERS) -> None:
+        self._workers = max(1, workers)
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._workers, thread_name_prefix="dt-dispatch"
+        )
+        self._inflight: dict[str, _InflightDispatch] = {}
+        self._lock = Lock()
+        self.completed = Event()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._inflight)
+
+    def inflight(self, job_id: str) -> _InflightDispatch | None:
+        with self._lock:
+            return self._inflight.get(job_id)
+
+    def job_ids(self) -> frozenset[str]:
+        with self._lock:
+            return frozenset(self._inflight)
+
+    def saturated(self) -> bool:
+        """Every worker is busy; a further submit would only queue in memory."""
+        with self._lock:
+            return len(self._inflight) >= self._workers
+
+    def submit(
+        self,
+        cfg: HeadConfig,
+        entry: JobEntry,
+        log: Callable[[str], None],
+    ) -> None:
+        # The tick's snapshot row stays untouched: the worker mutates a copy,
+        # and the tick reads the registry again before deciding anything.
+        private = copy.deepcopy(entry)
+        item = _InflightDispatch(
+            entry=private,
+            future=self._executor.submit(dispatch_queued, cfg, private, log),
+            started_at=time.monotonic(),
+            pin_node=entry.pin_node,
+        )
+        with self._lock:
+            self._inflight[entry.job_id] = item
+        item.future.add_done_callback(lambda _future: self.completed.set())
+
+    def harvest(self) -> list[tuple[JobEntry, str, str | None]]:
+        """Collect finished dispatches as (entry, outcome, detail).
+
+        A dispatch that raised is reported as ``raised`` with the exception
+        text, matching the synchronous tick's "treat as blocked" posture.
+        """
+        self.completed.clear()
+        finished: list[tuple[JobEntry, str, str | None]] = []
+        with self._lock:
+            done = [
+                (job_id, item)
+                for job_id, item in self._inflight.items()
+                if item.future.done()
+            ]
+            for job_id, _item in done:
+                del self._inflight[job_id]
+        for _job_id, item in done:
+            try:
+                outcome, detail = item.future.result()
+            except Exception as exc:  # the worker's failure is the tick's to report
+                finished.append((item.entry, "raised", _bounded_exception(exc)))
+                continue
+            finished.append((item.entry, outcome, detail))
+        return finished
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        self._executor.shutdown(wait=wait)
+
+
+def _note_dispatch_outcome(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    outcome: str,
+    detail: str | None,
+    log: Callable[[str], None],
+    *,
+    blocked_log_state: dict[str, str] | None,
+    blocked_backoff: dict[str, tuple[int, float]] | None,
+) -> None:
+    """Log, notify, and update the backoff bookkeeping for one outcome."""
+    if outcome == "raised":
+        # One job's unexpected failure must never abort the tick and starve
+        # every queued job behind it. Treat it as a transient block, log it
+        # visibly, and move on; the next tick retries.
+        detail = detail or "unknown error"
+        log(
+            f"{entry.job_id} dispatch raised ({detail}); "
+            "treating as blocked and trying jobs behind it"
+        )
+        if blocked_log_state is not None:
+            blocked_log_state[entry.job_id] = detail
+        _bump_blocked_backoff(blocked_backoff, entry.job_id)
+        return
+    if blocked_log_state is not None and outcome not in (
+        "blocked",
+        "unreachable",
+        "waiting",
+    ):
+        blocked_log_state.pop(entry.job_id, None)
+    if blocked_backoff is not None and outcome not in ("blocked", "unreachable"):
+        blocked_backoff.pop(entry.job_id, None)
+    if outcome in _REPORTED_DISPATCH_OUTCOMES:
+        _report_dispatch_outcome(cfg, entry, outcome, detail, log)
+    elif outcome in ("blocked", "unreachable"):
+        # Both skip the job with backoff so it neither holds the FIFO nor
+        # burns the fleet every tick; only the words differ. An unreachable
+        # pin is an outage, not a fault of the job.
+        blocked_detail = detail or "reason unavailable"
+        verb = (
+            "waits for an unreachable node" if outcome == "unreachable" else "blocked"
+        )
+        if (
+            blocked_log_state is None
+            or blocked_log_state.get(entry.job_id) != blocked_detail
+        ):
+            log(f"{entry.job_id} {verb} ({blocked_detail}); trying jobs behind it")
+        if blocked_log_state is not None:
+            blocked_log_state[entry.job_id] = blocked_detail
+        _bump_blocked_backoff(blocked_backoff, entry.job_id)
+    elif outcome == "waiting":
+        waiting_detail = detail or "reason unavailable"
+        if (
+            blocked_log_state is None
+            or blocked_log_state.get(entry.job_id) != waiting_detail
+        ):
+            log(f"{entry.job_id} waiting ({waiting_detail}); trying jobs behind it")
+        if blocked_log_state is not None:
+            blocked_log_state[entry.job_id] = waiting_detail
 
 
 def _report_dispatch_outcome(
@@ -988,6 +1158,7 @@ def _process_once_with_snapshot(
     *,
     blocked_log_state: dict[str, str] | None = None,
     blocked_backoff: dict[str, tuple[int, float]] | None = None,
+    pool: DispatchPool | None = None,
 ) -> tuple[list[tuple[str, str]], list[JobEntry]]:
     """One poll tick: reconcile active jobs, then walk the queue FIFO.
 
@@ -1004,9 +1175,24 @@ def _process_once_with_snapshot(
     - busy (GPU capacity): preserve FIFO for every job that could use the same
       capacity; a pinned wait may be skipped only for later work pinned to a
       different node
+    - dispatching (with ``pool``): the placement runs on a worker thread and
+      is settled on a later tick; meanwhile its target node is treated as
+      busy for later work, and an unplaced dispatch holds later GPU work in
+      FIFO order exactly like a busy one
     Returns both outcomes and the updated registry snapshot so the rest of the
     loop can make watcher/sleep decisions without another historical scan.
     """
+    if pool is not None:
+        for finished_entry, outcome, detail in pool.harvest():
+            _note_dispatch_outcome(
+                cfg,
+                finished_entry,
+                outcome,
+                detail,
+                log,
+                blocked_log_state=blocked_log_state,
+                blocked_backoff=blocked_backoff,
+            )
     damage: list[RegistryDamage] = []
     active = active_entries(cfg, damage=damage)
     running_before = {entry.job_id for entry in active if entry.status == "running"}
@@ -1055,12 +1241,27 @@ def _process_once_with_snapshot(
     # work takes no card from anyone and is still attempted (field report: a
     # `-g 0 --node HEAD` job sat behind GPU jobs waiting for another node).
     unpinned_gpu_wait = False
+    # Nodes an in-flight dispatch has chosen. Work pinned there waits for it
+    # (one launcher per node at a time); unpinned work is not held, because
+    # its own placement sees those cards as reserved (_reserve_inflight_claims).
+    inflight_nodes: set[str] = set()
     for entry in queue:
         cap = cfg.queue.max_my_jobs
         entry_owns_slot = occupies_quota(entry)
         if cap is not None and running - int(entry_owns_slot) >= cap:
             results.append((entry.job_id, "capped"))
             break
+        if pool is not None and pool.inflight(entry.job_id) is not None:
+            # Its dispatcher thread owns the row until it returns. Until that
+            # thread has chosen a node, any node may be its target, so later
+            # GPU work keeps its FIFO place exactly as behind a busy job.
+            results.append((entry.job_id, "dispatching"))
+            target = entry.dispatch_node or entry.pin_node
+            if target is not None:
+                inflight_nodes.add(target)
+            elif entry.gpus_requested > 0:
+                unpinned_gpu_wait = True
+            continue
         if entry.gpus_requested > 0:
             if unpinned_gpu_wait:
                 results.append((entry.job_id, "busy"))
@@ -1087,74 +1288,55 @@ def _process_once_with_snapshot(
                 # burning the fleet every tick.
                 results.append((entry.job_id, "blocked"))
                 continue
+        if pool is not None:
+            # One dispatch per target node: the launcher's node lock would
+            # only bounce a second launcher, after a snapshot it paid for.
+            if entry.pin_node is not None and entry.pin_node in inflight_nodes:
+                results.append((entry.job_id, "busy"))
+                continue
+            if pool.saturated():
+                results.append((entry.job_id, "busy"))
+                continue
+            pool.submit(cfg, entry, log)
+            results.append((entry.job_id, "dispatching"))
+            if entry.pin_node is not None:
+                inflight_nodes.add(entry.pin_node)
+            elif entry.gpus_requested > 0:
+                # Unplaced until its thread probes and claims: later GPU work
+                # waits so this one's node choice comes first.
+                unpinned_gpu_wait = True
+            continue
         try:
             outcome, detail = dispatch_queued(cfg, entry, log)
         except Exception as exc:
-            # One job's unexpected failure must never abort the tick and starve
-            # every queued job behind it. Treat it as a transient block, log it
-            # visibly, and move on; the next tick retries.
-            detail = " ".join(str(exc).split())[:512] or type(exc).__name__
-            log(
-                f"{entry.job_id} dispatch raised ({detail}); "
-                "treating as blocked and trying jobs behind it"
+            _note_dispatch_outcome(
+                cfg,
+                entry,
+                "raised",
+                _bounded_exception(exc),
+                log,
+                blocked_log_state=blocked_log_state,
+                blocked_backoff=blocked_backoff,
             )
             results.append((entry.job_id, "blocked"))
-            if blocked_log_state is not None:
-                blocked_log_state[entry.job_id] = detail
-            _bump_blocked_backoff(blocked_backoff, entry.job_id)
             continue
         results.append((entry.job_id, outcome))
-        if blocked_log_state is not None and outcome not in (
-            "blocked",
-            "unreachable",
-            "waiting",
-        ):
-            blocked_log_state.pop(entry.job_id, None)
-        if blocked_backoff is not None and outcome not in ("blocked", "unreachable"):
-            blocked_backoff.pop(entry.job_id, None)
-        if outcome in {
-            "started",
-            "finished",
-            "failed",
-            "skipped",
-            "killed",
-            "cancel-failed",
-        }:
+        if outcome in _QUOTA_CHANGING_OUTCOMES:
             # dispatch_queued mutates this entry inside the one tick snapshot.
             # Recompute from that same snapshot whenever the transition may
             # acquire or release quota, so a recovered terminal attempt does
             # not leave later runnable work capped until the next tick.
             running = quota_occupancy(cfg, entries=entries, damage=damage)
-        if outcome in _REPORTED_DISPATCH_OUTCOMES:
-            _report_dispatch_outcome(cfg, entry, outcome, detail, log)
-        elif outcome in ("blocked", "unreachable"):
-            # Both skip the job with backoff so it neither holds the FIFO nor
-            # burns the fleet every tick; only the words differ. An unreachable
-            # pin is an outage, not a fault of the job.
-            blocked_detail = detail or "reason unavailable"
-            verb = (
-                "waits for an unreachable node"
-                if outcome == "unreachable"
-                else "blocked"
-            )
-            if (
-                blocked_log_state is None
-                or blocked_log_state.get(entry.job_id) != blocked_detail
-            ):
-                log(f"{entry.job_id} {verb} ({blocked_detail}); trying jobs behind it")
-            if blocked_log_state is not None:
-                blocked_log_state[entry.job_id] = blocked_detail
-            _bump_blocked_backoff(blocked_backoff, entry.job_id)
-        elif outcome == "waiting":
-            waiting_detail = detail or "reason unavailable"
-            if (
-                blocked_log_state is None
-                or blocked_log_state.get(entry.job_id) != waiting_detail
-            ):
-                log(f"{entry.job_id} waiting ({waiting_detail}); trying jobs behind it")
-            if blocked_log_state is not None:
-                blocked_log_state[entry.job_id] = waiting_detail
-        elif outcome == "busy" and entry.gpus_requested > 0:
+        _note_dispatch_outcome(
+            cfg,
+            entry,
+            outcome,
+            detail,
+            log,
+            blocked_log_state=blocked_log_state,
+            blocked_backoff=blocked_backoff,
+        )
+        if outcome == "busy" and entry.gpus_requested > 0:
             # A busy CPU job reserves nothing: no card would satisfy it.
             if entry.pin_node is None:
                 unpinned_gpu_wait = True
@@ -1165,7 +1347,9 @@ def _process_once_with_snapshot(
         if state is None:
             continue
         for job_id in list(state):
-            if job_id not in queued_ids:
+            if job_id not in queued_ids and (
+                pool is None or pool.inflight(job_id) is None
+            ):
                 state.pop(job_id, None)
     return results, entries
 
@@ -1541,6 +1725,7 @@ def _sleep_until_next_poll(
     completion_watch_disabled: set[str] | None = None,
     *,
     queue_active: bool | None = None,
+    pool: DispatchPool | None = None,
 ) -> str:
     deadline = time.monotonic() + _next_poll_delay(
         cfg,
@@ -1555,6 +1740,10 @@ def _sleep_until_next_poll(
             return "completion"
         if _consume_agent_wake(cfg):
             return "woken"
+        if pool is not None and pool.completed.is_set():
+            # A dispatch just returned: report it and move the FIFO along now
+            # rather than after the poll interval.
+            return "dispatched"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return "timeout"
@@ -1570,6 +1759,7 @@ class _RestartWatch:
     born_command_identity: tuple[str, str, int, int]
     rejected_restart: tuple[int, float] | None = None
     fd_released: bool = False
+    restart_pending: bool = False
 
 
 def _maybe_restart_for_new_code(
@@ -1579,13 +1769,16 @@ def _maybe_restart_for_new_code(
     fd: int,
     completion_watchers: dict[str, subprocess.Popen[bytes]],
     log: Callable[[str], None],
+    pool: DispatchPool | None = None,
 ) -> str:
     """Exec the replacement agent when dt's code or command changed.
 
     Returns "none" when nothing changed (or teardown failed and the loop
     should continue normally), "deferred" when the replacement failed
-    preflight and the loop should retry immediately, or "exit" when the
-    exec itself failed after the lock was released.
+    preflight and the loop should retry immediately, "busy" while dispatches
+    are still in flight (exec would abandon their launches mid-way; the next
+    pass retries), or "exit" when the exec itself failed after the lock was
+    released.
     """
     dt_bin: Path | None
     try:
@@ -1632,6 +1825,14 @@ def _maybe_restart_for_new_code(
             )
             return "deferred"
         reason = "active command changed" if command_changed else "code changed"
+        if pool is not None and len(pool):
+            if not watch.restart_pending:
+                log(
+                    f"dt {reason}; restarting agent once {len(pool)} in-flight "
+                    "dispatch(es) return"
+                )
+            watch.restart_pending = True
+            return "busy"
         log(f"dt {reason}; restarting agent")
         try:
             _stop_completion_watchers(completion_watchers)
@@ -1691,10 +1892,14 @@ def run_loop(cfg: HeadConfig) -> int:
     if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
         signal.signal(signal.SIGHUP, _term)
 
+    log_lock = Lock()
+
     def log(msg: str) -> None:
         stamp = datetime.now().strftime("%m-%d %H:%M:%S")
         try:
-            print(f"[{stamp}] {msg}", flush=True)
+            # Dispatch threads log too; one line at a time keeps them readable.
+            with log_lock:
+                print(f"[{stamp}] {msg}", flush=True)
         except OSError:
             # A full disk must not take the agent down: that would also stop
             # autoclean, the one thing that can free space again. Logging is
@@ -1719,8 +1924,10 @@ def run_loop(cfg: HeadConfig) -> int:
     rotate_log()
     log(
         f"agent up (pid {os.getpid()}, poll {cfg.queue.poll_s}s idle/"
-        f"{cfg.queue.active_poll_s:g}s queued, completion wake on)"
+        f"{cfg.queue.active_poll_s:g}s queued, completion wake on, "
+        f"{DISPATCH_WORKERS} dispatch workers)"
     )
+    pool = DispatchPool()
     born_identity = _runtime_identity(cfg)
     restart_watch = _RestartWatch(
         born_with=_code_fingerprint(),
@@ -1771,6 +1978,7 @@ def run_loop(cfg: HeadConfig) -> int:
                     log,
                     blocked_log_state=blocked_log_state,
                     blocked_backoff=blocked_backoff,
+                    pool=pool,
                 )
                 _sync_completion_watchers(
                     cfg,
@@ -1806,6 +2014,7 @@ def run_loop(cfg: HeadConfig) -> int:
                 fd=fd,
                 completion_watchers=completion_watchers,
                 log=log,
+                pool=pool,
             )
             if verdict == "deferred":
                 continue
@@ -1818,8 +2027,26 @@ def run_loop(cfg: HeadConfig) -> int:
                 log,
                 completion_watch_disabled,
                 queue_active=queue_active,
+                pool=pool,
             )
     finally:
+        if len(pool):
+            # A launch is never abandoned half-way: the claim would outlive us
+            # and the next agent would have to recover it from the node. The
+            # heartbeat keeps pulsing meanwhile so status does not call a
+            # draining agent stale.
+            log(f"waiting for {len(pool)} in-flight dispatch(es) before exit")
+        pool.shutdown(wait=True)
+        for drained_entry, drained_outcome, drained_detail in pool.harvest():
+            _note_dispatch_outcome(
+                cfg,
+                drained_entry,
+                drained_outcome,
+                drained_detail,
+                log,
+                blocked_log_state=blocked_log_state,
+                blocked_backoff=blocked_backoff,
+            )
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=1.0)
         _stop_completion_watchers(completion_watchers)
@@ -2455,6 +2682,46 @@ def _adaptive_handoff_state(
     return "ready", "queue is empty and ready for the next submission"
 
 
+def _inflight_dispatches(
+    entries: list[JobEntry],
+    pid: int | None,
+    *,
+    now: float | None = None,
+) -> list[dict[str, object]]:
+    """Queued rows whose dispatch claim the running agent owns right now.
+
+    The claim's owner identity is ``boot:pid:ticks``; a row claimed by the
+    live agent's pid is a launch one of its dispatch threads is driving.
+    """
+    if pid is None or pid <= 0:
+        return []
+    moment = time.time() if now is None else now
+    rows: list[dict[str, object]] = []
+    for entry in entries:
+        owner = entry.dispatch_owner or ""
+        parts = owner.split(":")
+        if (
+            entry.status != "queued"
+            or entry.dispatch_node is None
+            or len(parts) != 3
+            or parts[1] != str(pid)
+        ):
+            continue
+        claimed_at = entry.dispatch_claimed_at
+        rows.append(
+            {
+                "job_id": entry.job_id,
+                "name": entry.name,
+                "node": entry.dispatch_node,
+                "for_s": (
+                    max(0.0, moment - claimed_at) if claimed_at is not None else None
+                ),
+            }
+        )
+    rows.sort(key=lambda row: str(row["job_id"]))
+    return rows
+
+
 def status(cfg: HeadConfig) -> dict[str, object]:
     pid = alive_pid(cfg)
     damage: list[RegistryDamage] = []
@@ -2507,6 +2774,8 @@ def status(cfg: HeadConfig) -> dict[str, object]:
         "scheduler": scheduler,
         "queued": len(q),
         "queue_head": q[0].job_id if q else None,
+        "dispatching": _inflight_dispatches(entries, pid),
+        "dispatch_workers": DISPATCH_WORKERS,
         "running": running,
         "registry_entries": registry_entries,
         "registry_damage": len(damage),

@@ -101,6 +101,11 @@ queued row that is blocked or on an unreachable node.
   launch leaves a row the agent recovers or refuses safely, never a duplicate.
 - The resident agent retries blocked work on a capped backoff and drops that
   backoff the moment capacity changes or an artifact store is republished.
+- One slow launch does not stop the scheduler: dispatches run on worker
+  threads, one per target node, so a cold environment build on one node
+  leaves other nodes' queued work flowing. `dt agent status --json` lists
+  them under `dispatching` (`job_id`, `node`, `for_s`); each `dt info` on such
+  a job shows the launcher's phase after 15 s.
 
 ## Do not
 

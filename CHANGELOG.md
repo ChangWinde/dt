@@ -42,6 +42,20 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   (`dt_launch_progress_v1`). A launcher that already exited leaves `exited ·
   launcher exit N` behind so a dispatcher that died mid-launch cannot make the
   node look busy.
+- The resident agent dispatches several jobs at once, one per target node.
+  Its tick used to run each placement inline, so one slow launch — a cold
+  `uv sync`, a setup hook compiling for minutes, a code snapshot over a
+  saturated link — held every other node's queued work and the heartbeat with
+  it ("queue has jobs, GPUs are idle, nothing dispatches for minutes …
+  scheduler stalled · 210s since last tick", field report). Placement now runs
+  on a few worker threads while the tick keeps reconciling, heartbeating, and
+  placing work elsewhere; work pinned to a node with a launch in flight waits
+  for it, later GPU work waits only while an unpinned dispatch has not yet
+  chosen its node, and every dispatcher's probe view hides the cards a live
+  claim is about to take so two launchers never aim at one card. An older job
+  that already holds a claim reserves capacity on its claimed node only, so a
+  later job bound elsewhere passes it. The agent finishes in-flight dispatches
+  before it exits or re-execs; `dt agent status` lists them (`dispatching`).
 
 ### Fixed
 

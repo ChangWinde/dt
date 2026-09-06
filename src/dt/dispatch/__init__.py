@@ -1724,12 +1724,17 @@ from .queued import (  # noqa: E402
     _prepare_queued_stage as _prepare_queued_stage,
     _queued_node as _queued_node,
     _queued_run_spec as _queued_run_spec,
+    _INFLIGHT_JOB_IDS as _INFLIGHT_JOB_IDS,
+    _INFLIGHT_LOCK as _INFLIGHT_LOCK,
+    _dispatch_queued_gated as _dispatch_queued_gated,
     _recover_claimed_dispatch as _recover_claimed_dispatch,
     _refresh_queued_payload as _refresh_queued_payload,
     _request_remote_proof_command as _request_remote_proof_command,
+    _reserve_inflight_claims as _reserve_inflight_claims,
     _sync_queued_job_to_node as _sync_queued_job_to_node,
     dispatch_owner_identity as dispatch_owner_identity,
     dispatch_queued as dispatch_queued,
+    inflight_job_ids as inflight_job_ids,
     inspect_request_remote_proof as inspect_request_remote_proof,
 )
 from .progress import (  # noqa: E402

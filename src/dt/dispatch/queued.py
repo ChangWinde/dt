@@ -9,6 +9,7 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 import uuid
 
@@ -16,7 +17,7 @@ from .. import dispatch as _root
 from .. import submission_intent as intent_mod
 from ..artifact_distribution import DistributionError
 from ..config import ConfigError, HeadConfig, Node, head_bwlimit_kbps
-from ..probe import NodeStatus
+from ..probe import Gpu, NodeStatus
 from ..jobs import (
     JobEntry,
     RegistryDamage,
@@ -72,6 +73,31 @@ from . import (
 from ..scheduler import admission_decision
 
 
+# Jobs this process is dispatching right now, across threads. The resident
+# agent runs several dispatches at once (one per target node) so a slow
+# environment build on one node cannot stall placement everywhere else; a
+# claim owned by our own pid is then either one of these (live, leave it
+# alone) or a leftover of an attempt that raised (recoverable).
+_INFLIGHT_JOB_IDS: dict[str, int] = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def inflight_job_ids(*, exclude_current_thread: bool = False) -> frozenset[str]:
+    """Jobs whose dispatch is executing in this process at this moment.
+
+    ``exclude_current_thread`` leaves out the job the calling thread is itself
+    dispatching, so a dispatcher recovering its own row's stale claim does not
+    mistake that row for another thread's live attempt.
+    """
+    me = threading.get_ident()
+    with _INFLIGHT_LOCK:
+        return frozenset(
+            job_id
+            for job_id, owner in _INFLIGHT_JOB_IDS.items()
+            if not (exclude_current_thread and owner == me)
+        )
+
+
 def dispatch_queued(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -92,6 +118,23 @@ def dispatch_queued(
     the placement does not repeat a fleet-wide probe seconds later; the
     launcher's own locked capacity check still guards the placement.
     """
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_JOB_IDS[entry.job_id] = threading.get_ident()
+    try:
+        return _root._dispatch_queued_gated(cfg, entry, log, statuses=statuses)
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT_JOB_IDS.pop(entry.job_id, None)
+
+
+def _dispatch_queued_gated(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    log: Callable[[str], None],
+    *,
+    statuses: Sequence[NodeStatus] | None = None,
+) -> tuple[str, str | None]:
+    """Settle dependencies under the job lock, then place (see dispatch_queued)."""
     _root._finalize_dependency_rows(
         cfg,
         (entry.after_success, entry.after_complete, entry.after_result),
@@ -334,7 +377,11 @@ def _dispatch_claim_hold_reason(entry: JobEntry) -> str | None:
     except ValueError:
         return None
     if pid == os.getpid():
-        return None  # our own stale claim; single-threaded dispatch may recover
+        # Our own claim: live while another thread of this process is still
+        # dispatching the job, otherwise a leftover this process may recover.
+        if entry.job_id in _root.inflight_job_ids(exclude_current_thread=True):
+            return f"dispatch in progress on {entry.dispatch_node} in this process"
+        return None
     if boot_id != _current_head_boot_id():
         return None  # head rebooted: the owner is gone
     observed_ticks = _process_start_ticks(pid)
@@ -1203,6 +1250,64 @@ def _prepare_queued_stage(
     )
 
 
+def _reserve_inflight_claims(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    statuses: Sequence[NodeStatus],
+) -> list[NodeStatus]:
+    """Hide the cards other live dispatch claims are about to take.
+
+    A claimed queued row's launcher is on its node but has not taken its GPU
+    leases yet, so a probe still shows those cards free. Two dispatchers (the
+    agent's threads, or a `dt run` racing the agent) would otherwise both aim
+    at the same card and the loser would pay a snapshot and a launch to be
+    told busy at the node lock. Only claims with a provably live owner count;
+    a dead owner's claim is for dispatch recovery to settle, not for us to
+    reserve around.
+    """
+    reserved: dict[str, list[str]] = {}
+    try:
+        rows = active_entries(cfg)
+    except (OSError, RegistryError, PrivateStateError):
+        return list(statuses)
+    for row in rows:
+        if (
+            row.job_id == entry.job_id
+            or row.status != "queued"
+            or row.dispatch_node is None
+            or row.gpus_requested <= 0
+            or _root._dispatch_claim_hold_reason(row) is None
+        ):
+            continue
+        reserved.setdefault(row.dispatch_node, []).extend(
+            [row.job_id] * row.gpus_requested
+        )
+    if not reserved:
+        return list(statuses)
+    adjusted: list[NodeStatus] = []
+    for status in statuses:
+        owners = list(reserved.get(status.node, ()))
+        if not owners or status.error is not None:
+            adjusted.append(status)
+            continue
+        gpus: list[Gpu] = []
+        for gpu in status.gpus:
+            if owners and gpu.free:
+                owner = owners.pop(0)
+                gpus.append(
+                    replace(
+                        gpu,
+                        free=False,
+                        leased=True,
+                        lease_owner=f"dispatching:{owner}",
+                    )
+                )
+            else:
+                gpus.append(gpu)
+        adjusted.append(replace(status, gpus=gpus))
+    return adjusted
+
+
 def _fail_queued_placement(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -1308,7 +1413,7 @@ def _dispatch_queued_active(
         probed = _root.probe_center(cfg, use_cache=False)
     else:
         probed = list(statuses)
-    statuses = probed
+    statuses = _root._reserve_inflight_claims(cfg, entry, probed)
     probe_reasons = {
         status.node: probe_rejection_reason(status, spec) for status in statuses
     }

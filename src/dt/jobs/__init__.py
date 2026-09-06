@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import stat
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
@@ -1374,6 +1375,9 @@ def load(cfg: HeadConfig, job_id: str) -> JobEntry | None:
 _DECODE_CACHE_ENABLED = False
 _DECODE_CACHE_MAX = 65536
 _DECODE_CACHE: dict[str, tuple[tuple[int, int, int], JobEntry]] = {}
+# The resident agent scans the registry from its tick thread and from every
+# dispatch thread at once; an unguarded dict would raise mid-iteration.
+_DECODE_CACHE_LOCK = threading.Lock()
 
 
 def enable_registry_decode_cache() -> None:
@@ -1479,7 +1483,8 @@ def list_all(
                         cache_key = f"{directory}/{name}"
                         cache_seen.add(cache_key)
                         revision = (info.st_ino, info.st_size, info.st_mtime_ns)
-                        cached = _DECODE_CACHE.get(cache_key)
+                        with _DECODE_CACHE_LOCK:
+                            cached = _DECODE_CACHE.get(cache_key)
                         if cached is not None and cached[0] == revision:
                             # The resident agent mutates rows while attempting
                             # lifecycle transitions. Keep the cached decode as
@@ -1498,11 +1503,13 @@ def list_all(
                     )
                     if cache_key is not None and result is not None:
                         _, info = result
-                        if len(_DECODE_CACHE) < _DECODE_CACHE_MAX:
-                            _DECODE_CACHE[cache_key] = (
-                                (info.st_ino, info.st_size, info.st_mtime_ns),
-                                copy.deepcopy(entry),
-                            )
+                        snapshot = copy.deepcopy(entry)
+                        with _DECODE_CACHE_LOCK:
+                            if len(_DECODE_CACHE) < _DECODE_CACHE_MAX:
+                                _DECODE_CACHE[cache_key] = (
+                                    (info.st_ino, info.st_size, info.st_mtime_ns),
+                                    snapshot,
+                                )
                     entries[entry.job_id] = entry
                 except (OSError, PrivateStateError, RegistryError) as exc:
                     if damage is not None:
@@ -1512,9 +1519,10 @@ def list_all(
                         )
                         damage.append(RegistryDamage(path=name, detail=detail))
                     continue
-    if _DECODE_CACHE_ENABLED and _DECODE_CACHE:
-        for key in [k for k in _DECODE_CACHE if k not in cache_seen]:
-            del _DECODE_CACHE[key]
+    if _DECODE_CACHE_ENABLED:
+        with _DECODE_CACHE_LOCK:
+            for key in [k for k in _DECODE_CACHE if k not in cache_seen]:
+                del _DECODE_CACHE[key]
     return [entries[job_id] for job_id in sorted(entries)]
 
 

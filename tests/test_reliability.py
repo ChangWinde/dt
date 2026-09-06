@@ -1,6 +1,7 @@
 """Failure-injection tests: a single bad node must never sink a submission,
 and rsync retries must resume."""
 
+import itertools
 import json
 import math
 import os
@@ -1652,7 +1653,9 @@ def test_uncertain_direct_launch_is_registered_and_classified_unreachable(
             {"unreachable", "cancel-unverified"},
         ),
     )
-    failure_times = iter([100.0, 200.0])
+    # Submission stamps created_at first; every later clock read (the
+    # in-flight claim scan, the failure stamp) belongs to the failure.
+    failure_times = itertools.chain([100.0], itertools.repeat(200.0))
     monkeypatch.setattr(time, "time", lambda: next(failure_times))
     source = tmp_path / "source-uncertain"
     source.mkdir()
@@ -1934,7 +1937,7 @@ def test_direct_env_fail_persists_placed_failed_entry(tmp_path, monkeypatch):
             {"fatal"},
         ),
     )
-    failure_times = iter([100.0, 200.0])
+    failure_times = itertools.chain([100.0], itertools.repeat(200.0))
     monkeypatch.setattr(time, "time", lambda: next(failure_times))
     source = tmp_path / "source-env-fail"
     source.mkdir()

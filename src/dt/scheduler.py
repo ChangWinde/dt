@@ -53,9 +53,17 @@ def _capacity_overlaps(
     from anyone, and a 0-GPU older job is not waiting for one. Treating it as
     overlapping held a `-g 0 --node HEAD` job behind four jobs pinned to a
     full GPU node ("FIFO capacity is reserved for earlier job ...").
+
+    An older job that already carries a dispatch claim has its placement
+    decided: its launcher is running on ``dispatch_node``. It reserves
+    capacity there and nowhere else, so a candidate for another node passes
+    it instead of waiting out a slow environment build on a node it never
+    wanted.
     """
     if older.gpus_requested <= 0 or candidate.gpus_requested <= 0:
         return False
+    if older.dispatch_node is not None:
+        return older.dispatch_node == candidate_node
     if candidate.pin_node is None:
         return True
     return older.pin_node is None or older.pin_node == candidate_node
@@ -598,6 +606,14 @@ def scheduler_snapshot(
             forecast_running += 1
             if capacity is not None and selected_node is not None:
                 _consume_capacity(capacity, selected_node, entry)
+        elif (
+            state == "dispatch_reserved"
+            and capacity is not None
+            and selected_node is not None
+        ):
+            # The launcher on that node is about to take these cards (the row
+            # already holds a quota slot); the probe still shows them free.
+            _consume_capacity(capacity, selected_node, entry)
 
         if state == "waiting_capacity" and entry.gpus_requested > 0:
             if entry.pin_node is None:
