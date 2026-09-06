@@ -1330,10 +1330,11 @@ if [ -n "$DT_ARTIFACT_MANIFEST" ]; then
     dt_publish_launch_phase artifact_verification \
         "verifying artifact manifest ${DT_ARTIFACT_MANIFEST:0:12}"
     artifact_verify_started_ms=$(now_ms)
-    # The store is shared by every job of the project on this node and stays
-    # writable for republication, so a job writing through its workspace link
-    # (or an operator editing files) can make it drift from the manifest this
-    # job was pinned to.
+    # The store is shared by every job of the project on this node. It is
+    # published read-only, but an operator editing files, a store published
+    # by an older release, or a partial republication can still make it
+    # drift from the manifest this job was pinned to; the verifier reuses
+    # its last evidence when nothing changed, so this costs little.
     if ! artifact_verify_error=$(python3 -I "$DT_PAYLOAD_DIR/artifact_verify.py" \
         --root "$DT_ARTIFACT_ROOT" \
         --manifest "$artifact_manifest_path" \

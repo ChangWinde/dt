@@ -52,6 +52,72 @@ def test_ps_surfaces_damaged_registry_rows(tmp_path):
     assert any("unreadable registry entry" in message for message in errors.values())
 
 
+def test_ps_trusts_the_agents_last_reconciliation_instead_of_reprobing(
+    tmp_path, monkeypatch
+):
+    """Every `dt ps` probed the node of each running job although the resident
+    agent had verified those rows within its last tick: 270 ms of a 450 ms
+    command on a two-node head, for no news. While a live agent is on schedule
+    the registry is taken as current; `--progress`, a stopped agent or a stale
+    tick record still probe."""
+    import time
+
+    import dt.agent as agent_mod
+
+    cfg = _cfg(tmp_path)
+    cli.jobs_mod.save(cfg, _entry("run-1", created_at=1.0, status="running"))
+    probes: list[list[str]] = []
+
+    def fake_refresh(cfg_, entries, observations=None):
+        probes.append([entry.job_id for entry in entries])
+        return {entry.job_id: entry for entry in entries}
+
+    monkeypatch.setattr(cli.jobs_mod, "refresh_statuses", fake_refresh)
+    monkeypatch.setattr(agent_mod, "alive_pid", lambda cfg_: 4242)
+    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
+    tick = agent_mod.scheduler_tick_path(cfg)
+
+    tick.write_text(
+        json.dumps({"last_success_at": time.time(), "next_due_at": time.time() + 60})
+    )
+    rows, _errors = ps_cmd._gather_ps_rows(cfg, None, active_only=True)
+    assert [row["job_id"] for row in rows] == ["run-1"]
+    assert probes == [], "a current registry must not be re-probed"
+
+    # Live progress needs the node regardless.
+    from dt.probe import NodeStatus
+
+    monkeypatch.setattr(cli, "probe_node", lambda *a, **k: NodeStatus(node="n1"))
+    monkeypatch.setattr(ps_cmd, "_collect_ps_progress", lambda entry: {})
+    ps_cmd._gather_ps_rows(cfg, None, active_only=True, include_progress=True)
+    assert probes == [["run-1"]]
+
+    # A tick older than one idle poll plus slack means the agent is behind.
+    probes.clear()
+    stale_at = time.time() - (cfg.queue.poll_s + 31)
+    tick.write_text(
+        json.dumps({"last_success_at": stale_at, "next_due_at": stale_at + 60})
+    )
+    ps_cmd._gather_ps_rows(cfg, None, active_only=True)
+    assert probes == [["run-1"]]
+
+    # No agent at all: probe, as before.
+    probes.clear()
+    tick.write_text(
+        json.dumps({"last_success_at": time.time(), "next_due_at": time.time() + 60})
+    )
+    monkeypatch.setattr(agent_mod, "alive_pid", lambda cfg_: None)
+    ps_cmd._gather_ps_rows(cfg, None, active_only=True)
+    assert probes == [["run-1"]]
+
+    # An unreadable tick record fails closed.
+    probes.clear()
+    monkeypatch.setattr(agent_mod, "alive_pid", lambda cfg_: 4242)
+    tick.write_text("{not json")
+    ps_cmd._gather_ps_rows(cfg, None, active_only=True)
+    assert probes == [["run-1"]]
+
+
 def test_ps_issues_filters_before_the_human_limit(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     for i in range(3):

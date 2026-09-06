@@ -6,6 +6,28 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `scripts/deploy.sh dist local` deploys (and `--rollback ... local` restores)
+  the head the script runs on with the same bundle checks, staging,
+  activation and rollback scripts the SSH targets get. A head cannot SSH to
+  itself, and driving its upgrade by hand with copies of the remote scripts
+  went wrong twice (a stale script copy; an incomplete bundle the remote path
+  would have refused).
+
+### Changed
+
+- `dt ps` and `dt ps --json` no longer probe the node of every running job
+  while the resident agent is on schedule. Each agent tick verifies the
+  running rows against their nodes and completion watchers land a finished
+  job within a tenth of a second, so the probe cost `dt ps` a WAN round trip
+  per node (270 ms of a 450 ms command) for no news. A stopped agent, a tick
+  older than one idle poll plus 30 s, or `--progress` still probe.
+- `dt doctor` measures PyPI throughput on a 2 MiB wheel from the files CDN
+  that serves every uv download. The 100 KiB index page it downloaded before
+  is latency-bound and read ~300 KB/s on 4 MB/s links, so every node was
+  labelled `slow(pypi ...)` and offered `dt seed` it did not need.
+
 ## 0.13.19 — 2026-09-07
 
 The tag `v0.13.18` points at the commit before this version stamp: a

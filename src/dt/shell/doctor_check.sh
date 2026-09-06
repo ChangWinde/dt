@@ -13,8 +13,14 @@ doctor_net() {
         # is the node's own path to PyPI - what uv sync sees on a cold
         # environment - not the head-to-node transfer link (dt topology and
         # dt seed measure that one); the label names the peer so the two are
-        # not compared.
-        spd=$(curl -m 4 -so /dev/null -w "%{speed_download}" https://pypi.org/simple/pip/ 2>/dev/null)
+        # not compared. The sample is a 2 MiB wheel from the files CDN that
+        # serves every uv download: the 100 KiB index page used before is
+        # latency-bound and read ~300 KB/s on 4 MB/s links, so every node was
+        # labelled slow. Four seconds bound the probe; a link cut off at that
+        # point still reports its true average throughput.
+        spd=$(curl -m 4 -so /dev/null -w "%{speed_download}" \
+            https://files.pythonhosted.org/packages/8a/6a/19e9fe04fca059ccf770861c7d5721ab4c2aebc539889e97c7977528a53b/pip-24.0-py3-none-any.whl \
+            2>/dev/null)
         label="pypi $(fmt_speed "$spd")"
         if awk -v s="${spd:-0}" 'BEGIN{exit !(s >= 1048576)}'; then
             echo "DT_NET=ok($label)"

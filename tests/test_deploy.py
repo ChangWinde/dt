@@ -477,9 +477,13 @@ set -euo pipefail
 args=("$@")
 source=${args[${#args[@]}-2]}
 target=${args[${#args[@]}-1]}
-host=${target%%:*}
-relative=${target#*:}
-destination="$FAKE_REMOTE_ROOT/$host/$relative"
+if [[ "$target" == *:* ]]; then
+    host=${target%%:*}
+    relative=${target#*:}
+    destination="$FAKE_REMOTE_ROOT/$host/$relative"
+else
+    destination="$target"  # the `local` deploy target: a plain path
+fi
 mkdir -p "$destination"
 if [[ -n "${FAKE_RSYNC_BLOCK_DIR:-}" ]]; then
     mkdir -p "$FAKE_RSYNC_BLOCK_DIR"
@@ -677,6 +681,47 @@ def test_deploy_upgrade_and_explicit_rollback_are_atomic(tmp_path):
 
     assert rollback.returncode == 0, rollback.stderr
     assert _installed_version(remote_home) == "dt 0.9.0"
+    assert (base / "current").readlink() == Path("releases/0.9.0")
+
+
+def test_deploy_local_target_runs_the_same_activation_on_this_head(tmp_path):
+    """A head cannot SSH to itself, so its own upgrades were driven by hand
+    with copies of the remote scripts - and twice went wrong (a stale script
+    copy, an incomplete bundle the remote path would have refused). The `local`
+    target runs the identical prepare/activate/rollback scripts here, after
+    the identical bundle checks, without touching ssh."""
+    env, remote_home = _transport(tmp_path)
+    ssh_log = tmp_path / "ssh.log"
+    env.update({"HOME": str(remote_home), "FAKE_SSH_LOG": str(ssh_log)})
+    remote_home.mkdir(parents=True, exist_ok=True)
+    first = _release(tmp_path, "0.9.0")
+    second = _release(tmp_path, "0.9.1")
+
+    initial = _deploy(env, str(first), "local")
+    upgrade = _deploy(env, str(second), "local")
+
+    assert initial.returncode == 0, initial.stdout + initial.stderr
+    assert upgrade.returncode == 0, upgrade.stdout + upgrade.stderr
+    assert "deployed local: dt 0.9.1" in upgrade.stdout
+    assert _installed_version(remote_home) == "dt 0.9.1"
+    base = remote_home / ".local" / "share" / "disttrainer"
+    assert (base / "current").readlink() == Path("releases/0.9.1")
+    assert list((base / "incoming").iterdir()) == []
+    assert not ssh_log.exists()
+
+    rollback = _deploy(env, "--rollback", "0.9.0", "local")
+    assert rollback.returncode == 0, rollback.stdout + rollback.stderr
+    assert _installed_version(remote_home) == "dt 0.9.0"
+    assert (base / "current").readlink() == Path("releases/0.9.0")
+    assert not ssh_log.exists()
+
+    # The bundle checks are the remote path's: an incomplete bundle is refused
+    # before anything is staged.
+    incomplete = _release(tmp_path, "0.9.2")
+    (incomplete / "release-manifest.json").unlink()
+    refused = _deploy(env, str(incomplete), "local")
+    assert refused.returncode == 4
+    assert "missing release file: release-manifest.json" in refused.stderr
     assert (base / "current").readlink() == Path("releases/0.9.0")
 
 
