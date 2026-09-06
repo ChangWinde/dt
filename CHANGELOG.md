@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.17 — 2026-09-07
+
 ### Fixed
 
 - A dependent job is admitted once its predecessor has finished. `dt run
