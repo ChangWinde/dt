@@ -1836,44 +1836,96 @@ def _maybe_restart_for_new_code(
         log(f"dt {reason}; restarting agent")
         try:
             _stop_completion_watchers(completion_watchers)
-            _pid_path(cfg).unlink(missing_ok=True)
+            # The singleton lock and the pid file travel through the exec:
+            # the pid does not change, and the replacement image adopts the
+            # locked descriptor (AGENT_LOCK_FD_ENV) instead of re-taking the
+            # lock. Releasing it here opened a window of a second or two in
+            # which `dt agent stop` reported "no agent running" and the
+            # deploy's `dt agent start` "agent already running" (field
+            # observation during a release).
+            os.set_inheritable(fd, True)
         except OSError as exc:
             log(f"agent restart deferred; teardown failed ({_bounded_exception(exc)})")
         else:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
             watch.fd_released = True
             try:
                 sys.stdout.flush()
             except OSError:
                 pass
+            environment = {**os.environ, AGENT_LOCK_FD_ENV: str(fd)}
             try:
-                os.execvp(str(dt_bin), [str(dt_bin), "agent", "run"])
+                os.execvpe(str(dt_bin), [str(dt_bin), "agent", "run"], environment)
             except OSError as exc:
-                # The lock is already released and this image cannot
-                # exec its replacement (deploy race, unexecutable
-                # binary). Exit cleanly so the supervisor starts a
-                # fresh agent instead of dying with a traceback and
-                # leaving the queue driverless.
+                # This image cannot exec its replacement (deploy race,
+                # unexecutable binary). Release the lock and exit cleanly so
+                # the supervisor starts a fresh agent instead of dying with a
+                # traceback and leaving the queue driverless.
                 log(
                     "agent restart exec failed "
                     f"({_bounded_exception(exc)}); exiting so "
                     "the supervisor can start a fresh agent"
                 )
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+                except OSError:
+                    pass
+                _pid_path(cfg).unlink(missing_ok=True)
                 return "exit"
     return "none"
+
+
+AGENT_LOCK_FD_ENV = "DT_AGENT_LOCK_FD"
+
+
+def _adopt_inherited_lock(cfg: HeadConfig) -> int | None:
+    """Take over the singleton lock a self-restarting agent handed to us.
+
+    The previous image exec'd this one with its locked descriptor open and
+    ``AGENT_LOCK_FD_ENV`` naming it. The descriptor is accepted only when it
+    is a regular file that is the current lock path (same device and inode);
+    anything else is ignored and the normal open-and-lock path runs. The
+    variable is removed either way so no child of this agent inherits it.
+    """
+    raw = os.environ.pop(AGENT_LOCK_FD_ENV, None)
+    if raw is None or not raw.isdigit() or int(raw) < 3:
+        return None
+    fd = int(raw)
+    try:
+        inherited = os.fstat(fd)
+        if not stat.S_ISREG(inherited.st_mode):
+            return None
+        expected = os.stat(_lock_path(cfg))
+        if (inherited.st_dev, inherited.st_ino) != (expected.st_dev, expected.st_ino):
+            # The previous image locked another root's file (the runtime
+            # identity changed under it); holding it would block that root.
+            os.close(fd)
+            return None
+        # Re-asserting the lock on the same open file description is a
+        # no-op when we hold it and a refusal when we somehow do not.
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.set_inheritable(fd, False)
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    return fd
 
 
 def run_loop(cfg: HeadConfig) -> int:
     """Foreground loop (what crontab/nohup runs). Exit 1 if another agent
     already holds the lock."""
     cfg.agent_dir().mkdir(parents=True, exist_ok=True)
-    fd = _open_private_regular(_lock_path(cfg), os.O_RDWR | os.O_CREAT)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        print("another dt agent is already running", file=sys.stderr)
-        return 1
+    fd = _adopt_inherited_lock(cfg)
+    if fd is None:
+        fd = _open_private_regular(_lock_path(cfg), os.O_RDWR | os.O_CREAT)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("another dt agent is already running", file=sys.stderr)
+            return 1
     _atomic_private_write(_pid_path(cfg), f"{os.getpid()}\n".encode("ascii"))
     # Resident process: registry scans repeat every tick, so decoded rows are
     # reused until their file revision changes (QR-P2).

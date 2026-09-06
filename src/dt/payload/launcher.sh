@@ -929,7 +929,7 @@ if ! tmux -L "$DT_TMUX_SOCKET" has-session -t "$DT_SESSION" 2>/dev/null \
           "$DT_STATE_DIR/runtime_containment" \
           "$DT_STATE_DIR/runtime_gpus_requested" \
           "$DT_STATE_DIR/runtime_linger" \
-          "$DT_STATE_DIR/tmux_socket" \
+          "$DT_STATE_DIR/tmux_socket" "$DT_STATE_DIR/wrapper_phase" \
           "$DT_STATE_DIR/started_at" "$DT_STATE_DIR/finished_at" \
           "$DT_STATE_DIR/exit_code" "$DT_STATE_DIR"/exit_code.tmp.* \
           "$DT_STATE_DIR/result_state" "$DT_STATE_DIR"/result_state.tmp.* \
@@ -2004,6 +2004,7 @@ start_session() {
     DT_REUSE_CACHE_ENV=$DT_CACHE_ENV
     DT_UV=$UV_BIN
     DT_UV_ENV=$UV_ENV
+    DT_ENV_BUILD_WAIT_S=$ENV_BUILD_WAIT_S
     DT_SHELL_QUOTED=""
     dt_shell_quote "$DT_JOB_DIR"
     # The dedicated per-job tmux server inherits its initial environment.
@@ -2034,6 +2035,7 @@ start_session() {
         CUDA_VISIBLE_DEVICES DT_GPU_IDS DT_GPUS DT_GPU_ISOLATION DT_MAX_HOURS \
         DT_MIN_VRAM_MIB \
         DT_MAX_VRAM_MIB DT_MAX_JOB_MEMORY_MIB DT_ENV_MODE DT_UV DT_UV_ENV \
+        DT_ENV_BUILD_WAIT_S \
         DT_JOB_LOG_MAX_BYTES DT_JOB_LOG_KEEP_FILES \
         DT_CENTER DT_NODE DT_JOB_ID DT_JOB_NAME
     )
@@ -2155,7 +2157,7 @@ launch_locked() {
           "$DT_STATE_DIR/runtime_containment" \
           "$DT_STATE_DIR/runtime_gpus_requested" \
           "$DT_STATE_DIR/runtime_linger" \
-          "$DT_STATE_DIR/tmux_socket" \
+          "$DT_STATE_DIR/tmux_socket" "$DT_STATE_DIR/wrapper_phase" \
           "$DT_STATE_DIR/started_at" "$DT_STATE_DIR/finished_at" \
           "$DT_STATE_DIR/exit_code" "$DT_STATE_DIR"/exit_code.tmp.* \
           "$DT_STATE_DIR/result_state" "$DT_STATE_DIR"/result_state.tmp.* \
@@ -2180,8 +2182,27 @@ launch_locked() {
     # Keep the node launch lock until wrapper.sh owns every selected GPU
     # lease and records its pgid. Otherwise a second launcher can observe an
     # idle card during CPU-only dataset initialization and double-assign it.
-    for ((attempt = 0; attempt < 100; attempt++)); do
+    # Ten seconds covers a wrapper's normal start; a wrapper that reports it
+    # is waiting for a shared lease on an environment another launch is
+    # rebuilding gets the environment build budget instead of being declared
+    # dead and killed (a fatal "internal" that hid the real cause).
+    local pgid_deadline_ms wrapper_phase lease_wait_ms
+    lease_wait_ms=$(((ENV_BUILD_WAIT_S + 10) * 1000))
+    pgid_deadline_ms=$(($(now_ms) + 10000))
+    while :; do
         [ -f "$DT_STATE_DIR/pgid" ] && pgid=$(cat "$DT_STATE_DIR/pgid") && break
+        wrapper_phase=$(head -c 96 "$DT_STATE_DIR/wrapper_phase" 2>/dev/null || true)
+        case "$wrapper_phase" in
+            env-lease:*)
+                if [ "$pgid_deadline_ms" -lt $((session_start_started_ms + lease_wait_ms)) ]; then
+                    pgid_deadline_ms=$((session_start_started_ms + lease_wait_ms))
+                    log "wrapper is waiting for a shared lease on env ${wrapper_phase#env-lease:} (being rebuilt by another launch); allowing ${ENV_BUILD_WAIT_S}s"
+                    dt_publish_launch_phase session_start \
+                        "wrapper waits for a shared lease on env ${wrapper_phase#env-lease:} (being rebuilt by another launch)"
+                fi
+                ;;
+        esac
+        [ "$(now_ms)" -lt "$pgid_deadline_ms" ] || break
         sleep 0.1
     done
     if [ -z "$pgid" ]; then

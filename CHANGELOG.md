@@ -78,6 +78,21 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   placement pass that carries fresh probe evidence re-tests the constraint on
   the node itself, so the stale verdict no longer vetoes it; dependency
   blockers and `dt free --explain`'s explanation are unchanged.
+- `dt agent stop` and `dt agent start` no longer contradict each other while
+  the agent re-execs itself for a new dt build. The restarting image released
+  its singleton lock and pid file before `exec`, so for a second or two a
+  deploy saw "no agent running" followed by "agent already running" (field
+  observation during a release). The locked descriptor and the pid now travel
+  through the `exec` and the replacement image adopts them; only a failed
+  `exec` releases them.
+- The wrapper's lifetime lease on the environment is bounded and explained.
+  Another launch can take the environment lock exclusively to build between
+  the launcher's shared entry check and the wrapper's lease; the wrapper waited
+  without bound while the launcher declared it dead after ten seconds (a
+  fatal `internal` that hid the cause). The wrapper now publishes
+  `env-lease:KEY` to the job's state directory and waits the environment
+  build budget (`DT_ENV_BUILD_WAIT_S`, 90 s); the launcher reads the marker,
+  extends its wait for the wrapper by that budget, and reports the phase.
 
 ### Fixed
 

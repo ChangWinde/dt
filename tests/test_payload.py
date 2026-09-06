@@ -1573,6 +1573,84 @@ def test_wrapper_exact_environment_reuse_does_not_require_uv(tmp_path):
     assert "DT_ENV_MODE" in _tmux_session_env_names()
 
 
+def _wrapper_reuse_env(tmp_path: Path, env_dir: Path) -> dict[str, str]:
+    (tmp_path / "code").mkdir()
+    (env_dir / "bin").mkdir(parents=True)
+    (env_dir / "bin" / "python").symlink_to(shutil.which("python3"))
+    (tmp_path / "cmd.sh").write_text("true\n")
+    return {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "",
+        "DT_MAX_HOURS": "",
+        "DT_ENV_MODE": "reuse",
+        "DT_UV": "",
+        "DT_UV_ENV": str(env_dir),
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+
+
+def test_wrapper_waits_a_bounded_time_for_an_environment_under_rebuild(tmp_path):
+    """Between the launcher's shared entry check and the wrapper's lifetime
+    lease another launch may take the environment lock exclusively to build.
+    The wrapper used to wait for it without bound while the launcher declared
+    it dead after ten seconds; now it publishes what it waits for and gives up
+    after the environment build budget, so both sides can explain the job."""
+    env_dir = tmp_path / "envs" / "0123456789ab"
+    env = _wrapper_reuse_env(tmp_path, env_dir)
+    env["DT_ENV_BUILD_WAIT_S"] = "1"
+    lock = Path(str(env_dir) + ".lock")
+    with _holding_environment_lock(lock, shared=False):
+        proc = subprocess.run(
+            ["bash", str(PAYLOAD / "wrapper.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=WRAPPER_TIMEOUT_SECONDS,
+        )
+
+    assert proc.returncode == 76, proc.stderr
+    assert "is being rebuilt by another launch; waiting up to 1s" in proc.stderr
+    assert "stayed under rebuild for 1s; cannot enter it" in proc.stderr
+    assert (tmp_path / "wrapper_phase").read_text().strip() == (
+        "env-lease:0123456789ab"
+    )
+    assert not (tmp_path / "pgid").exists()
+
+
+def test_wrapper_enters_the_environment_once_the_rebuild_releases_it(tmp_path):
+    env_dir = tmp_path / "envs" / "0123456789ab"
+    env = _wrapper_reuse_env(tmp_path, env_dir)
+    env["DT_ENV_BUILD_WAIT_S"] = "10"
+    lock = Path(str(env_dir) + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    holder = subprocess.Popen(
+        ["flock", "-x", str(lock), "-c", "echo held; sleep 1"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline() == "held\n"
+        proc = subprocess.run(
+            ["bash", str(PAYLOAD / "wrapper.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=WRAPPER_TIMEOUT_SECONDS,
+        )
+    finally:
+        holder.wait(timeout=10)
+        holder.stdout.close()
+
+    assert proc.returncode == 0, proc.stderr
+    assert "is being rebuilt by another launch" in proc.stderr
+    assert (tmp_path / "result_state").read_text().strip() == "success"
+    # The marker is transient: it is removed once the lease is held.
+    assert not (tmp_path / "wrapper_phase").exists()
+
+
 def test_launcher_setup_hook_stops_at_first_failed_command(tmp_path):
     proc = _run_launcher_with_fake_uv(tmp_path, "setup_failure")
 
@@ -3256,7 +3334,10 @@ def test_gpu_lease_closes_pre_cuda_startup_race():
     assert LAUNCHER.find("start_session") < LAUNCHER.find(
         "wrapper did not acquire GPU lease/start"
     )
-    assert "attempt < 100" in LAUNCHER
+    # Ten seconds for a normal wrapper start, extended only while the wrapper
+    # reports it is waiting for a shared lease on an environment under rebuild.
+    assert "pgid_deadline_ms=$(($(now_ms) + 10000))" in LAUNCHER
+    assert "env-lease:*)" in LAUNCHER
     assert "sleep 0.1" in LAUNCHER
     assert WRAPPER.find("flock -n") < WRAPPER.find(
         'dt_publish_state_marker "$DT_STATE_DIR/pgid" "$$"'
