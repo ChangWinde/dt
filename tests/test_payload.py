@@ -1426,6 +1426,43 @@ def test_launcher_does_not_count_configured_resident_processes_as_occupants(
         encoder.wait()
 
 
+def test_launcher_treats_nvidia_mps_daemons_as_resident_by_default(tmp_path):
+    """The MPS server a node keeps after its first client held a card busy for
+    the launcher as well (field report); NVIDIA's daemons are resident without
+    any DT_GPU_RESIDENT_PROCESSES entry, and a configured list adds to them."""
+    resident_bin = tmp_path / "resident-bin"
+    resident_bin.mkdir()
+    (resident_bin / "nvidia-cuda-mps-server").symlink_to("/bin/sleep")
+    server = subprocess.Popen([str(resident_bin / "nvidia-cuda-mps-server"), "60"])
+    try:
+        apps = f"GPU-fit, {server.pid}, 28\n"
+
+        def launch(**env: str) -> subprocess.CompletedProcess:
+            for stale in ("job", "home", "bin", "state"):
+                shutil.rmtree(tmp_path / stale, ignore_errors=True)
+            return _run_launcher_with_fake_uv(
+                tmp_path,
+                "plain",
+                gpu_rows="0, GPU-fit, 28, 24576",
+                env_overrides={
+                    "DT_GPUS": "1",
+                    "DT_MEM_MIB": "500",
+                    "DT_TEST_GPU_APPS": apps,
+                    **env,
+                },
+            )
+
+        unconfigured = launch()
+        assert unconfigured.returncode == 0, unconfigured.stderr
+        assert json.loads(unconfigured.stdout)["gpus"] == [0]
+
+        with_config = launch(DT_GPU_RESIDENT_PROCESSES="rustdesk")
+        assert with_config.returncode == 0, with_config.stderr
+    finally:
+        server.kill()
+        server.wait()
+
+
 @pytest.mark.parametrize(
     "gpu_rows",
     [

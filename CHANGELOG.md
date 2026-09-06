@@ -6,6 +6,18 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- NVIDIA's MPS daemons no longer hold a card busy. A node running MPS keeps an
+  `nvidia-cuda-mps-server` (about 28 MiB, no compute) on the card after its
+  first client; `dt free` then showed 0 free on an idle card and sixty queued
+  jobs never reached the node (field report). `nvidia-cuda-mps-server` and
+  `nvidia-cuda-mps-control` are resident on every node without a
+  `gpu_resident_processes` entry, for the head's probe and the launcher alike.
+  Names are also matched as `ps -o comm=` can show them — the kernel keeps 15
+  bytes, so both daemons appear as `nvidia-cuda-mps` and a configured
+  `remote-desktop-encoder` matches `remote-desktop-`.
+
 ## 0.13.17 — 2026-09-07
 
 ### Fixed

@@ -111,6 +111,19 @@ DT_GPU_RESIDENT_PROCESSES="${DT_GPU_RESIDENT_PROCESSES:-}"
 case "$DT_GPU_RESIDENT_PROCESSES" in
     *[!A-Za-z0-9._+,-]*) log "invalid resident process list"; exit 13 ;;
 esac
+# NVIDIA's MPS daemons never do a job's work; they are resident everywhere
+# (the head's probe agrees: BUILTIN_GPU_RESIDENT_PROCESSES). The kernel keeps
+# 15 bytes of a process name, so every name is also matched as `ps -o comm=`
+# can show it (`nvidia-cuda-mps` for both daemons).
+DT_GPU_RESIDENT_PROCESSES="${DT_GPU_RESIDENT_PROCESSES:+$DT_GPU_RESIDENT_PROCESSES,}nvidia-cuda-mps-server,nvidia-cuda-mps-control"
+dt_resident_truncated=""
+IFS=, read -r -a dt_resident_names <<<"$DT_GPU_RESIDENT_PROCESSES"
+for dt_resident_name in "${dt_resident_names[@]}"; do
+    [ -n "$dt_resident_name" ] || continue
+    dt_resident_truncated+=",${dt_resident_name:0:15}"
+done
+DT_GPU_RESIDENT_PROCESSES+="$dt_resident_truncated"
+unset dt_resident_truncated dt_resident_names dt_resident_name
 DT_ARTIFACT_ROOT="${DT_ARTIFACT_ROOT:-}"
 DT_ARTIFACT_MANIFEST="${DT_ARTIFACT_MANIFEST:-}"
 DT_ARTIFACT_TARGETS="${DT_ARTIFACT_TARGETS:-}"
