@@ -1980,7 +1980,20 @@ dt_shell_quote() {
 
 dt_append_session_env() {
     local name=$1 value=""
-    if [[ -v "$name" ]]; then
+    if [[ ! -v "$name" ]]; then
+        case "$name" in
+            DT_*) ;;  # the runtime contract: present, possibly empty
+            *)
+                # An inherited OS variable that is unset here must stay unset
+                # in the session. Exporting it empty is not the same thing:
+                # OpenSSL reads SSL_CERT_DIR="" as "no trust store" (every
+                # TLS download inside a job failed CERTIFICATE_VERIFY_FAILED
+                # while curl on the same node succeeded), and libc reads
+                # TZ="" as UTC (job logs carried +00:00 on a CST node).
+                return 0
+                ;;
+        esac
+    else
         value=${!name}
     fi
     dt_shell_quote "$value"

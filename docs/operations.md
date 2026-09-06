@@ -389,6 +389,22 @@ launcher fix therefore reaches the whole backlog on the next tick after a
 deploy. Tampering with a staged payload is refused before the refresh, as
 before.
 
+### TLS trust inside a job
+
+A job's Python is the uv-managed interpreter of its environment, whose
+OpenSSL looks for certificates under a build-time prefix that does not exist
+on the node. The job session therefore forwards `SSL_CERT_FILE`,
+`SSL_CERT_DIR`, `REQUESTS_CA_BUNDLE` and `CURL_CA_BUNDLE` from the launcher's
+login environment when they are set, and leaves them unset otherwise — an
+empty `SSL_CERT_DIR=` is read by OpenSSL as an empty trust store, which is how
+`torchvision` weight downloads once failed `CERTIFICATE_VERIFY_FAILED` on a
+node where `curl` succeeded. When none is set, the wrapper points
+`SSL_CERT_FILE` at the node's system bundle (`/etc/ssl/certs/ca-certificates.crt`,
+`/etc/pki/tls/certs/ca-bundle.crt`, ...). Set `SSL_CERT_FILE` in the node
+user's login environment to override the choice. Inputs that must be fetched
+online are still better published once with `dt sync --artifact` than
+downloaded by every job.
+
 ### Draining a node for maintenance
 
 Set `nodes[].drained: true` and the agent (which reloads the config every
