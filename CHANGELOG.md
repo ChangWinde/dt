@@ -6,6 +6,13 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.19 — 2026-09-07
+
+The tag `v0.13.18` points at the commit before this version stamp: a
+release-automation slip tagged it before the stamp had merged, and the
+repository's immutable-tag rule keeps it there. No 0.13.18 artefacts were
+built or deployed; 0.13.19 is the release that carries these changes.
+
 ### Fixed
 
 - NVIDIA's MPS daemons no longer hold a card busy. A node running MPS keeps an
