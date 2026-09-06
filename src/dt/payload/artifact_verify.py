@@ -267,8 +267,22 @@ def _decode_manifest(manifest_bytes: bytes) -> tuple[str, list[ManifestEntry]]:
     return schema_version, entries
 
 
-def _directory_bytes(path: Path) -> int:
+Identity = list[int]
+# One row per filesystem entry: [dev, ino, mode, uid, size, mtime_ns, ctime_ns].
+# ctime cannot be set from user space, so any content write, replacement,
+# chmod or chown since the last verification changes at least one field; the
+# same evidence git's index trusts to skip re-hashing unchanged files.
+_IDENTITY_FIELDS = 7
+
+
+def _identity_row(info: os.stat_result) -> Identity:
+    return list(_identity(info))
+
+
+def _directory_census(path: Path) -> tuple[int, dict[str, Identity]]:
+    """Total regular-file bytes and the identity of every entry under ``path``."""
     total = 0
+    identities: dict[str, Identity] = {"": _identity_row(path.lstat())}
     for child in path.rglob("*"):
         metadata = child.lstat()
         if stat.S_ISLNK(metadata.st_mode):
@@ -277,7 +291,142 @@ def _directory_bytes(path: Path) -> int:
             total += metadata.st_size
         elif not stat.S_ISDIR(metadata.st_mode):
             raise ValueError(f"artifact directory contains special file: {child}")
-    return total
+        identities[child.relative_to(path).as_posix()] = _identity_row(metadata)
+    return total, identities
+
+
+def _directory_bytes(path: Path) -> int:
+    return _directory_census(path)[0]
+
+
+CACHE_SCHEMA_VERSION = "dt_artifact_verification_cache_v1"
+MAX_CACHE_BYTES = 64 * 1024 * 1024
+
+
+def _cache_path(manifest_path: Path, manifest_sha256: str) -> Path:
+    """Beside the store's manifests, never among them: the dedupe probe greps
+    ``manifests/*.json`` for digests, and a cache full of file digests would
+    make every store look like a match."""
+    parent = manifest_path.parent
+    directory = (
+        parent.parent / "verified"
+        if parent.name == "manifests"
+        else parent / ".verified"
+    )
+    return directory / f"{manifest_sha256}.cache"
+
+
+def _load_cache(
+    path: Path, manifest_sha256: str
+) -> tuple[dict[str, dict[str, object]], int]:
+    """The previous verification's per-artifact evidence and when it was
+    written, or nothing.
+
+    Anything unexpected - another owner, group/world access, a foreign
+    schema, a malformed row - discards the cache; verification then hashes
+    everything, exactly as if no cache existed.
+    """
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+            or info.st_size > MAX_CACHE_BYTES
+        ):
+            return {}, 0
+        payload = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        return {}, 0
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != CACHE_SCHEMA_VERSION
+        or payload.get("manifest_sha256") != manifest_sha256
+    ):
+        return {}, 0
+    entries = payload.get("entries")
+    if not isinstance(entries, dict):
+        return {}, 0
+    cached: dict[str, dict[str, object]] = {}
+    for key, value in entries.items():
+        if not isinstance(key, str) or not isinstance(value, dict):
+            return {}, 0
+        sha256 = value.get("sha256")
+        size = value.get("size_bytes")
+        identities = value.get("identities")
+        if (
+            not isinstance(sha256, str)
+            or _SHA256_RE.fullmatch(sha256) is None
+            or type(size) is not int
+            or not isinstance(identities, dict)
+            or not all(
+                isinstance(relative, str)
+                and isinstance(row, list)
+                and len(row) == _IDENTITY_FIELDS
+                and all(type(field) is int for field in row)
+                for relative, row in identities.items()
+            )
+        ):
+            return {}, 0
+        cached[key] = {"sha256": sha256, "size_bytes": size, "identities": identities}
+    return cached, info.st_mtime_ns
+
+
+def _settled(identities: dict[str, Identity], written_ns: int) -> bool:
+    """False while any entry could have changed without the clock noticing.
+
+    File timestamps come from the kernel's coarse clock (one tick, up to a
+    few milliseconds), so a write in the same tick as the previous
+    verification's cache leaves mtime and ctime unchanged. Like git's racy
+    index rule, only an entry whose timestamps are strictly older than the
+    cache is trusted; the rest are hashed again.
+    """
+    return all(
+        row[5] < written_ns and row[6] < written_ns for row in identities.values()
+    )
+
+
+def _store_cache(
+    path: Path, manifest_sha256: str, entries: dict[str, dict[str, object]]
+) -> None:
+    """Best effort: a store whose control directory is not writable simply
+    verifies from scratch every time, as before."""
+    payload = json.dumps(
+        {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "manifest_sha256": manifest_sha256,
+            "entries": entries,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    if len(payload) > MAX_CACHE_BYTES:
+        return
+    try:
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(payload)
+        except BaseException:
+            os.unlink(temporary)
+            raise
+        os.replace(temporary, path)
+        # A cache outlives its manifest only until the next verification here;
+        # one whose manifest is still published (a v1 file manifest beside the
+        # v2 one, say) keeps serving the jobs pinned to it.
+        manifests = path.parent.parent / "manifests"
+        if manifests.is_dir():
+            for stale in path.parent.iterdir():
+                if (
+                    stale != path
+                    and stale.suffix == ".cache"
+                    and not (manifests / f"{stale.stem}.json").is_file()
+                ):
+                    stale.unlink(missing_ok=True)
+    except OSError:
+        return
 
 
 def verify(root: Path, manifest_path: Path, expected_sha256: str) -> dict[str, object]:
@@ -296,6 +445,16 @@ def verify(root: Path, manifest_path: Path, expected_sha256: str) -> dict[str, o
         )
     schema_version, entries = _decode_manifest(manifest_bytes)
     locked = schema_version == MANIFEST_SCHEMA_VERSION_V2
+
+    # Every job start verified the whole store byte for byte - ten seconds and
+    # more per launch for a multi-gigabyte store (field measurement), the
+    # dominant cost of starting a job. An artifact whose every entry still has
+    # the identity recorded at the last successful verification of this exact
+    # manifest is accepted on that evidence; anything else is hashed again.
+    cache_path = _cache_path(manifest_path, actual_manifest_sha256)
+    cached, cache_written_ns = _load_cache(cache_path, actual_manifest_sha256)
+    evidence: dict[str, dict[str, object]] = {}
+    reused = 0
 
     verified = 0
     for entry in entries:
@@ -330,31 +489,55 @@ def verify(root: Path, manifest_path: Path, expected_sha256: str) -> dict[str, o
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(f"artifact is not a regular file: {relative_raw}")
             actual_bytes = metadata.st_size
-            actual_sha256 = _sha256(resolved)
+            identities = {"": _identity_row(metadata)}
         else:
             if not stat.S_ISDIR(metadata.st_mode):
                 raise ValueError(f"artifact is not a directory: {relative_raw}")
-            actual_bytes = _directory_bytes(resolved)
-            actual_sha256 = (
-                artifact_tree_sha256(resolved) if locked else tree_sha256(resolved)
-            )
+            actual_bytes, identities = _directory_census(resolved)
         if actual_bytes != entry.size_bytes:
             raise ValueError(
                 f"artifact size mismatch for {relative_raw}: "
                 f"expected {entry.size_bytes}, got {actual_bytes}"
+            )
+        previous = cached.get(relative_raw)
+        if (
+            previous is not None
+            and previous["sha256"] == entry.sha256
+            and previous["size_bytes"] == actual_bytes
+            and previous["identities"] == identities
+            and _settled(identities, cache_written_ns)
+        ):
+            actual_sha256 = entry.sha256
+            reused += 1
+        elif entry.kind == "file":
+            actual_sha256 = _sha256(resolved)
+        else:
+            actual_sha256 = (
+                artifact_tree_sha256(resolved) if locked else tree_sha256(resolved)
             )
         if actual_sha256 != entry.sha256:
             raise ValueError(
                 f"artifact SHA-256 mismatch for {relative_raw}: "
                 f"expected {entry.sha256}, got {actual_sha256}"
             )
+        evidence[relative_raw] = {
+            "sha256": actual_sha256,
+            "size_bytes": actual_bytes,
+            "identities": identities,
+        }
         verified += 1
+
+    if reused < verified or not cache_path.exists():
+        # Rewritten whenever something was hashed: the new write time also
+        # settles entries that were racy against the previous cache.
+        _store_cache(cache_path, actual_manifest_sha256, evidence)
 
     return {
         "schema_version": "dt_artifact_verification_v1",
         "manifest_sha256": actual_manifest_sha256,
         "manifest_schema": schema_version,
         "artifacts": verified,
+        "reused": reused,
     }
 
 

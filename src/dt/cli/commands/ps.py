@@ -21,7 +21,7 @@ from ...config import HeadConfig, LaptopConfig, Node
 from ...jsonvalue import as_int
 from ...probe import NodeStatus
 from ...remote import FanErrors
-from ...render import queued_anomaly, err, issue_digest, ps_table
+from ...render import queued_anomaly, err, issue_digest, print_table, ps_table
 from .. import (
     EXIT_UNREACHABLE,
     JsonDict,
@@ -1575,7 +1575,8 @@ def _ps_human_mode(
         # digest names each pattern once with its count, span, and remedy.
         for line in issue_digest(rows):
             _root.out.print(line)
-    _root.out.print(
+    print_table(
+        _root.out,
         ps_table(
             visible,
             wide=view.wide,
@@ -1593,7 +1594,7 @@ def _ps_human_mode(
             ),
             title=view.view_title,
             empty_text=view.empty_text,
-        )
+        ),
     )
     if all_centers_failed:
         raise typer.Exit(_fan_failure_exit_code(errors))

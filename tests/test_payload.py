@@ -2791,6 +2791,163 @@ def test_launcher_treats_a_drifted_artifact_store_as_a_node_condition(tmp_path):
     assert not (tmp_path / "state" / "tmux-new-session").exists()
 
 
+def _published_store(
+    tmp_path: Path, *, payload: bytes, files: int
+) -> tuple[Path, Path, str]:
+    """A locked v2 store with one file artifact and one directory artifact,
+    plus its manifest under ``.dt/manifests`` the way ``dt sync`` leaves it."""
+    root = tmp_path / "store"
+    (root / "models" / "victim").mkdir(parents=True)
+    weights = root / "weights.bin"
+    weights.write_bytes(payload)
+    for index in range(files):
+        (root / "models" / "victim" / f"seed{index}.pt").write_bytes(
+            payload[: 64 + index]
+        )
+    for path in root.rglob("*"):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    entries = [
+        {
+            "path": "weights.bin",
+            "kind": "file",
+            "mode": 0o444 & artifact_verify.ARTIFACT_MODE_MASK,
+            "size_bytes": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+        {
+            "path": "models/victim",
+            "kind": "directory",
+            "mode": 0o555 & artifact_verify.ARTIFACT_MODE_MASK,
+            "size_bytes": sum(64 + index for index in range(files)),
+            "sha256": artifact_verify.artifact_tree_sha256(root / "models" / "victim"),
+        },
+    ]
+    manifest_bytes = json.dumps(
+        {
+            "schema_version": "dt_artifact_manifest_v2",
+            "project": "omni",
+            "artifacts": entries,
+        }
+    ).encode()
+    digest = hashlib.sha256(manifest_bytes).hexdigest()
+    manifests = root / ".dt" / "manifests"
+    manifests.mkdir(parents=True, mode=0o700)
+    manifest = manifests / f"{digest}.json"
+    manifest.write_bytes(manifest_bytes)
+    # File timestamps come from the kernel's coarse clock; let it tick so the
+    # first verification's cache is written strictly after every entry.
+    time.sleep(0.02)
+    return root, manifest, digest
+
+
+def test_artifact_verifier_reuses_the_last_verification_of_an_unchanged_store(
+    tmp_path, monkeypatch
+):
+    """Every job start re-hashed the whole store: ten seconds and more per
+    launch for a multi-gigabyte store (field measurement). The second
+    verification of an unchanged store accepts the recorded identities
+    (dev, inode, mode, owner, size, mtime, ctime) and reads no content."""
+    root, manifest, digest = _published_store(tmp_path, payload=b"w" * 4096, files=3)
+
+    first = verify_artifacts(root, manifest, digest)
+    assert first["artifacts"] == 2 and first["reused"] == 0
+    cache = root / ".dt" / "verified" / f"{digest}.cache"
+    assert cache.is_file() and stat.S_IMODE(cache.stat().st_mode) == 0o600
+
+    hashed: list[Path] = []
+    original = artifact_verify._sha256  # noqa: SLF001
+
+    def counting(path):
+        hashed.append(path)
+        return original(path)
+
+    monkeypatch.setattr(artifact_verify, "_sha256", counting)
+    monkeypatch.setattr(
+        artifact_verify,
+        "artifact_tree_sha256",
+        lambda path: (_ for _ in ()).throw(AssertionError("tree re-hashed")),
+    )
+    second = verify_artifacts(root, manifest, digest)
+    assert second["artifacts"] == 2 and second["reused"] == 2
+    assert hashed == []
+
+
+def test_artifact_verifier_rehashes_whatever_changed_and_still_refuses_drift(
+    tmp_path,
+):
+    root, manifest, digest = _published_store(tmp_path, payload=b"w" * 4096, files=3)
+    verify_artifacts(root, manifest, digest)
+    victim = root / "models" / "victim" / "seed1.pt"
+
+    # Same size, same mtime, different bytes: only ctime moves - and the cache
+    # is keyed on it, so the directory is hashed again and the drift refused.
+    before = victim.stat()
+    victim.chmod(0o644)
+    victim.write_bytes(b"X" * before.st_size)
+    victim.chmod(0o444)
+    os.utime(victim, ns=(before.st_atime_ns, before.st_mtime_ns))
+    time.sleep(0.02)
+    with pytest.raises(ValueError, match="SHA-256 mismatch for models/victim"):
+        verify_artifacts(root, manifest, digest)
+
+    # Restored content: verified from scratch once, then reused again.
+    victim.chmod(0o644)
+    victim.write_bytes((b"w" * 4096)[: before.st_size])
+    victim.chmod(0o444)
+    os.utime(victim, ns=(before.st_atime_ns, before.st_mtime_ns))
+    time.sleep(0.02)
+    repaired = verify_artifacts(root, manifest, digest)
+    time.sleep(0.02)
+    assert repaired["reused"] == 1  # the untouched file artifact
+    assert verify_artifacts(root, manifest, digest)["reused"] == 2
+
+
+def test_artifact_verifier_ignores_a_cache_it_cannot_trust(tmp_path):
+    root, manifest, digest = _published_store(tmp_path, payload=b"w" * 1024, files=1)
+    verify_artifacts(root, manifest, digest)
+    cache = root / ".dt" / "verified" / f"{digest}.cache"
+
+    # A cache that claims the store is fine while a file changed is not
+    # believed: identities are re-observed, not read from the cache.
+    victim = root / "weights.bin"
+    victim.chmod(0o644)
+    victim.write_bytes(b"Y" * 1024)
+    victim.chmod(0o444)
+    time.sleep(0.02)
+    with pytest.raises(ValueError, match="SHA-256 mismatch for weights.bin"):
+        verify_artifacts(root, manifest, digest)
+
+    victim.chmod(0o644)
+    victim.write_bytes(b"w" * 1024)
+    victim.chmod(0o444)
+    time.sleep(0.02)
+    verify_artifacts(root, manifest, digest)
+    time.sleep(0.02)
+    # Group- or world-accessible, or malformed: discarded, everything hashed.
+    cache.chmod(0o644)
+    assert verify_artifacts(root, manifest, digest)["reused"] == 0
+    cache.write_text("{not json")
+    cache.chmod(0o600)
+    assert verify_artifacts(root, manifest, digest)["reused"] == 0
+    time.sleep(0.02)
+    assert verify_artifacts(root, manifest, digest)["reused"] == 2
+
+
+def test_artifact_verifier_cache_never_lands_among_the_manifests(tmp_path):
+    """The cross-project dedupe probe greps ``manifests/*.json`` for digests."""
+    root, manifest, digest = _published_store(tmp_path, payload=b"w" * 64, files=1)
+    verify_artifacts(root, manifest, digest)
+    assert sorted(path.name for path in (root / ".dt" / "manifests").iterdir()) == [
+        f"{digest}.json"
+    ]
+    assert (root / ".dt" / "verified" / f"{digest}.cache").is_file()
+    # A loose manifest (tests, ad-hoc verification) caches beside itself.
+    loose = tmp_path / "loose.json"
+    loose.write_bytes(manifest.read_bytes())
+    verify_artifacts(root, loose, digest)
+    assert (tmp_path / ".verified" / f"{digest}.cache").is_file()
+
+
 def test_artifact_verifier_refuses_symlinked_trust_roots(tmp_path):
     real_root = tmp_path / "real-artifacts"
     real_root.mkdir()

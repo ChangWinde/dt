@@ -342,6 +342,18 @@ silently poisoning the store for every later job of the project on that node.
 The manifest identity (`dt_artifact_manifest_v2`) ignores write bits, so the
 writable source on the head and the locked copy on the node share one digest.
 
+Verification is cheap after the first job. Hashing a multi-gigabyte store
+took 10–14 s at every launch; the verifier now keeps the evidence of the
+last successful verification beside the manifests
+(`<store>/.dt/verified/<manifest>.cache`, mode 0600): for every entry of every
+artifact its device, inode, mode, owner, size, mtime and ctime. A later launch
+whose entries all match that evidence accepts the artifact without reading it
+(`reused` in the receipt); anything that changed is hashed again, and a
+tampered or foreign cache is discarded. An entry whose timestamps are not
+strictly older than the cache is never trusted (the kernel's coarse clock can
+leave a write in the same tick invisible — git's racy-index rule). Deleting
+the cache file only costs the next launch a full hash.
+
 Identical content is stored once per node. Before transferring an artifact,
 `dt sync` asks the node which sibling project stores already hold that path
 (a store whose published manifest carries the same digest is preferred) and

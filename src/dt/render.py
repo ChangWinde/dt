@@ -11,11 +11,13 @@ import os
 import sys
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Any, TypeAlias, cast
+from typing import Any, Sequence, TypeAlias, cast
 
 from rich.console import Console, ConsoleRenderable, Group, RenderHook
 from rich.markup import escape
-from rich.table import Table
+from rich.style import StyleType
+from rich.table import Column, Table
+from rich.text import Text
 
 from .jsonvalue import as_int, as_number
 from .jobs import CANCEL_UNVERIFIED_PREFIX
@@ -57,6 +59,113 @@ def content_sized(table: Table) -> Table:
         for column in table.columns
     ]
     return sized
+
+
+# Above this many rows a table is rendered flat: rich measures and renders
+# every cell through its layout engine (about half a millisecond per row), so
+# a full job history took longer to draw than to read from disk.
+FLAT_TABLE_ROWS = 200
+
+
+def _cell_text(cell: object, style: str | StyleType | None) -> Text:
+    if isinstance(cell, Text):
+        text = cell.copy()
+    else:
+        raw = str(cell)
+        # Markup parsing dominates a large table; most cells carry none.
+        text = Text.from_markup(raw) if "[" in raw else Text(raw)
+    if style:
+        text.stylize(style)
+    return text
+
+
+def flat_table_text(table: Table, *, content_sized: bool) -> Text:
+    """The same rows as ``table`` as one pre-aligned ``Text``.
+
+    Columns keep their header, style, justification and overflow rule; widths
+    come from the content, capped by the column's ``width``/``max_width`` on a
+    terminal and uncapped in a pipe, exactly like ``content_sized``. Rows are
+    separated by a single space (``padding=(0, 1)``, collapsed, no edge pad),
+    which is how every dt table is configured.
+    """
+    columns = table.columns
+    cells: list[list[Text]] = []
+    for column in columns:
+        column_cells = [
+            _cell_text(cell, column.style)
+            for cell in column._cells  # noqa: SLF001
+        ]
+        cells.append(column_cells)
+    row_count = max((len(column_cells) for column_cells in cells), default=0)
+    widths: list[int] = []
+    for column, column_cells in zip(columns, cells):
+        header = Text.from_markup(str(column.header)) if table.show_header else Text()
+        longest = max(
+            (cell.cell_len for cell in column_cells),
+            default=0,
+        )
+        width = max(longest, header.cell_len if table.show_header else 0)
+        if not content_sized:
+            if column.width is not None:
+                width = column.width
+            else:
+                if column.max_width is not None:
+                    width = min(width, column.max_width)
+                if column.min_width is not None:
+                    width = max(width, column.min_width)
+        widths.append(width)
+
+    lines: list[Text] = []
+    if table.title:
+        lines.append(_cell_text(table.title, table.title_style or "table.title"))
+    if table.show_header:
+        header_cells = [
+            _cell_text(column.header, table.header_style or column.header_style)
+            for column in columns
+        ]
+        lines.append(_flat_row(header_cells, widths, columns))
+    for index in range(row_count):
+        row = [
+            column_cells[index] if index < len(column_cells) else Text()
+            for column_cells in cells
+        ]
+        lines.append(_flat_row(row, widths, columns))
+    if table.caption:
+        lines.append(_cell_text(table.caption, table.caption_style or "table.caption"))
+    return Text("\n").join(lines)
+
+
+def print_table(console: Console, table: Table) -> None:
+    """Print ``table`` through rich, or flat when it is long.
+
+    The flat form keeps the pipe contract of ``_ContentSizedInPipes``: in a
+    pipe (unbounded width) nothing is truncated.
+    """
+    rows = table.row_count
+    if rows <= FLAT_TABLE_ROWS:
+        console.print(table)
+        return
+    console.print(
+        flat_table_text(table, content_sized=console.width >= UNBOUNDED_PIPE_WIDTH),
+        soft_wrap=True,
+    )
+
+
+def _flat_row(row: list[Text], widths: list[int], columns: Sequence[Column]) -> Text:
+    """Cells are owned by the caller and are consumed here."""
+    parts: list[Text] = []
+    for text, width, column in zip(row, widths, columns):
+        text.no_wrap = True
+        overflow = column.overflow if column.overflow != "fold" else "ellipsis"
+        text.truncate(width, overflow=overflow, pad=False)
+        if column.justify == "right":
+            text.pad_left(width - text.cell_len)
+        else:
+            text.pad_right(width - text.cell_len)
+        parts.append(text)
+    line = Text(" ").join(parts)
+    line.rstrip()
+    return line
 
 
 class _ContentSizedInPipes:
