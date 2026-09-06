@@ -6,6 +6,18 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- A job's Python can verify TLS peers again. The session whitelist exported
+  unset passthrough variables as empty strings, and OpenSSL reads
+  `SSL_CERT_DIR=""` as an empty trust store: every in-job download failed
+  `CERTIFICATE_VERIFY_FAILED` (a `torchvision` weight fetch, field report)
+  while `curl` on the same node succeeded; libc likewise read `TZ=""` as
+  UTC, so job logs carried `+00:00` on a CST node. Unset OS variables now
+  stay unset in the session, inherited values are forwarded verbatim, and
+  the wrapper points `SSL_CERT_FILE` at the node's system bundle when the
+  operator set none.
+
 ## 0.13.14 — 2026-09-06
 
 ### Added

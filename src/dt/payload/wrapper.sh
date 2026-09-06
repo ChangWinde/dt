@@ -710,6 +710,27 @@ export DT_META_PATH
 # concurrent environment reuse can never redirect its imports to another job.
 export PYTHONPATH="$DT_JOB_DIR/code:$DT_JOB_DIR/code/src${PYTHONPATH:+:$PYTHONPATH}"
 
+# uv-managed interpreters carry OpenSSL's compiled-in default certificate
+# paths, which do not exist on the node, so the job's own Python could verify
+# no TLS peer at all: a torchvision weight download failed
+# CERTIFICATE_VERIFY_FAILED on a node where curl fetched the same URL. Point
+# the standard library at the node's trust store unless the operator already
+# chose one; libraries that bundle certifi are unaffected either way.
+if [ -z "${SSL_CERT_FILE:-}" ] && [ -z "${SSL_CERT_DIR:-}" ]; then
+    for dt_ca_bundle in \
+        /etc/ssl/certs/ca-certificates.crt \
+        /etc/pki/tls/certs/ca-bundle.crt \
+        /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+        /etc/ssl/ca-bundle.pem \
+        /etc/ssl/cert.pem; do
+        if [ -f "$dt_ca_bundle" ] && [ -r "$dt_ca_bundle" ]; then
+            export SSL_CERT_FILE="$dt_ca_bundle"
+            break
+        fi
+    done
+    unset dt_ca_bundle
+fi
+
 # Runtime evidence is separate from application-owned outputs. The head pulls
 # this private directory through a strict allowlist and schema validator.
 mkdir -p "$DT_OUTPUT_DIR/dt"

@@ -1051,6 +1051,44 @@ def test_gpu_wrapper_rejects_symlinked_containment_attestation(tmp_path):
     assert not (tmp_path / "runner-ran").exists()
 
 
+def test_launcher_leaves_unset_os_variables_unset_in_the_session(tmp_path):
+    """Field report: every TLS download inside a job failed
+    CERTIFICATE_VERIFY_FAILED while curl on the same node succeeded. The
+    session whitelist exported unset passthrough variables as empty strings,
+    and OpenSSL reads SSL_CERT_DIR="" as an empty trust store (libc reads
+    TZ="" as UTC - job logs carried +00:00 on a CST node). Unset stays unset;
+    a value the launcher inherited is forwarded verbatim; the dt runtime
+    contract keeps its present-but-empty shape."""
+    env_overrides = {"DT_TEST_TMUX_CAPTURE": "1", "TZ": "Asia/Shanghai"}
+    proc = _run_launcher_with_fake_uv(tmp_path, "plain", env_overrides=env_overrides)
+    assert proc.returncode == 0, proc.stderr
+    session_command = (tmp_path / "state" / "session-command").read_text()
+    for name in (
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+    ):
+        if name not in os.environ:
+            assert f" {name}=" not in session_command, name
+    assert " TZ='Asia/Shanghai' " in session_command
+    assert " DT_MAX_HOURS='' " in session_command
+
+    with_store = _run_launcher_with_fake_uv(
+        tmp_path / "with-store",
+        "plain",
+        env_overrides={
+            "DT_TEST_TMUX_CAPTURE": "1",
+            "SSL_CERT_FILE": "/etc/pki/tls/certs/site-bundle.pem",
+        },
+    )
+    assert with_store.returncode == 0, with_store.stderr
+    assert (
+        " SSL_CERT_FILE='/etc/pki/tls/certs/site-bundle.pem' "
+        in (tmp_path / "with-store" / "state" / "session-command").read_text()
+    )
+
+
 def test_launcher_keeps_private_values_out_of_tmux_and_runtime_argv(tmp_path):
     secret = "private-value-that-must-not-enter-argv"
     launch_token = "a" * 32
@@ -3316,6 +3354,67 @@ def test_payload_clears_caller_virtualenv_before_managed_uv(tmp_path):
     )
     assert (tmp_path / "process_start_ticks").read_text().strip().isdigit()
     assert (tmp_path / "pgid").read_text().strip().isdigit()
+
+
+_SYSTEM_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+)
+
+
+def _run_wrapper_capturing_env(tmp_path: Path, extra_env: dict[str, str]) -> str:
+    (tmp_path / "code").mkdir(parents=True)
+    (tmp_path / "cmd.sh").write_text(
+        'printf "%s|%s\\n" "${SSL_CERT_FILE-unset}" "${SSL_CERT_DIR-unset}" '
+        '> "$DT_JOB_DIR/tls-seen"\n'
+    )
+    env = {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "",
+        "DT_MAX_HOURS": "",
+        "DT_UV": "",
+        "DT_UV_ENV": "",
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        env.pop(name, None)
+    env.update(extra_env)
+    proc = subprocess.run(
+        ["bash", str(PAYLOAD / "wrapper.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=WRAPPER_TIMEOUT_SECONDS,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return (tmp_path / "tls-seen").read_text().strip()
+
+
+def test_wrapper_points_the_job_python_at_the_node_trust_store(tmp_path):
+    """Field report: a torchvision weight download failed
+    CERTIFICATE_VERIFY_FAILED inside a job while curl fetched the same URL on
+    the node - the uv-managed interpreter's OpenSSL looks for certificates
+    under a prefix that does not exist there."""
+    present = [path for path in _SYSTEM_CA_BUNDLES if os.path.isfile(path)]
+    if not present:
+        pytest.skip("no system CA bundle on this host")
+
+    assert _run_wrapper_capturing_env(tmp_path, {}) == f"{present[0]}|unset"
+
+
+def test_wrapper_keeps_an_operator_chosen_trust_store(tmp_path):
+    seen = _run_wrapper_capturing_env(tmp_path, {"SSL_CERT_FILE": "/opt/ca/own.pem"})
+    assert seen == "/opt/ca/own.pem|unset"
+
+    seen = _run_wrapper_capturing_env(
+        tmp_path / "dir-only", {"SSL_CERT_DIR": "/opt/ca/certs"}
+    )
+    assert seen == "unset|/opt/ca/certs"
 
 
 def test_wrapper_reaps_group_escapees():
