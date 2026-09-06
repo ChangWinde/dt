@@ -1987,6 +1987,40 @@ def queued_entries(cfg: HeadConfig) -> list[JobEntry]:
     )
 
 
+def with_dependency_predecessors(
+    cfg: HeadConfig, entries: list[JobEntry]
+) -> list[JobEntry]:
+    """``entries`` plus the registry rows the queued ones depend on.
+
+    The active index drops a job once it is terminal, but a dependent queued
+    job needs exactly that terminal row to settle. Scheduling from the index
+    alone reported `dependency ... was not found` for a predecessor that had
+    finished successfully and left the dependent job blocked for good (field
+    report). Only the explicitly referenced identities are read, so the queue
+    model stays bounded by the active set rather than by years of history.
+    """
+    known = {entry.job_id for entry in entries}
+    joined = list(entries)
+    for entry in entries:
+        if entry.status != "queued":
+            continue
+        for dependency in (
+            entry.after_success,
+            entry.after_complete,
+            entry.after_result,
+        ):
+            if dependency is None or dependency in known:
+                continue
+            known.add(dependency)
+            try:
+                predecessor = load(cfg, dependency)
+            except (RegistryError, ValueError):
+                continue  # the dispatcher reports the unreadable row itself
+            if predecessor is not None:
+                joined.append(predecessor)
+    return joined
+
+
 def queue_contexts(entries: list[JobEntry]) -> dict[str, dict[str, object]]:
     """Annotate one registry snapshot with its current FIFO queue context."""
     queue = sorted(

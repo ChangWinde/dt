@@ -1892,6 +1892,72 @@ def test_unsuccessful_dependency_fails_before_gpu(
     assert not staging.exists()
 
 
+def test_dependent_job_is_admitted_after_its_predecessor_left_the_active_index(
+    tmp_path, monkeypatch
+):
+    """Field report: `--after-success REF` whose predecessor finished with
+    exit 0 stayed queued for good as `waiting: dependency REF was not found`
+    while a card sat idle. The dependency gate read the row from the registry,
+    but admission judged dependencies from the active index alone - which
+    drops a job the moment it is terminal."""
+    import dt.dispatch as dispatch
+    import dt.scheduler as scheduler
+
+    cfg = _cfg(tmp_path)
+    save(
+        cfg,
+        _entry(
+            "pred",
+            "finished",
+            created_at=1.0,
+            exit_code=0,
+            result_state="success",
+            finished_at=2.0,
+        ),
+    )
+    entry = _entry(
+        "next", "queued", created_at=3.0, after_success="pred", gpus_requested=0
+    )
+    (dispatch.stage_dir(cfg, entry.job_id) / "code").mkdir(parents=True)
+    save(cfg, entry)
+
+    # The index alone does not know the predecessor; scheduling must.
+    active = jobs_mod.active_entries(cfg)
+    assert [row.job_id for row in active] == ["next"]
+    complete = jobs_mod.with_dependency_predecessors(cfg, active)
+    assert sorted(row.job_id for row in complete) == ["next", "pred"]
+    refused = scheduler.admission_decision(cfg, entry, active, candidate_node="n1")
+    assert refused.state == "blocked_dependency_missing"
+    admitted = scheduler.admission_decision(cfg, entry, complete, candidate_node="n1")
+    assert admitted.allowed, admitted
+
+    monkeypatch.setattr(dispatch, "probe_center", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        dispatch, "pick_candidates", lambda statuses, nodes, spec, reserve: [nodes[0]]
+    )
+    claimed = {}
+
+    def fake_try_nodes(
+        cfg_, candidates, spec, job_id, job_dir, session, sync, log, **kw
+    ):
+        claimed["ok"] = kw["before_attempt"](candidates[0], job_dir(candidates[0]))
+        return None, {}, False, set()
+
+    monkeypatch.setattr(dispatch, "_try_nodes", fake_try_nodes)
+
+    outcome, detail = dispatch.dispatch_queued(cfg, entry, lambda message: None)
+
+    assert claimed["ok"] is True, "the claim must pass admission"
+    assert outcome == "busy" and (detail or "") == ""
+    persisted = load(cfg, entry.job_id)
+    assert persisted is not None and "was not found" not in (persisted.reason or "")
+
+    # The queue model behind `dt free --explain` agrees.
+    model = scheduler.scheduler_snapshot(cfg, complete, resources=[], agent_alive=True)
+    (row,) = [row for row in model["queue"] if row["job_id"] == "next"]
+    assert row["state"] != "blocked_dependency_missing", row
+
+
 def test_missing_dependency_fails_closed_before_gpu(tmp_path, monkeypatch):
     cfg = _cfg(tmp_path)
     successor = _entry(

@@ -24,6 +24,7 @@ from ..jobs import (
     RegistryError,
     UNCERTAIN_LAUNCH_PREFIX,
     active_entries,
+    with_dependency_predecessors,
     effective_result_state,
     job_lock,
     load,
@@ -501,7 +502,9 @@ def _claim_queued_dispatch_attempt(
                         entry.__dict__.update(current.__dict__)
                     return False
                 damage: list[RegistryDamage] = []
-                entries = active_entries(cfg, damage=damage)
+                entries = with_dependency_predecessors(
+                    cfg, active_entries(cfg, damage=damage)
+                )
                 decision = admission_decision(
                     cfg,
                     current,

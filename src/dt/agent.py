@@ -61,6 +61,7 @@ from .jobs import (
     AGENT_WAKE_ARTIFACTS_REPUBLISHED,
     AGENT_WAKE_MAX_BYTES,
     active_entries,
+    with_dependency_predecessors,
     agent_wake_path,
     effective_result_state,
     enable_registry_decode_cache,
@@ -2777,7 +2778,7 @@ def _inflight_dispatches(
 def status(cfg: HeadConfig) -> dict[str, object]:
     pid = alive_pid(cfg)
     damage: list[RegistryDamage] = []
-    entries = active_entries(cfg, damage=damage)
+    entries = with_dependency_predecessors(cfg, active_entries(cfg, damage=damage))
     registry_entries = registry_row_count(cfg)
     q = sorted(
         (entry for entry in entries if entry.status == "queued"),
