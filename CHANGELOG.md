@@ -6,6 +6,17 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Fixed
+
+- A dependent job is admitted once its predecessor has finished. `dt run
+  --after-success REF` whose predecessor completed with exit 0 stayed queued
+  for good as `waiting: dependency REF was not found` while a card sat idle
+  (field report): the dependency gate read the predecessor from the registry,
+  but admission and the queue model judged dependencies from the active index
+  alone, which drops a job the moment it is terminal. Scheduling now adds the
+  registry rows that queued jobs depend on to the active set — only the
+  explicitly referenced identities, so the model stays bounded by active work.
+
 ## 0.13.16 — 2026-09-06
 
 ### Changed

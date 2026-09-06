@@ -45,7 +45,9 @@ def _free_scheduler_context(
 
     try:
         damage: list[jobs_mod.RegistryDamage] = []
-        entries = jobs_mod.active_entries(cfg, damage=damage)
+        entries = jobs_mod.with_dependency_predecessors(
+            cfg, jobs_mod.active_entries(cfg, damage=damage)
+        )
         queued = sorted(
             (entry for entry in entries if entry.status == "queued"),
             key=lambda entry: entry.created_at,
