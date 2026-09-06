@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.18 — 2026-09-07
+
 ### Fixed
 
 - NVIDIA's MPS daemons no longer hold a card busy. A node running MPS keeps an
