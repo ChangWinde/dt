@@ -170,6 +170,36 @@ if [ -L "$DT_EVIDENCE_DIR" ] \
 fi
 mkdir -m 700 -p "$DT_EVIDENCE_DIR" || exit 15
 chmod 700 "$DT_EVIDENCE_DIR" || exit 15
+
+# Launch progress for the head. While the registry row says "dispatching",
+# the head reads this file to say what the launcher is doing on the node: a
+# job that merely waited for the environment lock showed "dispatching" for
+# twenty minutes and was misdiagnosed. Four lines, replaced atomically:
+# schema, phase (a launch_phases_ms key), a short detail, and the node-clock
+# second the phase began. Removed once the session is running; a refused or
+# failed launch leaves its exit behind until the next attempt overwrites it.
+DT_LAUNCH_PHASE_PATH="$DT_STATE_DIR/launch-phase"
+dt_publish_launch_phase() {
+    local phase=$1 detail=${2:-} tmp="$DT_LAUNCH_PHASE_PATH.tmp.$$"
+    if ! {
+        printf 'dt_launch_phase_v1\n%s\n%s\n%s\n' \
+            "$phase" "${detail:0:200}" "$(date +%s)" >"$tmp" \
+        && chmod 600 -- "$tmp" \
+        && mv -f -- "$tmp" "$DT_LAUNCH_PHASE_PATH"
+    } 2>/dev/null; then
+        rm -f -- "$tmp" 2>/dev/null || true
+    fi
+}
+dt_launch_phase_exit() {
+    if [ "$1" -eq 0 ]; then
+        rm -f -- "$DT_LAUNCH_PHASE_PATH" 2>/dev/null || true
+    else
+        dt_publish_launch_phase exited "launcher exit $1"
+    fi
+}
+trap 'dt_launch_phase_exit $?' EXIT
+dt_publish_launch_phase preflight "checking node prerequisites and disk"
+
 export DT_ROOT DT_WORKER_ROOT DT_JOB_DIR DT_CONTROL_DIR DT_PAYLOAD_DIR \
        DT_STATE_DIR DT_OUTPUT_DIR \
        DT_META_PATH DT_COMMAND_PATH DT_CANCEL_PATH DT_BIN_DIR DT_ENVS_DIR DT_CACHE_ROOT DT_RUNTIME_ROOT \
@@ -1207,6 +1237,8 @@ if [ -n "$DT_CACHE_SOURCE_JOB_ID" ] && [ "$DT_CACHE_MODE" = clone ]; then
         exit 15
     fi
     rm -rf -- "$cache_probe_root"
+    dt_publish_launch_phase preflight \
+        "cloning cache $DT_CACHE_SOURCE_RELPATH from job $DT_CACHE_SOURCE_JOB_ID"
     cache_clone_started_ms=$(now_ms)
     cache_source_before=$(cache_metadata_manifest "$DT_REUSE_CACHE_PATH") || {
         log "node-unfit: cache source failed safe content inventory"
@@ -1282,6 +1314,8 @@ if [ -n "$DT_ARTIFACT_MANIFEST" ]; then
         exit 19
     fi
     log "verifying artifact manifest ${DT_ARTIFACT_MANIFEST:0:12}"
+    dt_publish_launch_phase artifact_verification \
+        "verifying artifact manifest ${DT_ARTIFACT_MANIFEST:0:12}"
     artifact_verify_started_ms=$(now_ms)
     # The store is shared by every job of the project on this node and stays
     # writable for republication, so a job writing through its workspace link
@@ -1559,6 +1593,8 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
         if [ "$env_needs_build" -eq 0 ]; then
             log "entering env $lockhash, already built for this surface"
             # Only a builder holds this exclusively; wait for it to finish.
+            dt_publish_launch_phase environment \
+                "entering built env $lockhash (waits only for a build in progress)"
             if ! flock -s -w "$ENV_BUILD_WAIT_S" --close \
                     "$DT_ENVS_DIR/$lockhash.lock" true; then
                 log "environment $lockhash is being rebuilt; could not enter it within ${ENV_BUILD_WAIT_S}s"
@@ -1566,6 +1602,8 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
             fi
         else
         log "syncing env $lockhash"
+        dt_publish_launch_phase environment \
+            "waiting for the build lock on env $lockhash (held by running jobs or another build)"
         # only-managed: system interpreters lack dev headers (Python.h), which
         # breaks sdist builds; uv-managed toolchains ship them (design doc 6).
         # setup.sh (optional project hook, e.g. install local libs/ packages that
@@ -1575,9 +1613,21 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
         flock -w "$ENV_BUILD_WAIT_S" -E 213 --close "$DT_ENVS_DIR/$lockhash.lock" \
         env UV_PROJECT_ENVIRONMENT="$UV_ENV" UV_SYSTEM_CERTS=1 \
             UV_PYTHON_PREFERENCE=only-managed DT_JOB_DIR="$DT_JOB_DIR" UV_BIN="$UV_BIN" \
-            DT_EXTRAS="${DT_EXTRAS:-}" \
+            DT_EXTRAS="${DT_EXTRAS:-}" DT_ENV_KEY="$lockhash" \
+            DT_LAUNCH_PHASE_PATH="$DT_LAUNCH_PHASE_PATH" \
         bash -c '
             cd "$DT_JOB_DIR/code" || exit 1
+            # The build lock is held from here on: tell the head the wait is
+            # over and what the launcher is doing inside it.
+            phase() {
+                local tmp="$DT_LAUNCH_PHASE_PATH.tmp.$$"
+                { printf "dt_launch_phase_v1\nenvironment\n%s\n%s\n" \
+                    "$1" "$(date +%s)" >"$tmp" \
+                  && chmod 600 -- "$tmp" \
+                  && mv -f -- "$tmp" "$DT_LAUNCH_PHASE_PATH"; } 2>/dev/null \
+                  || rm -f -- "$tmp" 2>/dev/null || true
+            }
+            phase "syncing env $DT_ENV_KEY (uv sync)"
             extra_names=()
             extra_flags=()
             IFS=" " read -r -a extra_names <<< "$DT_EXTRAS"
@@ -1693,7 +1743,8 @@ if [ -f "$DT_JOB_DIR/code/uv.lock" ]; then
                 smark="$UV_PROJECT_ENVIRONMENT/.dt-setup-$(sha256sum "$DT_CONTROL_DIR/setup.sh" | cut -c1-8)"
                 if [ ! -f "$smark" ]; then
                     echo "[launcher] running project setup hook"
-                    env -u DT_EVIDENCE_DIR \
+                    phase "running the project setup hook in env $DT_ENV_KEY"
+                    env -u DT_EVIDENCE_DIR -u DT_LAUNCH_PHASE_PATH -u DT_ENV_KEY \
                         "$UV_BIN" run --no-sync bash -e \
                         "$DT_CONTROL_DIR/setup.sh" || exit 1
                     touch "$smark"
@@ -2021,6 +2072,8 @@ launch_locked() {
     local gpu_probe_started_ms session_start_started_ms attempt idx prior rc
     gpu_probe_started_ms=$(now_ms)
     if [ "$DT_GPUS" -gt 0 ]; then
+        dt_publish_launch_phase gpu_probe \
+            "selecting $DT_GPUS free GPU(s) under the node launch lock"
         local candidates candidate_rows query_rc row total free_count
         candidate_rows=$(free_gpu_indices)
         query_rc=$?
@@ -2109,6 +2162,8 @@ launch_locked() {
           "$DT_STATE_DIR"/process_start_ticks.tmp.*
     dt_publish_runtime_marker \
         "$DT_STATE_DIR/runtime_gpus_requested" "$DT_GPUS" || return 14
+    dt_publish_launch_phase session_start \
+        "starting the job session and waiting for the wrapper to take its leases"
     session_start_started_ms=$(now_ms)
     start_session "$ids"
     rc=$?
@@ -2142,6 +2197,8 @@ launch_locked() {
 lockfile="$DT_RUNTIME_ROOT/locks/launch-$(hostname).lock"
 mkdir -p "$DT_RUNTIME_ROOT/locks"
 exec 9>"$lockfile"
+dt_publish_launch_phase launch_lock_wait \
+    "waiting for the node launch lock (another launcher is placing a job)"
 LOCK_WAIT_STARTED_MS=$(now_ms)
 if ! flock -w 300 9; then
     log "could not take node launch lock within 300s"

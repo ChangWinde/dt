@@ -13,6 +13,7 @@ from rich.markup import escape
 import typer
 
 from ... import cli as _root
+from ... import dispatch as dispatch_mod
 from ... import jobs as jobs_mod
 from ...config import HeadConfig, LaptopConfig
 from ...jsonvalue import as_int, as_number
@@ -55,6 +56,14 @@ def _free_scheduler_context(
             agent_heartbeat_stale=bool(health["heartbeat_stale"]),
             registry_damage=len(damage),
         )
+        # "next is dispatching on NODE" can stand for minutes while the
+        # launcher builds an environment or waits for a lock; once the claim
+        # is old enough, one bounded read of the node says which.
+        head_progress = (
+            dispatch_mod.read_launch_progress(cfg, head)
+            if head is not None and dispatch_mod.launch_progress_due(head)
+            else None
+        )
         return {
             "center": cfg.center,
             "running": len(running),
@@ -68,6 +77,9 @@ def _free_scheduler_context(
             "queued": len(queued),
             "queue_head_job_id": head.job_id if head is not None else None,
             "queue_head_reason": head.reason if head is not None else None,
+            "queue_head_launch_progress": (
+                head_progress.as_payload() if head_progress is not None else None
+            ),
             "queue_head_pin_node": head.pin_node if head is not None else None,
             "queue_head_gpus_requested": (
                 head.gpus_requested if head is not None else None
@@ -93,6 +105,7 @@ def _free_scheduler_context(
             "queued": None,
             "queue_head_job_id": None,
             "queue_head_reason": None,
+            "queue_head_launch_progress": None,
             "queue_head_pin_node": None,
             "queue_head_gpus_requested": None,
             "queue_head_min_vram_mib": None,
@@ -550,6 +563,20 @@ def _free_explain_payload(
     }
 
 
+def _free_launch_progress_text(context: JsonDict) -> str | None:
+    """The launcher's phase on the node for a queue head that is dispatching."""
+    observation = dispatch_mod.LaunchProgress.from_payload(
+        context.get("queue_head_launch_progress")
+    )
+    if observation is None:
+        return None
+    text = escape(observation.summary())
+    claimed = observation.claimed_text()
+    if claimed:
+        text += f" [dim]({claimed})[/dim]"
+    return text
+
+
 def _free_action_text(
     cap: _CenterCapacity,
     context: JsonDict,
@@ -677,6 +704,9 @@ def _free_action_text(
                 action = f"next needs {wanted} {gpu_word} capacity"
         if minimum is not None:
             action += f" · ≥{minimum:,} MiB/GPU"
+        launch_text = _free_launch_progress_text(context)
+        if launch_text is not None:
+            action += f" · {launch_text}"
     else:
         running_nodes = context.get("running_nodes")
         successor_node = "NODE"
@@ -768,6 +798,9 @@ def _free_scheduler_table(
             table.add_row("", f"[dim]next job[/dim] {escape(head)}")
             if isinstance(reason, str) and reason:
                 table.add_row("", f"[dim]reason[/dim] {escape(reason)}")
+            launch_text = _free_launch_progress_text(context)
+            if launch_text is not None:
+                table.add_row("", f"[dim]launcher[/dim] {launch_text}")
             model = context.get("model")
             if isinstance(model, dict):
                 table.add_row(

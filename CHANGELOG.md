@@ -28,6 +28,20 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 - `dt seed --bwlimit KBPS`, and the site default / head `uplink_kbps` now
   pace cache seeding: seeding ships the head's whole uv cache to a node and
   was the one head-side bulk transfer no budget reached.
+- A dispatching job says what its launcher is doing on the node. A queued
+  row read `dispatching: NODE` for twenty minutes while the launcher merely
+  waited for the environment lock, and the wait was misdiagnosed as a stuck
+  dispatcher (field report). The launcher now publishes its current phase to
+  the job's state directory (`launch-phase`: `environment · syncing env KEY
+  (uv sync)`, `launch_lock_wait`, `gpu_probe`, ...; the same names as the
+  receipt's `launch_phases_s`), and once a claim is older than 15 s `dt info
+  REF` shows a `dispatching` row and `dt free` (with a `launcher` row under
+  `--explain`) appends it to `next is dispatching on NODE`, both through one
+  bounded remote read that reports a node it cannot reach instead of failing.
+  `dt info --json` carries the observation as `launch_progress`
+  (`dt_launch_progress_v1`). A launcher that already exited leaves `exited ·
+  launcher exit N` behind so a dispatcher that died mid-launch cannot make the
+  node look busy.
 
 ### Fixed
 

@@ -206,6 +206,21 @@ uploads raw application output to an external service.
 show the complete next-job ID and scheduler reason, or add `--json` for the
 structured explanation contract.
 
+A queued job whose reason is `dispatching: NODE` has been claimed by a
+dispatcher and handed to the launcher on that node. Once the claim is older
+than 15 seconds, `dt info REF` and `dt free` read the launcher's current phase
+from the node with one bounded read and show it (`dispatching NODE ·
+environment · syncing env KEY (uv sync) · 42s (claimed 1m22s ago)`; `dt free
+--explain` adds a `launcher` row). The phase names are the `launch_phases_s`
+keys of the launch receipt — `preflight`, `artifact_verification`,
+`environment`, `launch_lock_wait`, `gpu_probe`, `session_start` — plus
+`exited` when the launcher has already returned and the dispatcher has not
+recorded the outcome yet. `dt info REF --json` carries the observation as
+`launch_progress` (`dt_launch_progress_v1`: `node`, `phase`, `detail`,
+`phase_elapsed_s`, `dispatching_for_s`, `error`); it is `null` while no claim
+is open or the claim is too young to be worth a round trip, and a node that
+cannot be read reports `error` instead of failing the command.
+
 `dt info REF --json` includes `result_state`, a versioned `paths` object, and a
 `gpu_isolation` contract. The path entries state ownership, mutability,
 lifetime, cleanup policy, and the actual environment interpreter; agents
