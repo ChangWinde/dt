@@ -14,6 +14,7 @@ import time
 from rich.markup import escape
 import typer
 
+from ... import agent as agent_mod
 from ... import cli as _root
 from ... import jobs as jobs_mod
 from ... import ps_query as ps_query_mod
@@ -423,6 +424,13 @@ def _attach_ps_live_columns(
         row.setdefault("resources", None)
 
 
+def _registry_is_current(cfg: HeadConfig) -> bool:
+    """A live agent on schedule keeps the running rows fresh (see
+    ``agent.registry_recently_reconciled``); one idle poll plus slack is the
+    longest a row can lag its node then."""
+    return agent_mod.registry_recently_reconciled(cfg, within_s=cfg.queue.poll_s + 30.0)
+
+
 def _gather_ps_rows(
     cfg: HeadConfig | LaptopConfig,
     status: str | None,
@@ -481,6 +489,11 @@ def _gather_ps_rows(
     configured_nodes = {node.name: node for node in cfg.nodes}
     node_statuses: dict[str, NodeStatus] = {}
     progress_by_id: dict[str, JsonDict] = {}
+    if stale and not include_progress and _registry_is_current(cfg):
+        # The resident agent verified these rows against their nodes within
+        # its last tick; probing them again cost `dt ps` a WAN round trip per
+        # node (270 ms of a 450 ms command on a two-node head) for no news.
+        stale = []
     if stale:
         node_names = (
             sorted({entry.node for entry in stale if entry.node in configured_nodes})

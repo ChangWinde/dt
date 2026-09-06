@@ -120,6 +120,14 @@ scripts/deploy.sh --plan dist HEAD_A HEAD_B
 scripts/deploy.sh dist HEAD_A HEAD_B
 ```
 
+The head the script runs on is the target `local`: the same bundle checks,
+staging, activation and rollback scripts run on this machine instead of over
+SSH (a head cannot SSH to itself). Deploy every head from one place:
+
+```bash
+scripts/deploy.sh dist local HEAD_B
+```
+
 Each host retains the complete verified bundle below
 `~/.local/share/disttrainer/releases/VERSION/`. To restore a retained version:
 

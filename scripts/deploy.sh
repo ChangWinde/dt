@@ -3,6 +3,9 @@
 # Usage:
 #   scripts/deploy.sh [--plan] RELEASE_DIR HOST...
 #   scripts/deploy.sh [--plan] --rollback VERSION HOST...
+# HOST is an SSH target, or the word `local` for the head this script runs on:
+# the same prepare/activate/rollback scripts and the same release checks run
+# here, so a head that cannot SSH to itself is not deployed by hand.
 set -euo pipefail
 
 PLAN=0
@@ -55,8 +58,19 @@ done
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=5)
 RSYNC_RSH="ssh -o BatchMode=yes -o ConnectTimeout=5"
 
+is_local_target() {
+    [[ "$1" == "local" ]]
+}
+
 require_remote_bash() {
     local host="$1"
+    if is_local_target "$host"; then
+        command -v bash >/dev/null 2>&1 && return 0
+        printf '%s\n' \
+            "deploy: capability {\"schema_version\":\"dt_deploy_capability_v1\",\"host\":\"local\",\"bash\":false}" \
+            >&2
+        return 3
+    fi
     if ! "${SSH[@]}" "$host" "command -v bash >/dev/null 2>&1"; then
         printf '%s\n' \
             "deploy: capability {\"schema_version\":\"dt_deploy_capability_v1\",\"host\":\"$host\",\"bash\":false}" \
@@ -78,6 +92,12 @@ remote_bash() {
         }
         command+=" $argument"
     done
+    if is_local_target "$host"; then
+        # The scripts address everything relative to $HOME and read their
+        # arguments from `bash -s`, exactly as they do through SSH.
+        printf '%s\n' "$script" | bash -c "cd ~ && $command"
+        return
+    fi
     printf '%s\n' "$script" | "${SSH[@]}" "$host" "$command"
 }
 
@@ -1246,8 +1266,12 @@ for host in "${TARGETS[@]}"; do
     fi
     require_remote_bash "$host"
     remote_bash "$host" "$(remote_prepare_script)" "$REMOTE_STAGE"
-    if ! rsync -a --delete --partial --checksum -e "$RSYNC_RSH" \
-        "$RELEASE_DIR/" "$host:$REMOTE_STAGE/"; then
+    if is_local_target "$host"; then
+        transfer=(rsync -a --delete --partial --checksum "$RELEASE_DIR/" "$HOME/$REMOTE_STAGE/")
+    else
+        transfer=(rsync -a --delete --partial --checksum -e "$RSYNC_RSH" "$RELEASE_DIR/" "$host:$REMOTE_STAGE/")
+    fi
+    if ! "${transfer[@]}"; then
         remote_bash "$host" "$(remote_cleanup_script)" "$REMOTE_STAGE" || true
         echo "deploy: artifact transfer failed for $host" >&2
         exit 1

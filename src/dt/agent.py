@@ -2191,6 +2191,31 @@ def _wait_agent_gone(cfg: HeadConfig, wait_s: float) -> bool:
     return False
 
 
+def registry_recently_reconciled(cfg: HeadConfig, *, within_s: float) -> bool:
+    """True when a live agent verified every running row within ``within_s``.
+
+    Each agent tick refreshes the running jobs against their nodes (and
+    completion watchers land a finished job within a tenth of a second), so a
+    query command that runs while the agent is on schedule learns nothing from
+    probing the same nodes again - it only pays a WAN round trip per node. Any
+    doubt (no agent, unreadable or stale tick record) answers False and the
+    caller probes as before.
+    """
+    if alive_pid(cfg) is None:
+        return False
+    try:
+        decoded = json.loads(
+            _read_private_text(scheduler_tick_path(cfg), max_bytes=1024).strip()
+        )
+        raw = decoded.get("last_success_at", decoded.get("completed_at"))
+        last_success_at = float(raw)
+        if not math.isfinite(last_success_at) or last_success_at <= 0:
+            return False
+    except (OSError, UnicodeError, ValueError, TypeError, AttributeError):
+        return False
+    return 0.0 <= time.time() - last_success_at <= within_s
+
+
 def stop_agent(cfg: HeadConfig, *, wait_s: float = STOP_WAIT_S) -> str:
     """Ask the agent to exit; report ``stopped``, ``not_running``, or
     ``still_running``.
