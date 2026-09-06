@@ -577,9 +577,25 @@ if [ -n "${DT_UV_ENV:-}" ]; then
         echo "[wrapper] cannot open environment lifetime lock" >&2
         exit 76
     }
-    if ! flock -s "$dt_env_lease_fd"; then
-        echo "[wrapper] cannot acquire environment lifetime lock" >&2
-        exit 76
+    # Another launch may have started rebuilding this environment (held
+    # exclusively) between the launcher's shared entry check and here. Wait a
+    # bounded time and say so: the launcher reads this marker to keep waiting
+    # for pgid instead of declaring the wrapper dead after ten seconds, and
+    # an unbounded wait here would otherwise leave a half-started job that
+    # neither side could explain.
+    dt_env_lease_wait="${DT_ENV_BUILD_WAIT_S:-90}"
+    case "$dt_env_lease_wait" in
+        *[!0-9]*|"") dt_env_lease_wait=90 ;;
+    esac
+    if ! flock -s -n "$dt_env_lease_fd"; then
+        dt_publish_state_marker "$DT_STATE_DIR/wrapper_phase" \
+            "env-lease:$(basename -- "$DT_UV_ENV")" || exit 76
+        echo "[wrapper] environment $(basename -- "$DT_UV_ENV") is being rebuilt by another launch; waiting up to ${dt_env_lease_wait}s for a shared lease" >&2
+        if ! flock -s -w "$dt_env_lease_wait" "$dt_env_lease_fd"; then
+            echo "[wrapper] environment $(basename -- "$DT_UV_ENV") stayed under rebuild for ${dt_env_lease_wait}s; cannot enter it" >&2
+            exit 76
+        fi
+        rm -f -- "$DT_STATE_DIR/wrapper_phase" 2>/dev/null || true
     fi
 fi
 

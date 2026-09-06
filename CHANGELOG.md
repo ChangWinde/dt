@@ -28,9 +28,71 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 - `dt seed --bwlimit KBPS`, and the site default / head `uplink_kbps` now
   pace cache seeding: seeding ships the head's whole uv cache to a node and
   was the one head-side bulk transfer no budget reached.
+- A dispatching job says what its launcher is doing on the node. A queued
+  row read `dispatching: NODE` for twenty minutes while the launcher merely
+  waited for the environment lock, and the wait was misdiagnosed as a stuck
+  dispatcher (field report). The launcher now publishes its current phase to
+  the job's state directory (`launch-phase`: `environment · syncing env KEY
+  (uv sync)`, `launch_lock_wait`, `gpu_probe`, ...; the same names as the
+  receipt's `launch_phases_s`), and once a claim is older than 15 s `dt info
+  REF` shows a `dispatching` row and `dt free` (with a `launcher` row under
+  `--explain`) appends it to `next is dispatching on NODE`, both through one
+  bounded remote read that reports a node it cannot reach instead of failing.
+  `dt info --json` carries the observation as `launch_progress`
+  (`dt_launch_progress_v1`). A launcher that already exited leaves `exited ·
+  launcher exit N` behind so a dispatcher that died mid-launch cannot make the
+  node look busy.
+- The resident agent dispatches several jobs at once, one per target node.
+  Its tick used to run each placement inline, so one slow launch — a cold
+  `uv sync`, a setup hook compiling for minutes, a code snapshot over a
+  saturated link — held every other node's queued work and the heartbeat with
+  it ("queue has jobs, GPUs are idle, nothing dispatches for minutes …
+  scheduler stalled · 210s since last tick", field report). Placement now runs
+  on a few worker threads while the tick keeps reconciling, heartbeating, and
+  placing work elsewhere; work pinned to a node with a launch in flight waits
+  for it, later GPU work waits only while an unpinned dispatch has not yet
+  chosen its node, and every dispatcher's probe view hides the cards a live
+  claim is about to take so two launchers never aim at one card. An older job
+  that already holds a claim reserves capacity on its claimed node only, so a
+  later job bound elsewhere passes it. The agent finishes in-flight dispatches
+  before it exits or re-execs; `dt agent status` lists them (`dispatching`).
+- Repeated placement refusals are reported as a pattern. One job bounced off
+  the same node six times as `artifact-unverified` and another sat behind a
+  node that stayed unreachable for an hour; `dt ps --issues` showed each
+  attempt's reason but neither the count, the span, nor what to do. The row
+  now carries `placement_pattern` (`NODE=artifact-unverified`),
+  `placement_attempts`, and the streak's first/last time; `dt ps --issues`
+  opens with one digest line per pattern (jobs, attempts, first, last, next
+  step) and marks each row `×N`, `dt info` adds a `repeated` row, and `dt
+  free --explain` a `repeated` line for the queue head.
 
 ### Fixed
 
+- A blocked job retries on its capped exponential backoff, not every few
+  seconds. The claim refused a blocked job's retry because of the row's own
+  previous `blocked:` verdict, rewrote it as `waiting: blocked: ...`, and the
+  agent — which does not back off a wait — launched it again on the next
+  tick: two `artifact-unverified` jobs alternated `blocked` and `waiting`
+  every twelve seconds in the agent log, each cycle a code snapshot over the
+  tunnel and a launcher run, and the log deduplication never settled. The
+  placement pass that carries fresh probe evidence re-tests the constraint on
+  the node itself, so the stale verdict no longer vetoes it; dependency
+  blockers and `dt free --explain`'s explanation are unchanged.
+- `dt agent stop` and `dt agent start` no longer contradict each other while
+  the agent re-execs itself for a new dt build. The restarting image released
+  its singleton lock and pid file before `exec`, so for a second or two a
+  deploy saw "no agent running" followed by "agent already running" (field
+  observation during a release). The locked descriptor and the pid now travel
+  through the `exec` and the replacement image adopts them; only a failed
+  `exec` releases them.
+- The wrapper's lifetime lease on the environment is bounded and explained.
+  Another launch can take the environment lock exclusively to build between
+  the launcher's shared entry check and the wrapper's lease; the wrapper waited
+  without bound while the launcher declared it dead after ten seconds (a
+  fatal `internal` that hid the cause). The wrapper now publishes
+  `env-lease:KEY` to the job's state directory and waits the environment
+  build budget (`DT_ENV_BUILD_WAIT_S`, 90 s); the launcher reads the marker,
+  extends its wait for the wrapper by that budget, and reports the phase.
 - Node artifact stores are read-only to jobs. A job script's
   `ln -s "$DT_ARTIFACT_ROOT/<rel>" <rel>`, racing across two cells of one
   job, planted a symlink inside the worker's directory artifact and every

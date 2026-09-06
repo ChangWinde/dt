@@ -384,17 +384,23 @@ def _holding_environment_lock(lock: Path, *, shared: bool):
     (shared) or another launcher's build (exclusive) does."""
     lock.parent.mkdir(parents=True, exist_ok=True)
     flag = "-s" if shared else "-x"
+    # flock's child shell inherits the locked descriptor: kill the whole
+    # session so releasing the lock is immediate, not after `sleep 30`.
     holder = subprocess.Popen(
         ["flock", flag, str(lock), "-c", "echo held; exec sleep 30"],
         stdout=subprocess.PIPE,
         text=True,
+        start_new_session=True,
     )
     try:
         assert holder.stdout is not None
         assert holder.stdout.readline() == "held\n"
         yield
     finally:
-        holder.kill()
+        try:
+            os.killpg(holder.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         holder.wait()
         holder.stdout.close()
 
@@ -412,7 +418,10 @@ def _run_launcher_with_fake_uv(
     prebuilt: bool = False,
     pyproject: str | None = None,
     prebuilt_pyproject: str | None = None,
-) -> subprocess.CompletedProcess:
+    background: bool = False,
+) -> subprocess.CompletedProcess | subprocess.Popen:
+    """Run the launcher against fake node tools; ``background`` returns the
+    started process so a test can observe the launcher mid-phase."""
     job = tmp_path / "job"
     code = job / "code"
     code.mkdir(parents=True)
@@ -723,6 +732,16 @@ def _run_launcher_with_fake_uv(
         env["DT_PRIVATE_ENV_STDIN"] = "1"
         stdin = encode_private_env(private_env)
     command = ["bash", str(PAYLOAD / "launcher.sh")]
+    if background:
+        assert stdin is None
+        return subprocess.Popen(
+            command,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
     if stdin is None:
         return subprocess.run(
             command,
@@ -881,6 +900,125 @@ def test_launcher_waits_for_a_builder_before_entering_a_built_env(tmp_path):
     assert proc.returncode == 10, proc.stderr
     assert "is being rebuilt" in proc.stderr
     assert not (tmp_path / "state" / "tmux-new-session").exists()
+
+
+def _read_launch_phase(job: Path) -> tuple[str, str, int] | None:
+    """The launcher's published phase: (phase, detail, since) or None."""
+    path = job / "launch-phase"
+    if not path.exists():
+        return None
+    lines = path.read_text().split("\n")
+    assert lines[0] == "dt_launch_phase_v1", lines
+    return lines[1], lines[2], int(lines[3])
+
+
+def _wait_for_phase(job: Path, phase: str, *, timeout_s: float = 8.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        observed = _read_launch_phase(job)
+        if observed is not None and observed[0] == phase:
+            return observed
+        time.sleep(0.05)
+    raise AssertionError(
+        f"launcher never published phase {phase!r}: {_read_launch_phase(job)}"
+    )
+
+
+def test_launcher_publishes_its_phase_while_it_waits_for_the_environment_lock(
+    tmp_path,
+):
+    """Field report: the head showed "dispatching: NODE" for twenty minutes
+    while the launcher merely waited for the environment lock, and the wait
+    was misdiagnosed. The launcher now says what it is doing in
+    ``<state>/launch-phase`` so `dt info` / `dt free --explain` can show it,
+    and removes the file once the session is running."""
+    lock = tmp_path / "envs" / "0123456789ab.lock"
+    job = tmp_path / "job"
+    holder = _holding_environment_lock(lock, shared=False)
+    holder.__enter__()
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        prebuilt=True,
+        pyproject=_PYPROJECT,
+        env_overrides={"DT_ENV_BUILD_WAIT_S": "20"},
+        background=True,
+    )
+    try:
+        phase, detail, since = _wait_for_phase(job, "environment")
+        assert detail.startswith("entering built env 0123456789ab")
+        assert abs(since - time.time()) < 30
+        assert (job / "launch-phase").stat().st_mode & 0o777 == 0o600
+        # A refused builder lock keeps the launcher inside this phase.
+        time.sleep(0.5)
+        assert _read_launch_phase(job)[0] == "environment"
+    finally:
+        holder.__exit__(None, None, None)
+    stdout, stderr = proc.communicate(timeout=10)
+
+    assert proc.returncode == 0, stderr
+    assert (tmp_path / "state" / "tmux-new-session").exists()
+    # Once the wrapper owns the session there is nothing left to explain.
+    assert not (job / "launch-phase").exists()
+
+
+def test_launcher_publishes_the_build_lock_wait_then_the_sync_inside_it(tmp_path):
+    lock = tmp_path / "envs" / "0123456789ab.lock"
+    job = tmp_path / "job"
+    holder = _holding_environment_lock(lock, shared=True)
+    holder.__enter__()
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "setup",
+        pyproject=_PYPROJECT,
+        env_overrides={"DT_ENV_BUILD_WAIT_S": "20"},
+        background=True,
+    )
+    try:
+        phase, detail, _since = _wait_for_phase(job, "environment")
+        assert detail.startswith("waiting for the build lock on env 0123456789ab")
+    finally:
+        holder.__exit__(None, None, None)
+    stdout, stderr = proc.communicate(timeout=10)
+
+    assert proc.returncode == 0, stderr
+    assert (tmp_path / "state" / "sync-count").read_text() == "1\n"
+    assert not (job / "launch-phase").exists()
+
+
+def test_launcher_leaves_its_exit_behind_when_it_refuses(tmp_path):
+    """A busy/unfit refusal is reported to the dispatcher on stderr, but the
+    dispatcher may be gone (killed mid-launch) or slow to record it; the
+    phase file then says the launcher already exited instead of implying it
+    is still working."""
+    proc = _run_launcher_with_fake_uv(
+        tmp_path,
+        "plain",
+        gpu_rows="0, GPU-busy, 20000, 81920",
+        env_overrides={"DT_GPUS": "1", "DT_TEST_GPU_APPS": "GPU-busy, 4242, 20000\n"},
+    )
+
+    assert proc.returncode == 10, proc.stderr
+    phase, detail, _since = _read_launch_phase(tmp_path / "job")
+    assert phase == "exited"
+    assert detail == "launcher exit 10"
+
+
+def test_launcher_phase_names_match_the_receipt_and_the_head_vocabulary():
+    """The head validates phase names against dispatch.LAUNCH_PHASES; every
+    phase the launcher publishes must be one of them."""
+    from dt import dispatch
+
+    source = (PAYLOAD / "launcher.sh").read_text()
+    published = set(re.findall(r"dt_publish_launch_phase (\w+)", source))
+    published |= set(re.findall(r'printf "dt_launch_phase_v1\\n(\w+)\\n', source))
+    assert published, "the launcher publishes launch phases"
+    assert published <= set(dispatch.LAUNCH_PHASES), published - set(
+        dispatch.LAUNCH_PHASES
+    )
+    receipt = re.search(r'"launch_phases_ms": \{([^}]*)\}', source).group(1)
+    receipt_keys = set(re.findall(r'"(\w+)": %s', receipt))
+    assert published - {"exited"} <= receipt_keys, published - receipt_keys
 
 
 def test_gpu_wrapper_rejects_symlinked_containment_attestation(tmp_path):
@@ -1433,6 +1571,84 @@ def test_wrapper_exact_environment_reuse_does_not_require_uv(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert (tmp_path / "result_state").read_text().strip() == "success"
     assert "DT_ENV_MODE" in _tmux_session_env_names()
+
+
+def _wrapper_reuse_env(tmp_path: Path, env_dir: Path) -> dict[str, str]:
+    (tmp_path / "code").mkdir()
+    (env_dir / "bin").mkdir(parents=True)
+    (env_dir / "bin" / "python").symlink_to(shutil.which("python3"))
+    (tmp_path / "cmd.sh").write_text("true\n")
+    return {
+        **os.environ,
+        "DT_JOB_DIR": str(tmp_path),
+        "DT_GPU_IDS": "",
+        "DT_MAX_HOURS": "",
+        "DT_ENV_MODE": "reuse",
+        "DT_UV": "",
+        "DT_UV_ENV": str(env_dir),
+        "DT_WEBHOOK": "",
+        "DT_PROXY": "",
+    }
+
+
+def test_wrapper_waits_a_bounded_time_for_an_environment_under_rebuild(tmp_path):
+    """Between the launcher's shared entry check and the wrapper's lifetime
+    lease another launch may take the environment lock exclusively to build.
+    The wrapper used to wait for it without bound while the launcher declared
+    it dead after ten seconds; now it publishes what it waits for and gives up
+    after the environment build budget, so both sides can explain the job."""
+    env_dir = tmp_path / "envs" / "0123456789ab"
+    env = _wrapper_reuse_env(tmp_path, env_dir)
+    env["DT_ENV_BUILD_WAIT_S"] = "1"
+    lock = Path(str(env_dir) + ".lock")
+    with _holding_environment_lock(lock, shared=False):
+        proc = subprocess.run(
+            ["bash", str(PAYLOAD / "wrapper.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=WRAPPER_TIMEOUT_SECONDS,
+        )
+
+    assert proc.returncode == 76, proc.stderr
+    assert "is being rebuilt by another launch; waiting up to 1s" in proc.stderr
+    assert "stayed under rebuild for 1s; cannot enter it" in proc.stderr
+    assert (tmp_path / "wrapper_phase").read_text().strip() == (
+        "env-lease:0123456789ab"
+    )
+    assert not (tmp_path / "pgid").exists()
+
+
+def test_wrapper_enters_the_environment_once_the_rebuild_releases_it(tmp_path):
+    env_dir = tmp_path / "envs" / "0123456789ab"
+    env = _wrapper_reuse_env(tmp_path, env_dir)
+    env["DT_ENV_BUILD_WAIT_S"] = "10"
+    lock = Path(str(env_dir) + ".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    holder = subprocess.Popen(
+        ["flock", "-x", str(lock), "-c", "echo held; sleep 1"],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline() == "held\n"
+        proc = subprocess.run(
+            ["bash", str(PAYLOAD / "wrapper.sh")],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=WRAPPER_TIMEOUT_SECONDS,
+        )
+    finally:
+        holder.wait(timeout=10)
+        holder.stdout.close()
+
+    assert proc.returncode == 0, proc.stderr
+    assert "is being rebuilt by another launch" in proc.stderr
+    assert (tmp_path / "result_state").read_text().strip() == "success"
+    # The marker is transient: it is removed once the lease is held.
+    assert not (tmp_path / "wrapper_phase").exists()
 
 
 def test_launcher_setup_hook_stops_at_first_failed_command(tmp_path):
@@ -3118,7 +3334,10 @@ def test_gpu_lease_closes_pre_cuda_startup_race():
     assert LAUNCHER.find("start_session") < LAUNCHER.find(
         "wrapper did not acquire GPU lease/start"
     )
-    assert "attempt < 100" in LAUNCHER
+    # Ten seconds for a normal wrapper start, extended only while the wrapper
+    # reports it is waiting for a shared lease on an environment under rebuild.
+    assert "pgid_deadline_ms=$(($(now_ms) + 10000))" in LAUNCHER
+    assert "env-lease:*)" in LAUNCHER
     assert "sleep 0.1" in LAUNCHER
     assert WRAPPER.find("flock -n") < WRAPPER.find(
         'dt_publish_state_marker "$DT_STATE_DIR/pgid" "$$"'

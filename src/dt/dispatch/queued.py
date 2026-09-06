@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 import uuid
 
@@ -16,7 +17,7 @@ from .. import dispatch as _root
 from .. import submission_intent as intent_mod
 from ..artifact_distribution import DistributionError
 from ..config import ConfigError, HeadConfig, Node, head_bwlimit_kbps
-from ..probe import NodeStatus
+from ..probe import Gpu, NodeStatus
 from ..jobs import (
     JobEntry,
     RegistryDamage,
@@ -72,6 +73,31 @@ from . import (
 from ..scheduler import admission_decision
 
 
+# Jobs this process is dispatching right now, across threads. The resident
+# agent runs several dispatches at once (one per target node) so a slow
+# environment build on one node cannot stall placement everywhere else; a
+# claim owned by our own pid is then either one of these (live, leave it
+# alone) or a leftover of an attempt that raised (recoverable).
+_INFLIGHT_JOB_IDS: dict[str, int] = {}
+_INFLIGHT_LOCK = threading.Lock()
+
+
+def inflight_job_ids(*, exclude_current_thread: bool = False) -> frozenset[str]:
+    """Jobs whose dispatch is executing in this process at this moment.
+
+    ``exclude_current_thread`` leaves out the job the calling thread is itself
+    dispatching, so a dispatcher recovering its own row's stale claim does not
+    mistake that row for another thread's live attempt.
+    """
+    me = threading.get_ident()
+    with _INFLIGHT_LOCK:
+        return frozenset(
+            job_id
+            for job_id, owner in _INFLIGHT_JOB_IDS.items()
+            if not (exclude_current_thread and owner == me)
+        )
+
+
 def dispatch_queued(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -92,6 +118,23 @@ def dispatch_queued(
     the placement does not repeat a fleet-wide probe seconds later; the
     launcher's own locked capacity check still guards the placement.
     """
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_JOB_IDS[entry.job_id] = threading.get_ident()
+    try:
+        return _root._dispatch_queued_gated(cfg, entry, log, statuses=statuses)
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT_JOB_IDS.pop(entry.job_id, None)
+
+
+def _dispatch_queued_gated(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    log: Callable[[str], None],
+    *,
+    statuses: Sequence[NodeStatus] | None = None,
+) -> tuple[str, str | None]:
+    """Settle dependencies under the job lock, then place (see dispatch_queued)."""
     _root._finalize_dependency_rows(
         cfg,
         (entry.after_success, entry.after_complete, entry.after_result),
@@ -334,7 +377,11 @@ def _dispatch_claim_hold_reason(entry: JobEntry) -> str | None:
     except ValueError:
         return None
     if pid == os.getpid():
-        return None  # our own stale claim; single-threaded dispatch may recover
+        # Our own claim: live while another thread of this process is still
+        # dispatching the job, otherwise a leftover this process may recover.
+        if entry.job_id in _root.inflight_job_ids(exclude_current_thread=True):
+            return f"dispatch in progress on {entry.dispatch_node} in this process"
+        return None
     if boot_id != _current_head_boot_id():
         return None  # head rebooted: the owner is gone
     observed_ticks = _process_start_ticks(pid)
@@ -1203,6 +1250,101 @@ def _prepare_queued_stage(
     )
 
 
+def placement_pattern(reasons: Mapping[str, str], *, outcome: str) -> str:
+    """Name what kind of refusal each node gave, stably across attempts.
+
+    ``NODE=kind;NODE=kind``: the kind is the reason's prefix up to its first
+    colon (``artifact-unverified``, ``node-unfit``, ``busy``), or the outcome
+    for an outage whose transport text varies from probe to probe.
+    """
+    parts = []
+    for node, reason in sorted(reasons.items()):
+        kind = outcome if outcome == "unreachable" else reason.split(":", 1)[0].strip()
+        parts.append(f"{node}={kind or outcome}")
+    return ";".join(parts) or outcome
+
+
+def _note_placement_attempt(
+    entry: JobEntry,
+    pattern: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Count one placement attempt that ended in ``pattern``; True when the row changed.
+
+    Consecutive attempts with the same pattern extend one streak (its first
+    and last times bound it); a different pattern starts a new one. A busy
+    wait between two attempts is not an attempt and leaves the streak alone.
+    """
+    moment = time.time() if now is None else now
+    if entry.placement_pattern == pattern and entry.placement_attempts > 0:
+        entry.placement_attempts += 1
+    else:
+        entry.placement_pattern = pattern
+        entry.placement_attempts = 1
+        entry.placement_first_failed_at = moment
+    entry.placement_last_failed_at = moment
+    return True
+
+
+def _reserve_inflight_claims(
+    cfg: HeadConfig,
+    entry: JobEntry,
+    statuses: Sequence[NodeStatus],
+) -> list[NodeStatus]:
+    """Hide the cards other live dispatch claims are about to take.
+
+    A claimed queued row's launcher is on its node but has not taken its GPU
+    leases yet, so a probe still shows those cards free. Two dispatchers (the
+    agent's threads, or a `dt run` racing the agent) would otherwise both aim
+    at the same card and the loser would pay a snapshot and a launch to be
+    told busy at the node lock. Only claims with a provably live owner count;
+    a dead owner's claim is for dispatch recovery to settle, not for us to
+    reserve around.
+    """
+    reserved: dict[str, list[str]] = {}
+    try:
+        rows = active_entries(cfg)
+    except (OSError, RegistryError, PrivateStateError):
+        return list(statuses)
+    for row in rows:
+        if (
+            row.job_id == entry.job_id
+            or row.status != "queued"
+            or row.dispatch_node is None
+            or row.gpus_requested <= 0
+            or _root._dispatch_claim_hold_reason(row) is None
+        ):
+            continue
+        reserved.setdefault(row.dispatch_node, []).extend(
+            [row.job_id] * row.gpus_requested
+        )
+    if not reserved:
+        return list(statuses)
+    adjusted: list[NodeStatus] = []
+    for status in statuses:
+        owners = list(reserved.get(status.node, ()))
+        if not owners or status.error is not None:
+            adjusted.append(status)
+            continue
+        gpus: list[Gpu] = []
+        for gpu in status.gpus:
+            if owners and gpu.free:
+                owner = owners.pop(0)
+                gpus.append(
+                    replace(
+                        gpu,
+                        free=False,
+                        leased=True,
+                        lease_owner=f"dispatching:{owner}",
+                    )
+                )
+            else:
+                gpus.append(gpu)
+        adjusted.append(replace(status, gpus=gpus))
+    return adjusted
+
+
 def _fail_queued_placement(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -1262,10 +1404,21 @@ def _dispatch_queued_active(
             return interrupted
         return "failed", entry.reason
 
-    def hold(reason: str, outcome: tuple[str, str | None]) -> tuple[str, str | None]:
+    def hold(
+        reason: str,
+        outcome: tuple[str, str | None],
+        *,
+        probe_reasons: Mapping[str, str] | None = None,
+    ) -> tuple[str, str | None]:
         changed = entry.reason != reason
         if changed:
             entry.reason = reason
+        if outcome[0] in {"blocked", "unreachable"} and probe_reasons is not None:
+            # No node was tried, but the probe refused every candidate for a
+            # job-specific reason (or an outage): that repeats, so count it.
+            changed |= _root._note_placement_attempt(
+                entry, _root.placement_pattern(probe_reasons, outcome=outcome[0])
+            )
         interrupted = commit(persist=changed)
         if interrupted is not None:
             return interrupted
@@ -1308,7 +1461,7 @@ def _dispatch_queued_active(
         probed = _root.probe_center(cfg, use_cache=False)
     else:
         probed = list(statuses)
-    statuses = probed
+    statuses = _root._reserve_inflight_claims(cfg, entry, probed)
     probe_reasons = {
         status.node: probe_rejection_reason(status, spec) for status in statuses
     }
@@ -1329,6 +1482,7 @@ def _dispatch_queued_active(
         return hold(
             waiting_unreachable_reason(probe_reasons),
             ("unreachable", detail) if spec.node is not None else ("busy", None),
+            probe_reasons=probe_reasons,
         )
     if pin_is_busy(statuses, spec):
         candidates = []
@@ -1337,7 +1491,9 @@ def _dispatch_queued_active(
             detail = "; ".join(
                 f"{node}: {reason}" for node, reason in probe_reasons.items()
             )
-            return hold(f"blocked: {detail}", ("blocked", detail))
+            return hold(
+                f"blocked: {detail}", ("blocked", detail), probe_reasons=probe_reasons
+            )
         return hold(waiting_capacity_reason(probe_reasons), ("busy", None))
 
     candidates = [_queued_node(cfg, entry, node) for node in candidates]
@@ -1410,6 +1566,12 @@ def _dispatch_queued_active(
         changed = entry.reason != reason or placement_failures_changed
         if changed:
             entry.reason = reason
+        if reasons:
+            # A node was actually tried and refused: the sixth identical
+            # refusal is a pattern, not six independent surprises.
+            changed |= _root._note_placement_attempt(
+                entry, _root.placement_pattern(reasons, outcome=outcome[0])
+            )
         current = _root._commit_queued_transition(
             cfg,
             entry,

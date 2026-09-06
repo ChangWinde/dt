@@ -162,6 +162,7 @@ _OPTIONAL_TEXT_FIELDS = frozenset(
         "status_probe_error",
         "log_source",
         "progress_error",
+        "placement_pattern",
     }
 )
 _REQUIRED_BOOL_FIELDS = frozenset(
@@ -176,7 +177,9 @@ _REQUIRED_BOOL_FIELDS = frozenset(
 _OPTIONAL_BOOL_FIELDS = frozenset(
     {"env_preexisting", "setup_ran", "rerun_snapshot_changed"}
 )
-_REQUIRED_INT_FIELDS = frozenset({"gpus_requested", "retry_limit", "retry_count"})
+_REQUIRED_INT_FIELDS = frozenset(
+    {"gpus_requested", "retry_limit", "retry_count", "placement_attempts"}
+)
 _OPTIONAL_INT_FIELDS = frozenset(
     {
         "pgid",
@@ -203,6 +206,8 @@ _OPTIONAL_NUMBER_FIELDS = frozenset(
         "code_pruned_at",
         "terminal_finalized_at",
         "max_hours_overdue_s",
+        "placement_first_failed_at",
+        "placement_last_failed_at",
     }
 )
 _TEXT_LIST_FIELDS = frozenset({"extras", "after_result_states", "custom_env_keys"})

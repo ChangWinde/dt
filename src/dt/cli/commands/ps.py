@@ -21,7 +21,7 @@ from ...config import HeadConfig, LaptopConfig, Node
 from ...jsonvalue import as_int
 from ...probe import NodeStatus
 from ...remote import FanErrors
-from ...render import queued_anomaly, err, ps_table
+from ...render import queued_anomaly, err, issue_digest, ps_table
 from .. import (
     EXIT_UNREACHABLE,
     JsonDict,
@@ -1570,6 +1570,11 @@ def _ps_human_mode(
         if all_centers_failed:
             raise typer.Exit(_fan_failure_exit_code(errors))
         return
+    if view.issues:
+        # Repeated placement refusals read as unrelated rows in a table; the
+        # digest names each pattern once with its count, span, and remedy.
+        for line in issue_digest(rows):
+            _root.out.print(line)
     _root.out.print(
         ps_table(
             visible,

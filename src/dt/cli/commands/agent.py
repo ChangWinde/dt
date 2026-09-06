@@ -385,6 +385,25 @@ def _agent_status_table(
         )
         if verbose:
             table.add_row("queue id", escape(head))
+    dispatching = st.get("dispatching")
+    if isinstance(dispatching, list) and dispatching:
+        # The launches the agent's worker threads are driving right now; a
+        # long one used to look like a stalled scheduler.
+        parts = []
+        for item in dispatching[:3]:
+            if not isinstance(item, dict):
+                continue
+            for_s = item.get("for_s")
+            age = f" ({float(for_s):.0f}s)" if isinstance(for_s, (int, float)) else ""
+            parts.append(
+                f"{escape(_agent_queue_label(str(item.get('job_id'))))} → "
+                f"{escape(str(item.get('node')))}{age}"
+            )
+        more = f"  ·  +{len(dispatching) - 3} more" if len(dispatching) > 3 else ""
+        table.add_row(
+            "dispatching",
+            f"{len(dispatching)} in flight  ·  {', '.join(parts)}{more}",
+        )
     return table
 
 

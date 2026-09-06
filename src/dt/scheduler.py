@@ -53,9 +53,17 @@ def _capacity_overlaps(
     from anyone, and a 0-GPU older job is not waiting for one. Treating it as
     overlapping held a `-g 0 --node HEAD` job behind four jobs pinned to a
     full GPU node ("FIFO capacity is reserved for earlier job ...").
+
+    An older job that already carries a dispatch claim has its placement
+    decided: its launcher is running on ``dispatch_node``. It reserves
+    capacity there and nowhere else, so a candidate for another node passes
+    it instead of waiting out a slow environment build on a node it never
+    wanted.
     """
     if older.gpus_requested <= 0 or candidate.gpus_requested <= 0:
         return False
+    if older.dispatch_node is not None:
+        return older.dispatch_node == candidate_node
     if candidate.pin_node is None:
         return True
     return older.pin_node is None or older.pin_node == candidate_node
@@ -76,9 +84,10 @@ def admission_decision(
     This function performs no I/O. Callers serialize the snapshot+reservation
     transaction and repeat node-side lease checks after the lock is released.
     ``has_fresh_candidate`` is valid only when the current placement pass
-    selected ``candidate_node`` from fresh probe evidence. It supersedes only
-    derived historical reachability diagnostics; dependency and explicit
-    constraint blockers remain authoritative.
+    selected ``candidate_node`` from fresh probe evidence. It supersedes the
+    candidate's own historical verdicts (an unreachable node, a ``blocked:``
+    refusal the pass is about to re-test on the node); dependency blockers
+    remain authoritative, and other rows' verdicts are never rewritten.
     """
     observed_at = time.time() if now is None else now
     by_id = {entry.job_id: entry for entry in entries}
@@ -89,6 +98,7 @@ def admission_decision(
     persisted = _persisted_wait(
         candidate,
         has_resource_snapshot=has_fresh_candidate,
+        attempting=has_fresh_candidate,
     )
     if persisted is not None:
         state, reason, _condition = persisted
@@ -301,9 +311,24 @@ def _persisted_wait(
     entry: JobEntry,
     *,
     has_resource_snapshot: bool,
+    attempting: bool = False,
 ) -> tuple[str, str, str] | None:
+    """The wait a row's persisted reason still implies, or None.
+
+    A persisted ``blocked:`` reason is the previous attempt's verdict: it
+    explains the row and skips it in FIFO order. ``attempting`` is the
+    placement pass that is about to replace that verdict — it re-evaluates
+    every constraint against fresh probe evidence (a still-blocked node is
+    refused before the claim), so the stale verdict must not veto it.
+    Refusing it there only pushed the retry to the next tick as ``waiting:
+    blocked: ...``, an outcome the agent does not back off, so a blocked job
+    re-probed the fleet and re-launched every few seconds forever instead of
+    on its capped exponential backoff (agent log: two `artifact-unverified`
+    jobs alternating ``blocked`` and ``waiting`` every twelve seconds, each
+    cycle a snapshot and a launcher run).
+    """
     reason = entry.reason or ""
-    if reason.startswith("blocked:"):
+    if reason.startswith("blocked:") and not attempting:
         return "blocked_constraint", reason, "satisfy the reported job constraint"
     # Quota is recalculated from this registry snapshot below. A prior network
     # result is useful only when no fresh resource snapshot was supplied; live
@@ -598,6 +623,14 @@ def scheduler_snapshot(
             forecast_running += 1
             if capacity is not None and selected_node is not None:
                 _consume_capacity(capacity, selected_node, entry)
+        elif (
+            state == "dispatch_reserved"
+            and capacity is not None
+            and selected_node is not None
+        ):
+            # The launcher on that node is about to take these cards (the row
+            # already holds a quota slot); the probe still shows them free.
+            _consume_capacity(capacity, selected_node, entry)
 
         if state == "waiting_capacity" and entry.gpus_requested > 0:
             if entry.pin_node is None:

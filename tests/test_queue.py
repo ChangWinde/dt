@@ -270,13 +270,108 @@ def test_agent_restart_exec_failure_exits_for_supervisor(tmp_path, monkeypatch, 
     def _refuse_exec(*_args):
         raise OSError(8, "exec format error")
 
-    monkeypatch.setattr(agent.os, "execvp", _refuse_exec)
+    monkeypatch.setattr(agent.os, "execvpe", _refuse_exec)
 
     assert agent.run_loop(cfg) == AGENT_CONFIG_RESTART_EXIT
 
     output = capsys.readouterr().out
     assert "restart exec failed" in output
     assert "agent down" in output
+
+
+def test_agent_hands_its_lock_and_pid_to_the_replacement_image(
+    tmp_path, monkeypatch, capsys
+):
+    """Field observation during a release: the agent re-exec'd itself for
+    new code, `dt agent stop` ran in the same second and reported "no agent
+    running", and the deploy's `dt agent start` then reported "agent already
+    running". The lock was released before the exec and re-taken by the new
+    image a moment later. The lock now travels through the exec: the
+    descriptor stays open and inheritable, its number rides in the
+    environment, and the pid file (same pid) is left in place."""
+    import fcntl as fcntl_mod
+
+    import dt.agent as agent
+    import dt.config as config
+
+    cfg = _cfg(tmp_path)
+    monkeypatch.setattr(config, "load", lambda: cfg)
+    fingerprints = iter([1])
+    monkeypatch.setattr(agent, "_code_fingerprint", lambda: next(fingerprints, 2))
+    monkeypatch.setattr(agent, "_restart_preflight", lambda _bin: (True, None))
+    _fake_dt_bin(tmp_path, monkeypatch)
+    observed: dict[str, object] = {}
+
+    def fake_exec(binary, argv, env):
+        fd = int(env[agent.AGENT_LOCK_FD_ENV])
+        observed["argv"] = argv
+        observed["inheritable"] = os.get_inheritable(fd)
+        observed["pid_file"] = agent._pid_path(cfg).read_text().strip()
+        # The lock is still held while the exec happens: nobody else can
+        # take it, so `dt agent stop` / `start` see a running agent.
+        probe = os.open(agent._lock_path(cfg), os.O_RDWR)
+        try:
+            fcntl_mod.flock(probe, fcntl_mod.LOCK_SH | fcntl_mod.LOCK_NB)
+        except OSError:
+            observed["locked_during_exec"] = True
+        else:
+            observed["locked_during_exec"] = False
+        finally:
+            os.close(probe)
+        observed["alive_during_exec"] = agent.alive_pid(cfg)
+        raise OSError(8, "exec format error")
+
+    monkeypatch.setattr(agent.os, "execvpe", fake_exec)
+
+    assert agent.run_loop(cfg) == AGENT_CONFIG_RESTART_EXIT
+
+    assert observed["argv"][1:] == ["agent", "run"]
+    assert observed["inheritable"] is True
+    assert observed["pid_file"] == str(os.getpid())
+    assert observed["locked_during_exec"] is True
+    assert observed["alive_during_exec"] == os.getpid()
+    # The failed exec released everything for the supervisor's fresh agent.
+    assert agent.alive_pid(cfg) is None
+    assert not agent._pid_path(cfg).exists()
+    assert "restart exec failed" in capsys.readouterr().out
+
+
+def test_replacement_agent_adopts_the_inherited_lock_descriptor(tmp_path, monkeypatch):
+    import fcntl as fcntl_mod
+
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    cfg.agent_dir().mkdir(parents=True, exist_ok=True)
+    lock_path = agent._lock_path(cfg)
+    handed = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl_mod.flock(handed, fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
+    os.set_inheritable(handed, True)
+    monkeypatch.setenv(agent.AGENT_LOCK_FD_ENV, str(handed))
+
+    adopted = agent._adopt_inherited_lock(cfg)
+
+    assert adopted == handed
+    assert agent.AGENT_LOCK_FD_ENV not in os.environ
+    assert os.get_inheritable(handed) is False
+    probe = os.open(lock_path, os.O_RDWR)
+    try:
+        with pytest.raises(OSError):
+            fcntl_mod.flock(probe, fcntl_mod.LOCK_EX | fcntl_mod.LOCK_NB)
+    finally:
+        os.close(probe)
+    os.close(handed)
+
+    # Garbage, a standard stream, or a descriptor of some other file never
+    # become the singleton lock; the normal open-and-lock path runs instead.
+    for bogus in ("", "abc", "0", "2"):
+        monkeypatch.setenv(agent.AGENT_LOCK_FD_ENV, bogus)
+        assert agent._adopt_inherited_lock(cfg) is None
+    other = os.open(tmp_path / "other-root.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    monkeypatch.setenv(agent.AGENT_LOCK_FD_ENV, str(other))
+    assert agent._adopt_inherited_lock(cfg) is None
+    with pytest.raises(OSError):
+        os.fstat(other)  # released: it would otherwise pin another root's lock
 
 
 def test_agent_restarts_when_immutable_active_command_target_changes(
@@ -302,7 +397,7 @@ def test_agent_restarts_when_immutable_active_command_target_changes(
     monkeypatch.setattr(agent, "_restart_preflight", lambda _bin: (True, None))
     monkeypatch.setattr(
         agent.os,
-        "execvp",
+        "execvpe",
         lambda *_args: (_ for _ in ()).throw(OSError(8, "exec refused")),
     )
 

@@ -630,7 +630,15 @@ def test_admission_fresh_candidate_supersedes_only_stale_reachability(tmp_path):
     assert fresh.state == "admit"
 
 
-def test_admission_fresh_candidate_preserves_durable_blockers(tmp_path):
+def test_admission_fresh_candidate_retests_a_blocked_verdict_but_not_a_dependency(
+    tmp_path,
+):
+    """Agent log: two `artifact-unverified` jobs alternated ``blocked`` and
+    ``waiting (blocked: ...)`` every twelve seconds. The claim refused the
+    retry because of the row's own previous verdict, rewrote it as a wait the
+    agent does not back off, and the next tick launched again. The pass that
+    supplies fresh probe evidence re-tests the constraint on the node itself;
+    a missing dependency is not something a probe can refute."""
     cfg = _cfg(tmp_path)
     constrained = _entry(
         "constrained",
@@ -650,6 +658,12 @@ def test_admission_fresh_candidate_preserves_durable_blockers(tmp_path):
         candidate_node="n1",
         has_fresh_candidate=True,
     )
+    explained = admission_decision(
+        cfg,
+        constrained,
+        [constrained],
+        candidate_node="n1",
+    )
     dependency = admission_decision(
         cfg,
         missing_dependency,
@@ -658,8 +672,9 @@ def test_admission_fresh_candidate_preserves_durable_blockers(tmp_path):
         has_fresh_candidate=True,
     )
 
-    assert constraint.allowed is False
-    assert constraint.state == "blocked_constraint"
+    assert constraint.allowed is True
+    assert explained.allowed is False
+    assert explained.state == "blocked_constraint"
     assert dependency.allowed is False
     assert dependency.state == "blocked_dependency_missing"
 

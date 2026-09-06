@@ -109,6 +109,23 @@ gate, the resident agent, and the `dt free --explain` explanation apply one
 overlap rule. Missing required paths or incompatible pins likewise do not
 block unrelated candidates.
 
+Placement itself runs off the agent's tick thread. Each dispatch (stage,
+probe, claim, snapshot, launch) executes on one of a few worker threads, at
+most one per target node, while the tick keeps reconciling running jobs,
+writing its heartbeat, and placing work on other nodes; a cold environment
+build or a slow snapshot on one node no longer stalls the whole scheduler. The
+tick treats an in-flight dispatch's node as spoken for (work pinned there
+waits), holds later GPU work while an unpinned dispatch has not yet chosen its
+node, and settles each outcome on the pass after it returns. The safety
+argument is the one that already covered two dispatcher processes — an inline
+`dt run` racing the agent: the registry claim is a compare-and-swap under the
+job lock, a claim owned by a live dispatcher (a process, or a thread of this
+process) is never recovered from under it, the launcher's node lock decides
+GPU ownership, and every other dispatcher's probe view hides the cards a live
+claim is about to take. An older job that already holds a claim reserves
+capacity only on its claimed node, so a later job bound elsewhere passes it.
+The agent finishes in-flight dispatches before it exits or re-execs itself.
+
 ## Data plane
 
 Source snapshots are immutable and content-addressed. Editing a project after

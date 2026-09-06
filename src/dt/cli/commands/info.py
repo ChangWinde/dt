@@ -15,6 +15,7 @@ from rich.markup import escape
 import typer
 
 from ... import cli as _root
+from ... import dispatch as dispatch_mod
 from ... import evidence as evidence_mod
 from ... import jobs as jobs_mod
 from ...config import HeadConfig, LaptopConfig
@@ -34,6 +35,7 @@ from ...monitoring import (
     safe_phase_name as _safe_phase_name,
 )
 from ...path_contract import job_path_contract as _job_path_contract
+from ...render import placement_remedies
 from .. import (
     INFO_COMMAND_PREVIEW_CHARS,
     _format_transfer_bytes,
@@ -419,15 +421,29 @@ def _info_resource_guard_text(resource_guard: Mapping[str, object]) -> str:
     )
 
 
+def _info_launch_progress_text(progress: Mapping[str, object]) -> str:
+    """The launcher's current phase on the node, for a row still dispatching."""
+    observation = dispatch_mod.LaunchProgress.from_payload(progress)
+    if observation is None:
+        return "-"
+    claimed = observation.claimed_text()
+    suffix = f" [dim]({claimed})[/dim]" if claimed else ""
+    style = "yellow" if observation.error or observation.phase == "exited" else ""
+    text = f"{escape(observation.node)} · {escape(observation.summary())}"
+    return (f"[{style}]{text}[/{style}]" if style else text) + suffix
+
+
 _INFO_COMPACT_LABELS = frozenset(
     {
         "name",
         "ref",
         "status",
+        "dispatching",
         "queue",
         "queue head",
         "previous",
         "placement failures",
+        "repeated",
         "results in code/",
         "where",
         "gpus",
@@ -770,6 +786,9 @@ def _render_info_table(
                 display_refs.get(str(previous), str(previous)) if previous else "-",
             ),
         )
+    launch_progress = data.get("launch_progress")
+    if isinstance(launch_progress, dict) and entry.status == "queued":
+        rows.insert(3, ("dispatching", _info_launch_progress_text(launch_progress)))
     if entry.artifact_manifest:
         rows.insert(8, ("artifacts", f"manifest {entry.artifact_manifest[:12]}"))
     if entry.placement_failures:
@@ -784,6 +803,21 @@ def _render_info_table(
                 f"\n[dim]as of {_fmt_ts(entry.updated_at)} (last attempt)[/dim]"
             )
         rows.insert(3, ("placement failures", placement_text))
+    if (
+        entry.status == "queued"
+        and entry.placement_attempts >= 2
+        and entry.placement_pattern
+    ):
+        remedies = placement_remedies(entry.placement_pattern)
+        pattern_text = (
+            f"[yellow]{escape(entry.placement_pattern)}[/yellow] · "
+            f"{entry.placement_attempts} attempts · first "
+            f"{_fmt_ts(entry.placement_first_failed_at)} · last "
+            f"{_fmt_ts(entry.placement_last_failed_at)}"
+        )
+        if remedies:
+            pattern_text += f"\nnext: {escape('; '.join(remedies))}"
+        rows.insert(3, ("repeated", pattern_text))
     rows.extend(_info_launch_rows(entry))
     if failure_log is not None:
         rows.extend(_info_failure_log_rows(failure_log))
@@ -914,12 +948,20 @@ def _info_gather(
     # ssh) is what `dt ps` renders as `running?`; keep it beside the row so
     # the detail view can say why the status is provisional.
     probe_observation: dict[str, object] = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=5) as pool:
         status_future = (
             pool.submit(
                 jobs_mod.refresh_status, cfg, entry, observation=probe_observation
             )
             if initial_status in ("running", "lost")
+            else None
+        )
+        # A claim open for a while means the launcher is somewhere inside
+        # its environment or lock phases on the node; one bounded read says
+        # where (field report: "dispatching" for twenty minutes, misdiagnosed).
+        progress_future = (
+            pool.submit(dispatch_mod.read_launch_progress, cfg, entry)
+            if dispatch_mod.launch_progress_due(entry)
             else None
         )
         live_future = (
@@ -960,6 +1002,10 @@ def _info_gather(
         failure_log = (
             failure_log_future.result() if failure_log_future is not None else None
         )
+        if progress_future is not None:
+            progress = progress_future.result()
+            if progress is not None:
+                live["launch_progress"] = progress
     return entry, live, resources, failure_log
 
 
@@ -1072,6 +1118,11 @@ def _info_payload(
         "placement_failures": dict(entry.placement_failures),
         "node_unreachable": live.get("unreachable", False),
         "status_probe_error": live.get("status_probe_error"),
+        "launch_progress": (
+            live["launch_progress"].as_payload()
+            if isinstance(live.get("launch_progress"), dispatch_mod.LaunchProgress)
+            else None
+        ),
         "resources": resources,
         "resource_summary": resource_summary,
         "resource_summary_error": resource_summary_error,

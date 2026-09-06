@@ -63,6 +63,7 @@ scheduler's explanation and, where there is one, the remedy:
 | `blocked: NODE: node-unfit: ...` | The node cannot run this job (for example `GPU runtime requires loginctl Linger=yes`) | Fix the node or resubmit with another `--node` |
 | `blocked: NODE: artifact-unverified: ...` | The node's artifact store drifted from the manifest the job is pinned to | `dt sync NODE --artifact PATH` republishes; blocked jobs retry at once |
 | `blocked: NODE: path-missing: ...` | `--require-path` is absent on the node | Provide the path or resubmit elsewhere |
+| `dispatching: NODE` | A dispatcher claimed the job and the launcher is running on NODE (snapshot, environment build, lock waits) | Nothing; after 15 s `dt info REF --json` adds `launch_progress` naming the launcher's phase (`environment · syncing env KEY`, `launch_lock_wait`, ...) and how long it has been there |
 
 `dt ps` (default view) shows the same reason in its issue column for any
 queued row that is blocked or on an unreachable node.
@@ -100,6 +101,11 @@ queued row that is blocked or on an unreachable node.
   launch leaves a row the agent recovers or refuses safely, never a duplicate.
 - The resident agent retries blocked work on a capped backoff and drops that
   backoff the moment capacity changes or an artifact store is republished.
+- One slow launch does not stop the scheduler: dispatches run on worker
+  threads, one per target node, so a cold environment build on one node
+  leaves other nodes' queued work flowing. `dt agent status --json` lists
+  them under `dispatching` (`job_id`, `node`, `for_s`); each `dt info` on such
+  a job shows the launcher's phase after 15 s.
 
 ## Do not
 

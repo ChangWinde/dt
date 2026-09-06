@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import stat
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
@@ -240,6 +241,15 @@ class JobEntry:
     dispatch_owner: str | None = None
     dispatch_claimed_at: float | None = None
     placement_failures: dict[str, str] = field(default_factory=dict)
+    # How often the same placement outcome has repeated: ``placement_pattern``
+    # names it ("NODE=artifact-unverified"), ``placement_attempts`` counts the
+    # consecutive attempts that ended that way, and the two timestamps bound
+    # the streak. One bounce is noise; the sixth on the same node is a pattern
+    # an operator should see without reading the agent log.
+    placement_attempts: int = 0
+    placement_pattern: str | None = None
+    placement_first_failed_at: float | None = None
+    placement_last_failed_at: float | None = None
     env_hash: str | None = None  # shared reproducible venv identity (12 hex)
     snapshot_duration_s: float | None = None  # successful node snapshot transfer
     launch_duration_s: float | None = None  # uv/setup + launch lock/session startup
@@ -848,6 +858,8 @@ def _validate_entry_limits(entry: JobEntry) -> None:
         entry.snapshot_duration_s,
         entry.launch_duration_s,
         entry.recovered_at,
+        entry.placement_first_failed_at,
+        entry.placement_last_failed_at,
     )
     if any(
         value is not None
@@ -886,6 +898,17 @@ def _validate_entry_limits(entry: JobEntry) -> None:
         or entry.require_disk_gib < 0
     ):
         raise ValueError("job registry has an invalid disk requirement")
+    if (
+        isinstance(entry.placement_attempts, bool)
+        or not isinstance(entry.placement_attempts, int)
+        or entry.placement_attempts < 0
+    ):
+        raise ValueError("job registry has an invalid placement attempt count")
+    if entry.placement_pattern is not None and (
+        not isinstance(entry.placement_pattern, str)
+        or len(entry.placement_pattern) > MAX_JOB_DIAGNOSTIC_CHARS
+    ):
+        raise ValueError("job registry has an invalid placement pattern")
 
 
 def _validate_entry_contracts(entry: JobEntry) -> None:
@@ -1374,6 +1397,9 @@ def load(cfg: HeadConfig, job_id: str) -> JobEntry | None:
 _DECODE_CACHE_ENABLED = False
 _DECODE_CACHE_MAX = 65536
 _DECODE_CACHE: dict[str, tuple[tuple[int, int, int], JobEntry]] = {}
+# The resident agent scans the registry from its tick thread and from every
+# dispatch thread at once; an unguarded dict would raise mid-iteration.
+_DECODE_CACHE_LOCK = threading.Lock()
 
 
 def enable_registry_decode_cache() -> None:
@@ -1479,7 +1505,8 @@ def list_all(
                         cache_key = f"{directory}/{name}"
                         cache_seen.add(cache_key)
                         revision = (info.st_ino, info.st_size, info.st_mtime_ns)
-                        cached = _DECODE_CACHE.get(cache_key)
+                        with _DECODE_CACHE_LOCK:
+                            cached = _DECODE_CACHE.get(cache_key)
                         if cached is not None and cached[0] == revision:
                             # The resident agent mutates rows while attempting
                             # lifecycle transitions. Keep the cached decode as
@@ -1498,11 +1525,13 @@ def list_all(
                     )
                     if cache_key is not None and result is not None:
                         _, info = result
-                        if len(_DECODE_CACHE) < _DECODE_CACHE_MAX:
-                            _DECODE_CACHE[cache_key] = (
-                                (info.st_ino, info.st_size, info.st_mtime_ns),
-                                copy.deepcopy(entry),
-                            )
+                        snapshot = copy.deepcopy(entry)
+                        with _DECODE_CACHE_LOCK:
+                            if len(_DECODE_CACHE) < _DECODE_CACHE_MAX:
+                                _DECODE_CACHE[cache_key] = (
+                                    (info.st_ino, info.st_size, info.st_mtime_ns),
+                                    snapshot,
+                                )
                     entries[entry.job_id] = entry
                 except (OSError, PrivateStateError, RegistryError) as exc:
                     if damage is not None:
@@ -1512,9 +1541,10 @@ def list_all(
                         )
                         damage.append(RegistryDamage(path=name, detail=detail))
                     continue
-    if _DECODE_CACHE_ENABLED and _DECODE_CACHE:
-        for key in [k for k in _DECODE_CACHE if k not in cache_seen]:
-            del _DECODE_CACHE[key]
+    if _DECODE_CACHE_ENABLED:
+        with _DECODE_CACHE_LOCK:
+            for key in [k for k in _DECODE_CACHE if k not in cache_seen]:
+                del _DECODE_CACHE[key]
     return [entries[job_id] for job_id in sorted(entries)]
 
 
