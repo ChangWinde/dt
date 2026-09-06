@@ -9,12 +9,29 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config import ConfigError
-from .dispatch import RunSpec, validate_artifact_targets
+from .dispatch import ARTIFACT_MANIFEST_PREFIX_MIN, RunSpec, validate_artifact_targets
 from .jobs import RESULT_STATES
 
 
 class SubmissionValidationError(ValueError):
     """A user-input error that is safe to expose before loading config."""
+
+
+# `--artifact-manifest` takes the digest `dt sync --artifact` printed, or a
+# unique prefix of it; the prefix is expanded on the head against the manifests
+# it has published or pinned for the project (dispatch.artifacts).
+_ARTIFACT_MANIFEST_REFERENCE_RE = re.compile(
+    rf"[0-9a-f]{{{ARTIFACT_MANIFEST_PREFIX_MIN},64}}"
+)
+ARTIFACT_MANIFEST_REFERENCE_RULE = (
+    "--artifact-manifest must be a lowercase SHA-256 digest or a unique prefix "
+    f"of at least {ARTIFACT_MANIFEST_PREFIX_MIN} hex characters"
+)
+
+
+def artifact_manifest_reference_ok(value: str) -> bool:
+    """Whether a `--artifact-manifest` value is syntactically acceptable."""
+    return _ARTIFACT_MANIFEST_REFERENCE_RE.fullmatch(value) is not None
 
 
 def derive_task_name(command: str) -> str:
@@ -71,13 +88,10 @@ def validate_resources(
         raise SubmissionValidationError(
             "--max-job-memory-mib must be a positive integer"
         )
-    if (
-        artifact_manifest is not None
-        and re.fullmatch(r"[0-9a-f]{64}", artifact_manifest) is None
+    if artifact_manifest is not None and not artifact_manifest_reference_ok(
+        artifact_manifest
     ):
-        raise SubmissionValidationError(
-            "--artifact-manifest must be a lowercase SHA-256 digest"
-        )
+        raise SubmissionValidationError(ARTIFACT_MANIFEST_REFERENCE_RULE)
 
 
 def validate_workflow(

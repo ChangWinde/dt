@@ -803,7 +803,10 @@ def test_fork_cli_rejects_invalid_artifact_manifest_before_config(monkeypatch):
     assert json.loads(result.stdout) == {
         "schema_version": "dt_cli_error_v1",
         "error": "invalid_argument",
-        "message": "--artifact-manifest must be a lowercase SHA-256 digest",
+        "message": (
+            "--artifact-manifest must be a lowercase SHA-256 digest or a unique "
+            "prefix of at least 12 hex characters"
+        ),
         "reasons": {},
         "exit_code": 1,
     }

@@ -21,7 +21,7 @@ import subprocess
 import tempfile
 import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from io import TextIOBase
@@ -40,6 +40,8 @@ REMOTE_DT = "~/.local/bin/dt"
 BULK_TRANSFER_TIMEOUT_S = 4 * 3600
 GENERATED_SSH_CONFIG_MAX_BYTES = 1024 * 1024
 MAX_TRANSFER_RETRIES = 10
+# rsync's MAX_BASIS_DIRS: more --link-dest/--copy-dest baselines are refused.
+MAX_LINK_DESTS = 20
 PRIVATE_RSYNC_CHMOD = "Du=rwx,Dgo=,Fu+rw,Fgo="
 MAX_CAPTURE_BYTES = 16 * 1024 * 1024
 CONTROL_CAPTURE_BYTES = 256 * 1024
@@ -1236,7 +1238,7 @@ def rsync(
     src: str,
     dst: str,
     excludes: list[str] | None = None,
-    link_dest: str | None = None,
+    link_dest: str | Sequence[str] | None = None,
     copy_dest: str | None = None,
     delete: bool = False,
     delete_excluded: bool = False,
@@ -1252,16 +1254,35 @@ def rsync(
     cancel_event: Event | None = None,
     on_retry: Callable[[RsyncRetryEvent], None] | None = None,
     workload: SSHWorkload = SSHWorkload.ARTIFACT,
+    chmod: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """--partial keeps interrupted transfers resumable; with retries > 0 a
     network-ish failure is retried and resumes where it stopped (large
-    checkpoint pulls over flaky links)."""
+    checkpoint pulls over flaky links).
+
+    ``link_dest`` accepts up to :data:`MAX_LINK_DESTS` baseline directories
+    (rsync's own limit); ``chmod`` is an rsync ``--chmod`` spec applied to
+    every transferred entry, exclusive with ``private_destination``.
+    """
     if isinstance(retries, bool) or not 0 <= retries <= MAX_TRANSFER_RETRIES:
         raise ValueError(f"rsync retries must be between 0 and {MAX_TRANSFER_RETRIES}")
     if bwlimit_kbps is not None and (
         isinstance(bwlimit_kbps, bool) or bwlimit_kbps <= 0
     ):
         raise ValueError("rsync bwlimit_kbps must be a positive integer")
+    link_dests = [link_dest] if isinstance(link_dest, str) else list(link_dest or [])
+    if len(link_dests) > MAX_LINK_DESTS:
+        raise ValueError(f"rsync accepts at most {MAX_LINK_DESTS} link_dest baselines")
+    if any(not path or path.startswith("-") for path in link_dests):
+        raise ValueError("rsync link_dest baselines must be non-empty paths")
+    if chmod is not None and (
+        not chmod
+        or chmod.startswith("-")
+        or any(character.isspace() for character in chmod)
+    ):
+        raise ValueError("rsync chmod must be a non-empty --chmod specification")
+    if chmod is not None and private_destination:
+        raise ValueError("rsync accepts only one of chmod or private_destination")
     # --timeout is rsync's own io-stall detector: a NAT link that freezes
     # mid-stream aborts in 60s instead of hanging the dispatcher forever
     # (--partial + retries then resumes where it stopped)
@@ -1303,6 +1324,8 @@ def rsync(
         # make directories traversable by that owner, and strip every
         # group/other permission even when the source came from umask 022.
         cmd.append(f"--chmod={PRIVATE_RSYNC_CHMOD}")
+    if chmod is not None:
+        cmd.append(f"--chmod={chmod}")
     if safe_links:
         # Pull direction materializes trees written by a zero-trust remote;
         # -a would otherwise recreate symlinks pointing outside the
@@ -1316,10 +1339,10 @@ def rsync(
         cmd.append("--delete-excluded")
     for ex in excludes or []:
         cmd += ["--exclude", ex]
-    if link_dest and copy_dest:
+    if link_dests and copy_dest:
         raise ValueError("rsync accepts only one of link_dest or copy_dest")
-    if link_dest:
-        cmd += [f"--link-dest={link_dest}"]
+    for baseline in link_dests:
+        cmd.append(f"--link-dest={baseline}")
     if copy_dest:
         cmd += [f"--copy-dest={copy_dest}"]
     # ``--`` ends option parsing so a src/dst that begins with ``-`` cannot be

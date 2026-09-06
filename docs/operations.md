@@ -300,7 +300,8 @@ Then choose one action:
 | Queued job no longer needed | `dt kill JOB -y` |
 | Running job must stop | `dt kill JOB -y`; add `--force` only after TERM failure is confirmed |
 | Terminal job left processes behind | `dt kill JOB -y --sweep`; signals leftovers, never rewrites the recorded result |
-| Transfer interrupted | Rerun the same `dt pull` command |
+| Transfer interrupted or reported `incomplete_transfer` | Rerun the same `dt pull` command; it resumes and re-verifies every file against the worker's census (`verification` / `logs_verification` in `--json`) |
+| Pull of a running job reports `in_progress` | Expected: the job kept writing; the copy is a point-in-time snapshot, pull again once it finishes |
 | SSH disconnected | Reconnect with `dt watch`, `dt logs -f`, or `dt wait`; do not resubmit blindly |
 | Launch outcome uncertain | Inspect, then use verified `dt kill JOB -y` cleanup before retrying |
 | Submission response lost with `--request-id` | `dt request REQUEST_ID --json`; never blindly resubmit |
@@ -361,13 +362,15 @@ pull with `--bwlimit`.
 
 ### Transfer bandwidth budget
 
-`dt pull --bwlimit KBPS` and `dt sync --bwlimit KBPS` cap the head-side
-transfer legs (rsync `--bwlimit`, KiB/s) so a checkpoint recovery cannot
-starve interactive sessions sharing the head's uplink.
-`sites.<name>.bwlimit_kbps` sets a per-site default; the flag overrides it.
-`uplink_kbps` at the top of the head configuration is the floor under both:
-it reaches every leg that leaves the head, including the dispatcher's own
-code snapshots, which no flag can name. A workstation head on a home line
+`dt pull --bwlimit KBPS`, `dt sync --bwlimit KBPS`, and `dt seed --bwlimit
+KBPS` cap the head-side transfer legs (rsync `--bwlimit`, KiB/s) so a
+checkpoint recovery or a cache seed cannot starve interactive sessions sharing
+the head's uplink. `sites.<name>.bwlimit_kbps` sets a per-site default; the
+flag overrides it. `uplink_kbps` at the top of the head configuration is the
+floor under both: it reaches every leg that leaves the head, including the
+dispatcher's own code snapshots, the cold upload that seeds a site cache under
+`artifact_policy: topology-aware` (and its `fallback_direct` retry), and cache
+seeding — none of which a flag has to name. A workstation head on a home line
 (a 52 Mbit/s uplink is about 6,500 KiB/s) saturates it with one unthrottled
 rsync and stalls its own SSH and remote desktop; `uplink_kbps: 4500` leaves
 room for them. The budget deliberately never throttles intra-site LAN

@@ -188,17 +188,27 @@ def test_sync_artifacts_preserves_relative_file_path(tmp_path, monkeypatch):
         cancel_event=cancel_event,
     )
 
-    assert "mkdir -p dt/artifacts/omni/outputs/run-a" in seen["prepare"][0][2]
-    assert "artifact destination contains symlink" in seen["prepare"][0][2]
-    assert "dt/artifacts/omni/.dt/incoming/" in seen["prepare"][1][2]
-    assert "artifact_verify.py" in seen["prepare"][2][2]
-    assert "mkdir -p dt/artifacts/omni/.dt/manifests" in seen["prepare"][2][2]
+    unlock, check, probe, incoming, verify, lock = [row[2] for row in seen["prepare"]]
+    # The store's own directories are reopened for the publication and locked
+    # again once the manifest is in place; rsync locks the artifacts themselves.
+    assert "chmod u+w dt/artifacts/omni " in unlock
+    assert "chmod u+w dt/artifacts/omni/outputs/run-a " in unlock
+    assert "mkdir -p dt/artifacts/omni/outputs/run-a" in check
+    assert "artifact destination contains symlink" in check
+    assert probe.startswith("sh -c ") and "cd dt/artifacts " in probe
+    assert "dt/artifacts/omni/.dt/incoming/" in incoming
+    assert "artifact_verify.py" in verify
+    assert "mkdir -p dt/artifacts/omni/.dt/manifests" in verify
+    assert "chmod a-w dt/artifacts/omni " in lock
+    assert "chmod a-w dt/artifacts/omni/outputs/run-a " in lock
     artifact_transfer, manifest_transfer = seen["rsync"]
     assert artifact_transfer[0] == str(checkpoint)
     assert artifact_transfer[1] == "n1:dt/artifacts/omni/outputs/run-a/"
     assert artifact_transfer[2]["delete"] is False
     assert artifact_transfer[2]["checksum"] is True
     assert artifact_transfer[2]["retries"] == 2
+    assert artifact_transfer[2]["chmod"] == "a-w"
+    assert artifact_transfer[2]["link_dest"] == []
     assert artifact_transfer[2]["cancel_event"] is cancel_event
     assert "n1:dt/artifacts/omni/.dt/incoming/" in manifest_transfer[1]
     assert manifest_transfer[2]["private_destination"] is True
@@ -211,6 +221,7 @@ def test_sync_artifacts_preserves_relative_file_path(tmp_path, monkeypatch):
     assert result["transferred_gib"] == 7 / 2**30
     assert result["deleted_files"] == 0
     assert result["transferred_files"] == 1
+    assert result["store_locked"] is True
     assert len(result["artifact_manifest_sha256"]) == 64
     assert result["artifact_manifest_path"].endswith(
         f"/{result['artifact_manifest_sha256']}.json"
@@ -220,7 +231,8 @@ def test_sync_artifacts_preserves_relative_file_path(tmp_path, monkeypatch):
             "source": "outputs/run-a/model.pt",
             "path": "~/dt/artifacts/omni/outputs/run-a/model.pt",
             "kind": "file",
-            "mode": stat.S_IMODE(checkpoint.stat().st_mode),
+            # The manifest names the read-only mode the node will hold.
+            "mode": stat.S_IMODE(checkpoint.stat().st_mode) & 0o555,
             "source_bytes": 7,
             "source_sha256": hashlib.sha256(b"weights").hexdigest(),
             "transferred_bytes": 7,
@@ -228,6 +240,246 @@ def test_sync_artifacts_preserves_relative_file_path(tmp_path, monkeypatch):
             "transferred_files": 1,
         }
     ]
+
+
+@pytest.mark.real_transport
+def test_sync_artifacts_publishes_a_read_only_store_and_hardlinks_sibling_content(
+    tmp_path, monkeypatch
+):
+    """Two field reports, one mechanism.
+
+    A job's ``ln -s "$DT_ARTIFACT_ROOT/<rel>" <rel>`` wrote a symlink into the
+    worker's artifact store and every later job of the project failed
+    ``artifact integrity failed``: the store must be read-only to jobs. And
+    three projects with one code path each shipped the same 7.9 GB to one
+    node (24 minutes for the third) although identical bytes sat one
+    directory over: identical content is hard-linked from a sibling store.
+    The hard links are only safe because of the lock, so both are verified
+    here through the real rsync and the real verifier on a local node.
+    """
+    import os
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    cfg = _cfg(tmp_path)
+    node = Node(name="local", local=True)
+    project = tmp_path / "project"
+    (project / "data" / "sub").mkdir(parents=True)
+    (project / "data" / "big.bin").write_bytes(b"identical" * 4096)
+    (project / "data" / "sub" / "small.bin").write_bytes(b"s" * 128)
+    (project / "data" / "sub" / "small.bin").chmod(0o755)
+    (project / "model.pt").write_bytes(b"weights")
+    messages: list[str] = []
+
+    alpha = dispatch.sync_artifacts(
+        cfg, "alpha", project, node, ["data", "model.pt"], messages.append
+    )
+
+    store = home / "dt" / "artifacts" / "alpha"
+    assert alpha["store_locked"] is True
+    assert stat.S_IMODE(store.stat().st_mode) == 0o555
+    assert stat.S_IMODE((store / "data").stat().st_mode) == 0o555
+    assert stat.S_IMODE((store / "data" / "sub").stat().st_mode) == 0o555
+    assert stat.S_IMODE((store / "data" / "big.bin").stat().st_mode) == 0o444
+    assert stat.S_IMODE((store / "data" / "sub" / "small.bin").stat().st_mode) == 0o555
+    assert stat.S_IMODE((store / "model.pt").stat().st_mode) == 0o444
+    # dt's own bookkeeping stays private and reachable for the next publish.
+    assert stat.S_IMODE((store / ".dt").stat().st_mode) == 0o700
+    manifest_path = (
+        store / ".dt" / "manifests" / f"{alpha['artifact_manifest_sha256']}.json"
+    )
+    manifest = json.loads(manifest_path.read_bytes())
+    assert manifest["schema_version"] == "dt_artifact_manifest_v2"
+    assert {row["mode"] for row in manifest["artifacts"]} == {0o555, 0o444}
+    if os.geteuid() != 0:
+        # The field symptom, replayed against the published store.
+        with pytest.raises(PermissionError):
+            (store / "data" / "stray").symlink_to("big.bin")
+        with pytest.raises(PermissionError):
+            (store / "data" / "big.bin").open("ab")
+        with pytest.raises(PermissionError):
+            (store / "extra").write_text("x")
+
+    beta = dispatch.sync_artifacts(
+        cfg, "beta", project, node, ["data", "model.pt"], messages.append
+    )
+
+    sibling = home / "dt" / "artifacts" / "beta"
+    assert beta["transferred_bytes"] == 0
+    assert beta["store_locked"] is True
+    for relative in ("data/big.bin", "data/sub/small.bin", "model.pt"):
+        original = (store / relative).stat()
+        linked = (sibling / relative).stat()
+        assert (original.st_dev, original.st_ino) == (linked.st_dev, linked.st_ino)
+        assert linked.st_nlink == 2
+    assert [row["reused_from"] for row in beta["artifacts"]] == [["alpha"], ["alpha"]]
+    assert any(
+        "reusing identical files already on local from alpha" in m for m in messages
+    )
+    assert (
+        sibling / ".dt" / "manifests" / f"{beta['artifact_manifest_sha256']}.json"
+    ).is_file()
+
+    # Republishing beta with changed content must never write through the
+    # shared inode into alpha's store.
+    (project / "data" / "big.bin").write_bytes(b"changed" * 4096)
+    beta_v2 = dispatch.sync_artifacts(
+        cfg, "beta", project, node, ["data", "model.pt"], messages.append
+    )
+    assert beta_v2["artifact_manifest_sha256"] != beta["artifact_manifest_sha256"]
+    assert (sibling / "data" / "big.bin").read_bytes() == b"changed" * 4096
+    assert (store / "data" / "big.bin").read_bytes() == b"identical" * 4096
+    assert (sibling / "data" / "big.bin").stat().st_nlink == 1
+    assert (sibling / "model.pt").stat().st_nlink == 2
+    from dt.payload import artifact_verify
+
+    assert (
+        artifact_verify.verify(store, manifest_path, alpha["artifact_manifest_sha256"])[
+            "artifacts"
+        ]
+        == 2
+    )
+
+    # The head remembers every verified publication, so a unique prefix of the
+    # digest `dt sync` printed resolves for `--artifact-manifest`.
+    digests = {row["manifest_sha256"] for row in dispatch.artifact_publications(cfg)}
+    assert digests == {
+        alpha["artifact_manifest_sha256"],
+        beta["artifact_manifest_sha256"],
+        beta_v2["artifact_manifest_sha256"],
+    }
+    prefix = alpha["artifact_manifest_sha256"][:12]
+    assert (
+        dispatch.resolve_artifact_manifest_reference(cfg, "alpha", prefix)
+        == alpha["artifact_manifest_sha256"]
+    )
+
+
+def test_link_dest_probe_ranks_exact_digest_stores_first_through_a_real_shell(
+    tmp_path, monkeypatch
+):
+    """The node-side probe is plain sh: it must skip the project's own store,
+    symlinked entries, stores that never published, and stores that lack the
+    path; rank a store whose manifest carries the digest first; and survive an
+    empty or missing store parent under zsh as well as sh."""
+    import os
+    import shutil
+
+    home = tmp_path / "home"
+    stores = home / "dt" / "artifacts"
+    digest = "f" * 64
+    for name in ("ratimage", "ratimage_b", "ratimage_c"):
+        (stores / name / "data" / "il_demos").mkdir(parents=True)
+    for name in ("ratimage", "ratimage_b"):
+        (stores / name / ".dt" / "manifests").mkdir(parents=True)
+    (stores / "ratimage" / ".dt" / "manifests" / "m.json").write_text(
+        json.dumps({"artifacts": [{"path": "data/il_demos", "sha256": digest}]})
+    )
+    (stores / "unpublished" / "data" / "il_demos").mkdir(parents=True)
+    (stores / "alias").symlink_to("ratimage")
+    (stores / "other" / ".dt" / "manifests").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+    command = dispatch.link_dest_probe_command(
+        "dt/artifacts", "ratimage_c", "data/il_demos", is_dir=True, digest=digest
+    )
+    proc = sshio.run_local(command, timeout=10)
+
+    assert proc.returncode == 0, proc.stderr
+    assert dispatch.parse_link_dest_probe(proc.stdout) == ["ratimage", "ratimage_b"]
+    assert dispatch.link_dest_paths(
+        ["ratimage", "ratimage_b"],
+        parent_rel="dt/artifacts",
+        destination_dir_rel="dt/artifacts/ratimage_c/data/il_demos",
+        directory_rel="data/il_demos",
+    ) == ["../../../ratimage/data/il_demos", "../../../ratimage_b/data/il_demos"]
+
+    # A file artifact links from the sibling's copy of its parent directory.
+    (stores / "ratimage" / "model.pt").write_bytes(b"w")
+    single = sshio.run_local(
+        dispatch.link_dest_probe_command(
+            "dt/artifacts", "ratimage_c", "model.pt", is_dir=False, digest="a" * 64
+        ),
+        timeout=10,
+    )
+    assert dispatch.parse_link_dest_probe(single.stdout) == ["ratimage"]
+    assert dispatch.link_dest_paths(
+        ["ratimage"],
+        parent_rel="dt/artifacts",
+        destination_dir_rel="dt/artifacts/ratimage_c",
+        directory_rel="",
+    ) == ["../ratimage"]
+
+    empty = sshio.run_local(
+        dispatch.link_dest_probe_command(
+            "dt/nowhere", "x", "f", is_dir=False, digest="a" * 64
+        ),
+        timeout=10,
+    )
+    assert (empty.returncode, empty.stdout) == (0, "")
+    if shutil.which("zsh"):
+        under_zsh = subprocess.run(
+            ["zsh", "-c", command],
+            cwd=home,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "HOME": str(home)},
+        )
+        assert under_zsh.returncode == 0, under_zsh.stderr
+        assert dispatch.parse_link_dest_probe(under_zsh.stdout) == [
+            "ratimage",
+            "ratimage_b",
+        ]
+
+    # Garbage rows never become baselines.
+    assert dispatch.parse_link_dest_probe(
+        "0 ../escape\n2 late\nnope\n1 ok.store\n"
+    ) == ["ok.store"]
+
+
+def test_artifact_store_permission_command_locks_only_the_stores_own_directories(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    store = home / "dt" / "artifacts" / "omni"
+    (store / "models" / "victim" / "seed1").mkdir(parents=True)
+    (store / "models" / "victim" / "seed1" / "w.pt").write_bytes(b"w")
+    (store / ".dt" / "manifests").mkdir(parents=True)
+    (store / ".dt").chmod(0o700)
+    (home / "dt" / "artifacts" / "linked").symlink_to("omni")
+    monkeypatch.setenv("HOME", str(home))
+    relatives = ["models/victim/seed1", "data.bin"]
+
+    lock = dispatch.artifact_store_permission_command(
+        "dt/artifacts/omni", relatives, lock=True
+    )
+    assert sshio.run_local(lock, timeout=10).returncode == 0
+    assert stat.S_IMODE(store.stat().st_mode) == 0o555
+    assert stat.S_IMODE((store / "models").stat().st_mode) == 0o555
+    assert stat.S_IMODE((store / "models" / "victim").stat().st_mode) == 0o555
+    # The artifact itself and dt's private control directory are rsync's and
+    # dt's business respectively; the lock never descends into them.
+    assert stat.S_IMODE((store / "models" / "victim" / "seed1").stat().st_mode) == 0o755
+    assert stat.S_IMODE((store / ".dt").stat().st_mode) == 0o700
+
+    unlock = dispatch.artifact_store_permission_command(
+        "dt/artifacts/omni", relatives, lock=False
+    )
+    assert sshio.run_local(unlock, timeout=10).returncode == 0
+    assert stat.S_IMODE(store.stat().st_mode) == 0o755
+    assert stat.S_IMODE((store / "models" / "victim").stat().st_mode) == 0o755
+
+    # A symlinked store is left alone, an absent one is not an error.
+    via_link = dispatch.artifact_store_permission_command(
+        "dt/artifacts/linked", ["data.bin"], lock=True
+    )
+    assert sshio.run_local(via_link, timeout=10).returncode == 0
+    assert stat.S_IMODE(store.stat().st_mode) == 0o755
+    absent = dispatch.artifact_store_permission_command(
+        "dt/artifacts/none", ["data.bin"], lock=True
+    )
+    assert sshio.run_local(absent, timeout=10).returncode == 0
 
 
 def test_sync_artifacts_publication_wakes_the_agent_for_blocked_jobs(

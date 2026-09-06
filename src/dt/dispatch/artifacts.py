@@ -11,6 +11,7 @@ from typing import Callable
 import hashlib
 import json
 import os
+import posixpath
 import re
 import shlex
 import stat
@@ -20,6 +21,7 @@ import time
 import uuid
 
 from .. import dispatch as _root
+from .. import jobs as jobs_mod
 from .. import sync_relay
 from ..config import HeadConfig, Node, head_bwlimit_kbps
 from ..jobs import AGENT_WAKE_ARTIFACTS_REPUBLISHED, request_agent_wake, sanitize_name
@@ -29,7 +31,13 @@ from ..layout import (
     node_path_expression,
     rsync_destination,
 )
-from ..private_state import private_lock
+from ..private_state import (
+    PrivateStateError,
+    atomic_write_regular,
+    decode_strict_json,
+    private_lock,
+    read_bounded_regular,
+)
 from ..pull_relay import RelayRoute
 from ..sshio import (
     BULK_TRANSFER_TIMEOUT_S,
@@ -51,6 +59,30 @@ from . import (
     transferred_files,
     transferred_gib,
 )
+
+
+# Artifact stores are published read-only (ADR: a job that wrote through its
+# workspace link, or a stray `ln -s` inside a directory artifact, made every
+# later job of the project fail artifact verification). rsync applies the lock
+# while it writes, so unchanged files are never left writable and files shared
+# with another project's store by hard link never carry a write bit.
+ARTIFACT_MANIFEST_SCHEMA = "dt_artifact_manifest_v2"
+ARTIFACT_LOCK_CHMOD = "a-w"
+# Sibling artifact stores rsync may hard-link identical content from. Each
+# extra baseline costs the node a checksum read for every same-size file the
+# earlier baselines did not match, so the probe ranks exact-digest matches
+# first and the list stays short.
+ARTIFACT_LINK_DEST_LIMIT = 4
+ARTIFACT_LINK_DEST_PROBE_TIMEOUT_S = 20
+_ARTIFACT_STORE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+# Head-side memory of every verified publication: which manifests exist on
+# which node, so `--artifact-manifest` can resolve a unique digest prefix.
+ARTIFACT_PUBLICATIONS_SCHEMA = "dt_artifact_publications_v1"
+ARTIFACT_PUBLICATIONS_LIMIT = 2000
+ARTIFACT_PUBLICATIONS_MAX_BYTES = 8 * 1024 * 1024
+ARTIFACT_MANIFEST_PREFIX_MIN = 12
+_MANIFEST_DIGEST_RE = re.compile(r"[0-9a-f]{64}")
+_MANIFEST_PREFIX_RE = re.compile(rf"[0-9a-f]{{{ARTIFACT_MANIFEST_PREFIX_MIN},63}}")
 
 
 def sync_cache_rel(
@@ -110,7 +142,9 @@ def _file_sha256(path: Path) -> str:
 
 def _artifact_identity(source: Path, is_dir: bool) -> tuple[int, int, str]:
     metadata = source.lstat()
-    mode = stat.S_IMODE(metadata.st_mode)
+    # The node holds the store read-only, so the identity records the mode the
+    # node will show and directory digests ignore write bits on both ends.
+    mode = stat.S_IMODE(metadata.st_mode) & _root.ARTIFACT_MODE_MASK
     if not is_dir:
         return mode, metadata.st_size, _file_sha256(source)
 
@@ -127,7 +161,7 @@ def _artifact_identity(source: Path, is_dir: bool) -> tuple[int, int, str]:
             raise DispatchError(
                 f"artifact directory contains a special file: {child.as_posix()!r}"
             )
-    return mode, source_bytes, _root.tree_sha256(source)
+    return mode, source_bytes, _root.artifact_tree_sha256(source)
 
 
 def _is_common_artifact_transient(path: Path) -> bool:
@@ -250,7 +284,7 @@ def _artifact_manifest(
     sources: list[tuple[str, Path, bool, int, int, str]],
 ) -> tuple[bytes, str]:
     payload = {
-        "schema_version": "dt_artifact_manifest_v1",
+        "schema_version": ARTIFACT_MANIFEST_SCHEMA,
         "project": project_name,
         "artifacts": sorted(
             (
@@ -330,6 +364,460 @@ def _artifact_remote_check(
     )
 
 
+def artifact_directory_rel(relative: str, is_dir: bool) -> str:
+    """The store-relative directory rsync writes an artifact into ('' = root)."""
+    if is_dir:
+        return relative
+    parent = PurePosixPath(relative).parent
+    return "" if str(parent) == "." else parent.as_posix()
+
+
+def _artifact_lock_targets(root_rel: str, relatives: list[str]) -> list[str]:
+    """The store root and every directory between it and an artifact.
+
+    The artifacts themselves are locked by rsync (``--chmod``); these are the
+    directories dt creates around them, shallowest first.
+    """
+    targets = {root_rel}
+    for relative in relatives:
+        parts = PurePosixPath(relative).parts[:-1]
+        for depth in range(1, len(parts) + 1):
+            targets.add(f"{root_rel}/{'/'.join(parts[:depth])}")
+    return sorted(targets, key=lambda path: (len(PurePosixPath(path).parts), path))
+
+
+def artifact_store_permission_command(
+    root_rel: str,
+    relatives: list[str],
+    *,
+    lock: bool,
+) -> str:
+    """Lock (``a-w``) or reopen (``u+w``) the store's own directories.
+
+    Only directories that exist are touched, and a symlinked one is left
+    alone; rsync and the manifest publication need the root and the artifact
+    parents writable while they run, and every job afterwards must find them
+    read-only.
+    """
+    mode = ARTIFACT_LOCK_CHMOD if lock else "u+w"
+    steps = []
+    for target in _artifact_lock_targets(root_rel, relatives):
+        expr = node_path_expression(target)
+        steps.append(
+            f"if [ -d {expr} ] && [ ! -L {expr} ]; then chmod {mode} {expr} || exit 74; fi"
+        )
+    return "; ".join(steps)
+
+
+def _set_artifact_store_lock(
+    node: Node,
+    root_rel: str,
+    relatives: list[str],
+    *,
+    lock: bool,
+) -> None:
+    """Apply or lift the read-only guard on the store's own directories."""
+    action = "lock" if lock else "unlock"
+    changed = _root.run_on(
+        node.name,
+        node.local,
+        artifact_store_permission_command(root_rel, relatives, lock=lock),
+        timeout=15,
+    )
+    if changed.returncode == 0:
+        return
+    detail = diagnostic_excerpt(
+        changed.stderr,
+        changed.stdout,
+        fallback=f"chmod exited {changed.returncode}",
+    )
+    if changed.returncode == 255:
+        raise RemoteError(
+            node.name,
+            f"artifact store {action} failed: {detail}",
+            changed.returncode,
+        )
+    raise DispatchError(f"artifact store {action} on {node.name} failed: {detail}")
+
+
+def _relock_artifact_store_after_failure(
+    node: Node,
+    root_rel: str,
+    relatives: list[str],
+    locked: Callable[[], bool | None],
+    log: Callable[[str], None],
+) -> None:
+    """Best-effort relock when a sync unwinds before its own lock step ran.
+
+    A transfer that failed halfway must not leave the store writable to jobs
+    until the operator reruns the sync; an unreachable node is simply logged.
+    """
+    if locked() is not None:
+        return
+    try:
+        _set_artifact_store_lock(node, root_rel, relatives, lock=True)
+    except (RemoteError, DispatchError) as exc:
+        log(f"warning: artifact store left writable after the failed sync: {exc}")
+
+
+def link_dest_probe_command(
+    parent_rel: str,
+    self_name: str,
+    relative: str,
+    *,
+    is_dir: bool,
+    digest: str,
+    root_suffix: str = "",
+    manifests_subdir: str | None = ".dt/manifests",
+    limit: int = ARTIFACT_LINK_DEST_LIMIT,
+) -> str:
+    """List sibling stores below ``parent_rel`` that hold this artifact's path.
+
+    Field case: three projects with the same code path published the same
+    7.9 GB of inputs to one node, and each first sync re-sent every byte
+    although identical files already sat one directory over. rsync can hard
+    link from a baseline instead of transferring, so the probe names sibling
+    stores whose copy of ``relative`` exists with the right kind. A store
+    whose published manifests carry the exact digest ranks first (``0``);
+    path-only matches rank ``1``. Output rows are ``rank name``.
+    """
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ValueError("link-dest probe needs a full artifact digest")
+    if limit < 1:
+        raise ValueError("link-dest probe limit must be positive")
+    kind = "-d" if is_dir else "-f"
+    if manifests_subdir is None:
+        published = ""
+        ranked = "rank=1; "
+    else:
+        manifests = shlex.quote(manifests_subdir)
+        published = f'[ -d "$store"/{manifests} ] || continue; '
+        ranked = (
+            f'if grep -qsF -- {shlex.quote(digest)} "$store"/{manifests}/*.json '
+            "2>/dev/null; then rank=0; else rank=1; fi; "
+        )
+    script = (
+        f"cd {node_path_expression(parent_rel)} 2>/dev/null || exit 0; "
+        'for name in *; do [ -d "$name" ] && [ ! -L "$name" ] || continue; '
+        f'[ "$name" != {shlex.quote(self_name)} ] || continue; '
+        f'store="$name"{shlex.quote(root_suffix) if root_suffix else ""}; '
+        f"{published}"
+        f'candidate="$store"/{shlex.quote(relative)}; '
+        f'[ {kind} "$candidate" ] && [ ! -L "$candidate" ] || continue; '
+        f"{ranked}"
+        'printf \'%s %s\\n\' "$rank" "$name"; done '
+        f"| LC_ALL=C sort | head -n {limit}"
+    )
+    # POSIX sh leaves an unmatched glob literal; the operator's login shell
+    # (zsh) would abort the loop on an empty store parent instead.
+    return f"sh -c {shlex.quote(script)}"
+
+
+def parse_link_dest_probe(
+    stdout: str, *, limit: int = ARTIFACT_LINK_DEST_LIMIT
+) -> list[str]:
+    """Decode probe rows into ordered sibling store names (best first)."""
+    ranked: list[tuple[int, str]] = []
+    for line in (stdout or "").splitlines():
+        rank_text, separator, name = line.strip().partition(" ")
+        if (
+            not separator
+            or rank_text not in {"0", "1"}
+            or _ARTIFACT_STORE_NAME_RE.fullmatch(name) is None
+        ):
+            continue
+        ranked.append((int(rank_text), name))
+    ordered: list[str] = []
+    for _rank, name in sorted(ranked):
+        if name not in ordered:
+            ordered.append(name)
+    return ordered[:limit]
+
+
+def link_dest_paths(
+    names: list[str],
+    *,
+    parent_rel: str,
+    destination_dir_rel: str,
+    directory_rel: str,
+    root_suffix: str = "",
+) -> list[str]:
+    """Render ``--link-dest`` baselines relative to the receiving directory.
+
+    rsync resolves a relative baseline against the destination directory on
+    the receiving side, so the same string is correct for a local node, an
+    SSH destination, and a LAN replay executed on the gateway.
+    """
+    baselines: list[str] = []
+    for name in names:
+        candidate = f"{parent_rel}/{name}{root_suffix}"
+        if directory_rel:
+            candidate = f"{candidate}/{directory_rel}"
+        baselines.append(posixpath.relpath(candidate, destination_dir_rel))
+    return baselines
+
+
+def _artifact_link_dests(
+    node: Node,
+    root_rel: str,
+    *,
+    relative: str,
+    is_dir: bool,
+    digest: str,
+    log: Callable[[str], None],
+) -> tuple[list[str], list[str]]:
+    """Ask the node which sibling stores can serve as hard-link baselines.
+
+    Returns ``(store names, --link-dest baselines)``; a probe that fails for
+    any reason yields nothing, because dedup is an optimisation and the plain
+    transfer is always correct.
+    """
+    root = PurePosixPath(root_rel)
+    parent_rel = root.parent.as_posix()
+    directory_rel = artifact_directory_rel(relative, is_dir)
+    destination_dir_rel = f"{root_rel}/{directory_rel}" if directory_rel else root_rel
+    command = link_dest_probe_command(
+        parent_rel,
+        root.name,
+        relative,
+        is_dir=is_dir,
+        digest=digest,
+    )
+    try:
+        probed = _root.run_on(
+            node.name,
+            node.local,
+            command,
+            timeout=ARTIFACT_LINK_DEST_PROBE_TIMEOUT_S,
+        )
+    except (RemoteError, subprocess.TimeoutExpired, OSError) as exc:
+        log(f"sibling store probe skipped: {type(exc).__name__}")
+        return [], []
+    if probed.returncode != 0:
+        log(
+            "sibling store probe skipped: "
+            + diagnostic_excerpt(
+                probed.stderr,
+                probed.stdout,
+                fallback=f"probe exited {probed.returncode}",
+                limit=256,
+            )
+        )
+        return [], []
+    names = parse_link_dest_probe(probed.stdout)
+    if not names:
+        return [], []
+    log(
+        f"reusing identical files already on {node.name} from "
+        f"{', '.join(names)} where content matches"
+    )
+    return names, link_dest_paths(
+        names,
+        parent_rel=parent_rel,
+        destination_dir_rel=destination_dir_rel,
+        directory_rel=directory_rel,
+    )
+
+
+def _mirror_link_dests(
+    route: RelayRoute,
+    project_name: str,
+    *,
+    relative: str,
+    is_dir: bool,
+    digest: str,
+    cancel_event: Event | None,
+    log: Callable[[str], None],
+) -> list[str]:
+    """Sibling gateway mirrors that can seed the head -> gateway staging leg.
+
+    The WAN leg is the expensive one when a sync is relayed, so the same
+    identical-content reuse applies to the gateway's project mirrors.
+    """
+    parent_rel = sync_relay.SYNC_STAGING_REL
+    self_name = sanitize_name(project_name)
+    directory_rel = artifact_directory_rel(relative, is_dir)
+    mirror_rel = sync_relay.artifact_mirror_relative(project_name)
+    destination_dir_rel = (
+        f"{mirror_rel}/{directory_rel}" if directory_rel else mirror_rel
+    )
+    command = link_dest_probe_command(
+        parent_rel,
+        self_name,
+        relative,
+        is_dir=is_dir,
+        digest=digest,
+        root_suffix="/artifacts",
+        manifests_subdir=None,
+    )
+    try:
+        probed = sync_relay.run_gateway_probe(
+            route,
+            command,
+            timeout=ARTIFACT_LINK_DEST_PROBE_TIMEOUT_S,
+            cancel_event=cancel_event,
+        )
+    except sync_relay.RelayError as exc:
+        log(f"gateway mirror probe skipped: {exc}")
+        return []
+    names = parse_link_dest_probe(probed.stdout)
+    if not names:
+        return []
+    gateway = route.gateway.name if route.gateway is not None else "gateway"
+    log(
+        f"staging reuses identical files already mirrored on {gateway} from {', '.join(names)}"
+    )
+    return link_dest_paths(
+        names,
+        parent_rel=parent_rel,
+        destination_dir_rel=destination_dir_rel,
+        directory_rel=directory_rel,
+        root_suffix="/artifacts",
+    )
+
+
+def _artifact_publications_path(cfg: HeadConfig) -> Path:
+    return cfg.control_state_dir() / "artifact-publications.json"
+
+
+def artifact_publications(cfg: HeadConfig) -> list[dict[str, object]]:
+    """Verified publications this head performed, oldest first."""
+    path = _artifact_publications_path(cfg)
+    try:
+        loaded = read_bounded_regular(path, max_bytes=ARTIFACT_PUBLICATIONS_MAX_BYTES)
+    except PrivateStateError:
+        return []
+    if loaded is None:
+        return []
+    try:
+        payload = decode_strict_json(loaded[0])
+    except (ValueError, TypeError, RecursionError, UnicodeError):
+        return []
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != ARTIFACT_PUBLICATIONS_SCHEMA
+        or not isinstance(payload.get("publications"), list)
+    ):
+        return []
+    rows: list[dict[str, object]] = []
+    for row in payload["publications"]:
+        if (
+            isinstance(row, dict)
+            and isinstance(row.get("project"), str)
+            and isinstance(row.get("node"), str)
+            and isinstance(row.get("manifest_sha256"), str)
+            and _MANIFEST_DIGEST_RE.fullmatch(row["manifest_sha256"]) is not None
+        ):
+            rows.append(row)
+    return rows
+
+
+def record_artifact_publication(
+    cfg: HeadConfig,
+    *,
+    project_name: str,
+    node_name: str,
+    manifest_sha256: str,
+    artifacts: list[str],
+) -> str | None:
+    """Remember one verified publication; returns a reason when it could not.
+
+    Memory only: the node's own manifest directory stays the authority, so a
+    journal failure never fails the sync that produced it.
+    """
+    lock_path = cfg.state_dir() / "artifact-publications.lock"
+    try:
+        with private_lock(lock_path):
+            rows = [
+                row
+                for row in artifact_publications(cfg)
+                if not (
+                    row["project"] == project_name
+                    and row["node"] == node_name
+                    and row["manifest_sha256"] == manifest_sha256
+                )
+            ]
+            rows.append(
+                {
+                    "project": project_name,
+                    "node": node_name,
+                    "manifest_sha256": manifest_sha256,
+                    "artifacts": list(artifacts),
+                    "published_at": time.time(),
+                }
+            )
+            payload = {
+                "schema_version": ARTIFACT_PUBLICATIONS_SCHEMA,
+                "publications": rows[-ARTIFACT_PUBLICATIONS_LIMIT:],
+            }
+            atomic_write_regular(
+                _artifact_publications_path(cfg),
+                (json.dumps(payload, sort_keys=True, indent=1) + "\n").encode(),
+            )
+    except (OSError, PrivateStateError) as exc:
+        return type(exc).__name__
+    return None
+
+
+def known_artifact_manifests(cfg: HeadConfig, project_name: str) -> set[str]:
+    """Every manifest digest this head has published or pinned for a project."""
+    digests = {
+        str(row["manifest_sha256"])
+        for row in artifact_publications(cfg)
+        if row["project"] == project_name
+    }
+    for entry in jobs_mod.list_all(cfg):
+        if (
+            entry.project == project_name
+            and entry.artifact_manifest is not None
+            and _MANIFEST_DIGEST_RE.fullmatch(entry.artifact_manifest) is not None
+        ):
+            digests.add(entry.artifact_manifest)
+    return digests
+
+
+def resolve_artifact_manifest_reference(
+    cfg: HeadConfig,
+    project_name: str,
+    reference: str,
+) -> str:
+    """Expand a unique digest prefix into the full published manifest digest.
+
+    A full 64-character digest passes through untouched. A shorter reference
+    must be lowercase hex of at least ``ARTIFACT_MANIFEST_PREFIX_MIN``
+    characters and match exactly one manifest this head knows for the project
+    (its publication journal and every job that pinned one); ambiguity or an
+    unknown prefix is a ``DispatchError`` that lists the candidates.
+    """
+    if _MANIFEST_DIGEST_RE.fullmatch(reference) is not None:
+        return reference
+    if _MANIFEST_PREFIX_RE.fullmatch(reference) is None:
+        raise DispatchError(
+            "--artifact-manifest must be a lowercase SHA-256 digest or a unique "
+            f"prefix of at least {ARTIFACT_MANIFEST_PREFIX_MIN} hex characters"
+        )
+    matches = sorted(
+        digest
+        for digest in known_artifact_manifests(cfg, project_name)
+        if digest.startswith(reference)
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise DispatchError(
+            f"no artifact manifest known to this head for project {project_name!r} "
+            f"starts with {reference!r}; pass the full digest printed by "
+            "`dt sync <node> --artifact ...`"
+        )
+    shown = ", ".join(matches[:8])
+    if len(matches) > 8:
+        shown += f", +{len(matches) - 8} more"
+    raise DispatchError(
+        f"artifact manifest prefix {reference!r} is ambiguous for project "
+        f"{project_name!r}; candidates: {shown}"
+    )
+
+
 def _publish_verified_artifact_manifest(
     node: Node,
     root_rel: str,
@@ -354,6 +842,7 @@ def _publish_verified_artifact_manifest(
     incoming_manifest_rel = f"{incoming_rel}/{manifest_sha256}.json"
     manifest_rel = f"{root_rel}/.dt/manifests"
     manifest_path = f"{manifest_rel}/{manifest_sha256}.json"
+    control_rel = f"{root_rel}/.dt"
     prepared = _root.run_on(
         node.name,
         node.local,
@@ -363,7 +852,8 @@ def _publish_verified_artifact_manifest(
             is_dir=False,
             prepare=True,
         )
-        + f"; chmod 700 {node_path_expression(incoming_rel)}",
+        + f"; chmod 700 {node_path_expression(control_rel)} "
+        f"{node_path_expression(incoming_rel)}",
         timeout=15,
     )
     if prepared.returncode != 0:
@@ -438,6 +928,7 @@ def _publish_verified_artifact_manifest(
         f"--manifest {node_path_expression(incoming_manifest_rel)} "
         f"--expected-sha256 {shlex.quote(manifest_sha256)}; "
         f"{publish_guard}; "
+        f"chmod 700 {node_path_expression(manifest_rel)}; "
         f"mv -f -- {node_path_expression(incoming_manifest_rel)} "
         f"{node_path_expression(manifest_path)}",
         timeout=300,
@@ -588,10 +1079,10 @@ def _sync_project_locked(
             timeout=15,
         )
         if probed.returncode not in (0, 1):
-            detail = (
-                probed.stderr.strip()
-                or probed.stdout.strip()
-                or f"test exited {probed.returncode}"
+            detail = diagnostic_excerpt(
+                probed.stderr,
+                probed.stdout,
+                fallback=f"test exited {probed.returncode}",
             )
             if probed.returncode == 255:
                 raise RemoteError(
@@ -624,10 +1115,10 @@ def _sync_project_locked(
             timeout=15,
         )
         if prepared.returncode != 0:
-            detail = (
-                prepared.stderr.strip()
-                or prepared.stdout.strip()
-                or f"mkdir exited {prepared.returncode}"
+            detail = diagnostic_excerpt(
+                prepared.stderr,
+                prepared.stdout,
+                fallback=f"mkdir exited {prepared.returncode}",
             )
             if prepared.returncode == 255:
                 raise RemoteError(
@@ -729,7 +1220,10 @@ def _sync_project_locked(
             cancel_event=cancel_event,
         )
     if proc.returncode != 0:
-        detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
+        detail = diagnostic_excerpt(
+            proc.stderr,
+            fallback=f"rsync exited {proc.returncode}",
+        )
         if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
             raise RemoteError(
                 node.name,
@@ -834,10 +1328,10 @@ def _sync_one_artifact(
     if plan and checked.returncode in (0, 1):
         parent_present = checked.returncode == 0
     elif checked.returncode != 0:
-        detail = (
-            checked.stderr.strip()
-            or checked.stdout.strip()
-            or f"remote preparation exited {checked.returncode}"
+        detail = diagnostic_excerpt(
+            checked.stderr,
+            checked.stdout,
+            fallback=f"remote preparation exited {checked.returncode}",
         )
         if checked.returncode == 255:
             raise RemoteError(
@@ -868,6 +1362,20 @@ def _sync_one_artifact(
             directory=True,
         )
     source_arg = f"{source}/" if is_dir else str(source)
+    # Identical content already in a sibling project's store on this node is
+    # hard-linked into place instead of crossing the WAN again (the preview
+    # destination of a plan without a parent has no siblings to ask for).
+    reused_from: list[str] = []
+    link_dests: list[str] = []
+    if not (plan and not parent_present):
+        reused_from, link_dests = _artifact_link_dests(
+            node,
+            root_rel,
+            relative=relative,
+            is_dir=is_dir,
+            digest=source_sha256,
+            log=log,
+        )
     proc = None
     if relaying and relay_route is not None and relay_route.gateway is not None:
         # Leg A stages into the mirror's copy of this artifact's
@@ -878,6 +1386,15 @@ def _sync_one_artifact(
         if not is_dir:
             staged_parent = str(PurePosixPath(staged_parent).parent)
         try:
+            mirror_link_dests = _mirror_link_dests(
+                relay_route,
+                project_name,
+                relative=relative,
+                is_dir=is_dir,
+                digest=source_sha256,
+                cancel_event=cancel_event,
+                log=log,
+            )
             leg_a = _root.rsync(
                 source_arg,
                 rsync_destination(
@@ -886,6 +1403,7 @@ def _sync_one_artifact(
                     staged_parent,
                     directory=True,
                 ),
+                link_dest=mirror_link_dests,
                 delete=is_dir,
                 timeout=BULK_TRANSFER_TIMEOUT_S,
                 retries=retries,
@@ -911,6 +1429,7 @@ def _sync_one_artifact(
                 relative,
                 target_rel if is_dir else parent_rel,
                 is_dir=is_dir,
+                link_dests=link_dests,
                 cancel_event=cancel_event,
             )
             relayed = True
@@ -926,6 +1445,7 @@ def _sync_one_artifact(
         proc = _root.rsync(
             source_arg,
             destination,
+            link_dest=link_dests,
             delete=is_dir,
             timeout=BULK_TRANSFER_TIMEOUT_S,
             retries=retries,
@@ -934,10 +1454,14 @@ def _sync_one_artifact(
             stats=True,
             checksum=True,
             dry_run=plan,
+            chmod=ARTIFACT_LOCK_CHMOD,
             cancel_event=cancel_event,
         )
     if proc.returncode != 0:
-        detail = proc.stderr.strip() or f"rsync exited {proc.returncode}"
+        detail = diagnostic_excerpt(
+            proc.stderr,
+            fallback=f"rsync exited {proc.returncode}",
+        )
         if proc.returncode in RSYNC_UNREACHABLE_EXIT_CODES:
             raise RemoteError(
                 node.name,
@@ -963,6 +1487,8 @@ def _sync_one_artifact(
     }
     if files is not None:
         row["transferred_files"] = files
+    if reused_from:
+        row["reused_from"] = reused_from
     if plan:
         row["destination_parent_present"] = parent_present
     log(
@@ -1055,6 +1581,8 @@ def sync_artifacts(
     )
     relayed_any = False
 
+    relatives = [relative for relative, *_rest in sources]
+    store_locked: bool | None = None
     with ExitStack() as sync_locks:
         sync_locks.enter_context(
             _root._sync_cache_lock(
@@ -1064,6 +1592,19 @@ def sync_artifacts(
                 exclusive=not plan,
             )
         )
+        if not plan:
+            # Reopen the store's own directories for this publication; rsync
+            # keeps every artifact itself read-only while it writes, and the
+            # directories are locked again once the manifest is published.
+            _set_artifact_store_lock(node, root_rel, relatives, lock=False)
+            sync_locks.callback(
+                _relock_artifact_store_after_failure,
+                node,
+                root_rel,
+                relatives,
+                lambda: store_locked,
+                log,
+            )
         if relaying and relay_route is not None and relay_route.gateway is not None:
             sync_locks.enter_context(
                 _root._sync_cache_lock(
@@ -1077,7 +1618,7 @@ def sync_artifacts(
                 sync_relay.prepare_artifact_mirror(
                     relay_route,
                     project_name,
-                    [relative for relative, *_rest in sources],
+                    relatives,
                     cancel_event=cancel_event,
                 )
             except sync_relay.RelayError as exc:
@@ -1162,6 +1703,29 @@ def sync_artifacts(
                 on_retry=on_retry,
                 cancel_event=cancel_event,
             )
+            try:
+                _set_artifact_store_lock(node, root_rel, relatives, lock=True)
+            except (RemoteError, DispatchError) as exc:
+                # The manifest is published and verified; only the guard
+                # around it is missing. Say so rather than fail a sync whose
+                # data is right, and let the next publication lock it.
+                store_locked = False
+                log(f"warning: artifact store left writable: {exc}")
+            else:
+                store_locked = True
+            journal_error = record_artifact_publication(
+                cfg,
+                project_name=project_name,
+                node_name=node.name,
+                manifest_sha256=manifest_sha256,
+                artifacts=relatives,
+            )
+            if journal_error is not None:
+                log(
+                    "warning: artifact publication journal unavailable "
+                    f"({journal_error}); --artifact-manifest prefixes may not "
+                    "resolve to this manifest"
+                )
             # Jobs blocked on artifact-unverified for this node are placeable
             # again; without the nudge they sit out a backoff of up to five
             # minutes on a store that is already repaired.
@@ -1180,6 +1744,8 @@ def sync_artifacts(
         "artifact_manifest_sha256": manifest_sha256,
         "artifact_manifest_path": display_node_path(manifest_path),
     }
+    if store_locked is not None:
+        result["store_locked"] = store_locked
     if total_files_known:
         result["transferred_files"] = total_files
     if transient_files:

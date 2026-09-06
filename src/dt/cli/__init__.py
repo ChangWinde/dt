@@ -960,6 +960,42 @@ def _validate_submission_resources(
         )
 
 
+def _resolve_artifact_manifest_option(
+    cfg: HeadConfig,
+    reference: str | None,
+    *,
+    project: str | None,
+    json_: bool,
+) -> str | None:
+    """Expand a `--artifact-manifest` prefix into the full published digest.
+
+    Runs on the head, where the publication journal and the job registry
+    live; a laptop forwards the operator's value verbatim. ``project`` is the
+    configured name when the caller already knows it (a fork inherits its
+    source job's), otherwise it is inferred from the option or the cwd.
+    """
+    if reference is None or len(reference) == 64:
+        return reference
+    try:
+        project_name = (
+            project
+            if project is not None
+            else dispatch_mod.resolve_project(cfg, None, Path.cwd())[0]
+        )
+        return dispatch_mod.resolve_artifact_manifest_reference(
+            cfg,
+            project_name,
+            reference,
+        )
+    except (ConfigError, DispatchError) as exc:
+        _fail_submission(
+            kind="invalid_argument",
+            message=str(exc),
+            exit_code=1,
+            json_=json_,
+        )
+
+
 def _validate_submission_request_id(request_id: str | None, *, json_: bool) -> None:
     if request_id is None:
         return

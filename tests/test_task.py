@@ -474,6 +474,86 @@ def test_task_after_success_rejects_no_queue_before_config(monkeypatch):
     assert "requires queueing" in payload["message"]
 
 
+def test_task_expands_a_unique_artifact_manifest_prefix_on_the_head(
+    tmp_path,
+    monkeypatch,
+):
+    """`dt sync` prints the full digest, but operators paste the 12-character
+    prefix they read in the summary line; a unique prefix of a manifest this
+    head published resolves, an ambiguous or unknown one names the candidates."""
+    cfg = _cfg(tmp_path)
+    seen = {}
+    published = "b" * 12 + "1" * 52
+    sibling = "b" * 12 + "2" * 52
+    for digest in (published, sibling):
+        assert (
+            dispatch.record_artifact_publication(
+                cfg,
+                project_name="p",
+                node_name="n1",
+                manifest_sha256=digest,
+                artifacts=["data"],
+            )
+            is None
+        )
+    monkeypatch.setattr(cli, "_cfg", lambda: cfg)
+
+    def fake_submit(cfg_, spec, cwd, log, no_queue=False):
+        seen["spec"] = spec
+        return _entry(spec)
+
+    monkeypatch.setattr(cli, "submit", fake_submit)
+    argv = ["task", "n1", "python train.py", "-p", "p", "--json", "--artifact-manifest"]
+
+    result = CliRunner().invoke(cli.app, [*argv, published[:20]])
+
+    assert result.exit_code == 0, result.output
+    assert seen["spec"].artifact_manifest == published
+    assert json.loads(result.stdout)["artifact_manifest"] == published
+
+    ambiguous = CliRunner().invoke(cli.app, [*argv, "b" * 12])
+    assert ambiguous.exit_code == 1
+    payload = json.loads(ambiguous.stdout)
+    assert payload["error"] == "invalid_argument"
+    assert "ambiguous" in payload["message"]
+    assert published in payload["message"] and sibling in payload["message"]
+
+    unknown = CliRunner().invoke(cli.app, [*argv, "c" * 12])
+    assert unknown.exit_code == 1
+    payload = json.loads(unknown.stdout)
+    assert payload["error"] == "invalid_argument"
+    assert "no artifact manifest known to this head" in payload["message"]
+    assert "dt sync <node> --artifact" in payload["message"]
+
+    too_short = CliRunner().invoke(cli.app, [*argv, "b" * 11])
+    assert too_short.exit_code == 1
+    assert "at least 12 hex characters" in json.loads(too_short.stdout)["message"]
+
+    # A pinned job is memory too: manifests published before this head kept a
+    # journal still resolve through the registry.
+    monkeypatch.setattr(
+        cli.jobs_mod,
+        "list_all",
+        lambda _cfg: [
+            JobEntry(
+                job_id="20260101-0000_old_beef",
+                name="old",
+                center="c",
+                project="p",
+                node="n1",
+                node_local=False,
+                job_dir="dt/jobs/20260101-0000_old_beef",
+                session="dt_old",
+                cmd="true",
+                artifact_manifest="d" * 64,
+            )
+        ],
+    )
+    registry_only = CliRunner().invoke(cli.app, [*argv, "d" * 12])
+    assert registry_only.exit_code == 0, registry_only.output
+    assert seen["spec"].artifact_manifest == "d" * 64
+
+
 def test_task_binds_artifact_manifest_in_spec_and_submission_payload(
     tmp_path,
     monkeypatch,

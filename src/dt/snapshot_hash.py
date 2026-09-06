@@ -9,6 +9,11 @@ import sys
 from pathlib import Path
 
 _SCHEMA = b"dt-snapshot-tree-v1\0"
+_ARTIFACT_SCHEMA = b"dt-artifact-tree-v1\0"
+# Artifact stores are published read-only on nodes (every write bit cleared),
+# so an artifact tree's identity ignores write bits on both ends: the writable
+# source on the head and the locked copy on the node hash the same.
+ARTIFACT_MODE_MASK = 0o7555
 _CHUNK_SIZE = 1024 * 1024
 MAX_SNAPSHOT_ENTRIES = 2_000_000
 MAX_SNAPSHOT_BYTES = 1 << 40
@@ -37,7 +42,21 @@ def tree_sha256(root: Path) -> str:
     preserve source ownership on every node, and mtime-only changes do not
     alter executable snapshot semantics.
     """
-    root = Path(root)
+    return _tree_digest(Path(root), schema=_SCHEMA, mode_mask=0o7777)
+
+
+def artifact_tree_sha256(root: Path) -> str:
+    """The snapshot tree hash with write bits ignored (artifact manifest v2).
+
+    A distinct schema tag keeps this identity from ever colliding with a
+    code-snapshot digest of the same bytes.
+    """
+    return _tree_digest(
+        Path(root), schema=_ARTIFACT_SCHEMA, mode_mask=ARTIFACT_MODE_MASK
+    )
+
+
+def _tree_digest(root: Path, *, schema: bytes, mode_mask: int) -> str:
     root_info = root.lstat()
     if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
         raise NotADirectoryError(root)
@@ -49,7 +68,7 @@ def tree_sha256(root: Path) -> str:
         # trees collide on one digest, which would let a node run the wrong code.
         raise error
 
-    digest = hashlib.sha256(_SCHEMA)
+    digest = hashlib.sha256(schema)
     discovered: list[Path] = []
     for parent, dirnames, filenames in os.walk(root, onerror=_abort, followlinks=False):
         parent_path = Path(parent)
@@ -78,7 +97,7 @@ def tree_sha256(root: Path) -> str:
                 f"snapshot path exceeds byte budget: {relative_path}"
             )
         metadata = path.lstat()
-        mode = stat.S_IMODE(metadata.st_mode)
+        mode = stat.S_IMODE(metadata.st_mode) & mode_mask
         if stat.S_ISDIR(metadata.st_mode):
             kind = b"d"
             payload_size = 0
@@ -132,7 +151,7 @@ def tree_sha256(root: Path) -> str:
                     not stat.S_ISREG(opened.st_mode)
                     or opened.st_dev != metadata.st_dev
                     or opened.st_ino != metadata.st_ino
-                    or stat.S_IMODE(opened.st_mode) != mode
+                    or (stat.S_IMODE(opened.st_mode) & mode_mask) != mode
                     or opened.st_size != metadata.st_size
                 ):
                     raise OSError(f"snapshot entry changed while hashing: {path}")

@@ -281,7 +281,25 @@ parsing human check strings. Human hints are rendered from the same actions.
 `dt pull` treats application outputs as untrusted data: device nodes and
 special files are refused, `outputs/dt/` is excluded, and only a fixed
 schema-validated control-evidence allowlist is reported under
-`records_scope: "dt_control_allowlist"`.
+`records_scope: "dt_control_allowlist"`. rsync's exit status is not taken as
+proof of arrival: after each leg the worker's own file census is compared
+with what landed, and `dt_pull_v1` carries the result as `verification`
+(outputs) and `logs_verification` (run record) — `status` is `verified`, or
+`in_progress` when the job is still running and kept writing, with
+`files_checked`, `files_on_node`, `census_truncated`, and `scope`
+(`excluded_files_skipped`, or `arrived_files_only` when an `--exclude`
+pattern uses syntax the census cannot model). A terminal job whose files are
+missing or truncated locally fails with `incomplete_transfer`; rerunning the
+same pull resumes and re-verifies.
+
+`dt sync --artifact` rows carry `artifact_manifest_sha256` (schema
+`dt_artifact_manifest_v2`: modes without write bits, directories hashed with
+the write-bit-agnostic artifact tree hash), `store_locked` (the node's store
+was left read-only), and per-artifact `reused_from` (sibling project stores
+whose identical files were hard-linked instead of transferred).
+`--artifact-manifest` on `run`, `task`, `batch`, `chain`, and `fork` takes the
+full digest or a unique prefix of at least 12 hex characters, resolved on the
+head against its publication journal and pinned jobs.
 
 Streaming JSON commands use one object or a documented JSONL stream. Progress
 and reconnect notices remain on stderr.

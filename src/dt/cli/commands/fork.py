@@ -29,10 +29,15 @@ from .. import (
     _fail_from_submission_error,
     _fail_submission,
     _group_failure,
+    _resolve_artifact_manifest_option,
     _submission_payload,
     _validate_submission_request_id,
 )
 from ... import dispatch as dispatch_mod
+from ...submission import (
+    ARTIFACT_MANIFEST_REFERENCE_RULE,
+    artifact_manifest_reference_ok,
+)
 
 
 def _fork_repeat_host() -> fork_repeat_mod.Host:
@@ -227,17 +232,12 @@ def _validate_fork_options(
             exit_code=1,
             json_=json_,
         )
-    if (
-        artifact_manifest is not None
-        and re.fullmatch(
-            r"[0-9a-f]{64}",
-            artifact_manifest,
-        )
-        is None
+    if artifact_manifest is not None and not artifact_manifest_reference_ok(
+        artifact_manifest
     ):
         _fail_submission(
             kind="invalid_argument",
-            message="--artifact-manifest must be a lowercase SHA-256 digest",
+            message=ARTIFACT_MANIFEST_REFERENCE_RULE,
             exit_code=1,
             json_=json_,
         )
@@ -450,7 +450,10 @@ def fork(
     artifact_manifest: Optional[str] = typer.Option(
         None,
         "--artifact-manifest",
-        help="override REF's bound artifact manifest for the new fork(s)",
+        help=(
+            "override REF's bound artifact manifest for the new fork(s) (digest "
+            "or unique 12+ hex prefix)"
+        ),
         rich_help_panel="Reproducibility",
     ),
     max_hours: Optional[float] = typer.Option(
@@ -561,6 +564,12 @@ def fork(
 
     old = _root._find_or_die(cfg, ref, json_=json_)
     old_display_ref = _display_ref_for_entry(cfg, old)
+    artifact_manifest = _resolve_artifact_manifest_option(
+        cfg,
+        artifact_manifest,
+        project=old.project,
+        json_=json_,
+    )
     if max_vram_mib is not None and old.gpus_requested == 0:
         _fail_submission(
             kind="invalid_argument",

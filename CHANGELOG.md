@@ -6,6 +6,70 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- Node artifact stores deduplicate identical content across projects. A user
+  who created three projects over one code path (to run them concurrently)
+  paid three copies of the same 7.9 GB of inputs on one node, and the third
+  project's first `dt sync --artifact` spent 24 minutes on the WAN although
+  every byte already sat one directory over. Before transferring an artifact,
+  `dt sync` now asks the node which sibling project stores hold that path
+  (stores whose published manifest carries the same digest rank first) and
+  passes them to rsync as `--link-dest` baselines, so byte-identical files
+  are hard-linked into place and only real differences cross the network;
+  the same reuse applies to the gateway mirrors of a relayed sync. The
+  `--json` row names the stores used under `reused_from`.
+- `--artifact-manifest` (`run`, `task`, `batch`, `chain`, `fork`) accepts a
+  unique prefix of at least 12 hex characters — the width `dt sync` and
+  `dt info` print. The head expands it against every manifest it has
+  published (a new publication journal under the head's state directory)
+  or pinned to a job for the project; an ambiguous prefix fails listing the
+  candidate digests, an unknown one asks for the digest `dt sync` printed.
+- `dt seed --bwlimit KBPS`, and the site default / head `uplink_kbps` now
+  pace cache seeding: seeding ships the head's whole uv cache to a node and
+  was the one head-side bulk transfer no budget reached.
+
+### Fixed
+
+- Node artifact stores are read-only to jobs. A job script's
+  `ln -s "$DT_ARTIFACT_ROOT/<rel>" <rel>`, racing across two cells of one
+  job, planted a symlink inside the worker's directory artifact and every
+  later job of the project failed `env-fail: artifact integrity failed` until
+  someone republished. `dt sync --artifact` now publishes every file without
+  write bits and every directory as `0555` (rsync applies the lock as it
+  writes, so unchanged files are never left writable), reopens only its own
+  directories for the next publication, and relocks them even when a
+  transfer fails halfway. Manifests are `dt_artifact_manifest_v2`: modes
+  carry no write bits and directories use a write-bit-agnostic tree hash, so
+  the writable source on the head and the locked copy on the node share one
+  identity; the node-side verifier still accepts v1 manifests, including a
+  v1 file manifest whose store has since been locked. Republishing changed
+  content over a hard-linked file writes a new inode into that project's
+  store only. Upgrade note: a v1 manifest of a *directory* artifact stops
+  verifying once the same paths are republished (its digest included the old
+  modes); `dt sync --artifact` names the queued jobs that still pin it.
+- The cold cross-site upload that seeds a site cache under
+  `artifact_policy: topology-aware`, and its `fallback_direct` retry, now
+  carry the head's transfer budget. Both leave the head exactly like a direct
+  snapshot, yet neither honoured `uplink_kbps` or the site's `bwlimit_kbps`;
+  on a home uplink one unpaced cache upload stalled the operator's remote
+  desktop.
+- `dt pull` no longer fails a correct pull as `incomplete_transfer` because
+  the worker keeps `outputs/dt/resources.jsonl`: that reserved directory is
+  excluded from the transfer by design, and the census now applies the same
+  exclusion. With `--lite` or `--exclude` active the census used to judge
+  only files that had arrived, so a missing non-excluded file passed; it now
+  recognises excluded rows by the same patterns rsync applied (a pattern the
+  model cannot express falls back to the narrower check, reported as
+  `scope: arrived_files_only`). A pull of a *running* job reports differences
+  as `verification.status: in_progress` — the job kept writing, the copy is
+  a point-in-time snapshot — instead of a broken transfer. The run-record leg
+  (`logs/`) is verified the same way (`logs_verification`): a truncated
+  `env.log` that arrived with exit 0 is the same silent loss as a truncated
+  checkpoint.
+- Artifact and project sync errors carry a bounded excerpt of rsync's stderr
+  instead of the whole capture (up to 4 MiB in a `--json` row).
+
 ## 0.13.13 — 2026-09-06
 
 ### Fixed
