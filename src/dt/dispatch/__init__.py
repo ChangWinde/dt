@@ -1727,6 +1727,8 @@ from .queued import (  # noqa: E402
     _INFLIGHT_JOB_IDS as _INFLIGHT_JOB_IDS,
     _INFLIGHT_LOCK as _INFLIGHT_LOCK,
     _dispatch_queued_gated as _dispatch_queued_gated,
+    _note_placement_attempt as _note_placement_attempt,
+    placement_pattern as placement_pattern,
     _recover_claimed_dispatch as _recover_claimed_dispatch,
     _refresh_queued_payload as _refresh_queued_payload,
     _request_remote_proof_command as _request_remote_proof_command,

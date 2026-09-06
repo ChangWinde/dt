@@ -56,6 +56,28 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
   that already holds a claim reserves capacity on its claimed node only, so a
   later job bound elsewhere passes it. The agent finishes in-flight dispatches
   before it exits or re-execs; `dt agent status` lists them (`dispatching`).
+- Repeated placement refusals are reported as a pattern. One job bounced off
+  the same node six times as `artifact-unverified` and another sat behind a
+  node that stayed unreachable for an hour; `dt ps --issues` showed each
+  attempt's reason but neither the count, the span, nor what to do. The row
+  now carries `placement_pattern` (`NODE=artifact-unverified`),
+  `placement_attempts`, and the streak's first/last time; `dt ps --issues`
+  opens with one digest line per pattern (jobs, attempts, first, last, next
+  step) and marks each row `×N`, `dt info` adds a `repeated` row, and `dt
+  free --explain` a `repeated` line for the queue head.
+
+### Fixed
+
+- A blocked job retries on its capped exponential backoff, not every few
+  seconds. The claim refused a blocked job's retry because of the row's own
+  previous `blocked:` verdict, rewrote it as `waiting: blocked: ...`, and the
+  agent — which does not back off a wait — launched it again on the next
+  tick: two `artifact-unverified` jobs alternated `blocked` and `waiting`
+  every twelve seconds in the agent log, each cycle a code snapshot over the
+  tunnel and a launcher run, and the log deduplication never settled. The
+  placement pass that carries fresh probe evidence re-tests the constraint on
+  the node itself, so the stale verdict no longer vetoes it; dependency
+  blockers and `dt free --explain`'s explanation are unchanged.
 
 ### Fixed
 

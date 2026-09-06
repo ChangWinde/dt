@@ -253,6 +253,16 @@ filters such as `--limit`, `--issues`, or `-s` narrow it. Human `dt ps`
 defaults to active work, uses a plain sentence for empty filters, and compacts
 dependency references in issue rows.
 
+A queued job that keeps bouncing the same way carries the streak on its row:
+`placement_pattern` names the refusal per node (`NODE=artifact-unverified`,
+`NODE=unreachable`, `NODE=busy`), `placement_attempts` counts the consecutive
+attempts that ended that way, and `placement_first_failed_at` /
+`placement_last_failed_at` bound it (a capacity wait is not an attempt; a
+different refusal starts a new streak). Human `dt ps --issues` opens with one
+digest line per repeated pattern — jobs, attempts, first and last time, and
+the next step — and prefixes the issue cell with `×N`; `dt info REF` shows a
+`repeated` row and `dt free --explain` a `repeated` line for the queue head.
+
 Routine Agent polling should use the opt-in bounded query contract:
 
 ```bash

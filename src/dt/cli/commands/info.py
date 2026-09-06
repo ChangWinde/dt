@@ -35,6 +35,7 @@ from ...monitoring import (
     safe_phase_name as _safe_phase_name,
 )
 from ...path_contract import job_path_contract as _job_path_contract
+from ...render import placement_remedies
 from .. import (
     INFO_COMMAND_PREVIEW_CHARS,
     _format_transfer_bytes,
@@ -442,6 +443,7 @@ _INFO_COMPACT_LABELS = frozenset(
         "queue head",
         "previous",
         "placement failures",
+        "repeated",
         "results in code/",
         "where",
         "gpus",
@@ -801,6 +803,21 @@ def _render_info_table(
                 f"\n[dim]as of {_fmt_ts(entry.updated_at)} (last attempt)[/dim]"
             )
         rows.insert(3, ("placement failures", placement_text))
+    if (
+        entry.status == "queued"
+        and entry.placement_attempts >= 2
+        and entry.placement_pattern
+    ):
+        remedies = placement_remedies(entry.placement_pattern)
+        pattern_text = (
+            f"[yellow]{escape(entry.placement_pattern)}[/yellow] · "
+            f"{entry.placement_attempts} attempts · first "
+            f"{_fmt_ts(entry.placement_first_failed_at)} · last "
+            f"{_fmt_ts(entry.placement_last_failed_at)}"
+        )
+        if remedies:
+            pattern_text += f"\nnext: {escape('; '.join(remedies))}"
+        rows.insert(3, ("repeated", pattern_text))
     rows.extend(_info_launch_rows(entry))
     if failure_log is not None:
         rows.extend(_info_failure_log_rows(failure_log))

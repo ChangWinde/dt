@@ -621,6 +621,119 @@ def queued_anomaly(row: JsonRow) -> bool:
     )
 
 
+# What to do about a repeated placement refusal, by the kind the launcher or
+# probe named. Mirrors the queued-reason table in docs/agent-playbook.md.
+PLACEMENT_REMEDIES: dict[str, str] = {
+    "artifact-unverified": "republish the store: dt sync NODE --artifact PATH",
+    "node-unfit": "fix the node (dt doctor) or resubmit with another --node",
+    "path-missing": "provide --require-path on the node or resubmit elsewhere",
+    "disk-full": "free disk on the node or lower --require-disk-gib",
+    "unreachable": "check the node's network; the job retries on a backoff",
+    "busy": "the launcher found the cards taken at the node lock: dt free --who",
+    "cache-missing": "the cache source job is gone; resubmit without --reuse-cache",
+    "identity-conflict": "another attempt of this job is bound to the node: dt info REF",
+    "snapshot failed": "the code transfer keeps failing: dt topology; dt doctor",
+    "resource-mismatch": "no eligible node has this GPU shape: change -g/--min-vram-mib",
+    "drained": "the node is drained (nodes[].drained); lift it or repin",
+}
+
+
+@dataclasses.dataclass
+class _PlacementGroup:
+    jobs: int = 0
+    attempts: int = 0
+    first: float | None = None
+    last: float | None = None
+
+
+def _placement_streak(
+    row: JsonRow,
+) -> tuple[int, str | None, float | None, float | None]:
+    attempts = as_int(row.get("placement_attempts")) or 0
+    pattern = row.get("placement_pattern")
+    first = as_number(row.get("placement_first_failed_at"))
+    last = as_number(row.get("placement_last_failed_at"))
+    return (
+        attempts,
+        (pattern if isinstance(pattern, str) and pattern else None),
+        first,
+        last,
+    )
+
+
+def _clock(ts: float | None) -> str:
+    if ts is None:
+        return "?"
+    when = datetime.fromtimestamp(ts)
+    return (
+        when.strftime("%H:%M")
+        if when.date() == datetime.now().date()
+        else (when.strftime("%m-%d %H:%M"))
+    )
+
+
+def placement_streak_text(row: JsonRow) -> str | None:
+    """``×6 since 05:22`` for a queued row that keeps bouncing the same way."""
+    attempts, pattern, first, _last = _placement_streak(row)
+    if row.get("status") != "queued" or attempts < 2 or pattern is None:
+        return None
+    return f"×{attempts} since {_clock(first)}"
+
+
+def placement_remedies(pattern: str) -> list[str]:
+    """The distinct next steps for the kinds a placement pattern names."""
+    kinds: list[str] = []
+    for part in pattern.split(";"):
+        kind = part.split("=", 1)[1] if "=" in part else part
+        if kind not in kinds:
+            kinds.append(kind)
+    remedies: list[str] = []
+    for kind in kinds:
+        remedy = PLACEMENT_REMEDIES.get(kind)
+        if remedy is not None and remedy not in remedies:
+            remedies.append(remedy)
+    return remedies
+
+
+def issue_digest(rows: list[JsonRow], *, limit: int = 6) -> list[str]:
+    """One line per repeated placement pattern across the queued rows.
+
+    Six bounces of one job and one bounce each of six jobs read alike in a
+    table; here they become ``NODE=artifact-unverified · 3 jobs · 18 attempts
+    · first 05:22 · last 05:43 · next: republish ...``. Rows without a
+    repeated pattern contribute nothing.
+    """
+    groups: dict[str, _PlacementGroup] = {}
+    for row in rows:
+        attempts, pattern, first, last = _placement_streak(row)
+        if row.get("status") != "queued" or pattern is None or attempts < 1:
+            continue
+        group = groups.setdefault(pattern, _PlacementGroup())
+        group.jobs += 1
+        group.attempts += attempts
+        if first is not None:
+            group.first = first if group.first is None else min(group.first, first)
+        if last is not None:
+            group.last = last if group.last is None else max(group.last, last)
+    lines: list[str] = []
+    ranked = sorted(groups.items(), key=lambda item: -item[1].attempts)
+    for pattern, group in ranked:
+        if group.attempts < 2:
+            continue
+        text = (
+            f"[yellow]{escape(pattern)}[/yellow] · {group.jobs} "
+            f"job{'s' if group.jobs != 1 else ''} · {group.attempts} attempts"
+            f" · first {_clock(group.first)} · last {_clock(group.last)}"
+        )
+        remedies = placement_remedies(pattern)
+        if remedies:
+            text += f" · next: {escape('; '.join(remedies))}"
+        lines.append(text)
+    if len(lines) > limit:
+        lines = lines[:limit] + [f"[dim]… {len(lines) - limit} more pattern(s)[/dim]"]
+    return lines
+
+
 def _row_issue(row: JsonRow, *, display_ref: str) -> object:
     """The one diagnostic worth a table cell for this row, if any."""
     status = row.get("status", "?")
@@ -630,6 +743,10 @@ def _row_issue(row: JsonRow, *, display_ref: str) -> object:
     )
     if status == "queued" and isinstance(reason_issue, str):
         reason_issue = _compact_queue_reason(reason_issue)
+        streak = placement_streak_text(row)
+        if streak is not None:
+            # The count leads so a narrow cell still shows that it repeats.
+            reason_issue = f"{streak.split(' since ')[0]} {reason_issue}"
     issue = row.get("progress_error") or reason_issue or row.get("status_probe_error")
     if not issue and status == "lost":
         # Old registries may predate persisted lost diagnostics. Keep the

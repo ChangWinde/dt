@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 import os
 import re
 import shlex
@@ -1250,6 +1250,43 @@ def _prepare_queued_stage(
     )
 
 
+def placement_pattern(reasons: Mapping[str, str], *, outcome: str) -> str:
+    """Name what kind of refusal each node gave, stably across attempts.
+
+    ``NODE=kind;NODE=kind``: the kind is the reason's prefix up to its first
+    colon (``artifact-unverified``, ``node-unfit``, ``busy``), or the outcome
+    for an outage whose transport text varies from probe to probe.
+    """
+    parts = []
+    for node, reason in sorted(reasons.items()):
+        kind = outcome if outcome == "unreachable" else reason.split(":", 1)[0].strip()
+        parts.append(f"{node}={kind or outcome}")
+    return ";".join(parts) or outcome
+
+
+def _note_placement_attempt(
+    entry: JobEntry,
+    pattern: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Count one placement attempt that ended in ``pattern``; True when the row changed.
+
+    Consecutive attempts with the same pattern extend one streak (its first
+    and last times bound it); a different pattern starts a new one. A busy
+    wait between two attempts is not an attempt and leaves the streak alone.
+    """
+    moment = time.time() if now is None else now
+    if entry.placement_pattern == pattern and entry.placement_attempts > 0:
+        entry.placement_attempts += 1
+    else:
+        entry.placement_pattern = pattern
+        entry.placement_attempts = 1
+        entry.placement_first_failed_at = moment
+    entry.placement_last_failed_at = moment
+    return True
+
+
 def _reserve_inflight_claims(
     cfg: HeadConfig,
     entry: JobEntry,
@@ -1367,10 +1404,21 @@ def _dispatch_queued_active(
             return interrupted
         return "failed", entry.reason
 
-    def hold(reason: str, outcome: tuple[str, str | None]) -> tuple[str, str | None]:
+    def hold(
+        reason: str,
+        outcome: tuple[str, str | None],
+        *,
+        probe_reasons: Mapping[str, str] | None = None,
+    ) -> tuple[str, str | None]:
         changed = entry.reason != reason
         if changed:
             entry.reason = reason
+        if outcome[0] in {"blocked", "unreachable"} and probe_reasons is not None:
+            # No node was tried, but the probe refused every candidate for a
+            # job-specific reason (or an outage): that repeats, so count it.
+            changed |= _root._note_placement_attempt(
+                entry, _root.placement_pattern(probe_reasons, outcome=outcome[0])
+            )
         interrupted = commit(persist=changed)
         if interrupted is not None:
             return interrupted
@@ -1434,6 +1482,7 @@ def _dispatch_queued_active(
         return hold(
             waiting_unreachable_reason(probe_reasons),
             ("unreachable", detail) if spec.node is not None else ("busy", None),
+            probe_reasons=probe_reasons,
         )
     if pin_is_busy(statuses, spec):
         candidates = []
@@ -1442,7 +1491,9 @@ def _dispatch_queued_active(
             detail = "; ".join(
                 f"{node}: {reason}" for node, reason in probe_reasons.items()
             )
-            return hold(f"blocked: {detail}", ("blocked", detail))
+            return hold(
+                f"blocked: {detail}", ("blocked", detail), probe_reasons=probe_reasons
+            )
         return hold(waiting_capacity_reason(probe_reasons), ("busy", None))
 
     candidates = [_queued_node(cfg, entry, node) for node in candidates]
@@ -1515,6 +1566,12 @@ def _dispatch_queued_active(
         changed = entry.reason != reason or placement_failures_changed
         if changed:
             entry.reason = reason
+        if reasons:
+            # A node was actually tried and refused: the sixth identical
+            # refusal is a pattern, not six independent surprises.
+            changed |= _root._note_placement_attempt(
+                entry, _root.placement_pattern(reasons, outcome=outcome[0])
+            )
         current = _root._commit_queued_transition(
             cfg,
             entry,

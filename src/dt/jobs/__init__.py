@@ -241,6 +241,15 @@ class JobEntry:
     dispatch_owner: str | None = None
     dispatch_claimed_at: float | None = None
     placement_failures: dict[str, str] = field(default_factory=dict)
+    # How often the same placement outcome has repeated: ``placement_pattern``
+    # names it ("NODE=artifact-unverified"), ``placement_attempts`` counts the
+    # consecutive attempts that ended that way, and the two timestamps bound
+    # the streak. One bounce is noise; the sixth on the same node is a pattern
+    # an operator should see without reading the agent log.
+    placement_attempts: int = 0
+    placement_pattern: str | None = None
+    placement_first_failed_at: float | None = None
+    placement_last_failed_at: float | None = None
     env_hash: str | None = None  # shared reproducible venv identity (12 hex)
     snapshot_duration_s: float | None = None  # successful node snapshot transfer
     launch_duration_s: float | None = None  # uv/setup + launch lock/session startup
@@ -849,6 +858,8 @@ def _validate_entry_limits(entry: JobEntry) -> None:
         entry.snapshot_duration_s,
         entry.launch_duration_s,
         entry.recovered_at,
+        entry.placement_first_failed_at,
+        entry.placement_last_failed_at,
     )
     if any(
         value is not None
@@ -887,6 +898,17 @@ def _validate_entry_limits(entry: JobEntry) -> None:
         or entry.require_disk_gib < 0
     ):
         raise ValueError("job registry has an invalid disk requirement")
+    if (
+        isinstance(entry.placement_attempts, bool)
+        or not isinstance(entry.placement_attempts, int)
+        or entry.placement_attempts < 0
+    ):
+        raise ValueError("job registry has an invalid placement attempt count")
+    if entry.placement_pattern is not None and (
+        not isinstance(entry.placement_pattern, str)
+        or len(entry.placement_pattern) > MAX_JOB_DIAGNOSTIC_CHARS
+    ):
+        raise ValueError("job registry has an invalid placement pattern")
 
 
 def _validate_entry_contracts(entry: JobEntry) -> None:

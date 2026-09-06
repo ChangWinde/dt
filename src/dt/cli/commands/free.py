@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, cast
 import json
 import math
@@ -18,7 +19,13 @@ from ... import jobs as jobs_mod
 from ...config import HeadConfig, LaptopConfig
 from ...jsonvalue import as_int, as_number
 from ...probe import INTERACTIVE_PROBE_BUDGET_S
-from ...render import DISK_LOW_FREE_FRACTION, DISK_LOW_FREE_GIB, err, free_table
+from ...render import (
+    DISK_LOW_FREE_FRACTION,
+    DISK_LOW_FREE_GIB,
+    err,
+    free_table,
+    placement_remedies,
+)
 from .. import (
     EXIT_UNREACHABLE,
     JsonDict,
@@ -80,6 +87,18 @@ def _free_scheduler_context(
             "queue_head_launch_progress": (
                 head_progress.as_payload() if head_progress is not None else None
             ),
+            "queue_head_placement_streak": (
+                {
+                    "pattern": head.placement_pattern,
+                    "attempts": head.placement_attempts,
+                    "first_failed_at": head.placement_first_failed_at,
+                    "last_failed_at": head.placement_last_failed_at,
+                }
+                if head is not None
+                and head.placement_pattern
+                and head.placement_attempts >= 2
+                else None
+            ),
             "queue_head_pin_node": head.pin_node if head is not None else None,
             "queue_head_gpus_requested": (
                 head.gpus_requested if head is not None else None
@@ -106,6 +125,7 @@ def _free_scheduler_context(
             "queue_head_job_id": None,
             "queue_head_reason": None,
             "queue_head_launch_progress": None,
+            "queue_head_placement_streak": None,
             "queue_head_pin_node": None,
             "queue_head_gpus_requested": None,
             "queue_head_min_vram_mib": None,
@@ -563,6 +583,15 @@ def _free_explain_payload(
     }
 
 
+def _free_clock(timestamp: float | None) -> str:
+    if timestamp is None:
+        return "?"
+    try:
+        return datetime.fromtimestamp(timestamp).strftime("%m-%d %H:%M")
+    except (ValueError, OverflowError, OSError):
+        return "invalid"
+
+
 def _free_launch_progress_text(context: JsonDict) -> str | None:
     """The launcher's phase on the node for a queue head that is dispatching."""
     observation = dispatch_mod.LaunchProgress.from_payload(
@@ -801,6 +830,19 @@ def _free_scheduler_table(
             launch_text = _free_launch_progress_text(context)
             if launch_text is not None:
                 table.add_row("", f"[dim]launcher[/dim] {launch_text}")
+            streak = context.get("queue_head_placement_streak")
+            if isinstance(streak, dict) and isinstance(streak.get("pattern"), str):
+                pattern = str(streak["pattern"])
+                streak_text = (
+                    f"[yellow]{escape(pattern)}[/yellow] · "
+                    f"{as_int(streak.get('attempts')) or 0} attempts · first "
+                    f"{_free_clock(as_number(streak.get('first_failed_at')))} · last "
+                    f"{_free_clock(as_number(streak.get('last_failed_at')))}"
+                )
+                remedies = placement_remedies(pattern)
+                if remedies:
+                    streak_text += f" · next: {escape('; '.join(remedies))}"
+                table.add_row("", f"[dim]repeated[/dim] {streak_text}")
             model = context.get("model")
             if isinstance(model, dict):
                 table.add_row(
