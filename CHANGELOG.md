@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.22 — 2026-09-07
+
 ### Added
 
 - `dt migrate node-rename OLD NEW`: rename a node everywhere dt remembers it —
