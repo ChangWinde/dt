@@ -1013,3 +1013,169 @@ def test_worker_migration_holds_job_lock_across_copy_and_source_delete(tmp_path)
     assert delete_finished.is_set()
     assert competing_lock_acquired.is_set()
     assert applied["applied_summary"]["failed"] == 0
+
+
+def test_node_rename_moves_every_persisted_mention_once_the_agent_is_stopped(
+    tmp_path, monkeypatch
+):
+    """Retiring a transitional SSH alias stranded dt's memory of the node: 599
+    registry rows (two of them running) and the transfer-baseline map named
+    the old alias, so history would have pointed at a name that no longer
+    resolves and the running jobs would have been lost. `dt migrate
+    node-rename` rewrites the configuration, every row and the baselines in
+    one pass while both names still resolve; the derived indexes rebuild
+    themselves."""
+    import yaml
+
+    import dt.agent as agent_mod
+    from dt import dispatch
+    from dt.jobs import save
+    from dt.migration import apply_node_rename, plan_node_rename
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "center": "test",
+                "nodes": [
+                    {"name": "old-alias", "site": "gc"},
+                    {"name": "other", "site": "lab"},
+                ],
+                "sites": {
+                    "gc": {"gateway": "old-alias", "nodes": ["old-alias"]},
+                    "lab": {"gateway": "other", "nodes": ["other"]},
+                },
+                "projects": {
+                    "p": {"path": str(tmp_path / "p"), "exclude_nodes": ["old-alias"]}
+                },
+                "paths": {
+                    "root": str(tmp_path / "dt"),
+                    "worker_root": str(tmp_path / "w"),
+                },
+            }
+        )
+        + "# old-alias used to be the transitional name\n"
+    )
+    (tmp_path / "p").mkdir()
+    cfg = parse(yaml.safe_load(config_path.read_text()))
+    assert isinstance(cfg, HeadConfig)
+
+    def row(job_id: str, **fields):
+        base = dict(
+            name=job_id,
+            center="test",
+            project="p",
+            node="old-alias",
+            node_local=False,
+            job_dir=f"~/dt/worker/jobs/{job_id}",
+            session=f"dt_{job_id}",
+            cmd="true",
+            status="finished",
+            exit_code=0,
+            storage_layout=ROLE_LAYOUT,
+        )
+        base.update(fields)
+        return JobEntry(job_id=job_id, **base)
+
+    save(cfg, row("done"))
+    save(cfg, row("running", status="running", exit_code=None, pgid=4242))
+    save(
+        cfg,
+        row(
+            "queued-pin",
+            status="queued",
+            exit_code=None,
+            node="-",
+            pin_node="old-alias",
+        ),
+    )
+    save(
+        cfg,
+        row(
+            "refused",
+            status="queued",
+            exit_code=None,
+            node="-",
+            placement_failures={"old-alias": "busy", "other": "busy"},
+        ),
+    )
+    save(
+        cfg,
+        row(
+            "avoids",
+            status="queued",
+            exit_code=None,
+            node="-",
+            exclude_nodes=["old-alias"],
+        ),
+    )
+    save(cfg, row("elsewhere", node="other"))
+    dispatch._remember_snapshot(cfg, "p", cfg.nodes[0], "done")  # noqa: SLF001
+
+    # Blockers: a live agent, an in-flight claim.
+    monkeypatch.setattr(agent_mod, "alive_pid", lambda cfg_: 4242)
+    plan = plan_node_rename(cfg, "old-alias", "gc6", config_path=config_path)
+    assert sorted(plan.rows) == ["avoids", "done", "queued-pin", "refused", "running"]
+    assert sorted(plan.active_rows) == ["avoids", "queued-pin", "refused", "running"]
+    assert plan.linkdest_keys == ["p@old-alias"]
+    assert plan.config_mentions >= 4 and plan.agent_alive
+    assert any("dt agent stop" in problem for problem in plan.blockers())
+    with pytest.raises(ValueError, match="agent"):
+        apply_node_rename(cfg, plan, config_path=config_path)
+
+    monkeypatch.setattr(agent_mod, "alive_pid", lambda cfg_: None)
+    save(
+        cfg,
+        row(
+            "claimed",
+            status="queued",
+            exit_code=None,
+            node="-",
+            pin_node="old-alias",
+            dispatch_node="old-alias",
+            dispatch_token="a" * 32,
+        ),
+    )
+    plan = plan_node_rename(cfg, "old-alias", "gc6", config_path=config_path)
+    assert plan.claimed_rows == ["claimed"] and not plan.agent_alive
+    with pytest.raises(ValueError, match="in flight"):
+        apply_node_rename(cfg, plan, config_path=config_path)
+    save(
+        cfg,
+        row("claimed", status="queued", exit_code=None, node="-", pin_node="old-alias"),
+    )
+
+    plan = plan_node_rename(cfg, "old-alias", "gc6", config_path=config_path)
+    assert not plan.blockers()
+    report = apply_node_rename(cfg, plan, config_path=config_path)
+
+    assert sorted(report["rows_rewritten"]) == [
+        "avoids",
+        "claimed",
+        "done",
+        "queued-pin",
+        "refused",
+        "running",
+    ]
+    assert report["linkdest_keys_renamed"] == ["p@old-alias"]
+    assert report["config_backup"] and Path(report["config_backup"]).is_file()
+    text = config_path.read_text()
+    assert "old-alias" not in text and "gc6" in text
+    renamed_cfg = parse(yaml.safe_load(text))
+    assert isinstance(renamed_cfg, HeadConfig)
+    assert [node.name for node in renamed_cfg.nodes] == ["gc6", "other"]
+    assert renamed_cfg.sites["gc"].gateway == "gc6"
+    assert renamed_cfg.projects["p"].exclude_nodes == ["gc6"]
+    assert load(cfg, "done").node == "gc6"
+    assert (
+        load(cfg, "running").node == "gc6" and load(cfg, "running").status == "running"
+    )
+    assert load(cfg, "queued-pin").pin_node == "gc6"
+    assert load(cfg, "refused").placement_failures == {"gc6": "busy", "other": "busy"}
+    assert load(cfg, "avoids").exclude_nodes == ["gc6"]
+    assert load(cfg, "elsewhere").node == "other"
+    assert dispatch._load_linkdest(cfg) == {"p@gc6": "done"}  # noqa: SLF001
+
+    # Nothing left to do: a second plan is empty.
+    again = plan_node_rename(cfg, "old-alias", "gc6", config_path=config_path)
+    assert again.rows == [] and again.linkdest_keys == [] and again.config_mentions == 0

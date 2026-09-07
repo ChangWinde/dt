@@ -6,6 +6,17 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `dt migrate node-rename OLD NEW`: rename a node everywhere dt remembers it —
+  the configuration (whole-word replacement with a backup, re-parsed before it
+  is written), every registry row (`node`, `pin_node`, placement failures,
+  exclusions) and the transfer-baseline map — while both SSH names still
+  resolve. Retiring a transitional alias otherwise stranded 599 rows and two
+  running jobs under a name that was about to stop resolving (field case).
+  Refuses while the agent is alive or a dispatch is in flight; `--json` emits
+  `dt_node_rename_plan_v1` / `dt_node_rename_v1`.
+
 ## 0.13.21 — 2026-09-07
 
 ### Added

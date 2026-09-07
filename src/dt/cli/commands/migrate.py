@@ -8,11 +8,16 @@ import json
 import typer
 
 from ... import cli as _root
-from ...config import LaptopConfig
+from ...config import ConfigError, LaptopConfig, config_path
 from ...layout import ROLE_LAYOUT
 from ...render import err
 from .. import _fail_submission, _format_transfer_bytes, _typed_cli_decorator
-from ...migration import apply_layout, plan_layout
+from ...migration import (
+    apply_layout,
+    apply_node_rename,
+    plan_layout,
+    plan_node_rename,
+)
 
 migrate_app = typer.Typer(
     no_args_is_help=True,
@@ -124,3 +129,97 @@ def migrate_layout(
         assert isinstance(applied_summary, dict)
         if int(applied_summary["failed"]):
             raise typer.Exit(1)
+
+
+@_typed_cli_decorator(migrate_app.command("node-rename"))
+def migrate_node_rename(
+    old: str = typer.Argument(..., help="the node name every record carries today"),
+    new: str = typer.Argument(..., help="the name the node has now (its SSH name)"),
+    yes: bool = typer.Option(
+        False,
+        "-y",
+        "--yes",
+        help="apply the rename (without it the command only reports what would change)",
+    ),
+    center: Optional[str] = typer.Option(
+        None,
+        "-c",
+        "--center",
+        help="(laptop) which center's head",
+    ),
+    json_: bool = typer.Option(
+        False,
+        "--json",
+        help="emit one dt_node_rename_plan_v1 / dt_node_rename_v1 object",
+    ),
+) -> None:
+    """Rename a node everywhere dt remembers it: configuration, registry, baselines.
+
+    Run it while both names still resolve over SSH, with the agent stopped;
+    afterwards start the agent and retire the old SSH alias.
+    """
+    cfg = _root._cfg()
+    if isinstance(cfg, LaptopConfig):
+        head = cfg.centers[_root._laptop_center(cfg, center)]
+        argv = ["migrate", "node-rename", old, new] + (["-y"] if yes else [])
+        if json_:
+            argv.append("--json")
+        raise typer.Exit(_root.forward_call(head, argv, tty=False))
+    if center is not None:
+        _fail_submission(
+            kind="invalid_argument",
+            message="--center is a laptop-only option",
+            exit_code=1,
+            json_=json_,
+        )
+    try:
+        plan = plan_node_rename(cfg, old, new, config_path=config_path())
+    except ValueError as exc:
+        _fail_submission(
+            kind="invalid_argument", message=str(exc), exit_code=1, json_=json_
+        )
+    blockers = plan.blockers()
+    if not yes:
+        if json_:
+            print(json.dumps(plan.as_dict()))
+        else:
+            err.print(
+                f"plan: rename {old} -> {new} · {len(plan.rows)} registry rows "
+                f"({len(plan.active_rows)} active) · {len(plan.linkdest_keys)} baseline "
+                f"keys · {plan.config_mentions} configuration mentions"
+            )
+            for problem in blockers:
+                err.print(f"[yellow]blocker: {problem}[/yellow]")
+            if not blockers:
+                err.print(f"apply with: dt migrate node-rename {old} {new} -y")
+        raise typer.Exit(1 if blockers else 0)
+    if blockers:
+        _fail_submission(
+            kind="migration_blocked",
+            message="; ".join(blockers),
+            exit_code=1,
+            json_=json_,
+        )
+    try:
+        report = apply_node_rename(cfg, plan, config_path=config_path())
+    except (OSError, ValueError, ConfigError) as exc:
+        _fail_submission(
+            kind="migration_failed", message=str(exc), exit_code=1, json_=json_
+        )
+    if json_:
+        print(json.dumps(report))
+    else:
+        rows = report["rows_rewritten"]
+        keys = report["linkdest_keys_renamed"]
+        assert isinstance(rows, list) and isinstance(keys, list)
+        err.print(
+            f"renamed {old} -> {new}: {len(rows)} registry rows · "
+            f"{len(keys)} baseline keys · configuration "
+            + ("updated" if report["config_backup"] else "unchanged")
+        )
+        if report["config_backup"]:
+            err.print(f"[dim]configuration backup: {report['config_backup']}[/dim]")
+        err.print(
+            "next: dt agent start · then retire the old SSH alias "
+            f"({old}); dt free must list {new}"
+        )

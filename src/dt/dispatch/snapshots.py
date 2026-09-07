@@ -831,6 +831,33 @@ def _stable_snapshot_copy_dest(
         yield copy_dest if acquired else None
 
 
+def snapshot_baseline_keys(cfg: HeadConfig, node_name: str) -> list[str]:
+    """``project@node`` baseline keys recorded for ``node_name``."""
+    suffix = f"@{node_name}"
+    return sorted(key for key in _load_linkdest(cfg) if key.endswith(suffix))
+
+
+def rename_snapshot_baselines(cfg: HeadConfig, old: str, new: str) -> list[str]:
+    """Move every ``project@old`` baseline key to ``project@new``.
+
+    A key already present for ``new`` keeps its value: it is the newer
+    observation. Returns the keys that were moved.
+    """
+    suffix = f"@{old}"
+    moved: list[str] = []
+    with _linkdest_lock(cfg):
+        state = _load_linkdest(cfg)
+        for key in sorted(state):
+            if not key.endswith(suffix):
+                continue
+            state.setdefault(key[: -len(old)] + new, state[key])
+            del state[key]
+            moved.append(key)
+        if moved:
+            _save_linkdest(cfg, state)
+    return moved
+
+
 def _remember_snapshot(
     cfg: HeadConfig, project_name: str, node: Node, job_id: str
 ) -> None:

@@ -1615,6 +1615,8 @@ from .snapshots import (  # noqa: E402
     _rebuilt_queue_meta as _rebuilt_queue_meta,
     _remember_snapshot as _remember_snapshot,
     _repair_queued_snapshot as _repair_queued_snapshot,
+    rename_snapshot_baselines as rename_snapshot_baselines,
+    snapshot_baseline_keys as snapshot_baseline_keys,
     _save_linkdest as _save_linkdest,
     _snapshot_baselines as _snapshot_baselines,
     _source_matches_baseline as _source_matches_baseline,
