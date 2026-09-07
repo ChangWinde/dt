@@ -1541,6 +1541,11 @@ class _UniqueKeyLoader(_SafeLoaderBase):  # type: ignore[misc]  # yaml is untype
         return cast(dict[object, object], super().construct_mapping(node, deep=deep))
 
 
+def parse_text(payload: str) -> "HeadConfig | LaptopConfig":
+    """Parse configuration text exactly as ``load`` would read the file."""
+    return parse(_parse_yaml_strict(payload))
+
+
 def _parse_yaml_strict(payload: str) -> object:
     loader = _UniqueKeyLoader(payload)
     try:

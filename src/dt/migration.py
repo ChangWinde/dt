@@ -11,18 +11,21 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 from uuid import uuid4
 
-from .config import HeadConfig, Node
+from . import agent as agent_mod
+from .config import HeadConfig, Node, is_config_id, parse_text
+from .dispatch import rename_snapshot_baselines, snapshot_baseline_keys
 from .jobs import (
     MAX_JOB_RECORD_BYTES,
     JobEntry,
     RegistryError,
     decode_registry_document,
     encode_registry_entry,
+    iter_all,
     job_lock,
     list_all,
     load,
@@ -1029,4 +1032,187 @@ def apply_layout(
             "post_unknown_rows": list(post_accounting["unknown_rows"]),
             "post_summary": post_summary,
         },
+    }
+
+
+# --- node rename -------------------------------------------------------------
+#
+# A node's SSH name is its identity everywhere dt remembers it: every registry
+# row it ran or was pinned to, the transfer-baseline map, the configuration.
+# Retiring a transitional alias (a host renamed on the SSH side) therefore
+# strands history: `dt pull` / `dt logs` of a finished job go to a name that
+# no longer resolves, and running jobs recorded under it are lost to the
+# agent. This migration rewrites every persisted mention in one pass while the
+# old name still resolves; the derived indexes (active jobs, artifact
+# replicas) rebuild themselves from the registry.
+
+
+@dataclass
+class NodeRenamePlan:
+    old: str
+    new: str
+    rows: list[str]
+    active_rows: list[str]
+    claimed_rows: list[str]
+    linkdest_keys: list[str]
+    config_mentions: int
+    config_names_new: bool
+    agent_alive: bool
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": "dt_node_rename_plan_v1",
+            "old": self.old,
+            "new": self.new,
+            "rows": len(self.rows),
+            "active_rows": list(self.active_rows),
+            "claimed_rows": list(self.claimed_rows),
+            "linkdest_keys": list(self.linkdest_keys),
+            "config_mentions": self.config_mentions,
+            "config_names_new": self.config_names_new,
+            "agent_alive": self.agent_alive,
+            "blockers": self.blockers(),
+        }
+
+    def blockers(self) -> list[str]:
+        problems: list[str] = []
+        if self.agent_alive:
+            problems.append(
+                "the resident agent is running; stop it first (dt agent stop) - "
+                "running jobs keep running on the node and are adopted after the rename"
+            )
+        if self.claimed_rows:
+            problems.append(
+                "a dispatch is in flight for "
+                + ", ".join(self.claimed_rows)
+                + "; let it finish or fail before renaming"
+            )
+        if self.config_mentions == 0 and not self.config_names_new:
+            problems.append(
+                f"the configuration names neither {self.old!r} nor {self.new!r}"
+            )
+        return problems
+
+
+_NODE_NAME_FIELDS = ("node", "pin_node", "dispatch_node")
+
+
+def _row_mentions_node(entry: JobEntry, name: str) -> bool:
+    return (
+        any(getattr(entry, field) == name for field in _NODE_NAME_FIELDS)
+        or name in entry.placement_failures
+        or name in entry.worker_roots
+        or bool(entry.exclude_nodes and name in entry.exclude_nodes)
+    )
+
+
+def _rename_in_row(entry: JobEntry, old: str, new: str) -> None:
+    for field in _NODE_NAME_FIELDS:
+        if getattr(entry, field) == old:
+            setattr(entry, field, new)
+    if old in entry.placement_failures:
+        failures = dict(entry.placement_failures)
+        failures[new] = failures.pop(old)
+        entry.placement_failures = failures
+    if old in entry.worker_roots:
+        roots = dict(entry.worker_roots)
+        roots[new] = roots.pop(old)
+        entry.worker_roots = roots
+    if entry.exclude_nodes and old in entry.exclude_nodes:
+        entry.exclude_nodes = sorted(
+            {new if name == old else name for name in entry.exclude_nodes}
+        )
+
+
+def _config_mentions(config_path: Path, name: str) -> int:
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    return len(
+        re.findall(rf"(?<![A-Za-z0-9_.-]){re.escape(name)}(?![A-Za-z0-9_.-])", text)
+    )
+
+
+def plan_node_rename(
+    cfg: HeadConfig, old: str, new: str, *, config_path: Path
+) -> NodeRenamePlan:
+    if old == new:
+        raise ValueError("the old and new node names are the same")
+    for name in (old, new):
+        if not is_config_id(name):
+            raise ValueError(f"node name is not a configuration identifier: {name!r}")
+    rows: list[str] = []
+    active_rows: list[str] = []
+    claimed_rows: list[str] = []
+    for entry in iter_all(cfg):
+        if not _row_mentions_node(entry, old):
+            continue
+        rows.append(entry.job_id)
+        if entry.status in ("queued", "running"):
+            active_rows.append(entry.job_id)
+        if entry.dispatch_token is not None or entry.dispatch_node is not None:
+            claimed_rows.append(entry.job_id)
+    linkdest_keys = snapshot_baseline_keys(cfg, old)
+    return NodeRenamePlan(
+        old=old,
+        new=new,
+        rows=rows,
+        active_rows=active_rows,
+        claimed_rows=claimed_rows,
+        linkdest_keys=linkdest_keys,
+        config_mentions=_config_mentions(config_path, old),
+        config_names_new=any(node.name == new for node in cfg.nodes),
+        agent_alive=agent_mod.alive_pid(cfg) is not None,
+    )
+
+
+def apply_node_rename(
+    cfg: HeadConfig, plan: NodeRenamePlan, *, config_path: Path
+) -> dict[str, object]:
+    """Rewrite the configuration, every registry row and the baseline map.
+
+    The configuration goes first (a whole-word textual replacement, keeping a
+    timestamped backup beside it, re-parsed before anything else moves) so
+    that no row ever names a node the configuration does not know. Rows are
+    rewritten one at a time under their job lock through the same validating
+    save every dispatcher uses.
+    """
+    blockers = plan.blockers()
+    if blockers:
+        raise ValueError("; ".join(blockers))
+    config_backup: str | None = None
+    if plan.config_mentions:
+        text = config_path.read_text(encoding="utf-8")
+        renamed = re.sub(
+            rf"(?<![A-Za-z0-9_.-]){re.escape(plan.old)}(?![A-Za-z0-9_.-])",
+            plan.new,
+            text,
+        )
+        parse_text(renamed)  # refuse before writing
+        backup = config_path.with_name(
+            f"{config_path.name}.bak-node-rename-{time.strftime('%Y%m%d-%H%M%S')}"
+        )
+        shutil.copy2(config_path, backup)
+        config_backup = str(backup)
+        temporary = config_path.with_name(f".{config_path.name}.{os.getpid()}.tmp")
+        temporary.write_text(renamed, encoding="utf-8")
+        os.replace(temporary, config_path)
+    rewritten: list[str] = []
+    for job_id in plan.rows:
+        with job_lock(cfg, job_id):
+            entry = load(cfg, job_id)
+            if entry is None or not _row_mentions_node(entry, plan.old):
+                continue
+            _rename_in_row(entry, plan.old, plan.new)
+            save(cfg, entry)
+            rewritten.append(job_id)
+    renamed_keys = rename_snapshot_baselines(cfg, plan.old, plan.new)
+    return {
+        "schema_version": "dt_node_rename_v1",
+        "old": plan.old,
+        "new": plan.new,
+        "rows_rewritten": rewritten,
+        "linkdest_keys_renamed": renamed_keys,
+        "config_backup": config_backup,
     }

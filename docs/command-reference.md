@@ -50,6 +50,7 @@ This page helps operators choose a command and handle its result. Run
 | `dt events` | Query the bounded, redacted operation journal on this host or a head |
 | `dt storage` | Inventory DistTrainer-managed storage |
 | `dt migrate layout` | Plan or apply identity-verified legacy runtime moves |
+| `dt migrate node-rename` | Rename a node everywhere dt remembers it (configuration, registry rows, transfer baselines) |
 | `dt compact` | Remove recoverable old code copies while retaining job evidence (the agent also sweeps automatically; see `queue.auto_compact_hours`) |
 | `dt clean` | Delete explicitly scoped old jobs, results, environments, or deployment trees |
 | `dt sync` | Incrementally stage project code or explicit large inputs |

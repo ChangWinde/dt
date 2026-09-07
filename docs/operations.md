@@ -405,6 +405,29 @@ user's login environment to override the choice. Inputs that must be fetched
 online are still better published once with `dt sync --artifact` than
 downloaded by every job.
 
+### Renaming a node
+
+A node's SSH name is its identity in every registry row it ran or was pinned
+to, in the transfer-baseline map and in the configuration. Retiring a
+transitional alias without moving those records strands them: `dt pull` and
+`dt logs` of finished jobs go to a name that no longer resolves, and running
+jobs recorded under it are lost to the agent. While both names still resolve:
+
+```bash
+dt agent stop                      # running jobs keep running on the node
+dt migrate node-rename OLD NEW     # plan only: rows, baselines, config mentions, blockers
+dt migrate node-rename OLD NEW -y  # rewrite configuration (backup kept), rows, baselines
+dt agent start                     # adopts the running jobs under NEW
+# now retire the OLD SSH alias; dt free must list NEW
+```
+
+The rename refuses to start while the agent is alive or a dispatch is in
+flight, rewrites the configuration first (whole-word replacement, re-parsed
+before it is written) so no row ever names a node the configuration does not
+know, and rewrites rows one at a time under their job lock. The derived
+indexes (active jobs, artifact replicas) rebuild from the registry on their
+own.
+
 ### Draining a node for maintenance
 
 Set `nodes[].drained: true` and the agent (which reloads the config every

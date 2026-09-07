@@ -84,6 +84,7 @@ COMMAND_EMITS: dict[str, JsonEmission] = {
     "agent stop": ("object", ("dt_agent_control_v1",)),
     "agent install": ("object", ("dt_agent_control_v1",)),
     "migrate layout": ("object", ("dt_layout_migration_v1",)),
+    "migrate node-rename": ("object", ("dt_node_rename_plan_v1", "dt_node_rename_v1")),
     "init": ("object", ("dt_init_v1",)),
     "contract": ("object", (SCHEMA_VERSION,)),
 }
@@ -133,6 +134,8 @@ ERROR_KINDS: dict[str, str] = {
     "plan_failed": "the submission preview could not be computed",
     "log_read_failed": "the job log could not be read on the node",
     "telemetry_read_failed": "the job telemetry could not be read on the node",
+    "migration_blocked": "a runtime-data migration cannot start until a precondition is met",
+    "migration_failed": "a runtime-data migration stopped before completing",
     "telemetry_protocol": "the telemetry payload did not match its schema",
     "diagnosis_protocol": "the head returned diagnosis evidence dt cannot parse",
     "metric_artifact_not_found": "no output matched the compare metric glob",
