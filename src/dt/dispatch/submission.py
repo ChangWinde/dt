@@ -277,6 +277,9 @@ def _spec_entry_fields(
         "require_path": spec.require_path,
         "require_disk_gib": spec.require_disk_gib,
         "pin_node": spec.node,
+        "exclude_nodes": (
+            sorted(set(spec.exclude_nodes)) if spec.exclude_nodes else None
+        ),
         "max_hours": spec.max_hours,
         "min_vram_mib": spec.min_vram_mib,
         "max_vram_mib": spec.max_vram_mib,
@@ -357,6 +360,8 @@ def submit(
         )
     if spec.extras is None:
         spec.extras = project.extras
+    if spec.exclude_nodes is None and project.exclude_nodes:
+        spec.exclude_nodes = list(project.exclude_nodes)
 
     sha, dirty, diff = _root.git_info(project_dir)
     submodules = git_provenance_mod.submodule_commits(project_dir)

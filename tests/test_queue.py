@@ -2070,6 +2070,79 @@ def test_pending_dependency_does_not_starve_unrelated_queue_work(
     ]
 
 
+def test_unpinned_gpu_job_behind_a_busy_pin_is_placed_elsewhere(tmp_path, monkeypatch):
+    """Field report: `dt run --node HEAD` at the head of the queue with HEAD
+    busy held an unpinned job behind it while another node sat idle for a
+    quarter of an hour. The unpinned job is now attempted with the busy pin's
+    node reserved for the pinned waiter; a later job pinned to that same node
+    still keeps its FIFO place behind the first."""
+    import dt.agent as agent
+
+    cfg = _cfg(tmp_path)
+    save(cfg, _entry("pinned-head", "queued", created_at=1.0, pin_node="n1"))
+    save(cfg, _entry("anywhere", "queued", created_at=2.0))
+    save(cfg, _entry("pinned-again", "queued", created_at=3.0, pin_node="n1"))
+    calls: list[tuple[str, frozenset[str] | None]] = []
+
+    def fake_dispatch(cfg_, entry_, log_, **kwargs):
+        calls.append((entry_.job_id, kwargs.get("reserved_nodes")))
+        if entry_.job_id == "pinned-head":
+            return "busy", None
+        return "started", "n2"
+
+    monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
+    monkeypatch.setattr(
+        agent, "_reconcile_jobs", lambda cfg_, log_, entries=None: entries or []
+    )
+
+    outcomes, _ = agent._process_once_with_snapshot(cfg, lambda _m: None)
+
+    assert outcomes == [
+        ("pinned-head", "busy"),
+        ("anywhere", "started"),
+        ("pinned-again", "busy"),
+    ]
+    # The unpinned job was attempted with n1 reserved for the pinned waiter;
+    # the second pin to n1 was not attempted at all.
+    assert calls == [("pinned-head", None), ("anywhere", frozenset({"n1"}))]
+
+
+def test_pick_candidates_skips_reserved_and_excluded_nodes():
+    import dt.dispatch as dispatch
+    from dt.config import ConfigError, Node
+
+    nodes = [Node(name="n1"), Node(name="n2"), Node(name="n3")]
+    statuses = [_status("n1", 1), _status("n2", 1), _status("n3", 1)]
+    spec = dispatch.RunSpec(name="j", gpus=1, cmd=["true"])
+
+    ranked = dispatch.pick_candidates(statuses, nodes, spec, 0)
+    assert {node.name for node in ranked} == {"n1", "n2", "n3"}
+    reserved = dispatch.pick_candidates(
+        statuses, nodes, spec, 0, reserved_nodes=frozenset({"n1"})
+    )
+    assert {node.name for node in reserved} == {"n2", "n3"}
+    spec.exclude_nodes = ["n2"]
+    both = dispatch.pick_candidates(
+        statuses, nodes, spec, 0, reserved_nodes=frozenset({"n1"})
+    )
+    assert [node.name for node in both] == ["n3"]
+
+    # A pin is an explicit override: reservations never move it ...
+    pinned = dispatch.RunSpec(name="j", gpus=1, cmd=["true"], node="n1")
+    assert [
+        node.name
+        for node in dispatch.pick_candidates(
+            statuses, nodes, pinned, 0, reserved_nodes=frozenset({"n1"})
+        )
+    ] == ["n1"]
+    # ... but pinning to an excluded node is a contradiction, refused up front.
+    contradictory = dispatch.RunSpec(
+        name="j", gpus=1, cmd=["true"], node="n1", exclude_nodes=["n1"]
+    )
+    with pytest.raises(ConfigError, match="contradict"):
+        dispatch._validate_run_spec(contradictory)  # noqa: SLF001
+
+
 def test_blocked_placement_backs_off_while_dependency_waits_stay_hot(
     tmp_path,
     monkeypatch,
@@ -3829,6 +3902,7 @@ def test_dispatch_queued_replays_setup_extras_and_fork_lineage(tmp_path, monkeyp
         setup="uv pip install --no-deps ./libs/Foo",
         setup_inputs=["libs/Foo"],
         extras=["sim", "data"],
+        exclude_nodes=["n9"],
         forked_from="source-job",
         cache_source_job="source-job",
         cache_source_job_dir="dt/jobs/source-job",
@@ -3841,6 +3915,7 @@ def test_dispatch_queued_replays_setup_extras_and_fork_lineage(tmp_path, monkeyp
     )
     (dispatch.stage_dir(cfg, entry.job_id) / "code").mkdir(parents=True)
     save(cfg, entry)
+    assert load(cfg, entry.job_id).exclude_nodes == ["n9"]  # registry round trip
     request = dispatch.intent_mod.create(
         entry.request_id or "", "a" * 64, entry.job_id, now=1.0
     )
@@ -3895,6 +3970,7 @@ def test_dispatch_queued_replays_setup_extras_and_fork_lineage(tmp_path, monkeyp
     assert seen["spec"].setup == "uv pip install --no-deps ./libs/Foo"
     assert seen["spec"].setup_inputs == ["libs/Foo"]
     assert seen["spec"].extras == ["sim", "data"]
+    assert seen["spec"].exclude_nodes == ["n9"]
     assert seen["spec"].forked_from == "source-job"
     assert seen["spec"].cache_source_job == "source-job"
     assert seen["spec"].cache_source_job_dir == "dt/jobs/source-job"

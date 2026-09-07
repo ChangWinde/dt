@@ -229,6 +229,9 @@ class JobEntry:
     require_path: str | None = None
     require_disk_gib: int | None = None
     pin_node: str | None = None
+    # Nodes this job must never be placed on (`--exclude-node`, or the
+    # project's `exclude_nodes`); unpinned placement skips them.
+    exclude_nodes: list[str] | None = None
     reason: str | None = None  # queue blocker, failure/loss, or lifecycle warning
     # Private crash-recovery hint written before a queued remote attempt. It
     # is cleared only after the attempt is proven absent or adopted.
@@ -924,6 +927,12 @@ def _validate_entry_contracts(entry: JobEntry) -> None:
         raise ValueError("job registry has invalid launch phases")
     if len(entry.launch_phases_s) > MAX_JOB_COLLECTION_ITEMS:
         raise ValueError("job registry has too many launch phases")
+    if entry.exclude_nodes is not None and (
+        not isinstance(entry.exclude_nodes, list)
+        or len(entry.exclude_nodes) > MAX_JOB_COLLECTION_ITEMS
+        or any(not is_config_id(name) for name in entry.exclude_nodes)
+    ):
+        raise ValueError("job registry has invalid excluded nodes")
     if entry.setup_inputs is not None:
         if not isinstance(entry.setup_inputs, list) or len(entry.setup_inputs) > (
             MAX_SETUP_INPUTS
@@ -2054,6 +2063,9 @@ def queue_eligible_nodes(cfg: HeadConfig, entry: JobEntry) -> list[str]:
     names = [node.name for node in cfg.nodes if not node.drained]
     if entry.pin_node is not None:
         return [name for name in names if name == entry.pin_node]
+    if entry.exclude_nodes:
+        excluded = set(entry.exclude_nodes)
+        return [name for name in names if name not in excluded]
     return names
 
 

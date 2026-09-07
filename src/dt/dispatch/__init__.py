@@ -24,7 +24,14 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Mapping
 
 from .. import custom_env as custom_env_mod
-from ..config import ConfigError, HeadConfig, Node, Project, active_dt_command
+from ..config import (
+    ConfigError,
+    HeadConfig,
+    Node,
+    Project,
+    active_dt_command,
+    is_config_id,
+)
 from ..artifact_distribution import TransferExecutor as TransferExecutor
 from ..layout import normalize_node_root
 from ..maintenance import (
@@ -588,6 +595,8 @@ class RunSpec:
     gpu_isolation: str = "advisory"
     project: str | None = None
     node: str | None = None
+    # Nodes this job must never be placed on; None takes the project default.
+    exclude_nodes: list[str] | None = None
     require_path: str | None = None
     require_disk_gib: int | None = None
     max_hours: float | None = None
@@ -784,6 +793,13 @@ def _validate_run_spec(spec: RunSpec) -> None:
         raise ConfigError(str(exc)) from exc
     if spec.gpus < 0:
         raise ConfigError("gpus must be non-negative")
+    if spec.exclude_nodes is not None:
+        if not all(is_config_id(name) for name in spec.exclude_nodes):
+            raise ConfigError("excluded node names must be configuration identifiers")
+        if spec.node is not None and spec.node in spec.exclude_nodes:
+            raise ConfigError(
+                f"--node {spec.node} and --exclude-node {spec.node} contradict each other"
+            )
     if (
         spec.dispatch_token is not None
         and re.fullmatch(r"[0-9a-f]{32}", spec.dispatch_token) is None
@@ -995,6 +1011,9 @@ def _resource_spec_kwargs(entry: JobEntry) -> dict[str, Any]:
         "setup": entry.setup,
         "setup_inputs": (
             list(entry.setup_inputs) if entry.setup_inputs is not None else None
+        ),
+        "exclude_nodes": (
+            list(entry.exclude_nodes) if entry.exclude_nodes is not None else None
         ),
         "extras": list(entry.extras) if entry.extras else None,
         "custom_env": dict(entry.custom_env),
@@ -1408,11 +1427,23 @@ def drained_probe_reasons(
 
 
 def pick_candidates(
-    statuses: list[NodeStatus], nodes: list[Node], spec: RunSpec, reserve: int = 0
+    statuses: list[NodeStatus],
+    nodes: list[Node],
+    spec: RunSpec,
+    reserve: int = 0,
+    *,
+    reserved_nodes: frozenset[str] = frozenset(),
 ) -> list[Node]:
     """Rank eligible nodes. `reserve` = cards to leave free per node (7.4 knob);
-    an explicit --node pin is a user override and bypasses it."""
+    an explicit --node pin is a user override and bypasses it.
+
+    ``reserved_nodes`` are nodes an earlier queued job is waiting for (a pin on
+    a busy node): unpinned work is placed elsewhere so that the earlier job
+    keeps its FIFO claim there while idle nodes still get used. The job's own
+    ``exclude_nodes`` are never candidates either.
+    """
     by_name = {n.name: n for n in nodes}
+    excluded = reserved_nodes | frozenset(spec.exclude_nodes or ())
     if spec.node:
         if spec.node not in by_name:
             raise ConfigError(
@@ -1433,6 +1464,7 @@ def pick_candidates(
         and disk_rejection_reason(s, spec) is None
         and s.node in by_name
         and not by_name[s.node].drained
+        and s.node not in excluded
     ]
     if spec.gpus == 0:
         # CPU work takes no card, so ranking it by idle cards sent a head's

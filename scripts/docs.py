@@ -43,6 +43,9 @@ IGNORED_PARTS = {
     ".venv",
     "__pycache__",
     "dist",
+    # Field reports other agents drop for this project: untracked, and their
+    # links point wherever the reporter's own repository keeps things.
+    "inbox",
 }
 
 INLINE_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")

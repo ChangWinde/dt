@@ -211,7 +211,7 @@ _OPTIONAL_NUMBER_FIELDS = frozenset(
     }
 )
 _TEXT_LIST_FIELDS = frozenset({"extras", "after_result_states", "custom_env_keys"})
-_OPTIONAL_TEXT_LIST_FIELDS = frozenset({"setup_inputs"})
+_OPTIONAL_TEXT_LIST_FIELDS = frozenset({"setup_inputs", "exclude_nodes"})
 _TEXT_MAP_FIELDS = frozenset({"placement_failures", "worker_roots"})
 _OPTIONAL_TEXT_MAP_FIELDS = frozenset({"submodule_commits", "artifact_targets"})
 _NUMBER_MAP_FIELDS = frozenset({"launch_phases_s"})

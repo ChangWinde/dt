@@ -202,6 +202,7 @@ class SubmissionRequest:
     command: tuple[str, ...]
     project: str | None = None
     node: str | None = None
+    exclude_nodes: tuple[str, ...] = ()
     require_path: str | None = None
     require_disk_gib: int | None = None
     max_hours: float | None = None
@@ -248,6 +249,7 @@ class SubmissionRequest:
             cmd=list(self.command),
             project=self.project,
             node=self.node,
+            exclude_nodes=list(self.exclude_nodes) if self.exclude_nodes else None,
             require_path=self.require_path,
             require_disk_gib=self.require_disk_gib,
             max_hours=self.max_hours,

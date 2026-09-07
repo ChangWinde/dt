@@ -228,6 +228,10 @@ class Project:
     setup_inputs: list[str] | None = None  # snapshot paths that affect setup;
     # None keeps conservative whole-snapshot isolation
     extras: list[str] = field(default_factory=list)  # uv sync --extra groups
+    # Nodes this project's jobs are never placed on unless a run says
+    # otherwise (`--exclude-node`): a node whose driver or library stack
+    # breaks one project's workload need not be drained for everyone.
+    exclude_nodes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1148,7 +1152,7 @@ def _parse_projects(data: dict[str, Any]) -> dict[str, Project]:
         if isinstance(p, dict):
             _reject_unknown(
                 p,
-                {"path", "setup", "setup_inputs", "extras"},
+                {"path", "setup", "setup_inputs", "extras", "exclude_nodes"},
                 f"project {name!r}",
             )
             if "path" not in p:
@@ -1184,11 +1188,30 @@ def _parse_projects(data: dict[str, Any]) -> dict[str, Project]:
                     )
                     if normalized_extra not in extras:
                         extras.append(normalized_extra)
+            raw_excluded = p.get("exclude_nodes")
+            if raw_excluded is None:
+                exclude_nodes: list[str] = []
+            elif not isinstance(raw_excluded, list):
+                raise ConfigError(f"project {name!r} `exclude_nodes` must be a list")
+            else:
+                _require_item_limit(
+                    len(raw_excluded),
+                    f"projects.{name}.exclude_nodes",
+                    MAX_PROJECT_EXTRAS,
+                )
+                exclude_nodes = []
+                for raw_node in raw_excluded:
+                    normalized_node = _config_id(
+                        raw_node, f"projects.{name}.exclude_nodes[]"
+                    )
+                    if normalized_node not in exclude_nodes:
+                        exclude_nodes.append(normalized_node)
             projects[name] = Project(
                 path=project_path,
                 setup=setup,
                 setup_inputs=setup_inputs,
                 extras=extras,
+                exclude_nodes=exclude_nodes,
             )
         else:
             project_path = _project_root(p, f"projects.{name}")

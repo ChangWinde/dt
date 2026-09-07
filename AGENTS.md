@@ -62,7 +62,9 @@ capacity fits. A job-specific blocker does not hold up runnable work behind it
 and is retried on a capped exponential backoff; dependency waits stay cheap
 and are re-checked every tick. FIFO is preserved among jobs competing for the
 same capacity; a busy pinned node does not block later work pinned to a
-different node.
+different node, and an unpinned job behind it is placed on any other node (the
+busy pin's node stays reserved for the earlier waiter). `--exclude-node` /
+`projects.NAME.exclude_nodes` keep a job off named nodes.
 
 To preload independent work on one node:
 
@@ -233,3 +235,13 @@ uv run --no-sync ruff format --check .
 
 Read `.github/CONTRIBUTING.md` for the complete gate and `docs/README.md` for
 the documentation map.
+
+## Field reports (`inbox/`)
+
+Other agents drop bug reports for this project as Markdown files in `inbox/`
+(ignored by git). Find the root cause from logs and node-side evidence before
+trusting a report's own diagnosis — the reporter sees symptoms, not the
+mechanism. When a report is handled, archive a verbatim copy as
+`docs/audits/field-report-<date>-<slug>.md` (the tracked record; run
+`scripts/docs.py --write`) and rename the original in place with a `fix-`
+prefix so the reporter sees it was taken; never delete it.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 import os
 import re
 import shlex
@@ -105,6 +105,7 @@ def dispatch_queued(
     log: Callable[[str], None],
     *,
     statuses: Sequence[NodeStatus] | None = None,
+    reserved_nodes: frozenset[str] = frozenset(),
 ) -> tuple[str, str | None]:
     """Try to place a queued job now. Returns (outcome, detail) with outcome in:
     started | finished | busy | waiting | blocked | unreachable | failed |
@@ -118,11 +119,18 @@ def dispatch_queued(
     submission probes the center to decide whether to enqueue at all), so
     the placement does not repeat a fleet-wide probe seconds later; the
     launcher's own locked capacity check still guards the placement.
+
+    ``reserved_nodes`` are nodes an earlier queued job in this pass is waiting
+    for (its pin is busy); an unpinned job is placed elsewhere so the earlier
+    job keeps its FIFO claim there while idle nodes still get used.
     """
     with _INFLIGHT_LOCK:
         _INFLIGHT_JOB_IDS[entry.job_id] = threading.get_ident()
     try:
-        return _root._dispatch_queued_gated(cfg, entry, log, statuses=statuses)
+        # Test doubles stub the gate with its historical signature; pass the
+        # reservation only when there is one.
+        extra = {"reserved_nodes": reserved_nodes} if reserved_nodes else {}
+        return _root._dispatch_queued_gated(cfg, entry, log, statuses=statuses, **extra)
     finally:
         with _INFLIGHT_LOCK:
             _INFLIGHT_JOB_IDS.pop(entry.job_id, None)
@@ -134,6 +142,7 @@ def _dispatch_queued_gated(
     log: Callable[[str], None],
     *,
     statuses: Sequence[NodeStatus] | None = None,
+    reserved_nodes: frozenset[str] = frozenset(),
 ) -> tuple[str, str | None]:
     """Settle dependencies under the job lock, then place (see dispatch_queued)."""
     _root._finalize_dependency_rows(
@@ -324,9 +333,12 @@ def _dispatch_queued_gated(
                 current.reason = None
                 _root.save(cfg, current)
         entry.__dict__.update(current.__dict__)
-    if statuses is None:
-        return _root._dispatch_queued_active(cfg, entry, log)
-    return _root._dispatch_queued_active(cfg, entry, log, statuses=statuses)
+    active_kwargs: dict[str, Any] = {}
+    if statuses is not None:
+        active_kwargs["statuses"] = statuses
+    if reserved_nodes:
+        active_kwargs["reserved_nodes"] = reserved_nodes
+    return _root._dispatch_queued_active(cfg, entry, log, **active_kwargs)
 
 
 def _existing_dispatch_outcome(entry: JobEntry) -> tuple[str, str | None]:
@@ -1388,6 +1400,7 @@ def _dispatch_queued_active(
     log: Callable[[str], None],
     *,
     statuses: Sequence[NodeStatus] | None = None,
+    reserved_nodes: frozenset[str] = frozenset(),
 ) -> tuple[str, str | None]:
     """Dispatch one queued entry with atomic, cancellation-aware transitions."""
 
@@ -1471,7 +1484,11 @@ def _dispatch_queued_active(
     drained_probe_reasons(cfg, spec, probe_reasons)
     try:
         candidates = _root.pick_candidates(
-            statuses, cfg.nodes, spec, _root._reserve_for(cfg, spec)
+            statuses,
+            cfg.nodes,
+            spec,
+            _root._reserve_for(cfg, spec),
+            **({"reserved_nodes": reserved_nodes} if reserved_nodes else {}),
         )
     except ConfigError as e:
         return fail(str(e))

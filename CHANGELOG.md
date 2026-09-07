@@ -6,6 +6,26 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+### Added
+
+- `dt run --exclude-node NODE` (repeatable) and `projects.NAME.exclude_nodes`:
+  "any node but this one" for a workload one node's library stack breaks
+  (random SIGFPE in one simulator, field report) without draining the node
+  for everyone. Recorded on the job, so `rerun`, `fork` and queued re-dispatch
+  keep it; `dt free --explain` never promises an excluded node; pinning to an
+  excluded node is refused.
+
+### Fixed
+
+- An unpinned GPU job behind a job pinned to a busy node is placed on another
+  node. The queue walk and admission held it back ("an unpinned job could use
+  a card on every busy pin"), so a `dt run --node HEAD` at the head of the
+  queue idled every other node — `1/1` free on a second node for a quarter of
+  an hour (field report). The busy pin's node is now reserved for the pinned
+  waiter and the unpinned job is placed elsewhere; when the only free node is
+  the reserved one it waits behind the pin as before, and later work pinned to
+  the busy node still keeps its FIFO place.
+
 ## 0.13.20 — 2026-09-07
 
 ### Added
