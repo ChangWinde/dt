@@ -301,6 +301,41 @@ def test_project_extras_are_deduplicated_without_reordering():
     assert cfg.projects["p"].extras == ["sim", "data"]
 
 
+def test_project_exclude_nodes_are_parsed_deduplicated_and_validated():
+    """A node whose library stack breaks one project's workload (a random
+    SIGFPE in one simulator, field report) need not be drained for everyone:
+    the project lists it and its unpinned jobs are placed elsewhere."""
+    cfg = parse(
+        {
+            "center": "c",
+            "nodes": ["n1", "n2"],
+            "projects": {
+                "p": {"path": "~/p", "exclude_nodes": ["n2", "n2"]},
+                "q": "~/q",
+            },
+        }
+    )
+    assert cfg.projects["p"].exclude_nodes == ["n2"]
+    assert cfg.projects["q"].exclude_nodes == []
+
+    with pytest.raises(ConfigError, match="exclude_nodes"):
+        parse(
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "projects": {"p": {"path": "~/p", "exclude_nodes": "n1"}},
+            }
+        )
+    with pytest.raises(ConfigError, match=r"exclude_nodes\[\]"):
+        parse(
+            {
+                "center": "c",
+                "nodes": ["n1"],
+                "projects": {"p": {"path": "~/p", "exclude_nodes": ["bad node"]}},
+            }
+        )
+
+
 @pytest.mark.parametrize(
     "name",
     ["foo/bar", "foo?bar", ".hidden", "p" * 65],

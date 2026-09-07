@@ -40,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import Event, Lock, Thread
 from types import FrameType
-from typing import Callable
+from typing import Any, Callable
 
 from . import completion as completion_mod
 from .config import HeadConfig, active_dt_command
@@ -950,13 +950,18 @@ class DispatchPool:
         cfg: HeadConfig,
         entry: JobEntry,
         log: Callable[[str], None],
+        *,
+        reserved_nodes: frozenset[str] = frozenset(),
     ) -> None:
         # The tick's snapshot row stays untouched: the worker mutates a copy,
         # and the tick reads the registry again before deciding anything.
         private = copy.deepcopy(entry)
+        kwargs: dict[str, Any] = (
+            {"reserved_nodes": reserved_nodes} if reserved_nodes else {}
+        )
         item = _InflightDispatch(
             entry=private,
-            future=self._executor.submit(dispatch_queued, cfg, private, log),
+            future=self._executor.submit(dispatch_queued, cfg, private, log, **kwargs),
             started_at=time.monotonic(),
             pin_node=entry.pin_node,
         )
@@ -1267,13 +1272,11 @@ def _process_once_with_snapshot(
             if unpinned_gpu_wait:
                 results.append((entry.job_id, "busy"))
                 continue
-            if busy_pins and entry.pin_node is None:
-                # An unpinned GPU job could consume capacity on every busy
-                # pin, so it overlaps the earlier pinned waiters; from here on
-                # only CPU work is attempted.
-                results.append((entry.job_id, "busy"))
-                unpinned_gpu_wait = True
-                continue
+            # An unpinned GPU job behind pinned waiters is placed on any other
+            # node: the busy pins' nodes stay reserved for the earlier jobs
+            # (FIFO where they compete), while an idle node elsewhere is used.
+            # Holding it instead left a free node idle for as long as the
+            # pinned head of the queue waited for its own node (field report).
             if entry.pin_node in busy_pins:
                 # This job competes for the same capacity as an earlier pinned
                 # waiter. Keep its FIFO position while still reaching jobs
@@ -1289,6 +1292,13 @@ def _process_once_with_snapshot(
                 # burning the fleet every tick.
                 results.append((entry.job_id, "blocked"))
                 continue
+        # Nodes earlier queued GPU work is waiting for, or a launch is heading
+        # to: unpinned placement avoids them (see pick_candidates).
+        reserved_for_earlier = (
+            frozenset(busy_pins | inflight_nodes)
+            if entry.pin_node is None and entry.gpus_requested > 0
+            else frozenset()
+        )
         if pool is not None:
             # One dispatch per target node: the launcher's node lock would
             # only bounce a second launcher, after a snapshot it paid for.
@@ -1298,7 +1308,7 @@ def _process_once_with_snapshot(
             if pool.saturated():
                 results.append((entry.job_id, "busy"))
                 continue
-            pool.submit(cfg, entry, log)
+            pool.submit(cfg, entry, log, reserved_nodes=reserved_for_earlier)
             results.append((entry.job_id, "dispatching"))
             if entry.pin_node is not None:
                 inflight_nodes.add(entry.pin_node)
@@ -1308,7 +1318,12 @@ def _process_once_with_snapshot(
                 unpinned_gpu_wait = True
             continue
         try:
-            outcome, detail = dispatch_queued(cfg, entry, log)
+            if reserved_for_earlier:
+                outcome, detail = dispatch_queued(
+                    cfg, entry, log, reserved_nodes=reserved_for_earlier
+                )
+            else:
+                outcome, detail = dispatch_queued(cfg, entry, log)
         except Exception as exc:
             _note_dispatch_outcome(
                 cfg,

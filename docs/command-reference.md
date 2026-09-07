@@ -92,6 +92,14 @@ queue forecasting, replay, `rerun`, and `fork`. A GPU job fails closed when the
 node cannot provide trustworthy per-card memory inventory; `-g 0` is unaffected.
 This is a placement requirement, not the `--max-vram-mib` runtime usage guard.
 
+`--node NODE` pins a job; `--exclude-node NODE` (repeatable) is the other
+constraint the field needed — "any node but this one" — for a node whose
+library stack breaks one workload while serving every other project. A project
+can carry the default (`projects.NAME.exclude_nodes`); the flag overrides it
+for one run, and `--node X --exclude-node X` is refused. The exclusion is
+recorded on the job, so `rerun`, `fork` and queued re-dispatch keep it, and
+`dt free --explain` never promises an excluded node.
+
 For automated callers, add a stable `--request-id`. A retry with the same
 normalized intent returns the original job; a changed intent conflicts. If the
 client loses the response, query `dt request REQUEST_ID --json` instead of

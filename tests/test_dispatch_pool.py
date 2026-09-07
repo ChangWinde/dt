@@ -78,12 +78,14 @@ class _SlowDispatch:
         self.slow = slow
         self.outcomes = outcomes
         self.calls: list[str] = []
+        self.reserved: dict[str, frozenset[str] | None] = {}
         self.threads: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def __call__(self, cfg, entry, log):
+    def __call__(self, cfg, entry, log, **kwargs):
         with self._lock:
             self.calls.append(entry.job_id)
+            self.reserved[entry.job_id] = kwargs.get("reserved_nodes")
             self.threads[entry.job_id] = threading.get_ident()
         gate = self.slow.get(entry.job_id)
         if gate is not None:
@@ -201,6 +203,11 @@ def test_pool_holds_gpu_work_behind_an_unplaced_dispatch(tmp_path, monkeypatch):
             ("pinned", "busy"),
             ("same-node", "busy"),
         ]
+        # "second" was placed with the node "first" claimed kept out of reach.
+        deadline = time.monotonic() + 5
+        while "second" not in fake.reserved and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert fake.reserved["second"] == frozenset({"n1"})
         row = _entry("second", 2.0, dispatch_node="n2", dispatch_token="b" * 32)
         row.reason = "dispatching: n2"
         save(cfg, row)

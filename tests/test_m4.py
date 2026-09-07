@@ -191,16 +191,22 @@ def test_busy_pin_stops_at_later_unpinned_gpu_work(tmp_path, monkeypatch):
     )
     dispatched = []
 
-    def fake_dispatch(cfg_, entry, log):
+    reserved = {}
+
+    def fake_dispatch(cfg_, entry, log, **kwargs):
         dispatched.append(entry.job_id)
+        reserved[entry.job_id] = kwargs.get("reserved_nodes")
         return "busy", None
 
     monkeypatch.setattr(agent, "dispatch_queued", fake_dispatch)
     outcomes = process_once(cfg, lambda m: None)
-    # "anywhere" could use n1's cards, so it and every GPU job behind it keep
-    # their FIFO places; none of them is tried this pass.
+    # "anywhere" is tried with n1 kept for the pinned waiter; it finds no card
+    # elsewhere either, and as an unpinned GPU waiter it holds every GPU job
+    # behind it in FIFO order (field report: the old rule never tried it and
+    # left a free second node idle behind a pin to a busy one).
     assert outcomes == [("local", "busy"), ("anywhere", "busy"), ("remote", "busy")]
-    assert dispatched == ["local"]
+    assert dispatched == ["local", "anywhere"]
+    assert reserved["anywhere"] == frozenset({"n1"})
 
 
 def test_busy_pin_does_not_hold_cpu_only_work_on_the_same_node(

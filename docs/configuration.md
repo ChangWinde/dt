@@ -243,6 +243,7 @@ alone is insufficient and is not used as the isolation boundary.
 |---|---|
 | `projects.NAME.path` | Local project root captured at submission |
 | `projects.NAME.extras` | `uv` extras included in environment identity |
+| `projects.NAME.exclude_nodes` | Nodes this project's unpinned jobs are never placed on (`dt run --exclude-node` overrides per run) |
 | `projects.NAME.setup` | Trusted post-sync setup command executed inside the selected environment |
 | `projects.NAME.setup_inputs` | Project-relative inputs that define setup identity |
 | `default_project` | Project used when `-p/--project` is omitted |

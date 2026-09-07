@@ -11,3 +11,6 @@ coverage.xml
 /.logs/
 dist/
 *.egg-info/
+# Field reports from other agents (see the workspace conventions): kept out of
+# the repository; a handled report is renamed with a `fix-` prefix in place.
+/inbox/

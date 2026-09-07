@@ -64,8 +64,10 @@ def _capacity_overlaps(
         return False
     if older.dispatch_node is not None:
         return older.dispatch_node == candidate_node
-    if candidate.pin_node is None:
-        return True
+    # The candidate takes cards on ``candidate_node`` only. An older unpinned
+    # waiter could have used them; an older job pinned elsewhere could not,
+    # whether or not the candidate itself is pinned (an unpinned candidate
+    # used to be held behind every busy pin, leaving idle nodes unused).
     return older.pin_node is None or older.pin_node == candidate_node
 
 
@@ -344,7 +346,11 @@ def _capacity_state(
     cfg: HeadConfig,
     entry: JobEntry,
     capacity: _ResourceCapacity | None,
+    *,
+    excluded: frozenset[str] = frozenset(),
 ) -> tuple[str, str, str, str | None]:
+    """``excluded`` are nodes an unpinned entry must not be placed on: nodes
+    earlier pinned waiters hold, plus the entry's own ``exclude_nodes``."""
     if capacity is None:
         return (
             "pending_dispatch",
@@ -366,7 +372,11 @@ def _capacity_state(
             "repair the persisted pin or restore the configured node",
             None,
         )
-    candidates = [entry.pin_node] if entry.pin_node is not None else list(configured)
+    candidates = (
+        [entry.pin_node]
+        if entry.pin_node is not None
+        else [node for node in configured if node not in excluded]
+    )
     # Placement never uses a drained node (pick_candidates filters them,
     # pins included), so the explanation must not promise one either.
     if entry.pin_node is not None and entry.pin_node in drained:
@@ -596,8 +606,14 @@ def scheduler_snapshot(
             reason = f"max_my_jobs={cfg.queue.max_my_jobs} is reached"
             condition = f"running DT jobs must fall below {cfg.queue.max_my_jobs}"
         else:
+            # Unpinned work is placed away from the nodes earlier pinned
+            # waiters hold (the agent passes the same reservation), and never
+            # on its own excluded nodes.
+            excluded = frozenset(entry.exclude_nodes or ())
+            if entry.pin_node is None and entry.gpus_requested > 0:
+                excluded |= frozenset(busy_pins)
             state, reason, condition, selected_node = _capacity_state(
-                cfg, entry, capacity
+                cfg, entry, capacity, excluded=excluded
             )
 
         fifo_owner: str | None = None
@@ -606,8 +622,6 @@ def scheduler_snapshot(
             # attempted; only GPU work can overlap one (see _capacity_overlaps).
             if unpinned_capacity_wait is not None:
                 fifo_owner = unpinned_capacity_wait
-            elif entry.pin_node is None and busy_pins:
-                fifo_owner = next(iter(busy_pins.values()))
             elif entry.pin_node is not None and entry.pin_node in busy_pins:
                 fifo_owner = busy_pins[entry.pin_node]
         if fifo_owner is not None:

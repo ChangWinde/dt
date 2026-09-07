@@ -491,6 +491,7 @@ def _forward_run_to_head(
     gpus: int,
     project: str | None,
     node: str | None,
+    exclude_node: list[str] | None,
     require_path: str | None,
     require_disk_gib: int | None,
     max_hours: float | None,
@@ -552,6 +553,7 @@ def _forward_run_to_head(
         .option("-n", picked_name)
         .option("-p", project or None)
         .option("--node", node or None)
+        .repeat("--exclude-node", exclude_node or [])
         .option("--require-path", require_path or None)
         .option("--require-disk-gib", require_disk_gib)
         .option("--max-hours", max_hours)
@@ -639,6 +641,15 @@ def run(
         "--node",
         help="pin a specific node",
         rich_help_panel="Everyday",
+    ),
+    exclude_node: Optional[list[str]] = typer.Option(
+        None,
+        "--exclude-node",
+        help=(
+            "never place this job on NODE (repeatable); the project's "
+            "`exclude_nodes` applies when omitted"
+        ),
+        rich_help_panel="Scheduling & safety",
     ),
     require_path: Optional[str] = typer.Option(
         None,
@@ -915,6 +926,7 @@ def run(
             gpus=gpus,
             project=project,
             node=node,
+            exclude_node=exclude_node,
             require_path=require_path,
             require_disk_gib=require_disk_gib,
             max_hours=max_hours,
@@ -952,6 +964,7 @@ def run(
         command=tuple(cmd),
         project=project,
         node=node,
+        exclude_nodes=tuple(exclude_node or ()),
         require_path=require_path,
         require_disk_gib=require_disk_gib,
         max_hours=max_hours,

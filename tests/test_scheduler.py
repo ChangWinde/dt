@@ -478,6 +478,93 @@ def test_disjoint_pin_stays_runnable_behind_a_different_busy_pin(tmp_path):
     assert by_id["pin-n2"]["state"] == "runnable"
 
 
+def test_unpinned_work_behind_a_busy_pin_runs_on_another_node(tmp_path):
+    """Field report: a job pinned to a busy node sat at the head of the queue
+    and an unpinned job behind it waited too, while a second node showed
+    `1/1` free for a quarter of an hour. The busy pin's node stays reserved
+    for the pinned waiter; the unpinned job is placed on any other node."""
+    from dt.scheduler import _capacity_overlaps, admission_decision
+
+    cfg = _cfg(tmp_path)
+    resources = [
+        {"node": "n1", "gpus": [{"free": False}], "error": None},
+        {"node": "n2", "gpus": [{"free": True}], "error": None},
+    ]
+    pinned = _entry("pin-n1", 1, gpus_requested=1, pin_node="n1")
+    free_agent = _entry("anywhere", 2, gpus_requested=1)
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [pinned, free_agent],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    by_id = {row["job_id"]: row for row in snapshot["queue"]}
+    assert by_id["pin-n1"]["state"] == "waiting_capacity"
+    assert by_id["anywhere"]["state"] == "runnable"
+    assert by_id["anywhere"]["selected_node"] == "n2"
+
+    # Admission agrees: the candidate takes a card on n2 only, which the job
+    # pinned to n1 can never use ...
+    assert not _capacity_overlaps(pinned, free_agent, "n2")
+    assert admission_decision(
+        cfg, free_agent, [pinned, free_agent], candidate_node="n2"
+    ).allowed
+    # ... while placing it on n1 would still jump the queue there.
+    assert _capacity_overlaps(pinned, free_agent, "n1")
+    refused = admission_decision(
+        cfg, free_agent, [pinned, free_agent], candidate_node="n1"
+    )
+    assert refused.state == "waiting_fifo"
+
+    # When the only free node is the one the pin waits for, the unpinned job
+    # waits behind it as before.
+    only_n1 = [
+        {"node": "n1", "gpus": [{"free": True}], "error": None},
+        {"node": "n2", "gpus": [{"free": False}], "error": None},
+    ]
+    later = scheduler_snapshot(
+        cfg,
+        [pinned, free_agent],
+        resources=only_n1,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    states = {row["job_id"]: row["state"] for row in later["queue"]}
+    assert states["pin-n1"] == "runnable"
+    assert states["anywhere"] == "waiting_capacity"
+
+
+def test_excluded_nodes_are_never_candidates(tmp_path):
+    cfg = _cfg(tmp_path)
+    resources = [
+        {"node": "n1", "gpus": [{"free": True}], "error": None},
+        {"node": "n2", "gpus": [{"free": True}], "error": None},
+    ]
+    avoid_n1 = _entry("avoid", 1, gpus_requested=1, exclude_nodes=["n1"])
+
+    snapshot = scheduler_snapshot(
+        cfg,
+        [avoid_n1],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    (row,) = snapshot["queue"]
+    assert row["state"] == "runnable" and row["selected_node"] == "n2"
+
+    avoid_both = _entry("avoid-all", 1, gpus_requested=1, exclude_nodes=["n1", "n2"])
+    stuck = scheduler_snapshot(
+        cfg,
+        [avoid_both],
+        resources=resources,
+        agent_alive=True,
+        agent_heartbeat_stale=False,
+    )
+    assert stuck["queue"][0]["state"] != "runnable"
+
+
 def test_unpinned_capacity_wait_preserves_overlapping_fifo(tmp_path):
     cfg = _cfg(tmp_path)
     resources = [
