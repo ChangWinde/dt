@@ -6,6 +6,8 @@ CLI, JSON schema, and exit-code compatibility contracts within a minor line.
 
 ## Unreleased
 
+## 0.13.21 — 2026-09-07
+
 ### Added
 
 - `dt run --exclude-node NODE` (repeatable) and `projects.NAME.exclude_nodes`:
