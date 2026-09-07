@@ -238,10 +238,13 @@ the documentation map.
 
 ## Field reports (`inbox/`)
 
-Other agents drop bug reports for this project as Markdown files in `inbox/`
-(ignored by git). Find the root cause from logs and node-side evidence before
-trusting a report's own diagnosis — the reporter sees symptoms, not the
-mechanism. When a report is handled, archive a verbatim copy as
-`docs/audits/field-report-<date>-<slug>.md` (the tracked record; run
+Other agents and maintainers drop bug reports for this project as Markdown
+files in `inbox/` (ignored by git; written from the workspace's shared issue
+template). Find the root cause from logs and node-side evidence before trusting
+a report's own diagnosis — the reporter sees symptoms, not the mechanism. Once a
+fix has shipped *and* been verified (a test that reproduces the symptom, and
+where possible the mechanism observed on a real node), archive a verbatim copy
+as `docs/audits/field-report-<date>-<slug>.md` (the tracked record; run
 `scripts/docs.py --write`) and rename the original in place with a `fix-`
-prefix so the reporter sees it was taken; never delete it.
+prefix so the reporter sees it was taken. An unverified fix earns no `fix-`;
+never delete a report.
